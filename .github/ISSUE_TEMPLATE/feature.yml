@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a focused, user-visible capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator or security problem needs solving?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe observable behavior rather than placeholder architecture.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and authority impact
+      description: Does this add data access, credentials, provider execution, or external effects?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and non-goals

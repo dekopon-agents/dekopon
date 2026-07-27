@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/dekopon-agents/dekopon/security/advisories/new
+    about: Report vulnerabilities privately; do not open a public issue.
+  - name: Questions and design discussion
+    url: https://github.com/dekopon-agents/dekopon/discussions
+    about: Ask usage questions or discuss early design ideas.

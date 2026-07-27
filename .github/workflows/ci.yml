@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: quality (stable)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-features
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: test (Rust 1.85.0)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
+        with:
+          toolchain: 1.85.0
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv-1.85.0
+      - name: Test workspace on MSRV
+        run: cargo test --workspace --all-features --locked
+
+  package:
+    name: package crates
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
+        with:
+          toolchain: stable
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Package every publishable crate
+        run: cargo package --workspace --exclude dekopon-testkit --locked
+
+  cli-smoke:
+    name: CLI smoke tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
+        with:
+          toolchain: stable
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build CLI
+        run: cargo build --locked -p dekopon
+      - name: Exercise generated help and example commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/debug/dekopon
+          config=examples/local/dekopon.yaml
+          "$bin" --help >/dev/null
+          "$bin" get --help >/dev/null
+          "$bin" --config "$config" get agents >/dev/null
+          "$bin" --config "$config" get agents -o wide >/dev/null
+          "$bin" --config "$config" get agent reviewer -o yaml >/dev/null
+          "$bin" --config "$config" get capabilities -o name >/dev/null
+          "$bin" --config "$config" get providers >/dev/null
+          "$bin" --config "$config" describe agent reviewer >/dev/null
+          "$bin" --config "$config" validate >/dev/null
+          "$bin" --config "$config" config view -o json >/dev/null
+      - name: Verify invalid configuration exit behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalid="$RUNNER_TEMP/invalid-dekopon.yaml"
+          cat >"$invalid" <<'YAML'
+          apiVersion: dekopon.dev/v1alpha1
+          kind: Agent
+          metadata:
+            name: invalid
+          spec:
+            description: Missing declared capability
+            capabilities: [github.missing]
+          YAML
+          set +e
+          target/debug/dekopon --config "$invalid" validate >/dev/null 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 1
+      - name: Verify path installation
+        shell: bash
+        run: |
+          cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
+          "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
+
+  deny:
+    name: dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --all-features

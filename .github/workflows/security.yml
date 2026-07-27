@@ -1,0 +1,53 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dependency-review:
+    name: dependency and advisory review
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check RustSec advisories and yanked crates
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          command-arguments: advisories
+          arguments: --all-features
+      - name: Recheck licenses, duplicate policy, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          command-arguments: bans licenses sources
+          arguments: --all-features
+
+  dependency-inventory:
+    name: locked dependency inventory
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
+        with:
+          toolchain: stable
+      - name: Export locked dependency tree
+        run: cargo tree --workspace --all-features --locked > dependency-tree.txt
+      - name: Upload dependency inventory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-tree
+          path: dependency-tree.txt
+          retention-days: 30
+          if-no-files-found: error

@@ -154,7 +154,6 @@ version = "0.1.0"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
- "dekopon-testkit",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -189,6 +188,7 @@ name = "dekopon-testkit"
 version = "0.1.0"
 dependencies = [
  "dekopon-capability",
+ "dekopon-config",
  "dekopon-core",
  "dekopon-protocol",
  "serde_yaml_ng",

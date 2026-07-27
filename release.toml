@@ -1,0 +1,12 @@
+# cargo-release prepares versions and tags; GitHub Actions owns packaging/publication.
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+tag-message = "Dekopon {{version}}"
+pre-release-commit-message = "chore(release): prepare {{version}}"
+allow-branch = ["main"]
+dependent-version = "upgrade"
+publish = false
+push = false
+sign-commit = false
+sign-tag = false
