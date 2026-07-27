@@ -1,0 +1,91 @@
+# A local-only Dekopon catalog. Credential values are never stored here.
+apiVersion: dekopon.dev/v1alpha1
+kind: Provider
+metadata:
+  name: github
+  labels:
+    environment: local
+spec:
+  description: GitHub provider declaration for repository and pull-request operations
+  type: github
+  credentialRef: github-app-default
+status: Unknown
+---
+apiVersion: dekopon.dev/v1alpha1
+kind: Capability
+metadata:
+  name: github.pull-request.read
+spec:
+  description: Read pull-request metadata, diffs, and existing reviews
+  provider: github
+  effect: read-only
+  risk: Low
+  idempotency: idempotent
+  permissions:
+    - operation: pull_requests:read
+status: Unknown
+---
+apiVersion: dekopon.dev/v1alpha1
+kind: Capability
+metadata:
+  name: github.repository.read
+spec:
+  description: Read repository metadata and source content
+  provider: github
+  effect: read-only
+  risk: Low
+  idempotency: idempotent
+  permissions:
+    - operation: contents:read
+    - operation: metadata:read
+status: Unknown
+---
+apiVersion: dekopon.dev/v1alpha1
+kind: Capability
+metadata:
+  name: github.pull-request.comment
+spec:
+  description: Post a pull-request review comment as an explicit external write
+  provider: github
+  effect: external-write
+  risk: High
+  idempotency: conditional
+  permissions:
+    - operation: pull_requests:write
+      resource: review-comments
+status: Unknown
+---
+apiVersion: dekopon.dev/v1alpha1
+kind: Agent
+metadata:
+  name: reviewer
+  labels:
+    purpose: code-review
+spec:
+  description: Reviews pull requests without approval authority
+  enabled: true
+  capabilities:
+    - github.pull-request.read
+    - github.pull-request.comment
+  providers:
+    - github
+  modelClass: reasoning
+  policyProfile: pull-request-review
+status: Ready
+---
+apiVersion: dekopon.dev/v1alpha1
+kind: Agent
+metadata:
+  name: snooper
+  labels:
+    purpose: capability-research
+spec:
+  description: Finds recurring tool gaps without making external changes
+  enabled: false
+  capabilities:
+    - github.repository.read
+  providers:
+    - github
+  modelClass: analysis
+  policyProfile: repository-read-only
+status: Disabled
