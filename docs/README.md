@@ -1,0 +1,39 @@
+# Dekopon documentation map
+
+Start with [`design.md`](design.md). It is the shared product and system-design entry point; it separates current behavior from accepted future constraints and records the invariants every change must preserve.
+
+## Reading paths
+
+### Understand the project
+
+Read in this order:
+
+1. [`design.md`](design.md) — product thesis, vocabulary, authority flow, boundaries, and accepted decisions.
+2. [`security-model.md`](security-model.md) — trusted and untrusted inputs, threat model, and present limitations.
+3. [`architecture.md`](architecture.md) — how the design maps to current crates and planned processes.
+4. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
+
+### Change a specific area
+
+| Work | Read | Why |
+|---|---|---|
+| Any behavior or architecture change | [`design.md`](design.md) | Establishes invariants, ownership, terminology, and current-versus-future status. |
+| Capabilities, identity, policy, providers, credentials, evidence, or effects | [`security-model.md`](security-model.md) | Defines trust boundaries and threats the change must address. |
+| Crates, protocols, daemon/broker split, or dependencies | [`architecture.md`](architecture.md) | Defines implementation and deployment boundaries and explains intentionally absent machinery. |
+| Commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
+| Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
+
+Also read [`../CONTRIBUTING.md`](../CONTRIBUTING.md) before submitting a change and [`../SECURITY.md`](../SECURITY.md) before reporting a vulnerability.
+
+## Documentation contract
+
+Documentation is part of the reviewed behavior:
+
+- Use **Current**, **Committed direction**, and **Exploration** as defined in `design.md` when status could be ambiguous.
+- Present tense must not make an unimplemented component sound available.
+- Update the relevant document, examples, and tests in the same change as behavior.
+- Prefer one authoritative explanation with links over subtly different copies.
+- The security invariant outranks convenience. A roadmap item does not override the design or security model.
+- If code, tests, and documentation disagree about current behavior, treat the disagreement as a defect and make the resolution explicit.
+
+Human maintainers own product decisions and authorization. Coding agents may propose and implement reviewable changes, but must not silently redefine authority boundaries, publish packages, weaken repository protections, or claim future work as complete.

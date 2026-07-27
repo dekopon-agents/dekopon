@@ -1,5 +1,7 @@
 # Security model
 
+This document expands the security constraints introduced in [`design.md`](design.md). Read it before changing capabilities, identity, policy, credentials, providers, evidence, audit behavior, or external effects.
+
 ## Foundational invariant
 
 > A model may propose an invocation, but only the broker may turn it into an authorized invocation.

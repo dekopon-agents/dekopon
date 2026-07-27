@@ -4,6 +4,10 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. The in
 
 > **Status:** early and not production-ready. The CLI does not yet run models or execute tools.
 
+## Design documentation
+
+Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/README.md`](docs/README.md) provides task-based reading paths for humans and coding agents; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
+
 ## What works today
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
