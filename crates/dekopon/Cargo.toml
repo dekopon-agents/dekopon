@@ -1,0 +1,34 @@
+[package]
+name = "dekopon"
+description = "Capability-oriented control CLI for self-hosted AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon"
+readme = "README.md"
+keywords = ["agents", "cli", "capabilities", "security", "automation"]
+categories = ["command-line-utilities", "config"]
+default-run = "dekopon"
+include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+clap.workspace = true
+dekopon-capability.workspace = true
+dekopon-config.workspace = true
+dekopon-core.workspace = true
+dekopon-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

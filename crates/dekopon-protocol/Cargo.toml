@@ -1,0 +1,27 @@
+[package]
+name = "dekopon-protocol"
+description = "Versioned resource types shared by Dekopon clients and runtimes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-protocol"
+readme = "README.md"
+keywords = ["agents", "api", "capabilities", "protocol"]
+categories = ["data-structures", "encoding"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+schemars.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true

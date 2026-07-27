@@ -1,0 +1,28 @@
+[package]
+name = "dekopon-config"
+description = "Local YAML and JSON configuration discovery, loading, and validation for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-config"
+readme = "README.md"
+keywords = ["agents", "configuration", "validation", "yaml"]
+categories = ["config"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-core.workspace = true
+dekopon-protocol.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+dekopon-testkit.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
