@@ -37,7 +37,7 @@ const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 /// Result of inspecting Dekopon's ChatGPT subscription credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatGptAuthStatus {
-    /// Credential file used by the runner.
+    /// Credential file owned by Dekopon.
     pub path: PathBuf,
     /// Whether credentials are present.
     pub signed_in: bool,
@@ -183,9 +183,17 @@ impl ChatModel for ChatGptCodexModel {
     }
 }
 
-/// Performs a device-code login and stores credentials in Dekopon's auth file.
+/// Performs a device-code login, writes instructions to standard output, and stores credentials.
 pub fn login(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
-    login_with_endpoints(auth_path, ChatGptEndpoints::production(), &mut io::stdout())
+    login_with_output(auth_path, &mut io::stdout())
+}
+
+/// Performs a device-code login while writing authorization instructions to `output`.
+pub fn login_with_output(
+    auth_path: Option<&Path>,
+    output: &mut dyn Write,
+) -> Result<PathBuf, ChatGptError> {
+    login_with_endpoints(auth_path, ChatGptEndpoints::production(), output)
 }
 
 fn login_with_endpoints(
@@ -1013,7 +1021,7 @@ pub enum ChatGptError {
     #[error("invalid ChatGPT configuration: {0}")]
     Configuration(String),
     /// No Dekopon-owned login exists.
-    #[error("not logged in to ChatGPT; run `dekopon-run chatgpt login` (expected {})", path.display())]
+    #[error("not logged in to ChatGPT; run `dekopon auth chatgpt login` (expected {})", path.display())]
     NotLoggedIn {
         /// Expected credential path.
         path: PathBuf,
@@ -1104,18 +1112,15 @@ mod tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use dekopon_core::CapabilityId;
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
         AUTH_VERSION, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints, build_request_body,
-        extract_account_id, load_credentials, login_with_endpoints, parse_sse, save_credentials,
+        extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
+        save_credentials, status,
     };
-    use crate::{
-        model::{ChatModel as _, ModelMessage, ModelTool},
-        prompt::{RuntimeTool, ToolRuntime, ToolRuntimeError, run_prompt},
-    };
+    use crate::model::{ChatModel as _, ModelMessage, ModelTool};
 
     fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
@@ -1136,6 +1141,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_credentials_point_to_the_operator_auth_command() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("missing-auth.json");
+        let error = match ChatGptCodexModel::new("gpt-test", Some(&path), Duration::from_secs(1)) {
+            Ok(_) => panic!("missing credentials must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("dekopon auth chatgpt login"));
+    }
+
+    #[test]
     fn stores_credentials_without_exposing_them_in_status() {
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
@@ -1152,6 +1169,10 @@ mod tests {
 
         assert_eq!(loaded.account_id, "acct-test");
         assert_eq!(loaded.refresh, "refresh-secret");
+        let status = status(Some(&path)).expect("credential status");
+        assert!(status.signed_in);
+        assert!(!status.expired);
+        assert!(!format!("{status:?}").contains("refresh-secret"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1160,6 +1181,23 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn logout_removes_only_dekopons_selected_credential_file() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        let unrelated = temp.path().join("other-client.json");
+        fs::write(&path, "credential").expect("write credential fixture");
+        fs::write(&unrelated, "untouched").expect("write unrelated fixture");
+
+        logout(Some(&path)).expect("logout succeeds");
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(unrelated).expect("unrelated file remains"),
+            "untouched"
+        );
     }
 
     #[test]
@@ -1267,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_backend_runs_the_bounded_provider_tool_loop() {
+    fn subscription_model_replays_reasoning_and_correlates_tool_results() {
         let first = concat!(
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\"}}\n\n",
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\",\"arguments\":\"\"}}\n\n",
@@ -1277,7 +1315,6 @@ mod tests {
         );
         let second = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Echoed hello.\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echoed hello.\"}]}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         );
         let server = MockServer::start(vec![MockResponse::sse(first), MockResponse::sse(second)]);
@@ -1301,35 +1338,24 @@ mod tests {
             ChatGptEndpoints::local(&server.base_url()),
         )
         .expect("model client");
+        let tools = vec![ModelTool {
+            name: "echo_echo".to_owned(),
+            description: "Echo input".to_owned(),
+            parameters: json!({"type":"object"}),
+        }];
+        let mut messages = vec![ModelMessage::user("echo hello")];
 
-        let outcome = run_prompt(&model, &EchoRuntime, "echo hello", None, 4)
-            .expect("subscription tool loop");
+        let tool_turn = model.complete(&messages, &tools).expect("tool turn");
+        assert_eq!(tool_turn.tool_calls[0].id, "call_1");
+        messages.push(crate::model::assistant_message(&tool_turn));
+        messages.push(ModelMessage::tool("call_1", r#"{"message":"hello"}"#));
+        let answer = model.complete(&messages, &tools).expect("answer turn");
 
-        assert_eq!(outcome.answer, "Echoed hello.");
-        assert_eq!(outcome.provider_invocations, 1);
+        assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
         let requests = server.requests.lock().expect("request lock");
         assert!(requests[1].contains("opaque"));
         assert!(requests[1].contains("function_call_output"));
-    }
-
-    struct EchoRuntime;
-
-    impl ToolRuntime for EchoRuntime {
-        fn tools(&self) -> Vec<RuntimeTool> {
-            vec![RuntimeTool {
-                capability: "echo.echo".parse().expect("valid capability"),
-                description: "Echo input".to_owned(),
-                input_schema: json!({"type":"object"}),
-            }]
-        }
-
-        fn invoke(
-            &self,
-            _capability: &CapabilityId,
-            input: &Value,
-        ) -> Result<Value, ToolRuntimeError> {
-            Ok(input.clone())
-        }
+        assert!(requests[1].contains("call_1"));
     }
 
     #[test]

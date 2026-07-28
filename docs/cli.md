@@ -1,11 +1,14 @@
 # CLI reference
 
-`dekopon` is the local catalog operator interface. Version `0.1.0` is synchronous and reads a validated local catalog; it does not contact a daemon. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md). Its flags and effects are not part of this catalog CLI contract.
+`dekopon` is the operator interface for local catalog inspection and model-account lifecycle. Version `0.1.0` is synchronous and does not contact a daemon. Catalog commands read a validated local catalog; `auth` commands instead contact the selected model provider's fixed authentication endpoint. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md).
 
 ## Commands
 
 ```text
 dekopon version
+dekopon auth chatgpt login
+dekopon auth chatgpt status
+dekopon auth chatgpt logout
 dekopon get agents
 dekopon get agent <NAME>
 dekopon get capabilities
@@ -21,14 +24,18 @@ Run `dekopon --help` or `dekopon <COMMAND> --help` for generated syntax.
 
 ## Global flags
 
-- `--config <PATH>`: authoritative YAML or JSON source.
+- `--config <PATH>`: authoritative YAML or JSON source for catalog commands; ignored by `version` and `auth`.
 - `-o, --output <FORMAT>`: `table` (default), `wide`, `json`, `yaml`, or `name`.
 - `--no-color`: disable ANSI color in diagnostics.
 - `--quiet`: suppress successful output; errors still print.
 - `-v`: emit informational diagnostics and error causes.
 - `-vv`: emit debug diagnostics and debug error context.
 
-Global flags may appear before or after subcommands.
+Global flags may appear before or after subcommands. Authentication commands do not load the catalog. `--output json` or `--output yaml` keeps authentication status machine-readable; device-login instructions are written to standard error so standard output remains parseable.
+
+## ChatGPT subscription authentication
+
+`dekopon auth chatgpt login` uses OpenAI's Codex device authorization flow and writes only to Dekopon's credential file. `status` reports state without revealing tokens, and `logout` removes only Dekopon's file. The default is `~/.config/dekopon/chatgpt-auth.json`; override it with `DEKOPON_CHATGPT_AUTH_FILE` or `--auth-file <PATH>`. See [`run.md`](run.md) for inference behavior and the complete security boundary.
 
 ## Configuration discovery
 

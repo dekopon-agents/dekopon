@@ -22,13 +22,12 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 
 ## Intended package namespace
 
-The following names are reserved in the project architecture for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
+`dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-agent`
 - `dekopon-broker`
 - `dekopon-policy`
 - `dekopon-identity`
-- `dekopon-model`
 - `dekopon-context`
 - `dekopon-memory`
 - `dekopon-tribunal`
@@ -39,4 +38,4 @@ A crate should be added only with meaningful, tested behavior needed by an imple
 
 ## Explicit non-goals for 0.1
 
-Interactive TUI, daemon networking, shell-completion installation, provider credential access, provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally deferred. The current model call and component loading path exists only in the explicitly experimental `dekopon-run` executable.
+Interactive TUI, daemon networking, shell-completion installation, provider credential access, provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally deferred. Model-account lifecycle is exposed through `dekopon auth`; model inference and component loading remain confined to the explicitly experimental `dekopon-run` executable.

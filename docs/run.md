@@ -1,6 +1,6 @@
 # Immediate provider runner
 
-`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only Dekopon providers. It is separate from the `dekopon` catalog CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
+`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only Dekopon providers. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
 
 ## Commands
 
@@ -8,7 +8,7 @@
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
 dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
-dekopon-run chatgpt <login | status | logout>
+dekopon auth chatgpt <login | status | logout>
 ```
 
 All commands compile each component once. Description and invocation calls receive a fresh Wasmtime store with configured memory, fuel, wall-clock, input, and output limits. Repeating `--provider` creates one deterministic capability registry; duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`.
@@ -54,14 +54,14 @@ For authenticated endpoints, `--api-key-env <NAME>` names an environment variabl
 Dekopon implements OpenAI's Codex device authorization and streaming Responses protocol directly; OpenClaw, the Codex CLI, and pi are not runtime dependencies. Sign in once:
 
 ```console
-target/release/dekopon-run chatgpt login
+target/release/dekopon auth chatgpt login
 ```
 
 The command prints `https://auth.openai.com/codex/device` and a short code, waits for authorization, then stores refreshable credentials in Dekopon's own credential file. Check or remove that login with:
 
 ```console
-target/release/dekopon-run chatgpt status
-target/release/dekopon-run chatgpt logout
+target/release/dekopon auth chatgpt status
+target/release/dekopon auth chatgpt logout
 ```
 
 Then select the subscription backend explicitly:
@@ -76,7 +76,7 @@ target/release/dekopon-run prompt \
 
 Use an exact model exposed to the signed-in Codex account; `gpt-5.5` is a recovery choice when the account does not expose GPT-5.6. Dekopon automatically refreshes an expiring access token and replays opaque encrypted reasoning items only in memory when a tool call requires another model turn.
 
-The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE` or `--auth-file`/`--chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
+The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE`, `dekopon auth chatgpt ... --auth-file`, or `dekopon-run prompt --chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
 
 The subscription transport receives the prompt, system instruction, provider tool schemas, tool arguments, and tool results. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
 

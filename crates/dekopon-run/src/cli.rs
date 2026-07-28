@@ -70,12 +70,6 @@ pub enum Command {
         #[arg(long, default_value = "1", value_name = "COUNT")]
         repeat: NonZeroU32,
     },
-    /// Manage Dekopon's isolated ChatGPT/Codex subscription login.
-    Chatgpt {
-        /// Authentication operation.
-        #[command(subcommand)]
-        command: ChatGptCommand,
-    },
     /// Run a one-shot model prompt/tool loop.
     Prompt {
         /// Provider components whose capabilities become model tools.
@@ -86,7 +80,7 @@ pub enum Command {
         #[arg(long, value_name = "MODEL")]
         model: String,
 
-        /// Use Dekopon's ChatGPT/Codex subscription login instead of an API endpoint.
+        /// Use the ChatGPT/Codex login managed by `dekopon auth chatgpt`.
         #[arg(long)]
         chatgpt_subscription: bool,
 
@@ -117,29 +111,6 @@ pub enum Command {
         /// User prompt.
         #[arg(value_name = "PROMPT")]
         prompt: String,
-    },
-}
-
-/// ChatGPT/Codex subscription authentication operations.
-#[derive(Clone, Debug, Subcommand)]
-pub enum ChatGptCommand {
-    /// Sign in through OpenAI's Codex device authorization flow.
-    Login {
-        /// Override Dekopon's ChatGPT credential file.
-        #[arg(long, value_name = "PATH")]
-        auth_file: Option<PathBuf>,
-    },
-    /// Report whether Dekopon has a usable ChatGPT login.
-    Status {
-        /// Override Dekopon's ChatGPT credential file.
-        #[arg(long, value_name = "PATH")]
-        auth_file: Option<PathBuf>,
-    },
-    /// Delete Dekopon's ChatGPT login without touching other clients.
-    Logout {
-        /// Override Dekopon's ChatGPT credential file.
-        #[arg(long, value_name = "PATH")]
-        auth_file: Option<PathBuf>,
     },
 }
 
@@ -199,7 +170,7 @@ pub struct LimitArgs {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{ChatGptCommand, Cli, Command};
+    use super::{Cli, Command};
 
     #[test]
     fn clap_definition_is_internally_consistent() {
@@ -228,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_chatgpt_subscription_prompt_and_login() {
+    fn parses_chatgpt_subscription_prompt() {
         let cli = Cli::try_parse_from([
             "dekopon-run",
             "prompt",
@@ -245,15 +216,6 @@ mod tests {
             Command::Prompt {
                 chatgpt_subscription: true,
                 ..
-            }
-        ));
-
-        let cli =
-            Cli::try_parse_from(["dekopon-run", "chatgpt", "login"]).expect("valid login command");
-        assert!(matches!(
-            cli.command,
-            Command::Chatgpt {
-                command: ChatGptCommand::Login { .. }
             }
         ));
     }

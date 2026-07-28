@@ -21,7 +21,7 @@ Read in this order:
 | Any behavior or architecture change | [`design.md`](design.md) | Establishes invariants, ownership, terminology, and current-versus-future status. |
 | Capabilities, identity, policy, providers, credentials, evidence, or effects | [`security-model.md`](security-model.md) | Defines trust boundaries and threats the change must address. |
 | Crates, protocols, daemon/broker split, or dependencies | [`architecture.md`](architecture.md) | Defines implementation and deployment boundaries and explains intentionally absent machinery. |
-| Catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
+| Operator auth, catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Immediate provider loading, direct invocation, prompt tools, or tracing | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
 

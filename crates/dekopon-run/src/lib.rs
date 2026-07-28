@@ -15,21 +15,21 @@ use std::{
 };
 
 use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_model::{
+    chatgpt::{ChatGptCodexModel, ChatGptError},
+    model::{ChatModel, ModelError, OpenAiChatModel},
+};
 use dekopon_provider_host::{HostLimits, ProviderHostError, ProviderManifest, ProviderRegistry};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    chatgpt::{ChatGptCodexModel, ChatGptError},
-    cli::{ChatGptCommand, Cli, Command},
-    model::{ChatModel, ModelError, OpenAiChatModel},
+    cli::{Cli, Command},
     prompt::{PromptError, run_prompt},
 };
 
-pub mod chatgpt;
 pub mod cli;
-pub mod model;
 pub mod prompt;
 mod trace;
 
@@ -121,27 +121,6 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
             );
             serde_json::to_string_pretty(&report).map_err(AppError::Serialize)
         }
-        Command::Chatgpt { command } => match command {
-            ChatGptCommand::Login { auth_file } => {
-                let path = chatgpt::login(auth_file.as_deref())?;
-                Ok(format!("ChatGPT login saved to {}", path.display()))
-            }
-            ChatGptCommand::Status { auth_file } => {
-                let status = chatgpt::status(auth_file.as_deref())?;
-                let state = if !status.signed_in {
-                    "not logged in"
-                } else if status.expired {
-                    "logged in; access token will be refreshed on use"
-                } else {
-                    "logged in"
-                };
-                Ok(format!("{state} ({})", status.path.display()))
-            }
-            ChatGptCommand::Logout { auth_file } => {
-                let path = chatgpt::logout(auth_file.as_deref())?;
-                Ok(format!("ChatGPT login removed from {}", path.display()))
-            }
-        },
         Command::Prompt {
             providers,
             model,

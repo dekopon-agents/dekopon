@@ -370,6 +370,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-config",
  "dekopon-core",
+ "dekopon-model",
  "dekopon-protocol",
  "serde",
  "serde_json",
@@ -415,6 +416,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-model"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "dekopon-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "dekopon-protocol"
 version = "0.1.0"
 dependencies = [
@@ -456,9 +471,9 @@ dependencies = [
 name = "dekopon-run"
 version = "0.1.0"
 dependencies = [
- "base64",
  "clap",
  "dekopon-core",
+ "dekopon-model",
  "dekopon-provider-host",
  "serde",
  "serde_json",
@@ -467,7 +482,6 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]

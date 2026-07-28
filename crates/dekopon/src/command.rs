@@ -1,6 +1,7 @@
 //! Typed command execution, independent of rendering.
 
 use dekopon_config::CatalogSnapshot;
+use dekopon_model::chatgpt::ChatGptAuthStatus;
 use dekopon_protocol::{Agent, Capability, Provider};
 use serde::Serialize;
 
@@ -14,6 +15,8 @@ use crate::{
 pub enum CommandResult {
     /// CLI build information.
     Version(VersionInfo),
+    /// Model-account authentication state.
+    Auth(ModelAuthStatus),
     /// Agent list.
     Agents(Vec<Agent>),
     /// One agent.
@@ -32,6 +35,31 @@ pub enum CommandResult {
     Validation(ValidationSummary),
     /// Canonical validated catalog.
     Config(CatalogSnapshot),
+}
+
+/// Machine-readable model-account authentication state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAuthStatus {
+    /// Model account namespace.
+    pub account: &'static str,
+    /// Credential file owned by Dekopon.
+    pub credential_file: String,
+    /// Whether credentials are present.
+    pub signed_in: bool,
+    /// Whether the current access token is expired.
+    pub expired: bool,
+}
+
+impl ModelAuthStatus {
+    pub(crate) fn chatgpt(status: ChatGptAuthStatus) -> Self {
+        Self {
+            account: "chatgpt",
+            credential_file: status.path.display().to_string(),
+            signed_in: status.signed_in,
+            expired: status.expired,
+        }
+    }
 }
 
 /// Machine-readable CLI version information.
@@ -91,6 +119,9 @@ pub fn execute(
 ) -> Result<CommandResult, CatalogError> {
     match command {
         Command::Version => Ok(version_result()),
+        Command::Auth { .. } => {
+            unreachable!("auth commands are executed before catalog resolution")
+        }
         Command::Get { resource } => execute_get(resource, reader),
         Command::Describe { resource } => execute_describe(resource, reader),
         Command::Validate => {

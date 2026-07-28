@@ -81,14 +81,15 @@ The broker owns the only authority transition in this flow. Rust visibility is u
 
 | Component | Authority and responsibility | Status |
 |---|---|---|
-| `dekopon` | Human/operator CLI; parses commands, reads typed resources, renders results | **Current**, local catalog only |
+| `dekopon` | Human/operator CLI; reads typed resources, renders results, and owns model-account lifecycle commands | **Current**, local catalog plus isolated model auth |
 | `dekopon-core` | Validated identifiers and dependency-light domain types | **Current** |
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, and reference validation | **Current** |
 | `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, no executing broker |
 | `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and WIT export adapter | **Current**, experimental read-only contract |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
-| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, model login, timing, and trace export | **Current**, experimental immediate mode |
+| `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
+| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export | **Current**, experimental immediate mode |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
 | Policy evaluator | Declarative authorization decisions and explanations; Cedar is the intended engine after inputs stabilize | **Committed direction** |
@@ -110,6 +111,14 @@ parse dekopon CLI
 ```
 
 Command handlers do not manipulate YAML. `LocalConfigReader` implements `ResourceReader`; a future daemon client may implement the same read boundary. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
+
+Model-account lifecycle is a separate operator path that does not resolve or parse the catalog:
+
+```text
+parse dekopon auth chatgpt CLI
+  -> contact OpenAI's fixed device-auth endpoint
+  -> store, inspect, or remove Dekopon's isolated credential file
+```
 
 It also includes an explicitly experimental immediate provider path:
 

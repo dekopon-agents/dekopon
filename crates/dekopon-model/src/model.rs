@@ -381,12 +381,14 @@ pub enum ModelError {
     /// The response contained no choices.
     #[error("model response contained no choices")]
     NoChoices,
-    /// The model returned a tool kind the runner does not execute.
+    /// The model returned a tool kind Dekopon's prompt loop does not execute.
     #[error("model returned unsupported tool kind {0:?}")]
     UnsupportedToolKind(String),
 }
 
-pub(crate) fn assistant_message(turn: &AssistantTurn) -> ModelMessage {
+/// Converts an assistant turn into replayable conversation state.
+#[must_use]
+pub fn assistant_message(turn: &AssistantTurn) -> ModelMessage {
     ModelMessage::assistant(turn)
 }
 

@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dekopon_core::CapabilityId;
+use dekopon_model::model::{ChatModel, ModelError, ModelMessage, ModelTool, assistant_message};
 use dekopon_provider_host::{ProviderHostError, ProviderRegistry};
 use serde_json::Value;
 use thiserror::Error;
-
-use crate::model::{ChatModel, ModelError, ModelMessage, ModelTool, assistant_message};
 
 const MAX_FUNCTION_NAME_LENGTH: usize = 64;
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
@@ -296,7 +295,7 @@ mod tests {
     use dekopon_core::CapabilityId;
     use serde_json::{Value, json};
 
-    use crate::model::{
+    use dekopon_model::model::{
         AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
         ModelToolCall,
     };

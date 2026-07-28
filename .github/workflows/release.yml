@@ -185,6 +185,7 @@ jobs:
           }
           publish dekopon-core
           publish dekopon-capability
+          publish dekopon-model
           publish dekopon-provider-sdk
           publish dekopon-provider-host
           publish dekopon-protocol

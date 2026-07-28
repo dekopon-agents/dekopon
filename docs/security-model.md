@@ -50,7 +50,7 @@ The example reviewer has `github.pull-request.read` and the explicit external-wr
 
 ## Current 0.1.0 posture
 
-The `dekopon` catalog CLI reads operator-selected YAML or JSON, rejects unknown fields, validates identifiers and references, and renders declarations. It performs no network requests, model calls, credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
+The `dekopon` catalog commands read operator-selected YAML or JSON, reject unknown fields, validate identifiers and references, and render declarations without network access. The isolated `dekopon auth` namespace is the only current exception: it manages model-account login against fixed authentication hosts. The CLI performs no model inference, provider credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
 
 The separate experimental `dekopon-run` path can contact an operator-selected OpenAI-compatible model endpoint or OpenAI's fixed ChatGPT/Codex subscription endpoints and execute read-only Wasm component functions. Its provider boundary is deliberately narrower than a real integration:
 
@@ -60,7 +60,7 @@ The separate experimental `dekopon-run` path can contact an operator-selected Op
 - every description and invocation uses a fresh Wasmtime store with memory, fuel, wall-clock, input, and output limits;
 - the component linker exposes no WASI or custom imports, so guests receive no filesystem, network, clock, random, environment, credential, or external-read authority;
 - an optional model bearer token is read from a named environment variable and sent only to the selected compatible endpoint;
-- ChatGPT subscription login uses OpenAI's Codex device flow, stores refreshable credentials in a Dekopon-owned file (`0600` on Unix), fixes authentication and inference hosts to `auth.openai.com` and `chatgpt.com`, and never imports credentials from pi, OpenClaw, or Codex;
+- `dekopon auth chatgpt` uses OpenAI's Codex device flow and stores refreshable credentials in a Dekopon-owned file (`0600` on Unix); the shared model client fixes authentication and inference hosts to `auth.openai.com` and `chatgpt.com` and never imports credentials from pi, OpenClaw, or Codex;
 - model credentials and opaque encrypted reasoning replay data are not exposed to components, output, or trace fields;
 - immediate tool calls are not `AuthorizedInvocation` values and cannot be used for local or external writes.
 

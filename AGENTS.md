@@ -13,7 +13,7 @@ Then read the documents selected by the work:
 | Any product behavior or architecture | [`docs/design.md`](docs/design.md) | It defines the non-negotiable invariants and accepted design decisions. |
 | Capabilities, actors, identity, policy, credentials, providers, evidence, audit, or external effects | [`docs/security-model.md`](docs/security-model.md) | It defines trusted inputs, untrusted content, threats, and current limitations. |
 | Crate boundaries, dependencies, protocols, daemon/broker separation, async, Wasmtime, or Cedar | [`docs/architecture.md`](docs/architecture.md) | It maps design responsibilities to current and future implementation boundaries. |
-| Catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current catalog operator contract. |
+| Operator auth, catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator contract. |
 | Immediate providers, Wasm components, prompt tools, model endpoints, limits, or traces | [`docs/run.md`](docs/run.md) | It defines the experimental current runner and the privileges it must not gain. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
 

@@ -15,7 +15,7 @@ use dekopon_core::{AgentId, CapabilityId, ProviderId};
     propagate_version = true
 )]
 pub struct Cli {
-    /// Path to a YAML or JSON catalog.
+    /// Path to a YAML or JSON catalog; unused by version and auth commands.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -57,6 +57,12 @@ pub struct Cli {
 pub enum Command {
     /// Print CLI version information.
     Version,
+    /// Manage model-account authentication.
+    Auth {
+        /// Model account to manage.
+        #[command(subcommand)]
+        account: AuthCommand,
+    },
     /// Get one resource or list resources.
     Get {
         /// Resource selector.
@@ -76,6 +82,41 @@ pub enum Command {
         /// Configuration operation.
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+}
+
+/// Model-account authentication namespaces.
+#[derive(Clone, Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Manage Dekopon's isolated ChatGPT/Codex subscription login.
+    #[command(name = "chatgpt")]
+    ChatGpt {
+        /// Authentication operation.
+        #[command(subcommand)]
+        command: ChatGptAuthCommand,
+    },
+}
+
+/// ChatGPT/Codex subscription authentication operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ChatGptAuthCommand {
+    /// Sign in through OpenAI's Codex device authorization flow.
+    Login {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
+    },
+    /// Report whether Dekopon has a ChatGPT login.
+    Status {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
+    },
+    /// Delete Dekopon's ChatGPT login without touching other clients.
+    Logout {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
     },
 }
 
@@ -142,11 +183,33 @@ pub enum OutputFormat {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, GetCommand, OutputFormat};
+    use super::{AuthCommand, ChatGptAuthCommand, Cli, Command, GetCommand, OutputFormat};
 
     #[test]
     fn clap_definition_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_chatgpt_auth_commands() {
+        let cli = Cli::try_parse_from([
+            "dekopon",
+            "auth",
+            "chatgpt",
+            "status",
+            "--auth-file",
+            "auth.json",
+        ])
+        .expect("valid auth command");
+
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                account: AuthCommand::ChatGpt {
+                    command: ChatGptAuthCommand::Status { .. }
+                }
+            }
+        ));
     }
 
     #[test]

@@ -190,6 +190,26 @@ fn top_level_and_nested_help_are_generated() {
 }
 
 #[test]
+fn chatgpt_auth_status_does_not_require_configuration() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = directory.path().join("missing-auth.json");
+    let output = binary()
+        .current_dir(directory.path())
+        .args(["auth", "chatgpt", "status", "--auth-file"])
+        .arg(&auth_file)
+        .args(["--output", "json"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("auth status JSON parses");
+    assert_eq!(status["account"], "chatgpt");
+    assert_eq!(status["signedIn"], false);
+    assert_eq!(status["credentialFile"], auth_file.display().to_string());
+}
+
+#[test]
 fn version_does_not_require_configuration() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let output = binary()

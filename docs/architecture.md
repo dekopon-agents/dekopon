@@ -6,7 +6,7 @@ Read [`design.md`](design.md) first for the product model and accepted invariant
 
 Dekopon has two deliberately separate synchronous execution surfaces.
 
-The stable local catalog path remains:
+The operator CLI retains its local catalog path:
 
 ```text
 dekopon
@@ -16,7 +16,13 @@ dekopon
   -> render a typed result
 ```
 
-`ResourceReader` separates command execution from `LocalConfigReader`, leaving room for a daemon-backed reader without spreading YAML handling through commands.
+`ResourceReader` separates command execution from `LocalConfigReader`, leaving room for a daemon-backed reader without spreading YAML handling through commands. The same operator surface owns model-account lifecycle without loading the catalog:
+
+```text
+dekopon auth chatgpt
+  -> fixed OpenAI device-auth host
+  -> isolated Dekopon credential file
+```
 
 The experimental immediate path is:
 
@@ -40,9 +46,10 @@ Crate boundaries are:
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
 - `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and WIT export adapter.
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry.
-- `dekopon-run`: Clap CLI, direct invocation reports, OpenAI-compatible and ChatGPT/Codex subscription model clients, bounded prompt loop, isolated model login, and trace export.
+- `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.
+- `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, and trace export.
 - `dekopon-testkit`: private builders used by workspace tests.
-- `dekopon`: catalog command parsing, resource reads, rendering, and process exits.
+- `dekopon`: catalog and model-auth command parsing, resource reads, rendering, and process exits.
 
 ## Planned deployment boundary
 

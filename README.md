@@ -1,8 +1,8 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
 
-> **Status:** early and not production-ready. `dekopon` is catalog-only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, host I/O, or external effects.
+> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, host I/O, or external effects.
 
 ## Design documentation
 
@@ -12,7 +12,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
-- A local, deterministic `dekopon` operator CLI with table, wide, JSON, YAML, and name output.
+- A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
@@ -69,7 +69,7 @@ cargo run -p dekopon-run -- --trace trace.json invoke \
   echo.echo --input '{}'
 ```
 
-Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses Dekopon's isolated ChatGPT/Codex device login. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
+Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopon auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
 
 ## Security model
 
