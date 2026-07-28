@@ -21,9 +21,7 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = []
-skip = [
-  { crate = "syn@2.0.119", reason = "schemars 0.8 and tracing have not converged on syn 3" },
-]
+skip = []
 skip-tree = []
 
 [sources]
