@@ -1,0 +1,33 @@
+[package]
+name = "dekopon-run"
+description = "Immediate-mode prompt and WebAssembly provider runner for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-run"
+readme = "README.md"
+keywords = ["agents", "cli", "wasm", "llm", "benchmark"]
+categories = ["command-line-utilities", "wasm"]
+default-run = "dekopon-run"
+include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+clap.workspace = true
+dekopon-core.workspace = true
+dekopon-provider-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-chrome.workspace = true
+tracing-subscriber.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # CLI reference
 
-`dekopon` is the local operator interface. Version `0.1.0` is synchronous and reads a validated local catalog; it does not contact a daemon.
+`dekopon` is the local catalog operator interface. Version `0.1.0` is synchronous and reads a validated local catalog; it does not contact a daemon. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md). Its flags and effects are not part of this catalog CLI contract.
 
 ## Commands
 

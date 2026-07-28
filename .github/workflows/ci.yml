@@ -35,13 +35,19 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-features
+      - name: Install Rust provider target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Check Rust provider example
+        env:
+          CARGO_TARGET_DIR: target/provider-example
+        run: cargo check --locked --manifest-path examples/providers/echo/Cargo.toml --target wasm32-unknown-unknown
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps
 
   msrv:
-    name: test (Rust 1.85.0)
+    name: test (Rust 1.86.0)
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -49,11 +55,11 @@ jobs:
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable toolchain action
         with:
-          toolchain: 1.85.0
+          toolchain: 1.86.0
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: msrv-1.85.0
+          key: msrv-1.86.0
       - name: Test workspace on MSRV
         run: cargo test --workspace --all-features --locked
 
@@ -84,14 +90,16 @@ jobs:
           toolchain: stable
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Build CLI
-        run: cargo build --locked -p dekopon
+      - name: Build CLIs
+        run: cargo build --locked -p dekopon -p dekopon-run
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
           bin=target/debug/dekopon
+          runner=target/debug/dekopon-run
           config=examples/local/dekopon.yaml
+          provider=examples/providers/echo-provider.wasm
           "$bin" --help >/dev/null
           "$bin" get --help >/dev/null
           "$bin" --config "$config" get agents >/dev/null
@@ -102,6 +110,9 @@ jobs:
           "$bin" --config "$config" describe agent reviewer >/dev/null
           "$bin" --config "$config" validate >/dev/null
           "$bin" --config "$config" config view -o json >/dev/null
+          "$runner" --help >/dev/null
+          "$runner" inspect --provider "$provider" >/dev/null
+          "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
       - name: Verify invalid configuration exit behavior
         shell: bash
         run: |
@@ -125,7 +136,9 @@ jobs:
         shell: bash
         run: |
           cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
+          "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
 
   deny:
     name: dependency policy

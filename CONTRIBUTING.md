@@ -4,7 +4,7 @@ Dekopon is early-stage security infrastructure. Small, reviewable changes with e
 
 ## Development setup
 
-Install stable Rust with `rustfmt` and Clippy. The workspace MSRV is 1.85.0.
+Install stable Rust with `rustfmt` and Clippy. The workspace MSRV is 1.86.0.
 
 ```console
 rustup component add rustfmt clippy
@@ -21,11 +21,13 @@ cargo install cargo-deny --locked
 cargo deny check
 ```
 
-Exercise the CLI before submitting a CLI or config change:
+Exercise the affected executable before submitting a CLI, config, or provider-host change:
 
 ```console
 cargo run -p dekopon -- --config examples/local/dekopon.yaml validate
 cargo run -p dekopon -- --config examples/local/dekopon.yaml get agents
+cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.wasm
+cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
 ## Change guidelines

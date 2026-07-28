@@ -1,0 +1,25 @@
+[package]
+name = "dekopon-provider-sdk"
+description = "Rust guest SDK for building Dekopon WebAssembly component providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-sdk"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "capabilities", "sdk"]
+categories = ["wasm", "api-bindings"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wit-bindgen.workspace = true
+
+[lints]
+workspace = true

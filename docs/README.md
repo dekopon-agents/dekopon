@@ -11,7 +11,8 @@ Read in this order:
 1. [`design.md`](design.md) — product thesis, vocabulary, authority flow, boundaries, and accepted decisions.
 2. [`security-model.md`](security-model.md) — trusted and untrusted inputs, threat model, and present limitations.
 3. [`architecture.md`](architecture.md) — how the design maps to current crates and planned processes.
-4. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
+4. [`run.md`](run.md) — the experimental current immediate-mode provider and prompt path.
+5. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ### Change a specific area
 
@@ -20,7 +21,8 @@ Read in this order:
 | Any behavior or architecture change | [`design.md`](design.md) | Establishes invariants, ownership, terminology, and current-versus-future status. |
 | Capabilities, identity, policy, providers, credentials, evidence, or effects | [`security-model.md`](security-model.md) | Defines trust boundaries and threats the change must address. |
 | Crates, protocols, daemon/broker split, or dependencies | [`architecture.md`](architecture.md) | Defines implementation and deployment boundaries and explains intentionally absent machinery. |
-| Commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
+| Catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
+| Immediate provider loading, direct invocation, prompt tools, or tracing | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
 
 Also read [`../CONTRIBUTING.md`](../CONTRIBUTING.md) before submitting a change and [`../SECURITY.md`](../SECURITY.md) before reporting a vulnerability.

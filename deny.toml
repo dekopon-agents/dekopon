@@ -11,8 +11,13 @@ version = 2
 confidence-threshold = 0.93
 allow = [
   "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
   "MIT",
   "Unicode-3.0",
+  "Zlib",
 ]
 exceptions = []
 
@@ -21,8 +26,16 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = []
-skip = []
-skip-tree = []
+skip = [
+  { crate = "getrandom@0.2.17", reason = "rustls uses ring's established getrandom 0.2 API while tempfile uses 0.4" },
+  { crate = "hashbrown@0.15.5", reason = "Wasmtime's pinned compiler toolchain has not converged on indexmap's hashbrown 0.17" },
+  { crate = "syn@2.0.119", reason = "Wasmtime and WIT macro dependencies have not converged on syn 3" },
+  { crate = "windows-sys@0.52.0", reason = "ring's Windows support trails the current workspace Windows bindings" },
+  { crate = "windows-sys@0.60.2", reason = "Wasmtime pins the preceding Windows bindings release" },
+]
+skip-tree = [
+  { crate = "windows-targets@0.52.6", reason = "transitive architecture packages required by ring's Windows bindings" },
+]
 
 [sources]
 unknown-registry = "deny"

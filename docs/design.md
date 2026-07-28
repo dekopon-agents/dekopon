@@ -27,7 +27,7 @@ Success does not mean making a model trustworthy. Success means containing an un
 5. **Authorization is bound to execution.** A grant carries the proposal, policy decision, execution constraints, and receipt needed to prevent a provider host from executing a different or broader operation.
 6. **Effects produce evidence and audit linkage.** Proposal, identity, decision, policy revision, execution outcome, and evidence must remain correlatable by invocation and trace identifiers.
 7. **External-write authority requires process isolation.** Once writes exist, orchestration and broker authority run in separate processes and deployment units.
-8. **Documentation must distinguish reality from direction.** Never describe a daemon, broker, policy engine, provider host, or effect as available before it is implemented and tested.
+8. **Documentation must distinguish reality from direction.** Never describe a daemon, broker, policy engine, privileged provider interface, or external effect as available before it is implemented and tested. The immediate read-only component host must not be presented as the future broker host.
 
 These invariants are more important than API convenience, model autonomy, or architectural symmetry.
 
@@ -86,19 +86,22 @@ The broker owns the only authority transition in this flow. Rust visibility is u
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, and reference validation | **Current** |
 | `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, no executing broker |
+| `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and WIT export adapter | **Current**, experimental read-only contract |
+| `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
+| `dekopon-run` | One-shot direct invocation, OpenAI-compatible prompt tools, timing, and trace export | **Current**, experimental immediate mode |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
 | Policy evaluator | Declarative authorization decisions and explanations; Cedar is the intended engine after inputs stabilize | **Committed direction** |
-| Provider host | Bounded capability execution; Wasmtime components are the intended isolation mechanism | **Committed direction** |
+| Privileged provider host | Broker-controlled host imports, credentials, network, evidence, and authorized effects | **Committed direction** |
 
 The agent daemon must not gain effect authority merely because it coordinates a task. The broker must not perform model orchestration merely because it can execute a provider.
 
-## Current control path
+## Current control paths
 
-Version `0.1.0` implements only a local read path:
+Version `0.1.0` retains the local catalog read path:
 
 ```text
-parse CLI
+parse dekopon CLI
   -> resolve one config source
   -> parse YAML/JSON once
   -> validate a typed catalog
@@ -108,7 +111,18 @@ parse CLI
 
 Command handlers do not manipulate YAML. `LocalConfigReader` implements `ResourceReader`; a future daemon client may implement the same read boundary. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
 
-No current path performs model interaction, resolves credentials, authorizes an invocation, loads a plugin, or executes an external effect.
+It also includes an explicitly experimental immediate provider path:
+
+```text
+parse dekopon-run CLI
+  -> compile Wasm components and validate manifests
+  -> reject duplicate routes and every non-read-only effect
+  -> direct invocation or OpenAI-compatible prompt/tool loop
+  -> fresh bounded store per component call
+  -> JSON result/timings and optional Chrome trace
+```
+
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. No current path resolves provider credentials, makes an authorization decision, creates external effects, or produces durable audit evidence.
 
 ## Resource and API design
 
@@ -149,6 +163,8 @@ Proposed --broker denies----------------------> Denied result + evidence
 
 `ProposedInvocation` is publicly constructible because untrusted callers are allowed to express intent. `AuthorizedInvocation` is not publicly constructible from arbitrary fields. Broker authorization must validate its decision metadata and attach bounded `ExecutionConstraints`.
 
+`dekopon-run` does not cross this state boundary. Its prompt tool calls are immediate, unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that path would violate this design.
+
 Before a real broker is introduced, its protocol must define at least:
 
 - authenticated principal and workload identity;
@@ -176,9 +192,9 @@ dekopon-brokerd       policy, credentials, provider execution, effects
 Wasm provider          one narrow integration operation
 ```
 
-The agent and broker will run as separate processes and separate pods. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Providers run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
+The agent and broker will run as separate processes and separate pods. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
 
-Wasmtime, Tokio, and Cedar should be added only with meaningful, tested behavior. Their presence in the long-term design is not a reason to add them to the current dependency graph.
+Wasmtime now supports meaningful, tested immediate-mode component execution with no host imports. This does not implement the broker deployment or privileged provider contract. Tokio and Cedar remain deferred until asynchronous host calls and stable authorization inputs justify them.
 
 ## Operator interface
 
@@ -194,12 +210,13 @@ See [`cli.md`](cli.md) for the current command contract.
 |---|---|
 | One Cargo monorepo | Initial crates share versions, CI, issues, and security review and are changing together. |
 | Edition 2024 with an explicit MSRV | Modern language surface while preserving a tested minimum toolchain. |
-| Synchronous local `0.1.0` | Async and network machinery add cost without supporting a current operation. |
+| Synchronous one-shot `0.1.0` paths | The catalog and immediate provider operations are bounded commands; daemon and asynchronous provider-host machinery remain deferred. |
 | Strong identifier newtypes | Invalid and ambiguous names should fail at system boundaries, not deep in execution. |
 | Strict decoding | Misspelled security-relevant fields must not be ignored. |
 | `BTreeMap`-backed catalogs | Deterministic reads and output simplify review, testing, and automation. |
 | Private authorization fields plus compile-fail tests | Prevent accidental in-process authority fabrication while acknowledging that process isolation remains necessary. |
 | Private testkit | Shared fixtures are useful internally but are not part of the public product API. |
+| Import-free immediate providers | Provider traits, component ABI, routing, limits, prompt tools, timings, and traces can stabilize without prematurely granting host authority. |
 | No empty future crates | A package boundary must be justified by meaningful, tested behavior. |
 
 ## How to evaluate a proposed change
@@ -222,6 +239,7 @@ If authority ownership is unclear, stop and update the design before adding code
 
 - [`security-model.md`](security-model.md) — trust assumptions, threat boundaries, and limitations.
 - [`architecture.md`](architecture.md) — current crate structure and planned deployment topology.
-- [`cli.md`](cli.md) — current operator contract, discovery, output, and exit codes.
+- [`cli.md`](cli.md) — current catalog operator contract, discovery, output, and exit codes.
+- [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
 - [`roadmap.md`](roadmap.md) — implementation sequence and deliberately deferred scope.
 - [`README.md`](README.md) — documentation map and task-based reading guide.
