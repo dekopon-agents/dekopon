@@ -38,7 +38,22 @@ fn inspects_the_checked_in_provider_component() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let manifests: Value = serde_json::from_slice(&output.stdout).expect("manifest JSON parses");
     assert_eq!(manifests[0]["id"], "echo");
-    assert_eq!(manifests[0]["capabilities"][0]["id"], "echo.echo");
+    let capability_ids = manifests[0]["capabilities"]
+        .as_array()
+        .expect("capabilities are an array")
+        .iter()
+        .map(|capability| capability["id"].as_str().expect("capability ID"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        capability_ids,
+        [
+            "echo.echo",
+            "echo.reverse",
+            "echo.upcase",
+            "echo.downcase",
+            "echo.ransom-case",
+        ]
+    );
 }
 
 #[test]
@@ -61,6 +76,23 @@ fn invokes_and_times_the_checked_in_provider_component() {
     assert_eq!(report["iterations"], 2);
     assert_eq!(report["output"], json!({"message": "hello"}));
     assert!(report["timing"]["totalMs"].as_f64().is_some());
+}
+
+#[test]
+fn invokes_a_checked_in_text_transform() {
+    let provider = provider_path();
+    let output = run(&[
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.ransom-case",
+        "--input",
+        r#"{"message":"Hello, World!"}"#,
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("report JSON parses");
+    assert_eq!(report["output"], json!({"message": "hElLo, WoRlD!"}));
 }
 
 #[test]
@@ -99,7 +131,16 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
         assert_eq!(first["model"], "test-model");
-        assert_eq!(first["tools"][0]["function"]["name"], "echo_echo");
+        let tools = first["tools"].as_array().expect("tools are an array");
+        assert_eq!(tools.len(), 5);
+        assert!(tools.iter().any(|tool| {
+            tool["function"]["name"] == "echo_echo"
+                && tool["function"]["parameters"]["additionalProperties"] == true
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool["function"]["name"] == "echo_ransom_case"
+                && tool["function"]["parameters"]["required"] == json!(["message"])
+        }));
         respond(
             first_stream,
             &json!({

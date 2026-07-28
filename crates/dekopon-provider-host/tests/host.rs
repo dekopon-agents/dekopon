@@ -31,7 +31,41 @@ fn loads_routes_and_invokes_the_rust_provider_component() {
     assert_eq!(first.output, input);
     assert_eq!(second.output, json!({"message": "again"}));
     assert_eq!(registry.manifests().len(), 1);
-    assert_eq!(registry.capabilities().count(), 1);
+    assert_eq!(registry.capabilities().count(), 5);
+}
+
+#[test]
+fn invokes_the_checked_in_text_transform_capabilities() {
+    let registry = load_echo();
+    let cases = [
+        ("echo.reverse", "Hello 🦀", "🦀 olleH"),
+        ("echo.upcase", "Hello, Straße!", "HELLO, STRASSE!"),
+        ("echo.downcase", "Hello, WORLD!", "hello, world!"),
+        ("echo.ransom-case", "Hello, World!", "hElLo, WoRlD!"),
+    ];
+
+    for (capability, input, expected) in cases {
+        let capability = capability.parse().expect("valid capability fixture");
+        let output = registry
+            .invoke(&capability, &json!({"message": input}))
+            .expect("text transformation succeeds");
+        assert_eq!(output.output, json!({"message": expected}));
+    }
+}
+
+#[test]
+fn rejects_malformed_text_transform_inputs() {
+    let registry = load_echo();
+    let capability = "echo.upcase".parse().expect("valid capability fixture");
+
+    let error = registry
+        .invoke(&capability, &json!({"message": 42}))
+        .expect_err("invalid message input must fail");
+
+    assert!(matches!(
+        error,
+        ProviderHostError::ProviderFailure { ref code, .. } if code == "invalid-input"
+    ));
 }
 
 #[test]
