@@ -1,6 +1,6 @@
 # Roadmap
 
-Roadmap items describe direction, not shipped behavior or commitments.
+Roadmap items describe sequencing, not shipped behavior or permission to bypass the invariants in [`design.md`](design.md) and [`security-model.md`](security-model.md). They are intentions rather than delivery commitments.
 
 ## 0.1 — local control CLI (implemented)
 
