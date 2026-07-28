@@ -70,17 +70,31 @@ pub enum Command {
         #[arg(long, default_value = "1", value_name = "COUNT")]
         repeat: NonZeroU32,
     },
-    /// Run a one-shot OpenAI-compatible prompt/tool loop.
+    /// Manage Dekopon's isolated ChatGPT/Codex subscription login.
+    Chatgpt {
+        /// Authentication operation.
+        #[command(subcommand)]
+        command: ChatGptCommand,
+    },
+    /// Run a one-shot model prompt/tool loop.
     Prompt {
         /// Provider components whose capabilities become model tools.
         #[command(flatten)]
         providers: ProviderArgs,
 
-        /// Model identifier sent to the chat-completions endpoint.
+        /// Model identifier sent to the selected model backend.
         #[arg(long, value_name = "MODEL")]
         model: String,
 
-        /// OpenAI-compatible API base URL.
+        /// Use Dekopon's ChatGPT/Codex subscription login instead of an API endpoint.
+        #[arg(long)]
+        chatgpt_subscription: bool,
+
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, requires = "chatgpt_subscription", value_name = "PATH")]
+        chatgpt_auth_file: Option<PathBuf>,
+
+        /// OpenAI-compatible API base URL; ignored with `--chatgpt-subscription`.
         #[arg(long, default_value = "http://127.0.0.1:11434/v1", value_name = "URL")]
         endpoint: String,
 
@@ -103,6 +117,29 @@ pub enum Command {
         /// User prompt.
         #[arg(value_name = "PROMPT")]
         prompt: String,
+    },
+}
+
+/// ChatGPT/Codex subscription authentication operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ChatGptCommand {
+    /// Sign in through OpenAI's Codex device authorization flow.
+    Login {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
+    },
+    /// Report whether Dekopon has a usable ChatGPT login.
+    Status {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
+    },
+    /// Delete Dekopon's ChatGPT login without touching other clients.
+    Logout {
+        /// Override Dekopon's ChatGPT credential file.
+        #[arg(long, value_name = "PATH")]
+        auth_file: Option<PathBuf>,
     },
 }
 
@@ -162,7 +199,7 @@ pub struct LimitArgs {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{ChatGptCommand, Cli, Command};
 
     #[test]
     fn clap_definition_is_internally_consistent() {
@@ -188,6 +225,37 @@ mod tests {
             panic!("expected invoke command");
         };
         assert_eq!(providers.provider.len(), 2);
+    }
+
+    #[test]
+    fn parses_chatgpt_subscription_prompt_and_login() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "prompt",
+            "--provider",
+            "echo.wasm",
+            "--chatgpt-subscription",
+            "--model",
+            "gpt-test",
+            "echo hello",
+        ])
+        .expect("valid subscription prompt");
+        assert!(matches!(
+            cli.command,
+            Command::Prompt {
+                chatgpt_subscription: true,
+                ..
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["dekopon-run", "chatgpt", "login"]).expect("valid login command");
+        assert!(matches!(
+            cli.command,
+            Command::Chatgpt {
+                command: ChatGptCommand::Login { .. }
+            }
+        ));
     }
 
     #[test]

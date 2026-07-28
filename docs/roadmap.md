@@ -9,7 +9,7 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Deterministic get, describe, validate, and config-view commands.
 - Proposal/authorization typestate and documented process boundary.
 - Experimental Rust provider SDK and import-free Wasmtime component host.
-- One-shot direct invocation, OpenAI-compatible prompt tools, timing reports, and Chrome trace export for read-only provider computation.
+- One-shot direct invocation, OpenAI-compatible and ChatGPT/Codex subscription prompt tools, isolated device login, timing reports, and Chrome trace export for read-only provider computation.
 
 ## Next milestones
 

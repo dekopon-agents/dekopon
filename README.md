@@ -16,7 +16,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
-- `dekopon-run` direct invocation, OpenAI-compatible prompt tools, timing reports, and Chrome/Perfetto trace export.
+- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet
 
@@ -69,7 +69,7 @@ cargo run -p dekopon-run -- --trace trace.json invoke \
   echo.echo --input '{}'
 ```
 
-Prompt mode targets an OpenAI-compatible endpoint, defaulting to local Ollama at `http://127.0.0.1:11434/v1`. See [`docs/run.md`](docs/run.md) for provider builds, prompt usage, limits, benchmarking, and authority restrictions.
+Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses Dekopon's isolated ChatGPT/Codex device login. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
 
 ## Security model
 

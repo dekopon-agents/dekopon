@@ -15,6 +15,7 @@ default-run = "dekopon-run"
 include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 dekopon-core.workspace = true
 dekopon-provider-host.workspace = true

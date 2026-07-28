@@ -7,7 +7,8 @@
 ```text
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
-dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL>] <PROMPT>
+dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
+dekopon-run chatgpt <login | status | logout>
 ```
 
 All commands compile each component once. Description and invocation calls receive a fresh Wasmtime store with configured memory, fuel, wall-clock, input, and output limits. Repeating `--provider` creates one deterministic capability registry; duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`.
@@ -31,7 +32,11 @@ time target/release/dekopon-run invoke \
 
 ## Prompt mode
 
-Prompt mode sends OpenAI-compatible chat-completions requests. The default endpoint is `http://127.0.0.1:11434/v1`, suitable for an Ollama-compatible local server:
+Prompt mode supports either an OpenAI-compatible Chat Completions endpoint or a ChatGPT/Codex subscription. Both backends expose the same bounded provider tool loop.
+
+### OpenAI-compatible endpoints
+
+The default endpoint is `http://127.0.0.1:11434/v1`, suitable for an Ollama-compatible local server:
 
 ```console
 cargo run -p dekopon-run -- prompt \
@@ -43,6 +48,37 @@ cargo run -p dekopon-run -- prompt \
 Provider capability IDs are converted into deterministic OpenAI-compatible function names. Model arguments remain untrusted JSON, can select only offered capabilities, and are checked against the host's object-input requirement before invocation. Tool results are returned to the model until it emits final text or `--max-steps` is reached. A single model turn is capped at 32 tool calls to bound adversarial endpoint fan-out.
 
 For authenticated endpoints, `--api-key-env <NAME>` names an environment variable read as a bearer token; it defaults to `OPENAI_API_KEY`. The token is never sent to a provider or recorded as a tracing field, HTTP redirects are disabled, and bearer tokens require HTTPS except for loopback HTTP endpoints.
+
+### ChatGPT/Codex subscription
+
+Dekopon implements OpenAI's Codex device authorization and streaming Responses protocol directly; OpenClaw, the Codex CLI, and pi are not runtime dependencies. Sign in once:
+
+```console
+target/release/dekopon-run chatgpt login
+```
+
+The command prints `https://auth.openai.com/codex/device` and a short code, waits for authorization, then stores refreshable credentials in Dekopon's own credential file. Check or remove that login with:
+
+```console
+target/release/dekopon-run chatgpt status
+target/release/dekopon-run chatgpt logout
+```
+
+Then select the subscription backend explicitly:
+
+```console
+target/release/dekopon-run prompt \
+  --provider examples/providers/echo-provider.wasm \
+  --chatgpt-subscription \
+  --model gpt-5.6-sol \
+  'Use the echo tool with the message hello'
+```
+
+Use an exact model exposed to the signed-in Codex account; `gpt-5.5` is a recovery choice when the account does not expose GPT-5.6. Dekopon automatically refreshes an expiring access token and replays opaque encrypted reasoning items only in memory when a tool call requires another model turn.
+
+The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE` or `--auth-file`/`--chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
+
+The subscription transport receives the prompt, system instruction, provider tool schemas, tool arguments, and tool results. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
 
 ## Rust provider interface
 

@@ -68,7 +68,7 @@ pub fn run_prompt<M, R>(
     max_steps: u32,
 ) -> Result<PromptOutcome, PromptError>
 where
-    M: ChatModel,
+    M: ChatModel + ?Sized,
     R: ToolRuntime,
 {
     if max_steps == 0 {
@@ -367,10 +367,12 @@ mod tests {
                             arguments: r#"{"message":"hello"}"#.to_owned(),
                         },
                     }],
+                    replay_items: Vec::new(),
                 },
                 AssistantTurn {
                     content: Some("The provider echoed hello.".to_owned()),
                     tool_calls: Vec::new(),
+                    replay_items: Vec::new(),
                 },
             ])),
             observed_message_counts: RefCell::new(Vec::new()),
@@ -402,6 +404,7 @@ mod tests {
                         arguments: "{}".to_owned(),
                     },
                 }],
+                replay_items: Vec::new(),
             }])),
             observed_message_counts: RefCell::new(Vec::new()),
         };
@@ -432,6 +435,7 @@ mod tests {
             turns: RefCell::new(VecDeque::from([AssistantTurn {
                 content: None,
                 tool_calls,
+                replay_items: Vec::new(),
             }])),
             observed_message_counts: RefCell::new(Vec::new()),
         };

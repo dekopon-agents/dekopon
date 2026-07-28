@@ -88,7 +88,7 @@ The broker owns the only authority transition in this flow. Rust visibility is u
 | `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, no executing broker |
 | `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and WIT export adapter | **Current**, experimental read-only contract |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
-| `dekopon-run` | One-shot direct invocation, OpenAI-compatible prompt tools, timing, and trace export | **Current**, experimental immediate mode |
+| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, model login, timing, and trace export | **Current**, experimental immediate mode |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
 | Policy evaluator | Declarative authorization decisions and explanations; Cedar is the intended engine after inputs stabilize | **Committed direction** |
@@ -117,7 +117,7 @@ It also includes an explicitly experimental immediate provider path:
 parse dekopon-run CLI
   -> compile Wasm components and validate manifests
   -> reject duplicate routes and every non-read-only effect
-  -> direct invocation or OpenAI-compatible prompt/tool loop
+  -> direct invocation or OpenAI-compatible/ChatGPT-subscription prompt/tool loop
   -> fresh bounded store per component call
   -> JSON result/timings and optional Chrome trace
 ```

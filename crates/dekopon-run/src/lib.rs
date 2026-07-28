@@ -21,11 +21,13 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    cli::{Cli, Command},
-    model::{ModelError, OpenAiChatModel},
+    chatgpt::{ChatGptCodexModel, ChatGptError},
+    cli::{ChatGptCommand, Cli, Command},
+    model::{ChatModel, ModelError, OpenAiChatModel},
     prompt::{PromptError, run_prompt},
 };
 
+pub mod chatgpt;
 pub mod cli;
 pub mod model;
 pub mod prompt;
@@ -119,9 +121,32 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
             );
             serde_json::to_string_pretty(&report).map_err(AppError::Serialize)
         }
+        Command::Chatgpt { command } => match command {
+            ChatGptCommand::Login { auth_file } => {
+                let path = chatgpt::login(auth_file.as_deref())?;
+                Ok(format!("ChatGPT login saved to {}", path.display()))
+            }
+            ChatGptCommand::Status { auth_file } => {
+                let status = chatgpt::status(auth_file.as_deref())?;
+                let state = if !status.signed_in {
+                    "not logged in"
+                } else if status.expired {
+                    "logged in; access token will be refreshed on use"
+                } else {
+                    "logged in"
+                };
+                Ok(format!("{state} ({})", status.path.display()))
+            }
+            ChatGptCommand::Logout { auth_file } => {
+                let path = chatgpt::logout(auth_file.as_deref())?;
+                Ok(format!("ChatGPT login removed from {}", path.display()))
+            }
+        },
         Command::Prompt {
             providers,
             model,
+            chatgpt_subscription,
+            chatgpt_auth_file,
             endpoint,
             api_key_env,
             system,
@@ -129,23 +154,38 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
             model_timeout_ms,
             prompt,
         } => {
+            let backend = if *chatgpt_subscription {
+                "chatgpt-subscription"
+            } else {
+                "openai-compatible"
+            };
             let span = tracing::info_span!(
                 "runner.prompt",
                 provider.count = providers.provider.len(),
                 model = %model,
+                model.backend = backend,
                 prompt.max_steps = max_steps.get()
             );
             let _entered = span.enter();
             let registry = ProviderRegistry::load(providers.provider.clone(), limits)?;
-            let bearer_token = read_optional_secret(api_key_env)?;
-            let model = OpenAiChatModel::new(
-                endpoint,
-                model,
-                bearer_token,
-                Duration::from_millis(*model_timeout_ms),
-            )?;
+            let timeout = Duration::from_millis(*model_timeout_ms);
+            let model: Box<dyn ChatModel> = if *chatgpt_subscription {
+                Box::new(ChatGptCodexModel::new(
+                    model,
+                    chatgpt_auth_file.as_deref(),
+                    timeout,
+                )?)
+            } else {
+                let bearer_token = read_optional_secret(api_key_env)?;
+                Box::new(OpenAiChatModel::new(
+                    endpoint,
+                    model,
+                    bearer_token,
+                    timeout,
+                )?)
+            };
             let outcome = run_prompt(
-                &model,
+                model.as_ref(),
                 &registry,
                 prompt,
                 system.as_deref(),
@@ -323,6 +363,8 @@ fn milliseconds(duration: Duration) -> f64 {
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[error(transparent)]
+    ChatGpt(#[from] ChatGptError),
     #[error(transparent)]
     Provider(#[from] ProviderHostError),
     #[error(transparent)]

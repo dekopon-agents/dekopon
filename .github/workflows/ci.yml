@@ -111,6 +111,8 @@ jobs:
           "$bin" --config "$config" validate >/dev/null
           "$bin" --config "$config" config view -o json >/dev/null
           "$runner" --help >/dev/null
+          DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
+            "$runner" chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
           "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
       - name: Verify invalid configuration exit behavior

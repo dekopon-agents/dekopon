@@ -26,6 +26,8 @@ pub struct ModelMessage {
     tool_calls: Vec<ModelToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip)]
+    replay_items: Vec<Value>,
 }
 
 impl ModelMessage {
@@ -49,6 +51,7 @@ impl ModelMessage {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            replay_items: Vec::new(),
         }
     }
 
@@ -58,6 +61,7 @@ impl ModelMessage {
             content: turn.content.clone(),
             tool_calls: turn.tool_calls.clone(),
             tool_call_id: None,
+            replay_items: turn.replay_items.clone(),
         }
     }
 
@@ -67,6 +71,7 @@ impl ModelMessage {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            replay_items: Vec::new(),
         }
     }
 
@@ -80,6 +85,18 @@ impl ModelMessage {
     #[must_use]
     pub fn content(&self) -> Option<&str> {
         self.content.as_deref()
+    }
+
+    pub(crate) fn tool_calls(&self) -> &[ModelToolCall] {
+        &self.tool_calls
+    }
+
+    pub(crate) fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    pub(crate) fn replay_items(&self) -> &[Value] {
+        &self.replay_items
     }
 }
 
@@ -111,6 +128,9 @@ pub struct AssistantTurn {
     pub content: Option<String>,
     /// Requested tool calls.
     pub tool_calls: Vec<ModelToolCall>,
+    /// Provider-specific opaque response items required for safe replay.
+    #[doc(hidden)]
+    pub replay_items: Vec<Value>,
 }
 
 /// Synchronous model boundary used by the immediate prompt loop.
@@ -238,6 +258,7 @@ impl ChatModel for OpenAiChatModel {
         Ok(AssistantTurn {
             content: choice.message.content,
             tool_calls,
+            replay_items: Vec::new(),
         })
     }
 }

@@ -26,7 +26,7 @@ dekopon-run
   -> call and validate read-only provider manifests
   -> direct invoke: route one capability and emit timings
      or
-  -> prompt: expose schemas to an OpenAI-compatible model and execute selected tools
+  -> prompt: expose schemas through OpenAI-compatible or ChatGPT/Codex subscription transport and execute selected tools
   -> create a fresh bounded Wasmtime store for every component call
 ```
 
@@ -40,7 +40,7 @@ Crate boundaries are:
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
 - `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and WIT export adapter.
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry.
-- `dekopon-run`: Clap CLI, direct invocation reports, OpenAI-compatible prompt loop, and trace export.
+- `dekopon-run`: Clap CLI, direct invocation reports, OpenAI-compatible and ChatGPT/Codex subscription model clients, bounded prompt loop, isolated model login, and trace export.
 - `dekopon-testkit`: private builders used by workspace tests.
 - `dekopon`: catalog command parsing, resource reads, rendering, and process exits.
 
@@ -66,6 +66,8 @@ A model-facing tool call is only a proposal. The broker owns the authority trans
 ## Immediate isolation and planned provider authority
 
 The immediate host establishes a small current subset of the planned mechanism: component-model providers run in Wasmtime, components compile once per process, and each description or invocation gets a fresh store with explicit fuel, time, memory, input, and output limits. An empty linker is the authority boundary: no filesystem, network, clock, random, environment, credential, or other host function is available to the guest.
+
+Model authentication terminates in the model client, separately from provider authority. ChatGPT subscription mode owns a distinct device-flow credential file, refreshes tokens only against OpenAI's fixed authentication host, and sends inference only to the fixed Codex Responses host. It does not import another application's token store or expose model credentials to a component.
 
 The privileged provider design remains future work. The broker will eventually share Wasmtime's compiled engine and component cache, create a fresh bounded store for every authorized invocation, and expose narrowly scoped asynchronous host interfaces integrated with Tokio. Network destinations, credentials, retries, evidence, and host calls will be derived from an authenticated `AuthorizedInvocation`, not from an immediate prompt session. `dekopon-run` must not grow those privileges in-process.
 

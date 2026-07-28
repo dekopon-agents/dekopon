@@ -25,7 +25,7 @@ Then read the documents selected by the work:
 - Capability declarations permit proposals; they do not grant ambient process authority.
 - Read authority never implies write authority. External writes require explicit narrow capabilities.
 - Trusted actor identity comes from an authenticated envelope, never from model or repository content.
-- Credentials remain inside the broker boundary and out of prompts, config, evidence, and logs.
+- Provider credentials remain inside the broker boundary and out of prompts, config, evidence, and logs; model credentials stay inside the selected model client and never enter provider components.
 - `dekopond` and `dekopon-brokerd` remain separate processes once external-write authority exists.
 - `dekopon-run` remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode.
 - Do not describe unimplemented daemons, policy, privileged provider interfaces, or external effects as available.

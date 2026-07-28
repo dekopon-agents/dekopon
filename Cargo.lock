@@ -456,6 +456,7 @@ dependencies = [
 name = "dekopon-run"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "dekopon-core",
  "dekopon-provider-host",
