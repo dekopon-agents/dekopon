@@ -1,5 +1,7 @@
 # Architecture
 
+Read [`design.md`](design.md) first for the product model and accepted invariants. This document maps that design to current crate boundaries and the planned deployment topology; it does not make planned components current.
+
 ## Present in 0.1.0
 
 Dekopon currently consists of a synchronous local CLI and a typed Cargo workspace. The runtime path is deliberately small:
