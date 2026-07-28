@@ -13,7 +13,8 @@ Then read the documents selected by the work:
 | Any product behavior or architecture | [`docs/design.md`](docs/design.md) | It defines the non-negotiable invariants and accepted design decisions. |
 | Capabilities, actors, identity, policy, credentials, providers, evidence, audit, or external effects | [`docs/security-model.md`](docs/security-model.md) | It defines trusted inputs, untrusted content, threats, and current limitations. |
 | Crate boundaries, dependencies, protocols, daemon/broker separation, async, Wasmtime, or Cedar | [`docs/architecture.md`](docs/architecture.md) | It maps design responsibilities to current and future implementation boundaries. |
-| CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator-facing contract. |
+| Operator auth, catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator contract. |
+| Immediate providers, Wasm components, prompt tools, model endpoints, limits, or traces | [`docs/run.md`](docs/run.md) | It defines the experimental current runner and the privileges it must not gain. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
 
 [`docs/README.md`](docs/README.md) is the complete documentation map. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for validation and pull-request expectations.
@@ -24,9 +25,10 @@ Then read the documents selected by the work:
 - Capability declarations permit proposals; they do not grant ambient process authority.
 - Read authority never implies write authority. External writes require explicit narrow capabilities.
 - Trusted actor identity comes from an authenticated envelope, never from model or repository content.
-- Credentials remain inside the broker boundary and out of prompts, config, evidence, and logs.
+- Provider credentials remain inside the broker boundary and out of prompts, config, evidence, and logs; model credentials stay inside the selected model client and never enter provider components.
 - `dekopond` and `dekopon-brokerd` remain separate processes once external-write authority exists.
-- Do not describe unimplemented daemons, policy, providers, or effects as available.
+- `dekopon-run` remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode.
+- Do not describe unimplemented daemons, policy, privileged provider interfaces, or external effects as available.
 - Do not add empty crates or heavy future dependencies without meaningful, tested behavior.
 - Parse config once into typed resources; do not spread YAML handling through command execution.
 - Do not publish crates, create releases, weaken branch protection, or add credentials without explicit human authorization.

@@ -1,8 +1,8 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog and a kubectl-inspired CLI. Future releases will add a separately deployed agent runtime, authorization broker, and sandboxed capability providers.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
 
-> **Status:** early and not production-ready. The CLI does not yet run models or execute tools.
+> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, host I/O, or external effects.
 
 ## Design documentation
 
@@ -12,23 +12,27 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
-- A local, deterministic `dekopon` operator CLI with table, wide, JSON, YAML, and name output.
+- A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
+- A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
+- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet
 
-There is no daemon, model integration, network API, policy engine, credential broker, provider execution, Wasm host, task store, or agent memory in `0.1.0`. Provider and status resources are declarations only. In particular, this release cannot post the review comment represented by the example capability.
+There is no daemon, authenticated network API, policy engine, credential broker, privileged provider host, task store, or agent memory in `0.1.0`. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
-The workspace uses stable Rust (MSRV 1.85.0, edition 2024):
+The workspace uses stable Rust (MSRV 1.86.0, edition 2024):
 
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
 cargo install --locked --path crates/dekopon
+cargo install --locked --path crates/dekopon-run
 dekopon version
+dekopon-run --version
 ```
 
 The crates.io release is prepared but publication requires explicit maintainer authorization. Until it is published, install from the repository as shown above.
@@ -50,15 +54,32 @@ The `reviewer` may read pull requests and may propose a review comment only thro
 
 See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
 
+## Run a Rust provider immediately
+
+The checked-in component is generated from [`examples/providers/echo/src/lib.rs`](examples/providers/echo/src/lib.rs), which implements `dekopon_provider_sdk::Provider`:
+
+```console
+cargo run -p dekopon-run -- inspect \
+  --provider examples/providers/echo-provider.wasm
+cargo run -p dekopon-run -- invoke \
+  --provider examples/providers/echo-provider.wasm \
+  echo.echo --input '{"message":"hello"}'
+cargo run -p dekopon-run -- --trace trace.json invoke \
+  --provider examples/providers/echo-provider.wasm \
+  echo.echo --input '{}'
+```
+
+Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopon auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
+
 ## Security model
 
-A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, credentials, provider execution, evidence, and audit records belong to a separate privileged boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. The broker does not exist yet, so `0.1.0` executes no external effects.
+A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-run` does not create authorized invocations: it executes only import-free components declaring `read-only`, so `0.1.0` still performs no provider external effects.
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
 
 ## Roadmap
 
-The next architectural milestones are a separate unprivileged `dekopond`, an authenticated privileged broker, declarative policy evaluation, and bounded Wasm capability providers. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are a separate unprivileged `dekopond`, an authenticated privileged broker, declarative policy evaluation, and broker-mediated provider host I/O. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Organization and package names
 

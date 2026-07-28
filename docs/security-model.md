@@ -50,12 +50,24 @@ The example reviewer has `github.pull-request.read` and the explicit external-wr
 
 ## Current 0.1.0 posture
 
-The local CLI reads operator-selected YAML or JSON, rejects unknown fields, validates identifiers and references, and renders declarations. It performs no network requests, model calls, credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
+The `dekopon` catalog commands read operator-selected YAML or JSON, reject unknown fields, validate identifiers and references, and render declarations without network access. The isolated `dekopon auth` namespace is the only current exception: it manages model-account login against fixed authentication hosts. The CLI performs no model inference, provider credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
 
-Terminal table cells remove control characters. Machine-readable output preserves authored strings and must still be handled as untrusted data by downstream consumers.
+The separate experimental `dekopon-run` path can contact an operator-selected OpenAI-compatible model endpoint or OpenAI's fixed ChatGPT/Codex subscription endpoints and execute read-only Wasm component functions. Its provider boundary is deliberately narrower than a real integration:
+
+- provider manifests are strictly decoded and may declare only `read-only` capabilities;
+- duplicate provider and capability IDs are rejected before model interaction;
+- model-selected function names map only to the offered capability registry and arguments must be JSON objects;
+- every description and invocation uses a fresh Wasmtime store with memory, fuel, wall-clock, input, and output limits;
+- the component linker exposes no WASI or custom imports, so guests receive no filesystem, network, clock, random, environment, credential, or external-read authority;
+- an optional model bearer token is read from a named environment variable and sent only to the selected compatible endpoint;
+- `dekopon auth chatgpt` uses OpenAI's Codex device flow and stores refreshable credentials in a Dekopon-owned file (`0600` on Unix); the shared model client fixes authentication and inference hosts to `auth.openai.com` and `chatgpt.com` and never imports credentials from pi, OpenClaw, or Codex;
+- model credentials and opaque encrypted reasoning replay data are not exposed to components, output, or trace fields;
+- immediate tool calls are not `AuthorizedInvocation` values and cannot be used for local or external writes.
+
+Chrome trace fields omit prompts, model responses, component input/output, and bearer tokens. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
 
 ## Threat-model limitations
 
-The current project does not yet defend against a malicious local user who can replace the binary or config, a compromised host, dependency or compiler compromise, denial of service from very large input files, rollback of files or audit data, or side channels. It has no authenticated daemon protocol, replay defense, policy semantics, secret-store integration, Wasm sandbox, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
+The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The immediate Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, privileged host-call interface, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
 
 Future releases must threat-model confused-deputy attacks, prompt injection, credential exfiltration, provider escalation, TOCTOU between authorization and execution, duplicate external effects, malicious Wasm components, resource exhaustion, forged identity envelopes, audit tampering, and cross-tenant data leaks before claiming production readiness.

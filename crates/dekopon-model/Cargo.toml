@@ -1,0 +1,29 @@
+[package]
+name = "dekopon-model"
+description = "Bounded model clients and account authentication for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-model"
+readme = "README.md"
+keywords = ["agents", "llm", "openai", "chatgpt", "oauth"]
+categories = ["api-bindings", "authentication"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+base64.workspace = true
+dekopon-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

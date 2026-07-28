@@ -97,8 +97,8 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-${{ matrix.target }}
-      - name: Build CLI
-        run: cargo build --release --locked -p dekopon --target ${{ matrix.target }}
+      - name: Build CLIs
+        run: cargo build --release --locked -p dekopon -p dekopon-run --target ${{ matrix.target }}
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -107,6 +107,7 @@ jobs:
           archive="dekopon-${version}-${{ matrix.target }}"
           mkdir -p "staging/$archive"
           cp "target/${{ matrix.target }}/release/dekopon" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopon-run" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
@@ -184,6 +185,10 @@ jobs:
           }
           publish dekopon-core
           publish dekopon-capability
+          publish dekopon-model
+          publish dekopon-provider-sdk
+          publish dekopon-provider-host
           publish dekopon-protocol
           publish dekopon-config
+          publish dekopon-run
           cargo publish --locked -p dekopon

@@ -19,6 +19,7 @@ clap.workspace = true
 dekopon-capability.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
+dekopon-model.workspace = true
 dekopon-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

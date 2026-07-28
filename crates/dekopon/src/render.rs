@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     cli::OutputFormat,
-    command::{AgentDescription, CommandResult, ValidationSummary, VersionInfo},
+    command::{AgentDescription, CommandResult, ModelAuthStatus, ValidationSummary, VersionInfo},
 };
 
 /// Failure to serialize a typed command result.
@@ -27,6 +27,7 @@ pub enum RenderError {
 pub fn render(result: &CommandResult, format: OutputFormat) -> Result<String, RenderError> {
     match result {
         CommandResult::Version(info) => render_version(info, format),
+        CommandResult::Auth(status) => render_auth(status, format),
         CommandResult::Agents(agents) => render_agents(agents, format),
         CommandResult::Agent(agent) => render_agent(agent, format),
         CommandResult::Capabilities(capabilities) => render_capabilities(capabilities, format),
@@ -45,6 +46,31 @@ fn render_version(info: &VersionInfo, format: OutputFormat) -> Result<String, Re
         OutputFormat::Yaml => to_yaml(info),
         OutputFormat::Table | OutputFormat::Wide | OutputFormat::Name => {
             Ok(format!("{} {}", info.product, info.version))
+        }
+    }
+}
+
+fn render_auth(status: &ModelAuthStatus, format: OutputFormat) -> Result<String, RenderError> {
+    match format {
+        OutputFormat::Json => to_json(status),
+        OutputFormat::Yaml => to_yaml(status),
+        OutputFormat::Name => Ok(format!("auth/{}", status.account)),
+        OutputFormat::Table | OutputFormat::Wide => {
+            let state = if !status.signed_in {
+                "not signed in"
+            } else if status.expired {
+                "signed in; refresh required"
+            } else {
+                "signed in"
+            };
+            Ok(table(
+                &["ACCOUNT", "STATUS", "CREDENTIAL FILE"],
+                &[vec![
+                    cell_text(status.account),
+                    state.to_owned(),
+                    cell_text(&status.credential_file),
+                ]],
+            ))
         }
     }
 }

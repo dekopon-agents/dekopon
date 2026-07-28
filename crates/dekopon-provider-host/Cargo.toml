@@ -1,0 +1,27 @@
+[package]
+name = "dekopon-provider-host"
+description = "Bounded WebAssembly component host for read-only Dekopon providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-host"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "capabilities", "sandbox"]
+categories = ["wasm", "api-bindings"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+dekopon-provider-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+
+[lints]
+workspace = true
