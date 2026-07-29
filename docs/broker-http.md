@@ -2,6 +2,10 @@
 
 This document records the **committed direction** for the first privileged Dekopon provider host. It does not describe current behavior until the corresponding broker, host interface, and client paths are implemented and tested.
 
+## Current foundation
+
+The immutable `dekopon:http@1.0.0` WIT package and the `dekopon-provider-http` Rust guest facade are current once their package slice lands. They define and call the buffered import but provide no transport or authority. The broker, host implementation, authorization, audit, client, and external interaction described below remain committed direction until their respective slices are implemented and tested.
+
 ## Decision
 
 Dekopon will expose a project-owned, buffered WebAssembly Component Model interface named `dekopon:http@1.0.0`. Provider components may import that interface, but an import is only a structural requirement. It is not authority to contact a destination.

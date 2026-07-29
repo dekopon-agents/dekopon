@@ -1,0 +1,6 @@
+[metadata]
+authors = "Dekopon contributors"
+description = "Buffered broker-mediated HTTP interface for Dekopon WebAssembly components"
+license = "Apache-2.0 OR MIT"
+homepage = "https://github.com/dekopon-agents/dekopon"
+repository = "https://github.com/dekopon-agents/dekopon"

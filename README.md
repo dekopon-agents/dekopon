@@ -16,6 +16,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
+- A published buffered `dekopon:http@1.0.0` contract and guest Rust facade; no current host implements the import.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet
