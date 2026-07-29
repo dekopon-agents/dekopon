@@ -74,7 +74,9 @@ Chrome trace fields omit prompts, model responses, component input/output, and b
 
 ## Threat-model limitations
 
-The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The immediate Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, privileged host-call interface, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
+A native HTTP library now demonstrates destination, method, DNS, header, byte, call-count, and deadline enforcement against loopback mock servers, but it is not linked to Wasmtime and no current process authenticates a caller, evaluates policy, resolves credentials, or exposes it to a model. Its presence does not expand the immediate runner's authority.
+
+The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The immediate Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, privileged component-host path, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
 
 The committed first privileged-provider design is documented in [`broker-http.md`](broker-http.md). It preserves the separate broker boundary, keeps direct `dekopon-run` execution import-free, and treats HTTP imports as structural requirements rather than authority.
 
