@@ -20,7 +20,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    io::{self, SeekFrom},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use dekopon_broker_host::{
     BrokerHostError, BrokerProviderRegistry, HttpCallEvidence, ProviderCapability,
@@ -32,11 +42,16 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
 };
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncBufReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, BufReader},
+    sync::Mutex,
+};
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
@@ -52,8 +67,10 @@ const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+js
 pub const DEFAULT_MAX_POLICY_RULES: usize = 1_024;
 /// Default process-lifetime invocation identifiers retained for replay rejection.
 pub const DEFAULT_MAX_REPLAY_IDS: usize = 100_000;
-/// Default maximum records retained by an in-memory audit log.
+/// Default maximum records retained by an in-memory or durable audit log.
 pub const DEFAULT_MAX_AUDIT_RECORDS: usize = 200_000;
+/// Default maximum serialized bytes in one durable JSONL audit record (64 KiB).
+pub const DEFAULT_MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 
 /// Identity established by a trusted broker transport.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -341,6 +358,12 @@ pub enum BrokerBuildError {
         /// Maximum count.
         maximum: usize,
     },
+    /// Verified durable state contained more IDs than the replay ledger can retain.
+    #[error("durable replay state exceeds its {maximum}-identifier bound")]
+    TooManyReplayIds {
+        /// Configured maximum.
+        maximum: usize,
+    },
     /// An exact principal/actor/capability rule was duplicated.
     #[error("policy duplicates principal {principal} capability {capability}")]
     DuplicatePolicyRule {
@@ -537,6 +560,345 @@ impl AuditLog for InMemoryAuditLog {
     }
 }
 
+/// Durable, owner-only JSONL audit chain.
+///
+/// Existing records are bounded and verified before the log accepts an append. Each append is
+/// flushed and synchronized before it returns. A partial write poisons the open handle, and a
+/// later reopen rejects the unterminated or invalid record.
+#[derive(Debug)]
+pub struct FileAuditLog {
+    path: PathBuf,
+    maximum_records: usize,
+    maximum_line_bytes: usize,
+    state: Mutex<FileAuditState>,
+}
+
+#[derive(Debug)]
+struct FileAuditState {
+    file: File,
+    count: usize,
+    head: Option<String>,
+    replay_ids: BTreeSet<InvocationId>,
+    poisoned: bool,
+}
+
+impl FileAuditLog {
+    /// Opens or creates an owner-only log and verifies every retained record.
+    pub async fn open(
+        path: impl AsRef<Path>,
+        maximum_records: usize,
+        maximum_line_bytes: usize,
+    ) -> Result<Self, FileAuditError> {
+        if maximum_records == 0 {
+            return Err(FileAuditError::ZeroMaximumRecords);
+        }
+        if maximum_line_bytes == 0 {
+            return Err(FileAuditError::ZeroMaximumLineBytes);
+        }
+        let path = path.as_ref().to_path_buf();
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .await
+            .map_err(|source| FileAuditError::Io { source })?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|source| FileAuditError::Io { source })?;
+        if !metadata.is_file() {
+            return Err(FileAuditError::NotRegularFile);
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(FileAuditError::InsecureFile);
+        }
+        let standard_file = file.into_std().await;
+        standard_file
+            .try_lock_exclusive()
+            .map_err(|source| FileAuditError::Lock { source })?;
+        let file = File::from_std(standard_file);
+
+        let mut reader = BufReader::new(file);
+        let (count, head, replay_ids) =
+            scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
+        let mut file = reader.into_inner();
+        file.seek(SeekFrom::End(0))
+            .await
+            .map_err(|source| FileAuditError::Io { source })?;
+        Ok(Self {
+            path,
+            maximum_records,
+            maximum_line_bytes,
+            state: Mutex::new(FileAuditState {
+                file,
+                count,
+                head,
+                replay_ids,
+                poisoned: false,
+            }),
+        })
+    }
+
+    /// Returns the configured file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the verified record count and current chain head.
+    pub async fn checkpoint(&self) -> (usize, Option<String>) {
+        let state = self.state.lock().await;
+        (state.count, state.head.clone())
+    }
+
+    /// Returns invocation IDs reconstructed from verified decision records.
+    pub async fn replay_ids(&self) -> Vec<InvocationId> {
+        self.state.lock().await.replay_ids.iter().cloned().collect()
+    }
+}
+
+impl AuditLog for FileAuditLog {
+    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+        let mut state = self.state.lock().await;
+        if state.poisoned {
+            return Err(AuditError::Poisoned);
+        }
+        if state.count >= self.maximum_records {
+            return Err(AuditError::Full {
+                maximum: self.maximum_records,
+            });
+        }
+        let sequence = u64::try_from(state.count)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(AuditError::SequenceOverflow)?;
+        let previous_hash = state.head.clone();
+        let record_hash = audit_record_hash(sequence, previous_hash.as_deref(), &event)?;
+        let record = AuditRecord {
+            sequence,
+            previous_hash,
+            event,
+            record_hash,
+        };
+        let mut line =
+            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
+        if line.len() > self.maximum_line_bytes {
+            return Err(AuditError::RecordTooLarge {
+                length: line.len(),
+                maximum: self.maximum_line_bytes,
+            });
+        }
+        line.push(b'\n');
+
+        state.poisoned = true;
+        if let Err(source) = state.file.write_all(&line).await {
+            return Err(AuditError::Io { source });
+        }
+        if let Err(source) = state.file.flush().await {
+            return Err(AuditError::Io { source });
+        }
+        if let Err(source) = state.file.sync_all().await {
+            return Err(AuditError::Io { source });
+        }
+        state.count += 1;
+        state.head = Some(record.record_hash.clone());
+        if let AuditEvent::Decision { invocation, .. } = &record.event {
+            state.replay_ids.insert(invocation.clone());
+        }
+        state.poisoned = false;
+        Ok(record)
+    }
+}
+
+async fn scan_audit_file(
+    reader: &mut BufReader<File>,
+    maximum_records: usize,
+    maximum_line_bytes: usize,
+) -> Result<(usize, Option<String>, BTreeSet<InvocationId>), FileAuditError> {
+    let mut count = 0_usize;
+    let mut previous = None::<String>;
+    let mut replay_ids = BTreeSet::new();
+    loop {
+        let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
+            return Ok((count, previous, replay_ids));
+        };
+        if count >= maximum_records {
+            return Err(FileAuditError::TooManyRecords {
+                maximum: maximum_records,
+            });
+        }
+        let record = serde_json::from_slice::<AuditRecord>(&line).map_err(|source| {
+            FileAuditError::InvalidRecord {
+                line: count + 1,
+                source,
+            }
+        })?;
+        verify_file_record(count, previous.as_deref(), &record)?;
+        if let AuditEvent::Decision { invocation, .. } = &record.event {
+            replay_ids.insert(invocation.clone());
+        }
+        previous = Some(record.record_hash);
+        count += 1;
+    }
+}
+
+async fn read_bounded_line(
+    reader: &mut BufReader<File>,
+    maximum: usize,
+    line_number: usize,
+) -> Result<Option<Vec<u8>>, FileAuditError> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|source| FileAuditError::Io { source })?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Err(FileAuditError::UnterminatedRecord { line: line_number });
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk_length = newline.unwrap_or(available.len());
+        let length =
+            line.len()
+                .checked_add(chunk_length)
+                .ok_or(FileAuditError::RecordTooLarge {
+                    line: line_number,
+                    maximum,
+                })?;
+        if length > maximum {
+            return Err(FileAuditError::RecordTooLarge {
+                line: line_number,
+                maximum,
+            });
+        }
+        line.extend_from_slice(&available[..chunk_length]);
+        let consumed = chunk_length + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn verify_file_record(
+    index: usize,
+    previous: Option<&str>,
+    record: &AuditRecord,
+) -> Result<(), FileAuditError> {
+    let expected_sequence = u64::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(FileAuditError::Integrity {
+            line: index + 1,
+            source: AuditIntegrityError::Sequence { index },
+        })?;
+    if record.sequence != expected_sequence {
+        return Err(FileAuditError::Integrity {
+            line: index + 1,
+            source: AuditIntegrityError::Sequence { index },
+        });
+    }
+    if record.previous_hash.as_deref() != previous {
+        return Err(FileAuditError::Integrity {
+            line: index + 1,
+            source: AuditIntegrityError::PreviousHash { index },
+        });
+    }
+    let expected = audit_record_hash(
+        record.sequence,
+        record.previous_hash.as_deref(),
+        &record.event,
+    )
+    .map_err(|_| FileAuditError::Integrity {
+        line: index + 1,
+        source: AuditIntegrityError::Serialize { index },
+    })?;
+    if record.record_hash != expected {
+        return Err(FileAuditError::Integrity {
+            line: index + 1,
+            source: AuditIntegrityError::RecordHash { index },
+        });
+    }
+    Ok(())
+}
+
+/// Failure to open and verify a durable audit chain.
+#[derive(Debug, Error)]
+pub enum FileAuditError {
+    /// Record bound was zero.
+    #[error("durable audit record maximum must be greater than zero")]
+    ZeroMaximumRecords,
+    /// Per-record byte bound was zero.
+    #[error("durable audit line maximum must be greater than zero")]
+    ZeroMaximumLineBytes,
+    /// Audit path did not identify a regular file.
+    #[error("durable audit path must identify a regular file")]
+    NotRegularFile,
+    /// Unix file permissions or hard-link count did not preserve exclusive ownership.
+    #[error("durable audit file must be owner-only and have exactly one hard link")]
+    InsecureFile,
+    /// Another process already owns the audit writer lock.
+    #[error("durable audit file is already locked by another writer")]
+    Lock {
+        /// Lock failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Existing log exceeded its configured record bound.
+    #[error("durable audit log exceeds its {maximum}-record bound")]
+    TooManyRecords {
+        /// Configured maximum.
+        maximum: usize,
+    },
+    /// One existing record exceeded its byte bound.
+    #[error("durable audit record on line {line} exceeds {maximum} bytes")]
+    RecordTooLarge {
+        /// One-based line number.
+        line: usize,
+        /// Configured maximum.
+        maximum: usize,
+    },
+    /// Existing final record was only partially written.
+    #[error("durable audit record on line {line} is not newline-terminated")]
+    UnterminatedRecord {
+        /// One-based line number.
+        line: usize,
+    },
+    /// Existing JSONL record was malformed or had unknown fields.
+    #[error("durable audit record on line {line} is invalid JSON")]
+    InvalidRecord {
+        /// One-based line number.
+        line: usize,
+        /// JSON failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Existing record failed sequence or hash verification.
+    #[error("durable audit record on line {line} failed integrity verification")]
+    Integrity {
+        /// One-based line number.
+        line: usize,
+        /// Verification failure.
+        #[source]
+        source: AuditIntegrityError,
+    },
+    /// File operation failed.
+    #[error("durable audit file operation failed")]
+    Io {
+        /// I/O failure.
+        #[source]
+        source: io::Error,
+    },
+}
+
 /// Invalid in-memory audit configuration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuditConfigurationError {
@@ -548,9 +910,20 @@ pub enum AuditConfigurationError {
 /// Audit append failure.
 #[derive(Debug, Error)]
 pub enum AuditError {
-    /// Bounded in-memory storage was exhausted.
+    /// Bounded audit storage was exhausted.
     #[error("audit log reached its {maximum}-record bound")]
     Full {
+        /// Configured maximum.
+        maximum: usize,
+    },
+    /// Durable handle encountered an earlier partial or failed append.
+    #[error("durable audit handle is poisoned after an incomplete append")]
+    Poisoned,
+    /// Serialized durable record exceeded its byte ceiling.
+    #[error("audit record is {length} bytes; maximum is {maximum}")]
+    RecordTooLarge {
+        /// Actual serialized bytes.
+        length: usize,
         /// Configured maximum.
         maximum: usize,
     },
@@ -563,6 +936,13 @@ pub enum AuditError {
         /// JSON failure.
         #[source]
         source: serde_json::Error,
+    },
+    /// Durable append, flush, or sync failed.
+    #[error("durable audit append failed")]
+    Io {
+        /// I/O failure.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -691,6 +1071,27 @@ where
         audit: Arc<A>,
         limits: BrokerLimits,
     ) -> Result<Self, BrokerBuildError> {
+        Self::new_with_replay_ids(
+            registry,
+            broker_principal,
+            policy_revision,
+            rules,
+            audit,
+            limits,
+            std::iter::empty(),
+        )
+    }
+
+    /// Builds a broker while restoring invocation IDs from a verified durable audit chain.
+    pub fn new_with_replay_ids(
+        registry: BrokerProviderRegistry,
+        broker_principal: PrincipalId,
+        policy_revision: String,
+        rules: Vec<PolicyRule>,
+        audit: Arc<A>,
+        limits: BrokerLimits,
+        replay_ids: impl IntoIterator<Item = InvocationId>,
+    ) -> Result<Self, BrokerBuildError> {
         if limits.max_policy_rules == 0 {
             return Err(BrokerBuildError::ZeroLimit {
                 field: "max_policy_rules",
@@ -702,6 +1103,15 @@ where
             });
         }
         let policy = ExactPolicy::new(policy_revision, rules, &registry, limits.max_policy_rules)?;
+        let mut restored_replay_ids = BTreeSet::new();
+        for invocation in replay_ids {
+            restored_replay_ids.insert(invocation);
+            if restored_replay_ids.len() > limits.max_replay_ids {
+                return Err(BrokerBuildError::TooManyReplayIds {
+                    maximum: limits.max_replay_ids,
+                });
+            }
+        }
         Ok(Self {
             registry,
             policy,
@@ -710,7 +1120,7 @@ where
             audit,
             replay: ReplayLedger {
                 maximum: limits.max_replay_ids,
-                ids: Mutex::new(BTreeSet::new()),
+                ids: Mutex::new(restored_replay_ids),
             },
         })
     }

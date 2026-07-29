@@ -17,11 +17,18 @@ include = ["src/**", "README.md", "Cargo.toml"]
 dekopon-broker-host.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
