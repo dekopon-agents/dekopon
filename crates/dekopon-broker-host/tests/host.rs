@@ -216,6 +216,88 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("jsonplaceholder-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("JSONPlaceholder provider loads without description-time HTTP");
+
+    let get_body = br#"{"userId":2,"id":7,"title":"mock title","body":"mock body"}"#;
+    let get_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        get_body.len(),
+        String::from_utf8_lossy(get_body)
+    );
+    let (get_authority, get_request, get_server) = mock_http(get_response.as_bytes());
+    let get = registry
+        .invoke(authorized(
+            "jsonplaceholder.posts.get"
+                .parse()
+                .expect("valid get capability"),
+            json!({
+                "postId": 7,
+                "endpoint": format!("http://{get_authority}")
+            }),
+            http_constraints(get_authority.clone(), "GET"),
+        ))
+        .await
+        .expect("authorized JSONPlaceholder read succeeds");
+    assert_eq!(get.output["post"]["id"], 7);
+    assert_eq!(get.http_calls.len(), 1);
+    assert_eq!(get.http_calls[0].method, "GET");
+    assert!(
+        get_request
+            .recv()
+            .expect("GET request recorded")
+            .starts_with(b"GET /posts/7 HTTP/1.1\r\n")
+    );
+    get_server.join().expect("GET fixture server exits");
+
+    let create_body = br#"{"userId":3,"id":101,"title":"created title","body":"created body"}"#;
+    let create_response = format!(
+        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        create_body.len(),
+        String::from_utf8_lossy(create_body)
+    );
+    let (create_authority, create_request, create_server) = mock_http(create_response.as_bytes());
+    let create = registry
+        .invoke(authorized(
+            "jsonplaceholder.posts.create"
+                .parse()
+                .expect("valid create capability"),
+            json!({
+                "userId": 3,
+                "title": "created title",
+                "body": "created body",
+                "endpoint": format!("http://{create_authority}")
+            }),
+            http_constraints(create_authority.clone(), "POST"),
+        ))
+        .await
+        .expect("authorized JSONPlaceholder write succeeds");
+    assert_eq!(create.output["post"]["id"], 101);
+    assert_eq!(create.http_calls.len(), 1);
+    assert_eq!(create.http_calls[0].method, "POST");
+    let request = create_request.recv().expect("POST request recorded");
+    assert!(request.starts_with(b"POST /posts HTTP/1.1\r\n"));
+    let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+    assert!(!request_text.contains("authorization:"));
+    assert!(!request_text.contains("cookie:"));
+    let body_offset = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("POST headers terminate")
+        + 4;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request[body_offset..]).expect("POST body is JSON"),
+        json!({"userId": 3, "title": "created title", "body": "created body"})
+    );
+    create_server.join().expect("POST fixture server exits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denies_http_when_authorization_has_no_http_grant() {
     let registry = BrokerProviderRegistry::load(
         [fixture("http-probe-provider.wasm")],

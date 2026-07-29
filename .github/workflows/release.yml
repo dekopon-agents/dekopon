@@ -105,12 +105,15 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           archive="dekopon-${version}-${{ matrix.target }}"
-          mkdir -p "staging/$archive"
+          mkdir -p "staging/$archive/providers"
           cp "target/${{ matrix.target }}/release/dekopon" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-run" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
+          cp examples/providers/jsonplaceholder-provider.wasm "staging/$archive/providers/"
+          cp examples/providers/jsonplaceholder/README.md \
+            "staging/$archive/providers/JSONPLACEHOLDER.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - name: Upload CLI archive

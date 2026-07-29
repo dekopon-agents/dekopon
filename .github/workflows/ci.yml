@@ -41,7 +41,8 @@ jobs:
         run: |
           for manifest in \
             examples/providers/echo/Cargo.toml \
-            examples/providers/http-probe/Cargo.toml
+            examples/providers/http-probe/Cargo.toml \
+            examples/providers/jsonplaceholder/Cargo.toml
           do
             cargo fmt --manifest-path "$manifest" -- --check
             cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
@@ -55,6 +56,7 @@ jobs:
         run: |
           cargo check --locked --manifest-path examples/providers/echo/Cargo.toml --target wasm32-unknown-unknown
           cargo check --locked --manifest-path examples/providers/http-probe/Cargo.toml --target wasm32-unknown-unknown
+          cargo check --locked --manifest-path examples/providers/jsonplaceholder/Cargo.toml --target wasm32-unknown-unknown
       - name: Check HTTP guest bindings for Wasm
         run: cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
       - name: Build documentation

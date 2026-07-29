@@ -19,10 +19,10 @@ fn provider_path() -> PathBuf {
         .join("examples/providers/echo-provider.wasm")
 }
 
-fn http_probe_path() -> PathBuf {
+fn imported_provider_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("examples/providers/http-probe-provider.wasm")
+        .join(format!("examples/providers/{name}"))
 }
 
 fn run(arguments: &[&str]) -> Output {
@@ -64,19 +64,21 @@ fn inspects_the_checked_in_provider_component() {
 
 #[test]
 fn direct_mode_rejects_the_http_importing_provider() {
-    let provider = http_probe_path();
-    let output = run(&[
-        "inspect",
-        "--provider",
-        provider.to_str().expect("UTF-8 fixture path"),
-    ]);
+    for fixture in ["http-probe-provider.wasm", "jsonplaceholder-provider.wasm"] {
+        let provider = imported_provider_path(fixture);
+        let output = run(&[
+            "inspect",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+        ]);
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        stderr(&output).contains("could not instantiate provider component"),
-        "{}",
-        stderr(&output)
-    );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("could not instantiate provider component"),
+            "{}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]

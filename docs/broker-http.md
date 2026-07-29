@@ -8,7 +8,7 @@ The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust
 
 `dekopon-broker` now binds a separately supplied authenticated context to exact principal/actor/capability/provider rules, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
-The versioned local wire format, unprivileged Unix client, and `dekopon-brokerd` process are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. External checkpoint anchoring, credentials, and unprivileged CLI integration remain committed direction.
+The versioned local wire format, unprivileged Unix client, `dekopon-brokerd` process, and JSONPlaceholder demonstration provider are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. External checkpoint anchoring, credentials, and unprivileged CLI integration remain committed direction.
 
 ## Decision
 
@@ -57,7 +57,7 @@ model or direct dekopon-run request
        result + evidence + audit
 ```
 
-The flow from authenticated socket acceptance downward is current; model and direct-runner client integration above it remains future work. External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
+The flow from authenticated socket acceptance downward is current; model and direct-runner client integration above it remains future work. External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. The JSONPlaceholder component exposes `jsonplaceholder.posts.get` as read-only/idempotent and `jsonplaceholder.posts.create` as external-write/non-idempotent. It defaults to the exact production HTTPS origin, accepts only literal loopback HTTP overrides for deterministic tests, validates bounded typed inputs and responses, and still relies on independent exact broker authority/method grants. Automated tests never contact the public service. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
 
 ## Local broker protocol
 
@@ -143,7 +143,7 @@ The behavior lands in reviewable slices without temporarily granting authority t
 5. **Implemented foundation:** add owner-only durable audit persistence, restart verification, checkpoints, and replay-ID restoration.
 6. **Implemented client foundation:** add strict bounded local framing and an unprivileged Unix client with no identity or authorization payload fields.
 7. **Implemented service foundation:** add the authenticated owner-only Unix listener, exact peer-UID context mapping, secure socket lifecycle, bounded concurrency/draining, and broker executable.
-8. Add a JSONPlaceholder demonstration provider with separately named read and write capabilities.
+8. **Implemented demonstration:** add mock-backed JSONPlaceholder post-read and external-write capabilities with exact method/authority policy and audit-redaction tests.
 9. Integrate an unprivileged CLI client, broker-owned credentials, and externally anchored checkpoints before production claims.
 
 Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

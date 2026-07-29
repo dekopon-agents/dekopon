@@ -18,6 +18,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, and drains bounded connections on shutdown.
+- A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet

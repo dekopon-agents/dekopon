@@ -11,6 +11,9 @@ on:
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
       - "examples/providers/http-probe/**"
+      - "examples/providers/http-probe-provider.wasm"
+      - "examples/providers/jsonplaceholder/**"
+      - "examples/providers/jsonplaceholder-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -24,6 +27,9 @@ on:
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
       - "examples/providers/http-probe/**"
+      - "examples/providers/http-probe-provider.wasm"
+      - "examples/providers/jsonplaceholder/**"
+      - "examples/providers/jsonplaceholder-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -84,15 +90,21 @@ jobs:
           cmp \
             crates/dekopon-provider-sdk/wit/provider.wit \
             crates/dekopon-provider-host/wit/provider.wit
-          cmp \
-            crates/dekopon-provider-sdk/wit/provider.wit \
-            examples/providers/http-probe/wit/deps/provider.wit
+          for mirror in \
+            examples/providers/http-probe/wit/deps/provider.wit \
+            examples/providers/jsonplaceholder/wit/deps/provider.wit
+          do
+            cmp crates/dekopon-provider-sdk/wit/provider.wit "$mirror"
+          done
           cmp \
             wit/http/http.wit \
             crates/dekopon-provider-http/wit/deps/http.wit
-          cmp \
-            wit/http/http.wit \
-            examples/providers/http-probe/wit/deps/http.wit
+          for mirror in \
+            examples/providers/http-probe/wit/deps/http.wit \
+            examples/providers/jsonplaceholder/wit/deps/http.wit
+          do
+            cmp wit/http/http.wit "$mirror"
+          done
           wkg build \
             --wit-dir crates/dekopon-provider-sdk/wit \
             --output target/wit-package/dekopon-provider.wasm \
@@ -180,23 +192,26 @@ jobs:
             (.worlds == [])
           ' target/wit-package/dekopon-http.json
 
-      - name: Verify HTTP-importing provider fixture
+      - name: Verify HTTP-importing provider fixtures
         shell: bash
         run: |
           set -euo pipefail
-          component=examples/providers/http-probe-provider.wasm
-          wasm-tools validate "$component"
-          wasm-tools component wit --json "$component" > target/wit-package/http-probe.json
-          jq --exit-status '
-            (.packages | map(.name) == ["dekopon:http@1.0.0", "root:component"]) and
-            (.worlds | length == 1) and
-            (.worlds[0].name == "root") and
-            (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
-            (.interfaces | length == 1) and
-            (.interfaces[0].name == "client") and
-            ((.interfaces[0].functions | keys) == ["send"])
-          ' target/wit-package/http-probe.json
+          for name in http-probe jsonplaceholder; do
+            component="examples/providers/$name-provider.wasm"
+            description="target/wit-package/$name.json"
+            wasm-tools validate "$component"
+            wasm-tools component wit --json "$component" > "$description"
+            jq --exit-status '
+              (.packages | map(.name) == ["dekopon:http@1.0.0", "root:component"]) and
+              (.worlds | length == 1) and
+              (.worlds[0].name == "root") and
+              (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
+              ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
+              (.interfaces | length == 1) and
+              (.interfaces[0].name == "client") and
+              ((.interfaces[0].functions | keys) == ["send"])
+            ' "$description"
+          done
 
       - name: Exercise local wkg publish and fetch
         shell: bash

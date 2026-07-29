@@ -1,0 +1,10 @@
+package dekopon:provider@0.1.0;
+
+/// A minimal JSON-over-WIT contract for experimental read-only providers.
+world provider {
+    /// Returns a JSON-encoded provider manifest.
+    export describe: func() -> string;
+
+    /// Invokes one declared capability and returns a JSON-encoded response.
+    export invoke: func(capability: string, input-json: string) -> string;
+}

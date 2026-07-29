@@ -21,6 +21,7 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Exact deny-by-default broker rules, authenticated-context binding, replay rejection/restoration, digest evidence, and bounded metadata-only in-memory or owner-only durable verified audit chains.
 - Strict versioned length-delimited broker messages and an unprivileged Unix client whose invocation payload cannot carry identity or authority.
 - Unix-only `dekopon-brokerd` with owner-controlled strict configuration, private socket lifecycle, peer-UID context mapping, bounded connections/draining, provider execution, and durable replay restoration.
+- Mock-backed JSONPlaceholder post-read and separately classified external-write capabilities using exact broker HTTP grants.
 
 The broker process is deployable for one local owner-UID trust domain but is not integrated with either unprivileged CLI. It has no credentials or externally anchored checkpoint.
 
@@ -28,10 +29,9 @@ The broker process is deployable for one local owner-UID trust domain but is not
 
 1. Integrate the current unprivileged client while keeping direct `dekopon-run` on its import-free host.
 2. Add external checkpoint storage/verification so valid-prefix audit rollback is detectable outside the broker host.
-3. Add a JSONPlaceholder demonstration provider using narrowly scoped destinations and separately named read and external-write capabilities; keep tests deterministic and mock-backed.
-4. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
-5. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
-6. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
+3. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
+4. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
+5. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
 
 ## Intended package namespace
 

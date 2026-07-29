@@ -16,7 +16,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, Idem
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -59,6 +59,26 @@ fn rule(
     provider: &str,
     constraints: ExecutionConstraints,
 ) -> PolicyRule {
+    rule_with_metadata(
+        principal,
+        capability,
+        provider,
+        EffectKind::ReadOnly,
+        RiskLevel::Low,
+        Idempotency::Idempotent,
+        constraints,
+    )
+}
+
+fn rule_with_metadata(
+    principal: &str,
+    capability: &str,
+    provider: &str,
+    effect: EffectKind,
+    risk: RiskLevel,
+    idempotency: Idempotency,
+    constraints: ExecutionConstraints,
+) -> PolicyRule {
     PolicyRule {
         principal: principal
             .parse::<PrincipalId>()
@@ -74,9 +94,9 @@ fn rule(
         provider: provider
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
-        effect: EffectKind::ReadOnly,
-        risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
+        effect,
+        risk,
+        idempotency,
         constraints,
     }
 }
@@ -369,6 +389,37 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     )
     .expect_err("policy cannot exceed independent host timeout");
     assert!(matches!(error, BrokerBuildError::HostConstraint { .. }));
+
+    let registry = BrokerProviderRegistry::load(
+        [fixture("jsonplaceholder-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("JSONPlaceholder provider fixture loads");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let error = Broker::new(
+        registry,
+        "broker-test"
+            .parse::<PrincipalId>()
+            .expect("valid broker principal"),
+        "policy-test".to_owned(),
+        vec![rule(
+            "caller",
+            "jsonplaceholder.posts.create",
+            "jsonplaceholder",
+            ExecutionConstraints::default(),
+        )],
+        audit,
+        BrokerLimits::default(),
+    )
+    .expect_err("external-write metadata cannot be downgraded to read-only");
+    assert!(matches!(
+        error,
+        BrokerBuildError::CapabilityMetadataMismatch {
+            field: "effect",
+            ..
+        }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -452,4 +503,125 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     ] {
         assert!(!serialized.contains(secret), "audit leaked {secret}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_content() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("jsonplaceholder-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("JSONPlaceholder provider fixture loads");
+    let response_body = br#"{"userId":3,"id":101,"title":"private title","body":"private body"}"#;
+    let response = format!(
+        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(),
+        String::from_utf8_lossy(response_body)
+    );
+    let (authority, received, server) = mock_http(response.as_bytes());
+    let constraints = ExecutionConstraints {
+        timeout_ms: 5_000,
+        max_output_bytes: 1024 * 1024,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec![authority.clone()],
+            allowed_methods: vec!["POST".to_owned()],
+            max_requests: 1,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+        }),
+    };
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        "broker-test"
+            .parse::<PrincipalId>()
+            .expect("valid broker principal"),
+        "policy-jsonplaceholder".to_owned(),
+        vec![rule_with_metadata(
+            "caller",
+            "jsonplaceholder.posts.create",
+            "jsonplaceholder",
+            EffectKind::ExternalWrite,
+            RiskLevel::Medium,
+            Idempotency::NonIdempotent,
+            constraints,
+        )],
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("external-write rule exactly matches trusted provider metadata");
+    let available = broker.capabilities(&context("caller"));
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
+    assert_eq!(available[0].capability.risk, RiskLevel::Medium);
+    assert_eq!(
+        available[0].capability.idempotency,
+        Idempotency::NonIdempotent
+    );
+    let read = broker
+        .invoke(
+            &context("caller"),
+            request(
+                "invoke-json-read-with-write-rule",
+                "jsonplaceholder.posts.get",
+                json!({
+                    "postId": 7,
+                    "endpoint": format!("http://{authority}")
+                }),
+            ),
+        )
+        .await
+        .expect("ungranted read is denied and audited");
+    assert_eq!(read.outcome, dekopon_capability::InvocationOutcome::Denied);
+    assert_eq!(read.error.as_deref(), Some("policy-denied"));
+
+    let result = broker
+        .invoke(
+            &context("caller"),
+            request(
+                "invoke-json-write",
+                "jsonplaceholder.posts.create",
+                json!({
+                    "userId": 3,
+                    "title": "private title",
+                    "body": "private body",
+                    "endpoint": format!("http://{authority}")
+                }),
+            ),
+        )
+        .await
+        .expect("authorized JSONPlaceholder write succeeds");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    assert_eq!(
+        result.output.as_ref().expect("write returns output")["post"]["id"],
+        101
+    );
+    let wire = received.recv().expect("fixture POST recorded");
+    assert!(wire.starts_with(b"POST /posts HTTP/1.1\r\n"));
+    let body_offset = wire
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("POST headers terminate")
+        + 4;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
+        json!({"userId": 3, "title": "private title", "body": "private body"})
+    );
+    server.join().expect("fixture server exits");
+
+    let records = audit.records().await;
+    assert_eq!(records.len(), 3);
+    verify_audit_chain(&records).expect("audit chain verifies");
+    let serialized = serde_json::to_string(&records).expect("audit serializes");
+    assert!(serialized.contains(&authority));
+    assert!(serialized.contains("external-write"));
+    assert!(serialized.contains("POST"));
+    assert!(!serialized.contains("private title"));
+    assert!(!serialized.contains("private body"));
+    assert!(!serialized.contains("/posts"));
 }
