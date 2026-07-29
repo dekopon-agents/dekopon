@@ -11,12 +11,14 @@ A capability name in an agent spec permits the agent to propose that operation. 
 ## Security-relevant stages
 
 1. **Model proposal** — untrusted model output names a capability and supplies untrusted arguments in a `ProposedInvocation`.
-2. **Authorization decision** — the privileged broker authenticates the message envelope, resolves the actor and workload, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation`.
-3. **External effect** — a narrow provider executes only the authorized capability using broker-held credentials and enforced constraints.
+2. **Authorization decision** — the privileged broker authenticates the message envelope, resolves the actor and workload, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation` inside its execution boundary.
+3. **External effect** — the broker consumes that authorization state while a narrow provider executes only the authorized capability using broker-held credentials and enforced constraints.
 4. **Evidence** — policy decisions and provider execution produce digests or bounded records that support later verification.
 5. **Audit record** — the broker links proposal, trusted identity, policy revision, authorization receipt, effect outcome, and evidence under an invocation and trace ID.
 
-Rust's private `AuthorizedInvocation` fields make accidental in-process fabrication harder. This is defense in depth only. The real authority boundary depends on separate processes, authenticated requests, policy enforcement, isolated credentials, provider sandboxing, and durable audit integrity.
+The daemon-to-broker request carries a proposal in an authenticated envelope, not an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopond`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
+
+Rust's private `AuthorizedInvocation` fields and intentional absence of deserialization make accidental in-process fabrication harder. This is defense in depth only. The real authority boundary depends on separate processes, authenticated and replay-resistant requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and durable audit integrity.
 
 ## Trust boundaries
 
