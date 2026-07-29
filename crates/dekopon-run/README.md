@@ -16,6 +16,9 @@ cargo run -p dekopon-run -- inspect \
 cargo run -p dekopon-run -- invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{"message":"hello"}'
+cargo run -p dekopon-run -- invoke \
+  --provider examples/providers/echo-provider.wasm \
+  echo.reverse --input '{"message":"stressed"}'
 ```
 
 ChatGPT subscription mode uses OpenAI's device authorization and Codex Responses transport directly; it does not import credentials from pi, OpenClaw, or the Codex CLI. This remains an experimental development runner, not a daemon or authorization broker. It rejects local and external provider writes and does not resolve provider credentials. See [`../../docs/run.md`](../../docs/run.md) for the full contract.

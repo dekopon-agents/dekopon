@@ -23,12 +23,16 @@ cargo run -p dekopon-run -- invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{"message":"hello"}'
 
+cargo run -p dekopon-run -- invoke \
+  --provider examples/providers/echo-provider.wasm \
+  echo.ransom-case --input '{"message":"Hello, World!"}'
+
 time target/release/dekopon-run invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{"message":"hello"}' --repeat 100
 ```
 
-`invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final output. Shell `time` also includes process startup and component compilation.
+The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final output. Shell `time` also includes process startup and component compilation.
 
 ## Prompt mode
 

@@ -35,6 +35,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-features
+      - name: Lint and test Rust provider example
+        env:
+          CARGO_TARGET_DIR: target/provider-example-native
+        run: |
+          cargo clippy --locked --manifest-path examples/providers/echo/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path examples/providers/echo/Cargo.toml
       - name: Install Rust provider target
         run: rustup target add wasm32-unknown-unknown
       - name: Check Rust provider example
@@ -115,6 +121,8 @@ jobs:
             "$bin" auth chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
           "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
+          "$runner" invoke --provider "$provider" echo.ransom-case \
+            --input '{"message":"Hello, World!"}' >/dev/null
       - name: Verify invalid configuration exit behavior
         shell: bash
         run: |

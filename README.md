@@ -64,6 +64,9 @@ cargo run -p dekopon-run -- inspect \
 cargo run -p dekopon-run -- invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{"message":"hello"}'
+cargo run -p dekopon-run -- invoke \
+  --provider examples/providers/echo-provider.wasm \
+  echo.ransom-case --input '{"message":"Hello, World!"}'
 cargo run -p dekopon-run -- --trace trace.json invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{}'

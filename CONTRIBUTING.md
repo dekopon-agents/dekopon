@@ -26,6 +26,7 @@ Exercise the affected executable before submitting a CLI, config, or provider-ho
 ```console
 cargo run -p dekopon -- --config examples/local/dekopon.yaml validate
 cargo run -p dekopon -- --config examples/local/dekopon.yaml get agents
+cargo test --locked --manifest-path examples/providers/echo/Cargo.toml
 cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.wasm
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
