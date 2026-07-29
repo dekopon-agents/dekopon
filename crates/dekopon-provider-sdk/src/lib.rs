@@ -180,7 +180,9 @@ pub fn __invoke<P: Provider>(capability: String, input_json: String) -> String {
     })
 }
 
-/// Exports a Rust [`Provider`] implementation as the Dekopon WIT world.
+/// Exports a Rust [`Provider`] implementation as the import-free Dekopon WIT world.
+///
+/// Provider crates with additional imports use [`export_provider_with_bindings!`] instead.
 #[macro_export]
 macro_rules! export_provider {
     ($provider:ty) => {
@@ -201,6 +203,36 @@ macro_rules! export_provider {
 
         $crate::__wit::export!(
             __DekoponProviderComponent with_types_in $crate::__wit
+        );
+    };
+}
+
+/// Exports a Rust [`Provider`] implementation through caller-generated world bindings.
+///
+/// The bindings module must be an identifier that describes a world with the same root `describe`
+/// and `invoke` exports. It may add explicitly versioned imports such as
+/// `dekopon:http/client@1.0.0`. Imports remain structural requirements; only a broker host can
+/// grant and implement them.
+#[macro_export]
+macro_rules! export_provider_with_bindings {
+    ($provider:ty, $bindings:ident) => {
+        struct __DekoponProviderComponent;
+
+        impl $bindings::Guest for __DekoponProviderComponent {
+            fn describe() -> ::std::string::String {
+                $crate::__describe::<$provider>()
+            }
+
+            fn invoke(
+                capability: ::std::string::String,
+                input_json: ::std::string::String,
+            ) -> ::std::string::String {
+                $crate::__invoke::<$provider>(capability, input_json)
+            }
+        }
+
+        $bindings::export!(
+            __DekoponProviderComponent with_types_in $bindings
         );
     };
 }

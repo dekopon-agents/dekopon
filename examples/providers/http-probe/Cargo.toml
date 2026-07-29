@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "dekopon-http-probe-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dekopon-provider-http = { path = "../../../crates/dekopon-provider-http" }
+dekopon-provider-sdk = { path = "../../../crates/dekopon-provider-sdk" }
+serde_json = "1.0.151"
+wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }

@@ -36,7 +36,7 @@ cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
-The Rust echo provider is excluded from the root workspace and has its own lockfile. Provider changes require its separate format, Clippy, test, and `wasm32-unknown-unknown` checks. If provider source or the guest contract changes, regenerate—not hand-edit—`examples/providers/echo-provider.wasm`. Exact commands are in [`docs/development.md`](docs/development.md).
+Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—`examples/providers/echo-provider.wasm`. Exact commands are in [`docs/development.md`](docs/development.md).
 
 ## Change guidelines
 
