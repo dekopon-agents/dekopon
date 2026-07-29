@@ -1,0 +1,28 @@
+[package]
+name = "dekopon-broker-host"
+description = "Broker-owned bounded asynchronous WebAssembly provider host for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-broker-host"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "http", "sandbox"]
+categories = ["wasm", "web-programming::http-client"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+dekopon-http-host.workspace = true
+dekopon-provider-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wasmtime = { workspace = true, features = ["async"] }
+
+[lints]
+workspace = true

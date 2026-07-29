@@ -190,6 +190,7 @@ jobs:
           publish dekopon-provider-http
           publish dekopon-provider-host
           publish dekopon-http-host
+          publish dekopon-broker-host
           publish dekopon-protocol
           publish dekopon-config
           publish dekopon-run

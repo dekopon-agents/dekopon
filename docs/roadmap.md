@@ -11,14 +11,25 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Experimental Rust provider SDK and import-free Wasmtime component host.
 - One-shot direct invocation, OpenAI-compatible and ChatGPT/Codex subscription prompt tools, isolated device login, timing reports, and Chrome trace export for read-only provider computation.
 
+## 0.2 — privileged host foundation (in development)
+
+- Immutable buffered `dekopon:http@1.0.0` WIT package and statically compiled Rust guest facade.
+- Caller-generated provider worlds plus a checked-in HTTP-importing component that the immediate runner rejects.
+- Exact per-invocation HTTP authorization constraints beneath independent native ceilings.
+- Statically linked HTTP engine with bounded buffers, DNS/IP and redirect controls, and sanitized evidence metadata.
+- Asynchronous broker component-host library with one shared Wasmtime engine, compiled components, fresh bounded stores, Tokio host calls, and a single-use `AuthorizedInvocation` public execution boundary.
+
+These libraries are not a deployable broker and are not reachable from an operator command.
+
 ## Next milestones
 
-1. Define an authenticated local daemon protocol and add an unprivileged `dekopond` catalog/task service without external-write authority.
-2. Build a separately deployed broker prototype with policy decisions, constrained authorization receipts, evidence, and append-only audit records.
-3. Integrate the implemented buffered `dekopon:http@1.0.0` native engine with an async component host and one broker-mediated read-only provider using narrowly scoped destinations, authenticated identity, and evidence before enabling separately named external-write capabilities.
-4. Introduce Cedar policy only after authorization inputs and explainability requirements are proven by the broker prototype.
-5. Build the broker-owned asynchronous component host around the native HTTP engine with a shared Wasmtime engine, compiled components, fresh bounded stores, Tokio-integrated host calls, and import-free direct runner execution.
-6. Add identity, model, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
+1. Define a bounded authenticated local broker protocol with peer identity and replay protection.
+2. Build a separately deployed broker prototype with deny-by-default policy decisions, constrained authorization issuance, provider execution, public evidence, and hash-linked append-only audit records.
+3. Add an unprivileged broker client while keeping direct `dekopon-run` on its import-free host.
+4. Add a JSONPlaceholder demonstration provider using narrowly scoped destinations and separately named read and external-write capabilities; keep tests deterministic and mock-backed.
+5. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
+6. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
+7. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
 
 ## Intended package namespace
 
