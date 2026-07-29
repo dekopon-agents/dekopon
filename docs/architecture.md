@@ -72,7 +72,9 @@ A model-facing tool call is only a proposal. The broker owns the authority trans
 
 ## Immediate isolation and planned provider authority
 
-The immediate host establishes a small current subset of the planned mechanism: component-model providers run in Wasmtime, components compile once per process, and each description or invocation gets a fresh store with explicit fuel, time, memory, input, and output limits. An empty linker is the authority boundary: no filesystem, network, clock, random, environment, credential, or other host function is available to the guest.
+The immediate host establishes a small current subset of the planned mechanism: component-model providers run in Wasmtime, each `ProviderRegistry` retains its compiled components in memory, and each description or invocation gets a fresh store and instance with explicit fuel, time, memory, input, and output limits. There is no cross-process or on-disk compilation cache. A shared runtime mutex serializes component execution. An empty linker is the authority boundary: no filesystem, network, clock, random, environment, credential, or other host function is available to the guest.
+
+Capability JSON Schemas are exposed to models and must be object-shaped, but the host is not a general JSON Schema validator. Providers validate their operation-specific fields. Immediate success output remains raw JSON rather than an authorized invocation, broker evidence, or an audit record.
 
 Model authentication terminates in the model client, separately from provider authority. ChatGPT subscription mode owns a distinct device-flow credential file, refreshes tokens only against OpenAI's fixed authentication host, and sends inference only to the fixed Codex Responses host. It does not import another application's token store or expose model credentials to a component.
 

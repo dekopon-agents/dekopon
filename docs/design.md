@@ -23,7 +23,7 @@ Success does not mean making a model trustworthy. Success means containing an un
 1. **A proposal is not authority.** A model, agent, repository, or tool payload may create a `ProposedInvocation`; only the broker may create an `AuthorizedInvocation`.
 2. **Capabilities are explicit and narrow.** Read authority does not imply write authority. Every external write requires a specifically named capability.
 3. **Identity comes from a trusted envelope.** Model text and repository content cannot assert a trusted `Actor`, principal, or workload identity.
-4. **Credentials belong to the broker boundary.** Agents, prompts, authored resources, normal logs, and evidence records must not contain provider credentials.
+4. **Provider credentials belong to the broker boundary.** Agents, prompts, authored resources, normal logs, and evidence records must not contain provider credentials. Model-endpoint credentials terminate inside the selected model client and never enter provider components.
 5. **Authorization is bound to execution.** A grant carries the proposal, policy decision, execution constraints, and receipt needed to prevent a provider host from executing a different or broader operation.
 6. **Effects produce evidence and audit linkage.** Proposal, identity, decision, policy revision, execution outcome, and evidence must remain correlatable by invocation and trace identifiers.
 7. **External-write authority requires process isolation.** Once writes exist, orchestration and broker authority run in separate processes and deployment units.
@@ -248,7 +248,8 @@ If authority ownership is unclear, stop and update the design before adding code
 
 - [`security-model.md`](security-model.md) — trust assumptions, threat boundaries, and limitations.
 - [`architecture.md`](architecture.md) — current crate structure and planned deployment topology.
-- [`cli.md`](cli.md) — current catalog operator contract, discovery, output, and exit codes.
+- [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
+- [`cli.md`](cli.md) — current catalog and model-auth operator contract, discovery, output, and exit codes.
 - [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
 - [`roadmap.md`](roadmap.md) — implementation sequence and deliberately deferred scope.
 - [`README.md`](README.md) — documentation map and task-based reading guide.

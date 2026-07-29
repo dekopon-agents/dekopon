@@ -57,11 +57,13 @@ The separate experimental `dekopon-run` path can contact an operator-selected Op
 - provider manifests are strictly decoded and may declare only `read-only` capabilities;
 - duplicate provider and capability IDs are rejected before model interaction;
 - model-selected function names map only to the offered capability registry and arguments must be JSON objects;
-- every description and invocation uses a fresh Wasmtime store with memory, fuel, wall-clock, input, and output limits;
+- capability schemas constrain model-facing tool declarations but are not generally enforced by the host, so providers must validate operation-specific input;
+- every description and invocation uses a fresh Wasmtime store with memory, fuel, wall-clock, input, and output limits; component calls are currently serialized;
 - the component linker exposes no WASI or custom imports, so guests receive no filesystem, network, clock, random, environment, credential, or external-read authority;
 - an optional model bearer token is read from a named environment variable and sent only to the selected compatible endpoint;
 - `dekopon auth chatgpt` uses OpenAI's Codex device flow and stores refreshable credentials in a Dekopon-owned file (`0600` on Unix); the shared model client fixes authentication and inference hosts to `auth.openai.com` and `chatgpt.com` and never imports credentials from pi, OpenClaw, or Codex;
 - model credentials and opaque encrypted reasoning replay data are not exposed to components, output, or trace fields;
+- immediate success output is raw untrusted JSON, not broker evidence, an authorization receipt, or an `InvocationResult`;
 - immediate tool calls are not `AuthorizedInvocation` values and cannot be used for local or external writes.
 
 Chrome trace fields omit prompts, model responses, component input/output, and bearer tokens. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
