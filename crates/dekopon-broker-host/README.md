@@ -8,7 +8,7 @@ Unlike `dekopon-provider-host`, this crate is privileged machinery. Its public i
 
 `BrokerProviderRegistry` compiles configured components once, validates their manifests, and builds deterministic capability routes. Every description or invocation gets a fresh store and component instance. Stores have per-memory size, memory/table/instance count, table-element, fuel, input, output, and wall-clock ceilings. Wasm execution yields on bounded fuel intervals so Tokio deadlines can cancel computation without a process-wide epoch interrupt or global execution mutex.
 
-The linker exposes only `dekopon:http@1.0.0`; generic WASI and unknown imports fail before execution. Provider description is linked so an HTTP-importing component can instantiate, but any host call during `describe` rejects the component. Invocation requires an `AuthorizedInvocation`; an absent HTTP constraint supplies no HTTP authority.
+The linker exposes only `dekopon:http@1.0.0`; generic WASI and unknown imports fail before execution. Provider description is linked so an HTTP-importing component can instantiate, but any host call during `describe` rejects the component. Invocation requires an `AuthorizedInvocation`; its provider must match the trusted capability route, and an absent HTTP constraint supplies no HTTP authority.
 
 ## Buffered HTTP enforcement
 

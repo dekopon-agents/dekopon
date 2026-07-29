@@ -21,7 +21,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     redirect,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 
@@ -173,8 +173,8 @@ pub enum ConfigurationError {
 }
 
 /// Sanitized metadata for one attempted native request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpCallEvidence {
     /// HTTP method selected by the provider.
     pub method: String,

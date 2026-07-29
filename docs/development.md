@@ -28,6 +28,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, and loopback tests |
+| Broker policy, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline hash-chain/context tests plus `crates/dekopon-broker/tests/broker.rs` exact-policy and redaction tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
@@ -110,7 +111,9 @@ Privileged host foundation:
 - `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation.
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
-- The component host has no credential resolver and no workspace executable invokes it yet. Direct `dekopon-run` remains on the independent empty-linker host.
+- `dekopon-broker` validates exact trusted rules against loaded routes and host ceilings, reserves invocation IDs before policy evaluation, creates single-use authorization, and audits only metadata/digests.
+- Its `AuthenticatedContext` is a transport input, not authentication; its replay ledger and in-memory hash chain do not survive process restart.
+- The component host has no credential resolver and no workspace executable invokes the broker core yet. Direct `dekopon-run` remains on the independent empty-linker host.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
 
@@ -140,7 +143,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --exclude dekopon-testkit --locked
 ```
 
-The immediate and broker host packages intentionally exclude their repository-only component integration fixtures, so Cargo may warn that `tests/host.rs` is not included in each published package.
+The immediate host, broker host, and broker-core packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs` or `tests/broker.rs` is not included in the published package.
 
 ### Provider example workspaces
 
@@ -164,6 +167,7 @@ wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
+cargo test -p dekopon-broker --locked
 cargo test -p dekopon-run --test cli --locked
 ```
 

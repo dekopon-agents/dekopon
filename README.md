@@ -2,7 +2,7 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
 
-> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, provider host I/O, or external effects. The workspace contains a privileged component-host library, but no broker process or operator command exposes it.
+> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, provider host I/O, or external effects. The workspace contains a privileged component-host and exact-policy/audit core, but no authenticated broker process or operator command exposes them.
 
 ## Design documentation
 
@@ -16,12 +16,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
-- A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, and asynchronous broker component-host library tested against loopback fixtures; no current process or operator command exposes that privileged path.
+- A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, and deny-by-default authorization/evidence/audit core tested against loopback fixtures; no current process or operator command exposes that privileged path.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet
 
-There is no daemon, authenticated network API, policy engine, credential broker service, broker executable, task store, or agent memory. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+There is no daemon, authenticated network API, credential broker service, broker executable, durable audit store, task store, or agent memory. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
@@ -77,7 +77,7 @@ Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at
 
 ## Security model
 
-A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. The broker component-host library consumes constrained authorization state, but no current service authenticates callers or creates that state. `dekopon-run` does not create authorized invocations: it executes only import-free components declaring `read-only` and performs no provider external effects.
+A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. The broker core can create constrained authorization only from a separately supplied authenticated context and exact trusted rule, but no current service establishes that context or exposes execution. `dekopon-run` does not create authorized invocations: it executes only import-free components declaring `read-only` and performs no provider external effects.
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
 

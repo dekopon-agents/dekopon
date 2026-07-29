@@ -440,6 +440,19 @@ impl BrokerProviderRegistry {
         })
     }
 
+    /// Validates one policy grant against the component host's independent ceilings.
+    pub fn validate_constraints(
+        &self,
+        constraints: &ExecutionConstraints,
+    ) -> Result<(), BrokerHostError> {
+        let runtime = &self
+            .providers
+            .first()
+            .expect("a registry is constructed with at least one provider")
+            .runtime;
+        validate_authorized_constraints(constraints, &runtime.limits)
+    }
+
     /// Consumes one broker-authorized proposal through its trusted capability route.
     pub async fn invoke(
         &self,
@@ -453,7 +466,15 @@ impl BrokerProviderRegistry {
             .ok_or_else(|| BrokerHostError::UnknownCapability {
                 capability: proposal.capability.clone(),
             })?;
-        self.providers[provider_index]
+        let provider = &self.providers[provider_index];
+        if &provider.manifest.id != authorized.provider() {
+            return Err(BrokerHostError::AuthorizedProviderMismatch {
+                capability: proposal.capability.clone(),
+                authorized: authorized.provider().clone(),
+                routed: provider.manifest.id.clone(),
+            });
+        }
+        provider
             .invoke(
                 &proposal.capability,
                 &proposal.input,
@@ -739,6 +760,18 @@ pub enum BrokerHostError {
     UnknownCapability {
         /// Capability ID.
         capability: CapabilityId,
+    },
+    /// Authorization selected a different provider than the trusted route.
+    #[error(
+        "authorization selected provider {authorized} for {capability}, but route selects {routed}"
+    )]
+    AuthorizedProviderMismatch {
+        /// Capability.
+        capability: CapabilityId,
+        /// Provider bound into authorization.
+        authorized: ProviderId,
+        /// Provider selected by the loaded route.
+        routed: ProviderId,
     },
     /// Selected provider did not implement the routed capability.
     #[error("broker provider {provider} does not implement capability {capability}")]

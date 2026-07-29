@@ -18,13 +18,14 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Exact per-invocation HTTP authorization constraints beneath independent native ceilings.
 - Statically linked HTTP engine with bounded buffers, DNS/IP and redirect controls, and sanitized evidence metadata.
 - Asynchronous broker component-host library with one shared Wasmtime engine, compiled components, fresh bounded stores, Tokio host calls, and a single-use `AuthorizedInvocation` public execution boundary.
+- Exact deny-by-default broker rules, authenticated-context binding, process-lifetime replay rejection, digest evidence, and a bounded metadata-only verifiable in-memory audit chain.
 
 These libraries are not a deployable broker and are not reachable from an operator command.
 
 ## Next milestones
 
-1. Define a bounded authenticated local broker protocol with peer identity and replay protection.
-2. Build a separately deployed broker prototype with deny-by-default policy decisions, constrained authorization issuance, provider execution, public evidence, and hash-linked append-only audit records.
+1. Define a bounded authenticated local broker protocol with peer identity, secure socket ownership, and replay recovery.
+2. Build a separately deployed broker process around the current core with durable hash-linked audit records and restart validation.
 3. Add an unprivileged broker client while keeping direct `dekopon-run` on its import-free host.
 4. Add a JSONPlaceholder demonstration provider using narrowly scoped destinations and separately named read and external-write capabilities; keep tests deterministic and mock-backed.
 5. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
@@ -36,7 +37,6 @@ These libraries are not a deployable broker and are not reachable from an operat
 `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-agent`
-- `dekopon-broker`
 - `dekopon-policy`
 - `dekopon-identity`
 - `dekopon-context`
