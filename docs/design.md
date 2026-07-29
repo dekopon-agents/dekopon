@@ -75,7 +75,7 @@ untrusted model/repository content
                 evidence + audit
 ```
 
-The broker owns the only authority transition in this flow. Rust visibility is useful defense in depth, but the actual control comes from authentication, process isolation, policy, credential separation, and enforcement at the provider host.
+The broker owns the only authority transition in this flow. The authenticated request into the broker carries a proposal and trusted envelope context, not an authorized bearer grant. `AuthorizedInvocation` is created and consumed inside the broker-owned execution boundary; `dekopond` never receives it or presents its serialized representation as authority. Rust visibility and the absence of deserialization are useful defense in depth, but the actual control comes from authentication, process isolation, policy, credential separation, binding authorization to execution, and enforcement at the provider host.
 
 ## Component boundaries
 
@@ -196,12 +196,12 @@ dekopond              unprivileged orchestration and model interaction
       v
 dekopon-brokerd       policy, credentials, provider execution, effects
       |
-      | constrained invocation
+      | broker-owned constrained host call
       v
 Wasm provider          one narrow integration operation
 ```
 
-The agent and broker will run as separate processes and separate pods. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
+The agent and broker will run as separate processes and separate pods. `dekopond` sends authenticated proposal envelopes and receives results; it does not receive or relay an `AuthorizedInvocation` as a wire grant. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
 
 Wasmtime now supports meaningful, tested immediate-mode component execution with no host imports. This does not implement the broker deployment or privileged provider contract. Tokio and Cedar remain deferred until asynchronous host calls and stable authorization inputs justify them.
 

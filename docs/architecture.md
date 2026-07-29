@@ -68,7 +68,7 @@ dekopon
 
 `dekopond` will be unprivileged. The agent and broker will be separate processes and separate pods once any external-write authority exists. Authenticated, replay-resistant message envelopes will carry principal and workload identity across that boundary.
 
-A model-facing tool call is only a proposal. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`; it evaluates policy, attaches constraints, invokes a provider, and records evidence. Agent code never receives raw provider credentials.
+A model-facing tool call is only a proposal. The authenticated daemon-to-broker request carries that proposal and trusted envelope context, not an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`; it creates and consumes that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopond` never receives or presents serialized authorization state as a bearer grant, and agent code never receives raw provider credentials.
 
 ## Immediate isolation and planned provider authority
 

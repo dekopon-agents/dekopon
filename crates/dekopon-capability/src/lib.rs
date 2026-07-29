@@ -3,7 +3,8 @@
 //! The central API distinction is between [`ProposedInvocation`] and
 //! [`AuthorizedInvocation`]. A model-facing tool call can create only the former. The
 //! latter has private fields and can be produced only by the broker-oriented transition
-//! in this crate.
+//! in this crate. The broker-owned execution boundary creates and consumes this state;
+//! its serialized representation is inert audit/evidence data, not transferable authority.
 //!
 //! ```compile_fail
 //! use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints, ProposedInvocation};
@@ -15,6 +16,19 @@
 //!         receipt: todo!(),
 //!         constraints,
 //!     };
+//! }
+//! ```
+//!
+//! Serialized authorization state cannot be decoded into executable authority:
+//!
+//! ```compile_fail
+//! use dekopon_capability::AuthorizedInvocation;
+//! use serde::de::DeserializeOwned;
+//!
+//! fn require_deserializable<T: DeserializeOwned>() {}
+//!
+//! fn main() {
+//!     require_deserializable::<AuthorizedInvocation>();
 //! }
 //! ```
 //!
@@ -212,9 +226,10 @@ impl AuthorizationReceipt {
 
 /// An invocation for which a broker has explicitly granted authority.
 ///
-/// Private fields prevent accidental conversion from an untrusted proposal. This type is
-/// serializable for evidence and future broker responses, but intentionally is not
-/// deserializable in `0.1.0`.
+/// Private fields prevent accidental conversion from an untrusted proposal. The
+/// broker-owned execution boundary creates and consumes this type. It is serializable as
+/// inert data for future broker-owned audit and evidence recording, but its serialized form
+/// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
@@ -433,18 +448,43 @@ mod tests {
     }
 
     #[test]
-    fn authorized_invocation_is_evidence_serializable() {
+    fn authorized_invocation_serialization_preserves_linkage() {
+        let constraints = ExecutionConstraints {
+            allowed_hosts: vec!["api.github.com".to_owned()],
+            ..ExecutionConstraints::default()
+        };
         let authorized = broker::test_gate()
             .authorize(
                 proposal(),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
                 "policy-1".to_owned(),
-                ExecutionConstraints::default(),
+                constraints,
             )
             .expect("valid broker decision");
         let value = serde_json::to_value(authorized).expect("authorization serializes");
 
-        assert_eq!(value["receipt"]["decisionId"], "decision-1");
+        assert_eq!(
+            value,
+            json!({
+                "proposal": {
+                    "id": "invoke-1",
+                    "capability": "github.pull-request.comment",
+                    "actor": {"type": "agent", "agent": "reviewer"},
+                    "trace": "trace-1",
+                    "input": {"body": "Looks good"}
+                },
+                "receipt": {
+                    "decisionId": "decision-1",
+                    "authorizedBy": "broker",
+                    "policyRevision": "policy-1"
+                },
+                "constraints": {
+                    "timeoutMs": 30_000,
+                    "maxOutputBytes": 1_048_576,
+                    "allowedHosts": ["api.github.com"]
+                }
+            })
+        );
     }
 }
