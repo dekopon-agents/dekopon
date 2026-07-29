@@ -11,7 +11,7 @@ dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> |
 dekopon auth chatgpt <login | status | logout>
 ```
 
-All commands compile each component once. Description and invocation calls receive a fresh Wasmtime store with configured memory, fuel, wall-clock, input, and output limits. Repeating `--provider` creates one deterministic capability registry; duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`.
+Each command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`.
 
 The checked-in Rust echo provider is immediately runnable:
 
@@ -32,7 +32,7 @@ time target/release/dekopon-run invoke \
   echo.echo --input '{"message":"hello"}' --repeat 100
 ```
 
-The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final output. Shell `time` also includes process startup and component compilation.
+The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final raw JSON output. That output is not broker evidence or an `InvocationResult`. Shell `time` also includes process startup and component compilation.
 
 ## Prompt mode
 
@@ -49,7 +49,7 @@ cargo run -p dekopon-run -- prompt \
   'Use the echo tool with the message hello'
 ```
 
-Provider capability IDs are converted into deterministic OpenAI-compatible function names. Model arguments remain untrusted JSON, can select only offered capabilities, and are checked against the host's object-input requirement before invocation. Tool results are returned to the model until it emits final text or `--max-steps` is reached. A single model turn is capped at 32 tool calls to bound adversarial endpoint fan-out.
+Provider capability IDs are converted into deterministic OpenAI-compatible function names. Model arguments remain untrusted JSON, can select only offered capabilities, and are checked against the host's object-input requirement before invocation. Capability schemas are sent to the model, but the host does not perform general JSON Schema validation; each provider must validate its own required fields, types, and operation-specific constraints. Tool results are returned to the model until it emits final text or `--max-steps` is reached. A single model turn is capped at 32 tool calls to bound adversarial endpoint fan-out.
 
 For authenticated endpoints, `--api-key-env <NAME>` names an environment variable read as a bearer token; it defaults to `OPENAI_API_KEY`. The token is never sent to a provider or recorded as a tracing field, HTTP redirects are disabled, and bearer tokens require HTTPS except for loopback HTTP endpoints.
 
@@ -99,7 +99,7 @@ world provider {
 
 The strings carry strict typed manifest and response JSON. This keeps the first WIT surface deliberately small while the Rust trait and wire model stabilize.
 
-Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT metadata. The echo-provider README contains exact commands. A `wasm32-wasip2` build imports WASI and will be rejected because this host intentionally links no guest imports.
+Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT metadata. The echo provider is a separate Cargo workspace, and its checked-in component is generated rather than hand-edited. The [echo-provider README](../examples/providers/echo/README.md) and [`development.md`](development.md) contain exact build and validation commands. A `wasm32-wasip2` build imports WASI and will be rejected because this host intentionally links no guest imports.
 
 ## Tracing and limits
 

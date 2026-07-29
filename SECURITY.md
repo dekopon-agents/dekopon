@@ -14,4 +14,8 @@ Maintainers will acknowledge a report when a human is available, assess scope, c
 
 ## Scope notes
 
-The `0.1.0` CLI parses local operator-provided files and performs no model interaction, provider execution, credential access, or network daemon communication. Future broker and provider-host components will materially expand the threat model; their introduction must include dedicated review and updated documentation.
+The current `0.1.x` code has two CLI surfaces. `dekopon` reads local operator-provided catalogs and manages an isolated ChatGPT/Codex model login. The experimental `dekopon-run` can contact an operator-selected model endpoint and execute bounded, import-free, read-only Wasm components. It has no broker authority, provider credentials, provider host I/O, provider external-read authority, or local/external-write path.
+
+Model credentials stay in the selected model client and never enter provider components. Dekopon does not import OAuth material from other applications. See [`docs/security-model.md`](docs/security-model.md) for current trust boundaries and limitations.
+
+Future daemons, policy, broker credentials, privileged provider host calls, evidence, and external effects will materially expand the threat model; their introduction requires dedicated review and updated documentation.

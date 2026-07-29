@@ -2,11 +2,11 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
 
-> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, host I/O, or external effects.
+> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, provider host I/O, or external effects.
 
 ## Design documentation
 
-Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/README.md`](docs/README.md) provides task-based reading paths for humans and coding agents; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
+Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
 ## What works today
 
