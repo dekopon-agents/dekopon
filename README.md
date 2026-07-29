@@ -36,7 +36,7 @@ dekopon version
 dekopon-run --version
 ```
 
-The crates.io release is prepared but publication requires explicit maintainer authorization. Until it is published, install from the repository as shown above.
+The `0.1.0` crates are published. The workspace now targets the `0.2.0` development line; install from the repository as shown above until that release is cut.
 
 ## Run the example
 

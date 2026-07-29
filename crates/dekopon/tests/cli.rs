@@ -219,5 +219,8 @@ fn version_does_not_require_configuration() {
         .expect("CLI process starts");
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(stdout(&output), "dekopon 0.1.0\n");
+    assert_eq!(
+        stdout(&output),
+        format!("dekopon {}\n", env!("CARGO_PKG_VERSION"))
+    );
 }
