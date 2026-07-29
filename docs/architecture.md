@@ -4,7 +4,7 @@ Read [`design.md`](design.md) first for the product model and accepted invariant
 
 ## Published baseline and current 0.2 foundation
 
-The published `0.1.0` baseline has two deliberately separate synchronous execution surfaces. The current `0.2.0` development line adds privileged asynchronous host and authorization/evidence/audit libraries without yet adding an authenticated broker process or operator-facing path.
+The published `0.1.0` baseline has two deliberately separate synchronous execution surfaces. The current `0.2.0` development line adds privileged asynchronous host, authorization/evidence/audit libraries, and a separately deployed authenticated Unix broker. Neither unprivileged CLI integrates with that broker yet.
 
 The operator CLI retains its local catalog path:
 
@@ -36,7 +36,7 @@ dekopon-run
   -> create a fresh bounded Wasmtime store for every component call
 ```
 
-The immediate host links no WASI or custom imports, rejects non-read-only manifests, resolves no credentials, and cannot access external systems. It is provider computation tooling, not the privileged provider host. There is still no daemon, authenticated broker transport, credential resolver, deployed audit/checkpoint service, or operator-accessible external effect path.
+The immediate host links no WASI or custom imports, rejects non-read-only manifests, resolves no credentials, and cannot access external systems. It is provider computation tooling, not the privileged provider host. There is still no unprivileged agent daemon or credential resolver. The separate Unix broker can expose policy-authorized provider effects, but neither `dekopon` nor direct `dekopon-run` can request them, and audit checkpoints are logged rather than externally anchored.
 
 Crate boundaries are:
 
@@ -51,6 +51,7 @@ Crate boundaries are:
 - `dekopon-broker-host`: privileged asynchronous Wasmtime component host that adapts `dekopon:http@1.0.0` to the native engine and accepts only authorized invocations.
 - `dekopon-broker`: exact deny-by-default policy, trusted context binding, single-use authorization, replay rejection/recovery, public evidence, and bounded in-memory or durable owner-only single-writer hash-linked audit coordination around the component host.
 - `dekopon-broker-protocol`: strict versioned length-delimited messages and an unprivileged Unix client that carry proposals/results but no identity or authorization fields.
+- `dekopon-brokerd`: Unix-only privileged process with strict owner-controlled configuration, private socket lifecycle, peer-UID context mapping, bounded concurrency/shutdown, durable replay restoration, and provider execution.
 - `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.
 - `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, and trace export.
 - `dekopon-testkit`: private builders used by workspace tests.
@@ -71,9 +72,9 @@ dekopon
     human/operator control CLI
 ```
 
-`dekopond` will be unprivileged. The agent and broker will be separate processes and separate pods once any external-write authority exists. Authenticated, replay-resistant message envelopes will carry principal and workload identity across that boundary.
+`dekopond` will be unprivileged. `dekopon-brokerd` is already a separate process for local Unix deployment; a future pod boundary needs a different authenticated transport. Local requests carry no principal or actor fields: the broker derives exact context from OS peer UID and trusted configuration, while unique invocation IDs and verified durable history provide replay rejection.
 
-A model-facing tool call is only a proposal. The authenticated daemon-to-broker request carries that proposal and trusted envelope context, not an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`; it creates and consumes that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopond` never receives or presents serialized authorization state as a bearer grant, and agent code never receives raw provider credentials.
+A model-facing tool call is only a proposal. The daemon-to-broker request carries that proposal, not trusted identity context or an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`; it creates and consumes that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopond` never receives or presents serialized authorization state as a bearer grant, and agent code never receives raw provider credentials.
 
 ## Immediate isolation and planned provider authority
 
@@ -83,9 +84,9 @@ Capability JSON Schemas are exposed to models and must be object-shaped, but the
 
 Model authentication terminates in the model client, separately from provider authority. ChatGPT subscription mode owns a distinct device-flow credential file, refreshes tokens only against OpenAI's fixed authentication host, and sends inference only to the fixed Codex Responses host. It does not import another application's token store or expose model credentials to a component.
 
-The privileged component-linking library is now present, but the privileged provider **process** remains future work. `dekopon-http-host` consumes exact destinations, methods, call counts, byte limits, and deadlines beneath independent ceilings. It checks and pins DNS results, disables redirects and ambient proxies, and emits sanitized metadata. `dekopon-broker-host` adds a shared async Wasmtime engine, compiled components, fresh fuel/memory-bounded stores, wall-clock cancellation, typed WIT adaptation, and rejection tracking that guest code cannot mask. It consumes one non-cloneable `AuthorizedInvocation` at its public execution boundary and has no credential injection.
+The privileged component-linking library and Unix provider **process** are now present. `dekopon-http-host` consumes exact destinations, methods, call counts, byte limits, and deadlines beneath independent ceilings. It checks and pins DNS results, disables redirects and ambient proxies, and emits sanitized metadata. `dekopon-broker-host` adds a shared async Wasmtime engine, compiled components, fresh fuel/memory-bounded stores, wall-clock cancellation, typed WIT adaptation, and rejection tracking that guest code cannot mask. It consumes one non-cloneable `AuthorizedInvocation` at its public execution boundary and has no credential injection.
 
-`dekopon-broker` supplies the next in-process boundary: a transport-independent `AuthenticatedContext`, exact principal/actor/capability/provider policy rules, replay rejection with durable restoration, authorization construction, provider execution, redacted public evidence, and bounded in-memory plus durable JSONL hash-chain implementations. The durable log verifies existing records, synchronizes each append, exposes checkpoints, and restores replay IDs; a separate known checkpoint is still needed to detect valid-prefix truncation. Constructing a context does not authenticate it. `dekopon-broker-protocol` adds strict one-request-per-connection framing with hard byte/deadline ceilings and a client that verifies private socket metadata plus the server peer UID. Its invocation payload deliberately omits principal, actor, policy, constraints, credentials, and authorization. No crate yet accepts a socket and maps peer credentials into `AuthenticatedContext`; none resolves credentials or exposes a service. No executable currently reaches the privileged host. Direct `dekopon-run` execution must not grow those privileges in-process; future broker-backed runner operations remain unprivileged clients. The complete boundary is described in [`broker-http.md`](broker-http.md).
+`dekopon-broker` supplies the next in-process boundary: a transport-independent `AuthenticatedContext`, exact principal/actor/capability/provider policy rules, replay rejection with durable restoration, authorization construction, provider execution, redacted public evidence, and bounded in-memory plus durable JSONL hash-chain implementations. The durable log verifies existing records, synchronizes each append, exposes checkpoints, and restores replay IDs; a separate known checkpoint is still needed to detect valid-prefix truncation. Constructing a context alone does not authenticate it. `dekopon-broker-protocol` adds strict one-request-per-connection framing with hard byte/deadline ceilings and a client that verifies private socket metadata plus the server peer UID. Its invocation payload deliberately omits principal, actor, policy, constraints, credentials, and authorization. `dekopon-brokerd` accepts that socket, derives peer UID from the connected stream, applies an exact owner-controlled UID-to-context mapping, and invokes the core. Owner-only socket mode currently creates one UID trust domain; it is not process-level attestation. No credential resolver exists. Direct `dekopon-run` execution must not grow those privileges in-process; future broker-backed runner operations remain unprivileged clients. The complete boundary is described in [`broker-http.md`](broker-http.md).
 
 ## Resource evolution
 

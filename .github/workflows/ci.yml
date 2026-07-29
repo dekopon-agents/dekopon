@@ -107,13 +107,14 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build CLIs
-        run: cargo build --locked -p dekopon -p dekopon-run
+        run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
           bin=target/debug/dekopon
           runner=target/debug/dekopon-run
+          broker=target/debug/dekopon-brokerd
           config=examples/local/dekopon.yaml
           provider=examples/providers/echo-provider.wasm
           "$bin" --help >/dev/null
@@ -127,6 +128,8 @@ jobs:
           "$bin" --config "$config" validate >/dev/null
           "$bin" --config "$config" config view -o json >/dev/null
           "$runner" --help >/dev/null
+          "$broker" --help >/dev/null
+          "$broker" --version >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
             "$bin" auth chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
@@ -157,8 +160,10 @@ jobs:
         run: |
           cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
           cargo install --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
+          "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
 
   deny:
     name: dependency policy

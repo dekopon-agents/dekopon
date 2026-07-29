@@ -11,7 +11,7 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Experimental Rust provider SDK and import-free Wasmtime component host.
 - One-shot direct invocation, OpenAI-compatible and ChatGPT/Codex subscription prompt tools, isolated device login, timing reports, and Chrome trace export for read-only provider computation.
 
-## 0.2 — privileged host foundation (in development)
+## 0.2 — privileged local broker foundation (in development)
 
 - Immutable buffered `dekopon:http@1.0.0` WIT package and statically compiled Rust guest facade.
 - Caller-generated provider worlds plus a checked-in HTTP-importing component that the immediate runner rejects.
@@ -20,18 +20,18 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Asynchronous broker component-host library with one shared Wasmtime engine, compiled components, fresh bounded stores, Tokio host calls, and a single-use `AuthorizedInvocation` public execution boundary.
 - Exact deny-by-default broker rules, authenticated-context binding, replay rejection/restoration, digest evidence, and bounded metadata-only in-memory or owner-only durable verified audit chains.
 - Strict versioned length-delimited broker messages and an unprivileged Unix client whose invocation payload cannot carry identity or authority.
+- Unix-only `dekopon-brokerd` with owner-controlled strict configuration, private socket lifecycle, peer-UID context mapping, bounded connections/draining, provider execution, and durable replay restoration.
 
-These libraries are not a deployable broker and are not reachable from an operator command.
+The broker process is deployable for one local owner-UID trust domain but is not integrated with either unprivileged CLI. It has no credentials or externally anchored checkpoint.
 
 ## Next milestones
 
-1. Build a bounded Unix listener with secure socket ownership and map OS peer credentials into trusted broker context.
-2. Build a separately deployed broker process around the current core with external checkpoint handling.
-3. Integrate the current unprivileged client while keeping direct `dekopon-run` on its import-free host.
-4. Add a JSONPlaceholder demonstration provider using narrowly scoped destinations and separately named read and external-write capabilities; keep tests deterministic and mock-backed.
-5. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
-6. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
-7. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
+1. Integrate the current unprivileged client while keeping direct `dekopon-run` on its import-free host.
+2. Add external checkpoint storage/verification so valid-prefix audit rollback is detectable outside the broker host.
+3. Add a JSONPlaceholder demonstration provider using narrowly scoped destinations and separately named read and external-write capabilities; keep tests deterministic and mock-backed.
+4. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
+5. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
+6. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
 
 ## Intended package namespace
 

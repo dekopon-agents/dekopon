@@ -1,6 +1,6 @@
 # Broker-mediated HTTP providers
 
-This document records both the implemented privileged host foundation and the **committed direction** for the broker process around it. Status is called out explicitly because a host library does not by itself create an authenticated external-effect path.
+This document records the implemented privileged host and local Unix broker foundation plus **committed direction** for credentials, client integration, and stronger deployment transports. Status is called out explicitly because local UID authentication is not a production multi-tenant boundary.
 
 ## Current foundation
 
@@ -8,7 +8,7 @@ The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust
 
 `dekopon-broker` now binds a separately supplied authenticated context to exact principal/actor/capability/provider rules, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
-The versioned local wire format and unprivileged Unix client are also current: frames are length-delimited and deadline-bounded, invocation payloads contain no identity/authority fields, and clients verify private socket ownership plus server peer UID. A server-side authenticated listener, external checkpoint anchoring, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
+The versioned local wire format, unprivileged Unix client, and `dekopon-brokerd` process are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. External checkpoint anchoring, credentials, and unprivileged CLI integration remain committed direction.
 
 ## Decision
 
@@ -57,11 +57,11 @@ model or direct dekopon-run request
        result + evidence + audit
 ```
 
-External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
+The flow from authenticated socket acceptance downward is current; model and direct-runner client integration above it remains future work. External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
 
 ## Local broker protocol
 
-The current protocol crate defines a local Unix-domain socket client; the following server slice will own the socket path, create it with owner-only permissions, and authenticate peers from operating-system socket credentials. Payload fields have no principal or actor slot and cannot override authenticated identity.
+The current protocol and service use a local Unix-domain socket. `dekopon-brokerd` owns a path under an owner-only directory, rejects unsafe replacement and live listeners, creates mode `0600`, authenticates the connected stream from operating-system peer credentials, and maps that UID to one exact configured principal/actor. Payload fields have no principal or actor slot and cannot override authenticated identity. Because the socket is owner-only, this is one UID trust domain rather than per-process attestation.
 
 Each invocation request carries a unique invocation identifier, trace identifier, capability identifier, bounded JSON input, and protocol version. The broker rejects duplicate invocation identifiers across verified durable history and current state. Requests and responses use four-byte length-delimited, size-bounded strict JSON with one complete-frame deadline, so a peer cannot force unbounded buffering or hold a partial frame indefinitely.
 
@@ -116,7 +116,7 @@ Policy decisions produce a stable decision identifier and policy revision. Autho
 
 ## Evidence and audit
 
-The current core appends one decision event for every request and a terminal execution event after each authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, effect/risk/idempotency classification, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
+The current core appends one decision event for every decoded invocation from a mapped peer and a terminal execution event after each completed authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, effect/risk/idempotency classification, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
 
 The bounded in-memory implementation hash-links events for tests. `FileAuditLog` persists exclusively writer-locked owner-only bounded JSONL, verifies the complete existing chain before append, synchronizes every decision/outcome, rejects partial writes, and reconstructs replay IDs on restart. With a separately retained known checkpoint, valid-prefix truncation is also detectable. This is local integrity evidence, not a claim of tamper-proof storage against a compromised broker host. Durable remote anchoring, key-backed signatures, tenancy, and incident-response machinery remain separate work.
 
@@ -142,8 +142,8 @@ The behavior lands in reviewable slices without temporarily granting authority t
 4. **Implemented foundation:** add exact deny-by-default policy, trusted context binding, single-use authorization, bounded replay state, digest evidence, and an in-memory verifiable audit chain.
 5. **Implemented foundation:** add owner-only durable audit persistence, restart verification, checkpoints, and replay-ID restoration.
 6. **Implemented client foundation:** add strict bounded local framing and an unprivileged Unix client with no identity or authorization payload fields.
-7. Add the server-side authenticated broker listener and map OS peer credentials into trusted context.
+7. **Implemented service foundation:** add the authenticated owner-only Unix listener, exact peer-UID context mapping, secure socket lifecycle, bounded concurrency/draining, and broker executable.
 8. Add a JSONPlaceholder demonstration provider with separately named read and write capabilities.
-9. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
+9. Integrate an unprivileged CLI client, broker-owned credentials, and externally anchored checkpoints before production claims.
 
 Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

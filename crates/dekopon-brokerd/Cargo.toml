@@ -1,0 +1,37 @@
+[package]
+name = "dekopon-brokerd"
+description = "Authenticated local Unix broker service for Dekopon provider execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-brokerd"
+readme = "README.md"
+keywords = ["agents", "broker", "authorization", "wasm", "ipc"]
+categories = ["command-line-utilities", "network-programming"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+clap.workspace = true
+dekopon-broker.workspace = true
+dekopon-broker-host.workspace = true
+dekopon-broker-protocol.workspace = true
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
