@@ -18,3 +18,16 @@ dekopon_provider_sdk::export_provider!(Example);
 ```
 
 The immediate host accepts only read-only manifests and supplies no WASI imports. The SDK WIT file is mirrored by `dekopon-provider-host`; update both copies together and keep their equality test passing.
+
+## WIT package
+
+The same import-free world is published as `dekopon:provider@0.1.0`. Fetch it through Dekopon's public registry metadata:
+
+```console
+wkg get \
+  --registry dekopon-agents.github.io \
+  --output provider.wasm \
+  dekopon:provider@0.1.0
+```
+
+The package contains exactly the `describe` and `invoke` exports and no imports. Publishing it makes the existing authoring contract available to component tooling; it does not add host functions or runtime authority.

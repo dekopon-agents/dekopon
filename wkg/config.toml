@@ -1,0 +1,2 @@
+[namespace_registries]
+dekopon = { registry = "dekopon-agents.github.io", metadata = { preferredProtocol = "oci", oci = { registry = "ghcr.io", namespacePrefix = "dekopon-agents/" } } }
