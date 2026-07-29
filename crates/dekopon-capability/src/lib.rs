@@ -169,17 +169,40 @@ impl ProposedInvocation {
     }
 }
 
+/// Broker-enforced buffered HTTP limits attached to one authorization.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HttpConstraints {
+    /// Exact DNS names or IP authorities the invocation may contact.
+    pub allowed_hosts: Vec<String>,
+    /// Exact case-sensitive HTTP method tokens the invocation may use.
+    pub allowed_methods: Vec<String>,
+    /// Maximum number of HTTP requests in this provider invocation.
+    pub max_requests: u32,
+    /// Maximum encoded request bytes, including headers and body.
+    pub max_request_bytes: u64,
+    /// Maximum encoded response bytes, including headers and body.
+    pub max_response_bytes: u64,
+    /// Whether explicitly allowed loopback hosts may use plaintext HTTP.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_plaintext_loopback: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Broker-enforced execution limits attached to an authorization.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
     /// Maximum wall-clock duration allowed for provider execution.
     pub timeout_ms: u64,
-    /// Maximum serialized output size.
+    /// Maximum serialized provider output size.
     pub max_output_bytes: u64,
-    /// Optional host allow-list. An empty list permits no network destinations.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_hosts: Vec<String>,
+    /// Optional buffered HTTP grant. Its absence permits no HTTP host calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpConstraints>,
 }
 
 impl Default for ExecutionConstraints {
@@ -187,7 +210,7 @@ impl Default for ExecutionConstraints {
         Self {
             timeout_ms: 30_000,
             max_output_bytes: 1_048_576,
-            allowed_hosts: Vec::new(),
+            http: None,
         }
     }
 }
@@ -319,6 +342,15 @@ pub enum AuthorizationError {
     /// Provider execution was authorized without a positive output bound.
     #[error("authorization output limit must be greater than zero")]
     ZeroOutputLimit,
+    /// HTTP was granted without an exact destination.
+    #[error("HTTP authorization requires at least one allowed host")]
+    NoHttpHosts,
+    /// HTTP was granted without an exact method.
+    #[error("HTTP authorization requires at least one allowed method")]
+    NoHttpMethods,
+    /// HTTP was granted without positive call and byte limits.
+    #[error("HTTP authorization limits must be greater than zero")]
+    ZeroHttpLimit,
 }
 
 /// Broker-only authority transition.
@@ -371,6 +403,20 @@ pub mod broker {
             if constraints.max_output_bytes == 0 {
                 return Err(AuthorizationError::ZeroOutputLimit);
             }
+            if let Some(http) = &constraints.http {
+                if http.allowed_hosts.is_empty() {
+                    return Err(AuthorizationError::NoHttpHosts);
+                }
+                if http.allowed_methods.is_empty() {
+                    return Err(AuthorizationError::NoHttpMethods);
+                }
+                if http.max_requests == 0
+                    || http.max_request_bytes == 0
+                    || http.max_response_bytes == 0
+                {
+                    return Err(AuthorizationError::ZeroHttpLimit);
+                }
+            }
 
             Ok(AuthorizedInvocation {
                 proposal,
@@ -395,7 +441,9 @@ mod tests {
     use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
     use serde_json::json;
 
-    use super::{AuthorizationError, ExecutionConstraints, ProposedInvocation, broker};
+    use super::{
+        AuthorizationError, ExecutionConstraints, HttpConstraints, ProposedInvocation, broker,
+    };
 
     fn proposal() -> ProposedInvocation {
         ProposedInvocation::new(
@@ -448,9 +496,67 @@ mod tests {
     }
 
     #[test]
+    fn broker_gate_rejects_incomplete_http_authority() {
+        let valid = HttpConstraints {
+            allowed_hosts: vec!["api.example.test".to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 1,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            allow_plaintext_loopback: false,
+        };
+        let cases = [
+            (
+                HttpConstraints {
+                    allowed_hosts: Vec::new(),
+                    ..valid.clone()
+                },
+                AuthorizationError::NoHttpHosts,
+            ),
+            (
+                HttpConstraints {
+                    allowed_methods: Vec::new(),
+                    ..valid.clone()
+                },
+                AuthorizationError::NoHttpMethods,
+            ),
+            (
+                HttpConstraints {
+                    max_requests: 0,
+                    ..valid
+                },
+                AuthorizationError::ZeroHttpLimit,
+            ),
+        ];
+
+        for (http, expected) in cases {
+            let error = broker::test_gate()
+                .authorize(
+                    proposal(),
+                    "decision-1".to_owned(),
+                    "broker".parse::<PrincipalId>().expect("valid fixture"),
+                    "policy-1".to_owned(),
+                    ExecutionConstraints {
+                        http: Some(http),
+                        ..ExecutionConstraints::default()
+                    },
+                )
+                .expect_err("incomplete HTTP authority must fail");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
     fn authorized_invocation_serialization_preserves_linkage() {
         let constraints = ExecutionConstraints {
-            allowed_hosts: vec!["api.github.com".to_owned()],
+            http: Some(HttpConstraints {
+                allowed_hosts: vec!["api.github.com".to_owned()],
+                allowed_methods: vec!["POST".to_owned()],
+                max_requests: 1,
+                max_request_bytes: 65_536,
+                max_response_bytes: 1_048_576,
+                allow_plaintext_loopback: false,
+            }),
             ..ExecutionConstraints::default()
         };
         let authorized = broker::test_gate()
@@ -482,7 +588,13 @@ mod tests {
                 "constraints": {
                     "timeoutMs": 30_000,
                     "maxOutputBytes": 1_048_576,
-                    "allowedHosts": ["api.github.com"]
+                    "http": {
+                        "allowedHosts": ["api.github.com"],
+                        "allowedMethods": ["POST"],
+                        "maxRequests": 1,
+                        "maxRequestBytes": 65_536,
+                        "maxResponseBytes": 1_048_576
+                    }
                 }
             })
         );
