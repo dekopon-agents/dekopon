@@ -485,6 +485,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-broker-protocol"
+version = "0.2.0"
+dependencies = [
+ "dekopon-broker",
+ "dekopon-capability",
+ "dekopon-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "dekopon-capability"
 version = "0.2.0"
 dependencies = [

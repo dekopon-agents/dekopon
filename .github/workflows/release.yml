@@ -192,6 +192,7 @@ jobs:
           publish dekopon-http-host
           publish dekopon-broker-host
           publish dekopon-broker
+          publish dekopon-broker-protocol
           publish dekopon-protocol
           publish dekopon-config
           publish dekopon-run

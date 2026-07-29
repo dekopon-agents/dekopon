@@ -156,6 +156,19 @@ pub struct PolicyRule {
     pub constraints: ExecutionConstraints,
 }
 
+/// One capability visible to an authenticated broker client.
+///
+/// Routing and effect metadata are overwritten from the trusted exact rule. Description and input
+/// schema remain bounded provider-supplied model metadata and are not authorization inputs.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AvailableCapability {
+    /// Trusted selected provider.
+    pub provider: ProviderId,
+    /// Client-visible capability metadata.
+    pub capability: ProviderCapability,
+}
+
 /// Independent broker limits for policy and replay state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -1123,6 +1136,33 @@ where
                 ids: Mutex::new(restored_replay_ids),
             },
         })
+    }
+
+    /// Returns only capabilities allowed for this exact authenticated context.
+    pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
+        let mut capabilities = self
+            .policy
+            .rules
+            .iter()
+            .filter(|rule| &rule.principal == context.principal() && &rule.actor == context.actor())
+            .map(|rule| {
+                let (_, manifest_capability) = self
+                    .registry
+                    .capabilities()
+                    .find(|(_, capability)| capability.id == rule.capability)
+                    .expect("policy construction validates every capability route");
+                let mut capability = manifest_capability.clone();
+                capability.effect = rule.effect;
+                capability.risk = rule.risk;
+                capability.idempotency = rule.idempotency;
+                AvailableCapability {
+                    provider: rule.provider.clone(),
+                    capability,
+                }
+            })
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
+        capabilities
     }
 
     /// Evaluates and, when allowed, executes one authenticated proposal exactly once.

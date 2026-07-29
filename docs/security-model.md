@@ -82,7 +82,9 @@ The statically linked native client enforces exact authority/port and method gra
 
 `FileAuditLog` uses an exclusively writer-locked owner-only single-link file opened without symlink following, verifies bounded JSONL records before append, synchronizes each append, rejects partial records, exposes a chain checkpoint, and reconstructs replay IDs for restart. A valid-prefix truncation remains undetectable without comparing a separately retained checkpoint.
 
-These libraries perform no socket authentication, trusted workload discovery, credential injection, external checkpoint anchoring, or network service. `AuthenticatedContext` construction is not authentication; a future transport must derive it from peer credentials. No workspace executable reaches the broker core today. Its presence does not expand `dekopon-run`: the immediate runner still uses its separate empty linker and rejects the HTTP-importing fixture.
+`dekopon-broker-protocol` defines strict versioned frames and an unprivileged Unix client. Invocation wire values omit principal, actor, policy, constraints, credentials, and authorization. Frame lengths have a hard ceiling before allocation, complete reads/writes time out, and the client checks owner-only socket metadata plus server peer UID.
+
+These libraries still perform no server-side socket acceptance/authentication, trusted workload discovery, credential injection, external checkpoint anchoring, or network service. `AuthenticatedContext` construction is not authentication; a future transport must derive it from peer credentials. No workspace executable reaches the broker core today. Its presence does not expand `dekopon-run`: the immediate runner still uses its separate empty linker and rejects the HTTP-importing fixture.
 
 ## Threat-model limitations
 

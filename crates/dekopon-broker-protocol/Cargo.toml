@@ -1,0 +1,29 @@
+[package]
+name = "dekopon-broker-protocol"
+description = "Bounded local broker wire protocol and unprivileged client for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-broker-protocol"
+readme = "README.md"
+keywords = ["agents", "protocol", "ipc", "security", "client"]
+categories = ["network-programming"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-broker.workspace = true
+dekopon-capability.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dekopon-core.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
