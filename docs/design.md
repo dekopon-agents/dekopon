@@ -89,7 +89,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and WIT export adapter | **Current**, experimental read-only contract |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
-| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export | **Current**, experimental immediate mode |
+| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export; future broker client without effect authority | **Current**, experimental immediate mode; broker client is **committed direction** |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
 | Policy evaluator | Declarative authorization decisions and explanations; Cedar is the intended engine after inputs stabilize | **Committed direction** |
@@ -172,7 +172,7 @@ Proposed --broker denies----------------------> Denied result + evidence
 
 `ProposedInvocation` is publicly constructible because untrusted callers are allowed to express intent. `AuthorizedInvocation` is not publicly constructible from arbitrary fields. Broker authorization must validate its decision metadata and attach bounded `ExecutionConstraints`.
 
-`dekopon-run` does not cross this state boundary. Its prompt tool calls are immediate, unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that path would violate this design.
+The direct `dekopon-run` provider path does not cross this state boundary. Its immediate prompt tool calls are unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that in-process path would violate this design. A broker-backed mode may submit proposals over an authenticated transport, but only the separate broker may authorize them, resolve privileged imports, and execute effects.
 
 Before a real broker is introduced, its protocol must define at least:
 
@@ -203,7 +203,7 @@ Wasm provider          one narrow integration operation
 
 The agent and broker will run as separate processes and separate pods. `dekopond` sends authenticated proposal envelopes and receives results; it does not receive or relay an `AuthorizedInvocation` as a wire grant. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
 
-Wasmtime now supports meaningful, tested immediate-mode component execution with no host imports. This does not implement the broker deployment or privileged provider contract. Tokio and Cedar remain deferred until asynchronous host calls and stable authorization inputs justify them.
+Wasmtime now supports meaningful, tested immediate-mode component execution with no host imports. This does not implement the broker deployment or privileged provider contract. The first privileged host will expose a statically implemented, buffered `dekopon:http@1.0.0` interface only inside `dekopon-brokerd`; its accepted contract, authorization boundary, and staged delivery are defined in [`broker-http.md`](broker-http.md). Tokio becomes justified when that bounded asynchronous host is implemented; Cedar remains deferred until authorization inputs and explainability requirements have been proven by the initial deny-by-default policy.
 
 ## Operator interface
 
@@ -226,6 +226,8 @@ See [`cli.md`](cli.md) for the current command contract.
 | Private authorization fields plus compile-fail tests | Prevent accidental in-process authority fabrication while acknowledging that process isolation remains necessary. |
 | Private testkit | Shared fixtures are useful internally but are not part of the public product API. |
 | Import-free immediate providers | Provider traits, component ABI, routing, limits, prompt tools, timings, and traces can stabilize without prematurely granting host authority. |
+| Broker-owned buffered HTTP | Privileged providers import a project-owned high-level HTTP contract, while only the separate broker implements networking, applies authorization constraints, and records evidence. |
+| No native runtime plugins | Broker host services are statically linked; untrusted imports never trigger Rust library or package downloads. |
 | No empty future crates | A package boundary must be justified by meaningful, tested behavior. |
 
 ## How to evaluate a proposed change
@@ -251,5 +253,6 @@ If authority ownership is unclear, stop and update the design before adding code
 - [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
 - [`cli.md`](cli.md) — current catalog and model-auth operator contract, discovery, output, and exit codes.
 - [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
+- [`broker-http.md`](broker-http.md) — committed broker-mediated HTTP contract and authority boundary.
 - [`roadmap.md`](roadmap.md) — implementation sequence and deliberately deferred scope.
 - [`README.md`](README.md) — documentation map and task-based reading guide.

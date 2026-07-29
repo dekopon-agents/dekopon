@@ -13,7 +13,8 @@ Read in this order:
 3. [`security-model.md`](security-model.md) — trusted and untrusted inputs, threat model, and present limitations.
 4. [`architecture.md`](architecture.md) — how the design maps to current crates and planned processes.
 5. [`cli.md`](cli.md) and [`run.md`](run.md) — the two current user-facing command surfaces.
-6. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
+6. [`broker-http.md`](broker-http.md) — committed broker-mediated HTTP design; not current behavior until implemented.
+7. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ### Change a specific area
 
@@ -25,6 +26,7 @@ Read in this order:
 | Source locations, tests, WIT, generated Wasm, CI, dependencies, packaging, or releases | [`development.md`](development.md) | Records the practical repository workflow and scope-specific checks. |
 | Operator auth, catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Immediate provider loading, direct invocation, prompt tools, or tracing | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
+| Broker-mediated provider HTTP, host imports, or broker client mode | [`broker-http.md`](broker-http.md) | Records the accepted HTTP contract, process ownership, authorization, and delivery boundaries. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
 
 Implementation-level contracts live beside their code in `crates/*/README.md`. The provider example and generated-component workflow are documented in [`../examples/providers/echo/README.md`](../examples/providers/echo/README.md).

@@ -18,6 +18,7 @@ Finally, read the documents selected by the work:
 | Operator auth, catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator contract. |
 | Immediate providers, Wasm components, prompt tools, model endpoints, limits, or traces | [`docs/run.md`](docs/run.md) | It defines the experimental current runner and the privileges it must not gain. |
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md) | It records repository mechanics and validation traps that root workspace commands do not cover. |
+| Broker-mediated provider HTTP, host imports, or broker client mode | [`docs/broker-http.md`](docs/broker-http.md) | It defines the accepted process boundary, buffered HTTP contract, authorization inputs, and staged delivery. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
 
 [`docs/README.md`](docs/README.md) is the complete documentation map. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for validation and pull-request expectations.
@@ -30,7 +31,7 @@ Finally, read the documents selected by the work:
 - Trusted actor identity comes from an authenticated envelope, never from model or repository content.
 - Provider credentials remain inside the broker boundary and out of prompts, config, evidence, and logs; model credentials stay inside the selected model client and never enter provider components.
 - `dekopond` and `dekopon-brokerd` remain separate processes once external-write authority exists.
-- `dekopon-run` remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode.
+- The direct `dekopon-run` provider path remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode. A broker-backed mode may submit proposals, but only the separate broker may resolve privileged imports or execute effects.
 - Do not describe unimplemented daemons, policy, privileged provider interfaces, or external effects as available.
 - Do not add empty crates or heavy future dependencies without meaningful, tested behavior.
 - Parse config once into typed resources; do not spread YAML handling through command execution.

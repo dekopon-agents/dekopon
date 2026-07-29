@@ -47,6 +47,8 @@ A model or repository document cannot self-assert a trusted `Actor`. The trusted
 - Authorization constraints bind timeout, output size, and future network scopes.
 - Retries account for declared idempotency and use provider-enforced idempotency keys where available.
 - Credentials do not appear in agent prompts, authored catalogs, invocation evidence, or normal logs.
+- A component import declares a required host interface; it never grants that interface or any transitive authority.
+- Broker HTTP authorization binds exact destinations, methods, host-call counts, byte limits, and deadlines to one invocation.
 
 The example reviewer has `github.pull-request.read` and the explicit external-write `github.pull-request.comment`. It does not have, and the example does not declare, `github.pull-request.approve`.
 
@@ -74,4 +76,6 @@ Chrome trace fields omit prompts, model responses, component input/output, and b
 
 The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The immediate Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, privileged host-call interface, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
 
-Future releases must threat-model confused-deputy attacks, prompt injection, credential exfiltration, provider escalation, TOCTOU between authorization and execution, duplicate external effects, malicious Wasm components, resource exhaustion, forged identity envelopes, audit tampering, and cross-tenant data leaks before claiming production readiness.
+The committed first privileged-provider design is documented in [`broker-http.md`](broker-http.md). It preserves the separate broker boundary, keeps direct `dekopon-run` execution import-free, and treats HTTP imports as structural requirements rather than authority.
+
+Future releases must threat-model confused-deputy attacks, prompt injection, credential exfiltration, provider escalation, SSRF and DNS rebinding, redirect escapes, TOCTOU between authorization and execution, duplicate external effects, malicious Wasm components, resource exhaustion, forged identity envelopes, audit tampering, and cross-tenant data leaks before claiming production readiness.
