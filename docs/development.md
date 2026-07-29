@@ -58,7 +58,11 @@ The SDK and host WIT files are mirrored and must remain byte-identical:
 - `crates/dekopon-provider-sdk/wit/provider.wit`
 - `crates/dekopon-provider-host/wit/provider.wit`
 
-Update both copies together and keep `host_and_guest_sdk_use_the_same_wit_contract` passing. Immediate providers must remain read-only and import-free; adding WASI or a host import is an authority change, not a convenience refactor.
+Update both copies together and keep `host_and_guest_sdk_use_the_same_wit_contract` passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+
+The root [`wkg.toml`](../wkg.toml), [`wkg.lock`](../wkg.lock), and [`wkg/config.toml`](../wkg/config.toml) define package metadata, dependency resolution, and the namespace-to-GHCR mapping. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
+
+Immediate providers must remain read-only and import-free; adding WASI or a host import is an authority change, not a convenience refactor.
 
 The checked-in component is generated:
 
@@ -135,6 +139,33 @@ cargo test -p dekopon-run --test cli --locked
 ```
 
 A deterministic rebuild should leave the artifact unchanged when the source and toolchain are unchanged.
+
+### Published WIT package
+
+Install the pinned package and component tools, then build and inspect the package from the repository root:
+
+```console
+cargo install wkg --version 0.16.0 --locked
+cargo install wasm-tools --version 1.236.1 --locked
+mkdir -p target/wit-package
+wkg build \
+  --wit-dir crates/dekopon-provider-sdk/wit \
+  --output target/wit-package/dekopon-provider.wasm \
+  --config wkg/config.toml
+wasm-tools validate target/wit-package/dekopon-provider.wasm
+wasm-tools component wit target/wit-package/dekopon-provider.wasm
+```
+
+The build must leave `wkg.lock` unchanged and the decoded package must identify `dekopon:provider@0.1.0`, one `provider` world, two exports, and zero imports. Exercise the configured fetch path with:
+
+```console
+wkg get \
+  --config wkg/config.toml \
+  --output target/wit-package/fetched-provider.wasm \
+  dekopon:provider@0.1.0
+```
+
+`.github/workflows/wit-package.yml` performs a local publish/fetch round trip on pull requests. When the relevant files reach `main`, it publishes the immutable package to GHCR and verifies that fetching the same package returns identical bytes.
 
 ## Before opening a pull request
 

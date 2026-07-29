@@ -1,0 +1,6 @@
+[metadata]
+authors = "Dekopon contributors"
+description = "Experimental import-free provider interface for Dekopon WebAssembly components"
+license = "Apache-2.0 OR MIT"
+homepage = "https://github.com/dekopon-agents/dekopon"
+repository = "https://github.com/dekopon-agents/dekopon"
