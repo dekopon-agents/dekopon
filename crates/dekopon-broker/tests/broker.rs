@@ -8,8 +8,8 @@ use std::{
 };
 
 use dekopon_broker::{
-    AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, InMemoryAuditLog,
-    InvocationRequest, PolicyRule, verify_audit_chain,
+    AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, FileAuditLog,
+    InMemoryAuditLog, InvocationRequest, PolicyRule, verify_audit_chain,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, Idempotency};
@@ -198,6 +198,78 @@ async fn exact_policy_authorizes_once_and_audits_no_payloads() {
     assert!(matches!(records[1].event, AuditEvent::Execution { .. }));
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(!serialized.contains("top-secret-payload"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_audit_restores_replay_rejection_after_restart() {
+    let directory = tempfile::tempdir().expect("create durable broker fixture");
+    let path = directory.path().join("audit.jsonl");
+    let audit = Arc::new(
+        FileAuditLog::open(&path, 8, 64 * 1024)
+            .await
+            .expect("create durable audit"),
+    );
+    let policy_rule = rule(
+        "caller",
+        "echo.echo",
+        "echo",
+        ExecutionConstraints::default(),
+    );
+    let broker = Broker::new(
+        echo_registry(BrokerHostLimits::default()).await,
+        "broker-test"
+            .parse::<PrincipalId>()
+            .expect("valid broker principal"),
+        "policy-test".to_owned(),
+        vec![policy_rule.clone()],
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("durable broker starts");
+    let first = broker
+        .invoke(
+            &context("caller"),
+            request("invoke-durable", "echo.echo", json!({"message": "hello"})),
+        )
+        .await
+        .expect("first invocation succeeds and is durable");
+    assert_eq!(
+        first.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    drop(broker);
+    drop(audit);
+
+    let audit = Arc::new(
+        FileAuditLog::open(&path, 8, 64 * 1024)
+            .await
+            .expect("verified audit reopens"),
+    );
+    let replay_ids = audit.replay_ids().await;
+    let broker = Broker::new_with_replay_ids(
+        echo_registry(BrokerHostLimits::default()).await,
+        "broker-test"
+            .parse::<PrincipalId>()
+            .expect("valid broker principal"),
+        "policy-test".to_owned(),
+        vec![policy_rule],
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        replay_ids,
+    )
+    .expect("broker restores verified replay state");
+    let replay = broker
+        .invoke(
+            &context("caller"),
+            request("invoke-durable", "echo.echo", json!({"message": "again"})),
+        )
+        .await
+        .expect("replay denial is durably audited");
+    assert_eq!(
+        replay.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -20,4 +20,4 @@ The `0.2.0` development line also contains a privileged asynchronous component h
 
 Model credentials stay in the selected model client and never enter provider components. Dekopon does not import OAuth material from other applications. See [`docs/security-model.md`](docs/security-model.md) for current trust boundaries and limitations.
 
-Future daemons, authenticated broker transport, broker credentials, deployable privileged provider calls, durable evidence/audit persistence, and external effects will materially expand the threat model; their introduction requires dedicated review and updated documentation.
+Future daemons, authenticated broker transport, broker credentials, deployable privileged provider calls, externally anchored evidence/audit, and external effects will materially expand the threat model; their introduction requires dedicated review and updated documentation.

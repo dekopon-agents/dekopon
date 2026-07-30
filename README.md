@@ -21,7 +21,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 ## What does not work yet
 
-There is no daemon, authenticated network API, credential broker service, broker executable, durable audit store, task store, or agent memory. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+There is no daemon, authenticated network API, credential broker service, broker executable, deployed audit/checkpoint service, task store, or agent memory. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
