@@ -3,7 +3,8 @@
 use std::{num::NonZeroU32, path::PathBuf};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
-use dekopon_core::CapabilityId;
+use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES};
+use dekopon_core::{CapabilityId, InvocationId, TraceId};
 use dekopon_provider_host::{
     DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT,
@@ -14,7 +15,7 @@ use dekopon_provider_host::{
 #[command(
     name = "dekopon-run",
     version,
-    about = "Run read-only Dekopon providers in bounded WebAssembly components",
+    about = "Run import-free providers directly or call a separate Dekopon broker",
     long_about = None,
     propagate_version = true
 )]
@@ -31,26 +32,30 @@ pub struct Cli {
     #[arg(short = 'v', global = true, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// Wasm execution limits shared by all loaded providers.
-    #[command(flatten)]
-    pub limits: LimitArgs,
-
     /// Operation to perform.
     #[command(subcommand)]
     pub command: Command,
 }
 
-/// Immediate-mode operations.
+/// Direct, prompt, and broker-client operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Load providers, validate their manifests, and print them as JSON.
     Inspect {
+        /// Bounded immediate-mode Wasm settings.
+        #[command(flatten)]
+        limits: LimitArgs,
+
         /// Provider components to load.
         #[command(flatten)]
         providers: ProviderArgs,
     },
     /// Invoke one capability directly without contacting a model.
     Invoke {
+        /// Bounded immediate-mode Wasm settings.
+        #[command(flatten)]
+        limits: LimitArgs,
+
         /// Provider components to load.
         #[command(flatten)]
         providers: ProviderArgs,
@@ -70,8 +75,18 @@ pub enum Command {
         #[arg(long, default_value = "1", value_name = "COUNT")]
         repeat: NonZeroU32,
     },
+    /// Use the unprivileged client for a separately running authenticated broker.
+    Broker {
+        /// Broker operation.
+        #[command(subcommand)]
+        command: BrokerCommand,
+    },
     /// Run a one-shot model prompt/tool loop.
     Prompt {
+        /// Bounded immediate-mode Wasm settings.
+        #[command(flatten)]
+        limits: LimitArgs,
+
         /// Provider components whose capabilities become model tools.
         #[command(flatten)]
         providers: ProviderArgs,
@@ -114,6 +129,66 @@ pub enum Command {
     },
 }
 
+/// Unprivileged broker operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum BrokerCommand {
+    /// List capabilities exact policy exposes to this authenticated Unix peer.
+    Capabilities {
+        /// Authenticated Unix connection settings.
+        #[command(flatten)]
+        connection: BrokerConnectionArgs,
+    },
+    /// Submit one untrusted invocation proposal to the broker.
+    Invoke {
+        /// Authenticated Unix connection settings.
+        #[command(flatten)]
+        connection: BrokerConnectionArgs,
+
+        /// Capability to propose.
+        capability: CapabilityId,
+
+        /// Caller-generated unique invocation identifier used for durable replay rejection.
+        #[arg(long, value_name = "ID")]
+        invocation_id: InvocationId,
+
+        /// Caller-generated trace correlation identifier.
+        #[arg(long, value_name = "ID")]
+        trace_id: TraceId,
+
+        /// JSON object supplied to the capability.
+        #[arg(long, conflicts_with = "input_file", value_name = "JSON")]
+        input: Option<String>,
+
+        /// Read capability input as JSON from a file, or `-` for stdin.
+        #[arg(long, conflicts_with = "input", value_name = "PATH")]
+        input_file: Option<PathBuf>,
+    },
+}
+
+/// Authenticated local broker connection settings.
+#[derive(Clone, Debug, Args)]
+pub struct BrokerConnectionArgs {
+    /// Owner-only Unix socket created by `dekopon-brokerd`.
+    #[arg(long, value_name = "PATH")]
+    pub socket: PathBuf,
+
+    /// Trusted operating-system UID expected for the broker server process.
+    #[arg(long, value_name = "UID")]
+    pub server_uid: u32,
+
+    /// Maximum JSON frame bytes, excluding the four-byte prefix.
+    #[arg(long, default_value_t = DEFAULT_MAX_FRAME_BYTES, value_name = "BYTES")]
+    pub max_frame_bytes: usize,
+
+    /// Deadline for connect and each complete frame operation.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_IO_TIMEOUT.as_millis() as u64,
+        value_name = "MILLISECONDS"
+    )]
+    pub io_timeout_ms: u64,
+}
+
 /// Repeatable provider component arguments.
 #[derive(Clone, Debug, Args)]
 pub struct ProviderArgs {
@@ -128,7 +203,6 @@ pub struct LimitArgs {
     /// Maximum linear memory per provider call.
     #[arg(
         long,
-        global = true,
         default_value_t = DEFAULT_MAX_MEMORY_BYTES,
         value_name = "BYTES"
     )]
@@ -137,7 +211,6 @@ pub struct LimitArgs {
     /// Maximum serialized invocation input.
     #[arg(
         long,
-        global = true,
         default_value_t = DEFAULT_MAX_INPUT_BYTES,
         value_name = "BYTES"
     )]
@@ -146,20 +219,18 @@ pub struct LimitArgs {
     /// Maximum serialized provider manifest or output.
     #[arg(
         long,
-        global = true,
         default_value_t = DEFAULT_MAX_OUTPUT_BYTES,
         value_name = "BYTES"
     )]
     pub max_output_bytes: usize,
 
     /// Wasm instruction fuel supplied to each fresh store.
-    #[arg(long, global = true, default_value_t = DEFAULT_FUEL, value_name = "UNITS")]
+    #[arg(long, default_value_t = DEFAULT_FUEL, value_name = "UNITS")]
     pub fuel: u64,
 
     /// Wall-clock limit for each provider instantiation and call.
     #[arg(
         long,
-        global = true,
         default_value_t = DEFAULT_TIMEOUT.as_millis() as u64,
         value_name = "MILLISECONDS"
     )]
@@ -170,7 +241,7 @@ pub struct LimitArgs {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{BrokerCommand, Cli, Command};
 
     #[test]
     fn clap_definition_is_internally_consistent() {
@@ -218,6 +289,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_identity_free_broker_invocation() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "broker",
+            "invoke",
+            "--socket",
+            "/run/dekopon/broker.sock",
+            "--server-uid",
+            "1000",
+            "--invocation-id",
+            "invoke-client-test",
+            "--trace-id",
+            "trace-client-test",
+            "jsonplaceholder.posts.get",
+            "--input",
+            r#"{"postId":7}"#,
+        ])
+        .expect("valid broker invocation");
+        let Command::Broker {
+            command:
+                BrokerCommand::Invoke {
+                    connection,
+                    invocation_id,
+                    trace_id,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected broker invoke command");
+        };
+        assert_eq!(connection.server_uid, 1000);
+        assert_eq!(invocation_id.as_str(), "invoke-client-test");
+        assert_eq!(trace_id.as_str(), "trace-client-test");
+    }
+
+    #[test]
+    fn rejects_broker_payload_identity_claims() {
+        let error = Cli::try_parse_from([
+            "dekopon-run",
+            "broker",
+            "capabilities",
+            "--socket",
+            "/run/dekopon/broker.sock",
+            "--server-uid",
+            "1000",
+            "--principal",
+            "forged",
+        ])
+        .expect_err("broker client has no payload principal argument");
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

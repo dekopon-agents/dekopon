@@ -1,7 +1,8 @@
-//! Immediate-mode prompt and provider execution for Dekopon.
+//! Immediate-mode provider execution and an unprivileged broker client for Dekopon.
 //!
-//! `dekopon-run` deliberately keeps this path separate from the operator catalog CLI. It loads
-//! only read-only, import-free provider components and does not claim broker authorization.
+//! Direct and prompt modes load only read-only, import-free provider components. Explicit broker
+//! mode loads no component: it submits identity-free proposals to a separate authenticated broker
+//! and never constructs or receives authorization state.
 
 #![forbid(unsafe_code)]
 
@@ -14,6 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use dekopon_broker_protocol::{
+    BrokerClient, ClientError, FrameLimits, InvocationOutcome, InvocationRequest,
+};
 use dekopon_core::{CapabilityId, ProviderId};
 use dekopon_model::{
     chatgpt::{ChatGptCodexModel, ChatGptError},
@@ -23,9 +28,11 @@ use dekopon_provider_host::{HostLimits, ProviderHostError, ProviderManifest, Pro
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
+#[cfg(unix)]
+use tracing::Instrument as _;
 
 use crate::{
-    cli::{Cli, Command},
+    cli::{BrokerCommand, Cli, Command, LimitArgs},
     prompt::{PromptError, run_prompt},
 };
 
@@ -37,7 +44,7 @@ mod trace;
 ///
 /// Clap handles syntax failures before this function and exits with code `2`.
 #[must_use]
-pub fn run(cli: Cli) -> i32 {
+pub async fn run(cli: Cli) -> i32 {
     let _trace_guard = match trace::initialize(cli.verbose, cli.no_color, cli.trace.as_deref()) {
         Ok(guard) => guard,
         Err(error) => {
@@ -46,10 +53,10 @@ pub fn run(cli: Cli) -> i32 {
         }
     };
 
-    match evaluate(&cli) {
-        Ok(output) => match write_output(&output) {
-            Ok(()) => 0,
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => 0,
+    match evaluate(&cli).await {
+        Ok(output) => match write_output(&output.text) {
+            Ok(()) => output.exit_code,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
             Err(error) => {
                 eprintln!("error: could not write output: {error}");
                 1
@@ -62,25 +69,20 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
-fn evaluate(cli: &Cli) -> Result<String, AppError> {
-    let limits = HostLimits {
-        max_memory_bytes: cli.limits.max_memory_bytes,
-        max_input_bytes: cli.limits.max_input_bytes,
-        max_output_bytes: cli.limits.max_output_bytes,
-        fuel: cli.limits.fuel,
-        timeout: Duration::from_millis(cli.limits.timeout_ms),
-    };
-
+async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
     match &cli.command {
-        Command::Inspect { providers } => {
+        Command::Inspect { limits, providers } => {
             let span =
                 tracing::info_span!("runner.inspect", provider.count = providers.provider.len());
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(providers.provider.clone(), limits)?;
+            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
             let manifests = registry.manifests().collect::<Vec<&ProviderManifest>>();
-            serde_json::to_string_pretty(&manifests).map_err(AppError::Serialize)
+            serde_json::to_string_pretty(&manifests)
+                .map(CommandOutput::success)
+                .map_err(AppError::Serialize)
         }
         Command::Invoke {
+            limits,
             providers,
             capability,
             input,
@@ -97,9 +99,9 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
             let input = read_input(
                 input.as_deref(),
                 input_file.as_deref(),
-                cli.limits.max_input_bytes,
+                limits.max_input_bytes,
             )?;
-            let registry = ProviderRegistry::load(providers.provider.clone(), limits)?;
+            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
             let mut samples = TimingSamples::default();
             let mut last = None;
             let total_start = Instant::now();
@@ -119,9 +121,13 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
                 &samples,
                 output.output,
             );
-            serde_json::to_string_pretty(&report).map_err(AppError::Serialize)
+            serde_json::to_string_pretty(&report)
+                .map(CommandOutput::success)
+                .map_err(AppError::Serialize)
         }
+        Command::Broker { command } => evaluate_broker(command).await,
         Command::Prompt {
+            limits,
             providers,
             model,
             chatgpt_subscription,
@@ -146,7 +152,7 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
                 prompt.max_steps = max_steps.get()
             );
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(providers.provider.clone(), limits)?;
+            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
             let timeout = Duration::from_millis(*model_timeout_ms);
             let model: Box<dyn ChatModel> = if *chatgpt_subscription {
                 Box::new(ChatGptCodexModel::new(
@@ -175,9 +181,113 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
                 provider.invocations = outcome.provider_invocations,
                 "prompt session completed"
             );
-            Ok(outcome.answer)
+            Ok(CommandOutput::success(outcome.answer))
         }
     }
+}
+
+struct CommandOutput {
+    text: String,
+    exit_code: i32,
+}
+
+impl CommandOutput {
+    fn success(text: String) -> Self {
+        Self { text, exit_code: 0 }
+    }
+}
+
+fn host_limits(limits: &LimitArgs) -> HostLimits {
+    HostLimits {
+        max_memory_bytes: limits.max_memory_bytes,
+        max_input_bytes: limits.max_input_bytes,
+        max_output_bytes: limits.max_output_bytes,
+        fuel: limits.fuel,
+        timeout: Duration::from_millis(limits.timeout_ms),
+    }
+}
+
+#[cfg(unix)]
+async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppError> {
+    const ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
+
+    match command {
+        BrokerCommand::Capabilities { connection } => {
+            async {
+                let client = BrokerClient::new(
+                    &connection.socket,
+                    connection.server_uid,
+                    FrameLimits {
+                        max_frame_bytes: connection.max_frame_bytes,
+                        io_timeout: Duration::from_millis(connection.io_timeout_ms),
+                    },
+                )?;
+                let capabilities = client.capabilities().await?;
+                serde_json::to_string_pretty(&capabilities)
+                    .map(CommandOutput::success)
+                    .map_err(AppError::Serialize)
+            }
+            .instrument(tracing::info_span!("runner.broker.capabilities"))
+            .await
+        }
+        BrokerCommand::Invoke {
+            connection,
+            capability,
+            invocation_id,
+            trace_id,
+            input,
+            input_file,
+        } => {
+            async {
+                let client = BrokerClient::new(
+                    &connection.socket,
+                    connection.server_uid,
+                    FrameLimits {
+                        max_frame_bytes: connection.max_frame_bytes,
+                        io_timeout: Duration::from_millis(connection.io_timeout_ms),
+                    },
+                )?;
+                let input = read_input(
+                    input.as_deref(),
+                    input_file.as_deref(),
+                    connection
+                        .max_frame_bytes
+                        .saturating_sub(ENVELOPE_RESERVE_BYTES),
+                )?;
+                if !input.is_object() {
+                    return Err(AppError::BrokerInputObject);
+                }
+                let result = client
+                    .invoke(InvocationRequest {
+                        id: invocation_id.clone(),
+                        capability: capability.clone(),
+                        trace: trace_id.clone(),
+                        input,
+                    })
+                    .await?;
+                let exit_code = if result.outcome == InvocationOutcome::Succeeded {
+                    0
+                } else {
+                    1
+                };
+                serde_json::to_string_pretty(&result)
+                    .map(|text| CommandOutput { text, exit_code })
+                    .map_err(AppError::Serialize)
+            }
+            .instrument(tracing::info_span!(
+                "runner.broker.invoke",
+                capability.id = %capability,
+                invocation.id = %invocation_id,
+                trace.id = %trace_id
+            ))
+            .await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn evaluate_broker(_command: &BrokerCommand) -> Result<CommandOutput, AppError> {
+    Err(AppError::BrokerUnsupported)
 }
 
 fn read_input(
@@ -342,6 +452,14 @@ fn milliseconds(duration: Duration) -> f64 {
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[cfg(unix)]
+    #[error(transparent)]
+    BrokerClient(#[from] ClientError),
+    #[cfg(not(unix))]
+    #[error("broker client mode requires Unix peer credentials and Unix-domain sockets")]
+    BrokerUnsupported,
+    #[error("broker capability input must be a JSON object")]
+    BrokerInputObject,
     #[error(transparent)]
     ChatGpt(#[from] ChatGptError),
     #[error(transparent)]
@@ -356,21 +474,21 @@ enum AppError {
         #[source]
         source: io::Error,
     },
-    #[error("could not read provider input from {source_name}")]
+    #[error("could not read capability input from {source_name}")]
     ReadInputStream {
         source_name: String,
         #[source]
         source: io::Error,
     },
-    #[error("provider input from {source_name} is not UTF-8")]
+    #[error("capability input from {source_name} is not UTF-8")]
     InputUtf8 {
         source_name: String,
         #[source]
         source: std::string::FromUtf8Error,
     },
-    #[error("provider input is {length} bytes; the maximum is {maximum}")]
+    #[error("capability input is {length} bytes; the maximum is {maximum}")]
     InputTooLarge { length: usize, maximum: usize },
-    #[error("provider input is not valid JSON")]
+    #[error("capability input is not valid JSON")]
     ParseInput(#[source] serde_json::Error),
     #[error("could not serialize command output")]
     Serialize(#[source] serde_json::Error),

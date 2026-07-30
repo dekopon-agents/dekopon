@@ -32,7 +32,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
 | Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
-| Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
+| Direct runner, prompt loop, broker client, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
@@ -49,7 +49,7 @@ Update protocol types first, then config validation, testkit builders, CLI rende
 
 Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exits documented. Add parser tests and black-box tests. Machine-readable JSON/YAML shapes and exit codes need compatibility consideration even when table output can evolve.
 
-`dekopon auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands.
+`dekopon auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands. Its explicit broker subcommands must remain identity-free clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
 
 ### Model clients or prompt tools
 
@@ -116,10 +116,10 @@ Privileged broker path:
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
 - `dekopon-broker` validates exact trusted rules against loaded routes and host ceilings, reserves invocation IDs before policy evaluation, creates single-use authorization, and audits only metadata/digests.
-- `AuthenticatedContext` construction alone is not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes a chain checkpoint, and restores replay IDs across restart; an external checkpoint is still required to detect valid-prefix truncation.
-- `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, and its client authenticates the configured server UID.
-- `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, rejects unreachable UID mappings, bounds concurrent connections, and restores audit/replay state before listening.
-- The service currently treats one owner UID as a trust domain, has no credential resolver or external checkpoint anchor, and is not integrated with either unprivileged CLI. Direct `dekopon-run` remains on the independent empty-linker host.
+- `AuthenticatedContext` construction alone is not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes exact chain-prefix checks, and restores replay IDs across restart. `dekopon-brokerd` synchronizes a separately locked atomic checkpoint after each append and requires it to match a verified audit prefix at startup.
+- `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
+- `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, rejects unreachable UID mappings, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening.
+- The service currently treats one owner UID as a trust domain, has no credential resolver or independently retained, signed, or remote checkpoint anchor, and is not integrated with the operator CLI or an agent daemon. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI also rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, or `dekopon-brokerd` in the runner's normal dependency tree.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
 

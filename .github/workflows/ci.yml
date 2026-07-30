@@ -33,6 +33,15 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint all targets
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Verify runner excludes privileged broker machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
       - name: Test workspace
         run: cargo test --workspace --all-features
       - name: Format, lint, and test Rust provider examples
@@ -130,6 +139,8 @@ jobs:
           "$bin" --config "$config" validate >/dev/null
           "$bin" --config "$config" config view -o json >/dev/null
           "$runner" --help >/dev/null
+          "$runner" broker --help >/dev/null
+          "$runner" broker invoke --help >/dev/null
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
