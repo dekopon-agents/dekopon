@@ -13,13 +13,14 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{BrokerClient, FrameLimits};
 use dekopon_brokerd::{
-    AuditCheckpoint, BrokerServer, BrokerdError, CONFIG_API_VERSION, ServerLimits, current_uid, run,
+    AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
+    CheckpointError, ServerLimits, current_uid, run,
 };
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::oneshot};
 
 fn fixture(name: &str) -> PathBuf {
@@ -184,10 +185,14 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
     let audit_path = directory.path().join("audit.jsonl");
+    let checkpoint_path = directory.path().join("checkpoint.json");
+    let checkpoint_lock_path = directory.path().join("checkpoint.lock");
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": &audit_path,
+        "checkpointPath": &checkpoint_path,
+        "checkpointLockPath": &checkpoint_lock_path,
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": [fixture("echo-provider.wasm")],
@@ -252,6 +257,25 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         .expect("second service task exits")
         .expect("second service stops cleanly");
     assert_eq!(checkpoint.records, 3);
+    let stored: Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).expect("read durable checkpoint"))
+            .expect("checkpoint JSON decodes");
+    assert_eq!(stored.as_object().expect("checkpoint object").len(), 3);
+    assert_eq!(stored["apiVersion"], CHECKPOINT_API_VERSION);
+    assert_eq!(stored["records"], 3);
+    assert!(stored["head"].as_str().is_some());
+
+    let audit = fs::read_to_string(&audit_path).expect("read audit before truncation");
+    let first = audit.lines().next().expect("audit has a first record");
+    fs::write(&audit_path, format!("{first}\n")).expect("write valid-prefix truncation");
+    let error = run(&config_path, async {})
+        .await
+        .expect_err("checkpoint must reject valid-prefix audit rollback");
+    assert!(matches!(
+        error,
+        BrokerdError::Checkpoint(CheckpointError::AuditMismatch)
+    ));
+    assert!(!socket_path.exists());
 }
 
 async fn wait_for_socket(

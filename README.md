@@ -17,13 +17,13 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
-- A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, and drains bounded connections on shutdown.
+- A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing/trace export, and explicit bounded broker capability/invocation client commands.
 
 ## What does not work yet
 
-There is no unprivileged agent daemon, credential broker service, externally anchored audit/checkpoint service, task store, agent memory, or operator-CLI integration with the broker. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+There is no unprivileged agent daemon, credential broker service, independently retained/signed/remote audit checkpoint service, task store, agent memory, or operator-CLI integration with the broker. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
@@ -41,7 +41,7 @@ dekopon-run --version
 
 The `0.1.0` crates are published. The workspace now targets the `0.2.0` development line; install from the repository as shown above until that release is cut.
 
-`dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit directories, and pinned provider component paths:
+`dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
@@ -94,7 +94,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are broker-owned credentials, external checkpoint anchoring, operator/agent integration, and a separate unprivileged `dekopond`. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are broker-owned credentials, independent checkpoint retention or signing, operator/agent integration, and a separate unprivileged `dekopond`. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Organization and package names
 

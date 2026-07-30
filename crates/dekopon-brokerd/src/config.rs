@@ -38,6 +38,8 @@ pub struct BrokerdConfig {
     pub api_version: ConfigApiVersion,
     pub socket_path: PathBuf,
     pub audit_path: PathBuf,
+    pub checkpoint_path: PathBuf,
+    pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
     pub providers: Vec<PathBuf>,
@@ -172,6 +174,8 @@ pub struct ResolvedConfig {
     pub source: PathBuf,
     pub socket_path: PathBuf,
     pub audit_path: PathBuf,
+    pub checkpoint_path: PathBuf,
+    pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
     pub providers: Vec<PathBuf>,
@@ -254,6 +258,13 @@ fn resolve_future_path(path: PathBuf) -> Result<PathBuf, ConfigError> {
     Ok(parent.join(name))
 }
 
+fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf, ConfigError> {
+    let name = path.file_name().ok_or(ConfigError::MissingFileName)?;
+    let mut sibling = name.to_os_string();
+    sibling.push(suffix);
+    Ok(path.with_file_name(sibling))
+}
+
 fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, ConfigError> {
     if config.providers.is_empty() {
         return Err(ConfigError::NoProviders);
@@ -281,6 +292,9 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
     let source = resolve_future_path(source)?;
     let socket_path = resolve_future_path(resolve_path(config.socket_path))?;
     let audit_path = resolve_future_path(resolve_path(config.audit_path))?;
+    let checkpoint_path = resolve_future_path(resolve_path(config.checkpoint_path))?;
+    let checkpoint_lock_path = resolve_future_path(resolve_path(config.checkpoint_lock_path))?;
+    let checkpoint_temporary_path = sibling_with_suffix(&checkpoint_path, ".tmp")?;
     let mut provider_set = BTreeSet::new();
     let mut providers = Vec::with_capacity(config.providers.len());
     for provider in config.providers {
@@ -295,12 +309,18 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         }
         providers.push(provider);
     }
-    if socket_path == audit_path
-        || socket_path == source
-        || audit_path == source
-        || providers.iter().any(|provider| {
-            provider == &socket_path || provider == &audit_path || provider == &source
-        })
+    let reserved = [
+        source.clone(),
+        socket_path.clone(),
+        audit_path.clone(),
+        checkpoint_path.clone(),
+        checkpoint_lock_path.clone(),
+        checkpoint_temporary_path,
+    ];
+    if reserved.iter().collect::<BTreeSet<_>>().len() != reserved.len()
+        || providers
+            .iter()
+            .any(|provider| reserved.iter().any(|path| path == provider))
     {
         return Err(ConfigError::ConflictingPaths);
     }
@@ -359,6 +379,8 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         source,
         socket_path,
         audit_path,
+        checkpoint_path,
+        checkpoint_lock_path,
         broker_principal: config.broker_principal,
         policy_revision: config.policy_revision,
         providers,
@@ -398,7 +420,7 @@ pub enum ConfigError {
     },
     #[error("configured path has no parent")]
     MissingParent,
-    #[error("configured socket or audit path has no file name")]
+    #[error("configured socket, audit, or checkpoint path has no file name")]
     MissingFileName,
     #[error("could not resolve configured path: {path}")]
     ResolvePath {
@@ -412,7 +434,9 @@ pub enum ConfigError {
     TooManyProviders { maximum: usize },
     #[error("broker configuration must map at least one peer identity")]
     NoIdentities,
-    #[error("configuration, socket, audit, and provider paths must not conflict")]
+    #[error(
+        "configuration, socket, audit, checkpoint, lock, temporary, and provider paths must not conflict"
+    )]
     ConflictingPaths,
     #[error("provider component path is repeated: {path}")]
     DuplicateProviderPath { path: PathBuf },

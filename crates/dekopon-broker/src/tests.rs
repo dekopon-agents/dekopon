@@ -124,6 +124,19 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
     let checkpoint = audit.checkpoint().await;
     assert_eq!(checkpoint.0, 2);
     assert!(checkpoint.1.is_some());
+    assert!(audit.contains_checkpoint(0, None).await);
+    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
+    let first = serde_json::from_str::<AuditRecord>(
+        fs::read_to_string(&path)
+            .expect("read synchronized audit")
+            .lines()
+            .next()
+            .expect("first record exists"),
+    )
+    .expect("first record decodes");
+    assert!(audit.contains_checkpoint(1, Some(&first.record_hash)).await);
+    assert!(!audit.contains_checkpoint(1, checkpoint.1.as_deref()).await);
+    assert!(!audit.contains_checkpoint(3, None).await);
     let error = FileAuditLog::open(&path, 4, 16 * 1024)
         .await
         .expect_err("a second writer must not share the audit file");
