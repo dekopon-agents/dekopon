@@ -385,6 +385,10 @@ pub mod broker {
         _private: (),
     }
 
+    #[allow(
+        clippy::new_without_default,
+        reason = "authorization transitions should require an explicit broker-owned constructor"
+    )]
     impl AuthorizationGate {
         /// Creates a transition handle for trusted broker code.
         ///
