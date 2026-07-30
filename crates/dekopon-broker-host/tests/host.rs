@@ -34,6 +34,21 @@ fn authorized(
     input: Value,
     constraints: ExecutionConstraints,
 ) -> AuthorizedInvocation {
+    let provider = capability
+        .as_str()
+        .split('.')
+        .next()
+        .expect("fixture capability has a provider prefix")
+        .to_owned();
+    authorized_for(&provider, capability, input, constraints)
+}
+
+fn authorized_for(
+    provider: &str,
+    capability: CapabilityId,
+    input: Value,
+    constraints: ExecutionConstraints,
+) -> AuthorizedInvocation {
     let proposal = ProposedInvocation::new(
         "invoke-test"
             .parse::<InvocationId>()
@@ -52,6 +67,7 @@ fn authorized(
     AuthorizationGate::new()
         .authorize(
             proposal,
+            provider.parse().expect("valid provider fixture"),
             "decision-test".to_owned(),
             "broker-test"
                 .parse::<PrincipalId>()
@@ -410,6 +426,28 @@ async fn broker_host_also_runs_import_free_components() {
 
     assert_eq!(output.output, json!({"message": "hello"}));
     assert!(output.http_calls.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_authorization_bound_to_a_different_provider() {
+    let registry =
+        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("echo provider loads");
+    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let error = registry
+        .invoke(authorized_for(
+            "http-probe",
+            capability,
+            json!({"message": "hello"}),
+            ExecutionConstraints::default(),
+        ))
+        .await
+        .expect_err("authorization cannot be retargeted to the routed provider");
+    assert!(matches!(
+        error,
+        BrokerHostError::AuthorizedProviderMismatch { .. }
+    ));
 }
 
 #[test]

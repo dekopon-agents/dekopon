@@ -1,0 +1,27 @@
+[package]
+name = "dekopon-broker"
+description = "Deny-by-default authorization, execution, evidence, and audit core for Dekopon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-broker"
+readme = "README.md"
+keywords = ["agents", "authorization", "audit", "wasm", "security"]
+categories = ["authentication", "development-tools"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-broker-host.workspace = true
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

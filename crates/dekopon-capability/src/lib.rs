@@ -261,14 +261,16 @@ impl AuthorizationReceipt {
 
 /// An invocation for which a broker has explicitly granted authority.
 ///
-/// Private fields prevent accidental conversion from an untrusted proposal. The value is not
-/// cloneable or deserializable: the broker-owned execution boundary creates and consumes it once. It is serializable as
+/// Private fields prevent accidental conversion from an untrusted proposal. The selected provider
+/// is bound alongside the proposal and constraints. The value is not cloneable or deserializable:
+/// the broker-owned execution boundary creates and consumes it once. It is serializable as
 /// inert data for future broker-owned audit and evidence recording, but its serialized form
 /// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
 #[derive(Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
     proposal: ProposedInvocation,
+    provider: ProviderId,
     receipt: AuthorizationReceipt,
     constraints: ExecutionConstraints,
 }
@@ -278,6 +280,12 @@ impl AuthorizedInvocation {
     #[must_use]
     pub fn proposal(&self) -> &ProposedInvocation {
         &self.proposal
+    }
+
+    /// Returns the exact provider selected by trusted policy and routing.
+    #[must_use]
+    pub fn provider(&self) -> &ProviderId {
+        &self.provider
     }
 
     /// Returns the broker authorization receipt.
@@ -291,6 +299,21 @@ impl AuthorizedInvocation {
     pub fn constraints(&self) -> &ExecutionConstraints {
         &self.constraints
     }
+}
+
+/// Public, inert linkage to the broker decision behind an invocation result.
+///
+/// Unlike [`AuthorizationReceipt`], this value is deserializable because it carries no execution
+/// authority and cannot be converted into an [`AuthorizedInvocation`].
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DecisionReference {
+    /// Stable broker decision identifier.
+    pub decision_id: String,
+    /// Broker principal that owned the authority transition.
+    pub authorized_by: PrincipalId,
+    /// Exact evaluated policy revision.
+    pub policy_revision: String,
 }
 
 /// A piece of evidence produced during authorization or execution.
@@ -326,6 +349,8 @@ pub enum InvocationOutcome {
 pub struct InvocationResult {
     /// Invocation identifier.
     pub invocation: InvocationId,
+    /// Inert linkage to the broker decision and policy revision.
+    pub decision: DecisionReference,
     /// Terminal state.
     pub outcome: InvocationOutcome,
     /// Provider output when available.
@@ -372,7 +397,7 @@ pub enum AuthorizationError {
 /// packaged broker adapter own the transition; it does not authenticate anything by itself and
 /// must never be driven directly from model-provided data.
 pub mod broker {
-    use dekopon_core::PrincipalId;
+    use dekopon_core::{PrincipalId, ProviderId};
 
     use super::{
         AuthorizationError, AuthorizationReceipt, AuthorizedInvocation, ExecutionConstraints,
@@ -387,7 +412,7 @@ pub mod broker {
 
     #[allow(
         clippy::new_without_default,
-        reason = "authorization transitions should require an explicit broker-owned constructor"
+        reason = "authority transitions should require an explicit broker-owned constructor"
     )]
     impl AuthorizationGate {
         /// Creates a transition handle for trusted broker code.
@@ -404,6 +429,7 @@ pub mod broker {
         pub fn authorize(
             &self,
             proposal: ProposedInvocation,
+            provider: ProviderId,
             decision_id: String,
             authorized_by: PrincipalId,
             policy_revision: String,
@@ -438,6 +464,7 @@ pub mod broker {
 
             Ok(AuthorizedInvocation {
                 proposal,
+                provider,
                 receipt: AuthorizationReceipt {
                     decision_id,
                     authorized_by,
@@ -477,6 +504,7 @@ mod tests {
         let authorized = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
+                "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
                 "policy-1".to_owned(),
@@ -485,6 +513,7 @@ mod tests {
             .expect("valid broker decision");
 
         assert_eq!(authorized.proposal().id.as_str(), "invoke-1");
+        assert_eq!(authorized.provider().as_str(), "github");
         assert_eq!(authorized.receipt().decision_id(), "decision-1");
         assert_eq!(authorized.constraints().timeout_ms, 30_000);
     }
@@ -498,6 +527,7 @@ mod tests {
         let error = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
+                "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
                 "policy-1".to_owned(),
@@ -546,6 +576,7 @@ mod tests {
             let error = broker::AuthorizationGate::new()
                 .authorize(
                     proposal(),
+                    "github".parse().expect("valid provider fixture"),
                     "decision-1".to_owned(),
                     "broker".parse::<PrincipalId>().expect("valid fixture"),
                     "policy-1".to_owned(),
@@ -575,6 +606,7 @@ mod tests {
         let authorized = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
+                "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
                 "policy-1".to_owned(),
@@ -593,6 +625,7 @@ mod tests {
                     "trace": "trace-1",
                     "input": {"body": "Looks good"}
                 },
+                "provider": "github",
                 "receipt": {
                     "decisionId": "decision-1",
                     "authorizedBy": "broker",

@@ -36,7 +36,7 @@ Finally, read the documents selected by the work:
 - Do not add empty crates or heavy future dependencies without meaningful, tested behavior.
 - Parse config once into typed resources; do not spread YAML handling through command execution.
 - Provider schemas are model-facing metadata, not complete host validation; providers must validate capability-specific input.
-- The SDK and host provider WIT files must remain identical. The SDK copy is also the source for the published `dekopon:provider` WIT package; preserve its import-free boundary and bump its WIT version before changing an already-published contract. The canonical `dekopon:http` WIT file and every checked-in guest fixture mirror must also remain identical. Never hand-edit generated provider `.wasm` files; rebuild them from their Rust source.
+- The SDK and host provider WIT files must remain identical. The SDK copy is also the source for the published `dekopon:provider` WIT package; preserve its import-free boundary and bump its WIT version before changing an already-published contract. The canonical `dekopon:http` WIT file and every checked-in guest or broker-host mirror must also remain identical. Never hand-edit generated provider `.wasm` files; rebuild them from their Rust source.
 - Root workspace commands do not cover the separate workspaces under `examples/providers/`; validate each affected provider workspace explicitly.
 - Do not publish crates, create releases, weaken branch protection, or add credentials without explicit human authorization.
 

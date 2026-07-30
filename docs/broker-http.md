@@ -6,7 +6,9 @@ This document records both the implemented privileged host foundation and the **
 
 The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. The broker host compiles components once, creates fresh bounded stores, links only the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata.
 
-Authenticated transport, replay defense, policy evaluation, authorization construction, audit persistence, broker clients, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
+`dekopon-broker` now binds a separately supplied authenticated context to exact principal/actor/capability/provider rules, validates trusted metadata and constraints at startup, rejects invocation-ID reuse for the process lifetime, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
+
+Authenticated transport, restart-persistent replay state, durable audit persistence and checkpoints, broker clients, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
 
 ## Decision
 
@@ -114,9 +116,9 @@ Policy decisions produce a stable decision identifier and policy revision. Autho
 
 ## Evidence and audit
 
-Each broker request produces an append-only audit entry for denial, success, or failure. Entries correlate authenticated principal, invocation and trace identifiers, capability, provider, policy decision, effect classification, timing, outcome, and bounded HTTP metadata. Request and response bodies, authorization headers, cookies, credentials, model text, and provider-returned sensitive values are not written to normal audit fields.
+The current core appends one decision event for every request and a terminal execution event after each authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, effect/risk/idempotency classification, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
 
-Audit entries are hash-linked within one broker log so truncation or reordering after a known checkpoint is detectable. This is local integrity evidence, not a claim of tamper-proof storage against a compromised broker host. Durable remote anchoring, key-backed signatures, tenancy, and incident-response machinery remain separate work.
+The current bounded in-memory implementation hash-links events and verifies mutation or reordering within its retained chain. A deployable broker must persist the same append sequence durably before it exposes effects. With a known durable checkpoint, truncation or reordering is detectable. This is local integrity evidence, not a claim of tamper-proof storage against a compromised broker host. Durable remote anchoring, key-backed signatures, tenancy, and incident-response machinery remain separate work.
 
 ## Version and implementation policy
 
@@ -137,8 +139,9 @@ The behavior lands in reviewable slices without temporarily granting authority t
 1. **Implemented:** publish and validate the HTTP WIT contract and guest bindings.
 2. **Implemented:** generalize provider guest world generation and add an HTTP-importing fixture that the immediate host still rejects.
 3. **Implemented foundation:** add the bounded native engine and asynchronous broker-owned component host with loopback mock-server tests.
-4. Add authenticated broker transport, deny-by-default policy, authorization issuance, evidence, and audit.
-5. Add broker client mode and a JSONPlaceholder demonstration provider with separately named read and write capabilities.
-6. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
+4. **Implemented foundation:** add exact deny-by-default policy, trusted context binding, single-use authorization, bounded replay state, digest evidence, and an in-memory verifiable audit chain.
+5. Add authenticated broker transport plus durable replay/audit persistence.
+6. Add broker client mode and a JSONPlaceholder demonstration provider with separately named read and write capabilities.
+7. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
 
 Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

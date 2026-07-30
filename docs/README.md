@@ -13,7 +13,7 @@ Read in this order:
 3. [`security-model.md`](security-model.md) — trusted and untrusted inputs, threat model, and present limitations.
 4. [`architecture.md`](architecture.md) — how the design maps to current crates and planned processes.
 5. [`cli.md`](cli.md) and [`run.md`](run.md) — the two current user-facing command surfaces.
-6. [`broker-http.md`](broker-http.md) — committed broker-mediated HTTP design; not current behavior until implemented.
+6. [`broker-http.md`](broker-http.md) — implemented host/policy foundation and committed authenticated broker-process design, with status called out per slice.
 7. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ### Change a specific area
@@ -29,7 +29,7 @@ Read in this order:
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`broker-http.md`](broker-http.md) | Records the accepted HTTP contract, process ownership, authorization, and delivery boundaries. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
 
-Implementation-level contracts live beside their code in `crates/*/README.md`, including the bounded native [`dekopon-http-host`](../crates/dekopon-http-host/README.md) engine and privileged async [`dekopon-broker-host`](../crates/dekopon-broker-host/README.md) adapter boundaries. The provider example and generated-component workflow are documented in [`../examples/providers/echo/README.md`](../examples/providers/echo/README.md); guest HTTP bindings are documented in [`../crates/dekopon-provider-http/README.md`](../crates/dekopon-provider-http/README.md).
+Implementation-level contracts live beside their code in `crates/*/README.md`, including the bounded native [`dekopon-http-host`](../crates/dekopon-http-host/README.md) engine, privileged async [`dekopon-broker-host`](../crates/dekopon-broker-host/README.md) adapter, and exact-policy [`dekopon-broker`](../crates/dekopon-broker/README.md) coordination boundaries. The provider example and generated-component workflow are documented in [`../examples/providers/echo/README.md`](../examples/providers/echo/README.md); guest HTTP bindings are documented in [`../crates/dekopon-provider-http/README.md`](../crates/dekopon-provider-http/README.md).
 
 Also read [`../CONTRIBUTING.md`](../CONTRIBUTING.md) before submitting a change and [`../SECURITY.md`](../SECURITY.md) before reporting a vulnerability.
 
