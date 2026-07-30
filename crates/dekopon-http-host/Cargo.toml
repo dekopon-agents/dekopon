@@ -1,0 +1,25 @@
+[package]
+name = "dekopon-http-host"
+description = "Statically linked bounded HTTP primitive for Dekopon broker hosts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-http-host"
+readme = "README.md"
+keywords = ["agents", "http", "security", "sandbox", "wasm"]
+categories = ["web-programming::http-client"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-capability.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

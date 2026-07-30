@@ -26,6 +26,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
+| Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
@@ -59,7 +60,7 @@ The SDK and host provider WIT files are mirrored and must remain byte-identical:
 - `crates/dekopon-provider-sdk/wit/provider.wit`
 - `crates/dekopon-provider-host/wit/provider.wit`
 
-The buffered HTTP WIT package and guest copies are also mirrored:
+The buffered HTTP WIT package and guest/host copies are also mirrored:
 
 - `wit/http/http.wit`
 - `crates/dekopon-provider-http/wit/deps/http.wit`
@@ -69,7 +70,7 @@ The HTTP probe also mirrors the provider package under `examples/providers/http-
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.1.0` world and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
-Immediate providers must remain read-only and import-free; adding WASI or a host import is an authority change, not a convenience refactor.
+Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. The native `dekopon-http-host` engine is not component-linked: it consumes one exact HTTP grant beneath independent host ceilings, disables redirects and ambient proxies, validates and pins DNS results, and returns sanitized HTTP evidence metadata.
 
 The checked-in components are generated:
 
@@ -88,6 +89,8 @@ GitHub Actions are pinned by full commit SHA. Required check names such as `test
 
 ## Runtime facts that are easy to miss
 
+Immediate host:
+
 - A `ProviderRegistry` retains compiled Wasmtime `Component` values for its lifetime. There is no cross-process or on-disk compilation cache.
 - Every describe or invoke operation creates a fresh bounded store and component instance.
 - One shared runtime mutex serializes immediate component execution; current calls are not parallel.
@@ -96,6 +99,13 @@ GitHub Actions are pinned by full commit SHA. Required check names such as `test
 - Immediate provider output is raw JSON. It is not broker evidence, an `InvocationResult`, or an authorization receipt.
 - Prompt-visible tool names are deterministic adaptations of capability IDs. Model tool selection and arguments remain untrusted.
 - The prompt loop is bounded by `--max-steps` and at most 32 tool calls per model turn.
+
+Native HTTP engine:
+
+- `BufferedHttpClient` accepts a broker-produced `HttpConstraints` grant but performs no authorization transition itself.
+- Grants can narrow but never widen native ceilings for HTTP call count, request bytes, response bytes, and headers.
+- Native HTTP disables redirects, ambient proxies, and decompression; DNS results are checked and pinned before connection.
+- The engine is not yet linked to WIT, Wasmtime, provider credentials, or any operator command.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
 

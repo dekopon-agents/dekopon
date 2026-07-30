@@ -47,6 +47,7 @@ Crate boundaries are:
 - `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and adapters for its default or a caller-generated provider world.
 - `dekopon-provider-http`: guest-only Rust facade for the published buffered HTTP interface; no current host implements it.
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry.
+- `dekopon-http-host`: statically linked native buffered HTTP engine; it consumes HTTP constraints but is not yet linked to a component host.
 - `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.
 - `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, and trace export.
 - `dekopon-testkit`: private builders used by workspace tests.
@@ -79,7 +80,7 @@ Capability JSON Schemas are exposed to models and must be object-shaped, but the
 
 Model authentication terminates in the model client, separately from provider authority. ChatGPT subscription mode owns a distinct device-flow credential file, refreshes tokens only against OpenAI's fixed authentication host, and sends inference only to the fixed Codex Responses host. It does not import another application's token store or expose model credentials to a component.
 
-The privileged provider design remains future work. The broker will share Wasmtime's compiled engine and component cache, create a fresh bounded store for every authorized invocation, and expose narrowly scoped asynchronous host interfaces integrated with Tokio. The first such interface is the committed buffered `dekopon:http@1.0.0` contract described in [`broker-http.md`](broker-http.md). Its native Rust implementation is statically linked into `dekopon-brokerd`; guest bindings are statically linked into provider components. Network destinations, methods, credentials, retries, evidence, and host calls are derived from an authenticated `AuthorizedInvocation`, not from an immediate prompt session. Direct `dekopon-run` execution must not grow those privileges in-process; broker-backed runner operations remain unprivileged clients.
+The privileged provider process and component linker remain future work, while their native HTTP engine is now present. `dekopon-http-host` consumes exact destinations, methods, call counts, byte limits, and deadlines from broker-produced HTTP constraints beneath independent ceilings. It checks and pins DNS results, disables redirects and ambient proxies, and emits sanitized metadata, but it knows nothing about WIT, Wasmtime, authenticated callers, policy decisions, or credentials. The future broker host will adapt the buffered `dekopon:http@1.0.0` contract described in [`broker-http.md`](broker-http.md) to this statically linked engine. Direct `dekopon-run` execution must not grow those privileges in-process; broker-backed runner operations remain unprivileged clients.
 
 ## Resource evolution
 

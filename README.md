@@ -16,12 +16,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
-- A published buffered `dekopon:http@1.0.0` contract and guest Rust facade; no current host implements the import.
+- A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, and statically linked bounded native HTTP engine; no current component host or broker process exposes it.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
 
 ## What does not work yet
 
-There is no daemon, authenticated network API, policy engine, credential broker, privileged provider host, task store, or agent memory in `0.1.0`. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+There is no daemon, authenticated network API, policy engine, credential broker, privileged component host, task store, or agent memory in `0.1.0`. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
