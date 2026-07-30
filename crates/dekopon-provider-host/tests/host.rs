@@ -9,10 +9,10 @@ fn provider_path() -> PathBuf {
         .join("examples/providers/echo-provider.wasm")
 }
 
-fn http_probe_path() -> PathBuf {
+fn imported_provider_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("examples/providers/http-probe-provider.wasm")
+        .join(format!("examples/providers/{name}"))
 }
 
 fn load_echo() -> ProviderRegistry {
@@ -126,10 +126,13 @@ fn reports_unknown_capabilities_without_entering_wasm() {
 
 #[test]
 fn immediate_host_rejects_components_requiring_http() {
-    let error = ProviderRegistry::load([http_probe_path()], HostLimits::default())
-        .expect_err("the immediate linker must not satisfy HTTP imports");
+    for fixture in ["http-probe-provider.wasm", "jsonplaceholder-provider.wasm"] {
+        let error =
+            ProviderRegistry::load([imported_provider_path(fixture)], HostLimits::default())
+                .expect_err("the immediate linker must not satisfy HTTP imports");
 
-    assert!(matches!(error, ProviderHostError::Instantiate { .. }));
+        assert!(matches!(error, ProviderHostError::Instantiate { .. }));
+    }
 }
 
 #[test]
