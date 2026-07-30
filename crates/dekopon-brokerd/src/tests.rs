@@ -125,7 +125,6 @@ async fn stale_socket_is_replaced_but_guard_never_removes_a_new_inode() {
     let (listener, mut guard) = socket::bind(&path, uid)
         .await
         .expect("replace safe stale socket");
-    drop(listener);
     fs::remove_file(&path).expect("remove guarded socket before replacement");
     let replacement = tokio::net::UnixListener::bind(&path).expect("bind replacement socket");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
@@ -133,5 +132,6 @@ async fn stale_socket_is_replaced_but_guard_never_removes_a_new_inode() {
     assert!(guard.cleanup().is_err());
     assert!(path.exists());
     drop(replacement);
+    drop(listener);
     fs::remove_file(path).expect("remove replacement fixture");
 }
