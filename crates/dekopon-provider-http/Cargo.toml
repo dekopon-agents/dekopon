@@ -1,0 +1,20 @@
+[package]
+name = "dekopon-provider-http"
+description = "Rust guest bindings for Dekopon's buffered broker-mediated HTTP interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-http"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "http", "sdk"]
+categories = ["wasm", "api-bindings"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[lints]
+workspace = true

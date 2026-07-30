@@ -48,6 +48,8 @@ jobs:
         env:
           CARGO_TARGET_DIR: target/provider-example
         run: cargo check --locked --manifest-path examples/providers/echo/Cargo.toml --target wasm32-unknown-unknown
+      - name: Check HTTP guest bindings for Wasm
+        run: cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings

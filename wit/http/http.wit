@@ -1,0 +1,57 @@
+package dekopon:http@1.0.0;
+
+/// Buffered, broker-mediated HTTP for Dekopon provider components.
+interface client {
+    /// One HTTP header. Names are ASCII tokens; values are opaque bytes.
+    record header {
+        name: string,
+        value: list<u8>,
+    }
+
+    /// A complete buffered HTTP request.
+    record request {
+        /// Any valid HTTP method token. Authorization remains host-owned.
+        method: string,
+        /// Absolute request URI.
+        uri: string,
+        /// Ordered request headers. Duplicate names are preserved.
+        headers: list<header>,
+        /// Complete request body.
+        body: list<u8>,
+    }
+
+    /// A complete buffered HTTP response.
+    record response {
+        status: u16,
+        /// Ordered response headers. Duplicate names are preserved.
+        headers: list<header>,
+        /// Complete response body.
+        body: list<u8>,
+    }
+
+    /// Stable classes of broker or transport failure.
+    enum error-code {
+        invalid-method,
+        invalid-uri,
+        invalid-header,
+        request-too-large,
+        denied,
+        host-call-limit,
+        dns,
+        connect,
+        tls,
+        timeout,
+        protocol,
+        response-too-large,
+        internal,
+    }
+
+    /// A bounded HTTP failure safe to return to a provider.
+    record http-error {
+        code: error-code,
+        message: string,
+    }
+
+    /// Executes one authorized, bounded request.
+    send: func(request: request) -> result<response, http-error>;
+}
