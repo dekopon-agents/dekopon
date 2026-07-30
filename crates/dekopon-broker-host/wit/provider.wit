@@ -1,0 +1,7 @@
+package dekopon:broker-provider@0.1.0;
+
+/// Broker provider world with buffered HTTP authority supplied per invocation.
+world provider {
+    include dekopon:provider/provider@0.1.0;
+    import dekopon:http/client@1.0.0;
+}

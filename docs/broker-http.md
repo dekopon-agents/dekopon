@@ -1,10 +1,12 @@
 # Broker-mediated HTTP providers
 
-This document records the **committed direction** for the first privileged Dekopon provider host. It does not describe current behavior until the corresponding broker, host interface, and client paths are implemented and tested.
+This document records both the implemented privileged host foundation and the **committed direction** for the broker process around it. Status is called out explicitly because a host library does not by itself create an authenticated external-effect path.
 
 ## Current foundation
 
-The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, and the statically linked `dekopon-http-host` native engine are current once their slices land. The checked-in HTTP probe demonstrates direct-host rejection, while the native engine is tested only against loopback mock servers and is not yet component-linked. Async Wasmtime integration, authenticated transport, policy, audit, client, credentials, and external interaction remain committed direction until their respective slices are implemented and tested.
+The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. The broker host compiles components once, creates fresh bounded stores, links only the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata.
+
+Authenticated transport, replay defense, policy evaluation, authorization construction, audit persistence, broker clients, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
 
 ## Decision
 
@@ -98,7 +100,7 @@ Before performing a request, the broker host validates all of the following agai
 - the request body and complete encoded request remain within their limits;
 - the invocation has remaining host-call budget.
 
-The native client does not inherit proxy configuration from the environment and does not follow redirects. DNS results are checked against the authorized destination policy before connection, and redirects cannot be used to escape that decision. Responses have status, header, body, decompression, and wall-clock bounds. Dropping or timing out an invocation cancels outstanding host work and releases its resources.
+The native client does not inherit proxy configuration from the environment, does not follow redirects, and disables automatic decompression. DNS results are checked against destination rules and pinned into the client before connection, so a later resolver answer or redirect cannot escape that decision. Response headers and bodies, host calls, Wasm memory and fuel, serialized input/output, and wall-clock duration are bounded. Timing out an invocation drops the async Wasmtime/HTTP operation and releases its fresh store.
 
 Provider credentials remain broker-owned. A future credential resolver may inject destination-bound headers after guest headers and policy have been validated; raw credentials are never returned to the provider, model, client, trace, evidence, or normal audit fields.
 
@@ -130,13 +132,13 @@ The broker fails closed when no approved implementation exists for an import. Ru
 
 ## Delivery sequence
 
-The behavior can land in reviewable slices without temporarily granting authority to the immediate host:
+The behavior lands in reviewable slices without temporarily granting authority to the immediate host:
 
-1. publish and validate the HTTP WIT contract and guest bindings;
-2. generalize provider guest world generation and add an HTTP-importing fixture that the immediate host still rejects;
-3. add the bounded asynchronous broker-owned host implementation with local mock-server tests;
-4. add authenticated broker transport, deny-by-default policy, authorization, evidence, and audit;
-5. add broker client mode and a JSONPlaceholder demonstration provider with separately named read and write capabilities;
-6. add release artifacts and end-to-end CI after every preceding boundary is independently tested.
+1. **Implemented:** publish and validate the HTTP WIT contract and guest bindings.
+2. **Implemented:** generalize provider guest world generation and add an HTTP-importing fixture that the immediate host still rejects.
+3. **Implemented foundation:** add the bounded native engine and asynchronous broker-owned component host with loopback mock-server tests.
+4. Add authenticated broker transport, deny-by-default policy, authorization issuance, evidence, and audit.
+5. Add broker client mode and a JSONPlaceholder demonstration provider with separately named read and write capabilities.
+6. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
 
-Until a slice is implemented, its behavior remains committed direction rather than current functionality.
+Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

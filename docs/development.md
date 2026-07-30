@@ -27,6 +27,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
+| Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, and loopback tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
@@ -64,13 +65,14 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 
 - `wit/http/http.wit`
 - `crates/dekopon-provider-http/wit/deps/http.wit`
+- `crates/dekopon-broker-host/wit/deps/http.wit`
 - `examples/providers/http-probe/wit/deps/http.wit`
 
-The HTTP probe also mirrors the provider package under `examples/providers/http-probe/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+The HTTP probe and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit` and `crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.1.0` world and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
-Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. The native `dekopon-http-host` engine is not component-linked: it consumes one exact HTTP grant beneath independent host ceilings, disables redirects and ambient proxies, validates and pins DNS results, and returns sanitized HTTP evidence metadata.
+Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. `dekopon-broker-host` is the separate privileged adapter: it links only the project-owned HTTP interface, consumes `AuthorizedInvocation`, and maps WIT values to `dekopon-http-host`. The native engine consumes one exact HTTP grant beneath independent host ceilings, disables redirects, ambient proxies, and automatic decompression, validates and pins DNS results, and returns sanitized HTTP evidence metadata. Neither host authenticates callers, evaluates policy, constructs authorization, injects credentials, or writes audit records.
 
 The checked-in components are generated:
 
@@ -100,12 +102,15 @@ Immediate host:
 - Prompt-visible tool names are deterministic adaptations of capability IDs. Model tool selection and arguments remain untrusted.
 - The prompt loop is bounded by `--max-steps` and at most 32 tool calls per model turn.
 
-Native HTTP engine:
+Privileged host foundation:
 
 - `BufferedHttpClient` accepts a broker-produced `HttpConstraints` grant but performs no authorization transition itself.
 - Grants can narrow but never widen native ceilings for HTTP call count, request bytes, response bytes, and headers.
 - Native HTTP disables redirects, ambient proxies, and decompression; DNS results are checked and pinned before connection.
-- The engine is not yet linked to WIT, Wasmtime, provider credentials, or any operator command.
+- `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation.
+- Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
+- Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
+- The component host has no credential resolver and no workspace executable invokes it yet. Direct `dekopon-run` remains on the independent empty-linker host.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
 
@@ -135,7 +140,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --exclude dekopon-testkit --locked
 ```
 
-The host package intentionally excludes its repository-only component integration fixture, so Cargo may warn that `tests/host.rs` is not included in the published package.
+The immediate and broker host packages intentionally exclude their repository-only component integration fixtures, so Cargo may warn that `tests/host.rs` is not included in each published package.
 
 ### Provider example workspaces
 
@@ -158,6 +163,7 @@ wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
+cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-run --test cli --locked
 ```
 

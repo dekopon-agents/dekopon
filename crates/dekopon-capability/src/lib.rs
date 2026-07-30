@@ -32,6 +32,18 @@
 //! }
 //! ```
 //!
+//! Authorization is also intentionally single-use at the type boundary:
+//!
+//! ```compile_fail
+//! use dekopon_capability::AuthorizedInvocation;
+//!
+//! fn require_clone<T: Clone>() {}
+//!
+//! fn main() {
+//!     require_clone::<AuthorizedInvocation>();
+//! }
+//! ```
+//!
 //! Rust visibility is defense in depth. It is not a substitute for process isolation,
 //! authenticated broker messages, authorization policy, or credential separation.
 
@@ -249,11 +261,11 @@ impl AuthorizationReceipt {
 
 /// An invocation for which a broker has explicitly granted authority.
 ///
-/// Private fields prevent accidental conversion from an untrusted proposal. The
-/// broker-owned execution boundary creates and consumes this type. It is serializable as
+/// Private fields prevent accidental conversion from an untrusted proposal. The value is not
+/// cloneable or deserializable: the broker-owned execution boundary creates and consumes it once. It is serializable as
 /// inert data for future broker-owned audit and evidence recording, but its serialized form
 /// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
-#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize)]
+#[derive(Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
     proposal: ProposedInvocation,
@@ -355,10 +367,10 @@ pub enum AuthorizationError {
 
 /// Broker-only authority transition.
 ///
-/// `AuthorizationGate` is public so its role is visible in API documentation, but its
-/// constructor remains crate-private until a real broker process and authenticated
-/// transport exist. A future broker adapter will own gate construction; normal callers
-/// can never obtain one from model-provided data.
+/// `AuthorizationGate` is constructed only by trusted broker code after its deployment boundary
+/// has authenticated a caller and evaluated policy. Public construction lets a separately
+/// packaged broker adapter own the transition; it does not authenticate anything by itself and
+/// must never be driven directly from model-provided data.
 pub mod broker {
     use dekopon_core::PrincipalId;
 
@@ -373,12 +385,18 @@ pub mod broker {
         _private: (),
     }
 
+    #[allow(
+        clippy::new_without_default,
+        reason = "authorization transitions should require an explicit broker-owned constructor"
+    )]
     impl AuthorizationGate {
-        #[allow(
-            dead_code,
-            reason = "construction is reserved for the future authenticated broker adapter"
-        )]
-        pub(crate) const fn new() -> Self {
+        /// Creates a transition handle for trusted broker code.
+        ///
+        /// Construction itself conveys no authenticated identity or policy decision. Keep this
+        /// handle inside the privileged broker process and call [`Self::authorize`] only after
+        /// those checks have completed.
+        #[must_use]
+        pub const fn new() -> Self {
             Self { _private: () }
         }
 
@@ -429,11 +447,6 @@ pub mod broker {
             })
         }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn test_gate() -> AuthorizationGate {
-        AuthorizationGate::new()
-    }
 }
 
 #[cfg(test)]
@@ -461,7 +474,7 @@ mod tests {
 
     #[test]
     fn broker_gate_performs_explicit_authority_transition() {
-        let authorized = broker::test_gate()
+        let authorized = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
                 "decision-1".to_owned(),
@@ -482,7 +495,7 @@ mod tests {
             timeout_ms: 0,
             ..ExecutionConstraints::default()
         };
-        let error = broker::test_gate()
+        let error = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
                 "decision-1".to_owned(),
@@ -530,7 +543,7 @@ mod tests {
         ];
 
         for (http, expected) in cases {
-            let error = broker::test_gate()
+            let error = broker::AuthorizationGate::new()
                 .authorize(
                     proposal(),
                     "decision-1".to_owned(),
@@ -559,7 +572,7 @@ mod tests {
             }),
             ..ExecutionConstraints::default()
         };
-        let authorized = broker::test_gate()
+        let authorized = broker::AuthorizationGate::new()
             .authorize(
                 proposal(),
                 "decision-1".to_owned(),

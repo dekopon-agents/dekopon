@@ -89,19 +89,20 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and default or caller-generated WIT world export adapters | **Current**, experimental component contract |
 | `dekopon-provider-http` | Rust guest facade for the buffered `dekopon:http@1.0.0` import; contains no transport or authority | **Current**, bindings only |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
-| `dekopon-http-host` | Statically linked native buffered HTTP engine consuming exact grants beneath independent ceilings; no WIT or Wasmtime authority | **Current** library, not yet component-linked |
+| `dekopon-http-host` | Statically linked native buffered HTTP engine consuming exact grants beneath independent ceilings; contains no WIT or Wasmtime integration | **Current** library |
+| `dekopon-broker-host` | Privileged async Wasmtime adapter that consumes authorized invocations, links only `dekopon:http@1.0.0`, and emits bounded metadata | **Current** library, no process or operator path |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
 | `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export; future broker client without effect authority | **Current**, experimental immediate mode; broker client is **committed direction** |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
 | Policy evaluator | Declarative authorization decisions and explanations; Cedar is the intended engine after inputs stabilize | **Committed direction** |
-| Privileged provider host | Broker-controlled host imports, credentials, network, evidence, and authorized effects | **Committed direction** |
+| Deployable privileged provider path | Authenticated broker ownership of policy, credentials, component-host execution, durable evidence, and authorized effects | **Committed direction** |
 
 The agent daemon must not gain effect authority merely because it coordinates a task. The broker must not perform model orchestration merely because it can execute a provider.
 
 ## Current control paths
 
-Version `0.1.0` retains the local catalog read path:
+The published `0.1.0` baseline and current development line retain the local catalog read path:
 
 ```text
 parse dekopon CLI
@@ -133,7 +134,7 @@ parse dekopon-run CLI
   -> JSON result/timings and optional Chrome trace
 ```
 
-The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. No current path resolves provider credentials, makes an authorization decision, creates external effects, or produces durable audit evidence.
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. No current executable resolves provider credentials, makes an authorization decision, creates provider external effects, or produces durable audit evidence.
 
 ## Resource and API design
 
@@ -205,7 +206,7 @@ Wasm provider          one narrow integration operation
 
 The agent and broker will run as separate processes and separate pods. `dekopond` sends authenticated proposal envelopes and receives results; it does not receive or relay an `AuthorizedInvocation` as a wire grant. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
 
-Wasmtime now supports meaningful, tested immediate-mode component execution with no host imports. This does not implement the broker deployment or privileged provider contract. The first privileged host will expose a statically implemented, buffered `dekopon:http@1.0.0` interface only inside `dekopon-brokerd`; its accepted contract, authorization boundary, and staged delivery are defined in [`broker-http.md`](broker-http.md). Tokio becomes justified when that bounded asynchronous host is implemented; Cedar remains deferred until authorization inputs and explainability requirements have been proven by the initial deny-by-default policy.
+Wasmtime now supports two intentionally disjoint tested libraries. The immediate host exposes no imports and remains the only host used by `dekopon-run`. The privileged `dekopon-broker-host` uses Tokio and exposes only the statically implemented, buffered `dekopon:http@1.0.0` interface, consumes constrained authorization state, and creates a fresh bounded store per operation. It is not a broker deployment: no executable authenticates callers, evaluates policy, constructs authorization, resolves credentials, or writes audit records. Its accepted contract and remaining staged delivery are defined in [`broker-http.md`](broker-http.md). Cedar remains deferred until authorization inputs and explainability requirements have been proven by the initial deny-by-default policy.
 
 ## Operator interface
 

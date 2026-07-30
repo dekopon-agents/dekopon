@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/dekopon",
+    "crates/dekopon-broker-host",
     "crates/dekopon-capability",
     "crates/dekopon-config",
     "crates/dekopon-core",
@@ -44,6 +45,7 @@ ureq = { version = "3.3.0", default-features = false, features = ["json", "rustl
 wasmtime = { version = "36.0.12", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
+dekopon-broker-host = { version = "0.2.0", path = "crates/dekopon-broker-host" }
 dekopon-capability = { version = "0.2.0", path = "crates/dekopon-capability" }
 dekopon-config = { version = "0.2.0", path = "crates/dekopon-config" }
 dekopon-core = { version = "0.2.0", path = "crates/dekopon-core" }

@@ -18,7 +18,7 @@ A capability name in an agent spec permits the agent to propose that operation. 
 
 The daemon-to-broker request carries a proposal in an authenticated envelope, not an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopond`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
 
-Rust's private `AuthorizedInvocation` fields and intentional absence of deserialization make accidental in-process fabrication harder. This is defense in depth only. The real authority boundary depends on separate processes, authenticated and replay-resistant requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and durable audit integrity.
+Rust's private, non-cloneable `AuthorizedInvocation` fields and intentional absence of deserialization make accidental in-process fabrication or reuse harder. `AuthorizationGate::new` is public so a broker adapter can own the transition; constructing that handle does not authenticate a caller or evaluate policy. This is defense in depth only. The real authority boundary depends on separate processes, authenticated and replay-resistant requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and durable audit integrity.
 
 ## Trust boundaries
 
@@ -52,7 +52,7 @@ A model or repository document cannot self-assert a trusted `Actor`. The trusted
 
 The example reviewer has `github.pull-request.read` and the explicit external-write `github.pull-request.comment`. It does not have, and the example does not declare, `github.pull-request.approve`.
 
-## Current 0.1.0 posture
+## Published 0.1.0 posture and immediate path
 
 The `dekopon` catalog commands read operator-selected YAML or JSON, reject unknown fields, validate identifiers and references, and render declarations without network access. The isolated `dekopon auth` namespace is the only current exception: it manages model-account login against fixed authentication hosts. The CLI performs no model inference, provider credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
 
@@ -72,11 +72,17 @@ The separate experimental `dekopon-run` path can contact an operator-selected Op
 
 Chrome trace fields omit prompts, model responses, component input/output, and bearer tokens. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
 
+## Current privileged host foundation
+
+`dekopon-broker-host` is a privileged library, not a deployed broker. It links only `dekopon:http@1.0.0`, consumes one non-cloneable `AuthorizedInvocation` at its public invocation boundary, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description receives a linked but disabled HTTP context, and any attempted description-time call rejects the component. Policy denials remain terminal even if guest code catches the typed WIT error.
+
+The statically linked native client enforces exact authority/port and method grants, request count and byte bounds, HTTPS by default, loopback-only explicitly authorized plaintext, DNS address validation and pinning, sensitive-header ownership, no redirects, no ambient proxy, no automatic decompression, and bounded response collection. Its evidence contains method, authorized authority, status, and byte counts—not paths, queries, headers, or bodies.
+
+This library performs no caller authentication, replay defense, policy evaluation, authorization construction, credential injection, audit persistence, or network service. No workspace executable reaches it today. Its presence does not expand `dekopon-run`: the immediate runner still uses its separate empty linker and rejects the HTTP-importing fixture.
+
 ## Threat-model limitations
 
-A native HTTP library now demonstrates destination, method, DNS, header, byte, call-count, and deadline enforcement against loopback mock servers, but it is not linked to Wasmtime and no current process authenticates a caller, evaluates policy, resolves credentials, or exposes it to a model. Its presence does not expand the immediate runner's authority.
-
-The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The immediate Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, privileged component-host path, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
+The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, replay defense, policy semantics, provider secret-store integration, deployable privileged broker path, audit storage, evidence canonicalization, key management, revocation, tenancy isolation, or incident-response automation.
 
 The committed first privileged-provider design is documented in [`broker-http.md`](broker-http.md). It preserves the separate broker boundary, keeps direct `dekopon-run` execution import-free, and treats HTTP imports as structural requirements rather than authority.
 
