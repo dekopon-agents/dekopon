@@ -293,6 +293,12 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     )
     .expect("policy is coherent");
 
+    let allowed = broker.capabilities(&context("allowed-caller"));
+    assert_eq!(allowed.len(), 1);
+    assert_eq!(allowed[0].provider.as_str(), "echo");
+    assert_eq!(allowed[0].capability.id.as_str(), "echo.echo");
+    assert!(broker.capabilities(&context("other-caller")).is_empty());
+
     let result = broker
         .invoke(
             &context("other-caller"),

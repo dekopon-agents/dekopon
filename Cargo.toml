@@ -3,6 +3,7 @@ members = [
     "crates/dekopon",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",
+    "crates/dekopon-broker-protocol",
     "crates/dekopon-capability",
     "crates/dekopon-config",
     "crates/dekopon-core",
@@ -51,6 +52,7 @@ wit-bindgen = { version = "0.44.0", default-features = false, features = ["macro
 
 dekopon-broker = { version = "0.2.0", path = "crates/dekopon-broker" }
 dekopon-broker-host = { version = "0.2.0", path = "crates/dekopon-broker-host" }
+dekopon-broker-protocol = { version = "0.2.0", path = "crates/dekopon-broker-protocol" }
 dekopon-capability = { version = "0.2.0", path = "crates/dekopon-capability" }
 dekopon-config = { version = "0.2.0", path = "crates/dekopon-config" }
 dekopon-core = { version = "0.2.0", path = "crates/dekopon-core" }

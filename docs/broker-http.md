@@ -8,7 +8,7 @@ The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust
 
 `dekopon-broker` now binds a separately supplied authenticated context to exact principal/actor/capability/provider rules, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
-Authenticated transport, external checkpoint anchoring, broker clients, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
+The versioned local wire format and unprivileged Unix client are also current: frames are length-delimited and deadline-bounded, invocation payloads contain no identity/authority fields, and clients verify private socket ownership plus server peer UID. A server-side authenticated listener, external checkpoint anchoring, credentials, and a deployable broker process remain committed direction until their respective slices are implemented and tested. No current command exposes the privileged host.
 
 ## Decision
 
@@ -61,11 +61,11 @@ External-write capabilities require this separate broker process even when a dem
 
 ## Local broker protocol
 
-The first implementation will use a local Unix-domain socket. The broker owns the socket path, creates it with owner-only permissions, and authenticates peers from operating-system socket credentials. Payload fields cannot override the authenticated principal.
+The current protocol crate defines a local Unix-domain socket client; the following server slice will own the socket path, create it with owner-only permissions, and authenticate peers from operating-system socket credentials. Payload fields have no principal or actor slot and cannot override authenticated identity.
 
-Each request carries a unique invocation identifier, trace identifier, capability identifier, bounded JSON input, and protocol version. The broker rejects duplicate invocation identifiers for the lifetime of its replay window. Requests and responses use length-delimited, size-bounded messages so a peer cannot force unbounded buffering.
+Each invocation request carries a unique invocation identifier, trace identifier, capability identifier, bounded JSON input, and protocol version. The broker rejects duplicate invocation identifiers across verified durable history and current state. Requests and responses use four-byte length-delimited, size-bounded strict JSON with one complete-frame deadline, so a peer cannot force unbounded buffering or hold a partial frame indefinitely.
 
-The initial protocol exposes only the operations needed by a broker client:
+The protocol exposes only the operations needed by a broker client:
 
 - inspect the broker's available provider capabilities;
 - submit one invocation proposal;
@@ -141,8 +141,9 @@ The behavior lands in reviewable slices without temporarily granting authority t
 3. **Implemented foundation:** add the bounded native engine and asynchronous broker-owned component host with loopback mock-server tests.
 4. **Implemented foundation:** add exact deny-by-default policy, trusted context binding, single-use authorization, bounded replay state, digest evidence, and an in-memory verifiable audit chain.
 5. **Implemented foundation:** add owner-only durable audit persistence, restart verification, checkpoints, and replay-ID restoration.
-6. Add authenticated broker transport and an unprivileged broker client.
-7. Add a JSONPlaceholder demonstration provider with separately named read and write capabilities.
-8. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
+6. **Implemented client foundation:** add strict bounded local framing and an unprivileged Unix client with no identity or authorization payload fields.
+7. Add the server-side authenticated broker listener and map OS peer credentials into trusted context.
+8. Add a JSONPlaceholder demonstration provider with separately named read and write capabilities.
+9. Add release artifacts and end-to-end CI after every preceding boundary is independently tested.
 
 Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

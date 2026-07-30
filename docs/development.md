@@ -29,6 +29,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, and loopback tests |
 | Broker policy, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests plus `crates/dekopon-broker/tests/broker.rs` exact-policy, redaction, and replay-restart tests |
+| Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
@@ -113,6 +114,7 @@ Privileged host foundation:
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
 - `dekopon-broker` validates exact trusted rules against loaded routes and host ceilings, reserves invocation IDs before policy evaluation, creates single-use authorization, and audits only metadata/digests.
 - Its `AuthenticatedContext` is a transport input, not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes a chain checkpoint, and restores replay IDs across restart; an external checkpoint is still required to detect valid-prefix truncation.
+- `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, and its client authenticates the configured server UID.
 - The component host has no credential resolver and no workspace executable invokes the broker core yet. Direct `dekopon-run` remains on the independent empty-linker host.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
@@ -168,6 +170,7 @@ wasm-tools component wit examples/providers/http-probe-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked
+cargo test -p dekopon-broker-protocol --locked
 cargo test -p dekopon-run --test cli --locked
 ```
 
