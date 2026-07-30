@@ -35,6 +35,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use dekopon_broker_host::{
     BrokerHostError, BrokerProviderRegistry, HttpCallEvidence, ProviderCapability,
 };
+pub use dekopon_broker_protocol::{AvailableCapability, InvocationRequest};
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints, Idempotency,
     InvocationOutcome, InvocationResult, ProposedInvocation, broker::AuthorizationGate,
@@ -44,7 +45,6 @@ use dekopon_core::{
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -118,22 +118,6 @@ pub enum ContextError {
     PrincipalMismatch,
 }
 
-/// Unprivileged invocation fields accepted from a broker client.
-///
-/// Actor and principal are deliberately absent: the transport supplies them separately.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct InvocationRequest {
-    /// Client-selected identifier reserved for replay rejection.
-    pub id: InvocationId,
-    /// Requested exact capability.
-    pub capability: CapabilityId,
-    /// End-to-end correlation identifier.
-    pub trace: TraceId,
-    /// Capability-specific untrusted input.
-    pub input: Value,
-}
-
 /// One exact, deny-by-default broker policy rule.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -154,19 +138,6 @@ pub struct PolicyRule {
     pub idempotency: Idempotency,
     /// Execution and optional HTTP authority granted by this rule.
     pub constraints: ExecutionConstraints,
-}
-
-/// One capability visible to an authenticated broker client.
-///
-/// Routing and effect metadata are overwritten from the trusted exact rule. Description and input
-/// schema remain bounded provider-supplied model metadata and are not authorization inputs.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AvailableCapability {
-    /// Trusted selected provider.
-    pub provider: ProviderId,
-    /// Client-visible capability metadata.
-    pub capability: ProviderCapability,
 }
 
 /// Independent broker limits for policy and replay state.

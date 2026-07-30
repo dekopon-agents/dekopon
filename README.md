@@ -2,7 +2,7 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
 
-> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model and execute import-free read-only components, but it has no broker authority, provider credentials, provider host I/O, or external effects. The separate Unix-only `dekopon-brokerd` executable can authenticate one owner-UID trust domain, enforce exact policy, and invoke privileged providers; it is not yet integrated into either unprivileged CLI.
+> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or explicitly submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, enforces exact policy, and invokes privileged providers. The `dekopon` operator CLI is not broker-integrated.
 
 ## Design documentation
 
@@ -19,11 +19,11 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
-- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing reports, and Chrome/Perfetto trace export.
+- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing/trace export, and explicit bounded broker capability/invocation client commands.
 
 ## What does not work yet
 
-There is no unprivileged agent daemon, credential broker service, externally anchored audit/checkpoint service, task store, agent memory, or CLI integration with the broker. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+There is no unprivileged agent daemon, credential broker service, externally anchored audit/checkpoint service, task store, agent memory, or operator-CLI integration with the broker. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
 
 ## Install
 
@@ -47,7 +47,7 @@ The `0.1.0` crates are published. The workspace now targets the `0.2.0` developm
 dekopon-brokerd --config /path/to/broker.yaml
 ```
 
-See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `dekopon-run` never connects to it.
+See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
 ## Run the example
 
@@ -88,13 +88,13 @@ Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at
 
 ## Security model
 
-A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-brokerd` establishes that context only from Unix peer credentials and an owner-controlled exact mapping; payloads cannot claim identity or authority. `dekopon-run` does not create authorized invocations: it executes only import-free components declaring `read-only` and performs no provider external effects.
+A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-brokerd` establishes that context only from Unix peer credentials and an owner-controlled exact mapping; payloads cannot claim identity or authority. `dekopon-run` never creates or receives authorized invocations: direct mode executes only import-free components declaring `read-only`, while broker mode submits untrusted proposals and prints broker results.
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
 
 ## Roadmap
 
-The next architectural milestones are unprivileged broker-client integration, broker-owned credentials, JSONPlaceholder demonstration capabilities, external checkpoint anchoring, and a separate unprivileged `dekopond`. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are broker-owned credentials, external checkpoint anchoring, operator/agent integration, and a separate unprivileged `dekopond`. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Organization and package names
 

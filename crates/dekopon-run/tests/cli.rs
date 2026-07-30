@@ -7,7 +7,24 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, sync::Arc};
+
+#[cfg(unix)]
+use dekopon_broker::{Broker, BrokerLimits, InMemoryAuditLog, PolicyRule};
+#[cfg(unix)]
+use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+#[cfg(unix)]
+use dekopon_broker_protocol::FrameLimits;
+#[cfg(unix)]
+use dekopon_brokerd::{BrokerServer, ServerLimits, current_uid};
+#[cfg(unix)]
+use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
+#[cfg(unix)]
+use dekopon_core::{Actor, AgentId, PrincipalId, RiskLevel};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use tokio::{net::UnixListener, sync::oneshot};
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dekopon-run"))
@@ -79,6 +96,154 @@ fn direct_mode_rejects_the_http_importing_provider() {
             stderr(&output)
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_broker_mode_uses_authenticated_client_without_loading_components() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("temporary broker directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure broker directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("secure broker socket");
+    let registry = BrokerProviderRegistry::load([provider_path()], BrokerHostLimits::default())
+        .await
+        .expect("load broker provider");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let actor = Actor::Agent {
+        agent: "runner-client-test"
+            .parse::<AgentId>()
+            .expect("valid agent fixture"),
+    };
+    let principal = "runner-client"
+        .parse::<PrincipalId>()
+        .expect("valid principal fixture");
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-runner-client".to_owned(),
+            vec![PolicyRule {
+                principal: principal.clone(),
+                actor: actor.clone(),
+                capability: "echo.echo".parse().expect("valid capability fixture"),
+                provider: "echo".parse().expect("valid provider fixture"),
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                idempotency: Idempotency::Idempotent,
+                constraints: ExecutionConstraints::default(),
+            }],
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("build broker fixture"),
+    );
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        dekopon_broker::AuthenticatedContext::new(principal, actor).expect("bind fixture context"),
+    );
+    let limits = ServerLimits {
+        frame: FrameLimits::default(),
+        max_connections: 4,
+        shutdown_grace: Duration::from_secs(2),
+    };
+    let server = BrokerServer::new(broker, identities, limits).expect("build server fixture");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+    let socket_text = socket.to_str().expect("UTF-8 socket path").to_owned();
+    let uid_text = uid.to_string();
+
+    let capabilities_socket = socket_text.clone();
+    let capabilities_uid = uid_text.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run(&[
+            "broker",
+            "capabilities",
+            "--socket",
+            &capabilities_socket,
+            "--server-uid",
+            &capabilities_uid,
+        ])
+    })
+    .await
+    .expect("capabilities process task exits");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let capabilities: Value =
+        serde_json::from_slice(&output.stdout).expect("capabilities output is JSON");
+    assert_eq!(capabilities.as_array().map(Vec::len), Some(1));
+    assert_eq!(capabilities[0]["capability"]["id"], "echo.echo");
+
+    let trace = directory.path().join("broker-trace.json");
+    let trace_text = trace.to_str().expect("UTF-8 trace path").to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        run(&[
+            "--trace",
+            &trace_text,
+            "broker",
+            "invoke",
+            "--socket",
+            &socket_text,
+            "--server-uid",
+            &uid_text,
+            "--invocation-id",
+            "invoke-runner-client",
+            "--trace-id",
+            "trace-runner-client",
+            "echo.echo",
+            "--input",
+            r#"{"message":"through broker"}"#,
+        ])
+    })
+    .await
+    .expect("invoke process task exits");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let result: Value = serde_json::from_slice(&output.stdout).expect("result output is JSON");
+    assert_eq!(result["outcome"], "Succeeded");
+    assert_eq!(result["output"], json!({"message": "through broker"}));
+    let denied_socket = socket.to_str().expect("UTF-8 socket path").to_owned();
+    let denied_uid = uid.to_string();
+    let denied = tokio::task::spawn_blocking(move || {
+        run(&[
+            "broker",
+            "invoke",
+            "--socket",
+            &denied_socket,
+            "--server-uid",
+            &denied_uid,
+            "--invocation-id",
+            "invoke-runner-denied",
+            "--trace-id",
+            "trace-runner-denied",
+            "echo.reverse",
+            "--input",
+            r#"{"message":"not authorized"}"#,
+        ])
+    })
+    .await
+    .expect("denied process task exits");
+    assert_eq!(denied.status.code(), Some(1), "{}", stderr(&denied));
+    let denial: Value = serde_json::from_slice(&denied.stdout).expect("denial output is JSON");
+    assert_eq!(denial["outcome"], "Denied");
+    assert_eq!(denial["error"], "policy-denied");
+    assert_eq!(audit.records().await.len(), 3);
+    let trace_json = std::fs::read_to_string(trace).expect("broker trace reads");
+    assert!(trace_json.contains("runner.broker.invoke"));
+    assert!(!trace_json.contains("through broker"));
+    assert!(!trace_json.contains(socket.to_string_lossy().as_ref()));
+
+    shutdown_send.send(()).expect("stop broker fixture");
+    server_task
+        .await
+        .expect("server task exits")
+        .expect("server drains cleanly");
 }
 
 #[test]

@@ -14,15 +14,15 @@ categories = ["network-programming"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
-dekopon-broker.workspace = true
 dekopon-capability.workspace = true
+dekopon-core.workspace = true
+dekopon-provider-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-dekopon-core.workspace = true
 tempfile.workspace = true
 
 [lints]

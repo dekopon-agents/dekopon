@@ -92,9 +92,9 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-http-host` | Statically linked native buffered HTTP engine consuming exact grants beneath independent ceilings; contains no WIT or Wasmtime integration | **Current** library |
 | `dekopon-broker-host` | Privileged async Wasmtime adapter that consumes authorized invocations, links only `dekopon:http@1.0.0`, and emits bounded metadata | **Current** library used by the separate broker process |
 | `dekopon-broker` | Trusted context binding, exact policy, replay rejection/recovery, authorization, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit |
-| `dekopon-broker-protocol` | Strict versioned bounded frames and unprivileged Unix client with identity/authority-free invocation payloads and server peer-UID verification | **Current** client/wire library used by broker tests and future CLI integration |
+| `dekopon-broker-protocol` | Lightweight strict versioned bounded frames and Unix client with identity/authority-free payloads and server peer-UID verification | **Current** shared broker/runner API with no privileged host or native-HTTP dependency |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
-| `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export; future broker client without effect authority | **Current**, experimental immediate mode; broker client is **committed direction** |
+| `dekopon-run` | One-shot direct invocation, model prompt tools, timing/trace export, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Owner-only Unix peer authentication, exact authorization, replay restoration, provider execution, evidence, and durable audit | **Current** privileged process; credentials and external checkpoint anchoring remain direction |
 | Exact policy evaluator | Principal/actor/capability/provider rules with bounded constraints and deny-by-default matching | **Current** library foundation |
@@ -137,7 +137,7 @@ parse dekopon-run CLI
   -> JSON result/timings and optional Chrome trace
 ```
 
-The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials and neither unprivileged CLI invokes it.
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials and neither unprivileged CLI invokes it.
 
 ## Resource and API design
 
@@ -178,7 +178,7 @@ Proposed --broker denies----------------------> Denied result + evidence
 
 `ProposedInvocation` is publicly constructible because untrusted callers are allowed to express intent. `AuthorizedInvocation` is not publicly constructible from arbitrary fields. Broker authorization must validate its decision metadata and attach bounded `ExecutionConstraints`.
 
-The direct `dekopon-run` provider path does not cross this state boundary. Its immediate prompt tool calls are unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that in-process path would violate this design. A broker-backed mode may submit proposals over an authenticated transport, but only the separate broker may authorize them, resolve privileged imports, and execute effects.
+The direct `dekopon-run` provider path does not cross this state boundary. Its immediate prompt tool calls are unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that in-process path would violate this design. The explicit broker-backed mode submits proposals over authenticated Unix transport, but only the separate broker may authorize them, resolve privileged imports, and execute effects.
 
 The current local broker protocol and service define:
 

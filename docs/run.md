@@ -1,6 +1,6 @@
-# Immediate provider runner
+# Direct provider runner and broker client
 
-`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only Dekopon providers. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
+`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only import-free providers plus an explicit unprivileged client for `dekopon-brokerd`. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
 
 ## Commands
 
@@ -8,10 +8,12 @@
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
 dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
+dekopon-run broker capabilities --socket <PATH> --server-uid <UID>
+dekopon-run broker invoke --socket <PATH> --server-uid <UID> --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
 dekopon auth chatgpt <login | status | logout>
 ```
 
-Each command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`.
+Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
 The checked-in Rust echo provider is immediately runnable:
 
@@ -32,7 +34,26 @@ time target/release/dekopon-run invoke \
   echo.echo --input '{"message":"hello"}' --repeat 100
 ```
 
-The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final raw JSON output. That output is not broker evidence or an `InvocationResult`. Shell `time` also includes process startup and component compilation.
+The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. Direct `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final raw JSON output. That output is not broker evidence or an `InvocationResult`. Shell `time` also includes process startup and component compilation.
+
+## Broker client mode
+
+Broker mode never loads a component and has no provider authority. It opens one fresh Unix connection, validates an owner-only single-link socket and the configured server peer UID, sends one strict bounded protocol request, and closes the connection. Invocation payloads contain capability, caller-generated invocation/trace IDs, and JSON input—never principal, actor, policy, constraints, credentials, or authorization state. The server derives identity from peer credentials and chooses all authority.
+
+```console
+dekopon-run broker capabilities \
+  --socket "$HOME/.local/run/dekopon/broker.sock" \
+  --server-uid "$(id -u)"
+
+dekopon-run broker invoke \
+  --socket "$HOME/.local/run/dekopon/broker.sock" \
+  --server-uid "$(id -u)" \
+  --invocation-id invoke-example-001 \
+  --trace-id trace-example-001 \
+  jsonplaceholder.posts.get --input '{"postId":7}'
+```
+
+The caller must generate and retain unique invocation IDs; reuse is durably denied. The client never retries automatically: after a lost response to an external write, treat the outcome as unknown and consult broker audit rather than issuing a new ID blindly. `--max-frame-bytes` and `--io-timeout-ms` constrain client allocation and each connect/frame operation. Broker results are `InvocationResult` JSON with policy decision linkage and evidence. Provider output is intentionally printed to the invoking client but remains absent from broker audit fields. Direct Wasm limits do not appear in broker subcommands because only broker policy and host ceilings constrain provider execution.
 
 ## Prompt mode
 
@@ -105,7 +126,7 @@ Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT
 
 `--trace <PATH>` writes Chrome/Perfetto-compatible JSON containing runner, model, component compilation, description, and invocation spans. Prompt text, model responses, provider input/output, and bearer tokens are intentionally excluded from span fields.
 
-Global bounds are configurable with:
+Direct-operation bounds are configurable on `inspect`, `invoke`, and `prompt` with:
 
 - `--max-memory-bytes`
 - `--max-input-bytes`
@@ -117,4 +138,4 @@ The host supplies no WASI, filesystem, network, environment, clock, random, or c
 
 ## Authority limitation
 
-A model tool call in direct `dekopon-run` mode is not an `AuthorizedInvocation`. Immediate mode performs no broker transition and must not be extended to provider credentials, host networking, local writes, or external writes. A future broker-backed mode may submit proposals without receiving effect authority; the authenticated, policy-controlled, separately deployed broker owns HTTP imports and execution as described in [`broker-http.md`](broker-http.md), [`design.md`](design.md), and [`security-model.md`](security-model.md).
+A model tool call in direct `dekopon-run` mode is not an `AuthorizedInvocation`. Immediate mode performs no broker transition and must not be extended to provider credentials, host networking, local writes, or external writes. Explicit broker mode submits proposals without receiving effect authority; the authenticated, policy-controlled, separately deployed broker owns HTTP imports and execution as described in [`broker-http.md`](broker-http.md), [`design.md`](design.md), and [`security-model.md`](security-model.md).

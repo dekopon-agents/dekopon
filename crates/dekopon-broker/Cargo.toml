@@ -15,6 +15,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 dekopon-broker-host.workspace = true
+dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 fs2.workspace = true

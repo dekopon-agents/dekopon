@@ -19,19 +19,18 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - Statically linked HTTP engine with bounded buffers, DNS/IP and redirect controls, and sanitized evidence metadata.
 - Asynchronous broker component-host library with one shared Wasmtime engine, compiled components, fresh bounded stores, Tokio host calls, and a single-use `AuthorizedInvocation` public execution boundary.
 - Exact deny-by-default broker rules, authenticated-context binding, replay rejection/restoration, digest evidence, and bounded metadata-only in-memory or owner-only durable verified audit chains.
-- Strict versioned length-delimited broker messages and an unprivileged Unix client whose invocation payload cannot carry identity or authority.
+- Strict versioned length-delimited broker messages and explicit `dekopon-run broker` client commands whose invocation payload cannot carry identity or authority.
 - Unix-only `dekopon-brokerd` with owner-controlled strict configuration, private socket lifecycle, peer-UID context mapping, bounded connections/draining, provider execution, and durable replay restoration.
 - Mock-backed JSONPlaceholder post-read and separately classified external-write capabilities using exact broker HTTP grants.
 
-The broker process is deployable for one local owner-UID trust domain but is not integrated with either unprivileged CLI. It has no credentials or externally anchored checkpoint.
+The broker process is deployable for one local owner-UID trust domain and has an explicit unprivileged `dekopon-run` client; the operator CLI and an agent daemon remain unintegrated. It has no credentials or externally anchored checkpoint.
 
 ## Next milestones
 
-1. Integrate the current unprivileged client while keeping direct `dekopon-run` on its import-free host.
-2. Add external checkpoint storage/verification so valid-prefix audit rollback is detectable outside the broker host.
-3. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
-4. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
-5. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
+1. Add external checkpoint storage/verification so valid-prefix audit rollback is detectable outside the broker host.
+2. Add broker-owned credential resolution only after destination binding and redaction are independently tested.
+3. Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.
+4. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior.
 
 ## Intended package namespace
 

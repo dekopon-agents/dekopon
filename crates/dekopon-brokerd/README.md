@@ -54,4 +54,4 @@ SIGINT and SIGTERM stop acceptance, drain bounded in-flight connections, synchro
 - Generic WASI and ambient I/O imports remain unavailable.
 - The durable JSONL chain is mutation-evident and replay-restoring, but its logged checkpoint is not an externally anchored transparency service.
 - Credential resolution is not implemented. Providers receive only explicitly linked Dekopon host interfaces and policy constraints.
-- Direct `dekopon-run` remains a separate import-free executable and does not connect to this service yet.
+- Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.

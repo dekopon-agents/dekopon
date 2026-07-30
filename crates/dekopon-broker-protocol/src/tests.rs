@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use dekopon_broker::InvocationRequest;
 use dekopon_core::{CapabilityId, InvocationId, TraceId};
 use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    BrokerRequest, FrameLimits, ProtocolError, RequestEnvelope, ResponseEnvelope, read_frame,
-    write_frame,
+    BrokerRequest, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
+    ResponseEnvelope, read_frame, write_frame,
 };
 
 fn invocation() -> InvocationRequest {

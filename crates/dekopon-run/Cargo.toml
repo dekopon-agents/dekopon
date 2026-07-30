@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-run"
-description = "Immediate-mode prompt and WebAssembly provider runner for Dekopon"
+description = "Direct WebAssembly provider runner and unprivileged broker client for Dekopon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,17 +16,23 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 clap.workspace = true
+dekopon-broker-protocol.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-chrome.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+dekopon-broker.workspace = true
+dekopon-broker-host.workspace = true
+dekopon-brokerd.workspace = true
+dekopon-capability.workspace = true
 tempfile.workspace = true
 
 [lints]

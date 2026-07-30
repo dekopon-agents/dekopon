@@ -14,9 +14,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dekopon_broker::{AvailableCapability, InvocationRequest};
-use dekopon_capability::InvocationResult;
+pub use dekopon_capability::{InvocationOutcome, InvocationResult};
+use dekopon_core::{CapabilityId, InvocationId, ProviderId, TraceId};
+use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
@@ -41,6 +43,35 @@ pub enum ProtocolVersion {
     /// Initial strict JSON protocol.
     #[serde(rename = "dekopon.dev/broker/v1alpha1")]
     V1Alpha1,
+}
+
+/// Unprivileged invocation fields accepted from a broker client.
+///
+/// Actor and principal are deliberately absent: the server derives them from transport identity.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InvocationRequest {
+    /// Client-selected identifier reserved for replay rejection.
+    pub id: InvocationId,
+    /// Requested exact capability.
+    pub capability: CapabilityId,
+    /// End-to-end correlation identifier.
+    pub trace: TraceId,
+    /// Capability-specific untrusted input.
+    pub input: Value,
+}
+
+/// One capability visible to an authenticated broker client.
+///
+/// Routing and effect metadata are overwritten from trusted exact policy. Description and input
+/// schema remain bounded provider-supplied model metadata and are not authorization inputs.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AvailableCapability {
+    /// Trusted selected provider.
+    pub provider: ProviderId,
+    /// Client-visible capability metadata.
+    pub capability: ProviderCapability,
 }
 
 /// One strict untrusted client request.

@@ -457,6 +457,7 @@ name = "dekopon-broker"
 version = "0.2.0"
 dependencies = [
  "dekopon-broker-host",
+ "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
  "fs2",
@@ -488,9 +489,9 @@ dependencies = [
 name = "dekopon-broker-protocol"
 version = "0.2.0"
 dependencies = [
- "dekopon-broker",
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-provider-sdk",
  "serde",
  "serde_json",
  "tempfile",
@@ -630,6 +631,11 @@ name = "dekopon-run"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "dekopon-broker",
+ "dekopon-broker-host",
+ "dekopon-broker-protocol",
+ "dekopon-brokerd",
+ "dekopon-capability",
  "dekopon-core",
  "dekopon-model",
  "dekopon-provider-host",
@@ -637,6 +643,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

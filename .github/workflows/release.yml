@@ -58,6 +58,15 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features --locked
           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify runner excludes privileged broker machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
       - name: Check dependency policy
@@ -192,12 +201,12 @@ jobs:
           publish dekopon-capability
           publish dekopon-model
           publish dekopon-provider-sdk
+          publish dekopon-broker-protocol
           publish dekopon-provider-http
           publish dekopon-provider-host
           publish dekopon-http-host
           publish dekopon-broker-host
           publish dekopon-broker
-          publish dekopon-broker-protocol
           publish dekopon-brokerd
           publish dekopon-protocol
           publish dekopon-config
