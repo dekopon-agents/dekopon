@@ -39,6 +39,8 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
+        "checkpointPath": "checkpoint.json",
+        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -65,7 +67,24 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         canonical_directory.join("broker.sock")
     );
     assert_eq!(resolved.audit_path, canonical_directory.join("audit.jsonl"));
+    assert_eq!(
+        resolved.checkpoint_path,
+        canonical_directory.join("checkpoint.json")
+    );
+    assert_eq!(
+        resolved.checkpoint_lock_path,
+        canonical_directory.join("checkpoint.lock")
+    );
     assert_eq!(resolved.providers, [canonical_directory.join("echo.wasm")]);
+
+    let mut conflicting = document.clone();
+    conflicting["checkpointLockPath"] = json!("checkpoint.json.tmp");
+    fs::write(
+        &path,
+        serde_json::to_vec(&conflicting).expect("conflict fixture serializes"),
+    )
+    .expect("replace config fixture");
+    assert!(config::load(&path, uid).await.is_err());
 
     let mut invalid = document;
     invalid["principal"] = json!("payload-forgery");

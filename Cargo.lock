@@ -509,6 +509,7 @@ dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
+ "fs2",
  "libc",
  "rustix",
  "serde",

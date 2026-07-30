@@ -562,6 +562,7 @@ struct FileAuditState {
     file: File,
     count: usize,
     head: Option<String>,
+    record_hashes: Vec<String>,
     replay_ids: BTreeSet<InvocationId>,
     poisoned: bool,
 }
@@ -608,7 +609,7 @@ impl FileAuditLog {
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);
-        let (count, head, replay_ids) =
+        let (count, head, record_hashes, replay_ids) =
             scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
         let mut file = reader.into_inner();
         file.seek(SeekFrom::End(0))
@@ -622,6 +623,7 @@ impl FileAuditLog {
                 file,
                 count,
                 head,
+                record_hashes,
                 replay_ids,
                 poisoned: false,
             }),
@@ -638,6 +640,18 @@ impl FileAuditLog {
     pub async fn checkpoint(&self) -> (usize, Option<String>) {
         let state = self.state.lock().await;
         (state.count, state.head.clone())
+    }
+
+    /// Reports whether a retained sequence/head pair is an exact verified chain prefix.
+    pub async fn contains_checkpoint(&self, count: usize, head: Option<&str>) -> bool {
+        let state = self.state.lock().await;
+        match count {
+            0 => head.is_none(),
+            count if count <= state.record_hashes.len() => {
+                head == Some(state.record_hashes[count - 1].as_str())
+            }
+            _ => false,
+        }
     }
 
     /// Returns invocation IDs reconstructed from verified decision records.
@@ -691,6 +705,7 @@ impl AuditLog for FileAuditLog {
         }
         state.count += 1;
         state.head = Some(record.record_hash.clone());
+        state.record_hashes.push(record.record_hash.clone());
         if let AuditEvent::Decision { invocation, .. } = &record.event {
             state.replay_ids.insert(invocation.clone());
         }
@@ -703,13 +718,14 @@ async fn scan_audit_file(
     reader: &mut BufReader<File>,
     maximum_records: usize,
     maximum_line_bytes: usize,
-) -> Result<(usize, Option<String>, BTreeSet<InvocationId>), FileAuditError> {
+) -> Result<(usize, Option<String>, Vec<String>, BTreeSet<InvocationId>), FileAuditError> {
     let mut count = 0_usize;
     let mut previous = None::<String>;
+    let mut record_hashes = Vec::new();
     let mut replay_ids = BTreeSet::new();
     loop {
         let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
-            return Ok((count, previous, replay_ids));
+            return Ok((count, previous, record_hashes, replay_ids));
         };
         if count >= maximum_records {
             return Err(FileAuditError::TooManyRecords {
@@ -726,6 +742,7 @@ async fn scan_audit_file(
         if let AuditEvent::Decision { invocation, .. } = &record.event {
             replay_ids.insert(invocation.clone());
         }
+        record_hashes.push(record.record_hash.clone());
         previous = Some(record.record_hash);
         count += 1;
     }

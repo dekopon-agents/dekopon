@@ -6,17 +6,19 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod checkpoint;
 mod config;
 mod server;
 mod socket;
 
 use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
 
-use dekopon_broker::{Broker, FileAuditLog};
+use dekopon_broker::{AuditLog, Broker, FileAuditLog};
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use thiserror::Error;
 
+pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
     PeerIdentity, ResolvedConfig, ServerLimitsConfig,
@@ -54,11 +56,21 @@ where
     }
     socket::validate_private_parent(&config.socket_path, uid)?;
     socket::validate_private_parent(&config.audit_path, uid)?;
+    socket::validate_private_parent(&config.checkpoint_path, uid)?;
+    socket::validate_private_parent(&config.checkpoint_lock_path, uid)?;
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
     }
 
-    let audit = Arc::new(
+    let (checkpoint_store, stored_checkpoint) = checkpoint::CheckpointStore::open(
+        &config.checkpoint_path,
+        &config.checkpoint_lock_path,
+        uid,
+    )
+    .await
+    .map_err(BrokerdError::Checkpoint)?;
+    let checkpoint_store = Arc::new(checkpoint_store);
+    let file_audit = Arc::new(
         FileAuditLog::open(
             &config.audit_path,
             config.server_limits.audit_max_records,
@@ -68,7 +80,14 @@ where
         .map_err(BrokerdError::Audit)?,
     );
     socket::validate_owned_file(&config.audit_path, uid)?;
-    let replay_ids = audit.replay_ids().await;
+    checkpoint::reconcile(&file_audit, &checkpoint_store, stored_checkpoint.as_ref())
+        .await
+        .map_err(BrokerdError::Checkpoint)?;
+    let replay_ids = file_audit.replay_ids().await;
+    let audit = Arc::new(checkpoint::CheckpointedAuditLog::new(
+        file_audit,
+        checkpoint_store,
+    ));
     let registry = BrokerProviderRegistry::load(config.providers, config.host_limits)
         .await
         .map_err(BrokerdError::Host)?;
@@ -123,8 +142,8 @@ where
     Ok(AuditCheckpoint { records, head })
 }
 
-fn validate_capability_responses(
-    broker: &Broker<FileAuditLog>,
+fn validate_capability_responses<A: AuditLog>(
+    broker: &Broker<A>,
     identities: &BTreeMap<u32, dekopon_broker::AuthenticatedContext>,
     maximum: usize,
 ) -> Result<(), BrokerdError> {
@@ -174,6 +193,9 @@ pub enum BrokerdError {
     /// Owner-only durable audit could not be opened and verified.
     #[error("broker durable audit is unavailable")]
     Audit(#[source] dekopon_broker::FileAuditError),
+    /// Durable checkpoint could not be locked, verified, reconciled, or synchronized.
+    #[error("broker audit checkpoint is unavailable")]
+    Checkpoint(#[source] CheckpointError),
     /// Provider components could not be validated and compiled.
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),
