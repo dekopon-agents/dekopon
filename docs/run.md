@@ -117,4 +117,4 @@ The host supplies no WASI, filesystem, network, environment, clock, random, or c
 
 ## Authority limitation
 
-A model tool call in `dekopon-run` is not an `AuthorizedInvocation`. Immediate mode performs no broker transition and must not be extended to provider credentials, host networking, local writes, or external writes. Those require the authenticated, policy-controlled, separately deployed broker described in [`design.md`](design.md) and [`security-model.md`](security-model.md).
+A model tool call in direct `dekopon-run` mode is not an `AuthorizedInvocation`. Immediate mode performs no broker transition and must not be extended to provider credentials, host networking, local writes, or external writes. A future broker-backed mode may submit proposals without receiving effect authority; the authenticated, policy-controlled, separately deployed broker owns HTTP imports and execution as described in [`broker-http.md`](broker-http.md), [`design.md`](design.md), and [`security-model.md`](security-model.md).
