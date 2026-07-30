@@ -11,12 +11,12 @@ A capability name in an agent spec permits the agent to propose that operation. 
 ## Security-relevant stages
 
 1. **Model proposal** — untrusted model output names a capability and supplies untrusted arguments in a `ProposedInvocation`.
-2. **Authorization decision** — the privileged broker authenticates the message envelope, resolves the actor and workload, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation` inside its execution boundary.
+2. **Authorization decision** — the privileged broker authenticates the transport, derives the actor/workload from trusted mapping, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation` inside its execution boundary.
 3. **External effect** — the broker consumes that authorization state while a narrow provider executes only the authorized capability using broker-held credentials and enforced constraints.
 4. **Evidence** — policy decisions and provider execution produce digests or bounded records that support later verification.
 5. **Audit record** — the broker links proposal, trusted identity, policy revision, authorization receipt, effect outcome, and evidence under an invocation and trace ID.
 
-The daemon-to-broker request carries a proposal in an authenticated envelope, not an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopond`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
+The local daemon-to-broker request carries only a proposal over an authenticated Unix connection, not identity claims or an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopond`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
 
 Rust's private, non-cloneable `AuthorizedInvocation` fields and intentional absence of deserialization make accidental in-process fabrication or reuse harder. `AuthorizationGate::new` is public so a broker adapter can own the transition; constructing that handle does not authenticate a caller or evaluate policy. This is defense in depth only. The real authority boundary depends on separate processes, authenticated and replay-resistant requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and durable audit integrity.
 
@@ -24,7 +24,7 @@ Rust's private, non-cloneable `AuthorizedInvocation` fields and intentional abse
 
 Trusted inputs are expected to include:
 
-- message-envelope principal and workload identity established by authenticated infrastructure;
+- principal and workload identity derived from authenticated transport plus owner-controlled mapping;
 - broker configuration and policy installed by an authorized operator;
 - broker-generated authorization receipts and audit sequencing;
 - secrets obtained by the broker from an approved secret store.
@@ -37,14 +37,14 @@ Explicitly untrusted inputs include:
 - identity claims embedded inside model text or repository content;
 - local config supplied from an untrusted checkout.
 
-A model or repository document cannot self-assert a trusted `Actor`. The trusted message envelope owns identity attribution; payload claims are data only.
+A model or repository document cannot self-assert a trusted `Actor`. For the local broker, the connected peer UID and strict owner-controlled mapping own identity attribution; invocation payloads have no identity fields.
 
 ## Capability and effect rules
 
 - Capabilities are narrow and name one effect class.
 - External writes require an explicit capability; read access never implies write access.
 - Provider permissions should be least privilege and independently enforced by provider credentials.
-- Authorization constraints bind timeout, output size, and future network scopes.
+- Authorization constraints bind timeout, output size, exact HTTP destinations/methods, call counts, and byte ceilings.
 - Retries account for declared idempotency and use provider-enforced idempotency keys where available.
 - Credentials do not appear in agent prompts, authored catalogs, invocation evidence, or normal logs.
 - A component import declares a required host interface; it never grants that interface or any transitive authority.
@@ -72,9 +72,9 @@ The separate experimental `dekopon-run` path can contact an operator-selected Op
 
 Chrome trace fields omit prompts, model responses, component input/output, and bearer tokens. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
 
-## Current privileged host foundation
+## Current privileged broker foundation
 
-`dekopon-broker-host` is a privileged library, not a deployed broker. It links only `dekopon:http@1.0.0`, consumes one non-cloneable `AuthorizedInvocation` at its public invocation boundary, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description receives a linked but disabled HTTP context, and any attempted description-time call rejects the component. Policy denials remain terminal even if guest code catches the typed WIT error.
+`dekopon-broker-host` is the privileged component library used only by the separately deployed `dekopon-brokerd` process. It links only `dekopon:http@1.0.0`, consumes one non-cloneable `AuthorizedInvocation` at its public invocation boundary, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description receives a linked but disabled HTTP context, and any attempted description-time call rejects the component. Policy denials remain terminal even if guest code catches the typed WIT error.
 
 The statically linked native client enforces exact authority/port and method grants, request count and byte bounds, HTTPS by default, loopback-only explicitly authorized plaintext, DNS address validation and pinning, sensitive-header ownership, no redirects, no ambient proxy, no automatic decompression, and bounded response collection. Its evidence contains method, authorized authority, status, and byte counts—not paths, queries, headers, or bodies.
 
@@ -84,11 +84,13 @@ The statically linked native client enforces exact authority/port and method gra
 
 `dekopon-broker-protocol` defines strict versioned frames and an unprivileged Unix client. Invocation wire values omit principal, actor, policy, constraints, credentials, and authorization. Frame lengths have a hard ceiling before allocation, complete reads/writes time out, and the client checks owner-only socket metadata plus server peer UID.
 
-These libraries still perform no server-side socket acceptance/authentication, trusted workload discovery, credential injection, external checkpoint anchoring, or network service. `AuthenticatedContext` construction is not authentication; a future transport must derive it from peer credentials. No workspace executable reaches the broker core today. Its presence does not expand `dekopon-run`: the immediate runner still uses its separate empty linker and rejects the HTTP-importing fixture.
+`dekopon-brokerd` now performs server-side Unix socket acceptance and derives `AuthenticatedContext` from the connected peer UID plus exact trusted configuration. It requires a private non-symlink parent, creates an owner-only socket, refuses unsafe/live replacement, limits concurrent one-request connections, drains under a configured grace period, restores replay IDs before listening, and removes only its own socket inode. Its strict configuration and provider files must be single-link, server-owned, and not group/world writable; provider parents must also be protected, writable non-sticky ancestors are rejected, and socket/audit parents must be owner-only. Because mode `0600` makes the socket one UID trust domain, every process under that UID can use its configured actor—use a dedicated UID when this matters.
+
+The service performs no credential injection, process attestation, external checkpoint anchoring, or non-Unix network transport. Logged chain heads are not durable external anchors. Its presence does not expand `dekopon-run`: the immediate runner still uses its separate empty linker, rejects the HTTP-importing fixture, and has no broker client mode.
 
 ## Threat-model limitations
 
-The current project does not yet defend against a malicious local user who can replace the binary, component, or config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no authenticated daemon protocol, provider secret-store integration, deployable privileged broker path, external audit checkpoint/anchoring service, external evidence store, key management, revocation, tenancy isolation, or incident-response automation.
+The current project does not defend against a malicious process in the broker/client UID trust domain, a local user who can replace the binary, component, or owner-controlled config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; rollback of files or audit data; or side channels. The Wasmtime limits reduce invocation risk but are not a production sandbox claim. The project has no unprivileged daemon integration, provider secret-store integration, per-process/client attestation, external audit checkpoint/anchoring service, external evidence store, key management, revocation, tenancy isolation, or incident-response automation.
 
 The committed first privileged-provider design is documented in [`broker-http.md`](broker-http.md). It preserves the separate broker boundary, keeps direct `dekopon-run` execution import-free, and treats HTTP imports as structural requirements rather than authority.
 

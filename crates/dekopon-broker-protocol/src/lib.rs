@@ -28,8 +28,8 @@ use tokio::net::UnixStream;
 
 /// Initial local broker protocol identifier.
 pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha1";
-/// Default complete request/response frame bound (1 MiB).
-pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Default complete request/response frame bound (2 MiB).
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Hard ceiling accepted for any configured frame bound (16 MiB).
 pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Default connection/read/write deadline.

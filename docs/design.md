@@ -22,7 +22,7 @@ Success does not mean making a model trustworthy. Success means containing an un
 
 1. **A proposal is not authority.** A model, agent, repository, or tool payload may create a `ProposedInvocation`; only the broker may create an `AuthorizedInvocation`.
 2. **Capabilities are explicit and narrow.** Read authority does not imply write authority. Every external write requires a specifically named capability.
-3. **Identity comes from a trusted envelope.** Model text and repository content cannot assert a trusted `Actor`, principal, or workload identity.
+3. **Identity comes from authenticated transport.** Model text, repository content, and invocation payloads cannot assert a trusted `Actor`, principal, or workload identity.
 4. **Provider credentials belong to the broker boundary.** Agents, prompts, authored resources, normal logs, and evidence records must not contain provider credentials. Model-endpoint credentials terminate inside the selected model client and never enter provider components.
 5. **Authorization is bound to execution.** A grant carries the proposal, policy decision, execution constraints, and receipt needed to prevent a provider host from executing a different or broader operation.
 6. **Effects produce evidence and audit linkage.** Proposal, identity, decision, policy revision, execution outcome, and evidence must remain correlatable by invocation and trace identifiers.
@@ -55,7 +55,7 @@ untrusted model/repository content
               v
      ProposedInvocation
               |
-              | authenticated envelope + policy input
+              | authenticated transport + trusted mapping + policy input
               v
        authorization broker
           /           \
@@ -75,7 +75,7 @@ untrusted model/repository content
                 evidence + audit
 ```
 
-The broker owns the only authority transition in this flow. The authenticated request into the broker carries a proposal and trusted envelope context, not an authorized bearer grant. `AuthorizedInvocation` is created and consumed inside the broker-owned execution boundary; `dekopond` never receives it or presents its serialized representation as authority. Rust visibility and the absence of deserialization are useful defense in depth, but the actual control comes from authentication, process isolation, policy, credential separation, binding authorization to execution, and enforcement at the provider host.
+The broker owns the only authority transition in this flow. The authenticated request into the local broker carries a proposal only; trusted context comes from Unix peer credentials and owner-controlled mapping, not an authorized bearer grant or payload fields. `AuthorizedInvocation` is created and consumed inside the broker-owned execution boundary; `dekopond` never receives it or presents its serialized representation as authority. Rust visibility and the absence of deserialization are useful defense in depth, but the actual control comes from authentication, process isolation, policy, credential separation, binding authorization to execution, and enforcement at the provider host.
 
 ## Component boundaries
 
@@ -85,21 +85,21 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-core` | Validated identifiers and dependency-light domain types | **Current** |
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, and reference validation | **Current** |
-| `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, consumed by broker libraries but no service |
+| `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, consumed by broker libraries and service |
 | `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and default or caller-generated WIT world export adapters | **Current**, experimental component contract |
 | `dekopon-provider-http` | Rust guest facade for the buffered `dekopon:http@1.0.0` import; contains no transport or authority | **Current**, bindings only |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
 | `dekopon-http-host` | Statically linked native buffered HTTP engine consuming exact grants beneath independent ceilings; contains no WIT or Wasmtime integration | **Current** library |
-| `dekopon-broker-host` | Privileged async Wasmtime adapter that consumes authorized invocations, links only `dekopon:http@1.0.0`, and emits bounded metadata | **Current** library, no process or operator path |
-| `dekopon-broker` | Trusted context binding, exact policy, replay rejection/recovery, authorization, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit; no authenticated transport |
-| `dekopon-broker-protocol` | Strict versioned bounded frames and unprivileged Unix client with identity/authority-free invocation payloads and server peer-UID verification | **Current** client/wire library; no listener process |
+| `dekopon-broker-host` | Privileged async Wasmtime adapter that consumes authorized invocations, links only `dekopon:http@1.0.0`, and emits bounded metadata | **Current** library used by the separate broker process |
+| `dekopon-broker` | Trusted context binding, exact policy, replay rejection/recovery, authorization, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit |
+| `dekopon-broker-protocol` | Strict versioned bounded frames and unprivileged Unix client with identity/authority-free invocation payloads and server peer-UID verification | **Current** client/wire library used by broker tests and future CLI integration |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
 | `dekopon-run` | One-shot direct invocation, OpenAI-compatible or ChatGPT/Codex subscription prompt tools, timing, and trace export; future broker client without effect authority | **Current**, experimental immediate mode; broker client is **committed direction** |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
-| `dekopon-brokerd` | Authentication, authorization, credentials, provider execution, evidence, and external effects | **Committed direction** |
+| `dekopon-brokerd` | Owner-only Unix peer authentication, exact authorization, replay restoration, provider execution, evidence, and durable audit | **Current** privileged process; credentials and external checkpoint anchoring remain direction |
 | Exact policy evaluator | Principal/actor/capability/provider rules with bounded constraints and deny-by-default matching | **Current** library foundation |
 | Cedar policy adapter | Richer declarative authorization and explanations after inputs stabilize | **Committed direction** |
-| Deployable privileged provider path | Authenticated broker ownership of policy, credentials, component-host execution, durable evidence, and authorized effects | **Committed direction** |
+| Deployable privileged provider path | Authenticated broker ownership of policy, component-host execution, durable evidence, and authorized effects | **Current** local Unix foundation; credentials and stronger deployment transport remain direction |
 
 The agent daemon must not gain effect authority merely because it coordinates a task. The broker must not perform model orchestration merely because it can execute a provider.
 
@@ -137,7 +137,7 @@ parse dekopon-run CLI
   -> JSON result/timings and optional Chrome trace
 ```
 
-The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. No current executable resolves provider credentials, makes an authorization decision, creates provider external effects, or produces durable audit evidence.
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials and neither unprivileged CLI invokes it.
 
 ## Resource and API design
 
@@ -180,36 +180,36 @@ Proposed --broker denies----------------------> Denied result + evidence
 
 The direct `dekopon-run` provider path does not cross this state boundary. Its immediate prompt tool calls are unprivileged requests accepted only for import-free components declaring `read-only`; they are not `AuthorizedInvocation` values. Adding provider I/O, credentials, local writes, or external writes to that in-process path would violate this design. A broker-backed mode may submit proposals over an authenticated transport, but only the separate broker may authorize them, resolve privileged imports, and execute effects.
 
-Before a real broker is introduced, its protocol must define at least:
+The current local broker protocol and service define:
 
-- authenticated principal and workload identity;
-- freshness and replay protection;
+- peer-UID-authenticated principal and actor mapping with no payload identity fields;
+- bounded invocation-ID replay protection restored from verified audit history;
 - canonical proposal and decision identifiers;
 - policy revision and explainable decision output;
-- expiration, timeout, output, network, and host-call constraints;
-- idempotency and retry behavior;
+- timeout, output, exact network, and host-call constraints;
+- exact idempotency metadata matching (automatic retries remain future work);
 - evidence integrity and durable audit ordering;
 - denial and partial-failure semantics.
 
 ## Deployment and provider isolation
 
-When external writes are implemented, the deployment boundary is:
+For current and future external writes, the deployment boundary is:
 
 ```text
 dekopond              unprivileged orchestration and model interaction
       |
-      | authenticated proposal envelope
+      | authenticated proposal connection
       v
-dekopon-brokerd       policy, credentials, provider execution, effects
+dekopon-brokerd       policy, provider execution, effects (credentials future)
       |
       | broker-owned constrained host call
       v
 Wasm provider          one narrow integration operation
 ```
 
-The agent and broker will run as separate processes and separate pods. `dekopond` sends authenticated proposal envelopes and receives results; it does not receive or relay an `AuthorizedInvocation` as a wire grant. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers will run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
+The local broker already runs as a separate process; a future `dekopond` and non-local transport will preserve separate deployment units. `dekopond` will send proposals on authenticated connections and receive results; it does not receive or relay an `AuthorizedInvocation` as a wire grant. The broker may share a Wasmtime engine and compiled component cache, but each invocation gets a fresh store. Privileged providers run as bounded asynchronous invocations integrated with Tokio, with explicit limits on time, memory, output, network destinations, and host calls.
 
-The immediate host exposes no imports and remains the only host used by `dekopon-run`. The privileged `dekopon-broker-host` uses Tokio and exposes only the statically implemented, buffered `dekopon:http@1.0.0` interface, consumes constrained authorization state, and creates a fresh bounded store per operation. `dekopon-broker` now binds a separately supplied authenticated context to exact rules, rejects replays from verified durable history and the current process, constructs and consumes authorization, and records redacted decision/outcome metadata in bounded in-memory or durable verified JSONL chains. Durable reopen restores replay IDs and rejects mutation, insecure permissions, hard links, symlinks, concurrent writers, overlong records, and partial writes. The protocol/client library adds hard-bounded strict frames and verifies a configured server UID, but no listener maps OS peer credentials into trusted context. These are not a broker deployment: no executable authenticates callers, resolves credentials, anchors checkpoints, or exposes effects. Their accepted contract and remaining staged delivery are defined in [`broker-http.md`](broker-http.md). Cedar remains deferred until authorization inputs and explainability requirements have been proven by the exact policy foundation.
+The immediate host exposes no imports and remains the only host used by `dekopon-run`. The privileged `dekopon-broker-host` uses Tokio and exposes only the statically implemented, buffered `dekopon:http@1.0.0` interface, consumes constrained authorization state, and creates a fresh bounded store per operation. `dekopon-broker` now binds a separately supplied authenticated context to exact rules, rejects replays from verified durable history and the current process, constructs and consumes authorization, and records redacted decision/outcome metadata in bounded in-memory or durable verified JSONL chains. Durable reopen restores replay IDs and rejects mutation, insecure permissions, hard links, symlinks, concurrent writers, overlong records, and partial writes. The protocol/client library adds hard-bounded strict frames and verifies a configured server UID. `dekopon-brokerd` maps connected peer UID into trusted context, restores verified replay state before binding an owner-only socket, limits and drains connections, and exposes policy-authorized provider execution. It does not resolve credentials or externally anchor checkpoints. Their accepted contract and remaining staged delivery are defined in [`broker-http.md`](broker-http.md). Cedar remains deferred until authorization inputs and explainability requirements have been proven by the exact policy foundation.
 
 ## Operator interface
 
@@ -225,7 +225,7 @@ See [`cli.md`](cli.md) for the current command contract.
 |---|---|
 | One Cargo monorepo | Initial crates share versions, CI, issues, and security review and are changing together. |
 | Edition 2024 with an explicit MSRV | Modern language surface while preserving a tested minimum toolchain. |
-| Synchronous one-shot `0.1.0` paths | The catalog and immediate provider operations are bounded commands; daemon and asynchronous provider-host machinery remain deferred. |
+| Synchronous one-shot `0.1.0` paths | The catalog and immediate provider operations remain bounded commands separate from asynchronous broker machinery. |
 | Strong identifier newtypes | Invalid and ambiguous names should fail at system boundaries, not deep in execution. |
 | Strict decoding | Misspelled security-relevant fields must not be ignored. |
 | `BTreeMap`-backed catalogs | Deterministic reads and output simplify review, testing, and automation. |
@@ -234,6 +234,7 @@ See [`cli.md`](cli.md) for the current command contract.
 | Import-free immediate providers | Provider traits, component ABI, routing, limits, prompt tools, timings, and traces can stabilize without prematurely granting host authority. |
 | Broker-owned buffered HTTP | Privileged providers import a project-owned high-level HTTP contract, while only the separate broker implements networking, applies authorization constraints, and records evidence. |
 | No native runtime plugins | Broker host services are statically linked; untrusted imports never trigger Rust library or package downloads. |
+| Owner-only Unix broker IPC | Local payloads cannot claim identity; private socket peer UID maps exactly to trusted context, with the whole UID as one trust domain. |
 | No empty future crates | A package boundary must be justified by meaningful, tested behavior. |
 
 ## How to evaluate a proposed change

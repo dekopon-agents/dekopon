@@ -30,6 +30,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, and loopback tests |
 | Broker policy, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests plus `crates/dekopon-broker/tests/broker.rs` exact-policy, redaction, and replay-restart tests |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
+| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
@@ -104,7 +105,7 @@ Immediate host:
 - Prompt-visible tool names are deterministic adaptations of capability IDs. Model tool selection and arguments remain untrusted.
 - The prompt loop is bounded by `--max-steps` and at most 32 tool calls per model turn.
 
-Privileged host foundation:
+Privileged broker path:
 
 - `BufferedHttpClient` accepts a broker-produced `HttpConstraints` grant but performs no authorization transition itself.
 - Grants can narrow but never widen native ceilings for HTTP call count, request bytes, response bytes, and headers.
@@ -113,9 +114,10 @@ Privileged host foundation:
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
 - `dekopon-broker` validates exact trusted rules against loaded routes and host ceilings, reserves invocation IDs before policy evaluation, creates single-use authorization, and audits only metadata/digests.
-- Its `AuthenticatedContext` is a transport input, not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes a chain checkpoint, and restores replay IDs across restart; an external checkpoint is still required to detect valid-prefix truncation.
+- `AuthenticatedContext` construction alone is not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes a chain checkpoint, and restores replay IDs across restart; an external checkpoint is still required to detect valid-prefix truncation.
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, and its client authenticates the configured server UID.
-- The component host has no credential resolver and no workspace executable invokes the broker core yet. Direct `dekopon-run` remains on the independent empty-linker host.
+- `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, rejects unreachable UID mappings, bounds concurrent connections, and restores audit/replay state before listening.
+- The service currently treats one owner UID as a trust domain, has no credential resolver or external checkpoint anchor, and is not integrated with either unprivileged CLI. Direct `dekopon-run` remains on the independent empty-linker host.
 
 See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
 
@@ -145,7 +147,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --exclude dekopon-testkit --locked
 ```
 
-The immediate host, broker host, and broker-core packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs` or `tests/broker.rs` is not included in the published package.
+The immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs`, `tests/broker.rs`, or `tests/server.rs` is not included in the published package.
 
 ### Provider example workspaces
 
@@ -171,6 +173,7 @@ cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked
 cargo test -p dekopon-broker-protocol --locked
+cargo test -p dekopon-brokerd --locked
 cargo test -p dekopon-run --test cli --locked
 ```
 
