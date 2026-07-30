@@ -29,7 +29,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Immediate runner, prompt loop, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs` |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
-| Rust provider example | `examples/providers/echo/src/lib.rs` | Inline tests plus `crates/dekopon-provider-host/tests/host.rs` and `crates/dekopon-run/tests/cli.rs` against the checked-in component |
+| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/` | Inline tests plus host/runner tests against the checked-in components |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 
 Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory is only a placeholder.
@@ -59,24 +59,26 @@ The SDK and host provider WIT files are mirrored and must remain byte-identical:
 - `crates/dekopon-provider-sdk/wit/provider.wit`
 - `crates/dekopon-provider-host/wit/provider.wit`
 
-The buffered HTTP WIT package and guest-binding copy are also mirrored:
+The buffered HTTP WIT package and guest copies are also mirrored:
 
 - `wit/http/http.wit`
 - `crates/dekopon-provider-http/wit/deps/http.wit`
+- `examples/providers/http-probe/wit/deps/http.wit`
 
-Update each pair together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+The HTTP probe also mirrors the provider package under `examples/providers/http-probe/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.1.0` world and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
 Immediate providers must remain read-only and import-free; adding WASI or a host import is an authority change, not a convenience refactor.
 
-The checked-in component is generated:
+The checked-in components are generated:
 
-- source: `examples/providers/echo/src/lib.rs`
-- build script: `examples/providers/echo/build.sh`
-- artifact: `examples/providers/echo-provider.wasm`
+| Source | Build script | Artifact |
+|---|---|---|
+| `examples/providers/echo/src/lib.rs` | `examples/providers/echo/build.sh` | `examples/providers/echo-provider.wasm` |
+| `examples/providers/http-probe/src/lib.rs` | `examples/providers/http-probe/build.sh` | `examples/providers/http-probe-provider.wasm` |
 
-Never edit the `.wasm` file directly. `examples/providers/echo` is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it.
+Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. The HTTP probe must decode to the two provider exports, exactly one `dekopon:http/client@1.0.0` import, and no WASI imports; the direct host test proves that the empty linker rejects it.
 
 ### Dependencies, crates, CI, or releases
 
@@ -125,21 +127,26 @@ cargo package --workspace --exclude dekopon-testkit --locked
 
 The host package intentionally excludes its repository-only component integration fixture, so Cargo may warn that `tests/host.rs` is not included in the published package.
 
-### Echo provider workspace
+### Provider example workspaces
+
+Run these commands for each affected provider manifest (`echo` and `http-probe`):
 
 ```console
-cargo fmt --manifest-path examples/providers/echo/Cargo.toml -- --check
-cargo clippy --locked --manifest-path examples/providers/echo/Cargo.toml --all-targets -- -D warnings
-cargo test --locked --manifest-path examples/providers/echo/Cargo.toml
-cargo check --locked --manifest-path examples/providers/echo/Cargo.toml --target wasm32-unknown-unknown
+cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
+cargo clippy --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml
+cargo check --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml --target wasm32-unknown-unknown
 ```
 
-If provider source, SDK exports, WIT, or tool manifests change, install the pinned component tool, regenerate, validate, and exercise the checked-in artifact:
+If provider source, SDK exports, WIT, or tool manifests change, install the pinned component tool, regenerate, validate, and exercise each affected checked-in artifact:
 
 ```console
 cargo install wasm-tools --version 1.236.1 --locked
 examples/providers/echo/build.sh
+examples/providers/http-probe/build.sh
 wasm-tools validate examples/providers/echo-provider.wasm
+wasm-tools validate examples/providers/http-probe-provider.wasm
+wasm-tools component wit examples/providers/http-probe-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-run --test cli --locked
 ```

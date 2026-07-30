@@ -86,7 +86,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, and reference validation | **Current** |
 | `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, no executing broker |
-| `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and WIT export adapter | **Current**, experimental read-only contract |
+| `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and default or caller-generated WIT world export adapters | **Current**, experimental component contract |
 | `dekopon-provider-http` | Rust guest facade for the buffered `dekopon:http@1.0.0` import; contains no transport or authority | **Current**, bindings only |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |

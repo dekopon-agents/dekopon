@@ -4,7 +4,7 @@ This document records the **committed direction** for the first privileged Dekop
 
 ## Current foundation
 
-The immutable `dekopon:http@1.0.0` WIT package and the `dekopon-provider-http` Rust guest facade are current once their package slice lands. They define and call the buffered import but provide no transport or authority. The broker, host implementation, authorization, audit, client, and external interaction described below remain committed direction until their respective slices are implemented and tested.
+The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, and SDK support for caller-generated provider worlds are current once their slices land. The checked-in HTTP probe demonstrates the exact import and direct-host rejection. These pieces define and call the buffered import but provide no transport or authority. The broker, host implementation, authorization, audit, client, and external interaction described below remain committed direction until their respective slices are implemented and tested.
 
 ## Decision
 

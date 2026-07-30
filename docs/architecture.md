@@ -44,7 +44,7 @@ Crate boundaries are:
 - `dekopon-capability`: capability metadata and proposal/authorization invocation states.
 - `dekopon-protocol`: strict `dekopon.dev/v1alpha1` resources and list responses.
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
-- `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and WIT export adapter.
+- `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and adapters for its default or a caller-generated provider world.
 - `dekopon-provider-http`: guest-only Rust facade for the published buffered HTTP interface; no current host implements it.
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry.
 - `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.

@@ -19,6 +19,32 @@ dekopon_provider_sdk::export_provider!(Example);
 
 The immediate host accepts only read-only manifests and supplies no WASI imports. The SDK WIT file is mirrored by `dekopon-provider-host`; update both copies together and keep their equality test passing.
 
+## Provider-owned worlds
+
+The default `export_provider!` macro targets the SDK's import-free world. A provider that needs a broker service generates bindings from its own composed world and supplies that module to `export_provider_with_bindings!`:
+
+```wit
+world provider {
+    include dekopon:provider/provider@0.1.0;
+    import dekopon:http/client@1.0.0;
+}
+```
+
+```rust,ignore
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "provider",
+        generate_all,
+        pub_export_macro: true,
+    });
+}
+
+dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
+```
+
+The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. The direct `dekopon-run` host remains empty and rejects such components; see the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
+
 ## WIT package
 
 The same import-free world is published as `dekopon:provider@0.1.0`. Fetch it through Dekopon's public registry metadata:

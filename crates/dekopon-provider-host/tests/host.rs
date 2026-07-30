@@ -9,6 +9,12 @@ fn provider_path() -> PathBuf {
         .join("examples/providers/echo-provider.wasm")
 }
 
+fn http_probe_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/providers/http-probe-provider.wasm")
+}
+
 fn load_echo() -> ProviderRegistry {
     ProviderRegistry::load([provider_path()], HostLimits::default())
         .expect("Rust echo provider loads")
@@ -116,6 +122,14 @@ fn reports_unknown_capabilities_without_entering_wasm() {
         .expect_err("unknown capability must fail");
 
     assert!(matches!(error, ProviderHostError::UnknownCapability { .. }));
+}
+
+#[test]
+fn immediate_host_rejects_components_requiring_http() {
+    let error = ProviderRegistry::load([http_probe_path()], HostLimits::default())
+        .expect_err("the immediate linker must not satisfy HTTP imports");
+
+    assert!(matches!(error, ProviderHostError::Instantiate { .. }));
 }
 
 #[test]
