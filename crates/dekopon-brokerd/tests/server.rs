@@ -12,7 +12,9 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{BrokerClient, FrameLimits};
-use dekopon_brokerd::{BrokerServer, CONFIG_API_VERSION, ServerLimits, current_uid, run};
+use dekopon_brokerd::{
+    AuditCheckpoint, BrokerServer, BrokerdError, CONFIG_API_VERSION, ServerLimits, current_uid, run,
+};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
@@ -206,13 +208,13 @@ async fn full_service_restores_replay_state_from_verified_audit() {
 
     let (stop, stopped) = oneshot::channel::<()>();
     let first_config = config_path.clone();
-    let first = tokio::spawn(async move {
+    let mut first = tokio::spawn(async move {
         run(first_config, async move {
             let _ = stopped.await;
         })
         .await
     });
-    wait_for_socket(&socket_path).await;
+    wait_for_socket(&socket_path, &mut first).await;
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create service client");
     let result = client
@@ -229,13 +231,13 @@ async fn full_service_restores_replay_state_from_verified_audit() {
 
     let (stop, stopped) = oneshot::channel::<()>();
     let second_config = config_path.clone();
-    let second = tokio::spawn(async move {
+    let mut second = tokio::spawn(async move {
         run(second_config, async move {
             let _ = stopped.await;
         })
         .await
     });
-    wait_for_socket(&socket_path).await;
+    wait_for_socket(&socket_path, &mut second).await;
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create restarted service client");
     let replay = client
@@ -252,12 +254,19 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     assert_eq!(checkpoint.records, 3);
 }
 
-async fn wait_for_socket(path: &Path) {
-    for _ in 0..200 {
+async fn wait_for_socket(
+    path: &Path,
+    task: &mut tokio::task::JoinHandle<Result<AuditCheckpoint, BrokerdError>>,
+) {
+    for _ in 0..3_000 {
         if path.exists() {
             return;
         }
+        if task.is_finished() {
+            let result = task.await;
+            panic!("broker fixture exited before binding its socket: {result:?}");
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("broker fixture socket did not appear");
+    panic!("broker fixture socket did not appear within thirty seconds");
 }
