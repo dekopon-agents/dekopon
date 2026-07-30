@@ -34,7 +34,7 @@ Roadmap items describe sequencing, not shipped behavior or permission to bypass 
 - `dekopon-mcp`
 - `dekopon-observe`
 
-A crate should be added only with meaningful, tested behavior needed by an implemented milestone. Tightly coupled crates remain in this monorepo and initially share the `0.1.x` release line.
+A crate should be added only with meaningful, tested behavior needed by an implemented milestone. Tightly coupled crates remain in this monorepo and share one pre-1.0 release line.
 
 ## Explicit non-goals for 0.1
 

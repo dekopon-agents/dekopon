@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-core",
  "schemars",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "schemars",
  "serde",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "dekopon-core",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -457,14 +457,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-run"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dekopon-core",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-config",
