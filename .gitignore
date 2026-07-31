@@ -7,3 +7,6 @@
 .env.*
 !.env.example
 coverage/
+
+# Code-review artifacts; system of record is the vagus vault, not git history.
+/docs/review-2026-07/
