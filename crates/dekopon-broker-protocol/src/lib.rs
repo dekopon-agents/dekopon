@@ -37,6 +37,21 @@ pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Default connection/read/write deadline.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Stable failure code: the connected peer is not mapped by broker policy.
+pub const ERROR_UNAUTHENTICATED: &str = "unauthenticated";
+/// Stable failure code: the request frame could not be decoded.
+pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
+/// Stable failure code: the broker could not complete the request and **nothing executed**.
+///
+/// No provider work began, so the same work may be resubmitted under a fresh invocation
+/// identifier without risking a duplicate external effect.
+pub const ERROR_BROKER_UNAVAILABLE: &str = "broker-unavailable";
+/// Stable failure code: provider work may already have completed and its outcome was not audited.
+///
+/// The external effect may have taken place. The request must **not** be resubmitted under any
+/// identifier; the durable audit is the only record of what happened.
+pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
+
 /// Exact protocol version carried by every envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolVersion {
