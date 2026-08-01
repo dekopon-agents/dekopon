@@ -49,7 +49,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-chrome = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
-wasmtime = { version = "36.0.12", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
 dekopon-broker = { version = "0.2.0", path = "crates/dekopon-broker" }
