@@ -8,8 +8,8 @@
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
 dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
-dekopon-run broker capabilities --socket <PATH> --server-uid <UID>
-dekopon-run broker invoke --socket <PATH> --server-uid <UID> --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
+dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
+dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
 dekopon auth chatgpt <login | status | logout>
 ```
 
@@ -40,7 +40,11 @@ The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downc
 
 Broker mode never loads a component and has no provider authority. It opens one fresh Unix connection, validates an owner-only single-link socket and the configured server peer UID, sends one strict bounded protocol request, and closes the connection. Invocation payloads contain capability, caller-generated invocation/trace IDs, and JSON input—never principal, actor, policy, constraints, credentials, or authorization state. The server derives identity from peer credentials and chooses all authority.
 
+Both connection flags are optional. `--socket` resolves in strict precedence order: the flag, then `$DEKOPON_BROKER_SOCKET`, then `$XDG_RUNTIME_DIR/dekopon/broker.sock`, then `$HOME/.local/run/dekopon/broker.sock`; if none apply the command fails with `could not determine broker socket path`. Candidate paths are never probed for existence, because a socket is legitimately absent while the daemon is stopped—the tightest resolved tier is trusted and a stopped daemon surfaces as a connect failure against that exact path. `--server-uid` defaults to the caller's own effective UID, which is correct for the common per-user broker sharing one owner-UID trust domain; pass it explicitly for a broker running under a dedicated service account. Neither default weakens validation: socket ownership and connected peer credentials are checked against the resolved values exactly as they are against explicit ones.
+
 ```console
+dekopon-run broker capabilities
+
 dekopon-run broker capabilities \
   --socket "$HOME/.local/run/dekopon/broker.sock" \
   --server-uid "$(id -u)"

@@ -168,13 +168,16 @@ pub enum BrokerCommand {
 /// Authenticated local broker connection settings.
 #[derive(Clone, Debug, Args)]
 pub struct BrokerConnectionArgs {
-    /// Owner-only Unix socket created by `dekopon-brokerd`.
+    /// Owner-only Unix socket created by `dekopon-brokerd`; defaults to
+    /// `$DEKOPON_BROKER_SOCKET`, then `$XDG_RUNTIME_DIR/dekopon/broker.sock`,
+    /// then `$HOME/.local/run/dekopon/broker.sock`.
     #[arg(long, value_name = "PATH")]
-    pub socket: PathBuf,
+    pub socket: Option<PathBuf>,
 
-    /// Trusted operating-system UID expected for the broker server process.
+    /// Trusted operating-system UID expected for the broker server process;
+    /// defaults to the caller's own effective UID.
     #[arg(long, value_name = "UID")]
-    pub server_uid: u32,
+    pub server_uid: Option<u32>,
 
     /// Maximum JSON frame bytes, excluding the four-byte prefix.
     #[arg(long, default_value_t = DEFAULT_MAX_FRAME_BYTES, value_name = "BYTES")]
@@ -239,6 +242,8 @@ pub struct LimitArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::{CommandFactory, Parser};
 
     use super::{BrokerCommand, Cli, Command};
@@ -322,9 +327,27 @@ mod tests {
         else {
             panic!("expected broker invoke command");
         };
-        assert_eq!(connection.server_uid, 1000);
+        assert_eq!(
+            connection.socket.as_deref(),
+            Some(Path::new("/run/dekopon/broker.sock"))
+        );
+        assert_eq!(connection.server_uid, Some(1000));
         assert_eq!(invocation_id.as_str(), "invoke-client-test");
         assert_eq!(trace_id.as_str(), "trace-client-test");
+    }
+
+    #[test]
+    fn defaults_broker_socket_and_server_uid_when_omitted() {
+        let cli = Cli::try_parse_from(["dekopon-run", "broker", "capabilities"])
+            .expect("broker capabilities without connection flags");
+        let Command::Broker {
+            command: BrokerCommand::Capabilities { connection },
+        } = cli.command
+        else {
+            panic!("expected broker capabilities command");
+        };
+        assert!(connection.socket.is_none());
+        assert!(connection.server_uid.is_none());
     }
 
     #[test]

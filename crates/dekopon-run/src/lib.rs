@@ -214,9 +214,12 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
     match command {
         BrokerCommand::Capabilities { connection } => {
             async {
+                let socket =
+                    BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
+                let server_uid = resolve_broker_server_uid(connection.server_uid);
                 let client = BrokerClient::new(
-                    &connection.socket,
-                    connection.server_uid,
+                    &socket,
+                    server_uid,
                     FrameLimits {
                         max_frame_bytes: connection.max_frame_bytes,
                         io_timeout: Duration::from_millis(connection.io_timeout_ms),
@@ -239,9 +242,12 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
             input_file,
         } => {
             async {
+                let socket =
+                    BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
+                let server_uid = resolve_broker_server_uid(connection.server_uid);
                 let client = BrokerClient::new(
-                    &connection.socket,
-                    connection.server_uid,
+                    &socket,
+                    server_uid,
                     FrameLimits {
                         max_frame_bytes: connection.max_frame_bytes,
                         io_timeout: Duration::from_millis(connection.io_timeout_ms),
@@ -288,6 +294,78 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
 #[cfg(not(unix))]
 async fn evaluate_broker(_command: &BrokerCommand) -> Result<CommandOutput, AppError> {
     Err(AppError::BrokerUnsupported)
+}
+
+/// Inputs used to resolve the broker socket precedence.
+///
+/// Unlike configuration discovery, no candidate is probed for existence: a broker socket is
+/// absent whenever the daemon is not running, so the tightest resolved tier is always trusted
+/// and connection failures are reported against that exact path.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrokerSocketDiscovery {
+    explicit: Option<PathBuf>,
+    environment: Option<PathBuf>,
+    xdg_runtime_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl BrokerSocketDiscovery {
+    /// Captures discovery inputs from the current process.
+    fn from_process(explicit: Option<PathBuf>) -> Self {
+        Self {
+            explicit,
+            environment: env::var_os("DEKOPON_BROKER_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            xdg_runtime_dir: env::var_os("XDG_RUNTIME_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            home: env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+
+    /// Creates an injectable discovery context for deterministic tests.
+    #[cfg(test)]
+    fn new(
+        explicit: Option<PathBuf>,
+        environment: Option<PathBuf>,
+        xdg_runtime_dir: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            explicit,
+            environment,
+            xdg_runtime_dir,
+            home,
+        }
+    }
+
+    /// Resolves the highest-precedence broker socket path.
+    fn resolve(&self) -> Result<PathBuf, AppError> {
+        if let Some(path) = &self.explicit {
+            return Ok(path.clone());
+        }
+        if let Some(path) = &self.environment {
+            return Ok(path.clone());
+        }
+        if let Some(root) = &self.xdg_runtime_dir {
+            return Ok(root.join("dekopon/broker.sock"));
+        }
+        if let Some(home) = &self.home {
+            return Ok(home.join(".local/run/dekopon/broker.sock"));
+        }
+        Err(AppError::BrokerSocketUnresolved)
+    }
+}
+
+/// Resolves the trusted broker server UID, defaulting to the caller's own effective UID.
+#[cfg(unix)]
+fn resolve_broker_server_uid(explicit: Option<u32>) -> u32 {
+    explicit.unwrap_or_else(|| rustix::process::geteuid().as_raw())
 }
 
 fn read_input(
@@ -455,6 +533,9 @@ enum AppError {
     #[cfg(unix)]
     #[error(transparent)]
     BrokerClient(#[from] ClientError),
+    #[cfg(unix)]
+    #[error("could not determine broker socket path; pass --socket or set DEKOPON_BROKER_SOCKET")]
+    BrokerSocketUnresolved,
     #[cfg(not(unix))]
     #[error("broker client mode requires Unix peer credentials and Unix-domain sockets")]
     BrokerUnsupported,
@@ -502,6 +583,11 @@ mod tests {
 
     use serde_json::json;
 
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use super::{AppError, BrokerSocketDiscovery, resolve_broker_server_uid};
     use super::{InvocationReport, TimingSamples, read_input};
 
     #[test]
@@ -542,5 +628,85 @@ mod tests {
         assert_eq!(report.timing.min_ms, 2.0);
         assert_eq!(report.timing.mean_ms, 3.0);
         assert_eq!(report.timing.max_ms, 4.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_broker_socket_outranks_every_default() {
+        let discovery = BrokerSocketDiscovery::new(
+            Some(PathBuf::from("/explicit/broker.sock")),
+            Some(PathBuf::from("/environment/broker.sock")),
+            Some(PathBuf::from("/run/user/1000")),
+            Some(PathBuf::from("/home/dekopon")),
+        );
+
+        assert_eq!(
+            discovery.resolve().expect("explicit socket"),
+            PathBuf::from("/explicit/broker.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_socket_environment_outranks_runtime_and_home_defaults() {
+        let discovery = BrokerSocketDiscovery::new(
+            None,
+            Some(PathBuf::from("/environment/broker.sock")),
+            Some(PathBuf::from("/run/user/1000")),
+            Some(PathBuf::from("/home/dekopon")),
+        );
+
+        assert_eq!(
+            discovery.resolve().expect("environment socket"),
+            PathBuf::from("/environment/broker.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_socket_runtime_directory_outranks_the_home_default() {
+        let discovery = BrokerSocketDiscovery::new(
+            None,
+            None,
+            Some(PathBuf::from("/run/user/1000")),
+            Some(PathBuf::from("/home/dekopon")),
+        );
+
+        assert_eq!(
+            discovery.resolve().expect("runtime socket"),
+            PathBuf::from("/run/user/1000/dekopon/broker.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_socket_falls_back_to_the_documented_home_path() {
+        let discovery =
+            BrokerSocketDiscovery::new(None, None, None, Some(PathBuf::from("/home/dekopon")));
+
+        assert_eq!(
+            discovery.resolve().expect("home socket"),
+            PathBuf::from("/home/dekopon/.local/run/dekopon/broker.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_broker_socket_reports_actionable_guidance() {
+        let error = BrokerSocketDiscovery::new(None, None, None, None)
+            .resolve()
+            .expect_err("no socket candidate");
+
+        assert!(matches!(error, AppError::BrokerSocketUnresolved));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_server_uid_defaults_to_the_calling_process() {
+        assert_eq!(
+            resolve_broker_server_uid(None),
+            rustix::process::geteuid().as_raw()
+        );
+        assert_eq!(resolve_broker_server_uid(Some(4242)), 4242);
     }
 }
