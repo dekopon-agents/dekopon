@@ -73,6 +73,21 @@ The protocol exposes only the operations needed by a broker client:
 
 `AuthorizedInvocation` is never accepted from or returned to the client. It is created and consumed inside the broker process.
 
+### Failure codes
+
+A failure response carries a stable code and a bounded message. The code is the contract; the message is human-facing and may change. Codes are exported as constants from `dekopon-broker-protocol` so clients need not hardcode strings.
+
+| Code | Meaning | Safe to resubmit? |
+| --- | --- | --- |
+| `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
+| `invalid-request` | The request frame could not be decoded. | Yes, once corrected. |
+| `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
+| `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
+
+`outcome-unaudited` is the durable-state signal that separates "nothing happened" from "something may have happened and nothing recorded it". It is emitted only for failures raised after execution began — a failed terminal audit append, or a failure to hash terminal evidence. A denied or failed *invocation* is not a failure response at all: it returns a normal result carrying its outcome and decision linkage.
+
+The server logs `broker_outcome_unaudited` with the invocation identifier for exactly this case, so the invocation needing manual reconciliation is identifiable without correlating client-side state.
+
 ## HTTP component contract
 
 `dekopon:http@1.0.0` is a high-level request/response interface rather than a socket or generic I/O interface. Its request shape carries:

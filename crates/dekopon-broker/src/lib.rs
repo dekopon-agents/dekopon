@@ -1193,7 +1193,7 @@ where
             allowed: false,
             reason: Some(reason),
         };
-        let digest = evidence_digest("policy-decision", &material)?;
+        let digest = decision_evidence_digest("policy-decision", &material)?;
         self.audit
             .append(AuditEvent::Decision {
                 invocation: request.id.clone(),
@@ -1255,7 +1255,7 @@ where
                 rule.constraints.clone(),
             )
             .map_err(|source| BrokerError::Authorization { source })?;
-        let decision_digest = evidence_digest("authorized-invocation", &authorized)?;
+        let decision_digest = decision_evidence_digest("authorized-invocation", &authorized)?;
         let policy_evidence = Evidence {
             kind: "policy-decision".to_owned(),
             digest: decision_digest.clone(),
@@ -1286,7 +1286,8 @@ where
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
             Ok(output) => {
-                let output_digest = evidence_digest("provider-response", &output.output)?;
+                let output_digest =
+                    outcome_evidence_digest(&invocation_id, "provider-response", &output.output)?;
                 let mut evidence = vec![policy_evidence];
                 evidence.push(Evidence {
                     kind: "provider-response".to_owned(),
@@ -1297,7 +1298,11 @@ where
                 if !output.http_calls.is_empty() {
                     evidence.push(Evidence {
                         kind: "http-calls".to_owned(),
-                        digest: evidence_digest("http-calls", &output.http_calls)?,
+                        digest: outcome_evidence_digest(
+                            &invocation_id,
+                            "http-calls",
+                            &output.http_calls,
+                        )?,
                         media_type: HTTP_EVIDENCE_MEDIA_TYPE.to_owned(),
                         uri: None,
                     });
@@ -1337,7 +1342,11 @@ where
                 if !failure.http_calls.is_empty() {
                     evidence.push(Evidence {
                         kind: "http-calls".to_owned(),
-                        digest: evidence_digest("http-calls", &failure.http_calls)?,
+                        digest: outcome_evidence_digest(
+                            &invocation_id,
+                            "http-calls",
+                            &failure.http_calls,
+                        )?,
                         media_type: HTTP_EVIDENCE_MEDIA_TYPE.to_owned(),
                         uri: None,
                     });
@@ -1446,8 +1455,25 @@ struct DecisionMaterial<'a> {
     reason: Option<&'a str>,
 }
 
-fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, BrokerError> {
-    let bytes = serde_json::to_vec(value).map_err(|source| BrokerError::Evidence { source })?;
+/// Hashes evidence produced before execution began; a failure means nothing ran.
+fn decision_evidence_digest(label: &str, value: &impl Serialize) -> Result<String, BrokerError> {
+    evidence_digest(label, value).map_err(|source| BrokerError::DecisionEvidence { source })
+}
+
+/// Hashes evidence produced after execution began; a failure leaves the outcome unaudited.
+fn outcome_evidence_digest(
+    invocation: &InvocationId,
+    label: &str,
+    value: &impl Serialize,
+) -> Result<String, BrokerError> {
+    evidence_digest(label, value).map_err(|source| BrokerError::OutcomeEvidence {
+        invocation: invocation.clone(),
+        source,
+    })
+}
+
+fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(value)?;
     let mut material = Vec::with_capacity(label.len() + 1 + bytes.len());
     material.extend_from_slice(label.as_bytes());
     material.push(0);
@@ -1526,9 +1552,9 @@ pub enum BrokerError {
         #[source]
         source: AuthorizationError,
     },
-    /// Public evidence could not be hashed.
-    #[error("broker could not serialize bounded evidence")]
-    Evidence {
+    /// Decision evidence could not be hashed; execution did not begin.
+    #[error("broker could not serialize bounded decision evidence")]
+    DecisionEvidence {
         /// JSON failure.
         #[source]
         source: serde_json::Error,
@@ -1540,6 +1566,15 @@ pub enum BrokerError {
         #[source]
         source: AuditError,
     },
+    /// Terminal evidence could not be hashed after provider work ended.
+    #[error("broker could not serialize terminal evidence for {invocation}")]
+    OutcomeEvidence {
+        /// Invocation whose effect may already have completed.
+        invocation: InvocationId,
+        /// JSON failure.
+        #[source]
+        source: serde_json::Error,
+    },
     /// Terminal execution could not be audited after provider work ended.
     #[error("broker could not audit terminal execution for {invocation}")]
     OutcomeAudit {
@@ -1549,6 +1584,30 @@ pub enum BrokerError {
         #[source]
         source: AuditError,
     },
+}
+
+impl BrokerError {
+    /// Invocation whose provider work may already have completed with no terminal audit record.
+    ///
+    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
+    /// execution: the external effect may have taken place, nothing durably recorded its
+    /// outcome, and the request must not be resubmitted under any identifier. `None` when
+    /// execution provably never began, so resubmission under a fresh identifier is safe.
+    ///
+    /// Transports are expected to preserve this distinction; collapsing both cases into one
+    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
+    #[must_use]
+    pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
+        match self {
+            Self::OutcomeEvidence { invocation, .. } | Self::OutcomeAudit { invocation, .. } => {
+                Some(invocation)
+            }
+            Self::ReplayLedgerFull { .. }
+            | Self::Authorization { .. }
+            | Self::DecisionEvidence { .. }
+            | Self::DecisionAudit { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]

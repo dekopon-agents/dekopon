@@ -1,10 +1,12 @@
 use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
-use dekopon_broker::{AuditLog, AuthenticatedContext, Broker};
+use dekopon_broker::{AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_protocol::{
-    BrokerRequest, FrameLimits, ProtocolError, RequestEnvelope, ResponseEnvelope, read_frame,
-    write_frame,
+    BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED,
+    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope, ResponseEnvelope,
+    read_frame, write_frame,
 };
+use dekopon_core::InvocationId;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -120,10 +122,19 @@ fn observe_task(
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            tracing::warn!(
-                event = "broker_connection_failed",
-                category = error.category()
-            );
+            // An unaudited outcome is the only connection failure an operator must act on: it
+            // names the one invocation whose effect may have happened with nothing recording it.
+            match error.unaudited_outcome() {
+                Some(invocation) => tracing::error!(
+                    event = "broker_outcome_unaudited",
+                    category = error.category(),
+                    invocation.id = %invocation
+                ),
+                None => tracing::warn!(
+                    event = "broker_connection_failed",
+                    category = error.category()
+                ),
+            }
             Ok(())
         }
         Err(_) => {
@@ -152,7 +163,7 @@ where
     let Some(context) = identities.get(&uid) else {
         write_frame(
             &mut stream,
-            &ResponseEnvelope::error("unauthenticated", "peer is not mapped by broker policy"),
+            &ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "peer is not mapped by broker policy"),
             limits,
         )
         .await
@@ -164,7 +175,7 @@ where
         Err(_) => {
             write_frame(
                 &mut stream,
-                &ResponseEnvelope::error("invalid-request", "request frame is invalid"),
+                &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid"),
                 limits,
             )
             .await
@@ -176,8 +187,8 @@ where
         BrokerRequest::Capabilities => ResponseEnvelope::capabilities(broker.capabilities(context)),
         BrokerRequest::Invoke { invocation } => match broker.invoke(context, invocation).await {
             Ok(result) => ResponseEnvelope::invocation(result),
-            Err(_) => {
-                return write_broker_failure(&mut stream, limits).await;
+            Err(error) => {
+                return write_broker_failure(&mut stream, limits, &error).await;
             }
         },
     };
@@ -186,21 +197,34 @@ where
         .map_err(ConnectionError::Write)
 }
 
+/// Reports a broker failure while preserving whether provider work may already have completed.
+///
+/// Collapsing the two cases into one code would invite a resubmission that duplicates a
+/// non-idempotent external effect, so the distinction the broker library draws survives the
+/// wire boundary.
 async fn write_broker_failure(
     stream: &mut UnixStream,
     limits: FrameLimits,
+    error: &BrokerError,
 ) -> Result<(), ConnectionError> {
-    write_frame(
-        stream,
-        &ResponseEnvelope::error(
-            "broker-unavailable",
-            "broker could not durably complete the request",
+    let (code, message, failure) = match error.unaudited_outcome() {
+        Some(invocation) => (
+            ERROR_OUTCOME_UNAUDITED,
+            "provider work may already have completed and its outcome was not audited",
+            ConnectionError::OutcomeUnaudited {
+                invocation: invocation.clone(),
+            },
         ),
-        limits,
-    )
-    .await
-    .map_err(ConnectionError::Write)?;
-    Err(ConnectionError::Broker)
+        None => (
+            ERROR_BROKER_UNAVAILABLE,
+            "broker could not durably complete the request",
+            ConnectionError::Broker,
+        ),
+    };
+    write_frame(stream, &ResponseEnvelope::error(code, message), limits)
+        .await
+        .map_err(ConnectionError::Write)?;
+    Err(failure)
 }
 
 #[derive(Debug, Error)]
@@ -212,6 +236,11 @@ enum ConnectionError {
     },
     #[error("invalid request")]
     InvalidRequest,
+    #[error("broker could not audit the outcome of {invocation}")]
+    OutcomeUnaudited {
+        /// Invocation whose external effect may already have completed.
+        invocation: InvocationId,
+    },
     #[error("broker failed")]
     Broker,
     #[error("response write failed")]
@@ -219,10 +248,21 @@ enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// Invocation whose provider work may already have completed with no terminal audit record.
+    const fn unaudited_outcome(&self) -> Option<&InvocationId> {
+        match self {
+            Self::OutcomeUnaudited { invocation } => Some(invocation),
+            Self::PeerCredentials { .. } | Self::InvalidRequest | Self::Broker | Self::Write(_) => {
+                None
+            }
+        }
+    }
+
     const fn category(&self) -> &'static str {
         match self {
             Self::PeerCredentials { .. } => "peer-credentials",
             Self::InvalidRequest => "invalid-request",
+            Self::OutcomeUnaudited { .. } => "broker-outcome-unaudited",
             Self::Broker => "broker",
             Self::Write(_) => "response-write",
         }

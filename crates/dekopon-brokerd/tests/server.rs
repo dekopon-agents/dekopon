@@ -11,7 +11,7 @@ use dekopon_broker::{
     AuthenticatedContext, Broker, BrokerLimits, InMemoryAuditLog, InvocationRequest, PolicyRule,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_broker_protocol::{BrokerClient, FrameLimits};
+use dekopon_broker_protocol::{BrokerClient, ClientError, FrameLimits};
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
     CheckpointError, ServerLimits, current_uid, run,
@@ -86,11 +86,17 @@ fn bind_fixture(path: &Path) -> UnixListener {
 }
 
 async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+    broker_with_audit_bound(8).await
+}
+
+async fn broker_with_audit_bound(
+    maximum: usize,
+) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     let registry =
         BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
             .await
             .expect("load echo fixture");
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
     let broker = Arc::new(
         Broker::new(
             registry,
@@ -293,4 +299,58 @@ async fn wait_for_socket(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("broker fixture socket did not appear within thirty seconds");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_never_ran() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    // One audit slot: the first allowed invocation spends it on its Decision, so its terminal
+    // Execution append is already doomed when the provider runs.
+    let (broker, audit) = broker_with_audit_bound(1).await;
+    let mut identities = BTreeMap::new();
+    identities.insert(uid, context("caller"));
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let ran = client
+        .invoke(request("invoke-outcome-unaudited"))
+        .await
+        .expect_err("a terminal audit failure is not a successful invocation");
+    let ClientError::Remote { code, message } = ran else {
+        panic!("expected a remote broker failure, got {ran}");
+    };
+    assert_eq!(code, "outcome-unaudited");
+    assert!(
+        message.contains("may already have completed"),
+        "the client must be told the effect may have happened: {message}"
+    );
+    // The Decision landed; the provider ran; nothing recorded the outcome.
+    assert_eq!(audit.records().await.len(), 1);
+
+    let never_ran = client
+        .invoke(request("invoke-never-ran"))
+        .await
+        .expect_err("a full audit cannot authorize");
+    let ClientError::Remote {
+        code: unran_code, ..
+    } = never_ran
+    else {
+        panic!("expected a remote broker failure, got {never_ran}");
+    };
+    assert_eq!(unran_code, "broker-unavailable");
+    assert_ne!(
+        unran_code, code,
+        "a client must distinguish an effect that may have run from one that never began"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    let _ = task.await.expect("server task exits");
 }
