@@ -128,6 +128,40 @@ impl Default for BrokerHostLimits {
     }
 }
 
+/// Failed broker-provider invocation and the evidence for calls that already executed.
+///
+/// An invocation can fail after the guest has already dispatched authorized HTTP requests, so
+/// the terminal failure carries the same sanitized metadata a success would have carried. The
+/// evidence is empty only when the failure preceded any dispatch.
+#[derive(Debug)]
+pub struct BrokerInvocationFailure {
+    /// Host failure that ended the invocation.
+    pub error: BrokerHostError,
+    /// Sanitized metadata for every HTTP call dispatched before the failure.
+    pub http_calls: Vec<HttpCallEvidence>,
+}
+
+impl From<BrokerHostError> for BrokerInvocationFailure {
+    fn from(error: BrokerHostError) -> Self {
+        Self {
+            error,
+            http_calls: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Display for BrokerInvocationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for BrokerInvocationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Successful broker-provider output and bounded HTTP evidence metadata.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,7 +303,7 @@ impl BrokerWasmProvider {
         capability: &CapabilityId,
         input: &Value,
         constraints: &ExecutionConstraints,
-    ) -> Result<BrokerInvocationOutput, BrokerHostError> {
+    ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
             .manifest
@@ -280,12 +314,14 @@ impl BrokerWasmProvider {
             return Err(BrokerHostError::ProviderDoesNotImplement {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
-            });
+            }
+            .into());
         }
         if !input.is_object() {
             return Err(BrokerHostError::InputNotObject {
                 capability: capability.clone(),
-            });
+            }
+            .into());
         }
         let input_json = serde_json::to_string(input)
             .map_err(|source| BrokerHostError::SerializeInput { source })?;
@@ -294,7 +330,8 @@ impl BrokerWasmProvider {
                 capability: capability.clone(),
                 length: input_json.len(),
                 maximum: self.runtime.limits.max_input_bytes,
-            });
+            }
+            .into());
         }
 
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
@@ -305,17 +342,50 @@ impl BrokerWasmProvider {
         )
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
         let mut store = self.runtime.store(http)?;
+        // The store outlives the guest on every path, including the one where the timeout drops
+        // the operation future, so evidence for dispatched calls is harvested exactly once and
+        // reaches the caller whether the invocation succeeded or failed.
+        let executed = self
+            .execute_in_store(
+                &mut store,
+                capability,
+                &input_json,
+                constraints,
+                operation_timeout,
+            )
+            .await;
+        let http_calls = store.into_data().http.into_evidence();
+        match executed {
+            Ok(output) => Ok(BrokerInvocationOutput {
+                provider: self.manifest.id.clone(),
+                capability: capability.clone(),
+                output,
+                http_calls,
+            }),
+            Err(error) => Err(BrokerInvocationFailure { error, http_calls }),
+        }
+    }
+
+    /// Runs one guest invocation to a terminal outcome, leaving its store to the caller.
+    async fn execute_in_store(
+        &self,
+        store: &mut Store<StoreState>,
+        capability: &CapabilityId,
+        input_json: &str,
+        constraints: &ExecutionConstraints,
+        operation_timeout: Duration,
+    ) -> Result<Value, BrokerHostError> {
         let linker = self.runtime.linker()?;
         let operation = async {
             let bindings =
-                bindings::Provider::instantiate_async(&mut store, &self.component, &linker)
+                bindings::Provider::instantiate_async(&mut *store, &self.component, &linker)
                     .await
                     .map_err(|source| BrokerHostError::Instantiate {
                         path: self.source.clone(),
                         source,
                     })?;
             bindings
-                .call_invoke(&mut store, capability.as_str(), &input_json)
+                .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
                 .map_err(|source| BrokerHostError::Invoke {
                     provider: self.manifest.id.clone(),
@@ -355,24 +425,15 @@ impl BrokerWasmProvider {
                     source,
                 }
             })?;
-        let output = match response {
-            ComponentResponse::Succeeded { output } => output,
-            ComponentResponse::Failed { error } => {
-                return Err(BrokerHostError::ProviderFailure {
-                    provider: self.manifest.id.clone(),
-                    capability: capability.clone(),
-                    code: error.code,
-                    message: error.message,
-                });
-            }
-        };
-        let http_calls = store.into_data().http.into_evidence();
-        Ok(BrokerInvocationOutput {
-            provider: self.manifest.id.clone(),
-            capability: capability.clone(),
-            output,
-            http_calls,
-        })
+        match response {
+            ComponentResponse::Succeeded { output } => Ok(output),
+            ComponentResponse::Failed { error } => Err(BrokerHostError::ProviderFailure {
+                provider: self.manifest.id.clone(),
+                capability: capability.clone(),
+                code: error.code,
+                message: error.message,
+            }),
+        }
     }
 }
 
@@ -457,7 +518,7 @@ impl BrokerProviderRegistry {
     pub async fn invoke(
         &self,
         authorized: AuthorizedInvocation,
-    ) -> Result<BrokerInvocationOutput, BrokerHostError> {
+    ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         let proposal = authorized.proposal();
         let provider_index = self
             .routes
@@ -472,7 +533,8 @@ impl BrokerProviderRegistry {
                 capability: proposal.capability.clone(),
                 authorized: authorized.provider().clone(),
                 routed: provider.manifest.id.clone(),
-            });
+            }
+            .into());
         }
         provider
             .invoke(

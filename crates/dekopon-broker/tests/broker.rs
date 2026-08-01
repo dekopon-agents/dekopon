@@ -625,3 +625,113 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     assert!(!serialized.contains("private body"));
     assert!(!serialized.contains("/posts"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_execution_audits_the_external_write_that_already_landed() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("jsonplaceholder-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("JSONPlaceholder provider fixture loads");
+    // The POST is accepted by the server — the non-idempotent effect happens — but the body is
+    // not a post, so the guest reports its own failure after the external write has landed.
+    let (authority, received, server) = mock_http(
+        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+    );
+    let constraints = ExecutionConstraints {
+        timeout_ms: 5_000,
+        max_output_bytes: 1024 * 1024,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec![authority.clone()],
+            allowed_methods: vec!["POST".to_owned()],
+            max_requests: 1,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+        }),
+    };
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        "broker-test"
+            .parse::<PrincipalId>()
+            .expect("valid broker principal"),
+        "policy-jsonplaceholder".to_owned(),
+        vec![rule_with_metadata(
+            "caller",
+            "jsonplaceholder.posts.create",
+            "jsonplaceholder",
+            EffectKind::ExternalWrite,
+            RiskLevel::Medium,
+            Idempotency::NonIdempotent,
+            constraints,
+        )],
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("external-write rule exactly matches trusted provider metadata");
+
+    let result = broker
+        .invoke(
+            &context("caller"),
+            request(
+                "invoke-json-write-failure",
+                "jsonplaceholder.posts.create",
+                json!({
+                    "userId": 3,
+                    "title": "private title",
+                    "body": "private body",
+                    "endpoint": format!("http://{authority}")
+                }),
+            ),
+        )
+        .await
+        .expect("a failing provider is still durably accounted");
+
+    let wire = received.recv().expect("fixture POST recorded");
+    assert!(
+        wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
+        "the external write must have left the host before the failure"
+    );
+    server.join().expect("fixture server exits");
+
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Failed
+    );
+    assert_eq!(result.error.as_deref(), Some("provider-failure"));
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "http-calls"),
+        "a failure that dispatched HTTP must return http-call evidence"
+    );
+
+    let records = audit.records().await;
+    assert_eq!(records.len(), 2);
+    verify_audit_chain(&records).expect("audit chain verifies");
+    let AuditEvent::Execution {
+        outcome,
+        http_calls,
+        ..
+    } = &records[1].event
+    else {
+        panic!("the terminal record is an execution event");
+    };
+    assert_eq!(*outcome, dekopon_capability::InvocationOutcome::Failed);
+    assert_eq!(
+        http_calls.len(),
+        1,
+        "the completed call must survive into the failed execution record"
+    );
+    assert_eq!(http_calls[0].method, "POST");
+    assert_eq!(http_calls[0].authority, authority);
+    assert_eq!(http_calls[0].status, Some(201));
+
+    let serialized = serde_json::to_string(&records).expect("audit serializes");
+    assert!(!serialized.contains("private title"));
+    assert!(!serialized.contains("private body"));
+    assert!(!serialized.contains("/posts"));
+}
