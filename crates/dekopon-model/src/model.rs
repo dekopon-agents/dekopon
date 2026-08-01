@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use ureq::Agent;
+use ureq::{Agent, http};
 
 /// A model-facing tool definition.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -340,21 +340,32 @@ impl TryFrom<WireToolCall> for ModelToolCall {
     }
 }
 
+/// Whether a bearer token may accompany requests to this endpoint.
+///
+/// The connection host must be derived exactly as the transport derives it. `Uri::host` excludes
+/// userinfo, so an authority such as `127.0.0.1:80@models.example.test` resolves to the remote
+/// host it actually connects to rather than the loopback literal it imitates. `Uri::host` returns
+/// IPv6 literals bracketed and does not normalize case, so both are handled here.
 fn allows_bearer_token(endpoint: &str) -> bool {
-    let lowercase = endpoint.to_ascii_lowercase();
-    if lowercase.starts_with("https://") {
-        return true;
-    }
-    let Some(remainder) = lowercase.strip_prefix("http://") else {
+    let Ok(uri) = endpoint.parse::<http::Uri>() else {
         return false;
     };
-    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = if let Some(ipv6) = authority.strip_prefix('[') {
-        ipv6.split(']').next().unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
+    let Some(scheme) = uri.scheme_str() else {
+        return false;
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    scheme.eq_ignore_ascii_case("http") && uri.host().is_some_and(is_loopback_host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|literal| literal.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 fn completion_url(endpoint: &str) -> String {
@@ -426,11 +437,45 @@ mod tests {
         .expect("remote bearer tokens require TLS");
 
         assert!(matches!(error, ModelError::Configuration(_)));
+
+        // Userinfo makes the authority read as loopback while the socket connects elsewhere.
+        for disguised in [
+            "http://127.0.0.1:80@models.example.test/v1",
+            "http://localhost@models.example.test/v1",
+            "http://[::1]@models.example.test/v1",
+        ] {
+            let error = OpenAiChatModel::new(
+                disguised,
+                "test-model",
+                Some("secret".to_owned()),
+                Duration::from_secs(1),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{disguised} connects to a remote host in plaintext"));
+            assert!(matches!(error, ModelError::Configuration(_)));
+        }
+
+        for loopback in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert!(
+                OpenAiChatModel::new(
+                    loopback,
+                    "test-model",
+                    Some("local-secret".to_owned()),
+                    Duration::from_secs(1),
+                )
+                .is_ok(),
+                "{loopback} is a loopback endpoint"
+            );
+        }
         assert!(
             OpenAiChatModel::new(
-                "http://127.0.0.1:11434/v1",
+                "https://models.example.test/v1",
                 "test-model",
-                Some("local-secret".to_owned()),
+                Some("secret".to_owned()),
                 Duration::from_secs(1),
             )
             .is_ok()
