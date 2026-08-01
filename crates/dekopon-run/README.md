@@ -23,9 +23,13 @@ cargo run -p dekopon-run -- invoke \
   echo.reverse --input '{"message":"stressed"}'
 ```
 
-Broker mode is deliberately separate and never accepts a principal, actor, policy, constraint, credential, or `AuthorizedInvocation` argument. The server derives identity from Unix peer credentials. The client requires the trusted server UID and validates private socket metadata plus connected peer credentials:
+Broker mode is deliberately separate and never accepts a principal, actor, policy, constraint, credential, or `AuthorizedInvocation` argument. The server derives identity from Unix peer credentials. The client validates private socket metadata plus connected peer credentials against a trusted server UID.
+
+`--socket` and `--server-uid` are optional. The socket resolves from `--socket`, then `$DEKOPON_BROKER_SOCKET`, then `$XDG_RUNTIME_DIR/dekopon/broker.sock`, then `$HOME/.local/run/dekopon/broker.sock`, and fails with actionable guidance when none apply; candidates are never probed for existence, so a stopped daemon reports a connect failure against the exact resolved path. The server UID defaults to the caller's own effective UID, matching the single owner-UID trust domain of a per-user broker. Pass both explicitly for a broker running under a dedicated service account:
 
 ```console
+dekopon-run broker capabilities
+
 dekopon-run broker capabilities \
   --socket "$HOME/.local/run/dekopon/broker.sock" \
   --server-uid "$(id -u)"

@@ -640,6 +640,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-model",
  "dekopon-provider-host",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
