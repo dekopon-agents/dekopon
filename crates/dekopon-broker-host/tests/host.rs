@@ -131,6 +131,31 @@ fn mock_http(response: &[u8]) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<
     (format!("127.0.0.1:{}", address.port()), receiver, handle)
 }
 
+/// Accepts one request, records it, and never answers, so the call is dispatched but unresolved.
+fn mock_http_stalled() -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+    let address = listener.local_addr().expect("fixture address");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fixture request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set fixture timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while request.windows(4).all(|window| window != b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+            }
+        }
+        let _ = sender.send(request);
+        // Hold the connection open past the invocation deadline without ever responding.
+        thread::sleep(Duration::from_secs(5));
+    });
+    (format!("127.0.0.1:{}", address.port()), receiver)
+}
+
 fn content_length(headers: &[u8]) -> usize {
     String::from_utf8_lossy(headers)
         .lines()
@@ -315,7 +340,8 @@ async fn denies_http_when_authorization_has_no_http_grant() {
             ExecutionConstraints::default(),
         ))
         .await
-        .expect_err("missing HTTP authorization must fail");
+        .expect_err("missing HTTP authorization must fail")
+        .error;
 
     assert!(matches!(
         error,
@@ -344,7 +370,8 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
             http_constraints("127.0.0.1:10".to_owned(), "GET"),
         ))
         .await
-        .expect_err("different loopback port must be denied before connection");
+        .expect_err("different loopback port must be denied before connection")
+        .error;
 
     assert!(matches!(
         error,
@@ -376,7 +403,8 @@ async fn rejects_guest_control_of_authorization_headers() {
             http_constraints("127.0.0.1:9".to_owned(), "GET"),
         ))
         .await
-        .expect_err("guest authorization header must be rejected before connection");
+        .expect_err("guest authorization header must be rejected before connection")
+        .error;
 
     assert!(matches!(
         error,
@@ -408,7 +436,8 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
             http_constraints("127.0.0.1:10".to_owned(), "GET"),
         ))
         .await
-        .expect_err("host rejection remains terminal after the guest catches the WIT error");
+        .expect_err("host rejection remains terminal after the guest catches the WIT error")
+        .error;
 
     assert!(matches!(
         error,
@@ -450,7 +479,8 @@ async fn enforces_response_bytes_while_streaming() {
             constraints,
         ))
         .await
-        .expect_err("oversized response must fail the invocation");
+        .expect_err("oversized response must fail the invocation")
+        .error;
 
     assert!(matches!(
         error,
@@ -525,7 +555,8 @@ async fn rejects_authorization_bound_to_a_different_provider() {
             ExecutionConstraints::default(),
         ))
         .await
-        .expect_err("authorization cannot be retargeted to the routed provider");
+        .expect_err("authorization cannot be retargeted to the routed provider")
+        .error;
     assert!(matches!(
         error,
         BrokerHostError::AuthorizedProviderMismatch { .. }
@@ -578,11 +609,55 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
             },
         ))
         .await
-        .expect_err("authorization cannot widen host timeout");
+        .expect_err("authorization cannot widen host timeout")
+        .error;
     assert!(matches!(
         error,
         BrokerHostError::AuthorizationExceedsHostLimit {
             field: "timeout_ms"
         }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider loads");
+    let (authority, received) = mock_http_stalled();
+    let capability = "http-probe.fetch"
+        .parse()
+        .expect("valid capability fixture");
+    let constraints = ExecutionConstraints {
+        timeout_ms: 750,
+        ..http_constraints(authority.clone(), "GET")
+    };
+    let failure = registry
+        .invoke(authorized(
+            capability,
+            json!({"uri": format!("http://{authority}/")}),
+            constraints,
+        ))
+        .await
+        .expect_err("an unanswered request cannot succeed");
+
+    let wire = received.recv().expect("fixture request recorded");
+    assert!(
+        wire.starts_with(b"GET /"),
+        "the request must have left the host before the failure"
+    );
+    assert_eq!(
+        failure.http_calls.len(),
+        1,
+        "a dispatched call must survive the failure it precedes"
+    );
+    assert_eq!(failure.http_calls[0].method, "GET");
+    assert_eq!(failure.http_calls[0].authority, authority);
+    assert_eq!(
+        failure.http_calls[0].status, None,
+        "a call that never received a response records no status"
+    );
 }

@@ -1329,8 +1329,19 @@ where
                     event,
                 )
             }
-            Err(error) => {
-                let error = public_host_error(&error).to_owned();
+            Err(failure) => {
+                let error = public_host_error(&failure.error).to_owned();
+                // A failure can follow calls that already left the host; their sanitized
+                // metadata belongs in the terminal record exactly as it would on success.
+                let mut evidence = vec![policy_evidence];
+                if !failure.http_calls.is_empty() {
+                    evidence.push(Evidence {
+                        kind: "http-calls".to_owned(),
+                        digest: evidence_digest("http-calls", &failure.http_calls)?,
+                        media_type: HTTP_EVIDENCE_MEDIA_TYPE.to_owned(),
+                        uri: None,
+                    });
+                }
                 let event = execution_event(
                     context,
                     &invocation_id,
@@ -1344,7 +1355,7 @@ where
                     duration_ms,
                     Some(error.clone()),
                     None,
-                    Vec::new(),
+                    failure.http_calls,
                 );
                 (
                     InvocationResult {
@@ -1353,7 +1364,7 @@ where
                         outcome: InvocationOutcome::Failed,
                         output: None,
                         error: Some(error),
-                        evidence: vec![policy_evidence],
+                        evidence,
                     },
                     event,
                 )
