@@ -11,6 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+base64 = "0.22.1"
 dekopon-provider-http = { path = "../../../crates/dekopon-provider-http" }
 dekopon-provider-sdk = { path = "../../../crates/dekopon-provider-sdk" }
 serde_json = "1.0.151"

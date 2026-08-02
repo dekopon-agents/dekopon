@@ -15,6 +15,7 @@ members = [
     "crates/dekopon-provider-sdk",
     "crates/dekopon-protocol",
     "crates/dekopon-run",
+    "crates/dekopon-shell",
     "crates/dekopon-testkit",
 ]
 exclude = ["examples/providers/echo"]
@@ -34,6 +35,9 @@ base64 = "0.22.1"
 clap = { version = "4.6.4", features = ["derive"] }
 fs2 = "0.4.3"
 futures-util = "0.3.31"
+jaq-core = "3.1.0"
+jaq-json = "2.0.1"
+jaq-std = { version = "3.0.1", default-features = false, features = ["std"] }
 libc = "0.2.189"
 reqwest = { version = "0.12.28", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["process"] }
@@ -65,6 +69,7 @@ dekopon-provider-host = { version = "0.2.0", path = "crates/dekopon-provider-hos
 dekopon-provider-http = { version = "0.2.0", path = "crates/dekopon-provider-http" }
 dekopon-provider-sdk = { version = "0.2.0", path = "crates/dekopon-provider-sdk" }
 dekopon-protocol = { version = "0.2.0", path = "crates/dekopon-protocol" }
+dekopon-shell = { version = "0.2.0", path = "crates/dekopon-shell" }
 dekopon-testkit = { version = "0.2.0", path = "crates/dekopon-testkit" }
 
 [workspace.lints.rust]

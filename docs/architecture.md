@@ -53,7 +53,8 @@ Crate boundaries are:
 - `dekopon-broker-protocol`: lightweight strict versioned messages and an unprivileged Unix client carrying proposals/results but no identity or authorization fields; it has no broker-host or native-HTTP dependency.
 - `dekopon-brokerd`: Unix-only privileged process with strict owner-controlled configuration, private socket lifecycle, peer-UID context mapping, bounded concurrency/shutdown, durable replay restoration, and provider execution.
 - `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.
-- `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, trace export, and explicit unprivileged broker capability/invocation client.
+- `dekopon-shell`: sandboxed bash-flavored script parser and tree-walking interpreter whose command words dispatch to capabilities through one abstract seam; it links no Wasmtime, broker, HTTP, or filesystem code and owns its own step, recursion, output, deadline, and capability-call bounds.
+- `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, sandboxed script execution, trace export, and explicit unprivileged broker capability/invocation client.
 - `dekopon-testkit`: private builders used by workspace tests.
 - `dekopon`: catalog and model-auth command parsing, resource reads, rendering, and process exits.
 

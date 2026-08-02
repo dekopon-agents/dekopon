@@ -25,6 +25,10 @@ use dekopon_model::{
     model::{ChatModel, ModelError, OpenAiChatModel},
 };
 use dekopon_provider_host::{HostLimits, ProviderHostError, ProviderManifest, ProviderRegistry};
+use dekopon_shell::{
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, Interpreter,
+    Limits as ShellLimits,
+};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -32,7 +36,7 @@ use thiserror::Error;
 use tracing::Instrument as _;
 
 use crate::{
-    cli::{BrokerCommand, Cli, Command, LimitArgs},
+    cli::{BrokerCommand, Cli, Command, LimitArgs, ShellLimitArgs},
     prompt::{PromptError, run_prompt},
 };
 
@@ -125,6 +129,44 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 .map(CommandOutput::success)
                 .map_err(AppError::Serialize)
         }
+        Command::Shell {
+            limits,
+            providers,
+            shell,
+            curl_capability,
+            script,
+        } => {
+            let span = tracing::info_span!(
+                "runner.shell",
+                provider.count = providers.provider.len(),
+                shell.max_steps = shell.shell_max_steps,
+                shell.max_capability_calls = shell.shell_max_capability_calls
+            );
+            let _entered = span.enter();
+            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
+            let invoker = RegistryInvoker {
+                registry: &registry,
+            };
+            let outcome = Interpreter::new(shell_limits(shell))
+                .with_curl_capability(curl_capability.clone())
+                .run(script, &invoker);
+            tracing::info!(
+                shell.exit_code = outcome.exit_code.get(),
+                shell.steps = outcome.steps,
+                provider.invocations = outcome.capability_calls,
+                shell.truncated = outcome.truncated,
+                "shell script completed"
+            );
+            let mut text = outcome.output;
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[exit code: {}]", outcome.exit_code));
+            Ok(CommandOutput {
+                text,
+                exit_code: i32::from(outcome.exit_code.get()),
+            })
+        }
         Command::Broker { command } => evaluate_broker(command).await,
         Command::Prompt {
             limits,
@@ -194,6 +236,68 @@ struct CommandOutput {
 impl CommandOutput {
     fn success(text: String) -> Self {
         Self { text, exit_code: 0 }
+    }
+}
+
+/// Adapts the direct provider registry to the interpreter's capability seam.
+///
+/// Direct mode performs no broker transition, so no invocation here can be *denied*: there is no
+/// authorization to refuse one. `Denied` stays reachable in the shared vocabulary because a
+/// broker-backed invoker will produce it; this adapter simply never does.
+struct RegistryInvoker<'a> {
+    registry: &'a ProviderRegistry,
+}
+
+impl CapabilityInvoker for RegistryInvoker<'_> {
+    fn granted(&self) -> Vec<String> {
+        self.registry
+            .capabilities()
+            .map(|(_provider, capability)| capability.id.to_string())
+            .collect()
+    }
+
+    fn is_granted(&self, capability: &str) -> bool {
+        capability.parse::<CapabilityId>().is_ok_and(|capability| {
+            self.registry
+                .capabilities()
+                .any(|(_provider, candidate)| candidate.id == capability)
+        })
+    }
+
+    fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
+        let capability = capability.parse::<CapabilityId>().ok()?;
+        self.registry
+            .capabilities()
+            .find(|(_provider, candidate)| candidate.id == capability)
+            .map(|(_provider, candidate)| CapabilityDescription {
+                capability: candidate.id.to_string(),
+                description: candidate.description.clone(),
+                input_schema: candidate.input_schema.clone(),
+            })
+    }
+
+    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+        let Ok(capability) = capability.parse::<CapabilityId>() else {
+            return CapabilityCallResult::NotFound;
+        };
+        match self.registry.invoke(&capability, &input) {
+            Ok(output) => CapabilityCallResult::Succeeded(output.output),
+            Err(ProviderHostError::UnknownCapability { .. }) => CapabilityCallResult::NotFound,
+            Err(error) => CapabilityCallResult::Failed {
+                error: error.to_string(),
+            },
+        }
+    }
+}
+
+fn shell_limits(limits: &ShellLimitArgs) -> ShellLimits {
+    ShellLimits {
+        max_steps: limits.shell_max_steps,
+        max_recursion_depth: limits.shell_max_recursion_depth,
+        max_output_bytes: limits.shell_max_output_bytes,
+        max_output_lines: limits.shell_max_output_lines,
+        timeout: Duration::from_millis(limits.shell_timeout_ms),
+        max_capability_calls: limits.shell_max_capability_calls,
     }
 }
 

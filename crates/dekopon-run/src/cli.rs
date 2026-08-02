@@ -9,6 +9,11 @@ use dekopon_provider_host::{
     DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT,
 };
+use dekopon_shell::{
+    DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES as DEFAULT_SHELL_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS,
+    DEFAULT_TIMEOUT as DEFAULT_SHELL_TIMEOUT,
+};
 
 /// Immediate-mode Dekopon runner.
 #[derive(Clone, Debug, Parser)]
@@ -74,6 +79,30 @@ pub enum Command {
         /// Number of warm invocations after providers have been compiled.
         #[arg(long, default_value = "1", value_name = "COUNT")]
         repeat: NonZeroU32,
+    },
+    /// Run one sandboxed shell script whose commands dispatch to provider capabilities.
+    Shell {
+        /// Bounded immediate-mode Wasm settings.
+        #[command(flatten)]
+        limits: LimitArgs,
+
+        /// Provider components whose capabilities the script may invoke.
+        #[command(flatten)]
+        providers: ProviderArgs,
+
+        /// Bounded interpreter settings.
+        #[command(flatten)]
+        shell: ShellLimitArgs,
+
+        /// Direct-mode capability the `curl` builtin assembles requests for.
+        ///
+        /// Absent means `curl` reports "command not found".
+        #[arg(long, value_name = "CAPABILITY")]
+        curl_capability: Option<String>,
+
+        /// Script source.
+        #[arg(value_name = "SCRIPT")]
+        script: String,
     },
     /// Use the unprivileged client for a separately running authenticated broker.
     Broker {
@@ -198,6 +227,57 @@ pub struct ProviderArgs {
     /// Wasm component implementing the Dekopon provider world; repeat for multiple providers.
     #[arg(long, required = true, action = ArgAction::Append, value_name = "COMPONENT")]
     pub provider: Vec<PathBuf>,
+}
+
+/// Bounded interpreter settings for `shell`.
+///
+/// These are separate from [`LimitArgs`]: Wasm fuel and memory bound one component call, while
+/// these bound the native tree-walking interpreter that decides how many such calls happen.
+#[derive(Clone, Debug, Args)]
+pub struct ShellLimitArgs {
+    /// Statements, loop iterations, and function calls one script may execute.
+    #[arg(long, default_value_t = DEFAULT_MAX_STEPS, value_name = "COUNT")]
+    pub shell_max_steps: u64,
+
+    /// Maximum nested shell-function calls.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_RECURSION_DEPTH,
+        value_name = "DEPTH"
+    )]
+    pub shell_max_recursion_depth: u32,
+
+    /// Maximum accumulated script output.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHELL_MAX_OUTPUT_BYTES,
+        value_name = "BYTES"
+    )]
+    pub shell_max_output_bytes: usize,
+
+    /// Maximum accumulated script output lines.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_OUTPUT_LINES,
+        value_name = "LINES"
+    )]
+    pub shell_max_output_lines: usize,
+
+    /// Wall-clock deadline for the whole script.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHELL_TIMEOUT.as_millis() as u64,
+        value_name = "MILLISECONDS"
+    )]
+    pub shell_timeout_ms: u64,
+
+    /// Maximum capability invocations one script may drive.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_CAPABILITY_CALLS,
+        value_name = "COUNT"
+    )]
+    pub shell_max_capability_calls: u32,
 }
 
 /// Bounded Wasmtime store settings.
