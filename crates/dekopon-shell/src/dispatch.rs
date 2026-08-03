@@ -191,8 +191,6 @@ mod tests {
     fn resolution_follows_the_documented_priority_order() {
         let mut functions = BTreeSet::new();
         functions.insert("greet".to_owned());
-        // A user function shadows nothing in the builtin table unless it is declared first.
-        functions.insert("mine".to_owned());
 
         assert!(matches!(
             resolve("greet", &functions, &Granted),
@@ -226,6 +224,20 @@ mod tests {
         functions.insert("echo.echo".to_owned());
         assert!(matches!(
             resolve("echo.echo", &functions, &Granted),
+            Resolution::Function
+        ));
+    }
+
+    #[test]
+    fn a_function_shadows_a_builtin_only_by_being_declared() {
+        let mut functions = BTreeSet::new();
+        assert!(matches!(
+            resolve("jq", &functions, &Granted),
+            Resolution::Builtin(_)
+        ));
+        functions.insert("jq".to_owned());
+        assert!(matches!(
+            resolve("jq", &functions, &Granted),
             Resolution::Function
         ));
     }

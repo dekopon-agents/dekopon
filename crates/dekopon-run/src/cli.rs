@@ -12,7 +12,7 @@ use dekopon_provider_host::{
 use dekopon_shell::{
     DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES as DEFAULT_SHELL_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS,
-    DEFAULT_TIMEOUT as DEFAULT_SHELL_TIMEOUT,
+    DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT as DEFAULT_SHELL_TIMEOUT,
 };
 
 /// Immediate-mode Dekopon runner.
@@ -96,9 +96,11 @@ pub enum Command {
 
         /// Direct-mode capability the `curl` builtin assembles requests for.
         ///
-        /// Absent means `curl` reports "command not found".
+        /// Absent means `curl` reports "command not found". Typed as a capability identifier so a
+        /// malformed value is a usage error here rather than a "capability not found" at runtime,
+        /// which would tell an operator the wrong thing about what went wrong.
         #[arg(long, value_name = "CAPABILITY")]
-        curl_capability: Option<String>,
+        curl_capability: Option<CapabilityId>,
 
         /// Script source.
         #[arg(value_name = "SCRIPT")]
@@ -278,6 +280,18 @@ pub struct ShellLimitArgs {
         value_name = "COUNT"
     )]
     pub shell_max_capability_calls: u32,
+
+    /// Maximum value bytes one script may materialize in variables, buffers, and substitutions.
+    ///
+    /// This is cumulative across the run rather than a snapshot of what is held, so it is an upper
+    /// bound on the interpreter's peak value memory. Without it, doubling a string in a loop
+    /// reaches gigabytes in a few hundred steps.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_VALUE_BYTES,
+        value_name = "BYTES"
+    )]
+    pub shell_max_value_bytes: u64,
 }
 
 /// Bounded Wasmtime store settings.

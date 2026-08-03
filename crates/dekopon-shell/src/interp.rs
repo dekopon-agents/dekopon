@@ -54,6 +54,8 @@ enum Executed {
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
+    /// The value piped into the call, offered to the first command of each pipeline in the body.
+    stdin: Option<Value>,
 }
 
 /// Parses and evaluates one script, returning its outcome.
@@ -76,7 +78,7 @@ pub(crate) fn run(
         }
     };
 
-    let mut interpreter = Interpreter {
+    let mut evaluator = Evaluator {
         invoker,
         budget: Budget::start(limits),
         output: OutputBuffer::new(&limits),
@@ -91,24 +93,30 @@ pub(crate) fn run(
         last_substitution_status: ExitCode::SUCCESS,
     };
 
-    let exit_code = match interpreter.execute_program(&program) {
+    let exit_code = match evaluator.execute_program(&program) {
         Ok(Flow::Exit(code)) => code,
         Ok(Flow::Return(code)) => code,
-        Ok(_) => interpreter.last_status,
-        Err(fatal) => interpreter.report_fatal(&fatal),
+        Ok(_) => evaluator.last_status,
+        Err(fatal) => evaluator.report_fatal(&fatal),
     };
 
-    interpreter.output.finish();
+    evaluator.output.finish();
     ScriptOutcome {
-        output: interpreter.output.render(),
+        output: evaluator.output.render(),
         exit_code,
-        truncated: interpreter.output.is_truncated(),
-        capability_calls: interpreter.budget.capability_calls(),
-        steps: interpreter.budget.steps(),
+        truncated: evaluator.output.is_truncated(),
+        capability_calls: evaluator.budget.capability_calls(),
+        steps: evaluator.budget.steps(),
     }
 }
 
-struct Interpreter<'a> {
+/// The evaluator's mutable state for one script execution.
+///
+/// This is deliberately *not* named `Interpreter`: [`crate::Interpreter`] is the public,
+/// immutable configuration handle a caller builds, while this is the private machine that runs
+/// one script under it. Sharing a name would send a reader following `Interpreter::run` to the
+/// wrong type.
+struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
     output: OutputBuffer,
@@ -123,7 +131,7 @@ struct Interpreter<'a> {
     last_substitution_status: ExitCode,
 }
 
-impl Interpreter<'_> {
+impl Evaluator<'_> {
     // -----------------------------------------------------------------------
     // Diagnostics and output
     // -----------------------------------------------------------------------
@@ -148,6 +156,12 @@ impl Interpreter<'_> {
                 format!("dekopon-shell: script tried to make more than {maximum} capability calls"),
                 ExitCode::SYNTAX,
             ),
+            FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => (
+                format!(
+                    "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
+                ),
+                ExitCode::SYNTAX,
+            ),
             FatalError::Unsupported(reason) => {
                 (format!("dekopon-shell: {reason}"), ExitCode::SYNTAX)
             }
@@ -156,10 +170,14 @@ impl Interpreter<'_> {
         code
     }
 
+    /// Writes one diagnostic to the combined output.
+    ///
+    /// Diagnostics escape a `$( )` capture on purpose. Only the *value* of a substitution is being
+    /// captured; suppressing its errors too would leave `v=$(nosuchcmd)` with an empty variable, no
+    /// explanation, and only a numeric `$?` the script may never inspect. Real shells send command
+    /// substitution stderr to the terminal for exactly this reason.
     fn write_line(&mut self, line: &str) {
-        if self.captures.is_empty() {
-            self.output.push_block(line);
-        }
+        self.output.push_block(line);
     }
 
     fn emit(&mut self, result: CommandResult) {
@@ -202,22 +220,51 @@ impl Interpreter<'_> {
         self.globals.get(name)
     }
 
-    fn assign(&mut self, name: &str, value: Value) {
+    /// Binds a name, charging what the value costs against the value-byte ceiling.
+    ///
+    /// Every retention point funnels through here, [`Evaluator::declare_local`], and
+    /// [`Evaluator::write_buffer`]: `x="$x$x"` is one cheap step but doubles the bytes held, so
+    /// counting operations alone leaves memory unbounded.
+    fn assign(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
+        self.budget.charge_value_bytes(value_bytes(&value))?;
         for frame in self.frames.iter_mut().rev() {
             if let Some(slot) = frame.locals.get_mut(name) {
                 *slot = value;
-                return;
+                return Ok(());
             }
         }
         self.globals.insert(name.to_owned(), value);
+        Ok(())
     }
 
-    fn declare_local(&mut self, name: &str, value: Value) {
+    /// Restores a binding captured before a transient prefix assignment.
+    fn restore(&mut self, name: &str, previous: Option<Value>) {
+        match previous {
+            Some(value) => {
+                for frame in self.frames.iter_mut().rev() {
+                    if let Some(slot) = frame.locals.get_mut(name) {
+                        *slot = value;
+                        return;
+                    }
+                }
+                self.globals.insert(name.to_owned(), value);
+            }
+            // The prefix assignment created the binding, so removing it is what "restore" means.
+            // `assign` writes to `globals` exactly when no frame already held the name.
+            None => {
+                self.globals.remove(name);
+            }
+        }
+    }
+
+    fn declare_local(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
+        self.budget.charge_value_bytes(value_bytes(&value))?;
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.insert(name.to_owned(), value);
-            return;
+            return Ok(());
         }
         self.globals.insert(name.to_owned(), value);
+        Ok(())
     }
 
     fn positional(&self) -> &[Value] {
@@ -297,7 +344,7 @@ impl Interpreter<'_> {
         let mut body_status = ExitCode::SUCCESS;
         for item in items {
             self.budget.charge_step()?;
-            self.assign(&statement.variable, Value::String(item));
+            self.assign(&statement.variable, Value::String(item))?;
             let flow = self.execute_program(&statement.body)?;
             body_status = self.last_status;
             match flow {
@@ -389,15 +436,24 @@ impl Interpreter<'_> {
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step()?;
-        let mut input: Option<Value> = None;
+        // A function body inherits the value piped into the call, offered to the first command of
+        // each pipeline in the body. It is cloned rather than consumed: consuming it would let a
+        // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
+        // before `cat` could see it, which is the same class of silent data loss as dropping it.
+        let mut input: Option<Value> = self
+            .frames
+            .last()
+            .and_then(|frame| frame.stdin.as_ref())
+            .cloned();
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
 
         for (index, command) in pipeline.commands.iter().enumerate() {
-            match self.execute_command(command, input.take())? {
+            let piped = index + 1 < commands;
+            match self.execute_command(command, input.take(), piped)? {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
-                    if index + 1 < commands {
+                    if piped {
                         input = Some(result.value.clone());
                     }
                     last = result;
@@ -405,7 +461,11 @@ impl Interpreter<'_> {
             }
         }
 
-        let status = last.status;
+        let status = if pipeline.negated {
+            invert(last.status)
+        } else {
+            last.status
+        };
         self.emit(last);
         Ok((status, None))
     }
@@ -418,22 +478,13 @@ impl Interpreter<'_> {
         &mut self,
         command: &SimpleCommand,
         input: Option<Value>,
+        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
-        let mut assignment_status = ExitCode::SUCCESS;
-        for assignment in &command.assignments {
-            let value = match self.assignment_value(&assignment.value) {
-                Ok(value) => value,
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    return Ok(Executed::Result(CommandResult::status(status)));
-                }
-            };
-            assignment_status = self.last_substitution_status;
-            self.assign(&assignment.name, value);
-        }
-
+        // Command words are expanded *before* any prefix assignment is applied, so `x=new echo $x`
+        // prints the old value, and the binding is restored afterwards so it does not leak into the
+        // rest of the script. Both halves are what `DEBUG=1 some.capability` means in bash.
         let mut argv = Vec::new();
         for word in &command.words {
             match self.expand_word(word) {
@@ -442,6 +493,31 @@ impl Interpreter<'_> {
                     let status = self.absorb(failure)?;
                     return Ok(Executed::Result(CommandResult::status(status)));
                 }
+            }
+        }
+
+        let transient = !argv.is_empty();
+        let mut restore = Vec::new();
+        let mut assignment_status = ExitCode::SUCCESS;
+        for assignment in &command.assignments {
+            let value = match self.assignment_value(&assignment.value) {
+                Ok(value) => value,
+                Err(failure) => {
+                    self.restore_all(restore);
+                    let status = self.absorb(failure)?;
+                    return Ok(Executed::Result(CommandResult::status(status)));
+                }
+            };
+            assignment_status = self.last_substitution_status;
+            if transient {
+                restore.push((
+                    assignment.name.clone(),
+                    self.lookup(&assignment.name).cloned(),
+                ));
+            }
+            if let Err(limit) = self.assign(&assignment.name, value) {
+                self.restore_all(restore);
+                return Err(limit.into());
             }
         }
 
@@ -456,7 +532,9 @@ impl Interpreter<'_> {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
 
-        let executed = self.run_argv(&argv, input)?;
+        let executed = self.run_argv(&argv, input, capture_output);
+        self.restore_all(restore);
+        let executed = executed?;
         let Executed::Result(result) = executed else {
             return Ok(executed);
         };
@@ -478,15 +556,28 @@ impl Interpreter<'_> {
             );
             return Ok(Executed::Result(CommandResult::status(ExitCode::SYNTAX)));
         };
-        self.write_buffer(name, redirect.append, result.value);
+        self.write_buffer(name, redirect.append, result.value)?;
         Ok(Executed::Result(CommandResult::status(result.status)))
     }
 
+    /// Restores every binding a transient prefix assignment shadowed, in reverse order.
+    fn restore_all(&mut self, restore: Vec<(String, Option<Value>)>) {
+        for (name, previous) in restore.into_iter().rev() {
+            self.restore(&name, previous);
+        }
+    }
+
     /// Stores a redirected value in the named in-memory buffer store.
-    fn write_buffer(&mut self, name: &str, append: bool, value: Value) {
+    fn write_buffer(
+        &mut self,
+        name: &str,
+        append: bool,
+        value: Value,
+    ) -> Result<(), LimitExceeded> {
+        self.budget.charge_value_bytes(value_bytes(&value))?;
         if !append {
             self.buffers.insert(name.to_owned(), value);
-            return;
+            return Ok(());
         }
         match self.buffers.remove(name) {
             None => {
@@ -501,9 +592,15 @@ impl Interpreter<'_> {
                     .insert(name.to_owned(), Value::Array(vec![existing, value]));
             }
         }
+        Ok(())
     }
 
-    fn run_argv(&mut self, argv: &[String], input: Option<Value>) -> Result<Executed, FatalError> {
+    fn run_argv(
+        &mut self,
+        argv: &[String],
+        input: Option<Value>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
 
@@ -513,7 +610,7 @@ impl Interpreter<'_> {
 
         match dispatch::resolve(command, &self.function_names, self.invoker) {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported((*reason).to_owned())),
-            Resolution::Function => self.call_function(command, arguments),
+            Resolution::Function => self.call_function(command, arguments, input, capture_output),
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
                 let outcome = {
                     let mut context = BuiltinContext {
@@ -622,12 +719,36 @@ impl Interpreter<'_> {
                 for argument in arguments {
                     match argument.split_once('=') {
                         Some((name, text)) => {
-                            self.declare_local(name, value::scalar_from_token(text));
+                            self.declare_local(name, value::scalar_from_token(text))?;
                         }
-                        None => self.declare_local(argument, Value::String(String::new())),
+                        None => self.declare_local(argument, Value::String(String::new()))?,
                     }
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
+            }
+            // `shift` belongs beside `local`: this shell already models `$1`, `$@`, and `$#`, so
+            // its absence broke `while [ $# -gt 0 ]; do ...; shift; done` while looking fine.
+            "shift" => {
+                let Some(frame) = self.frames.last_mut() else {
+                    self.write_line("dekopon-shell: shift: only valid inside a function");
+                    return Ok(Some(Executed::Result(CommandResult::status(
+                        ExitCode::SYNTAX,
+                    ))));
+                };
+                let count = match parse_shift_count(arguments) {
+                    Ok(count) => count,
+                    Err(failure) => {
+                        let status = self.absorb(failure)?;
+                        return Ok(Some(Executed::Result(CommandResult::status(status))));
+                    }
+                };
+                if count > frame.positional.len() {
+                    // Shifting past the end is a failed `shift` in bash, not a truncation.
+                    Executed::Result(CommandResult::status(ExitCode::FAILURE))
+                } else {
+                    frame.positional.drain(..count);
+                    Executed::Result(CommandResult::status(ExitCode::SUCCESS))
+                }
             }
             "unset" => {
                 for name in arguments {
@@ -644,7 +765,20 @@ impl Interpreter<'_> {
         Ok(Some(executed))
     }
 
-    fn call_function(&mut self, name: &str, arguments: &[String]) -> Result<Executed, FatalError> {
+    /// Calls one shell function.
+    ///
+    /// `input` is the value piped into the call, and `capture_output` says whether the caller
+    /// consumes what the function produced. Both matter: without them a function is silently
+    /// broken in a pipeline, leaking its output past the pipe and handing the next command a null.
+    /// Output is captured only when it is consumed, so a function in terminal position keeps
+    /// streaming into the bounded output buffer rather than accumulating in memory.
+    fn call_function(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        input: Option<Value>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
         let Some(body) = self.functions.get(name).cloned() else {
             self.write_line(&format!("dekopon-shell: {name}: command not found"));
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
@@ -652,26 +786,50 @@ impl Interpreter<'_> {
 
         self.budget.charge_step()?;
         self.budget.enter_call()?;
+        let positional = arguments
+            .iter()
+            .map(|argument| Value::String(argument.clone()))
+            .collect::<Vec<_>>();
+        for argument in &positional {
+            self.budget.charge_value_bytes(value_bytes(argument))?;
+        }
         self.frames.push(Frame {
             locals: BTreeMap::new(),
-            positional: arguments
-                .iter()
-                .map(|argument| Value::String(argument.clone()))
-                .collect(),
+            positional,
+            stdin: input,
         });
+        if capture_output {
+            self.captures.push(Vec::new());
+        }
 
         let flow = self.execute_program(&body);
+        let captured = if capture_output {
+            self.captures.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.frames.pop();
         self.budget.leave_call();
 
+        let value = if capture_output {
+            reduce_captured(captured)
+        } else {
+            Value::Null
+        };
         Ok(match flow? {
-            Flow::Return(status) => Executed::Result(CommandResult::status(status)),
+            Flow::Return(status) => Executed::Result(CommandResult {
+                value,
+                status,
+                suppress_newline: false,
+            }),
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
             // `break`/`continue` that escape a function body do not unwind the caller's loop;
             // bash treats them as spent, and so does this evaluator.
-            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => {
-                Executed::Result(CommandResult::status(self.last_status))
-            }
+            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
+                value,
+                status: self.last_status,
+                suppress_newline: false,
+            }),
         })
     }
 
@@ -692,7 +850,7 @@ impl Interpreter<'_> {
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
             self.budget.charge_step()?;
-            match self.run_argv(&invocation, None)? {
+            match self.run_argv(&invocation, None, true)? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
                     if result.status != ExitCode::SUCCESS {
@@ -705,8 +863,14 @@ impl Interpreter<'_> {
             }
         }
 
+        // Nothing produced is nothing emitted; an empty `[]` would be a phantom line of output.
+        let value = if outputs.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(outputs)
+        };
         Ok(Executed::Result(CommandResult {
-            value: Value::Array(outputs),
+            value,
             status,
             suppress_newline: false,
         }))
@@ -748,9 +912,18 @@ impl Interpreter<'_> {
                     produced = true;
                 }
                 WordPart::DoubleQuoted(parts) => {
-                    let text = self.expand_quoted(parts)?;
-                    append(&mut fields, &text);
-                    produced = true;
+                    // `"$@"` is the one place double quotes produce more than one word. It is the
+                    // most-trained idiom in shell (`for x in "$@"`), so it follows bash exactly
+                    // rather than collapsing to a space-joined string; `"$*"` is the joined form.
+                    let expanded = self.expand_quoted_fields(parts)?;
+                    let mut expanded = expanded.into_iter();
+                    if let Some(first) = expanded.next() {
+                        append(&mut fields, &first);
+                        produced = true;
+                    }
+                    for extra in expanded {
+                        fields.push(extra);
+                    }
                 }
                 WordPart::Arithmetic(expression) => {
                     let number = self.evaluate_arithmetic(expression)?;
@@ -778,28 +951,54 @@ impl Interpreter<'_> {
 
     /// Expands the interior of a double-quoted string into exactly one field.
     fn expand_quoted(&mut self, parts: &[WordPart]) -> Result<String, CommandFailure> {
-        let mut text = String::new();
+        Ok(self.expand_quoted_fields(parts)?.join(" "))
+    }
+
+    /// Expands the interior of a double-quoted string, splitting only where `"$@"` demands it.
+    ///
+    /// Every part appends to the current field. `"$@"` is the sole exception: each parameter after
+    /// the first opens a new field, so `"$@"` yields one word per parameter, `"a$@b"` glues the
+    /// literals onto the outer two, and zero parameters yield zero words.
+    fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
+        let mut fields = vec![String::new()];
         for part in parts {
             match part {
                 WordPart::Literal(literal) | WordPart::SingleQuoted(literal) => {
-                    text.push_str(literal);
+                    append(&mut fields, literal);
                 }
-                WordPart::DoubleQuoted(inner) => text.push_str(&self.expand_quoted(inner)?),
+                WordPart::DoubleQuoted(inner) => {
+                    let inner = self.expand_quoted(inner)?;
+                    append(&mut fields, &inner);
+                }
                 WordPart::Arithmetic(expression) => {
                     let number = self.evaluate_arithmetic(expression)?;
-                    text.push_str(&render_number(number));
+                    append(&mut fields, &render_number(number));
+                }
+                WordPart::Parameter(Parameter::AllPositional) => {
+                    let mut positional = self.positional().iter().map(display);
+                    let Some(first) = positional.next() else {
+                        // A bare `"$@"` with no parameters is no word at all, so `f "$@"` with
+                        // nothing to forward calls `f` with zero arguments rather than one empty
+                        // one. Glued to other text it contributes nothing instead.
+                        if parts.len() == 1 {
+                            return Ok(Vec::new());
+                        }
+                        continue;
+                    };
+                    append(&mut fields, &first);
+                    fields.extend(positional);
                 }
                 WordPart::Parameter(parameter) => {
                     let value = self.parameter_value(parameter)?;
-                    text.push_str(&quoted_text(&value));
+                    append(&mut fields, &quoted_text(&value));
                 }
                 WordPart::CommandSubstitution(program) => {
                     let (value, _) = self.run_substitution(program)?;
-                    text.push_str(&quoted_text(&value));
+                    append(&mut fields, &quoted_text(&value));
                 }
             }
         }
-        Ok(text)
+        Ok(fields)
     }
 
     fn parameter_value(&mut self, parameter: &Parameter) -> Result<Value, CommandFailure> {
@@ -820,6 +1019,14 @@ impl Interpreter<'_> {
                 .cloned()
                 .unwrap_or(Value::Null),
             Parameter::AllPositional => Value::Array(self.positional().to_vec()),
+            // `$*` is the always-joined counterpart of `$@`: one word, whatever the quoting.
+            Parameter::AllPositionalJoined => Value::String(
+                self.positional()
+                    .iter()
+                    .map(display)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
             Parameter::PositionalCount => Value::from(self.positional().len()),
             Parameter::LastStatus => Value::from(self.last_status.get()),
         })
@@ -840,20 +1047,14 @@ impl Interpreter<'_> {
         }
 
         let status = self.last_status;
-        let value = match captured.len() {
-            0 => Value::String(String::new()),
-            1 => captured
-                .into_iter()
-                .next()
-                .map_or(Value::Null, |result| result.value),
-            _ => Value::String(
-                captured
-                    .iter()
-                    .map(|result| display(&result.value))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-        };
+        let value = reduce_captured(captured);
+        self.budget
+            .charge_value_bytes(value_bytes(&value))
+            .map_err(CommandFailure::from)?;
+        // Every substitution records its status, not only a whole-RHS one: `x=a$(false)` must
+        // still leave `$?` at 1, exactly as `url="https://$(get_host)/x"` must report a failed
+        // lookup rather than reading as a success.
+        self.last_substitution_status = status;
         Ok((value, status))
     }
 
@@ -861,7 +1062,13 @@ impl Interpreter<'_> {
     // Arithmetic
     // -----------------------------------------------------------------------
 
+    /// Evaluates one arithmetic node.
+    ///
+    /// Every node charges a step. The parser caps how deep and how large an expression may be, so
+    /// this recursion is bounded before it starts; the step charge is what keeps a large-but-legal
+    /// expression inside the same budget the rest of the evaluator answers to.
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
+        self.budget.charge_step()?;
         Ok(match expression {
             ArithExpr::Integer(value) => Number::Integer(*value),
             ArithExpr::Float(value) => Number::Float(*value),
@@ -911,6 +1118,66 @@ impl Interpreter<'_> {
                 arithmetic(*operator, left, right)?
             }
         })
+    }
+}
+
+/// Inverts a pipeline status for a leading `!`, collapsing every failure to plain success.
+fn invert(status: ExitCode) -> ExitCode {
+    if status == ExitCode::SUCCESS {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Reduces what a captured block emitted into one value.
+///
+/// One result keeps its structure so `x=$(cap ... )` stays JSON; several are joined as text
+/// because that is what a caller reading multiple lines expects.
+fn reduce_captured(captured: Vec<CommandResult>) -> Value {
+    match captured.len() {
+        0 => Value::String(String::new()),
+        1 => captured
+            .into_iter()
+            .next()
+            .map_or(Value::Null, |result| result.value),
+        _ => Value::String(
+            captured
+                .iter()
+                .map(|result| display(&result.value))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
+}
+
+/// Estimates the bytes one value occupies, for the value-byte ceiling.
+///
+/// This is an approximation of heap cost, not a measurement: it counts payload bytes plus a small
+/// fixed charge per node so that a deeply nested structure of empty pieces still costs something.
+fn value_bytes(value: &Value) -> u64 {
+    const NODE_OVERHEAD: u64 = 16;
+    NODE_OVERHEAD
+        + match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(text) => text.len() as u64,
+            Value::Array(items) => items.iter().map(value_bytes).sum(),
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, field)| key.len() as u64 + value_bytes(field))
+                .sum(),
+        }
+}
+
+fn parse_shift_count(arguments: &[String]) -> Result<usize, CommandFailure> {
+    match arguments {
+        [] => Ok(1),
+        [count] => count.parse::<usize>().map_err(|_| {
+            CommandFailure::usage(format!("shift: {count:?} is not a parameter count"))
+        }),
+        _ => Err(CommandFailure::usage(
+            "shift: accepts at most one parameter count",
+        )),
     }
 }
 

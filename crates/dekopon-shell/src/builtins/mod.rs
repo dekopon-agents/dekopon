@@ -131,13 +131,20 @@ pub(crate) struct BuiltinContext<'a> {
 
 impl BuiltinContext<'_> {
     /// Charges the capability-call budget and invokes one capability.
+    ///
+    /// The deadline is re-read on both sides of the call. A capability invocation is the single
+    /// most expensive thing a script can do in wall-clock terms and the cheapest in steps — the
+    /// default budget lets thirty-two of them run in ninety-six steps — so leaving the clock to the
+    /// step counter alone let a script overrun its deadline by minutes and still report success.
     pub(crate) fn invoke_capability(
         &mut self,
         capability: &str,
         input: Value,
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.charge_capability_call()?;
+        self.budget.check_deadline()?;
         let result = self.invoker.invoke(capability, input);
+        self.budget.check_deadline()?;
         let status = ExitCode::from_capability_result(&result);
         Ok(match result {
             CapabilityCallResult::Succeeded(output) => CommandResult {
@@ -343,11 +350,6 @@ mod tests {
             assert!(
                 !name.contains(['.', '-', '_']),
                 "builtin {name:?} contains a capability-identifier separator"
-            );
-            assert!(
-                name.parse::<dekopon_core::CapabilityId>().is_err()
-                    || !name.contains(['.', '-', '_']),
-                "builtin {name:?} must not be reachable through capability fallback"
             );
         }
     }

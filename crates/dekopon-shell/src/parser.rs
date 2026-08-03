@@ -15,10 +15,28 @@ use crate::{
     lexer::{LexError, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize},
 };
 
+/// How deeply the grammar may nest before parsing stops.
+///
+/// Command substitution, `if`/`for`/`while` bodies, and parenthesized arithmetic are all
+/// recursive productions, and this parser runs on the native stack before any [`crate::limits`]
+/// budget exists. Without a ceiling a few kilobytes of nested `$( $( ... ) )` overflows the stack
+/// and aborts the host process with `SIGABRT`, which is not a `ScriptOutcome` any caller can
+/// report. The bound is fixed rather than configurable because it is a property of this parser's
+/// stack usage, not of the script's resource budget; 64 is far past any hand-written nesting and
+/// far short of the depth that threatens the smallest stack this runs on.
+const MAX_NESTING_DEPTH: u32 = 64;
+
+/// How many tokens one `$(( ... ))` expansion may contain.
+///
+/// A flat `1 + 1 + 1 + ...` chain builds a left-leaning tree one node deep per term. Nothing walks
+/// it recursively at parse time, but evaluating *and dropping* it do, so the token count is what
+/// bounds that depth.
+const MAX_ARITHMETIC_TOKENS: usize = 4_096;
+
 /// Command words this shell refuses to let a script define or invoke.
 ///
-/// These are excluded because each one is a sandbox-escape-shaped or ambient-authority-shaped
-/// feature, not because they were merely left unfinished.
+/// Each one is excluded because it is sandbox-escape-shaped, ambient-authority-shaped, or would
+/// silently change the meaning of the surrounding script — not because it was left unfinished.
 pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
     (
         "eval",
@@ -59,6 +77,14 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
         "export",
         "`export` is excluded: there is no process environment to export into",
     ),
+    (
+        "set",
+        "`set` is excluded: this shell has no shell options, so `set -e`/`set -u`/`set -o pipefail` would change nothing while looking like they had; check each command's status with `$?`, `&&`, `||`, or `exit`",
+    ),
+    (
+        "[[",
+        "`[[ ... ]]` is not part of this shell; use `[ ... ]` or `test`, which support -z, -n, =, !=, <, >, and -eq/-ne/-lt/-le/-gt/-ge",
+    ),
 ];
 
 const RESERVED_WORDS: &[&str] = &[
@@ -93,8 +119,13 @@ impl ParseError {
 
 /// Parses one complete script.
 pub fn parse(source: &str) -> Result<Program, ParseError> {
+    parse_nested(source, 0)
+}
+
+/// Parses one script body already `depth` productions deep, for `$( ... )` re-entry.
+fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(tokens, depth);
     let program = parser.parse_program(&[])?;
     if let Some(token) = parser.peek() {
         let line = token.line;
@@ -104,17 +135,43 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
     Ok(program)
 }
 
+/// Reports the nesting ceiling as a syntax error a script can act on.
+fn too_deep(line: usize, construct: &str) -> ParseError {
+    ParseError::syntax(
+        line,
+        format!(
+            "{construct} nested more than {MAX_NESTING_DEPTH} levels deep; this shell parses on a fixed stack and refuses rather than risking it"
+        ),
+    )
+}
+
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    /// Recursive productions entered so far, checked against [`MAX_NESTING_DEPTH`].
+    depth: u32,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, depth: u32) -> Self {
         Self {
             tokens,
             position: 0,
+            depth,
         }
+    }
+
+    /// Enters one recursive production, refusing past the nesting ceiling.
+    fn enter(&mut self, construct: &str) -> Result<(), ParseError> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(too_deep(self.line(), construct));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -180,6 +237,13 @@ impl Parser {
     }
 
     fn parse_program(&mut self, terminators: &[&str]) -> Result<Program, ParseError> {
+        self.enter("a command block")?;
+        let program = self.parse_program_body(terminators);
+        self.leave();
+        program
+    }
+
+    fn parse_program_body(&mut self, terminators: &[&str]) -> Result<Program, ParseError> {
         let mut statements = Vec::new();
         loop {
             self.skip_separators();
@@ -353,6 +417,13 @@ impl Parser {
     fn parse_for(&mut self) -> Result<ForLoop, ParseError> {
         self.expect_reserved("for", "a `for` loop")?;
         let line = self.line();
+        // `for (( i=0; i<n; i++ ))` is a C-style loop, not a malformed loop variable.
+        if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
+            return Err(ParseError::syntax(
+                line,
+                "C-style `for (( ... ))` loops are not supported; use `for x in ...` over a list, or a `while` loop with `i=$(( i + 1 ))`",
+            ));
+        }
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
             return Err(ParseError::syntax(line, "expected a `for` loop variable"));
         };
@@ -378,7 +449,8 @@ impl Parser {
             }
             let raw = raw.clone();
             self.position += 1;
-            words.push(convert_word(&raw, line)?);
+            let depth = self.depth;
+            words.push(convert_word(&raw, line, depth)?);
         }
 
         self.skip_separators();
@@ -425,20 +497,37 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
+        // A leading `!` is the reserved word that inverts a pipeline's status. Dispatching it as a
+        // command word instead would report "!: command not found" and silently invert every
+        // `if ! cmd` branch, so it is recognized here rather than left to the builtin table.
+        let negated = self.eat_pipeline_negation();
         let mut commands = vec![self.parse_simple_command()?];
         while matches!(self.peek_kind(), Some(TokenKind::Pipe)) {
             self.position += 1;
             self.skip_newlines();
             commands.push(self.parse_simple_command()?);
         }
-        Ok(Pipeline { commands })
+        Ok(Pipeline { commands, negated })
+    }
+
+    fn eat_pipeline_negation(&mut self) -> bool {
+        let Some(TokenKind::Word(word)) = self.peek_kind() else {
+            return false;
+        };
+        if word.as_literal() != Some("!") {
+            return false;
+        }
+        self.position += 1;
+        true
     }
 
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
         let mut redirect: Option<Redirect> = None;
-        let start_line = self.line();
+        // `arr=(a b c)` lexes as an empty assignment followed by `(`; remembering that shape is
+        // what lets the paren below name array literals instead of blaming subshells.
+        let mut after_empty_assignment = false;
 
         loop {
             match self.peek_kind() {
@@ -448,6 +537,7 @@ impl Parser {
                     }
                     let raw = raw.clone();
                     let line = self.line();
+                    let depth = self.depth;
                     self.position += 1;
                     let assignment = if words.is_empty() {
                         split_assignment(&raw)
@@ -455,17 +545,20 @@ impl Parser {
                         None
                     };
                     if let Some((name, value)) = assignment {
+                        after_empty_assignment = value.parts.is_empty();
                         assignments.push(Assignment {
                             name,
-                            value: convert_word(&value, line)?,
+                            value: convert_word(&value, line, depth)?,
                         });
                         continue;
                     }
-                    words.push(convert_word(&raw, line)?);
+                    after_empty_assignment = false;
+                    words.push(convert_word(&raw, line, depth)?);
                 }
                 Some(TokenKind::Great | TokenKind::GreatGreat) => {
                     let append = matches!(self.peek_kind(), Some(TokenKind::GreatGreat));
                     let line = self.line();
+                    let depth = self.depth;
                     self.position += 1;
                     let Some(TokenKind::Word(raw)) = self.peek_kind() else {
                         return Err(ParseError::syntax(
@@ -481,9 +574,10 @@ impl Parser {
                             "a command accepts at most one buffer redirection",
                         ));
                     }
+                    after_empty_assignment = false;
                     redirect = Some(Redirect {
                         append,
-                        target: convert_word(&raw, line)?,
+                        target: convert_word(&raw, line, depth)?,
                     });
                 }
                 // Job control is dropped whole. A trailing `&` must never be silently discarded:
@@ -495,9 +589,26 @@ impl Parser {
                         "backgrounding with `&` is not supported: this shell has no job control, so `&` can only mean something it cannot do",
                     ));
                 }
-                // Subshell forking is dropped: there is no process to fork.
+                // Every paren-shaped bash construct arrives here. They are different features with
+                // different answers, so each is named for what it actually is: calling an array
+                // literal a subshell sends a reader looking for a process that was never involved.
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
+                    if after_empty_assignment {
+                        return Err(ParseError::syntax(
+                            line,
+                            "bash array literals `name=(a b c)` are not supported: arrays here are real JSON, so write `name='[\"a\",\"b\",\"c\"]'` or `name=$(... | jq ...)` and index it with `${name[0]}`",
+                        ));
+                    }
+                    if matches!(
+                        self.tokens.get(self.position + 1).map(|token| &token.kind),
+                        Some(TokenKind::LeftParen)
+                    ) {
+                        return Err(ParseError::syntax(
+                            line,
+                            "the arithmetic command `(( ... ))` is not supported; use the arithmetic expansion `x=$(( ... ))`, or `[ ... ]` to test a value",
+                        ));
+                    }
                     return Err(ParseError::syntax(
                         line,
                         "subshells `( ... )` are not supported: this shell forks no processes; use a function instead",
@@ -551,7 +662,6 @@ impl Parser {
                 format!("expected a command, found {found}"),
             ));
         }
-        let _ = start_line;
 
         Ok(SimpleCommand {
             assignments,
@@ -591,40 +701,50 @@ fn split_assignment(word: &RawWord) -> Option<(String, RawWord)> {
     Some((name.to_owned(), RawWord { parts }))
 }
 
-fn convert_word(raw: &RawWord, line: usize) -> Result<Word, ParseError> {
+fn convert_word(raw: &RawWord, line: usize, depth: u32) -> Result<Word, ParseError> {
     Ok(Word {
-        parts: convert_parts(&raw.parts, line)?,
+        parts: convert_parts(&raw.parts, line, depth)?,
     })
 }
 
-fn convert_parts(raw: &[RawPart], line: usize) -> Result<Vec<WordPart>, ParseError> {
+fn convert_parts(raw: &[RawPart], line: usize, depth: u32) -> Result<Vec<WordPart>, ParseError> {
     raw.iter()
-        .map(|part| convert_part(part, line))
+        .map(|part| convert_part(part, line, depth))
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn convert_part(raw: &RawPart, line: usize) -> Result<WordPart, ParseError> {
+fn convert_part(raw: &RawPart, line: usize, depth: u32) -> Result<WordPart, ParseError> {
     Ok(match raw {
         RawPart::Literal(text) => WordPart::Literal(text.clone()),
         RawPart::SingleQuoted(text) => WordPart::SingleQuoted(text.clone()),
-        RawPart::DoubleQuoted(parts) => WordPart::DoubleQuoted(convert_parts(parts, line)?),
-        RawPart::Parameter(parameter) => WordPart::Parameter(convert_parameter(parameter, line)?),
-        RawPart::CommandSubstitution(body) => WordPart::CommandSubstitution(parse(body)?),
-        RawPart::Arithmetic(body) => WordPart::Arithmetic(parse_arithmetic(body, line)?),
+        RawPart::DoubleQuoted(parts) => WordPart::DoubleQuoted(convert_parts(parts, line, depth)?),
+        RawPart::Parameter(parameter) => {
+            WordPart::Parameter(convert_parameter(parameter, line, depth)?)
+        }
+        // Each `$( ... )` re-enters the parser, so it counts against the same nesting ceiling the
+        // statement productions do.
+        RawPart::CommandSubstitution(body) => {
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(too_deep(line, "command substitution `$( ... )`"));
+            }
+            WordPart::CommandSubstitution(parse_nested(body, depth + 1)?)
+        }
+        RawPart::Arithmetic(body) => WordPart::Arithmetic(parse_arithmetic(body, line, depth)?),
     })
 }
 
-fn convert_parameter(raw: &RawParameter, line: usize) -> Result<Parameter, ParseError> {
+fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Parameter, ParseError> {
     Ok(match raw {
         RawParameter::Named { name, indices } => Parameter::Named {
             name: name.clone(),
             indices: indices
                 .iter()
-                .map(|index| convert_word(index, line))
+                .map(|index| convert_word(index, line, depth))
                 .collect::<Result<Vec<_>, _>>()?,
         },
         RawParameter::Positional(position) => Parameter::Positional(*position),
         RawParameter::AllPositional => Parameter::AllPositional,
+        RawParameter::AllPositionalJoined => Parameter::AllPositionalJoined,
         RawParameter::PositionalCount => Parameter::PositionalCount,
         RawParameter::LastStatus => Parameter::LastStatus,
     })
@@ -642,16 +762,92 @@ enum ArithToken {
     Symbol(&'static str),
 }
 
-fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, ParseError> {
-    const SYMBOLS: &[&str] = &[
-        "&&", "||", "<=", ">=", "==", "!=", "+", "-", "*", "/", "%", "(", ")", "<", ">", "!",
-    ];
+/// One arithmetic operator spelling and what this shell does with it.
+///
+/// Rejected spellings are listed alongside the kept ones so the tokenizer can name the operator a
+/// script actually wrote. Consuming `**` as two multiplications and then complaining about a stray
+/// `*` describes a script nobody wrote.
+enum ArithSymbol {
+    Kept,
+    Rejected(&'static str),
+}
 
+/// Operator spellings, longest first so `&&` is never mistaken for a rejected bitwise `&`.
+const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
+    (
+        "**",
+        ArithSymbol::Rejected("`**` is not supported; multiply repeatedly, or use `jq pow`"),
+    ),
+    (
+        "++",
+        ArithSymbol::Rejected("`++` is not supported; write `i=$(( i + 1 ))`"),
+    ),
+    (
+        "--",
+        ArithSymbol::Rejected("`--` is not supported; write `i=$(( i - 1 ))`"),
+    ),
+    ("+=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
+    ("-=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
+    ("*=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
+    ("/=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
+    ("%=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
+    ("<<", ArithSymbol::Rejected(BITWISE)),
+    (">>", ArithSymbol::Rejected(BITWISE)),
+    ("&&", ArithSymbol::Kept),
+    ("||", ArithSymbol::Kept),
+    ("<=", ArithSymbol::Kept),
+    (">=", ArithSymbol::Kept),
+    ("==", ArithSymbol::Kept),
+    ("!=", ArithSymbol::Kept),
+    ("+", ArithSymbol::Kept),
+    ("-", ArithSymbol::Kept),
+    ("*", ArithSymbol::Kept),
+    ("/", ArithSymbol::Kept),
+    ("%", ArithSymbol::Kept),
+    ("(", ArithSymbol::Kept),
+    (")", ArithSymbol::Kept),
+    ("<", ArithSymbol::Kept),
+    (">", ArithSymbol::Kept),
+    ("!", ArithSymbol::Kept),
+    (
+        "=",
+        ArithSymbol::Rejected(
+            "assignment inside `$(( ... ))` is not supported; assign the expansion instead, as `name=$(( ... ))`",
+        ),
+    ),
+    ("?", ArithSymbol::Rejected(TERNARY)),
+    (":", ArithSymbol::Rejected(TERNARY)),
+    ("&", ArithSymbol::Rejected(BITWISE)),
+    ("|", ArithSymbol::Rejected(BITWISE)),
+    ("^", ArithSymbol::Rejected(BITWISE)),
+    ("~", ArithSymbol::Rejected(BITWISE)),
+    (
+        ",",
+        ArithSymbol::Rejected("the comma operator is not supported; write one expansion per value"),
+    ),
+];
+
+const COMPOUND_ASSIGNMENT: &str =
+    "compound assignment is not supported inside `$(( ... ))`; write `name=$(( name + 1 ))`";
+const BITWISE: &str = "bitwise operators are not supported; this arithmetic is numeric only, so use `jq` for bit manipulation";
+const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
+
+fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, ParseError> {
     let mut tokens = Vec::new();
     let bytes = source.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        let character = bytes[index] as char;
+        if tokens.len() >= MAX_ARITHMETIC_TOKENS {
+            return Err(ParseError::syntax(
+                line,
+                format!(
+                    "an arithmetic expansion may hold at most {MAX_ARITHMETIC_TOKENS} tokens; split the calculation across assignments"
+                ),
+            ));
+        }
+        // Decoding a whole character rather than casting one byte keeps a non-ASCII diagnostic
+        // honest: `bytes[index] as char` reports 'Ã' for an 'é' the script never wrote.
+        let character = source[index..].chars().next().unwrap_or('\0');
         if character.is_ascii_whitespace() {
             index += 1;
             continue;
@@ -702,15 +898,19 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
             tokens.push(ArithToken::Name(source[start..index].to_owned()));
             continue;
         }
-        let matched = SYMBOLS
+        let (matched, symbol) = ARITH_SYMBOLS
             .iter()
-            .find(|symbol| source[index..].starts_with(**symbol))
+            .find(|(symbol, _)| source[index..].starts_with(*symbol))
             .ok_or_else(|| {
                 ParseError::syntax(
                     line,
                     format!("unsupported character {character:?} in an arithmetic expansion"),
                 )
             })?;
+        match symbol {
+            ArithSymbol::Kept => {}
+            ArithSymbol::Rejected(reason) => return Err(ParseError::syntax(line, *reason)),
+        }
         index += matched.len();
         tokens.push(ArithToken::Symbol(matched));
     }
@@ -721,9 +921,11 @@ struct ArithParser {
     tokens: Vec<ArithToken>,
     position: usize,
     line: usize,
+    /// Parenthesis nesting, checked against [`MAX_NESTING_DEPTH`]; see [`ArithParser::parse_primary`].
+    depth: u32,
 }
 
-fn parse_arithmetic(source: &str, line: usize) -> Result<ArithExpr, ParseError> {
+fn parse_arithmetic(source: &str, line: usize, depth: u32) -> Result<ArithExpr, ParseError> {
     let tokens = tokenize_arithmetic(source, line)?;
     if tokens.is_empty() {
         return Err(ParseError::syntax(line, "empty arithmetic expansion"));
@@ -732,6 +934,7 @@ fn parse_arithmetic(source: &str, line: usize) -> Result<ArithExpr, ParseError> 
         tokens,
         position: 0,
         line,
+        depth,
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
@@ -859,9 +1062,17 @@ impl ArithParser {
                 self.position += 1;
                 Ok(ArithExpr::Variable(name))
             }
+            // Each `(` re-enters the top of the precedence chain, roughly eight stack frames per
+            // level, so it is bounded by the same nesting ceiling the statement grammar uses.
             Some(ArithToken::Symbol("(")) => {
+                if self.depth >= MAX_NESTING_DEPTH {
+                    return Err(too_deep(line, "an arithmetic expansion"));
+                }
                 self.position += 1;
-                let inner = self.parse_or()?;
+                self.depth += 1;
+                let inner = self.parse_or();
+                self.depth -= 1;
+                let inner = inner?;
                 if !self.eat_symbol(")") {
                     return Err(ParseError::syntax(
                         line,

@@ -131,7 +131,7 @@ impl Provider for HttpProbe {
 /// returned bytes are valid UTF-8; an invalid encoding omits the field rather than failing the
 /// invocation, because a caller asking for a probe still wants the status and the raw bytes.
 fn describe_response(status: u16, body: &[u8], header_count: usize) -> Value {
-    let returned = &body[..body.len().min(MAX_RETURNED_BODY_BYTES)];
+    let returned = bounded_prefix(body);
     let mut fields = Map::new();
     fields.insert("status".to_owned(), json!(status));
     fields.insert("bodyBytes".to_owned(), json!(body.len()));
@@ -145,6 +145,27 @@ fn describe_response(status: u16, body: &[u8], header_count: usize) -> Value {
         fields.insert("bodyText".to_owned(), json!(text));
     }
     Value::Object(fields)
+}
+
+/// Returns the returnable prefix of a body, never cutting a character in half.
+///
+/// Slicing at a raw byte offset made `bodyText` vanish from bodies that were perfectly valid
+/// UTF-8, purely because the 64 KiB mark landed mid-character — roughly three times in four for a
+/// multibyte character straddling the boundary. The consumer path is `jq -r .bodyText`, so the
+/// script saw a bare `null` and could not tell "this body was binary" from "I cut it badly".
+fn bounded_prefix(body: &[u8]) -> &[u8] {
+    if body.len() <= MAX_RETURNED_BODY_BYTES {
+        return body;
+    }
+    let candidate = &body[..MAX_RETURNED_BODY_BYTES];
+    match core::str::from_utf8(candidate) {
+        Ok(_) => candidate,
+        // An error with no length is an *incomplete* trailing sequence, meaning the cut split a
+        // character; backing up to the last complete one keeps the body readable as text.
+        // A genuinely invalid byte keeps the full prefix and omits `bodyText`, as before.
+        Err(error) if error.error_len().is_none() => &candidate[..error.valid_up_to()],
+        Err(_) => candidate,
+    }
 }
 
 dekopon_provider_sdk::export_provider_with_bindings!(HttpProbe, bindings);
@@ -196,6 +217,32 @@ mod tests {
             described["bodyText"].as_str().map(str::len),
             Some(MAX_RETURNED_BODY_BYTES)
         );
+    }
+
+    #[test]
+    fn truncation_never_cuts_a_character_in_half() {
+        // An all-ASCII body can never exercise this: the cut has to land inside a multibyte
+        // character, which is where a valid UTF-8 body used to lose `bodyText` entirely.
+        let mut body = vec![b'x'; MAX_RETURNED_BODY_BYTES - 1];
+        body.extend_from_slice("€tail".as_bytes());
+        assert!(core::str::from_utf8(&body).is_ok(), "the body is valid UTF-8");
+
+        let described = describe_response(200, &body, 0);
+        assert_eq!(described["bodyTruncated"], json!(true));
+        let text = described["bodyText"]
+            .as_str()
+            .expect("a valid UTF-8 body keeps its text");
+        assert_eq!(text.len(), MAX_RETURNED_BODY_BYTES - 1);
+        assert!(text.ends_with('x'), "the partial character was dropped");
+    }
+
+    #[test]
+    fn a_body_that_is_binary_rather_than_badly_cut_still_omits_its_text() {
+        let mut body = vec![0xff_u8; MAX_RETURNED_BODY_BYTES];
+        body.extend_from_slice(b"tail");
+        let described = describe_response(200, &body, 0);
+        assert!(described.get("bodyText").is_none());
+        assert_eq!(described["bodyTruncated"], json!(true));
     }
 
     #[test]

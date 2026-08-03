@@ -52,6 +52,8 @@ pub enum AndOr {
 pub struct Pipeline {
     /// Commands in left-to-right order; never empty.
     pub commands: Vec<SimpleCommand>,
+    /// `true` when a leading `!` inverts the pipeline's exit status.
+    pub negated: bool,
 }
 
 /// One command: optional assignment prefixes, argv words, and an optional buffer redirect.
@@ -183,8 +185,10 @@ pub enum Parameter {
     },
     /// `$1` .. `${N}`.
     Positional(usize),
-    /// `$@`.
+    /// `$@`, which splits one word per parameter even inside double quotes.
     AllPositional,
+    /// `$*`, which is always exactly one space-joined word.
+    AllPositionalJoined,
     /// `$#`.
     PositionalCount,
     /// `$?`.

@@ -113,9 +113,28 @@ impl Substitution {
             ));
         }
 
+        // Unlike `grep`, this `s` command has no anchors at all, so a leading `^` or trailing `$`
+        // would be matched as that character. `sed "s/^ *//"` silently returning its input
+        // unchanged is precisely the failure this module claims cannot happen.
+        if fields[0].starts_with('^') || fields[0].ends_with('$') {
+            return Err(CommandFailure::usage(format!(
+                "sed: {:?} anchors with `^`/`$`, which this substitution does not support; match the literal text, or use `grep` for anchored selection",
+                fields[0]
+            )));
+        }
+        let pattern = super::literal_pattern("sed", &fields[0])?;
+        // `&` in a real sed replacement inserts the matched text. Treating it as a literal
+        // ampersand would rewrite the line into something the script never asked for.
+        if has_unescaped_ampersand(&fields[1]) {
+            return Err(CommandFailure::usage(
+                "sed: `&` in a replacement means the matched text in real sed and is not supported here; write `\\&` for a literal ampersand",
+            ));
+        }
+        let replacement = fields[1].replace("\\&", "&");
+
         Ok(Self {
-            pattern: fields[0].clone(),
-            replacement: fields[1].clone(),
+            pattern,
+            replacement,
             global,
             ignore_case,
         })
@@ -156,6 +175,21 @@ impl Substitution {
         output.push_str(line.get(cursor..).unwrap_or_default());
         output
     }
+}
+
+/// Reports whether a replacement contains a `&` that is not written as `\&`.
+fn has_unescaped_ampersand(replacement: &str) -> bool {
+    let mut characters = replacement.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            characters.next();
+            continue;
+        }
+        if character == '&' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Splits on an unescaped delimiter, honoring `\<delimiter>`.
@@ -257,6 +291,35 @@ mod tests {
                 "{script:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn regex_syntax_and_anchors_are_rejected_rather_than_silently_literal() {
+        // `s/^ *//` returning its input unchanged, and `s/x/[&]/` inserting a literal ampersand,
+        // are the two ways this substitution could quietly answer a question it was not asked.
+        for script in [
+            "s/^ *//",
+            "s/[0-9]*//g",
+            "s/^foo/bar/",
+            "s/foo$/bar/",
+            "s/a|b/x/",
+            "s/x/[&]/",
+        ] {
+            let failure = Substitution::parse(script).expect_err(script);
+            let message = format!("{failure:?}");
+            assert!(
+                message.contains("literal text")
+                    || message.contains("anchors")
+                    || message.contains("matched text"),
+                "{script}: {message}"
+            );
+        }
+        // Escaped forms recover the literal characters.
+        assert_eq!(
+            sed(&[r"s/\[x\]/y/"], json!("a [x] b")).value,
+            json!("a y b")
+        );
+        assert_eq!(sed(&[r"s/x/a\&b/"], json!("x")).value, json!("a&b"));
     }
 
     #[test]

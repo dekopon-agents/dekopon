@@ -529,23 +529,27 @@ fn shell_lists_and_describes_capabilities_through_the_escape_hatch() {
 }
 
 #[test]
-fn shell_rejects_every_dropped_grammar_feature_rather_than_ignoring_it() {
-    // An unquoted `*` is an ordinary character: there is no filesystem to glob against.
+fn shell_rejects_every_loudly_dropped_grammar_feature_rather_than_ignoring_it() {
+    // An unquoted `*` is an ordinary character: there is no filesystem to glob against, so this
+    // belongs to the documented "inert literal" group rather than the rejected one.
     let (stdout, code) = shell("echo *", &[]);
     assert_eq!(code, 0, "{stdout}");
     assert_eq!(stdout, "*\n[exit code: 0]\n");
 
-    // A trailing `&` is a hard parse error, never a silently dropped backgrounding request.
-    let (stdout, code) = shell("echo hi &", &[]);
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.contains("backgrounding"), "{stdout}");
-    assert!(!stdout.contains("hi\n"), "{stdout}");
-
-    // `eval` is excluded as a sandbox-escape-shaped feature.
-    let (stdout, code) = shell("eval 'echo pwned'", &[]);
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.contains("eval"), "{stdout}");
-    assert!(!stdout.contains("pwned"), "{stdout}");
+    // Everything below fails by name instead of doing something the script did not ask for.
+    for (script, expected, forbidden) in [
+        ("echo pwned &", "backgrounding", "pwned"),
+        ("eval 'echo pwned'", "eval", "pwned"),
+        ("echo `echo pwned`", "backtick", "pwned"),
+        ("set -euo pipefail\necho pwned", "shell options", "pwned"),
+        ("echo pwned 2>/dev/null", "file-descriptor", "pwned"),
+        ("[[ -n x ]] && echo pwned", "[[ ... ]]", "pwned"),
+    ] {
+        let (stdout, code) = shell(script, &[]);
+        assert_eq!(code, 2, "{script}: {stdout}");
+        assert!(stdout.contains(expected), "{script}: {stdout}");
+        assert!(!stdout.contains(forbidden), "{script}: {stdout}");
+    }
 }
 
 #[test]
@@ -630,4 +634,71 @@ fn shell_named_buffers_round_trip_without_touching_the_filesystem() {
     let (stdout, code) = shell("cat /etc/hosts", &[]);
     assert_eq!(code, 1, "{stdout}");
     assert!(stdout.contains("no such buffer"), "{stdout}");
+}
+
+#[test]
+fn shell_bounds_value_memory_not_only_operation_counts() {
+    // Doubling a string is one cheap step and twice the memory, so every ceiling that counts
+    // operations leaves memory unbounded. This trips in a few hundred steps of a 100,000 budget.
+    let (stdout, code) = shell(
+        "x=aaaaaaaaaaaaaaaa\ni=0\nwhile [ $i -lt 30 ]; do x=\"$x$x\"; i=$(( i + 1 )); done\necho survived",
+        &["--shell-max-value-bytes", "65536"],
+    );
+    assert_eq!(code, 2, "{stdout}");
+    assert!(stdout.contains("bytes of values"), "{stdout}");
+    assert!(!stdout.contains("survived"), "{stdout}");
+}
+
+#[test]
+fn shell_refuses_input_that_would_overflow_the_parser_stack() {
+    // A stack overflow is a SIGABRT, not a catchable panic: the runner would die before printing
+    // an exit code at all. These have to come back as ordinary syntax errors.
+    for script in [
+        format!("echo $(( {}1{} ))", "(".repeat(4_000), ")".repeat(4_000)),
+        format!("echo {}echo hi{}", "$(".repeat(2_000), ")".repeat(2_000)),
+    ] {
+        let (stdout, code) = shell(&script, &[]);
+        assert_eq!(code, 2, "{stdout}");
+        assert!(stdout.contains("syntax error"), "{stdout}");
+    }
+}
+
+#[test]
+fn shell_jq_cannot_read_the_real_process_environment() {
+    // `jq` embeds jaq, whose standard library exports an `env` filter reading the host process
+    // environment. That path bypasses `$VAR` lookup entirely, so the guard needs its own test:
+    // a script could otherwise dump every host secret and post it through `curl`.
+    let provider = provider_path();
+    let output = binary()
+        .args([
+            "shell",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            r#"jq -r "env.DEKOPON_SHELL_LEAK_PROBE""#,
+        ])
+        .env("DEKOPON_SHELL_LEAK_PROBE", "leaked-secret")
+        .output()
+        .expect("dekopon-run process starts");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(!stdout.contains("leaked-secret"), "{stdout}");
+    assert!(stdout.contains("undefined filter"), "{stdout}");
+}
+
+#[test]
+fn shell_rejects_a_malformed_curl_capability_at_parse_time() {
+    // A raw `String` here turned a malformed identifier into a runtime "capability not found",
+    // telling the operator the capability was missing when the value was simply not an identifier.
+    let provider = provider_path();
+    let output = run(&[
+        "shell",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--curl-capability",
+        "not a valid id!!",
+        "curl https://example.test/",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("capability not found"), "{stderr}");
 }

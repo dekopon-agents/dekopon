@@ -55,7 +55,7 @@ impl Builtin for Grep {
                 "grep: a pattern argument is required",
             ));
         };
-        let pattern = Pattern::new(&pattern, ignore_case);
+        let pattern = Pattern::compile("grep", &pattern, ignore_case)?;
 
         let mut matched = Vec::new();
         for (index, line) in to_lines(&input.unwrap_or(Value::Null))
@@ -120,10 +120,12 @@ mod tests {
     }
 
     #[test]
-    fn no_match_exits_one_like_real_grep() {
+    fn no_match_exits_one_and_emits_nothing_like_real_grep() {
         let result = grep(&["zzz"], json!("hello"));
         assert_eq!(result.status, ExitCode::FAILURE);
-        assert_eq!(result.value, json!(""));
+        // Null, not an empty string: real grep prints nothing when nothing matched, and an empty
+        // string would emit a phantom blank line into the script's output.
+        assert_eq!(result.value, Value::Null);
     }
 
     #[test]

@@ -21,12 +21,8 @@ pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default number of capability invocations one script may drive.
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 32;
-
-/// How often the deadline is re-read, in steps.
-///
-/// The deadline is checked cooperatively during evaluation rather than from a watchdog thread:
-/// Phase 1 has no async story, and a native tree walk has no safe point to interrupt from outside.
-const DEADLINE_CHECK_INTERVAL: u64 = 128;
+/// Default ceiling on the value bytes one script may materialize.
+pub const DEFAULT_MAX_VALUE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Configurable execution bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +39,8 @@ pub struct Limits {
     pub timeout: Duration,
     /// Maximum capability invocations one script may drive.
     pub max_capability_calls: u32,
+    /// Maximum value bytes one script may materialize; see [`Budget::charge_value_bytes`].
+    pub max_value_bytes: u64,
 }
 
 impl Default for Limits {
@@ -54,6 +52,7 @@ impl Default for Limits {
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             timeout: DEFAULT_TIMEOUT,
             max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
+            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
         }
     }
 }
@@ -81,6 +80,11 @@ pub enum LimitExceeded {
         /// Configured call cap.
         maximum: u32,
     },
+    /// The script materialized more value bytes than it is allowed to.
+    ValueBytes {
+        /// Configured value-byte ceiling.
+        maximum: u64,
+    },
 }
 
 /// Mutable per-execution counters for one script run.
@@ -91,6 +95,7 @@ pub struct Budget {
     steps: u64,
     depth: u32,
     capability_calls: u32,
+    value_bytes: u64,
 }
 
 impl Budget {
@@ -103,12 +108,17 @@ impl Budget {
             steps: 0,
             depth: 0,
             capability_calls: 0,
+            value_bytes: 0,
         }
     }
 
-    /// Charges one evaluation step and periodically re-checks the deadline.
+    /// Charges one evaluation step and re-checks the deadline.
     ///
-    /// This is the only backstop against `while true; do :; done`.
+    /// This is the only backstop against `while true; do :; done`. The deadline is re-read on
+    /// *every* step rather than every Nth: a script can spend minutes in very few steps (a handful
+    /// of slow capability calls, one enormous string concatenation), so a sampled clock leaves the
+    /// exact workloads that most need bounding unbounded. Reading a monotonic clock costs tens of
+    /// nanoseconds against a tree-walking step that costs far more.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_steps {
@@ -116,8 +126,23 @@ impl Budget {
                 maximum: self.limits.max_steps,
             });
         }
-        if self.steps % DEADLINE_CHECK_INTERVAL == 0 {
-            self.check_deadline()?;
+        self.check_deadline()
+    }
+
+    /// Charges value bytes a script materialized into a variable, buffer, or capture.
+    ///
+    /// This counter is deliberately **cumulative rather than retained**: it bounds how many bytes a
+    /// script may bring into existence over its whole run, not how many it holds at one instant.
+    /// Retained memory is always at most the cumulative total, so a cheap bound on the total is a
+    /// sound bound on the peak, and it needs no release path that a missed call could silently
+    /// corrupt. Without it, `x="$x$x"` repeated twenty-six times reaches gigabytes in a few hundred
+    /// steps — every other ceiling here counts operations, and none of them counts bytes.
+    pub fn charge_value_bytes(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
+        self.value_bytes = self.value_bytes.saturating_add(bytes);
+        if self.value_bytes > self.limits.max_value_bytes {
+            return Err(LimitExceeded::ValueBytes {
+                maximum: self.limits.max_value_bytes,
+            });
         }
         Ok(())
     }
@@ -179,6 +204,12 @@ impl Budget {
     #[must_use]
     pub fn steps(&self) -> u64 {
         self.steps
+    }
+
+    /// Returns the value bytes charged so far.
+    #[must_use]
+    pub fn value_bytes(&self) -> u64 {
+        self.value_bytes
     }
 }
 
@@ -349,16 +380,12 @@ mod tests {
 
     use super::{Budget, LimitExceeded, Limits, OutputBuffer};
 
-    fn tight(limits: Limits) -> Limits {
-        limits
-    }
-
     #[test]
     fn step_budget_trips_at_the_configured_ceiling() {
-        let mut budget = Budget::start(tight(Limits {
+        let mut budget = Budget::start(Limits {
             max_steps: 3,
             ..Limits::default()
-        }));
+        });
         assert!(budget.charge_step().is_ok());
         assert!(budget.charge_step().is_ok());
         assert!(budget.charge_step().is_ok());
@@ -370,10 +397,10 @@ mod tests {
 
     #[test]
     fn recursion_depth_is_capped_and_released() {
-        let mut budget = Budget::start(tight(Limits {
+        let mut budget = Budget::start(Limits {
             max_recursion_depth: 2,
             ..Limits::default()
-        }));
+        });
         assert!(budget.enter_call().is_ok());
         assert!(budget.enter_call().is_ok());
         assert_eq!(
@@ -386,10 +413,10 @@ mod tests {
 
     #[test]
     fn capability_calls_are_counted_separately_from_steps() {
-        let mut budget = Budget::start(tight(Limits {
+        let mut budget = Budget::start(Limits {
             max_capability_calls: 1,
             ..Limits::default()
-        }));
+        });
         assert!(budget.charge_capability_call().is_ok());
         assert_eq!(
             budget.charge_capability_call(),
@@ -400,17 +427,50 @@ mod tests {
     }
 
     #[test]
+    fn value_bytes_accumulate_across_the_whole_run() {
+        let mut budget = Budget::start(Limits {
+            max_value_bytes: 10,
+            ..Limits::default()
+        });
+        assert!(budget.charge_value_bytes(6).is_ok());
+        // Cumulative, not retained: two values that each fit still trip the ceiling together.
+        assert_eq!(
+            budget.charge_value_bytes(6),
+            Err(LimitExceeded::ValueBytes { maximum: 10 })
+        );
+        assert_eq!(budget.value_bytes(), 12);
+    }
+
+    #[test]
     fn an_expired_deadline_is_reported_immediately() {
-        let budget = Budget::start(tight(Limits {
+        let budget = Budget::start(Limits {
             timeout: Duration::ZERO,
             ..Limits::default()
-        }));
+        });
         std::thread::sleep(Duration::from_millis(2));
         assert!(matches!(
             budget.check_deadline(),
             Err(LimitExceeded::Deadline { .. })
         ));
         assert_eq!(budget.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn charging_a_step_re_reads_the_deadline() {
+        // The step counter is not the backstop here: a script that is slow rather than long must
+        // still be stopped, so every step re-reads the clock.
+        let mut budget = Budget::start(Limits {
+            max_steps: u64::MAX,
+            timeout: Duration::from_millis(5),
+            ..Limits::default()
+        });
+        assert!(budget.charge_step().is_ok());
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            budget.charge_step(),
+            Err(LimitExceeded::Deadline { .. })
+        ));
+        assert_eq!(budget.steps(), 2);
     }
 
     #[test]

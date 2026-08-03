@@ -47,9 +47,16 @@ impl Builtin for Curl {
 
 /// Parses curl-style flags into the buffered-HTTP request shape.
 ///
-/// Only a bare URL, `-X`/`--request`, repeatable `-H`/`--header`, and `-d`/`--data`/`--data-raw`
-/// are supported. Everything else is an explicit error: silently accepting `-o` or `-L` would let a
-/// script believe it wrote a file or followed a redirect when neither happened.
+/// Only a bare URL, `-X`/`--request`, repeatable `-H`/`--header`,
+/// `-d`/`--data`/`--data-raw`/`--data-binary`, and the output-quieting `-s`/`-S` are supported.
+/// Everything else is an explicit error: silently accepting `-o` or `-L` would let a script believe
+/// it wrote a file or followed a redirect when neither happened.
+///
+/// `-s`/`--silent` and `-S`/`--show-error` are accepted as documented no-ops rather than rejected.
+/// They control a progress meter and an error line on a terminal; against a capability that returns
+/// a structured value there is nothing for either to change, so honoring them costs nothing and is
+/// not a claim about behavior that did not happen. `-L` and `-f` stay rejected precisely because
+/// they *would* change what the request means.
 pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
     let mut uri: Option<String> = None;
     let mut method: Option<String> = None;
@@ -68,10 +75,13 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
                 let value = take_value(arguments, &mut index, argument)?;
                 headers.push(parse_header(&value)?);
             }
-            "-d" | "--data" | "--data-raw" => {
+            "-d" | "--data" | "--data-raw" | "--data-binary" => {
                 let value = take_value(arguments, &mut index, argument)?;
                 body = Some(value);
             }
+            "--silent" | "--show-error" => index += 1,
+            // `-s`, `-S`, and bundles such as `-sS` quiet output that this shell never produced.
+            flag if is_quiet_bundle(flag) => index += 1,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 return Err(unsupported_flag("curl", flag));
             }
@@ -112,6 +122,17 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
         }
     }
     Ok(request)
+}
+
+/// Reports whether a short-flag bundle contains only the no-op quieting flags.
+///
+/// `-fsSL` deliberately fails this test: it carries `-f` and `-L`, which change what the request
+/// means, and reporting the bundle as written is more useful than silently honoring half of it.
+fn is_quiet_bundle(flag: &str) -> bool {
+    flag.len() > 1
+        && flag.starts_with('-')
+        && !flag.starts_with("--")
+        && flag.chars().skip(1).all(|short| matches!(short, 's' | 'S'))
 }
 
 fn take_value(
@@ -235,18 +256,27 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_flags_are_reported_not_ignored() {
-        for flag in [
-            "-o",
-            "-L",
-            "-i",
-            "--include",
-            "-s",
-            "--silent",
-            "-f",
-            "--fail",
-            "-k",
+    fn output_quieting_flags_are_accepted_as_documented_no_ops() {
+        // `-s` and `-sS` are near-reflexive in model-written curl, and neither can change anything
+        // about a capability call, so rejecting them was a certain first-attempt failure for free.
+        for flags in [
+            vec!["-s", "https://example.test/"],
+            vec!["-sS", "https://example.test/"],
+            vec!["--silent", "--show-error", "https://example.test/"],
         ] {
+            assert_eq!(
+                parse(&arguments(&flags)).unwrap_or_else(|_| panic!("{flags:?}")),
+                json!({"uri": "https://example.test/", "method": "GET", "headers": []}),
+                "{flags:?}"
+            );
+        }
+        // A bundle carrying a flag that would change the request is still reported by name.
+        assert!(parse(&arguments(&["-fsSL", "https://example.test/"])).is_err());
+    }
+
+    #[test]
+    fn unsupported_flags_are_reported_not_ignored() {
+        for flag in ["-o", "-L", "-i", "--include", "-f", "--fail", "-k"] {
             let failure = parse(&arguments(&[flag, "https://example.test/"]))
                 .expect_err("unsupported flags must fail");
             let CommandFailure::Status { message, status } = failure else {

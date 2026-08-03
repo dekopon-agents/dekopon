@@ -140,6 +140,8 @@ pub enum RawParameter {
     Positional(usize),
     /// `$@`.
     AllPositional,
+    /// `$*`.
+    AllPositionalJoined,
     /// `$#`.
     PositionalCount,
     /// `$?`.
@@ -155,6 +157,12 @@ pub struct LexError {
     /// Human-readable detail.
     pub message: String,
 }
+
+/// Why backtick command substitution is refused, in both quoting contexts.
+const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
+
+/// Why file-descriptor redirection is refused.
+const FD_REDIRECTION_REJECTION: &str = "file-descriptor redirection (`2>`, `>&2`, `2>&1`) is not supported: this shell has one combined output stream, not numbered descriptors; `>` and `>>` write named in-memory buffers";
 
 impl LexError {
     fn new(line: usize, message: impl Into<String>) -> Self {
@@ -209,6 +217,10 @@ impl<'a> Lexer<'a> {
                 '\'' => self.read_single_quoted()?,
                 '"' => self.read_double_quoted()?,
                 '$' => self.read_dollar(index)?,
+                // Backticks are the one dropped construct a model reaches for by reflex, so they
+                // are rejected by name rather than falling through to the literal arm below. A
+                // silent literal would hand back the source text as if the command had run.
+                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
                 '|' | '&' | ';' | '<' | '>' | '(' | ')' => self.read_operator(character)?,
                 '{' | '}' if self.brace_is_reserved_word() => {
                     self.finish_word();
@@ -362,6 +374,7 @@ impl<'a> Lexer<'a> {
                         None => literal.push('$'),
                     }
                 }
+                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
                 other => {
                     if other == '\n' {
                         self.line += 1;
@@ -413,6 +426,10 @@ impl<'a> Lexer<'a> {
                 self.chars.next();
                 Ok(Some(RawPart::Parameter(RawParameter::AllPositional)))
             }
+            '*' => {
+                self.chars.next();
+                Ok(Some(RawPart::Parameter(RawParameter::AllPositionalJoined)))
+            }
             '#' => {
                 self.chars.next();
                 Ok(Some(RawPart::Parameter(RawParameter::PositionalCount)))
@@ -463,6 +480,11 @@ impl<'a> Lexer<'a> {
                 self.chars.next();
                 self.expect_brace_close(line)?;
                 return Ok(RawPart::Parameter(RawParameter::AllPositional));
+            }
+            Some('*') => {
+                self.chars.next();
+                self.expect_brace_close(line)?;
+                return Ok(RawPart::Parameter(RawParameter::AllPositionalJoined));
             }
             Some('#') => {
                 self.chars.next();
@@ -651,8 +673,22 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_operator(&mut self, character: char) -> Result<(), LexError> {
+        // `2>`, `2>&1`, and `>&2` all begin as a bare digit word glued to a redirection operator.
+        // Letting the digit finish as an ordinary word would append it to argv and divert the
+        // output into a buffer named `/dev/null`, so the whole shape is rejected by name instead.
+        if matches!(character, '<' | '>')
+            && self.word_started
+            && self.parts.is_empty()
+            && !self.literal.is_empty()
+            && self.literal.chars().all(|digit| digit.is_ascii_digit())
+        {
+            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+        }
         self.finish_word();
         let next = self.chars.peek().map(|(_, character)| *character);
+        if matches!((character, next), ('<' | '>', Some('&'))) {
+            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+        }
         let kind = match (character, next) {
             ('|', Some('|')) => {
                 self.chars.next();
@@ -820,15 +856,72 @@ mod tests {
     }
 
     #[test]
-    fn bash_array_expansion_is_rejected_by_name() {
-        let error = tokenize("echo ${arr[@]}").expect_err("array expansion is dropped");
-        assert!(error.message.contains("${NAME[@]}"), "{error}");
+    fn every_dropped_parameter_expansion_is_rejected_by_name() {
+        // One case per rejection branch, so a branch that regresses to falling through to
+        // `read_name` (where `${#x}` would quietly become the positional count `$#`) fails here.
+        for (source, expected) in [
+            ("echo ${arr[@]}", "${NAME[@]}"),
+            ("echo ${arr[*]}", "${NAME[@]}"),
+            ("echo ${#items}", "${#name} length expansion"),
+            ("echo ${name:-default}", "keeps only"),
+            ("echo ${name/a/b}", "keeps only"),
+            ("echo ${name^^}", "keeps only"),
+            ("echo ${}", "empty ${} parameter reference"),
+            ("echo ${name", "unterminated"),
+        ] {
+            let error = tokenize(source)
+                .map(|tokens| format!("{tokens:?}"))
+                .expect_err(source);
+            assert!(error.message.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]
-    fn unsupported_parameter_expansions_are_rejected() {
-        let error = tokenize("echo ${name:-default}").expect_err("suffix expansions are dropped");
-        assert!(error.message.contains("keeps only"), "{error}");
+    fn positional_parameters_cover_at_hash_and_star() {
+        assert_eq!(
+            single_word("$@"),
+            vec![RawPart::Parameter(RawParameter::AllPositional)]
+        );
+        assert_eq!(
+            single_word("$*"),
+            vec![RawPart::Parameter(RawParameter::AllPositionalJoined)]
+        );
+        assert_eq!(
+            single_word("${*}"),
+            vec![RawPart::Parameter(RawParameter::AllPositionalJoined)]
+        );
+        assert_eq!(
+            single_word("$#"),
+            vec![RawPart::Parameter(RawParameter::PositionalCount)]
+        );
+    }
+
+    #[test]
+    fn backtick_substitution_is_rejected_by_name() {
+        for source in ["echo `echo hi`", r#"echo "`echo hi`""#, "x=`date`"] {
+            let error = tokenize(source).expect_err("backticks are dropped");
+            assert!(error.message.contains("backtick"), "{source}: {error}");
+            assert!(error.message.contains("$( ... )"), "{source}: {error}");
+        }
+        // An escaped backtick is ordinary text in both bash and here.
+        assert_eq!(single_word(r"\`"), vec![RawPart::Literal("`".to_owned())]);
+        assert_eq!(
+            single_word("'`echo hi`'"),
+            vec![RawPart::SingleQuoted("`echo hi`".to_owned())]
+        );
+    }
+
+    #[test]
+    fn file_descriptor_redirection_is_rejected_by_name() {
+        for source in ["echo hi 2>buf", "echo hi 2>&1", "echo hi >&2", "cmd 2>>buf"] {
+            let error = tokenize(source).expect_err("fd redirection is dropped");
+            assert!(
+                error.message.contains("file-descriptor redirection"),
+                "{source}: {error}"
+            );
+        }
+        // A digit that is a plain argument, separated from the operator, still redirects normally.
+        assert!(kinds("echo 2 > buf").contains(&TokenKind::Great));
     }
 
     #[test]

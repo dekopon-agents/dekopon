@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::ExitCode;
 
-/// `echo [-n] ARGS...`.
+/// `echo [-neE] ARGS...`.
 pub(crate) struct Echo;
 
 impl Builtin for Echo {
@@ -22,18 +22,74 @@ impl Builtin for Echo {
         _input: Option<Value>,
     ) -> Result<CommandResult, CommandFailure> {
         let mut suppress_newline = false;
+        let mut escapes = false;
         let mut words = arguments;
-        if words.first().is_some_and(|first| first == "-n") {
-            suppress_newline = true;
+        // `-n`, `-e`, `-E`, and bundles of them are consumed as flags, exactly as busybox echo
+        // does. Leaving `-e` unconsumed printed it as data, silently corrupting the value the
+        // script produced — and `echo -e` is how a bash-fluent model writes a multi-line string.
+        while let Some(first) = words.first() {
+            if !is_echo_flags(first) {
+                break;
+            }
+            for flag in first.chars().skip(1) {
+                match flag {
+                    'n' => suppress_newline = true,
+                    'e' => escapes = true,
+                    _ => escapes = false,
+                }
+            }
             words = &words[1..];
         }
-        let result = CommandResult::value(Value::String(words.join(" ")));
+        let joined = words.join(" ");
+        let text = if escapes {
+            interpret_escapes(&joined)
+        } else {
+            joined
+        };
+        let result = CommandResult::value(Value::String(text));
         Ok(if suppress_newline {
             result.without_newline()
         } else {
             result
         })
     }
+}
+
+/// Reports whether one argument is an `echo` flag bundle such as `-n`, `-e`, or `-ne`.
+fn is_echo_flags(argument: &str) -> bool {
+    argument.len() > 1
+        && argument.starts_with('-')
+        && argument
+            .chars()
+            .skip(1)
+            .all(|flag| matches!(flag, 'n' | 'e' | 'E'))
+}
+
+/// Expands the escape sequences `echo -e` interprets.
+///
+/// The set matches [`format_text`]: an unrecognized escape stays literal rather than being dropped,
+/// so nothing disappears from the text a script meant to emit.
+fn interpret_escapes(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('n') => output.push('\n'),
+            Some('t') => output.push('\t'),
+            Some('r') => output.push('\r'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 /// `printf FORMAT [ARGS...]`.
@@ -157,15 +213,16 @@ impl Builtin for TestBracket {
 /// File tests (`-f`, `-d`, `-e`, `-r`, `-w`, `-x`) are absent: there is no filesystem, so accepting
 /// them would answer a question this shell cannot ask.
 fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
-    if let Some(rest) = arguments.strip_prefix(std::slice::from_ref(&"!".to_owned())) {
-        let inner = evaluate_test(command, rest)?;
-        let negated = if inner.status == ExitCode::SUCCESS {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
-        return Ok(CommandResult::status(negated));
+    // Leading `!`s are counted in a loop rather than peeled off by recursion. argv length here is
+    // attacker-controlled — an unquoted expansion of a JSON array spreads element by element — so
+    // one frame per `!` let a three-line script build a 20,000-deep stack and abort the process.
+    let mut negations = 0usize;
+    let mut arguments = arguments;
+    while arguments.first().is_some_and(|first| first == "!") {
+        negations += 1;
+        arguments = &arguments[1..];
     }
+    let negated = negations % 2 == 1;
 
     let truth = match arguments {
         [] => false,
@@ -214,7 +271,7 @@ fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, C
         }
     };
 
-    Ok(CommandResult::status(if truth {
+    Ok(CommandResult::status(if truth != negated {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -293,7 +350,11 @@ impl Builtin for Sleep {
 
         // Sleeping is capped by whatever remains of the script deadline, so `sleep 3600` cannot
         // park the interpreter past its own wall clock. Overshooting the deadline then trips it.
-        let requested = Duration::from_secs_f64(seconds);
+        //
+        // The conversion is fallible on purpose: `Duration::from_secs_f64` *panics* above roughly
+        // 1.8e19 seconds, so `sleep 1e30` would abort the whole process rather than being clamped
+        // to a deadline it was always going to exceed.
+        let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
         let remaining = context.budget.remaining();
         thread::sleep(requested.min(remaining));
         context.budget.check_deadline()?;
@@ -374,6 +435,34 @@ mod tests {
     }
 
     #[test]
+    fn echo_consumes_its_flag_bundles_instead_of_printing_them() {
+        // An unconsumed `-e` used to be printed as data, so the value the script produced silently
+        // gained a flag it never meant to emit.
+        assert_eq!(
+            run_builtin(&Echo, &["-e", "a\\nb"], None)
+                .expect("echo runs")
+                .value,
+            json!("a\nb")
+        );
+        assert_eq!(
+            run_builtin(&Echo, &["-E", "a\\nb"], None)
+                .expect("echo runs")
+                .value,
+            json!("a\\nb")
+        );
+        let bundled = run_builtin(&Echo, &["-ne", "a\\tb"], None).expect("echo runs");
+        assert_eq!(bundled.value, json!("a\tb"));
+        assert!(bundled.suppress_newline);
+        // A word that merely starts with a dash is still ordinary text, as in real echo.
+        assert_eq!(
+            run_builtin(&Echo, &["-x", "a"], None)
+                .expect("echo runs")
+                .value,
+            json!("-x a")
+        );
+    }
+
+    #[test]
     fn printf_renders_the_curated_conversions() {
         assert_eq!(
             run_builtin(&Printf, &["%s=%d\\n", "count", "7"], None)
@@ -410,6 +499,24 @@ mod tests {
         assert_eq!(status(&["2", "-gt", "1"]), ExitCode::SUCCESS);
         assert_eq!(status(&["2", "-le", "1"]), ExitCode::FAILURE);
         assert_eq!(status(&["!", "-z", "x"]), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn stacked_negations_are_counted_not_recursed() {
+        let status = |arguments: &[&str]| {
+            run_builtin(&Test, arguments, None)
+                .expect("test runs")
+                .status
+        };
+        assert_eq!(status(&["!", "!", "-n", "x"]), ExitCode::SUCCESS);
+        assert_eq!(status(&["!", "!", "!", "-n", "x"]), ExitCode::FAILURE);
+
+        // argv length is attacker-controlled: an unquoted expansion of a JSON array spreads one
+        // word per element, so a runtime-generated pile of `!`s must not build a stack frame each.
+        let bangs = vec!["!"; 50_000];
+        let mut arguments = bangs.clone();
+        arguments.extend(["-n", "x"]);
+        assert_eq!(status(&arguments), ExitCode::SUCCESS);
     }
 
     #[test]
@@ -467,6 +574,30 @@ mod tests {
         assert!(run_builtin(&Sleep, &["soon"], None).is_err());
         assert!(run_builtin(&Sleep, &["-1"], None).is_err());
         assert!(run_builtin(&Sleep, &[], None).is_err());
+    }
+
+    #[test]
+    fn an_astronomical_sleep_is_clamped_rather_than_panicking() {
+        // `Duration::from_secs_f64` panics past its u64-second ceiling, so `sleep 1e30` used to
+        // abort the process instead of being capped by the deadline like any other long sleep.
+        let limits = Limits {
+            timeout: Duration::from_millis(20),
+            ..Limits::default()
+        };
+        for duration in ["1e30", "99999999999999999999", "1e300"] {
+            let started = std::time::Instant::now();
+            let failure = run_builtin_with(
+                &Sleep,
+                &[duration],
+                None,
+                limits,
+                None,
+                &mut Default::default(),
+            )
+            .expect_err("an oversized sleep trips the deadline");
+            assert!(matches!(failure, CommandFailure::Fatal(_)), "{duration}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{duration}");
+        }
     }
 
     #[test]

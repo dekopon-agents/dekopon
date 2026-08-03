@@ -17,14 +17,23 @@
 //! There is no operating-system sandbox here. This is a native tree-walking evaluator, so every
 //! bound is hand-built in [`limits`]:
 //!
-//! - a step budget covering statements, loop iterations, and function calls,
+//! - a step budget covering statements, loop iterations, function calls, arithmetic nodes, and
+//!   values pulled from a `jq` filter,
 //! - a shell-function recursion depth cap,
 //! - independent output byte and line ceilings with head-and-tail truncation,
-//! - a cooperative wall-clock deadline,
-//! - a capability-invocation ceiling that is deliberately separate from the step budget.
+//! - a wall-clock deadline, re-read on every step and around every capability call,
+//! - a capability-invocation ceiling that is deliberately separate from the step budget,
+//! - a cumulative ceiling on the value bytes a script may materialize, which is what bounds memory
+//!   for a script that is cheap in steps and expensive in bytes.
+//!
+//! One bound is *not* in [`limits`], because it applies before any budget exists: [`parser`] caps
+//! grammar nesting depth at a fixed ceiling. Parsing is recursive and runs on the native stack, so
+//! without it a few kilobytes of nested `$( $( ... ) )` aborts the host process instead of
+//! returning a [`ScriptOutcome`].
 //!
 //! The variable namespace is seeded only from the script's own assignments. This interpreter never
-//! reads the host process environment.
+//! reads the host process environment — including through `jq`, whose standard library exports an
+//! `env` filter that is deliberately not linked.
 //!
 //! # Example
 //!
@@ -66,7 +75,8 @@ pub mod value;
 
 pub use limits::{
     DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS, DEFAULT_TIMEOUT, Limits,
+    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS, DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT,
+    Limits,
 };
 pub use parser::ParseError;
 

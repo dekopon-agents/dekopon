@@ -148,7 +148,7 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 registry: &registry,
             };
             let outcome = Interpreter::new(shell_limits(shell))
-                .with_curl_capability(curl_capability.clone())
+                .with_curl_capability(curl_capability.as_ref().map(CapabilityId::to_string))
                 .run(script, &invoker);
             tracing::info!(
                 shell.exit_code = outcome.exit_code.get(),
@@ -298,6 +298,7 @@ fn shell_limits(limits: &ShellLimitArgs) -> ShellLimits {
         max_output_lines: limits.shell_max_output_lines,
         timeout: Duration::from_millis(limits.shell_timeout_ms),
         max_capability_calls: limits.shell_max_capability_calls,
+        max_value_bytes: limits.shell_max_value_bytes,
     }
 }
 

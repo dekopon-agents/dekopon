@@ -68,12 +68,14 @@ pub fn to_lines(value: &Value) -> Vec<String> {
 
 /// Converts a line list back into a value.
 ///
+/// No lines becomes `null`, which emits nothing: a `grep` that matched nothing must print nothing,
+/// where an empty string would print a phantom blank line and spend a line of the output ceiling.
 /// A single line becomes a string so that `echo hi | grep hi` stays scalar; anything else becomes a
 /// JSON array of lines so that later `jq` or index expressions see real structure.
 #[must_use]
 pub fn from_lines(lines: Vec<String>) -> Value {
     match lines.len() {
-        0 => Value::String(String::new()),
+        0 => Value::Null,
         1 => Value::String(lines.into_iter().next().unwrap_or_default()),
         _ => Value::Array(lines.into_iter().map(Value::String).collect()),
     }
@@ -187,6 +189,8 @@ mod tests {
             from_lines(vec!["a".to_owned(), "b".to_owned()]),
             json!(["a", "b"])
         );
+        // Nothing selected is nothing emitted, not an empty line.
+        assert_eq!(from_lines(Vec::new()), Value::Null);
     }
 
     #[test]
