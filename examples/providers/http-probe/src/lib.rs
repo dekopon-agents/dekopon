@@ -225,7 +225,10 @@ mod tests {
         // character, which is where a valid UTF-8 body used to lose `bodyText` entirely.
         let mut body = vec![b'x'; MAX_RETURNED_BODY_BYTES - 1];
         body.extend_from_slice("€tail".as_bytes());
-        assert!(core::str::from_utf8(&body).is_ok(), "the body is valid UTF-8");
+        assert!(
+            core::str::from_utf8(&body).is_ok(),
+            "the body is valid UTF-8"
+        );
 
         let described = describe_response(200, &body, 0);
         assert_eq!(described["bodyTruncated"], json!(true));
