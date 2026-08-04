@@ -223,6 +223,10 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     assert_eq!(output.output["status"], 200);
     assert_eq!(output.output["bodyBytes"], 11);
     assert_eq!(output.output["headerCount"], 4);
+    // The probe returns the response body itself: base64 always, plus decoded text when it is UTF-8.
+    assert_eq!(output.output["body"], "eyJvayI6dHJ1ZX0=");
+    assert_eq!(output.output["bodyText"], r#"{"ok":true}"#);
+    assert_eq!(output.output["bodyTruncated"], false);
     assert_eq!(output.http_calls.len(), 1);
     assert_eq!(output.http_calls[0].method, "PATCH");
     assert_eq!(output.http_calls[0].authority, authority);

@@ -20,6 +20,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing/trace export, and explicit bounded broker capability/invocation client commands.
+- A sandboxed bash-flavored script interpreter (`dekopon-shell`, driven by `dekopon-run shell`) whose command words dispatch to provider capabilities instead of operating-system processes, so a multi-step plan is one tool call rather than many round trips.
 
 ## What does not work yet
 
@@ -85,6 +86,18 @@ cargo run -p dekopon-run -- --trace trace.json invoke \
 ```
 
 Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopon auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
+
+## Script several capability calls as one plan
+
+`dekopon-run shell` runs a script through [`crates/dekopon-shell`](crates/dekopon-shell/README.md), a sandboxed bash-flavored interpreter whose command words are capability invocations rather than operating-system processes, with `jq` and the usual text builtins alongside them:
+
+```console
+cargo run -p dekopon-run -- shell \
+  --provider examples/providers/echo-provider.wasm \
+  'echo.echo --message hi | jq -r .message'
+```
+
+Every variable is a JSON value, every bound is hand-built and configurable, and every dropped bash construct either fails by name or is documented as inert.
 
 ## Security model
 

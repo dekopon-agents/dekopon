@@ -8,6 +8,7 @@
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
 dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
+dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SCRIPT>
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
 dekopon auth chatgpt <login | status | logout>
@@ -35,6 +36,51 @@ time target/release/dekopon-run invoke \
 ```
 
 The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downcase`; all four transforms accept and return `{"message":"..."}`. Direct `invoke` emits a JSON report containing the routed provider, capability, iteration count, warm invocation timings, and final raw JSON output. That output is not broker evidence or an `InvocationResult`. Shell `time` also includes process startup and component compilation.
+
+## Shell mode
+
+`dekopon-run shell` runs one script through [`dekopon-shell`](../crates/dekopon-shell/), a sandboxed bash-flavored interpreter whose command words dispatch to provider capabilities instead of operating-system processes. It is a development and testing surface for that language; it contacts no model and changes nothing about prompt mode.
+
+```console
+cargo run -p dekopon-run -- shell \
+  --provider examples/providers/echo-provider.wasm \
+  'for word in alpha beta; do echo.upcase --message $word | jq -r .message; done'
+```
+
+A granted capability is callable as a bare command, and `cap` is always available:
+
+```console
+cargo run -p dekopon-run -- shell \
+  --provider examples/providers/echo-provider.wasm \
+  'cap --list | jq -r ".[]"'
+```
+
+Every shell variable is a JSON value rather than bash text, so capability inputs and outputs need no marshaling. `NAME --kebab-case value` flags become camelCase JSON keys, matching the capability input convention used everywhere else. A whole-right-hand-side `x=$(cmd)` keeps the command's structured value, which is a deliberate documented deviation from bash; interpolating `$( )` anywhere else coerces to text exactly as bash does. `|` delivers one structured value to the next command rather than a byte stream, and `>`/`>>` write to named in-memory buffers read back only by `cat`, never to files.
+
+The language keeps `if`/`elif`/`else`, `for`, `while`, `until`, `break`/`continue` with levels, functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local`, `&&`/`||`/`;`/`|`, a leading `!` to invert a pipeline, `$?`, `$(( ))` arithmetic, both quoting forms, and `#` comments.
+
+Dropped constructs fall into two groups, and the difference matters:
+
+- **Rejected loudly**, by name, as a parse or run failure: backticks (use `$( )`), job control (a trailing `&`), subshells, `(( ))`, `name=(a b c)`, C-style `for (( ))`, `[[ ]]`, `set` and its options, file-descriptor redirection (`2>`, `>&2`), here-documents, process substitution, `case`, `eval`, `exec`, `source`, `declare`, `export`, bash's array emulation, `${name:-default}`-style expansions, and regex metacharacters in a `grep`/`sed` pattern.
+- **Inert literals**, indistinguishable from ordinary text: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing for these to be rejected against; an unquoted expansion holding a JSON array is what produces multiple words here.
+
+Everything in the first group fails rather than doing something else, so a model can never believe something happened that did not.
+
+Script bounds are separate from the Wasm bounds, because a script decides how many component calls happen:
+
+- `--shell-max-steps`
+- `--shell-max-recursion-depth`
+- `--shell-max-output-bytes`
+- `--shell-max-output-lines`
+- `--shell-timeout-ms`
+- `--shell-max-capability-calls`
+- `--shell-max-value-bytes`
+
+`--shell-max-value-bytes` is the memory bound: it counts, cumulatively across the run, the bytes a script materializes into variables, buffers, and substitutions, so a script that is cheap in steps and expensive in memory (`x="$x$x"` in a loop) is stopped by something. Grammar nesting depth has a fixed ceiling that is not configurable, because it is a property of the parser's stack rather than of the script's budget; deeply nested `$( $( ... ) )` is a syntax error.
+
+The interpreter's variable namespace is seeded only by the script's own assignments; it never reads the host process environment, so `$PATH` and `$OPENAI_API_KEY` are unset inside a script. That covers `jq` too: jaq's `env` and `now` filters are not linked, so `jq -r env.SECRET` reports an undefined filter. Output is truncated to the configured ceilings keeping both the head and the tail with a marker between them. Exit codes are `0` for success, `1` for a capability that ran and failed, `2` for a syntax error or an exhausted limit, `124` for the wall-clock deadline, `126` for a denied capability, and `127` for an unknown command; `exit N` wraps as `N mod 256`. The command prints the script's combined output followed by an `[exit code: N]` line and exits with that code.
+
+`curl` in this shell speaks no HTTP itself. It parses curl-style flags into the `{uri, method, headers, body}` shape and submits it to the single capability named by `--curl-capability`; without that flag it reports "command not found". Direct mode's linker is empty by design, so no HTTP-importing component loads there and `curl` cannot reach the network from this subcommand. Broker-backed HTTP for scripts is future work.
 
 ## Broker client mode
 

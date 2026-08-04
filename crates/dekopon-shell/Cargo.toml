@@ -1,0 +1,26 @@
+[package]
+name = "dekopon-shell"
+description = "Sandboxed bash-flavored script interpreter whose commands dispatch to Dekopon capabilities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-shell"
+readme = "README.md"
+keywords = ["agents", "shell", "interpreter", "sandbox", "jq"]
+categories = ["command-line-interface", "parser-implementations"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+base64.workspace = true
+dekopon-core.workspace = true
+jaq-core.workspace = true
+jaq-json.workspace = true
+jaq-std.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
