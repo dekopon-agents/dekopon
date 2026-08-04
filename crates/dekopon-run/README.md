@@ -5,7 +5,7 @@ One-shot direct execution for read-only Dekopon WebAssembly providers plus an ex
 - `dekopon-run inspect` validates direct provider manifests.
 - `dekopon-run invoke` directly invokes and times an import-free read-only capability.
 - `dekopon-run shell` runs one sandboxed [`dekopon-shell`](../dekopon-shell/README.md) script whose command words dispatch to provider capabilities instead of operating-system processes.
-- `dekopon-run prompt` exposes direct capabilities as tools to an OpenAI-compatible endpoint or a ChatGPT/Codex subscription.
+- `dekopon-run prompt` gives an OpenAI-compatible endpoint or a ChatGPT/Codex subscription one scripting tool instead of one tool per capability, optionally reaching a running broker with `--broker` for capabilities direct mode cannot serve.
 - `dekopon-run broker capabilities` inspects exact policy visible to the authenticated Unix peer.
 - `dekopon-run broker invoke` submits one identity-free, caller-ID-bearing proposal to `dekopon-brokerd`.
 - `dekopon auth chatgpt` manages Dekopon's isolated subscription login.

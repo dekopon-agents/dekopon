@@ -105,8 +105,9 @@ Immediate host:
 - The linker is empty: no WASI, filesystem, network, environment, clock, random, or credential imports reach a component.
 - The host validates bounds, routing, read-only manifests, object-shaped inputs, and typed wire responses. Capability-specific argument validation remains provider-owned.
 - Immediate provider output is raw JSON. It is not broker evidence, an `InvocationResult`, or an authorization receipt.
-- Prompt-visible tool names are deterministic adaptations of capability IDs. Model tool selection and arguments remain untrusted.
-- The prompt loop is bounded by `--max-steps` and at most 32 tool calls per model turn.
+- Prompt mode offers exactly one model tool, `bash`, whose `script` argument runs on `dekopon-shell`. Model tool selection and arguments remain untrusted, and a call carrying no string `script` ends the session.
+- The prompt loop is bounded by `--max-steps`, at most four tool calls per model turn, and a whole-session `--shell-max-capability-calls` ceiling spent across every script rather than refreshed per script.
+- `prompt --broker` adds a second dispatch leg for capabilities direct mode cannot serve. Direct capabilities are always preferred; the broker stays the sole authority, so its denials reach the script as exit code `126`.
 - `dekopon-run shell` runs `dekopon-shell` over the same registry. Its bounds are independent of the Wasm ones: Wasm fuel bounds one component call, while the interpreter's step, recursion, output, deadline, and capability-call ceilings bound how many such calls a script can drive. The interpreter never reads the host process environment.
 
 Privileged broker path:

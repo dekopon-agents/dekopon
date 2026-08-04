@@ -137,7 +137,7 @@ parse dekopon-run CLI
   -> JSON result/timings and optional Chrome trace
 ```
 
-The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials, and the operator CLI does not invoke it.
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted: a call selects the one scripting tool or ends the session, and the script it carries can reach only loaded capability IDs plus, with `--broker`, whatever a separate broker authorizes for this peer. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials, and the operator CLI does not invoke it.
 
 ## Resource and API design
 

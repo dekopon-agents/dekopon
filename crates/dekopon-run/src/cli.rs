@@ -112,15 +112,37 @@ pub enum Command {
         #[command(subcommand)]
         command: BrokerCommand,
     },
-    /// Run a one-shot model prompt/tool loop.
+    /// Run a one-shot model prompt/tool loop over one sandboxed scripting tool.
     Prompt {
         /// Bounded immediate-mode Wasm settings.
         #[command(flatten)]
         limits: LimitArgs,
 
-        /// Provider components whose capabilities become model tools.
+        /// Provider components whose capabilities the model's scripts may invoke directly.
         #[command(flatten)]
         providers: ProviderArgs,
+
+        /// Bounded interpreter settings for the scripts the model writes.
+        #[command(flatten)]
+        shell: ShellLimitArgs,
+
+        /// Also reach a running broker for capabilities no loaded provider offers.
+        ///
+        /// Off by default, so prompt mode stays exactly as capable as direct mode with no daemon
+        /// running. Turning it on is what makes an HTTP-capable capability reachable at all: the
+        /// direct-mode Wasm linker is import-free by construction and cannot perform I/O.
+        #[arg(long)]
+        broker: bool,
+
+        /// Authenticated local broker connection settings; used only with `--broker`.
+        #[command(flatten)]
+        connection: BrokerConnectionArgs,
+
+        /// Capability the `curl` builtin assembles requests for.
+        ///
+        /// Typically reachable only over `--broker`, since direct mode cannot speak HTTP.
+        #[arg(long, value_name = "CAPABILITY")]
+        curl_capability: Option<CapabilityId>,
 
         /// Model identifier sent to the selected model backend.
         #[arg(long, value_name = "MODEL")]
@@ -273,7 +295,12 @@ pub struct ShellLimitArgs {
     )]
     pub shell_timeout_ms: u64,
 
-    /// Maximum capability invocations one script may drive.
+    /// Maximum capability invocations.
+    ///
+    /// `shell` runs exactly one script, so this bounds that script. `prompt` may run one script
+    /// per model turn, so there it bounds the whole session: without that, a model widens its own
+    /// budget just by writing more scripts, and the model-turn limit multiplies the ceiling
+    /// instead of bounding it.
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_CAPABILITY_CALLS,

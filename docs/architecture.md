@@ -32,7 +32,9 @@ dekopon-run
   -> call and validate read-only provider manifests
   -> direct invoke: route one capability and emit timings
      or
-  -> prompt: expose schemas through OpenAI-compatible or ChatGPT/Codex subscription transport and execute selected tools
+  -> prompt: offer one scripting tool over OpenAI-compatible or ChatGPT/Codex subscription transport,
+     run each model-authored script on the sandboxed interpreter, and optionally fall through
+     to a separate broker for capabilities direct mode cannot serve
   -> create a fresh bounded Wasmtime store for every component call
 ```
 
