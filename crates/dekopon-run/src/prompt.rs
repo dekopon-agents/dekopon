@@ -349,12 +349,12 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `break`/`continue`, functions with `$1`/`$@`/\
-`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, `exit`, both \
-quoting forms, and `>`/`>>` into named in-memory buffers all behave the way you expect. \
-Everything outside that curated set fails loudly and by name: `eval`, backticks, subshells, \
-`[[ ]]`, `case`, `set -e`, `2>&1`, here-documents, and `&` backgrounding are errors, never silent \
-no-ops. If a script ran, it did what it said.
+`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
+with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, \
+`exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
+`>`/`>>` into named in-memory buffers all behave the way you expect. Everything outside that \
+curated set fails loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `2>&1`, \
+`<<<`, and `&` backgrounding are errors, never silent no-ops. If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
@@ -370,10 +370,15 @@ in to work on it.
 tripping one ends the script with a message naming it.
 
 Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
-`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. `curl` opens no socket of its own — \
-it assembles a request for whichever HTTP capability this session was given, and is \"command not \
-found\" when it was given none. `grep` and `sed` patterns are literal text, not regular \
-expressions; use `jq` for real matching.
+`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them exist only when \
+this session was configured for them, and report \"command not found\" otherwise: `curl`, which \
+opens no socket of its own but assembles a request for whichever HTTP capability the session was \
+given, and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant.
+
+Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
+and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
+than a silent mismatch. Use `jq` for real matching. A here-document's body arrives as one JSON \
+string, so pipe it through `jq` when you want structure out of it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
 capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \
@@ -472,6 +477,7 @@ mod tests {
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
         PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, format_script_outcome,
@@ -844,6 +850,128 @@ mod tests {
             *dispatched.lock().expect("dispatch lock"),
             vec!["http.get --url https://example.test".to_owned()]
         );
+    }
+
+    /// One closed span: its name, and its enclosing span names innermost-first.
+    type SpanAncestry = (String, Vec<String>);
+
+    /// Records the ancestry of every span, so a test can assert what nests inside what.
+    #[derive(Default)]
+    struct SpanTreeLayer {
+        spans: Arc<Mutex<Vec<SpanAncestry>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanTreeLayer
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_close(
+            &self,
+            id: tracing::span::Id,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let Some(span) = context.span(&id) else {
+                return;
+            };
+            self.spans.lock().expect("span lock").push((
+                span.name().to_owned(),
+                span.scope()
+                    .skip(1)
+                    .map(|parent| parent.name().to_owned())
+                    .collect(),
+            ));
+        }
+    }
+
+    /// A runtime that runs the real interpreter and bridges capability calls back into async.
+    ///
+    /// This is production's exact shape: a synchronous [`ScriptRuntime`] driving
+    /// `dekopon-shell`, whose invoker reaches back into the runtime with `Handle::block_on` the
+    /// way [`crate::BrokerLeg`] does.
+    struct BridgedShellRuntime {
+        handle: tokio::runtime::Handle,
+    }
+
+    struct BridgedInvoker {
+        handle: tokio::runtime::Handle,
+    }
+
+    impl dekopon_shell::CapabilityInvoker for BridgedInvoker {
+        fn granted(&self) -> Vec<String> {
+            vec!["echo.echo".to_owned()]
+        }
+
+        fn invoke(&self, _capability: &str, input: Value) -> dekopon_shell::CapabilityCallResult {
+            // A real await point, on the same blocking-pool thread the whole session runs on.
+            self.handle.block_on(async move {
+                tokio::task::yield_now().await;
+                dekopon_shell::CapabilityCallResult::Succeeded(input)
+            })
+        }
+    }
+
+    impl ScriptRuntime for BridgedShellRuntime {
+        fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
+            dekopon_shell::Interpreter::new(dekopon_shell::Limits {
+                max_capability_calls,
+                ..dekopon_shell::Limits::default()
+            })
+            .run(
+                script,
+                &BridgedInvoker {
+                    handle: self.handle.clone(),
+                },
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge() {
+        // The interpreter creates its spans with no propagation code at all, relying on the whole
+        // session — including each broker round trip, bridged from this same blocking-pool thread
+        // — staying on one thread. That is an assumption about the runtime, not about `tracing`,
+        // so it is checked here against a real `spawn_blocking` and a real `Handle::block_on`
+        // rather than taken on faith.
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&spans);
+        let handle = tokio::runtime::Handle::current();
+
+        tokio::task::spawn_blocking(move || {
+            let subscriber = tracing_subscriber::registry().with(SpanTreeLayer { spans: recorded });
+            tracing::subscriber::with_default(subscriber, || {
+                let session = tracing::info_span!("runner.prompt");
+                let _entered = session.enter();
+                let model = ScriptedModel::new([
+                    script_call("call-1", "echo one\necho.echo --message two"),
+                    answer("done"),
+                ]);
+                let runtime = BridgedShellRuntime { handle };
+                run_prompt(&model, &runtime, "trace it", None, limits(4, 32))
+                    .expect("prompt session succeeds");
+            });
+        })
+        .await
+        .expect("blocking prompt task completes");
+
+        let spans = spans.lock().expect("span lock");
+        let commands = spans
+            .iter()
+            .filter(|(name, _)| name == "shell.command")
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2, "one span per command the script ran");
+        for (_, parents) in commands {
+            // `prompt.model_turn` is absent by design: the loop drops its guard once the model
+            // has answered, so a script runs under the session rather than under the turn.
+            assert_eq!(
+                parents,
+                &[
+                    "prompt.script".to_owned(),
+                    "prompt.session".to_owned(),
+                    "runner.prompt".to_owned(),
+                ],
+                "an interpreter span must land inside the script span that drove it"
+            );
+        }
     }
 
     #[test]

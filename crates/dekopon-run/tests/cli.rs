@@ -1151,6 +1151,124 @@ fn shell_jq_cannot_read_the_real_process_environment() {
 }
 
 #[test]
+fn shell_runs_case_branches_and_here_documents() {
+    let (stdout, code) = shell(
+        "for w in ready broken other; do case $w in ready) echo go ;; broken|failed) echo stop ;; *) echo huh ;; esac; done\ncat <<EOF\ndone\nEOF",
+        &[],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(stdout, "go\nstop\nhuh\ndone\n[exit code: 0]\n");
+}
+
+#[test]
+fn shell_rejects_a_case_pattern_that_would_glob() {
+    // Matching `*.json` as four literal characters is the silent wrong answer this shell refuses.
+    let (stdout, code) = shell("case a.json in *.json) echo hit ;; esac", &[]);
+    assert_eq!(code, 2, "{stdout}");
+    assert!(stdout.contains("literal text"), "{stdout}");
+}
+
+#[test]
+fn shell_reads_the_clock_only_when_an_operator_allows_it() {
+    let (denied, code) = shell("date +%s", &[]);
+    assert_eq!(code, 127, "{denied}");
+    assert!(denied.contains("command not found"), "{denied}");
+    assert!(denied.contains("--shell-allow-clock"), "{denied}");
+
+    let (allowed, code) = shell("date +%s", &["--shell-allow-clock"]);
+    assert_eq!(code, 0, "{allowed}");
+    let seconds = allowed
+        .lines()
+        .next()
+        .expect("an epoch second")
+        .parse::<i64>()
+        .expect("the epoch second is a number");
+    assert!(seconds > 1_577_836_800, "{allowed}");
+}
+
+#[test]
+fn shell_exports_one_span_per_command_without_exporting_any_argument() {
+    // The trace has to read as the ordered list of commands the script ran, and must carry none of
+    // the argv those commands received. Asserting the absence is the point: a test that only
+    // checked for the safe fields would pass just as happily beside a field leaking every one.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let trace = directory.path().join("trace.json");
+    let provider = provider_path();
+    let output = run(&[
+        "--trace",
+        trace.to_str().expect("UTF-8 trace path"),
+        "shell",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.upcase --message SENTINEL_DO_NOT_EXPORT | jq -r .message\nhelper_SENTINEL_DO_NOT_EXPORT() { echo inner; }\nhelper_SENTINEL_DO_NOT_EXPORT\nSENTINEL_DO_NOT_EXPORT_typo",
+    ]);
+    // 127, because the script deliberately ends on a word that resolves to nothing.
+    assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
+
+    let raw = std::fs::read_to_string(&trace).expect("trace file reads");
+    let events: Vec<Value> = serde_json::from_str(&raw).expect("trace is valid JSON");
+    // The Chrome layer renders field values through `Debug`, so a string arrives quoted.
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_owned()
+    };
+    let commands = events
+        .iter()
+        .filter(|event| event["name"] == "shell.command")
+        .filter(|event| !event["args"]["outcome"].is_null())
+        .map(|event| {
+            let arguments = &event["args"];
+            (
+                text(&arguments["shell.command.kind"]),
+                text(&arguments["shell.command.name"]),
+                text(&arguments["outcome"]),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        commands,
+        vec![
+            (
+                "capability".to_owned(),
+                "echo.upcase".to_owned(),
+                "succeeded".to_owned()
+            ),
+            (
+                "builtin".to_owned(),
+                "jq".to_owned(),
+                "succeeded".to_owned()
+            ),
+            (
+                "builtin".to_owned(),
+                "echo".to_owned(),
+                "succeeded".to_owned()
+            ),
+            (
+                "function".to_owned(),
+                "<withheld>".to_owned(),
+                "succeeded".to_owned()
+            ),
+            (
+                "not-found".to_owned(),
+                "<withheld>".to_owned(),
+                "not-found".to_owned()
+            ),
+        ]
+    );
+
+    // The argument value, the model-authored function name, and the unresolved word all appear in
+    // the script; none of them may appear anywhere in the exported trace.
+    assert!(
+        !raw.contains("SENTINEL_DO_NOT_EXPORT"),
+        "a script value reached the exported trace"
+    );
+}
+
+#[test]
 fn shell_rejects_a_malformed_curl_capability_at_parse_time() {
     // A raw `String` here turned a malformed identifier into a runtime "capability not found",
     // telling the operator the capability was missing when the value was simply not an identifier.

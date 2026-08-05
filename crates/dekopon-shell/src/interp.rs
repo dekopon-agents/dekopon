@@ -16,6 +16,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
+    time::Instant,
 };
 
 use serde_json::Value;
@@ -23,15 +24,20 @@ use serde_json::Value;
 use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, ForLoop, IfStatement, Parameter,
-        Pipeline, Program, SimpleCommand, Statement, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
+        ForLoop, IfStatement, Parameter, Pipeline, Program, SimpleCommand, Statement, WhileLoop,
+        Word, WordPart,
     },
     builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
     dispatch::{self, Resolution, arguments_to_input},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    parser::parse,
+    parser::{parse, pattern_metacharacter, unsupported_case_pattern},
     value::{self, display},
 };
+
+use telemetry::CommandKind;
+
+mod telemetry;
 
 /// Control-flow signals that unwind through the evaluator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +95,7 @@ pub(crate) fn run(
         buffers: BTreeMap::new(),
         captures: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
+        allow_clock: limits.allow_clock,
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
     };
@@ -127,6 +134,8 @@ struct Evaluator<'a> {
     buffers: BTreeMap<String, Value>,
     captures: Vec<Vec<CommandResult>>,
     curl_capability: Option<String>,
+    /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
+    allow_clock: bool,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
 }
@@ -136,38 +145,32 @@ impl Evaluator<'_> {
     // Diagnostics and output
     // -----------------------------------------------------------------------
 
+    /// Reports a fatal error and returns the exit code the script ends with.
+    ///
+    /// The code half comes from [`telemetry::fatal_exit_code`] rather than from this match, so the
+    /// code a `shell.command` span records for an aborted command is by construction the same one
+    /// the script itself reports.
     fn report_fatal(&mut self, fatal: &FatalError) -> ExitCode {
-        let (message, code) = match fatal {
-            FatalError::Limit(LimitExceeded::Steps { maximum }) => (
-                format!(
-                    "dekopon-shell: step budget exhausted after {maximum} steps; the script is doing too much work or looping without progress"
-                ),
-                ExitCode::SYNTAX,
+        let message = match fatal {
+            FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
+                "dekopon-shell: step budget exhausted after {maximum} steps; the script is doing too much work or looping without progress"
             ),
-            FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => (
-                format!("dekopon-shell: shell functions nested deeper than {maximum} frames"),
-                ExitCode::SYNTAX,
-            ),
-            FatalError::Limit(LimitExceeded::Deadline { timeout_ms }) => (
-                format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline"),
-                ExitCode::TIMEOUT,
-            ),
-            FatalError::Limit(LimitExceeded::CapabilityCalls { maximum }) => (
-                format!("dekopon-shell: script tried to make more than {maximum} capability calls"),
-                ExitCode::SYNTAX,
-            ),
-            FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => (
-                format!(
-                    "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
-                ),
-                ExitCode::SYNTAX,
-            ),
-            FatalError::Unsupported(reason) => {
-                (format!("dekopon-shell: {reason}"), ExitCode::SYNTAX)
+            FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => {
+                format!("dekopon-shell: shell functions nested deeper than {maximum} frames")
             }
+            FatalError::Limit(LimitExceeded::Deadline { timeout_ms }) => {
+                format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline")
+            }
+            FatalError::Limit(LimitExceeded::CapabilityCalls { maximum }) => {
+                format!("dekopon-shell: script tried to make more than {maximum} capability calls")
+            }
+            FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
+                "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
+            ),
+            FatalError::Unsupported(reason) => format!("dekopon-shell: {reason}"),
         };
         self.write_line(&message);
-        code
+        telemetry::fatal_exit_code(fatal)
     }
 
     /// Writes one diagnostic to the combined output.
@@ -298,6 +301,7 @@ impl Evaluator<'_> {
             Statement::If(statement) => self.execute_if(statement),
             Statement::For(statement) => self.execute_for(statement),
             Statement::While(statement) => self.execute_while(statement),
+            Statement::Case(statement) => self.execute_case(statement),
             Statement::Function(definition) => {
                 self.function_names.insert(definition.name.clone());
                 self.functions
@@ -322,6 +326,69 @@ impl Evaluator<'_> {
         if let Some(otherwise) = &statement.otherwise {
             return self.execute_program(otherwise);
         }
+        self.last_status = ExitCode::SUCCESS;
+        Ok(Flow::Normal)
+    }
+
+    /// Runs the first `case` clause whose pattern matches, and no other.
+    ///
+    /// Every clause tested charges a step, the way a loop iteration does: a `case` with many
+    /// alternatives inside a loop is real work, and a statement-level charge alone would let it
+    /// run outside the step budget that bounds everything else.
+    fn execute_case(&mut self, statement: &CaseStatement) -> Result<Flow, FatalError> {
+        let subject = match self.expand_word(&statement.subject) {
+            Ok(expanded) => expanded.join(" "),
+            Err(failure) => {
+                let status = self.absorb(failure)?;
+                self.last_status = status;
+                return Ok(Flow::Normal);
+            }
+        };
+
+        for clause in &statement.clauses {
+            for pattern in &clause.patterns {
+                self.budget.charge_step()?;
+                let matched = match pattern {
+                    CasePattern::Any => true,
+                    CasePattern::Literal(word) => match self.expand_word(word) {
+                        Ok(expanded) => expanded.join(" ") == subject,
+                        Err(failure) => {
+                            let status = self.absorb(failure)?;
+                            self.last_status = status;
+                            return Ok(Flow::Normal);
+                        }
+                    },
+                    // A pattern assembled at run time cannot be checked any earlier, so it is
+                    // checked here: `p='*.json'; case $f in $p)` must not quietly compare the
+                    // subject against the four literal characters `*`, `.`, `j`...
+                    CasePattern::Expanded(word) => {
+                        let expanded = match self.expand_word(word) {
+                            Ok(expanded) => expanded.join(" "),
+                            Err(failure) => {
+                                let status = self.absorb(failure)?;
+                                self.last_status = status;
+                                return Ok(Flow::Normal);
+                            }
+                        };
+                        if let Some((character, meaning)) = pattern_metacharacter(&expanded) {
+                            self.write_line(&format!(
+                                "dekopon-shell: {}",
+                                unsupported_case_pattern(character, meaning)
+                            ));
+                            self.last_status = ExitCode::SYNTAX;
+                            return Ok(Flow::Normal);
+                        }
+                        expanded == subject
+                    }
+                };
+                if matched {
+                    return self.execute_program(&clause.body);
+                }
+            }
+        }
+
+        // No clause matched. bash reports success for that, and so does this: `case` asked a
+        // question, and "none of the above" is an answer rather than a failure.
         self.last_status = ExitCode::SUCCESS;
         Ok(Flow::Normal)
     }
@@ -532,6 +599,30 @@ impl Evaluator<'_> {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
 
+        // A here-document supplies this command's input in place of anything piped into it: `<<EOF`
+        // redirects the same stdin a pipe would have filled, and the redirection is what bash
+        // applies last. The body arrives as one JSON string, because a block of literal text is
+        // exactly what a string is in this value model — no byte stream is involved anywhere here,
+        // so a command that wants structure still pipes the body through `jq`.
+        let input = match &command.here_doc {
+            None => input,
+            Some(body) => match self.expand_quoted(&body.parts) {
+                Ok(text) => {
+                    let value = Value::String(text);
+                    if let Err(limit) = self.budget.charge_value_bytes(value_bytes(&value)) {
+                        self.restore_all(restore);
+                        return Err(limit.into());
+                    }
+                    Some(value)
+                }
+                Err(failure) => {
+                    self.restore_all(restore);
+                    let status = self.absorb(failure)?;
+                    return Ok(Executed::Result(CommandResult::status(status)));
+                }
+            },
+        };
+
         let executed = self.run_argv(&argv, input, capture_output);
         self.restore_all(restore);
         let executed = executed?;
@@ -595,6 +686,17 @@ impl Evaluator<'_> {
         Ok(())
     }
 
+    /// Executes one command word, wrapped in the span every command in a script produces.
+    ///
+    /// This is the single place a command word actually runs, so it is the single place worth
+    /// instrumenting: one span here covers builtins, capability calls, shell functions, refused
+    /// words, and unknown words alike, and covers builtins added later without another edit. The
+    /// recursion `xargs` drives back into this function is deliberately *not* special-cased — one
+    /// script word that maps a command over ten items really did run ten commands, and each of
+    /// them gets its own span nested inside the `xargs` one, which is exactly the syscall-by-
+    /// syscall reading this instrumentation exists to give.
+    ///
+    /// See [`telemetry`] for what these spans may and may not carry.
     fn run_argv(
         &mut self,
         argv: &[String],
@@ -604,12 +706,92 @@ impl Evaluator<'_> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
 
-        if let Some(executed) = self.run_control_word(command, arguments)? {
-            return Ok(executed);
-        }
+        // Classification happens before execution so that the span and its opening event both
+        // carry the resolution kind, and so a command that aborts the script is still described by
+        // more than "something failed".
+        let (kind, resolution) = if telemetry::is_control_word(command) {
+            (CommandKind::Control, None)
+        } else {
+            let resolution = dispatch::resolve(command, &self.function_names, self.invoker);
+            (CommandKind::of(&resolution), Some(resolution))
+        };
+        let name = telemetry::traceable_name(kind, command);
 
-        match dispatch::resolve(command, &self.function_names, self.invoker) {
-            Resolution::Rejected(reason) => Err(FatalError::Unsupported((*reason).to_owned())),
+        let span = tracing::info_span!(
+            "shell.command",
+            shell.command.name = name,
+            shell.command.kind = kind.label(),
+            shell.command.argument_count = arguments.len(),
+            shell.command.exit_code = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        tracing::info!(
+            audit.event = "shell.command.started",
+            shell.command.name = name,
+            shell.command.kind = kind.label(),
+            shell.command.argument_count = arguments.len(),
+            "shell command started"
+        );
+
+        let started = Instant::now();
+        let executed = self.dispatch_command(command, arguments, resolution, input, capture_output);
+        let (status, outcome) = match &executed {
+            Ok(Executed::Result(result)) => {
+                (result.status, telemetry::outcome_label(result.status))
+            }
+            // `break`, `return 1`, and `exit 3` are commands that succeeded at doing what they
+            // were asked; the status they carry belongs to the script, and is reported as theirs.
+            Ok(Executed::Flow(flow)) => {
+                let status = match flow {
+                    Flow::Return(status) | Flow::Exit(status) => *status,
+                    Flow::Normal | Flow::Break(_) | Flow::Continue(_) => ExitCode::SUCCESS,
+                };
+                (status, telemetry::outcome_label(status))
+            }
+            Err(fatal) => (
+                telemetry::fatal_exit_code(fatal),
+                telemetry::fatal_outcome(fatal),
+            ),
+        };
+        span.record("shell.command.exit_code", status.get());
+        span.record("outcome", outcome);
+        tracing::info!(
+            audit.event = "shell.command.completed",
+            shell.command.name = name,
+            shell.command.kind = kind.label(),
+            shell.command.argument_count = arguments.len(),
+            duration_ms = telemetry::milliseconds(started.elapsed()),
+            shell.command.exit_code = status.get(),
+            outcome,
+            "shell command completed"
+        );
+        executed
+    }
+
+    /// Runs one already-classified command word.
+    fn dispatch_command(
+        &mut self,
+        command: &str,
+        arguments: &[String],
+        resolution: Option<Resolution>,
+        input: Option<Value>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
+        let Some(resolution) = resolution else {
+            if let Some(executed) = self.run_control_word(command, arguments)? {
+                return Ok(executed);
+            }
+            // Unreachable while [`telemetry::CONTROL_WORDS`] and `run_control_word` agree, which
+            // `control_words_and_their_dispatcher_agree` pins. Reporting "command not found" is
+            // what a word added to only one of the two should do: fail closed and visibly, rather
+            // than silently succeed with no effect.
+            self.write_line(&format!("dekopon-shell: {command}: command not found"));
+            return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
+        };
+
+        match resolution {
+            Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
             Resolution::Function => self.call_function(command, arguments, input, capture_output),
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
                 let outcome = {
@@ -618,6 +800,7 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
+                        allow_clock: self.allow_clock,
                     };
                     builtin.run(&mut context, arguments, input)
                 };
@@ -644,6 +827,7 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
+                        allow_clock: self.allow_clock,
                     };
                     context.invoke_capability(command, input)
                 };

@@ -30,6 +30,8 @@ pub enum TokenKind {
     Pipe,
     /// `;`.
     Semicolon,
+    /// `;;`, which ends one `case` clause.
+    DoubleSemicolon,
     /// A line break.
     Newline,
     /// `&&`.
@@ -52,8 +54,8 @@ pub enum TokenKind {
     GreatGreat,
     /// `<`. Kept so the parser can explain that there are no files to read.
     Less,
-    /// `<<`. Kept so the parser can reject here-documents by name.
-    LessLess,
+    /// A `<<DELIM` here-document, with its body already collected off the following lines.
+    HereDoc(RawWord),
     /// `<(`. Kept so the parser can reject process substitution by name.
     LessParen,
 }
@@ -62,8 +64,10 @@ impl fmt::Display for TokenKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rendered = match self {
             Self::Word(word) => return write!(formatter, "word {}", word.describe()),
+            Self::HereDoc(_) => "here-document",
             Self::Pipe => "|",
             Self::Semicolon => ";",
+            Self::DoubleSemicolon => ";;",
             Self::Newline => "newline",
             Self::AndAnd => "&&",
             Self::OrOr => "||",
@@ -75,7 +79,6 @@ impl fmt::Display for TokenKind {
             Self::Great => ">",
             Self::GreatGreat => ">>",
             Self::Less => "<",
-            Self::LessLess => "<<",
             Self::LessParen => "<(",
         };
         formatter.write_str(rendered)
@@ -164,6 +167,33 @@ const BACKTICK_REJECTION: &str = "backtick command substitution is not supported
 /// Why file-descriptor redirection is refused.
 const FD_REDIRECTION_REJECTION: &str = "file-descriptor redirection (`2>`, `>&2`, `2>&1`) is not supported: this shell has one combined output stream, not numbered descriptors; `>` and `>>` write named in-memory buffers";
 
+/// Why the here-string `<<<` is refused.
+///
+/// It is one character away from a here-document and means something else entirely, so it is named
+/// rather than left to fail as a malformed delimiter.
+const HERE_STRING_REJECTION: &str = "the here-string `<<<` is not supported; pipe the value instead, as in `echo \"$x\" | cmd`, or use a here-document `<<EOF ... EOF`";
+
+/// Why bash's fall-through `case` terminators are refused.
+const CASE_FALLTHROUGH_REJECTION: &str = "`;&` and `;;&` are not supported: a `case` clause here runs alone and never falls through to the next; end every clause with `;;`";
+
+/// A `<<DELIM` whose body has not been read yet.
+///
+/// The body of a here-document begins on the line *after* the operator, so the token is pushed
+/// where it appears and filled in when the scanner reaches that newline. `cat <<EOF | jq .` depends
+/// on that: the rest of the line is ordinary shell, and only then does the body start.
+struct PendingHereDoc {
+    /// Terminator line, already unquoted.
+    delimiter: String,
+    /// `<<-`: strip leading tabs from body lines and from the terminator.
+    strip_tabs: bool,
+    /// Whether the body interpolates `$NAME` and `$( )`; false when the delimiter was quoted.
+    expand: bool,
+    /// Line the operator appeared on, for diagnostics.
+    line: usize,
+    /// Index in `tokens` of the placeholder to fill in.
+    token: usize,
+}
+
 impl LexError {
     fn new(line: usize, message: impl Into<String>) -> Self {
         Self {
@@ -187,6 +217,8 @@ struct Lexer<'a> {
     literal: String,
     word_started: bool,
     word_line: usize,
+    /// Here-documents whose operator has been seen but whose body has not started yet.
+    pending_here_docs: Vec<PendingHereDoc>,
 }
 
 impl<'a> Lexer<'a> {
@@ -200,6 +232,7 @@ impl<'a> Lexer<'a> {
             literal: String::new(),
             word_started: false,
             word_line: 1,
+            pending_here_docs: Vec::new(),
         }
     }
 
@@ -210,6 +243,8 @@ impl<'a> Lexer<'a> {
                     self.finish_word();
                     self.push(TokenKind::Newline);
                     self.line += 1;
+                    // The body of every here-document opened on the line just ended starts here.
+                    self.read_pending_here_doc_bodies()?;
                 }
                 ' ' | '\t' | '\r' => self.finish_word(),
                 '#' if !self.word_started => self.skip_comment(),
@@ -234,6 +269,15 @@ impl<'a> Lexer<'a> {
             }
         }
         self.finish_word();
+        if let Some(pending) = self.pending_here_docs.first() {
+            return Err(LexError::new(
+                pending.line,
+                format!(
+                    "unterminated here-document: the script ended before a line containing exactly {:?}",
+                    pending.delimiter
+                ),
+            ));
+        }
         Ok(self.tokens)
     }
 
@@ -342,24 +386,54 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_double_quoted(&mut self) -> Result<(), LexError> {
+        let parts = self.read_interpolated(Some('"'), "unterminated double-quoted string")?;
+        self.push_part(RawPart::DoubleQuoted(parts));
+        Ok(())
+    }
+
+    /// Scans interpolated text: literals, `$NAME`, `$( )`, and `$(( ))`.
+    ///
+    /// Shared by double-quoted strings and by the body of an unquoted here-document, because bash
+    /// interpolates both by the same rules. The one difference is which characters a backslash may
+    /// escape: `\"` is an escaped quote inside quotes and ordinary text inside a here-document,
+    /// where collapsing it would silently corrupt embedded JSON such as `{"a": "\"x\""}`.
+    fn read_interpolated(
+        &mut self,
+        terminator: Option<char>,
+        unterminated: &str,
+    ) -> Result<Vec<RawPart>, LexError> {
         let opened = self.line;
+        let escapable: &[char] = if terminator == Some('"') {
+            &['"', '\\', '$', '`']
+        } else {
+            &['\\', '$', '`']
+        };
         let mut parts = Vec::new();
         let mut literal = String::new();
         loop {
             let Some((index, character)) = self.chars.next() else {
-                return Err(LexError::new(opened, "unterminated double-quoted string"));
+                if terminator.is_none() {
+                    break;
+                }
+                return Err(LexError::new(opened, unterminated));
             };
+            if Some(character) == terminator {
+                break;
+            }
             match character {
-                '"' => break,
                 '\\' => match self.chars.next() {
-                    Some((_, escaped @ ('"' | '\\' | '$' | '`'))) => literal.push(escaped),
+                    Some((_, escaped)) if escapable.contains(&escaped) => literal.push(escaped),
                     Some((_, '\n')) => self.line += 1,
                     Some((_, other)) => {
                         literal.push('\\');
                         literal.push(other);
                     }
                     None => {
-                        return Err(LexError::new(opened, "unterminated double-quoted string"));
+                        if terminator.is_none() {
+                            literal.push('\\');
+                            break;
+                        }
+                        return Err(LexError::new(opened, unterminated));
                     }
                 },
                 '$' => {
@@ -386,8 +460,173 @@ impl<'a> Lexer<'a> {
         if !literal.is_empty() {
             parts.push(RawPart::Literal(literal));
         }
-        self.push_part(RawPart::DoubleQuoted(parts));
+        Ok(parts)
+    }
+
+    /// Records a `<<DELIM` operator, leaving a placeholder token for its body.
+    fn read_here_doc_header(&mut self) -> Result<(), LexError> {
+        if self.chars.peek().map(|(_, character)| *character) == Some('<') {
+            return Err(LexError::new(self.line, HERE_STRING_REJECTION));
+        }
+        let strip_tabs = self.chars.peek().map(|(_, character)| *character) == Some('-');
+        if strip_tabs {
+            self.chars.next();
+        }
+        while matches!(
+            self.chars.peek().map(|(_, character)| *character),
+            Some(' ' | '\t')
+        ) {
+            self.chars.next();
+        }
+
+        let (delimiter, expand) = self.read_here_doc_delimiter()?;
+        let line = self.line;
+        let token = self.tokens.len();
+        self.tokens.push(Token {
+            kind: TokenKind::HereDoc(RawWord { parts: Vec::new() }),
+            line,
+        });
+        self.pending_here_docs.push(PendingHereDoc {
+            delimiter,
+            strip_tabs,
+            expand,
+            line,
+            token,
+        });
         Ok(())
+    }
+
+    /// Reads the terminator word after `<<`, reporting whether the body interpolates.
+    ///
+    /// Any quoting anywhere in the delimiter turns interpolation off, exactly as in bash: `<<'EOF'`,
+    /// `<<"EOF"`, and `<<\EOF` all mean "this body is literal text".
+    fn read_here_doc_delimiter(&mut self) -> Result<(String, bool), LexError> {
+        let line = self.line;
+        let mut delimiter = String::new();
+        let mut quoted = false;
+        while let Some((_, character)) = self.chars.peek().copied() {
+            match character {
+                '\'' | '"' => {
+                    self.chars.next();
+                    quoted = true;
+                    loop {
+                        match self.chars.next() {
+                            Some((_, closing)) if closing == character => break,
+                            Some((_, '\n')) | None => {
+                                return Err(LexError::new(
+                                    line,
+                                    "unterminated quoted here-document delimiter",
+                                ));
+                            }
+                            Some((_, other)) => delimiter.push(other),
+                        }
+                    }
+                }
+                '\\' => {
+                    self.chars.next();
+                    quoted = true;
+                    match self.chars.next() {
+                        Some((_, escaped)) => delimiter.push(escaped),
+                        None => {
+                            return Err(LexError::new(
+                                line,
+                                "script ends with a trailing backslash",
+                            ));
+                        }
+                    }
+                }
+                other if other.is_ascii_alphanumeric() || matches!(other, '_' | '.' | '-') => {
+                    delimiter.push(other);
+                    self.chars.next();
+                }
+                _ => break,
+            }
+        }
+        if delimiter.is_empty() {
+            return Err(LexError::new(
+                line,
+                "expected a here-document delimiter after `<<`, as in `cat <<EOF`",
+            ));
+        }
+        Ok((delimiter, !quoted))
+    }
+
+    /// Consumes the body of every here-document opened on the line that just ended.
+    fn read_pending_here_doc_bodies(&mut self) -> Result<(), LexError> {
+        // Several here-documents may open on one line (`cmd <<A <<B`); bash reads their bodies in
+        // the order the operators appeared, and so does this.
+        let pending = std::mem::take(&mut self.pending_here_docs);
+        for specification in pending {
+            let mut body = self.read_here_doc_body(&specification)?;
+            // Drop the newline that ended the last body line. Values in this shell are not
+            // newline-terminated — `echo hi` produces `"hi"`, and emitting a value adds the line
+            // ending — so keeping it would make `cat <<EOF` print a trailing blank line that the
+            // same here-document does not produce in bash.
+            body.pop();
+            let parts = if specification.expand {
+                Self::interpolate_here_doc_body(&body, specification.line)?
+            } else if body.is_empty() {
+                Vec::new()
+            } else {
+                vec![RawPart::Literal(body)]
+            };
+            self.tokens[specification.token] = Token {
+                kind: TokenKind::HereDoc(RawWord { parts }),
+                line: specification.line,
+            };
+        }
+        Ok(())
+    }
+
+    /// Reads raw body lines up to the terminator line.
+    fn read_here_doc_body(&mut self, specification: &PendingHereDoc) -> Result<String, LexError> {
+        let mut body = String::new();
+        loop {
+            let mut line = String::new();
+            let mut terminated = false;
+            for (_, character) in self.chars.by_ref() {
+                if character == '\n' {
+                    terminated = true;
+                    break;
+                }
+                line.push(character);
+            }
+            if terminated {
+                self.line += 1;
+            }
+
+            // `<<-` strips leading tabs — and only tabs, never spaces — from both the body lines
+            // and the terminator, which is what lets a here-document sit at the indentation of the
+            // block around it.
+            let content = if specification.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line.as_str()
+            };
+            if content == specification.delimiter {
+                return Ok(body);
+            }
+            if !terminated {
+                return Err(LexError::new(
+                    specification.line,
+                    format!(
+                        "unterminated here-document: the script ended before a line containing exactly {:?}",
+                        specification.delimiter
+                    ),
+                ));
+            }
+            body.push_str(content);
+            body.push('\n');
+        }
+    }
+
+    /// Interpolates an unquoted here-document body by re-scanning it as quoted-style text.
+    fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
+        let mut lexer = Lexer::new(body);
+        lexer.line = line;
+        lexer
+            .read_interpolated(None, "unterminated here-document")
+            .map_err(|error| LexError::new(error.line, error.message))
     }
 
     fn read_dollar(&mut self, index: usize) -> Result<(), LexError> {
@@ -701,11 +940,15 @@ impl<'a> Lexer<'a> {
             }
             ('&', _) => TokenKind::Ampersand,
             (';', Some(';')) => {
-                return Err(LexError::new(
-                    self.line,
-                    "`;;` is `case` syntax; `case`/`esac` is not part of this shell",
-                ));
+                self.chars.next();
+                // `;;&` and `;&` are bash's two fall-through terminators. Reading either as a
+                // plain `;;` would run one clause where the script asked for several.
+                if self.chars.peek().map(|(_, character)| *character) == Some('&') {
+                    return Err(LexError::new(self.line, CASE_FALLTHROUGH_REJECTION));
+                }
+                TokenKind::DoubleSemicolon
             }
+            (';', Some('&')) => return Err(LexError::new(self.line, CASE_FALLTHROUGH_REJECTION)),
             (';', _) => TokenKind::Semicolon,
             ('>', Some('>')) => {
                 self.chars.next();
@@ -714,7 +957,7 @@ impl<'a> Lexer<'a> {
             ('>', _) => TokenKind::Great,
             ('<', Some('<')) => {
                 self.chars.next();
-                TokenKind::LessLess
+                return self.read_here_doc_header();
             }
             ('<', Some('(')) => {
                 self.chars.next();
@@ -925,9 +1168,120 @@ mod tests {
     }
 
     #[test]
-    fn case_terminator_is_rejected() {
-        let error = tokenize("a;;").expect_err("case syntax is dropped");
-        assert!(error.message.contains("case"), "{error}");
+    fn case_clause_terminators_are_tokenized_and_fall_through_is_not() {
+        assert!(kinds("a;;").contains(&TokenKind::DoubleSemicolon));
+        for source in ["a;;&", "a;&"] {
+            let error = tokenize(source).expect_err("fall-through is dropped");
+            assert!(error.message.contains("falls through"), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_here_document_collects_the_lines_after_its_operator() {
+        let TokenKind::HereDoc(body) = &kinds("cat <<EOF\nhello\nthere\nEOF\n")[1] else {
+            panic!("expected a here-document token");
+        };
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Literal("hello\nthere".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unquoted_here_document_interpolates_and_a_quoted_one_does_not() {
+        let TokenKind::HereDoc(expanded) = &kinds("cat <<EOF\nid=$id\nEOF\n")[1] else {
+            panic!("expected a here-document token");
+        };
+        assert_eq!(
+            expanded.parts,
+            vec![
+                RawPart::Literal("id=".to_owned()),
+                RawPart::Parameter(RawParameter::Named {
+                    name: "id".to_owned(),
+                    indices: Vec::new(),
+                }),
+            ]
+        );
+
+        // Any quoting of the delimiter turns the whole body literal, as in bash.
+        for source in [
+            "cat <<'EOF'\nid=$id\nEOF\n",
+            "cat <<\"EOF\"\nid=$id\nEOF\n",
+            "cat <<\\EOF\nid=$id\nEOF\n",
+        ] {
+            let TokenKind::HereDoc(literal) = &kinds(source)[1] else {
+                panic!("expected a here-document token for {source:?}");
+            };
+            assert_eq!(
+                literal.parts,
+                vec![RawPart::Literal("id=$id".to_owned())],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_here_document_body_keeps_backslashes_that_json_depends_on() {
+        // `\"` is an escaped quote inside double quotes and ordinary text in a here-document.
+        // Collapsing it here would silently rewrite embedded JSON.
+        let TokenKind::HereDoc(body) = &kinds("cat <<EOF\n{\"a\": \"\\\"x\\\"\"}\nEOF\n")[1] else {
+            panic!("expected a here-document token");
+        };
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Literal("{\"a\": \"\\\"x\\\"\"}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_dash_here_document_strips_leading_tabs_from_body_and_terminator() {
+        let TokenKind::HereDoc(body) = &kinds("cat <<-EOF\n\t\tindented\n\tEOF\n")[1] else {
+            panic!("expected a here-document token");
+        };
+        assert_eq!(body.parts, vec![RawPart::Literal("indented".to_owned())]);
+
+        // Only tabs, never spaces: a space-indented terminator does not close the document.
+        assert!(tokenize("cat <<-EOF\nbody\n    EOF\n").is_err());
+    }
+
+    #[test]
+    fn the_rest_of_the_operator_line_is_ordinary_shell() {
+        // `cat <<EOF | jq .` must keep working: the body starts on the next line, not immediately.
+        let tokens = kinds("cat <<EOF | jq .\n{\"a\":1}\nEOF\n");
+        assert!(matches!(tokens[1], TokenKind::HereDoc(_)));
+        assert!(tokens.contains(&TokenKind::Pipe));
+    }
+
+    #[test]
+    fn several_here_documents_on_one_line_read_their_bodies_in_order() {
+        let tokens = kinds("f <<A <<B\nfirst\nA\nsecond\nB\n");
+        let bodies = tokens
+            .iter()
+            .filter_map(|token| match token {
+                TokenKind::HereDoc(body) => Some(body.parts.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            vec![
+                vec![RawPart::Literal("first".to_owned())],
+                vec![RawPart::Literal("second".to_owned())],
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_here_documents_are_rejected_by_name() {
+        for (source, expected) in [
+            ("cat <<EOF\nbody\n", "unterminated here-document"),
+            ("cat <<EOF", "unterminated here-document"),
+            ("cat <<\n", "expected a here-document delimiter"),
+            ("cat <<<\"$x\"", "here-string"),
+        ] {
+            let error = tokenize(source).expect_err(source);
+            assert!(error.message.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]
@@ -973,7 +1327,6 @@ mod tests {
         assert!(kinds("echo hi >> buf").contains(&TokenKind::GreatGreat));
         assert!(kinds("sleep 1 &").contains(&TokenKind::Ampersand));
         assert!(kinds("cat < f").contains(&TokenKind::Less));
-        assert!(kinds("cat <<EOF").contains(&TokenKind::LessLess));
         assert!(kinds("diff <(a) b").contains(&TokenKind::LessParen));
     }
 

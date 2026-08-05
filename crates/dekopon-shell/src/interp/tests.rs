@@ -537,14 +537,14 @@ fn ambient_authority_commands_are_rejected_by_name() {
 }
 
 #[test]
-fn subshells_here_documents_and_process_substitution_are_rejected() {
+fn subshells_here_strings_and_process_substitution_are_rejected() {
     for (script, expected) in [
         ("(echo hi)", "subshells"),
         ("{ echo hi; }", "brace command groups"),
-        ("cat <<EOF\nx\nEOF", "here-documents"),
+        ("cat <<<\"$x\"", "here-string"),
         ("diff <(echo a) b", "process substitution"),
         ("cat < file", "input redirection"),
-        ("case $x in esac", "case"),
+        ("case $x in a) echo a;& b) echo b;; esac", "falls through"),
     ] {
         let outcome = run(script);
         assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
@@ -554,6 +554,185 @@ fn subshells_here_documents_and_process_substitution_are_rejected() {
             outcome.output
         );
     }
+}
+
+#[test]
+fn case_runs_the_first_matching_clause_and_only_that_one() {
+    let script = "\
+for name in ready failed other; do\n\
+  case $name in\n\
+    ready) echo go ;;\n\
+    failed|broken) echo stop ;;\n\
+    *) echo unknown ;;\n\
+  esac\n\
+done";
+    assert_eq!(output(script), "go\nstop\nunknown");
+
+    // An alternative list matches on any of its patterns, and no clause below it runs.
+    assert_eq!(
+        output("case broken in\n ready) echo a ;;\n failed|broken) echo b ;;\n *) echo c ;;\nesac"),
+        "b"
+    );
+}
+
+#[test]
+fn case_matches_the_expanded_subject_and_reports_success_when_nothing_matches() {
+    assert_eq!(
+        output("x=ready\ncase \"$x\" in ready) echo yes ;; esac"),
+        "yes"
+    );
+    // bash reports success for a `case` no clause matched; "none of the above" is an answer.
+    let outcome = run("case nothing in ready) echo yes ;; esac");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "");
+}
+
+#[test]
+fn case_composes_with_the_control_flow_around_it() {
+    // `break` inside a `case` inside a loop unwinds the loop, exactly as in bash — the `case` is
+    // not a scope that swallows it.
+    assert_eq!(
+        output("for n in 1 2 3; do case $n in 2) break ;; *) echo $n ;; esac; done"),
+        "1"
+    );
+    assert_eq!(
+        output("f() { case $1 in a) return 0 ;; *) return 1 ;; esac; }\nf a && echo matched"),
+        "matched"
+    );
+}
+
+#[test]
+fn a_case_pattern_assembled_at_run_time_is_still_checked() {
+    // The parser cannot see this pattern's text, so the check happens where the text appears.
+    // Matching `*.json` literally would answer a question the script did not ask.
+    let outcome = run("p='*.json'\ncase report.json in $p) echo matched ;; esac");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("literal text"),
+        "{}",
+        outcome.output
+    );
+
+    // A run-time pattern with no pattern syntax in it matches literally and is left alone.
+    assert_eq!(
+        output("p=ready\ncase ready in $p) echo matched ;; esac"),
+        "matched"
+    );
+}
+
+#[test]
+fn case_charges_the_step_budget_like_every_other_construct() {
+    // Each clause tested is a step, so a `case` inside a loop cannot outrun the budget that
+    // bounds the rest of the interpreter.
+    let outcome = run_with(
+        "while true; do case x in a) : ;; b) : ;; *) : ;; esac; done",
+        Limits {
+            max_steps: 200,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("step budget"), "{}", outcome.output);
+}
+
+#[test]
+fn a_here_document_becomes_the_commands_input_as_one_string() {
+    // The newline that ended the last body line is dropped, so `cat <<EOF` prints what bash prints
+    // rather than one extra blank line: a value in this shell is not newline-terminated.
+    assert_eq!(output("cat <<EOF\nalpha\nbeta\nEOF"), "alpha\nbeta");
+
+    // The body is a JSON *string*, deliberately: a block of literal text is a string in this value
+    // model, and quietly parsing bodies that happen to look like JSON would make `cat <<EOF` mean
+    // two different things depending on its contents. `fromjson` is the explicit way across.
+    assert_eq!(
+        output("jq -r 'fromjson.name' <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
+        "dekopon"
+    );
+    let unparsed = run("jq -r .name <<EOF\n{\"name\": \"dekopon\"}\nEOF");
+    assert_eq!(unparsed.exit_code, ExitCode::FAILURE);
+    assert!(
+        unparsed.output.contains("cannot index"),
+        "{}",
+        unparsed.output
+    );
+}
+
+#[test]
+fn a_here_document_interpolates_unless_its_delimiter_is_quoted() {
+    assert_eq!(output("id=7\ncat <<EOF\nid=$id\nEOF"), "id=7");
+    assert_eq!(output("id=7\ncat <<'EOF'\nid=$id\nEOF"), "id=$id");
+    // A command substitution inside a body runs, like any other double-quoted context.
+    assert_eq!(output("cat <<EOF\nvalue=$(echo inner)\nEOF"), "value=inner");
+}
+
+#[test]
+fn a_here_document_replaces_what_a_pipe_would_have_supplied() {
+    // A redirection is applied after the pipe in bash, so the here-document wins.
+    assert_eq!(
+        output("echo piped | cat <<EOF\nredirected\nEOF"),
+        "redirected"
+    );
+    // And the rest of the operator's line stays ordinary shell.
+    assert_eq!(output("cat <<EOF | wc -l\na\nb\nEOF"), "2");
+}
+
+#[test]
+fn a_here_document_body_charges_the_value_byte_ceiling() {
+    // Nothing new may materialize bytes outside the ceiling that bounds this interpreter's memory.
+    let body = "x".repeat(4096);
+    let outcome = run_with(
+        &format!("cat <<EOF\n{body}\nEOF"),
+        Limits {
+            max_value_bytes: 512,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn the_clock_is_not_a_command_this_session_has_unless_it_was_granted() {
+    let outcome = run("date");
+    assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
+    assert!(
+        outcome.output.contains("command not found"),
+        "{}",
+        outcome.output
+    );
+
+    let enabled = run_with(
+        "date +%s",
+        Limits {
+            allow_clock: true,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(enabled.exit_code, ExitCode::SUCCESS);
+    assert!(
+        enabled.output.parse::<i64>().is_ok(),
+        "an epoch second is a number: {}",
+        enabled.output
+    );
+}
+
+#[test]
+fn the_clock_builtin_cannot_reach_the_process_environment() {
+    // `date` reads a monotonic-free wall clock and nothing else. It must not become a second way
+    // to observe `TZ`, or anything else the namespace-isolation rule already excludes.
+    let outcome = run_with(
+        "date",
+        Limits {
+            allow_clock: true,
+            ..Limits::default()
+        },
+    );
+    assert!(outcome.output.ends_with('Z'), "{}", outcome.output);
+    assert_eq!(outcome.output.len(), 20, "{}", outcome.output);
 }
 
 #[test]
