@@ -48,7 +48,10 @@ use tracing::Instrument as _;
 
 use crate::{
     cli::{BrokerCommand, BrokerConnectionArgs, Cli, Command, LimitArgs, ShellLimitArgs},
-    prompt::{PromptError, PromptLimits, ScriptRuntime, format_script_outcome, run_prompt},
+    prompt::{
+        PromptError, PromptLimits, ScriptRuntime, format_script_outcome, run_prompt,
+        script_outcome_label,
+    },
 };
 
 pub mod cli;
@@ -60,7 +63,12 @@ mod trace;
 /// Clap handles syntax failures before this function and exits with code `2`.
 #[must_use]
 pub async fn run(cli: Cli) -> i32 {
-    let _trace_guard = match trace::initialize(cli.verbose, cli.no_color, cli.trace.as_deref()) {
+    let trace_guard = match trace::initialize(
+        cli.verbose,
+        cli.no_color,
+        cli.trace.as_deref(),
+        &cli.telemetry,
+    ) {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("error: {error}");
@@ -68,19 +76,82 @@ pub async fn run(cli: Cli) -> i32 {
         }
     };
 
-    match evaluate(&cli).await {
-        Ok(output) => match write_output(&output.text) {
-            Ok(()) => output.exit_code,
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
+    let command_name = command_name(&cli.command);
+    let command_span = tracing::info_span!(
+        "runner.command",
+        command.name = command_name,
+        otel.kind = "internal"
+    );
+    let exit_code = {
+        let _entered = command_span.enter();
+        tracing::info!(
+            audit.event = "runner.command.started",
+            command.name = command_name,
+            "runner command started"
+        );
+
+        match evaluate(&cli).await {
+            Ok(output) => {
+                let exit_code = match write_output(&output.text) {
+                    Ok(()) => output.exit_code,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
+                    Err(error) => {
+                        tracing::error!(
+                            audit.event = "runner.command.failed",
+                            command.name = command_name,
+                            error.type = "output-write",
+                            "runner command failed"
+                        );
+                        eprintln!("error: could not write output: {error}");
+                        1
+                    }
+                };
+                tracing::info!(
+                    audit.event = "runner.command.completed",
+                    command.name = command_name,
+                    command.exit_code = exit_code,
+                    "runner command completed"
+                );
+                exit_code
+            }
             Err(error) => {
-                eprintln!("error: could not write output: {error}");
+                tracing::error!(
+                    audit.event = "runner.command.failed",
+                    command.name = command_name,
+                    error.type = error.telemetry_kind(),
+                    "runner command failed"
+                );
+                report_error(&error, cli.verbose);
                 1
             }
-        },
-        Err(error) => {
-            report_error(&error, cli.verbose);
-            1
         }
+    };
+
+    // Close the root span before flushing short-lived OTLP exporters.
+    drop(command_span);
+    if let Err(error) = trace_guard.shutdown() {
+        eprintln!("error: {error}");
+        return 1;
+    }
+    exit_code
+}
+
+/// Stable, low-cardinality label for the command under the root span.
+///
+/// Exhaustive on purpose: a new subcommand must be given a name here rather than silently
+/// inheriting a catch-all that would make it invisible in a trace search.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Inspect { .. } => "inspect",
+        Command::Invoke { .. } => "invoke",
+        Command::Shell { .. } => "shell",
+        Command::Prompt { .. } => "prompt",
+        Command::Broker {
+            command: BrokerCommand::Capabilities { .. },
+        } => "broker.capabilities",
+        Command::Broker {
+            command: BrokerCommand::Invoke { .. },
+        } => "broker.invoke",
     }
 }
 
@@ -120,11 +191,47 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             let mut samples = TimingSamples::default();
             let mut last = None;
             let total_start = Instant::now();
-            for _ in 0..repeat.get() {
+            for iteration in 1..=repeat.get() {
+                let invocation_span = tracing::info_span!(
+                    "runner.provider_invocation",
+                    capability.id = %capability,
+                    invocation.iteration = iteration
+                );
+                let _entered = invocation_span.enter();
+                tracing::info!(
+                    audit.event = "guest.invocation.started",
+                    capability.id = %capability,
+                    invocation.iteration = iteration,
+                    "guest provider invocation started"
+                );
                 let start = Instant::now();
-                let output = registry.invoke(capability, &input)?;
-                samples.record(start.elapsed());
-                last = Some(output);
+                match registry.invoke(capability, &input) {
+                    Ok(output) => {
+                        let elapsed = start.elapsed();
+                        samples.record(elapsed);
+                        tracing::info!(
+                            audit.event = "guest.invocation.completed",
+                            provider.id = %output.provider,
+                            capability.id = %output.capability,
+                            invocation.iteration = iteration,
+                            duration_ms = milliseconds(elapsed),
+                            outcome = "succeeded",
+                            "guest provider invocation completed"
+                        );
+                        last = Some(output);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            audit.event = "guest.invocation.completed",
+                            capability.id = %capability,
+                            invocation.iteration = iteration,
+                            duration_ms = milliseconds(start.elapsed()),
+                            outcome = "failed",
+                            "guest provider invocation failed"
+                        );
+                        return Err(error.into());
+                    }
+                }
             }
             let total = total_start.elapsed();
             let output = last.expect("repeat is represented by NonZeroU32");
@@ -162,10 +269,12 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 .with_curl_capability(curl_capability.as_ref().map(CapabilityId::to_string))
                 .run(script, &invoker);
             tracing::info!(
+                audit.event = "shell.script.completed",
                 shell.exit_code = outcome.exit_code.get(),
                 shell.steps = outcome.steps,
                 provider.invocations = outcome.capability_calls,
                 shell.truncated = outcome.truncated,
+                outcome = script_outcome_label(&outcome),
                 "shell script completed"
             );
             Ok(CommandOutput {
@@ -278,9 +387,11 @@ async fn evaluate_prompt(
     .map_err(AppError::PromptTask)??;
 
     tracing::info!(
+        audit.event = "agent.session.completed",
         model.turns = outcome.model_turns,
         script.calls = outcome.script_calls,
         provider.invocations = outcome.capability_invocations,
+        outcome = "succeeded",
         "prompt session completed"
     );
     Ok(CommandOutput::success(outcome.answer))
@@ -999,7 +1110,7 @@ impl TimingSamples {
     }
 }
 
-fn milliseconds(duration: Duration) -> f64 {
+pub(crate) fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
@@ -1060,6 +1171,40 @@ enum AppError {
     Serialize(#[source] serde_json::Error),
     #[error("invalid environment configuration: {0}")]
     Environment(String),
+}
+
+impl AppError {
+    /// Stable, low-cardinality failure category for telemetry.
+    ///
+    /// Deliberately not the error's own message: several variants wrap untrusted provider,
+    /// transport, or model text, and `docs/observability.md` keeps that text out of exported
+    /// telemetry. An operator correlates the category here with the full message on stderr.
+    fn telemetry_kind(&self) -> &'static str {
+        match self {
+            #[cfg(unix)]
+            Self::BrokerClient(_) => "broker-client",
+            #[cfg(unix)]
+            Self::BrokerSocketUnresolved => "broker-socket-unresolved",
+            #[cfg(not(unix))]
+            Self::BrokerUnsupported => "broker-unsupported",
+            Self::BrokerFlagsWithoutOptIn => "broker-flags-without-opt-in",
+            #[cfg(unix)]
+            Self::SessionIdentifier(_) => "session-identifier",
+            Self::PromptTask(_) => "prompt-task",
+            Self::BrokerInputObject => "broker-input-object",
+            Self::ChatGpt(_) => "chatgpt",
+            Self::Provider(_) => "provider",
+            Self::Model(_) => "model",
+            Self::Prompt(_) => "prompt",
+            Self::ReadInput { .. } => "input-read",
+            Self::ReadInputStream { .. } => "input-stream-read",
+            Self::InputUtf8 { .. } => "input-utf8",
+            Self::InputTooLarge { .. } => "input-too-large",
+            Self::ParseInput(_) => "input-json",
+            Self::Serialize(_) => "output-serialize",
+            Self::Environment(_) => "environment",
+        }
+    }
 }
 
 #[cfg(test)]

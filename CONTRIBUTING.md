@@ -36,7 +36,7 @@ cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
-Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—each affected checked-in provider component. Exact commands are in [`docs/development.md`](docs/development.md).
+Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—each affected checked-in provider component. Runner OTLP, image, manifest, or observability CI changes require `tests/otel-kind/e2e.sh` against a disposable kind cluster. Exact commands are in [`docs/development.md`](docs/development.md).
 
 ## Change guidelines
 

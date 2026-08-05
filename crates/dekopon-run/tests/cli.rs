@@ -561,9 +561,78 @@ fn exports_a_chrome_trace_with_runner_and_provider_spans() {
         .iter()
         .filter_map(|event| event["name"].as_str())
         .collect::<Vec<_>>();
+    assert!(names.contains(&"runner.command"));
     assert!(names.contains(&"runner.invoke"));
+    assert!(names.contains(&"runner.provider_invocation"));
     assert!(names.contains(&"provider.compile"));
     assert!(names.contains(&"provider.invoke"));
+}
+
+/// A configured endpoint is part of the command contract, so undelivered telemetry fails the run.
+///
+/// Reporting success here would tell an operator that a guest execution was fully observed when
+/// its spans never left the process.
+#[test]
+fn configured_otlp_delivery_failure_makes_the_command_fail() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve an unused local port");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("reserved local address")
+    );
+    drop(listener);
+    let provider = provider_path();
+    let output = run(&[
+        "--otlp-endpoint",
+        &endpoint,
+        "--otel-export-timeout-ms",
+        "100",
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.echo",
+        "--input",
+        "{}",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("could not flush OTLP telemetry"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// An unset endpoint must engage no telemetry path at all.
+///
+/// This is the property that keeps the feature opt-in: with no `--otlp-endpoint`, the runner is
+/// byte-for-byte the runner that shipped before it, including on the failure paths where the new
+/// shutdown step could otherwise turn a clean exit code into a 1.
+#[test]
+fn unset_otlp_endpoint_leaves_command_behavior_unchanged() {
+    let provider = provider_path();
+    let output = run(&[
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.echo",
+        "--input",
+        "{}",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("OTLP"), "{}", stderr(&output));
+
+    let missing = run(&[
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.nonexistent",
+        "--input",
+        "{}",
+    ]);
+
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(!stderr(&missing).contains("OTLP"), "{}", stderr(&missing));
 }
 
 /// Builds the assistant turn that calls the one scripting tool.
