@@ -19,7 +19,7 @@ use dekopon_broker_protocol::FrameLimits;
 #[cfg(unix)]
 use dekopon_brokerd::{BrokerServer, ServerLimits, current_uid};
 #[cfg(unix)]
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
+use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, Idempotency};
 #[cfg(unix)]
 use dekopon_core::{Actor, AgentId, PrincipalId, RiskLevel};
 use serde_json::{Value, json};
@@ -246,6 +246,258 @@ async fn explicit_broker_mode_uses_authenticated_client_without_loading_componen
         .expect("server drains cleanly");
 }
 
+/// Serves `requests` plaintext HTTP requests on loopback, returning the paths it was asked for.
+///
+/// The provider reaches this through the broker's HTTP host, so a request arriving here is proof
+/// the whole chain ran: script, broker authorization, Wasm provider, real socket.
+#[cfg(unix)]
+fn mock_http_target(requests: usize) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback target binds");
+    let authority = format!(
+        "127.0.0.1:{}",
+        listener.local_addr().expect("target address").port()
+    );
+    let handle = thread::spawn(move || {
+        let mut paths = Vec::new();
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().expect("target accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("target read timeout configures");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while find_bytes(&bytes, b"\r\n\r\n").is_none() {
+                let count = stream.read(&mut buffer).expect("target request reads");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8_lossy(&bytes).into_owned();
+            if let Some(line) = request.lines().next() {
+                paths.push(
+                    line.split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
+            let body = br#"{"ok":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("target headers write");
+            stream.write_all(body).expect("target body writes");
+            stream.flush().expect("target response flushes");
+        }
+        paths
+    });
+    (authority, handle)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
+    // The end-to-end proof this phase exists for. Direct mode's linker is import-free and provably
+    // cannot perform I/O, so an HTTP-capable capability is reachable only over the broker. One
+    // model-authored script drives both legs: `http-probe.fetch` and `curl` go through the broker,
+    // `echo.upcase` stays local, and none of it involves a tool schema per capability.
+    let (authority, target) = mock_http_target(3);
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("temporary broker directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure broker directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("secure broker socket");
+
+    let registry = BrokerProviderRegistry::load(
+        [imported_provider_path("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load HTTP-importing provider into the broker");
+    let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
+    let actor = Actor::Agent {
+        agent: "prompt-broker-test"
+            .parse::<AgentId>()
+            .expect("valid agent fixture"),
+    };
+    let principal = "prompt-broker"
+        .parse::<PrincipalId>()
+        .expect("valid principal fixture");
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-prompt-broker".to_owned(),
+            vec![PolicyRule {
+                principal: principal.clone(),
+                actor: actor.clone(),
+                capability: "http-probe.fetch"
+                    .parse()
+                    .expect("valid capability fixture"),
+                provider: "http-probe".parse().expect("valid provider fixture"),
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                idempotency: Idempotency::Idempotent,
+                constraints: ExecutionConstraints {
+                    timeout_ms: 5_000,
+                    max_output_bytes: 64 * 1024,
+                    http: Some(HttpConstraints {
+                        allowed_hosts: vec![authority.clone()],
+                        allowed_methods: vec!["GET".to_owned()],
+                        max_requests: 1,
+                        max_request_bytes: 64 * 1024,
+                        max_response_bytes: 64 * 1024,
+                        allow_plaintext_loopback: true,
+                    }),
+                },
+            }],
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("build broker fixture"),
+    );
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        dekopon_broker::AuthenticatedContext::new(principal, actor).expect("bind fixture context"),
+    );
+    let server = BrokerServer::new(
+        broker,
+        identities,
+        ServerLimits {
+            frame: FrameLimits::default(),
+            max_connections: 8,
+            shutdown_grace: Duration::from_secs(5),
+        },
+    )
+    .expect("build server fixture");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+
+    let script = format!(
+        "total=0\n\
+         for path in alpha beta; do\n\
+         status=$(http-probe.fetch --uri \"http://{authority}/$path\" | jq -r .status)\n\
+         echo \"$path=$status\"\n\
+         total=$(( total + 1 ))\n\
+         done\n\
+         curl \"http://{authority}/gamma\" | jq -r .status\n\
+         echo.upcase --message \"fetched $total\" | jq -r .message"
+    );
+    let endpoint_listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let endpoint_address = endpoint_listener
+        .local_addr()
+        .expect("mock endpoint address");
+    let model_server = thread::spawn(move || {
+        let (first, first_stream) = read_request(&endpoint_listener);
+        let tools = first["tools"].as_array().expect("tools are an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "bash");
+        respond(first_stream, &bash_tool_call("call-1", &script));
+
+        let (second, second_stream) = read_request(&endpoint_listener);
+        let content = tool_result(&second);
+        respond(second_stream, &final_answer("Fetched three paths."));
+        content
+    });
+
+    let socket_text = socket.to_str().expect("UTF-8 socket path").to_owned();
+    let uid_text = uid.to_string();
+    let endpoint = format!("http://{endpoint_address}/v1");
+    let provider = provider_path();
+    let output = tokio::task::spawn_blocking(move || {
+        run(&[
+            "prompt",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            "--broker",
+            "--socket",
+            &socket_text,
+            "--server-uid",
+            &uid_text,
+            "--curl-capability",
+            "http-probe.fetch",
+            "--model",
+            "test-model",
+            "--endpoint",
+            &endpoint,
+            "--api-key-env",
+            "DEKOPON_RUN_TEST_NO_API_KEY",
+            "Fetch alpha, beta and gamma",
+        ])
+    })
+    .await
+    .expect("prompt process task exits");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout UTF-8"),
+        "Fetched three paths.\n"
+    );
+
+    // What the model saw: two broker-backed capability calls, one broker-backed `curl`, and one
+    // direct-mode capability, all from a single tool call.
+    let content = model_server.join().expect("mock endpoint completes");
+    assert_eq!(
+        content,
+        "alpha=200\nbeta=200\n200\nFETCHED 2\n[exit code: 0]"
+    );
+
+    // The requests genuinely left the process through the broker's HTTP host.
+    let paths = target.join().expect("loopback target completes");
+    assert_eq!(paths, vec!["/alpha", "/beta", "/gamma"]);
+
+    // ...and the broker durably audited each one: an authorization decision plus a terminal
+    // execution record per invocation, three invocations, six records.
+    let records = audit.records().await;
+    assert_eq!(records.len(), 6);
+
+    // Every record carries an identifier this session generated, and all of them share one trace,
+    // so an operator can recover exactly what one prompt session did from the audit log alone.
+    let audited = serde_json::to_value(&records).expect("audit records serialize");
+    let invocations = audited
+        .as_array()
+        .expect("audit records are an array")
+        .iter()
+        .filter_map(|record| record["event"]["invocation"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(invocations.len(), 6, "{audited}");
+    let trace = invocations[0]
+        .rsplit_once('-')
+        .expect("invocation identifiers extend the session trace")
+        .0
+        .to_owned();
+    assert!(trace.starts_with("dekopon-run-prompt-"), "{trace}");
+    assert!(
+        invocations
+            .iter()
+            .all(|invocation| invocation.starts_with(&trace)),
+        "{invocations:?}"
+    );
+    // Three distinct invocation identifiers: the broker rejects a replayed one, so a script that
+    // calls the same capability in a loop must not collide with itself.
+    let mut unique = invocations.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "{invocations:?}");
+
+    shutdown_send.send(()).expect("stop broker fixture");
+    server_task
+        .await
+        .expect("server task exits")
+        .expect("server drains cleanly");
+}
+
 #[test]
 fn invokes_and_times_the_checked_in_provider_component() {
     let provider = provider_path();
@@ -314,6 +566,47 @@ fn exports_a_chrome_trace_with_runner_and_provider_spans() {
     assert!(names.contains(&"provider.invoke"));
 }
 
+/// Builds the assistant turn that calls the one scripting tool.
+fn bash_tool_call(id: &str, script: &str) -> Value {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json!({ "script": script }).to_string()
+                    }
+                }]
+            }
+        }]
+    })
+}
+
+/// Builds the assistant turn that ends a session.
+fn final_answer(text: &str) -> Value {
+    json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": text, "tool_calls": [] }
+        }]
+    })
+}
+
+/// Returns the content of the first tool result a request carried back to the model.
+fn tool_result(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .expect("messages are an array")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("tool result is returned to the model")
+        .to_owned()
+}
+
 #[test]
 fn runs_an_openai_compatible_prompt_tool_loop() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
@@ -321,34 +614,31 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
         assert_eq!(first["model"], "test-model");
+
+        // The whole point of this phase: one tool, whatever the provider offers. The echo provider
+        // exposes five capabilities and the model still sees a single schema.
         let tools = first["tools"].as_array().expect("tools are an array");
-        assert_eq!(tools.len(), 5);
-        assert!(tools.iter().any(|tool| {
-            tool["function"]["name"] == "echo_echo"
-                && tool["function"]["parameters"]["additionalProperties"] == true
-        }));
-        assert!(tools.iter().any(|tool| {
-            tool["function"]["name"] == "echo_ransom_case"
-                && tool["function"]["parameters"]["required"] == json!(["message"])
-        }));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "bash");
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["script"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["script"])
+        );
+        let description = tools[0]["function"]["description"]
+            .as_str()
+            .expect("tool description is a string");
+        assert!(description.contains("cap --list"), "{description}");
+
         respond(
             first_stream,
-            &json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {
-                                "name": "echo_echo",
-                                "arguments": "{\"message\":\"from model\"}"
-                            }
-                        }]
-                    }
-                }]
-            }),
+            &bash_tool_call(
+                "call-1",
+                "echo.upcase --message hello | jq -r .message\ncap --list | jq -r '.[0]'",
+            ),
         );
 
         let (second, second_stream) = read_request(&listener);
@@ -359,19 +649,12 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
             .find(|message| message["role"] == "tool")
             .expect("tool result is returned to model");
         assert_eq!(tool_message["tool_call_id"], "call-1");
-        assert_eq!(tool_message["content"], r#"{"message":"from model"}"#);
-        respond(
-            second_stream,
-            &json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "The echo provider returned: from model.",
-                        "tool_calls": []
-                    }
-                }]
-            }),
+        // Combined output plus an exit-code trailer, exactly what `dekopon-run shell` prints.
+        assert_eq!(
+            tool_message["content"],
+            "HELLO\necho.downcase\n[exit code: 0]"
         );
+        respond(second_stream, &final_answer("The script printed HELLO."));
     });
 
     let provider = provider_path();
@@ -386,15 +669,128 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
         &endpoint,
         "--api-key-env",
         "DEKOPON_RUN_TEST_NO_API_KEY",
-        "Use the echo tool",
+        "Upcase hello",
     ]);
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout UTF-8"),
-        "The echo provider returned: from model.\n"
+        "The script printed HELLO.\n"
     );
     server.join().expect("mock endpoint completes");
+}
+
+#[test]
+fn prompt_scripts_stay_inside_the_session_capability_ceiling() {
+    // The interpreter's ceiling bounds one script; in prompt mode it has to bound the session, or
+    // a model widens its own budget just by writing another script.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let server = thread::spawn(move || {
+        let (_first, first_stream) = read_request(&listener);
+        respond(
+            first_stream,
+            &bash_tool_call("call-1", "echo.echo --n 1\necho.echo --n 2\necho done"),
+        );
+
+        let (second, second_stream) = read_request(&listener);
+        let content = tool_result(&second);
+        assert!(content.contains("capability calls"), "{content}");
+        assert!(content.ends_with("[exit code: 2]"), "{content}");
+        assert!(!content.contains("done"), "{content}");
+        respond(second_stream, &final_answer("I ran out of budget."));
+
+        // A second script gets whatever the first left, which is nothing.
+        let (_third, third_stream) = read_request(&listener);
+        respond(third_stream, &final_answer("unused"));
+    });
+
+    let provider = provider_path();
+    let endpoint = format!("http://{address}/v1");
+    let output = run(&[
+        "prompt",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--shell-max-capability-calls",
+        "1",
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "Call echo twice",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout UTF-8"),
+        "I ran out of budget.\n"
+    );
+    drop(server);
+}
+
+#[test]
+fn prompt_scripts_never_read_the_real_process_environment() {
+    // Prompt mode gained a broker leg configured partly from the environment. A script that could
+    // read `DEKOPON_BROKER_SOCKET` back out would undo the interpreter's central guarantee.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let server = thread::spawn(move || {
+        let (_first, first_stream) = read_request(&listener);
+        respond(
+            first_stream,
+            &bash_tool_call("call-1", r#"echo "[$DEKOPON_BROKER_SOCKET][$PATH]""#),
+        );
+
+        let (second, second_stream) = read_request(&listener);
+        let content = tool_result(&second);
+        assert_eq!(content, "[][]\n[exit code: 0]");
+        assert!(!content.contains("leaked"), "{content}");
+        respond(second_stream, &final_answer("Nothing leaked."));
+    });
+
+    let provider = provider_path();
+    let endpoint = format!("http://{address}/v1");
+    let output = binary()
+        .args([
+            "prompt",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            "--model",
+            "test-model",
+            "--endpoint",
+            &endpoint,
+            "--api-key-env",
+            "DEKOPON_RUN_TEST_NO_API_KEY",
+            "Read the environment",
+        ])
+        .env("DEKOPON_BROKER_SOCKET", "/tmp/leaked-broker.sock")
+        .output()
+        .expect("dekopon-run process starts");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    server.join().expect("mock endpoint completes");
+}
+
+#[test]
+fn prompt_refuses_broker_connection_flags_without_the_broker_opt_in() {
+    // Silently ignoring `--socket` would let an operator believe the broker leg was live and read
+    // a "command not found" as a denial rather than as a broker that was never contacted.
+    let provider = provider_path();
+    let output = run(&[
+        "prompt",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--socket",
+        "/run/dekopon/broker.sock",
+        "--model",
+        "test-model",
+        "Do something",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("--broker"), "{}", stderr(&output));
 }
 
 fn read_request(listener: &TcpListener) -> (Value, TcpStream) {

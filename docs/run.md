@@ -7,7 +7,7 @@
 ```text
 dekopon-run inspect --provider <COMPONENT>...
 dekopon-run invoke --provider <COMPONENT>... <CAPABILITY> [--input <JSON> | --input-file <PATH>] [--repeat <COUNT>]
-dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] <PROMPT>
+dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] [--broker [--socket <PATH>] [--server-uid <UID>]] [--curl-capability <CAPABILITY>] <PROMPT>
 dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SCRIPT>
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
@@ -39,7 +39,7 @@ The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downc
 
 ## Shell mode
 
-`dekopon-run shell` runs one script through [`dekopon-shell`](../crates/dekopon-shell/), a sandboxed bash-flavored interpreter whose command words dispatch to provider capabilities instead of operating-system processes. It is a development and testing surface for that language; it contacts no model and changes nothing about prompt mode.
+`dekopon-run shell` runs one script through [`dekopon-shell`](../crates/dekopon-shell/), a sandboxed bash-flavored interpreter whose command words dispatch to provider capabilities instead of operating-system processes. It contacts no model. The same interpreter backs the single `bash` tool prompt mode offers, so `shell` is the way to develop and replay a script by hand exactly as a model would run it.
 
 ```console
 cargo run -p dekopon-run -- shell \
@@ -80,7 +80,7 @@ Script bounds are separate from the Wasm bounds, because a script decides how ma
 
 The interpreter's variable namespace is seeded only by the script's own assignments; it never reads the host process environment, so `$PATH` and `$OPENAI_API_KEY` are unset inside a script. That covers `jq` too: jaq's `env` and `now` filters are not linked, so `jq -r env.SECRET` reports an undefined filter. Output is truncated to the configured ceilings keeping both the head and the tail with a marker between them. Exit codes are `0` for success, `1` for a capability that ran and failed, `2` for a syntax error or an exhausted limit, `124` for the wall-clock deadline, `126` for a denied capability, and `127` for an unknown command; `exit N` wraps as `N mod 256`. The command prints the script's combined output followed by an `[exit code: N]` line and exits with that code.
 
-`curl` in this shell speaks no HTTP itself. It parses curl-style flags into the `{uri, method, headers, body}` shape and submits it to the single capability named by `--curl-capability`; without that flag it reports "command not found". Direct mode's linker is empty by design, so no HTTP-importing component loads there and `curl` cannot reach the network from this subcommand. Broker-backed HTTP for scripts is future work.
+`curl` in this shell speaks no HTTP itself. It parses curl-style flags into the `{uri, method, headers, body}` shape and submits it to the single capability named by `--curl-capability`; without that flag it reports "command not found". Direct mode's linker is empty by design, so no HTTP-importing component loads there and `curl` cannot reach the network from the `shell` subcommand. To run a script whose `curl` actually resolves, use `prompt --broker`, where the same capability seam falls through to a broker that can authorize HTTP.
 
 ## Broker client mode
 
@@ -107,7 +107,11 @@ The caller must generate and retain unique invocation IDs; reuse is durably deni
 
 ## Prompt mode
 
-Prompt mode supports either an OpenAI-compatible Chat Completions endpoint or a ChatGPT/Codex subscription. Both backends expose the same bounded provider tool loop.
+Prompt mode supports either an OpenAI-compatible Chat Completions endpoint or a ChatGPT/Codex subscription. Both backends expose the same bounded tool loop.
+
+A session offers the model exactly **one** tool, named `bash`, whose single `script` argument is a [`dekopon-shell`](../crates/dekopon-shell/) script. It is not one tool per capability: a model expresses a whole multi-step plan — loops, conditionals, JSON handling, several capability calls — in one script instead of being fed one capability per turn, and the tool surface stays a single fixed schema no matter how many capabilities an operator grants. The tool returns the script's combined output followed by an `[exit code: N]` trailer, byte-for-byte what `dekopon-run shell` prints, so any script a model wrote can be replayed by an operator unchanged.
+
+The model discovers what it can reach from inside the script rather than from the schema: `cap --list` returns the granted capability IDs and `cap --describe <capability>` returns one capability's input schema. There is no `help` builtin; the tool description carries the dialect.
 
 ### OpenAI-compatible endpoints
 
@@ -117,10 +121,29 @@ The default endpoint is `http://127.0.0.1:11434/v1`, suitable for an Ollama-comp
 cargo run -p dekopon-run -- prompt \
   --provider examples/providers/echo-provider.wasm \
   --model qwen3 \
-  'Use the echo tool with the message hello'
+  'Upcase the word hello'
 ```
 
-Provider capability IDs are converted into deterministic OpenAI-compatible function names. Model arguments remain untrusted JSON, can select only offered capabilities, and are checked against the host's object-input requirement before invocation. Capability schemas are sent to the model, but the host does not perform general JSON Schema validation; each provider must validate its own required fields, types, and operation-specific constraints. Tool results are returned to the model until it emits final text or `--max-steps` is reached. A single model turn is capped at 32 tool calls to bound adversarial endpoint fan-out.
+Model arguments remain untrusted JSON: a tool call must be a JSON object carrying a string `script`, and anything else ends the session rather than being guessed at. Capability inputs the script assembles are not schema-validated by the host, so each provider must still validate its own required fields, types, and operation-specific constraints. Script results are returned to the model until it emits final text or `--max-steps` is reached.
+
+Two bounds constrain a session, and they bound different things. A single model turn is capped at four tool calls: one script already expresses a multi-step plan, so a correct turn calls the tool once, and this only catches a runaway endpoint. The bound that limits actual work is `--shell-max-capability-calls`, which in prompt mode is a **whole-session** ceiling rather than a per-script one — a later script receives whatever earlier scripts left, and exhausting it trips the interpreter's own documented limit. Without that, a model widens its own budget simply by writing another script, and `--max-steps` multiplies the ceiling instead of bounding it. Every other interpreter bound (`--shell-max-steps`, output bytes and lines, `--shell-timeout-ms`, value bytes) applies per script exactly as in shell mode. A script's variable namespace is still seeded only by its own assignments; prompt mode reads the process environment for its own configuration and never exposes it to a script.
+
+### Reaching a broker from prompt mode
+
+By default a prompt session is direct-only and contacts no broker, so a local demo or a CI run needs no daemon. Passing `--broker` additionally routes any capability the loaded components do not offer to a running `dekopon-brokerd`, using the same socket and UID defaulting as the `broker` subcommands (`--socket`, then `$DEKOPON_BROKER_SOCKET`, then `$XDG_RUNTIME_DIR/dekopon/broker.sock`, then `$HOME/.local/run/dekopon/broker.sock`).
+
+This is what makes an HTTP-capable capability reachable at all. Direct mode's linker is import-free by construction, so a component there cannot perform I/O; `curl` and any fetching capability therefore resolve over the broker leg or not at all. Dispatch checks the direct registry first — a capability that can run locally always does, without an authorization decision or an audit record — and falls through to the broker only for what direct mode cannot serve. The broker remains the sole authority: `dekopon-run` submits an identity-free proposal per call and reports back whatever the broker decided, so a policy refusal surfaces to the script as exit code `126` (denied) rather than a generic failure, and a capability outside the session as `127`. Each call carries a freshly generated invocation ID extending one per-session trace ID, because the broker treats an invocation ID as a durable replay-rejection key.
+
+Passing `--socket` or `--server-uid` without `--broker` is a usage error rather than a silent no-op:
+
+```console
+cargo run -p dekopon-run -- prompt \
+  --provider examples/providers/echo-provider.wasm \
+  --broker --server-uid "$(id -u)" \
+  --curl-capability http-probe.fetch \
+  --model qwen3 \
+  'Fetch the service status page and summarize it'
+```
 
 For authenticated endpoints, `--api-key-env <NAME>` names an environment variable read as a bearer token; it defaults to `OPENAI_API_KEY`. The token is never sent to a provider or recorded as a tracing field, HTTP redirects are disabled, and bearer tokens require HTTPS except for loopback HTTP endpoints.
 
@@ -146,14 +169,14 @@ target/release/dekopon-run prompt \
   --provider examples/providers/echo-provider.wasm \
   --chatgpt-subscription \
   --model gpt-5.6-sol \
-  'Use the echo tool with the message hello'
+  'Upcase the word hello'
 ```
 
 Use an exact model exposed to the signed-in Codex account; `gpt-5.5` is a recovery choice when the account does not expose GPT-5.6. Dekopon automatically refreshes an expiring access token and replays opaque encrypted reasoning items only in memory when a tool call requires another model turn.
 
 The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE`, `dekopon auth chatgpt ... --auth-file`, or `dekopon-run prompt --chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
 
-The subscription transport receives the prompt, system instruction, provider tool schemas, tool arguments, and tool results. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
+The subscription transport receives the prompt, system instruction, the single scripting tool schema, the scripts the model writes, and their output. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
 
 ## Rust provider interface
 

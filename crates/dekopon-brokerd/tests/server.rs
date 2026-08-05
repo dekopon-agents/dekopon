@@ -284,12 +284,22 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     assert!(!socket_path.exists());
 }
 
+/// Waits until the fixture's socket exists *and* is owner-only.
+///
+/// Existence alone is not readiness. `socket::bind` binds the listener and then narrows the mode to
+/// `0600`, so between those two steps the path exists with the umask's permissions and a client
+/// that connects inside that window fails its own `UnsafeSocket` check. That is a test-timing
+/// problem rather than an exposure — `validate_private_parent` has already proved the containing
+/// directory is owner-only, so no other user can traverse it to reach the socket meanwhile — but
+/// polling on `exists()` alone makes the suite flaky under parallel load.
 async fn wait_for_socket(
     path: &Path,
     task: &mut tokio::task::JoinHandle<Result<AuditCheckpoint, BrokerdError>>,
 ) {
     for _ in 0..3_000 {
-        if path.exists() {
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o077 == 0)
+        {
             return;
         }
         if task.is_finished() {
@@ -298,7 +308,7 @@ async fn wait_for_socket(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("broker fixture socket did not appear within thirty seconds");
+    panic!("broker fixture socket did not become owner-only within thirty seconds");
 }
 
 #[tokio::test(flavor = "multi_thread")]

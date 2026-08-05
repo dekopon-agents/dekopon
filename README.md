@@ -19,8 +19,8 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
-- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing/trace export, and explicit bounded broker capability/invocation client commands.
-- A sandboxed bash-flavored script interpreter (`dekopon-shell`, driven by `dekopon-run shell`) whose command words dispatch to provider capabilities instead of operating-system processes, so a multi-step plan is one tool call rather than many round trips.
+- `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, timing/trace export, and explicit bounded broker capability/invocation client commands.
+- A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
 
 ## What does not work yet
 
@@ -89,7 +89,7 @@ Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at
 
 ## Script several capability calls as one plan
 
-`dekopon-run shell` runs a script through [`crates/dekopon-shell`](crates/dekopon-shell/README.md), a sandboxed bash-flavored interpreter whose command words are capability invocations rather than operating-system processes, with `jq` and the usual text builtins alongside them:
+[`crates/dekopon-shell`](crates/dekopon-shell/README.md) is a sandboxed bash-flavored interpreter whose command words are capability invocations rather than operating-system processes, with `jq` and the usual text builtins alongside them. `dekopon-run shell` runs one script by hand:
 
 ```console
 cargo run -p dekopon-run -- shell \
@@ -98,6 +98,8 @@ cargo run -p dekopon-run -- shell \
 ```
 
 Every variable is a JSON value, every bound is hand-built and configurable, and every dropped bash construct either fails by name or is documented as inert.
+
+`dekopon-run prompt` hands that same interpreter to a model as its **only** tool, so one tool call carries a whole multi-step plan instead of one capability per turn, and the tool surface stays a single schema however many capabilities an operator grants. Adding `--broker` lets those scripts reach capabilities direct mode provably cannot — anything performing I/O — while the broker remains the sole authority over them.
 
 ## Security model
 
