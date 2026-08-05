@@ -526,6 +526,15 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     quoted = true;
                     match self.chars.next() {
+                        // A line continuation here is bash's `<<\` + newline. Folding the newline
+                        // into the delimiter would make a terminator no body line can ever equal,
+                        // swallowing the rest of the script and skewing every later line number.
+                        Some((_, '\n')) => {
+                            return Err(LexError::new(
+                                line,
+                                "a here-document delimiter cannot be split across lines; write it on the same line as `<<`",
+                            ));
+                        }
                         Some((_, escaped)) => delimiter.push(escaped),
                         None => {
                             return Err(LexError::new(
@@ -623,7 +632,9 @@ impl<'a> Lexer<'a> {
     /// Interpolates an unquoted here-document body by re-scanning it as quoted-style text.
     fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
         let mut lexer = Lexer::new(body);
-        lexer.line = line;
+        // The body starts on the line *after* the operator, so a diagnostic from inside it counts
+        // from there. Seeding this with the operator's own line put every such error one line early.
+        lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")
             .map_err(|error| LexError::new(error.line, error.message))
@@ -1269,6 +1280,22 @@ mod tests {
                 vec![RawPart::Literal("second".to_owned())],
             ]
         );
+    }
+
+    #[test]
+    fn a_diagnostic_inside_a_here_document_body_counts_from_the_body() {
+        // The body starts on the line after the operator. Seeding the sub-scanner with the
+        // operator's own line reported every error inside a body one line early.
+        let error = tokenize("echo one\ncat <<EOF\nbad `sub`\nEOF\n").expect_err("backticks");
+        assert_eq!(error.line, 3, "{error}");
+    }
+
+    #[test]
+    fn a_here_document_delimiter_cannot_be_split_across_lines() {
+        // `<<\` + newline is a line continuation in bash. Folding the newline into the delimiter
+        // produced a terminator no line could match, swallowing the rest of the script.
+        let error = tokenize("cat <<\\\nEOF\nbody\nEOF\n").expect_err("a split delimiter");
+        assert!(error.message.contains("cannot be split"), "{error}");
     }
 
     #[test]

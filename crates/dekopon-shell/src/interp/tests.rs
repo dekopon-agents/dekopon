@@ -608,7 +608,15 @@ fn a_case_pattern_assembled_at_run_time_is_still_checked() {
     let outcome = run("p='*.json'\ncase report.json in $p) echo matched ;; esac");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
-        outcome.output.contains("literal text"),
+        outcome.output.contains("expanded to text"),
+        "{}",
+        outcome.output
+    );
+    // It must not advise quoting. Quoting exempts a metacharacter only while the parser can still
+    // see it; an expanded pattern has already lost its quotes, so `case '*b' in '*'$x)` is rejected
+    // too — and remediation that provably does not work is worse than none.
+    assert!(
+        !outcome.output.contains("quote it as"),
         "{}",
         outcome.output
     );

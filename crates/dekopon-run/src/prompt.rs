@@ -477,7 +477,6 @@ mod tests {
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
-    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
         PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, format_script_outcome,
@@ -852,127 +851,11 @@ mod tests {
         );
     }
 
-    /// One closed span: its name, and its enclosing span names innermost-first.
-    type SpanAncestry = (String, Vec<String>);
-
-    /// Records the ancestry of every span, so a test can assert what nests inside what.
-    #[derive(Default)]
-    struct SpanTreeLayer {
-        spans: Arc<Mutex<Vec<SpanAncestry>>>,
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for SpanTreeLayer
-    where
-        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-    {
-        fn on_close(
-            &self,
-            id: tracing::span::Id,
-            context: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let Some(span) = context.span(&id) else {
-                return;
-            };
-            self.spans.lock().expect("span lock").push((
-                span.name().to_owned(),
-                span.scope()
-                    .skip(1)
-                    .map(|parent| parent.name().to_owned())
-                    .collect(),
-            ));
-        }
-    }
-
-    /// A runtime that runs the real interpreter and bridges capability calls back into async.
-    ///
-    /// This is production's exact shape: a synchronous [`ScriptRuntime`] driving
-    /// `dekopon-shell`, whose invoker reaches back into the runtime with `Handle::block_on` the
-    /// way [`crate::BrokerLeg`] does.
-    struct BridgedShellRuntime {
-        handle: tokio::runtime::Handle,
-    }
-
-    struct BridgedInvoker {
-        handle: tokio::runtime::Handle,
-    }
-
-    impl dekopon_shell::CapabilityInvoker for BridgedInvoker {
-        fn granted(&self) -> Vec<String> {
-            vec!["echo.echo".to_owned()]
-        }
-
-        fn invoke(&self, _capability: &str, input: Value) -> dekopon_shell::CapabilityCallResult {
-            // A real await point, on the same blocking-pool thread the whole session runs on.
-            self.handle.block_on(async move {
-                tokio::task::yield_now().await;
-                dekopon_shell::CapabilityCallResult::Succeeded(input)
-            })
-        }
-    }
-
-    impl ScriptRuntime for BridgedShellRuntime {
-        fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
-            dekopon_shell::Interpreter::new(dekopon_shell::Limits {
-                max_capability_calls,
-                ..dekopon_shell::Limits::default()
-            })
-            .run(
-                script,
-                &BridgedInvoker {
-                    handle: self.handle.clone(),
-                },
-            )
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge() {
-        // The interpreter creates its spans with no propagation code at all, relying on the whole
-        // session — including each broker round trip, bridged from this same blocking-pool thread
-        // — staying on one thread. That is an assumption about the runtime, not about `tracing`,
-        // so it is checked here against a real `spawn_blocking` and a real `Handle::block_on`
-        // rather than taken on faith.
-        let spans = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&spans);
-        let handle = tokio::runtime::Handle::current();
-
-        tokio::task::spawn_blocking(move || {
-            let subscriber = tracing_subscriber::registry().with(SpanTreeLayer { spans: recorded });
-            tracing::subscriber::with_default(subscriber, || {
-                let session = tracing::info_span!("runner.prompt");
-                let _entered = session.enter();
-                let model = ScriptedModel::new([
-                    script_call("call-1", "echo one\necho.echo --message two"),
-                    answer("done"),
-                ]);
-                let runtime = BridgedShellRuntime { handle };
-                run_prompt(&model, &runtime, "trace it", None, limits(4, 32))
-                    .expect("prompt session succeeds");
-            });
-        })
-        .await
-        .expect("blocking prompt task completes");
-
-        let spans = spans.lock().expect("span lock");
-        let commands = spans
-            .iter()
-            .filter(|(name, _)| name == "shell.command")
-            .collect::<Vec<_>>();
-        assert_eq!(commands.len(), 2, "one span per command the script ran");
-        for (_, parents) in commands {
-            // `prompt.model_turn` is absent by design: the loop drops its guard once the model
-            // has answered, so a script runs under the session rather than under the turn.
-            assert_eq!(
-                parents,
-                &[
-                    "prompt.script".to_owned(),
-                    "prompt.session".to_owned(),
-                    "runner.prompt".to_owned(),
-                ],
-                "an interpreter span must land inside the script span that drove it"
-            );
-        }
-    }
+    // The companion assertion — that the interpreter's own spans nest under `prompt.script` across
+    // this same bridge — lives in `tests/prompt_tracing.rs` rather than here. `tracing` caches
+    // callsite interest globally and once, so a `prompt.script` first reached by one of the tests
+    // above (which install no subscriber) stays disabled for any later thread-local one; that made
+    // the assertion depend on test ordering. Its own binary removes the race.
 
     #[test]
     fn rejects_a_zero_step_session_before_contacting_the_model() {

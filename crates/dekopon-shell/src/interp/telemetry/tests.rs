@@ -424,8 +424,13 @@ fn command_spans_nest_under_the_callers_active_span() {
 #[test]
 fn control_words_and_their_dispatcher_agree() {
     // `run_argv` classifies a control word from `CONTROL_WORDS` and only then lets
-    // `run_control_word` execute it. If the two lists ever disagree in either direction, the word
-    // falls through to "command not found" instead of running — so one assertion covers both.
+    // `run_control_word` execute it, so a word dropped from the list stops running and says
+    // "command not found" instead. That is the direction this covers.
+    //
+    // The reverse — an arm added to `run_control_word` but not to the list — is caught by
+    // construction rather than here: such a word reaches `dispatch::resolve`, and no control word
+    // is in the builtin registry or the rejection table, so it also lands on "command not found"
+    // rather than silently doing something else. Both directions fail closed and loudly.
     for word in CONTROL_WORDS {
         let outcome = capture(word).outcome;
         assert!(

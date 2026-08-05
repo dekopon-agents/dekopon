@@ -798,11 +798,12 @@ impl Parser {
 /// A `case` pattern is matched as literal text here, so silently accepting these would answer a
 /// question the script never asked. The rule, and the shape of its rejection, follow `grep` and
 /// `sed`, whose patterns are literal for the same reason and reject metacharacters the same way.
+/// `]` is deliberately absent: only `[` opens a character class, so `[ab]` is still caught by its
+/// opening bracket while a lone `a]` — ordinary text in bash too — is left alone.
 const CASE_METACHARACTERS: &[(char, &str)] = &[
     ('*', "any run of characters"),
     ('?', "any single character"),
     ('[', "a character class"),
-    (']', "a character class"),
 ];
 
 /// Returns the first pattern metacharacter in some text, with what it would have meant.
@@ -815,10 +816,20 @@ pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> 
     })
 }
 
-/// Composes the rejection for a `case` pattern this shell cannot honor.
+/// Composes the rejection for a constant `case` pattern this shell cannot honor.
+///
+/// Quoting is offered here and *not* in [`expanded_case_pattern`], because it is only a way out
+/// while the parser can still see it: by the time a pattern has been expanded, its quoting is gone.
 pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String {
     format!(
         "a `case` pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the value out, add another `PATTERN|PATTERN` alternative, quote it as `'{character}'` to match the character itself, or use `*)` for the default branch"
+    )
+}
+
+/// Composes the rejection for a `case` pattern that only exists once the script has run.
+pub(crate) fn expanded_case_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `case` pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or branch with `if` and `jq` instead"
     )
 }
 

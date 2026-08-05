@@ -31,7 +31,7 @@ use crate::{
     builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
     dispatch::{self, Resolution, arguments_to_input},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    parser::{parse, pattern_metacharacter, unsupported_case_pattern},
+    parser::{expanded_case_pattern, parse, pattern_metacharacter},
     value::{self, display},
 };
 
@@ -373,7 +373,7 @@ impl Evaluator<'_> {
                         if let Some((character, meaning)) = pattern_metacharacter(&expanded) {
                             self.write_line(&format!(
                                 "dekopon-shell: {}",
-                                unsupported_case_pattern(character, meaning)
+                                expanded_case_pattern(character, meaning)
                             ));
                             self.last_status = ExitCode::SYNTAX;
                             return Ok(Flow::Normal);

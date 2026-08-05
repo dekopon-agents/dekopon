@@ -59,8 +59,10 @@ impl Builtin for Date {
         let seconds = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
 
         Ok(CommandResult::value(match format {
-            // The epoch second is a JSON number rather than text, so `$(( $(date +%s) + 60 ))`
-            // reads as arithmetic instead of relying on a string that happens to parse.
+            // A JSON number rather than text, so it stays a number through a pipe into `jq` and
+            // through an assignment. Arithmetic wants it in a variable first — `t=$(date +%s)`,
+            // then `$(( t + 60 ))` — because `$(( ... ))` here takes names and literals, not a
+            // nested command substitution.
             Format::EpochSeconds => Value::from(seconds),
             Format::Iso8601 => Value::String(render_iso8601(seconds)),
         }))
