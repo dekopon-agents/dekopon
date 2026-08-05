@@ -144,7 +144,7 @@ pub struct CaseClause {
 /// One `case` alternative.
 ///
 /// Bash matches these as filename-style patterns. This shell matches literal text instead, for the
-/// same reason [`crate::builtins`]'s `grep` and `sed` take literal patterns: a partial wildcard is
+/// same reason `builtins`' `grep` and `sed` take literal patterns: a partial wildcard is
 /// the pattern a literal matcher answers wrongly and silently, so it is rejected by name rather
 /// than quietly mismatched. A bare `*` is kept, because it is the default branch rather than a
 /// wildcard in any meaningful sense.
