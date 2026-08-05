@@ -195,9 +195,11 @@ The strings carry strictly typed manifest and response JSON. This keeps the firs
 
 Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT metadata. The echo provider is a separate Cargo workspace, and its checked-in component is generated rather than hand-edited. The [echo-provider README](../examples/providers/echo/README.md) and [`development.md`](development.md) contain exact build and validation commands. A `wasm32-wasip2` build imports WASI and will be rejected because this host intentionally links no guest imports.
 
-## Tracing and limits
+## Tracing, logs, and limits
 
-`--trace <PATH>` writes Chrome/Perfetto-compatible JSON containing runner, model, component compilation, description, and invocation spans. Prompt text, model responses, provider input/output, and bearer tokens are intentionally excluded from span fields.
+`--trace <PATH>` writes Chrome/Perfetto-compatible JSON containing runner, model, component compilation, description, and invocation spans. An optional `--otlp-endpoint <URL>` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) also exports correlated OTLP/gRPC traces and structured lifecycle logs. Quickwit 0.9 routing defaults to `otel-logs-v0_9` and `otel-traces-v0_9` and can be changed with the global `--otel-logs-index` and `--otel-traces-index` flags. The short-lived runner flushes configured exporters before returning, and a failed flush fails the command.
+
+Prompt text, model responses, model-authored script text and its output, provider input/output, bearer tokens, and raw errors are intentionally excluded from telemetry. Lifecycle logs record stable command/session/model/script/guest events and share generated trace and span IDs with performance traces. They are operational audit telemetry, not broker authorization evidence or a replacement for durable broker audit. See [`observability.md`](observability.md) for configuration, event semantics, data minimization, and the Quickwit kind stack.
 
 Direct-operation bounds are configurable on `inspect`, `invoke`, and `prompt` with:
 

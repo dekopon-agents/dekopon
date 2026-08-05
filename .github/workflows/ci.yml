@@ -68,10 +68,31 @@ jobs:
           cargo check --locked --manifest-path examples/providers/jsonplaceholder/Cargo.toml --target wasm32-unknown-unknown
       - name: Check HTTP guest bindings for Wasm
         run: cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
+      - name: Check observability end-to-end script
+        run: shellcheck tests/otel-kind/e2e.sh
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps
+
+  otel-e2e:
+    name: OTLP Quickwit end-to-end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.32.0
+          cluster_name: dekopon-otel
+          config: deploy/quickwit-kind/kind.yaml
+          wait: 120s
+      - name: Send runner logs and traces to Quickwit
+        env:
+          KIND_CLUSTER_NAME: dekopon-otel
+        run: tests/otel-kind/e2e.sh
 
   msrv:
     name: test (Rust 1.86.0)

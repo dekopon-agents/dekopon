@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub trace: Option<PathBuf>,
 
+    /// OpenTelemetry export settings.
+    #[command(flatten)]
+    pub telemetry: TelemetryArgs,
+
     /// Disable ANSI colors in diagnostics.
     #[arg(long, global = true)]
     pub no_color: bool,
@@ -245,6 +249,60 @@ pub struct BrokerConnectionArgs {
     pub io_timeout_ms: u64,
 }
 
+/// Optional OTLP/gRPC export settings for runner traces and audit-safe logs.
+#[derive(Clone, Debug, Args)]
+pub struct TelemetryArgs {
+    /// OTLP/gRPC endpoint. Export is disabled when this and
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` are unset.
+    #[arg(
+        long,
+        global = true,
+        env = "OTEL_EXPORTER_OTLP_ENDPOINT",
+        value_name = "URL"
+    )]
+    pub otlp_endpoint: Option<String>,
+
+    /// OpenTelemetry service name attached to logs and traces.
+    #[arg(
+        long,
+        global = true,
+        env = "OTEL_SERVICE_NAME",
+        default_value = "dekopon-run",
+        value_name = "NAME"
+    )]
+    pub otel_service_name: String,
+
+    /// Quickwit index selected through the `qw-otel-logs-index` OTLP header.
+    #[arg(
+        long,
+        global = true,
+        env = "DEKOPON_OTEL_LOGS_INDEX",
+        default_value = "otel-logs-v0_9",
+        value_name = "INDEX"
+    )]
+    pub otel_logs_index: String,
+
+    /// Quickwit index selected through the `qw-otel-traces-index` OTLP header.
+    #[arg(
+        long,
+        global = true,
+        env = "DEKOPON_OTEL_TRACES_INDEX",
+        default_value = "otel-traces-v0_9",
+        value_name = "INDEX"
+    )]
+    pub otel_traces_index: String,
+
+    /// Timeout for each OTLP export and final shutdown flush.
+    #[arg(
+        long,
+        global = true,
+        env = "DEKOPON_OTEL_EXPORT_TIMEOUT_MS",
+        default_value = "5000",
+        value_name = "MILLISECONDS"
+    )]
+    pub otel_export_timeout_ms: u64,
+}
+
 /// Repeatable provider component arguments.
 #[derive(Clone, Debug, Args)]
 pub struct ProviderArgs {
@@ -393,6 +451,55 @@ mod tests {
             panic!("expected invoke command");
         };
         assert_eq!(providers.provider.len(), 2);
+    }
+
+    #[test]
+    fn parses_global_otlp_settings() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "--otlp-endpoint",
+            "http://quickwit:7281",
+            "--otel-service-name",
+            "dekopon-run-test",
+            "--otel-logs-index",
+            "otel-logs-test",
+            "--otel-traces-index",
+            "otel-traces-test",
+            "inspect",
+            "--provider",
+            "echo.wasm",
+        ])
+        .expect("valid telemetry settings");
+
+        assert_eq!(
+            cli.telemetry.otlp_endpoint.as_deref(),
+            Some("http://quickwit:7281")
+        );
+        assert_eq!(cli.telemetry.otel_service_name, "dekopon-run-test");
+        assert_eq!(cli.telemetry.otel_logs_index, "otel-logs-test");
+        assert_eq!(cli.telemetry.otel_traces_index, "otel-traces-test");
+        assert_eq!(cli.telemetry.otel_export_timeout_ms, 5_000);
+    }
+
+    /// Telemetry is opt-in, and every subcommand accepts the same global flags.
+    ///
+    /// `shell` is the case worth pinning: it arrived after this feature was written, so a
+    /// per-subcommand argument group would have silently skipped it.
+    #[test]
+    fn telemetry_defaults_to_quickwit_0_9_indexes_on_every_subcommand() {
+        for command in [
+            vec!["inspect", "--provider", "echo.wasm"],
+            vec!["shell", "--provider", "echo.wasm", "echo hi"],
+        ] {
+            let mut arguments = vec!["dekopon-run"];
+            arguments.extend(command);
+            let cli = Cli::try_parse_from(&arguments).expect("valid command line");
+
+            assert!(cli.telemetry.otlp_endpoint.is_none(), "{arguments:?}");
+            assert_eq!(cli.telemetry.otel_logs_index, "otel-logs-v0_9");
+            assert_eq!(cli.telemetry.otel_traces_index, "otel-traces-v0_9");
+            assert_eq!(cli.telemetry.otel_service_name, "dekopon-run");
+        }
     }
 
     #[test]
