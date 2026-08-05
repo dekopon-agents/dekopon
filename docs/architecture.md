@@ -4,7 +4,7 @@ Read [`design.md`](design.md) first for the product model and accepted invariant
 
 ## Published baseline and current 0.2 foundation
 
-The published `0.1.0` baseline has two deliberately separate synchronous execution surfaces. The current `0.2.0` development line adds privileged asynchronous host, authorization/evidence/audit libraries, and a separately deployed authenticated Unix broker. Explicit `dekopon-run broker` commands are unprivileged clients; the operator CLI and an agent daemon are not integrated.
+The published `0.1.0` baseline has two deliberately separate synchronous execution surfaces. The current `0.2.0` development line adds privileged asynchronous host, authorization/evidence/audit libraries, and a separately deployed authenticated Unix broker. Explicit `dekopon-run broker` commands are unprivileged clients; the operator CLI and an agent daemon are not integrated. OTLP export is configured only in `dekopon-run`; collecting `dekopon-brokerd` or Kubernetes process logs remains separate deployment work.
 
 The operator CLI retains its local catalog path:
 
@@ -34,6 +34,7 @@ dekopon-run
      or
   -> prompt: expose schemas through OpenAI-compatible or ChatGPT/Codex subscription transport and execute selected tools
   -> create a fresh bounded Wasmtime store for every component call
+  -> optionally export payload-free execution spans and lifecycle logs over OTLP/gRPC
 ```
 
 The immediate host links no WASI or custom imports, rejects non-read-only manifests, resolves no credentials, and cannot access external systems. It is provider computation tooling, not the privileged provider host. There is still no unprivileged agent daemon or credential resolver. The separate Unix broker can expose policy-authorized provider effects through explicit `dekopon-run broker` commands, while `dekopon` and the direct runner subcommands cannot request them. Audit checkpoints are durably written to a separate atomic local file, but are not independently retained, signed, or remotely anchored.
@@ -53,7 +54,7 @@ Crate boundaries are:
 - `dekopon-broker-protocol`: lightweight strict versioned messages and an unprivileged Unix client carrying proposals/results but no identity or authorization fields; it has no broker-host or native-HTTP dependency.
 - `dekopon-brokerd`: Unix-only privileged process with strict owner-controlled configuration, private socket lifecycle, peer-UID context mapping, bounded concurrency/shutdown, durable replay restoration, and provider execution.
 - `dekopon-model`: bounded model contract, OpenAI-compatible transport, and isolated ChatGPT/Codex authentication and Responses client.
-- `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, trace export, and explicit unprivileged broker capability/invocation client.
+- `dekopon-run`: Clap CLI, direct invocation reports, bounded prompt loop, local Chrome traces, correlated OTLP/gRPC traces and audit-safe lifecycle logs, and explicit unprivileged broker capability/invocation client.
 - `dekopon-testkit`: private builders used by workspace tests.
 - `dekopon`: catalog and model-auth command parsing, resource reads, rendering, and process exits.
 

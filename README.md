@@ -19,7 +19,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
-- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, timing/trace export, and explicit bounded broker capability/invocation client commands.
+- `dekopon-run` direct invocation, OpenAI-compatible or ChatGPT-subscription prompt tools, local Chrome traces, correlated OTLP/gRPC traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 
 ## What does not work yet
 
@@ -82,6 +82,10 @@ cargo run -p dekopon-run -- invoke \
 cargo run -p dekopon-run -- --trace trace.json invoke \
   --provider examples/providers/echo-provider.wasm \
   echo.echo --input '{}'
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:7281 \
+  cargo run -p dekopon-run -- invoke \
+    --provider examples/providers/echo-provider.wasm \
+    echo.echo --input '{}'
 ```
 
 Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopon auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.

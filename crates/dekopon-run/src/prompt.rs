@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use dekopon_core::CapabilityId;
 use dekopon_model::model::{ChatModel, ModelError, ModelMessage, ModelTool, assistant_message};
@@ -91,10 +94,51 @@ where
         tool.count = model_tools.len()
     );
     let _session = session_span.enter();
+    tracing::info!(
+        audit.event = "agent.session.started",
+        prompt.max_steps = max_steps,
+        tool.count = model_tools.len(),
+        "prompt session started"
+    );
     let mut provider_invocations = 0_u32;
 
     for model_turns in 1..=max_steps {
-        let turn = model.complete(&messages, &model_tools)?;
+        let model_span = tracing::info_span!("prompt.model_turn", model.turn = model_turns);
+        let model_entered = model_span.enter();
+        tracing::info!(
+            audit.event = "agent.model.requested",
+            model.turn = model_turns,
+            message.count = messages.len(),
+            tool.count = model_tools.len(),
+            "model turn requested"
+        );
+        let model_started = Instant::now();
+        let turn = match model.complete(&messages, &model_tools) {
+            Ok(turn) => turn,
+            Err(error) => {
+                tracing::error!(
+                    audit.event = "agent.model.completed",
+                    model.turn = model_turns,
+                    duration_ms = model_started.elapsed().as_secs_f64() * 1_000.0,
+                    outcome = "failed",
+                    "model turn failed"
+                );
+                return Err(error.into());
+            }
+        };
+        tracing::info!(
+            audit.event = "agent.model.completed",
+            model.turn = model_turns,
+            duration_ms = model_started.elapsed().as_secs_f64() * 1_000.0,
+            tool_call.count = turn.tool_calls.len(),
+            answer.present = turn
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.trim().is_empty()),
+            outcome = "succeeded",
+            "model turn completed"
+        );
+        drop(model_entered);
         messages.push(assistant_message(&turn));
 
         if turn.tool_calls.is_empty() {
@@ -109,27 +153,67 @@ where
             });
         }
         if turn.tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
+            tracing::error!(
+                audit.event = "agent.tool.rejected",
+                model.turn = model_turns,
+                tool_call.count = turn.tool_calls.len(),
+                error.type = "too-many-tool-calls",
+                "model tool calls rejected"
+            );
             return Err(PromptError::TooManyToolCalls {
                 actual: turn.tool_calls.len(),
                 maximum: MAX_TOOL_CALLS_PER_TURN,
             });
         }
 
-        for call in turn.tool_calls {
+        for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
+            let tool_call_index = tool_call_index + 1;
             if call.id.trim().is_empty() {
+                tracing::error!(
+                    audit.event = "agent.tool.rejected",
+                    model.turn = model_turns,
+                    tool_call.index = tool_call_index,
+                    error.type = "empty-tool-call-id",
+                    "model tool call rejected"
+                );
                 return Err(PromptError::EmptyToolCallId);
             }
-            let tool = tools
-                .get(&call.function.name)
-                .ok_or_else(|| PromptError::UnknownTool(call.function.name.clone()))?;
-            let arguments =
-                serde_json::from_str::<Value>(&call.function.arguments).map_err(|source| {
-                    PromptError::InvalidArguments {
-                        tool: call.function.name.clone(),
+            let Some(tool) = tools.get(&call.function.name) else {
+                tracing::error!(
+                    audit.event = "agent.tool.rejected",
+                    model.turn = model_turns,
+                    tool_call.index = tool_call_index,
+                    error.type = "unknown-tool",
+                    "model tool call rejected"
+                );
+                return Err(PromptError::UnknownTool(call.function.name));
+            };
+            let arguments = match serde_json::from_str::<Value>(&call.function.arguments) {
+                Ok(arguments) => arguments,
+                Err(source) => {
+                    tracing::error!(
+                        audit.event = "agent.tool.rejected",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        capability.id = %tool.capability,
+                        error.type = "invalid-json-arguments",
+                        "model tool call rejected"
+                    );
+                    return Err(PromptError::InvalidArguments {
+                        tool: call.function.name,
                         source,
-                    }
-                })?;
+                    });
+                }
+            };
             if !arguments.is_object() {
+                tracing::error!(
+                    audit.event = "agent.tool.rejected",
+                    model.turn = model_turns,
+                    tool_call.index = tool_call_index,
+                    capability.id = %tool.capability,
+                    error.type = "arguments-not-object",
+                    "model tool call rejected"
+                );
                 return Err(PromptError::ArgumentsNotObject {
                     tool: call.function.name,
                 });
@@ -138,11 +222,46 @@ where
             let span = tracing::info_span!(
                 "prompt.tool_call",
                 tool.name = %tool.model.name,
-                capability.id = %tool.capability
+                capability.id = %tool.capability,
+                model.turn = model_turns,
+                tool_call.index = tool_call_index
             );
             let output = {
                 let _entered = span.enter();
-                runtime.invoke(&tool.capability, &arguments)?
+                tracing::info!(
+                    audit.event = "agent.tool.invocation.started",
+                    capability.id = %tool.capability,
+                    model.turn = model_turns,
+                    tool_call.index = tool_call_index,
+                    "agent tool invocation started"
+                );
+                let tool_started = Instant::now();
+                match runtime.invoke(&tool.capability, &arguments) {
+                    Ok(output) => {
+                        tracing::info!(
+                            audit.event = "agent.tool.invocation.completed",
+                            capability.id = %tool.capability,
+                            model.turn = model_turns,
+                            tool_call.index = tool_call_index,
+                            duration_ms = tool_started.elapsed().as_secs_f64() * 1_000.0,
+                            outcome = "succeeded",
+                            "agent tool invocation completed"
+                        );
+                        output
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            audit.event = "agent.tool.invocation.completed",
+                            capability.id = %tool.capability,
+                            model.turn = model_turns,
+                            tool_call.index = tool_call_index,
+                            duration_ms = tool_started.elapsed().as_secs_f64() * 1_000.0,
+                            outcome = "failed",
+                            "agent tool invocation failed"
+                        );
+                        return Err(error.into());
+                    }
+                }
             };
             provider_invocations = provider_invocations.saturating_add(1);
             let content = serde_json::to_string(&output).map_err(PromptError::ToolResult)?;

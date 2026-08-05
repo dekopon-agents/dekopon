@@ -94,7 +94,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-broker` | Trusted context binding, exact policy, replay rejection/recovery, authorization, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit |
 | `dekopon-broker-protocol` | Lightweight strict versioned bounded frames and Unix client with identity/authority-free payloads and server peer-UID verification | **Current** shared broker/runner API with no privileged host or native-HTTP dependency |
 | `dekopon-model` | Bounded model contract, OpenAI-compatible transport, and ChatGPT/Codex subscription auth and Responses client | **Current**, consumed by both CLIs |
-| `dekopon-run` | One-shot direct invocation, model prompt tools, timing/trace export, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
+| `dekopon-run` | One-shot direct invocation, model prompt tools, local/OTLP trace export, audit-safe lifecycle logs, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
 | `dekopond` | Model interaction, orchestration, context, memory, and unprivileged task coordination | **Committed direction** |
 | `dekopon-brokerd` | Owner-only Unix peer authentication, exact authorization, replay restoration, provider execution, evidence, durable audit, and atomic local checkpoint verification | **Current** privileged process; credentials and independent remote/signed anchoring remain direction |
 | Exact policy evaluator | Principal/actor/capability/provider rules with bounded constraints and deny-by-default matching | **Current** library foundation |
@@ -134,7 +134,7 @@ parse dekopon-run CLI
   -> reject duplicate routes and every non-read-only effect
   -> direct invocation or OpenAI-compatible/ChatGPT-subscription prompt/tool loop
   -> fresh bounded store per component call
-  -> JSON result/timings and optional Chrome trace
+  -> JSON result/timings and optional local Chrome plus remote OTLP telemetry
 ```
 
 The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted and may select only loaded capability IDs. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` makes exact authorization decisions, can execute policy-constrained provider HTTP, and produces durable audit evidence; it does not resolve credentials, and the operator CLI does not invoke it.

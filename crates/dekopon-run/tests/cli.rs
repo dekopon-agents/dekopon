@@ -315,6 +315,36 @@ fn exports_a_chrome_trace_with_runner_and_provider_spans() {
 }
 
 #[test]
+fn configured_otlp_delivery_failure_makes_the_command_fail() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve an unused local port");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("reserved local address")
+    );
+    drop(listener);
+    let provider = provider_path();
+    let output = run(&[
+        "--otlp-endpoint",
+        &endpoint,
+        "--otel-export-timeout-ms",
+        "100",
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.echo",
+        "--input",
+        "{}",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("could not flush OTLP telemetry"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn runs_an_openai_compatible_prompt_tool_loop() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
     let address = listener.local_addr().expect("mock endpoint address");
