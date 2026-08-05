@@ -1,16 +1,18 @@
 //! Hand-written recursive-descent parser: [`crate::lexer`] tokens to [`crate::ast`].
 //!
 //! Every construct the sandbox drops is rejected here by name with an actionable message. Nothing
-//! is silently ignored: a script that asks for backgrounding, a subshell, a here-document, process
-//! substitution, `case`, or a brace group fails to parse rather than quietly doing something else.
+//! is silently ignored: a script that asks for backgrounding, a subshell, process substitution, a
+//! here-string, or a brace group fails to parse rather than quietly doing something else. The same
+//! rule reaches inside constructs that are kept: a `case` pattern that would glob-match in bash is
+//! rejected by name here rather than matched literally behind the script's back.
 
 use thiserror::Error;
 
 use crate::{
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, ForLoop,
-        FunctionDefinition, IfStatement, Parameter, Pipeline, Program, Redirect, SimpleCommand,
-        Statement, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
+        CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Parameter, Pipeline,
+        Program, Redirect, SimpleCommand, Statement, WhileLoop, Word, WordPart,
     },
     lexer::{LexError, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize},
 };
@@ -248,7 +250,9 @@ impl Parser {
         loop {
             self.skip_separators();
             match self.peek_kind() {
-                None | Some(TokenKind::RightBrace) => break,
+                // `;;` ends a `case` clause, so a clause body stops here rather than trying to
+                // read it as another command.
+                None | Some(TokenKind::RightBrace | TokenKind::DoubleSemicolon) => break,
                 Some(_) => {}
             }
             if self
@@ -259,7 +263,13 @@ impl Parser {
             }
             statements.push(self.parse_statement()?);
             match self.peek_kind() {
-                None | Some(TokenKind::Newline | TokenKind::Semicolon | TokenKind::RightBrace) => {}
+                None
+                | Some(
+                    TokenKind::Newline
+                    | TokenKind::Semicolon
+                    | TokenKind::RightBrace
+                    | TokenKind::DoubleSemicolon,
+                ) => {}
                 Some(TokenKind::Word(_)) if self.peek_reserved().is_some() => {}
                 Some(other) => {
                     let line = self.line();
@@ -280,14 +290,10 @@ impl Parser {
             Some("for") => return self.parse_for().map(Statement::For),
             Some("while") => return self.parse_while(false).map(Statement::While),
             Some("until") => return self.parse_while(true).map(Statement::While),
-            // `case`/`esac` is dropped: it is pattern matching over text, and this value model
-            // prefers `if` plus `jq`, which stays JSON-native.
-            Some(dropped @ ("case" | "esac")) => {
+            Some("case") => return self.parse_case().map(Statement::Case),
+            Some("esac") => {
                 let line = self.line();
-                return Err(ParseError::syntax(
-                    line,
-                    format!("`{dropped}` is not part of this shell; use `if`/`elif` or `jq`"),
-                ));
+                return Err(ParseError::syntax(line, "`esac` without a matching `case`"));
             }
             Some("select") => {
                 let line = self.line();
@@ -464,6 +470,113 @@ impl Parser {
         })
     }
 
+    /// Parses `case WORD in PATTERN) LIST ;; ... esac`.
+    fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
+        self.expect_reserved("case", "a `case` statement")?;
+        let line = self.line();
+        let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+            return Err(ParseError::syntax(
+                line,
+                "expected a word to match after `case`",
+            ));
+        };
+        let raw = raw.clone();
+        let depth = self.depth;
+        self.position += 1;
+        let subject = convert_word(&raw, line, depth)?;
+        self.skip_newlines();
+        self.expect_reserved("in", "a `case` statement")?;
+
+        let mut clauses = Vec::new();
+        loop {
+            self.skip_separators();
+            if self.peek_reserved() == Some("esac") {
+                break;
+            }
+            if self.peek().is_none() {
+                let line = self.line();
+                return Err(ParseError::syntax(
+                    line,
+                    "expected `esac` in a `case` statement",
+                ));
+            }
+            clauses.push(self.parse_case_clause()?);
+        }
+        self.expect_reserved("esac", "a `case` statement")?;
+        Ok(CaseStatement { subject, clauses })
+    }
+
+    /// Parses one `PATTERN|PATTERN) LIST ;;` clause.
+    fn parse_case_clause(&mut self) -> Result<CaseClause, ParseError> {
+        // bash accepts a decorative `(` before the first pattern; accepting it costs nothing and
+        // rejecting it would blame subshells for a shape that is not one.
+        if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
+            self.position += 1;
+        }
+
+        let mut patterns = vec![self.parse_case_pattern()?];
+        while matches!(self.peek_kind(), Some(TokenKind::Pipe)) {
+            self.position += 1;
+            self.skip_newlines();
+            patterns.push(self.parse_case_pattern()?);
+        }
+        if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
+            let line = self.line();
+            return Err(ParseError::syntax(
+                line,
+                "expected `)` to close a `case` pattern list",
+            ));
+        }
+        self.position += 1;
+
+        let body = self.parse_program(&["esac"])?;
+        if matches!(self.peek_kind(), Some(TokenKind::DoubleSemicolon)) {
+            self.position += 1;
+        } else if self.peek_reserved() != Some("esac") {
+            let line = self.line();
+            return Err(ParseError::syntax(
+                line,
+                "expected `;;` to end a `case` clause",
+            ));
+        }
+        Ok(CaseClause { patterns, body })
+    }
+
+    /// Parses one `case` alternative, rejecting pattern syntax this shell cannot honor.
+    fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
+        let line = self.line();
+        let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+            let found = self
+                .peek_kind()
+                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
+            return Err(ParseError::syntax(
+                line,
+                format!("expected a `case` pattern, found {found}"),
+            ));
+        };
+        let raw = raw.clone();
+        let depth = self.depth;
+        self.position += 1;
+
+        // A bare `*` is kept because it is the default branch, not a wildcard: every subject
+        // reaches it, which is exactly what a literal matcher would also conclude.
+        if raw.as_literal() == Some("*") {
+            return Ok(CasePattern::Any);
+        }
+
+        let word = convert_word(&raw, line, depth)?;
+        if word_is_constant(&raw) {
+            if let Some((character, meaning)) = literal_pattern_metacharacter(&raw) {
+                return Err(ParseError::syntax(
+                    line,
+                    unsupported_case_pattern(character, meaning),
+                ));
+            }
+            return Ok(CasePattern::Literal(word));
+        }
+        Ok(CasePattern::Expanded(word))
+    }
+
     fn parse_while(&mut self, until: bool) -> Result<WhileLoop, ParseError> {
         let keyword = if until { "until" } else { "while" };
         let context = format!("an `{keyword}` loop");
@@ -525,6 +638,7 @@ impl Parser {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
         let mut redirect: Option<Redirect> = None;
+        let mut here_doc: Option<Word> = None;
         // `arr=(a b c)` lexes as an empty assignment followed by `(`; remembering that shape is
         // what lets the paren below name array literals instead of blaming subshells.
         let mut after_empty_assignment = false;
@@ -626,13 +740,20 @@ impl Parser {
                         "brace command groups `{ ...; }` are not supported; only function bodies use braces",
                     ));
                 }
-                // Here-documents and process substitution are dropped: nothing produces a file.
-                Some(TokenKind::LessLess) => {
+                // A here-document arrives with its body already collected off the following lines.
+                Some(TokenKind::HereDoc(raw)) => {
+                    let raw = raw.clone();
                     let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "here-documents `<<` are not supported: use a quoted string or a named buffer written with `>`",
-                    ));
+                    let depth = self.depth;
+                    self.position += 1;
+                    if here_doc.is_some() {
+                        return Err(ParseError::syntax(
+                            line,
+                            "a command accepts at most one here-document",
+                        ));
+                    }
+                    after_empty_assignment = false;
+                    here_doc = Some(convert_word(&raw, line, depth)?);
                 }
                 Some(TokenKind::LessParen) => {
                     let line = self.line();
@@ -667,8 +788,74 @@ impl Parser {
             assignments,
             words,
             redirect,
+            here_doc,
         })
     }
+}
+
+/// Pattern syntax bash would match as a glob, and what each piece would mean there.
+///
+/// A `case` pattern is matched as literal text here, so silently accepting these would answer a
+/// question the script never asked. The rule, and the shape of its rejection, follow `grep` and
+/// `sed`, whose patterns are literal for the same reason and reject metacharacters the same way.
+/// `]` is deliberately absent: only `[` opens a character class, so `[ab]` is still caught by its
+/// opening bracket while a lone `a]` — ordinary text in bash too — is left alone.
+const CASE_METACHARACTERS: &[(char, &str)] = &[
+    ('*', "any run of characters"),
+    ('?', "any single character"),
+    ('[', "a character class"),
+];
+
+/// Returns the first pattern metacharacter in some text, with what it would have meant.
+pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> {
+    text.chars().find_map(|character| {
+        CASE_METACHARACTERS
+            .iter()
+            .find(|(candidate, _)| *candidate == character)
+            .map(|(candidate, meaning)| (*candidate, *meaning))
+    })
+}
+
+/// Composes the rejection for a constant `case` pattern this shell cannot honor.
+///
+/// Quoting is offered here and *not* in [`expanded_case_pattern`], because it is only a way out
+/// while the parser can still see it: by the time a pattern has been expanded, its quoting is gone.
+pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "a `case` pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the value out, add another `PATTERN|PATTERN` alternative, quote it as `'{character}'` to match the character itself, or use `*)` for the default branch"
+    )
+}
+
+/// Composes the rejection for a `case` pattern that only exists once the script has run.
+pub(crate) fn expanded_case_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `case` pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or branch with `if` and `jq` instead"
+    )
+}
+
+/// Reports whether a raw word's text is fully known before the script runs.
+fn word_is_constant(word: &RawWord) -> bool {
+    fn parts_are_constant(parts: &[RawPart]) -> bool {
+        parts.iter().all(|part| match part {
+            RawPart::Literal(_) | RawPart::SingleQuoted(_) => true,
+            RawPart::DoubleQuoted(inner) => parts_are_constant(inner),
+            RawPart::Parameter(_) | RawPart::CommandSubstitution(_) | RawPart::Arithmetic(_) => {
+                false
+            }
+        })
+    }
+    parts_are_constant(&word.parts)
+}
+
+/// Returns the first pattern metacharacter in a constant word's *unquoted* text.
+///
+/// Quoted text is exempt because quoting is how bash itself spells "this asterisk is an asterisk",
+/// so `'*'` stays available as the way to match a literal one.
+fn literal_pattern_metacharacter(word: &RawWord) -> Option<(char, &'static str)> {
+    word.parts.iter().find_map(|part| match part {
+        RawPart::Literal(text) => pattern_metacharacter(text),
+        _ => None,
+    })
 }
 
 fn is_valid_name(name: &str) -> bool {
@@ -1095,7 +1282,7 @@ impl ArithParser {
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::{ArithBinaryOp, ArithExpr, Statement, WordPart};
+    use crate::ast::{ArithBinaryOp, ArithExpr, CasePattern, Statement, WordPart};
 
     use super::{ParseError, parse};
 
@@ -1183,12 +1370,79 @@ mod tests {
     fn dropped_grammar_is_rejected_by_name() {
         assert!(syntax_error("(echo hi)").contains("subshells"));
         assert!(syntax_error("{ echo hi; }").contains("brace command groups"));
-        assert!(syntax_error("cat <<EOF").contains("here-documents"));
+        assert!(syntax_error("cat <<<\"$x\"").contains("here-string"));
         assert!(syntax_error("diff <(a) b").contains("process substitution"));
         assert!(syntax_error("cat < file").contains("input redirection"));
-        assert!(syntax_error("case $x in esac").contains("case"));
         assert!(syntax_error("select x in a; do echo $x; done").contains("select"));
         assert!(syntax_error("function f { echo hi; }").contains("`function` keyword"));
+        assert!(syntax_error("esac").contains("without a matching `case`"));
+    }
+
+    #[test]
+    fn parses_case_statements_with_alternatives_and_a_default() {
+        let program =
+            parse("case $x in\n  a|b) echo ab ;;\n  ready) echo go ;;\n  *) echo other ;;\nesac")
+                .expect("valid script");
+        let Statement::Case(statement) = &program.statements[0] else {
+            panic!(
+                "expected a case statement, found {:?}",
+                program.statements[0]
+            );
+        };
+        assert_eq!(statement.clauses.len(), 3);
+        assert_eq!(statement.clauses[0].patterns.len(), 2);
+        assert!(matches!(statement.clauses[2].patterns[0], CasePattern::Any));
+    }
+
+    #[test]
+    fn a_final_case_clause_may_omit_its_terminator() {
+        let program = parse("case $x in a) echo a ;; *) echo b\nesac").expect("valid script");
+        let Statement::Case(statement) = &program.statements[0] else {
+            panic!("expected a case statement");
+        };
+        assert_eq!(statement.clauses.len(), 2);
+    }
+
+    #[test]
+    fn case_patterns_that_would_glob_are_rejected_by_name() {
+        // A literal matcher would answer `*.json` wrongly and silently, which is the one thing
+        // this shell will not do. `grep` and `sed` reject their metacharacters for the same reason.
+        for (source, expected) in [
+            ("case $f in *.json) echo j ;; esac", "any run of characters"),
+            ("case $f in a?c) echo q ;; esac", "any single character"),
+            ("case $f in [ab]) echo c ;; esac", "a character class"),
+        ] {
+            let message = syntax_error(source);
+            assert!(message.contains(expected), "{source}: {message}");
+            assert!(message.contains("literal text"), "{source}: {message}");
+        }
+
+        // Quoting is how bash itself spells "this asterisk is an asterisk", so it stays available.
+        assert!(parse("case $f in '*') echo star ;; esac").is_ok());
+    }
+
+    #[test]
+    fn malformed_case_statements_are_reported() {
+        assert!(syntax_error("case $x in a) echo a ;;").contains("expected `esac`"));
+        assert!(syntax_error("case $x in a echo a ;; esac").contains("expected `)`"));
+        assert!(syntax_error("case in a) echo a ;; esac").contains("expected `in`"));
+    }
+
+    #[test]
+    fn a_here_document_becomes_the_command_input() {
+        let program = parse("jq . <<EOF\n{\"a\": 1}\nEOF\n").expect("valid script");
+        let Statement::List(list) = &program.statements[0] else {
+            panic!("expected a list");
+        };
+        let command = &list.first.commands[0];
+        assert_eq!(command.words.len(), 2);
+        let body = command.here_doc.as_ref().expect("a here-document");
+        assert_eq!(body.as_literal(), Some("{\"a\": 1}"));
+    }
+
+    #[test]
+    fn a_command_accepts_at_most_one_here_document() {
+        assert!(syntax_error("cat <<A <<B\na\nA\nb\nB\n").contains("at most one here-document"));
     }
 
     #[test]
