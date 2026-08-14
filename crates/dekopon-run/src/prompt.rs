@@ -5,10 +5,14 @@
 //! do — inspect what it can reach, loop, branch, parse JSON, call capabilities — happens inside
 //! that script instead of across many small tool calls.
 
+use std::time::Instant;
+
 use dekopon_model::model::{ChatModel, ModelError, ModelMessage, ModelTool, assistant_message};
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
+
+use crate::milliseconds;
 
 /// Model-facing name of the single scripting tool.
 ///
@@ -99,11 +103,65 @@ where
         prompt.max_capability_calls = limits.max_capability_calls
     );
     let _session = session_span.enter();
+    tracing::info!(
+        target: "dekopon_run::audit",
+        {
+            audit.event = "agent.session.started",
+            prompt.max_steps = limits.max_steps,
+            prompt.max_capability_calls = limits.max_capability_calls,
+            tool.count = model_tools.len(),
+        },
+        "prompt session started"
+    );
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
 
     for model_turns in 1..=limits.max_steps {
-        let turn = model.complete(&messages, &model_tools)?;
+        let model_span = tracing::info_span!("prompt.model_turn", model.turn = model_turns);
+        let model_entered = model_span.enter();
+        tracing::info!(
+            target: "dekopon_run::audit",
+            {
+                audit.event = "agent.model.requested",
+                model.turn = model_turns,
+                message.count = messages.len(),
+                tool.count = model_tools.len(),
+            },
+            "model turn requested"
+        );
+        let model_started = Instant::now();
+        let turn = match model.complete(&messages, &model_tools) {
+            Ok(turn) => turn,
+            Err(error) => {
+                tracing::error!(
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.model.completed",
+                        model.turn = model_turns,
+                        duration_ms = milliseconds(model_started.elapsed()),
+                        outcome = "failed",
+                    },
+                    "model turn failed"
+                );
+                return Err(error.into());
+            }
+        };
+        tracing::info!(
+            target: "dekopon_run::audit",
+            {
+                audit.event = "agent.model.completed",
+                model.turn = model_turns,
+                duration_ms = milliseconds(model_started.elapsed()),
+                tool_call.count = turn.tool_calls.len(),
+                answer.present = turn
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| !content.trim().is_empty()),
+                outcome = "succeeded",
+            },
+            "model turn completed"
+        );
+        drop(model_entered);
         messages.push(assistant_message(&turn));
 
         if turn.tool_calls.is_empty() {
@@ -119,42 +177,92 @@ where
             });
         }
         if turn.tool_calls.len() > MAX_SCRIPT_CALLS_PER_TURN {
+            tracing::error!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "agent.tool.rejected",
+                    model.turn = model_turns,
+                    tool_call.count = turn.tool_calls.len(),
+                    error.type = "too-many-tool-calls",
+                },
+                "model tool calls rejected"
+            );
             return Err(PromptError::TooManyToolCalls {
                 actual: turn.tool_calls.len(),
                 maximum: MAX_SCRIPT_CALLS_PER_TURN,
             });
         }
 
-        for call in turn.tool_calls {
+        for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
+            let tool_call_index = tool_call_index + 1;
             if call.id.trim().is_empty() {
+                reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
                 return Err(PromptError::EmptyToolCallId);
             }
+            // The model-selected name is deliberately not copied into telemetry: it is untrusted
+            // model output, and an operator reads it from the error on stderr instead.
             if call.function.name != SCRIPT_TOOL_NAME {
+                reject_tool_call(model_turns, tool_call_index, "unknown-tool");
                 return Err(PromptError::UnknownTool(call.function.name));
             }
-            let script = script_argument(&call.function.name, &call.function.arguments)?;
+            let script = match script_argument(&call.function.name, &call.function.arguments) {
+                Ok(script) => script,
+                Err(error) => {
+                    reject_tool_call(model_turns, tool_call_index, error.telemetry_kind());
+                    return Err(error);
+                }
+            };
 
             // Whatever the session has already spent is unavailable to this script, so a model
             // cannot widen its own budget by splitting work across more tool calls.
             let remaining = limits
                 .max_capability_calls
                 .saturating_sub(capability_invocations);
+            // One span per unit of tool work. That unit is now a whole script rather than a single
+            // capability call, so the per-capability detail the old loop recorded here lives in
+            // the interpreter and is reported through the outcome attributes below.
             let span = tracing::info_span!(
                 "prompt.script",
+                model.turn = model_turns,
+                tool_call.index = tool_call_index,
                 script.max_capability_calls = remaining,
                 script.bytes = script.len()
             );
             let outcome = {
                 let _entered = span.enter();
-                runtime.run_script(&script, remaining)
+                tracing::info!(
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.tool.invocation.started",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        script.max_capability_calls = remaining,
+                        script.bytes = script.len(),
+                    },
+                    "agent tool invocation started"
+                );
+                let started = Instant::now();
+                // `run_script` returns no `Result`: a failed script is an outcome the model reads
+                // and recovers from, so this pair always completes and reports `outcome` from the
+                // script's own exit code rather than from a host error.
+                let outcome = runtime.run_script(&script, remaining);
+                tracing::info!(
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.tool.invocation.completed",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        duration_ms = milliseconds(started.elapsed()),
+                        script.exit_code = outcome.exit_code.get(),
+                        script.steps = outcome.steps,
+                        script.capability_calls = outcome.capability_calls,
+                        script.truncated = outcome.truncated,
+                        outcome = script_outcome_label(&outcome),
+                    },
+                    "agent tool invocation completed"
+                );
+                outcome
             };
-            tracing::info!(
-                script.exit_code = outcome.exit_code.get(),
-                script.steps = outcome.steps,
-                script.capability_calls = outcome.capability_calls,
-                script.truncated = outcome.truncated,
-                "model script completed"
-            );
             script_calls = script_calls.saturating_add(1);
             capability_invocations =
                 capability_invocations.saturating_add(outcome.capability_calls);
@@ -179,6 +287,38 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
     }
     text.push_str(&format!("[exit code: {}]", outcome.exit_code));
     text
+}
+
+/// Stable outcome label for one script run.
+///
+/// A script that exits non-zero is a *reported* failure, not a broken session, so this is the
+/// script's own exit status rather than a host error. Truncation is a separate dimension and is
+/// exported as its own attribute.
+#[must_use]
+pub fn script_outcome_label(outcome: &ScriptOutcome) -> &'static str {
+    if outcome.exit_code.get() == 0 {
+        "succeeded"
+    } else {
+        "failed"
+    }
+}
+
+/// Records one model-authored tool call the loop refused to run.
+///
+/// Every caller passes a fixed category rather than the model's own text: a rejection event is
+/// triggered by untrusted model output, and `docs/observability.md` keeps that output out of
+/// exported telemetry.
+fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
+    tracing::error!(
+        target: "dekopon_run::audit",
+        {
+            audit.event = "agent.tool.rejected",
+            model.turn = model_turn,
+            tool_call.index = tool_call_index,
+            error.type = error_type,
+        },
+        "model tool call rejected"
+    );
 }
 
 /// Builds the one tool a prompt session offers.
@@ -321,6 +461,26 @@ pub enum PromptError {
         /// Configured model-turn limit.
         maximum: u32,
     },
+}
+
+impl PromptError {
+    /// Stable, low-cardinality failure category for telemetry.
+    ///
+    /// Several variants carry model-chosen text; the category returned here never does.
+    pub(crate) fn telemetry_kind(&self) -> &'static str {
+        match self {
+            Self::ZeroSteps => "zero-steps",
+            Self::Model(_) => "model",
+            Self::UnknownTool(_) => "unknown-tool",
+            Self::TooManyToolCalls { .. } => "too-many-tool-calls",
+            Self::EmptyToolCallId => "empty-tool-call-id",
+            Self::InvalidArguments { .. } => "invalid-json-arguments",
+            Self::ArgumentsNotObject { .. } => "arguments-not-object",
+            Self::MissingScript { .. } => "missing-script",
+            Self::EmptyAnswer => "empty-answer",
+            Self::MaxSteps { .. } => "max-steps",
+        }
+    }
 }
 
 #[cfg(test)]

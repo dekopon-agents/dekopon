@@ -21,13 +21,19 @@ dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
 dekopon-shell.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 tracing-chrome.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

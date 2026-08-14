@@ -1,0 +1,13 @@
+.git
+.github
+.vscode
+.idea
+target
+**/target
+coverage
+.env
+.env.*
+!.env.example
+*.swp
+*.swo
+.DS_Store

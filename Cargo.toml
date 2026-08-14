@@ -32,14 +32,18 @@ authors = ["Dekopon contributors"]
 
 [workspace.dependencies]
 base64 = "0.22.1"
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive", "env"] }
 fs2 = "0.4.3"
 futures-util = "0.3.31"
 jaq-core = "3.1.0"
 jaq-json = "2.0.1"
 jaq-std = { version = "3.0.1", default-features = false, features = ["std"] }
 libc = "0.2.189"
-reqwest = { version = "0.12.28", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "stream"] }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "logs", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+reqwest ={ version = "0.12.28", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["process"] }
 schemars = { version = "1.2.2", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -49,9 +53,11 @@ sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14.1", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-chrome = "0.7.2"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }

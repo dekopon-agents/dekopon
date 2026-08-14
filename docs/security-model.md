@@ -66,11 +66,12 @@ The separate experimental `dekopon-run` path can contact an operator-selected Op
 - the component linker exposes no WASI or custom imports, so guests receive no filesystem, network, clock, random, environment, credential, or external-read authority;
 - an optional model bearer token is read from a named environment variable and sent only to the selected compatible endpoint;
 - `dekopon auth chatgpt` uses OpenAI's Codex device flow and stores refreshable credentials in a Dekopon-owned file (`0600` on Unix); the shared model client fixes authentication and inference hosts to `auth.openai.com` and `chatgpt.com` and never imports credentials from pi, OpenClaw, or Codex;
-- model credentials and opaque encrypted reasoning replay data are not exposed to components, output, or trace fields;
+- model credentials and opaque encrypted reasoning replay data are not exposed to components, output, or telemetry fields;
+- optional runner OTLP export sends generated performance spans and stable lifecycle events to an operator-selected endpoint, but omits prompts, model responses, model-authored script text and its output, provider input/output, credentials, broker socket paths, and raw errors;
 - immediate success output is raw untrusted JSON, not broker evidence, an authorization receipt, or an `InvocationResult`;
 - immediate tool calls are not `AuthorizedInvocation` values and cannot be used for local or external writes.
 
-Chrome trace fields omit prompts, model responses, component input/output, and bearer tokens. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
+Chrome and OTLP trace/log fields omit prompts, model responses, component input/output, bearer tokens, and raw untrusted errors. The operator-selected telemetry endpoint still learns execution metadata such as service/model/provider/capability identifiers, timings, outcomes, and source locations. OTLP lifecycle logs are operational audit data, not authorized invocation evidence or a substitute for the broker's durable hash-linked log. Final text and machine-readable outputs remain untrusted data. Terminal table cells in the catalog CLI continue to remove control characters.
 
 ## Current privileged broker foundation
 

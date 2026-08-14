@@ -33,12 +33,12 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
-| Direct runner, prompt loop, shell subcommand, broker client, tracing | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage |
+| Direct runner, prompt loop, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `tests/otel-kind/e2e.sh` for Quickwit signals/redaction |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 
-Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory is only a placeholder.
+Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory holds only the repository-level Quickwit observability script described in [`../tests/README.md`](../tests/README.md).
 
 ## Change maps
 
@@ -124,7 +124,7 @@ Privileged broker path:
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, rejects unreachable UID mappings, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening.
 - The service currently treats one owner UID as a trust domain, has no credential resolver or independently retained, signed, or remote checkpoint anchor, and is not integrated with the operator CLI or an agent daemon. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI also rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, or `dekopon-brokerd` in the runner's normal dependency tree.
 
-See [`run.md`](run.md) for the user-facing contract and [`security-model.md`](security-model.md) for the trust boundary.
+See [`run.md`](run.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
 
 ## Validation
 
@@ -153,6 +153,18 @@ cargo package --workspace --exclude dekopon-testkit --locked
 ```
 
 The immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs`, `tests/broker.rs`, or `tests/server.rs` is not included in the published package.
+
+### Quickwit OTLP end-to-end test
+
+For runner telemetry, image, Kubernetes manifest, or observability CI changes, use a disposable kind cluster:
+
+```console
+kind create cluster --name dekopon-otel --config deploy/quickwit-kind/kind.yaml
+KIND_CLUSTER_NAME=dekopon-otel tests/otel-kind/e2e.sh
+kind delete cluster --name dekopon-otel
+```
+
+The script builds the runner at the repository MSRV, deploys pinned Quickwit 0.9 plus PostgreSQL with ephemeral local splits, executes a two-turn model/script session, and searches both OTEL indexes for correlated spans and redacted lifecycle logs. Run `shellcheck tests/otel-kind/e2e.sh` and validate changed Kubernetes YAML before submission.
 
 ### Provider example workspaces
 
