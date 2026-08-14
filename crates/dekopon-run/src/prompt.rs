@@ -104,10 +104,13 @@ where
     );
     let _session = session_span.enter();
     tracing::info!(
-        audit.event = "agent.session.started",
-        prompt.max_steps = limits.max_steps,
-        prompt.max_capability_calls = limits.max_capability_calls,
-        tool.count = model_tools.len(),
+        target: "dekopon_run::audit",
+        {
+            audit.event = "agent.session.started",
+            prompt.max_steps = limits.max_steps,
+            prompt.max_capability_calls = limits.max_capability_calls,
+            tool.count = model_tools.len(),
+        },
         "prompt session started"
     );
     let mut script_calls = 0_u32;
@@ -117,10 +120,13 @@ where
         let model_span = tracing::info_span!("prompt.model_turn", model.turn = model_turns);
         let model_entered = model_span.enter();
         tracing::info!(
-            audit.event = "agent.model.requested",
-            model.turn = model_turns,
-            message.count = messages.len(),
-            tool.count = model_tools.len(),
+            target: "dekopon_run::audit",
+            {
+                audit.event = "agent.model.requested",
+                model.turn = model_turns,
+                message.count = messages.len(),
+                tool.count = model_tools.len(),
+            },
             "model turn requested"
         );
         let model_started = Instant::now();
@@ -128,25 +134,31 @@ where
             Ok(turn) => turn,
             Err(error) => {
                 tracing::error!(
-                    audit.event = "agent.model.completed",
-                    model.turn = model_turns,
-                    duration_ms = milliseconds(model_started.elapsed()),
-                    outcome = "failed",
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.model.completed",
+                        model.turn = model_turns,
+                        duration_ms = milliseconds(model_started.elapsed()),
+                        outcome = "failed",
+                    },
                     "model turn failed"
                 );
                 return Err(error.into());
             }
         };
         tracing::info!(
-            audit.event = "agent.model.completed",
-            model.turn = model_turns,
-            duration_ms = milliseconds(model_started.elapsed()),
-            tool_call.count = turn.tool_calls.len(),
-            answer.present = turn
-                .content
-                .as_ref()
-                .is_some_and(|content| !content.trim().is_empty()),
-            outcome = "succeeded",
+            target: "dekopon_run::audit",
+            {
+                audit.event = "agent.model.completed",
+                model.turn = model_turns,
+                duration_ms = milliseconds(model_started.elapsed()),
+                tool_call.count = turn.tool_calls.len(),
+                answer.present = turn
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| !content.trim().is_empty()),
+                outcome = "succeeded",
+            },
             "model turn completed"
         );
         drop(model_entered);
@@ -166,10 +178,13 @@ where
         }
         if turn.tool_calls.len() > MAX_SCRIPT_CALLS_PER_TURN {
             tracing::error!(
-                audit.event = "agent.tool.rejected",
-                model.turn = model_turns,
-                tool_call.count = turn.tool_calls.len(),
-                error.type = "too-many-tool-calls",
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "agent.tool.rejected",
+                    model.turn = model_turns,
+                    tool_call.count = turn.tool_calls.len(),
+                    error.type = "too-many-tool-calls",
+                },
                 "model tool calls rejected"
             );
             return Err(PromptError::TooManyToolCalls {
@@ -216,11 +231,14 @@ where
             let outcome = {
                 let _entered = span.enter();
                 tracing::info!(
-                    audit.event = "agent.tool.invocation.started",
-                    model.turn = model_turns,
-                    tool_call.index = tool_call_index,
-                    script.max_capability_calls = remaining,
-                    script.bytes = script.len(),
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.tool.invocation.started",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        script.max_capability_calls = remaining,
+                        script.bytes = script.len(),
+                    },
                     "agent tool invocation started"
                 );
                 let started = Instant::now();
@@ -229,15 +247,18 @@ where
                 // script's own exit code rather than from a host error.
                 let outcome = runtime.run_script(&script, remaining);
                 tracing::info!(
-                    audit.event = "agent.tool.invocation.completed",
-                    model.turn = model_turns,
-                    tool_call.index = tool_call_index,
-                    duration_ms = milliseconds(started.elapsed()),
-                    script.exit_code = outcome.exit_code.get(),
-                    script.steps = outcome.steps,
-                    script.capability_calls = outcome.capability_calls,
-                    script.truncated = outcome.truncated,
-                    outcome = script_outcome_label(&outcome),
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "agent.tool.invocation.completed",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        duration_ms = milliseconds(started.elapsed()),
+                        script.exit_code = outcome.exit_code.get(),
+                        script.steps = outcome.steps,
+                        script.capability_calls = outcome.capability_calls,
+                        script.truncated = outcome.truncated,
+                        outcome = script_outcome_label(&outcome),
+                    },
                     "agent tool invocation completed"
                 );
                 outcome
@@ -289,10 +310,13 @@ pub fn script_outcome_label(outcome: &ScriptOutcome) -> &'static str {
 /// exported telemetry.
 fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
     tracing::error!(
-        audit.event = "agent.tool.rejected",
-        model.turn = model_turn,
-        tool_call.index = tool_call_index,
-        error.type = error_type,
+        target: "dekopon_run::audit",
+        {
+            audit.event = "agent.tool.rejected",
+            model.turn = model_turn,
+            tool_call.index = tool_call_index,
+            error.type = error_type,
+        },
         "model tool call rejected"
     );
 }

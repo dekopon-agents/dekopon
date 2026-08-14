@@ -84,11 +84,14 @@ pub(crate) fn initialize(
         1 => "info",
         _ => "debug",
     };
+    // Lifecycle audit events target `dekopon_run::audit` so they reach the OTLP and Chrome sinks
+    // (whose `dekopon_run` directives match the prefix) without ever printing on the operator's
+    // stderr, which must stay byte-for-byte what it was before those events existed.
     let stderr_layer = fmt::layer()
         .with_ansi(!no_color)
         .with_target(verbosity > 1)
         .with_writer(io::stderr)
-        .with_filter(EnvFilter::new(level));
+        .with_filter(EnvFilter::new(format!("{level},dekopon_run::audit=off")));
 
     let (chrome_layer, chrome_guard) = if let Some(path) = chrome_trace {
         let file = File::create(path).map_err(|source| TraceError::Create {
@@ -109,14 +112,10 @@ pub(crate) fn initialize(
     };
 
     let shutdown_timeout = Duration::from_millis(telemetry.otel_export_timeout_ms);
-    if shutdown_timeout.is_zero() {
-        return Err(TraceError::Configuration(
-            "OTLP export timeout must be greater than zero".to_owned(),
-        ));
-    }
 
     // No endpoint means no exporter, no provider, and no extra layer: the subscriber built here is
-    // exactly the one a build without this feature would install.
+    // exactly the one a build without this feature would install. Telemetry settings are not even
+    // validated on this path — with export disabled they configure nothing.
     let Some(endpoint) = telemetry.otlp_endpoint.as_deref() else {
         tracing_subscriber::registry()
             .with(stderr_layer)
@@ -135,6 +134,11 @@ pub(crate) fn initialize(
     if endpoint.is_empty() {
         return Err(TraceError::Configuration(
             "OTLP endpoint must not be empty".to_owned(),
+        ));
+    }
+    if shutdown_timeout.is_zero() {
+        return Err(TraceError::Configuration(
+            "OTLP export timeout must be greater than zero".to_owned(),
         ));
     }
     let service_name = telemetry.otel_service_name.trim();

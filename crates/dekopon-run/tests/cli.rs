@@ -27,7 +27,16 @@ use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::oneshot};
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dekopon-run"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dekopon-run"));
+    // Every telemetry flag has an env fallback, so ambient OpenTelemetry configuration on the
+    // host would silently flip these subprocesses into export mode and fail unrelated tests.
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("OTEL_") || name.starts_with("DEKOPON_OTEL_") {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 fn provider_path() -> PathBuf {
@@ -606,7 +615,9 @@ fn configured_otlp_delivery_failure_makes_the_command_fail() {
 ///
 /// This is the property that keeps the feature opt-in: with no `--otlp-endpoint`, the runner is
 /// byte-for-byte the runner that shipped before it, including on the failure paths where the new
-/// shutdown step could otherwise turn a clean exit code into a 1.
+/// shutdown step could otherwise turn a clean exit code into a 1. Both stderr assertions are
+/// exact, not substring checks: the lifecycle audit events are emitted at info/error level, and
+/// an exact comparison is what proves they never reach the operator's stderr stream.
 #[test]
 fn unset_otlp_endpoint_leaves_command_behavior_unchanged() {
     let provider = provider_path();
@@ -620,7 +631,7 @@ fn unset_otlp_endpoint_leaves_command_behavior_unchanged() {
     ]);
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(!stderr(&output).contains("OTLP"), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "", "success stderr must stay empty");
 
     let missing = run(&[
         "invoke",
@@ -632,7 +643,11 @@ fn unset_otlp_endpoint_leaves_command_behavior_unchanged() {
     ]);
 
     assert_eq!(missing.status.code(), Some(1));
-    assert!(!stderr(&missing).contains("OTLP"), "{}", stderr(&missing));
+    assert_eq!(
+        stderr(&missing),
+        "error: no loaded provider implements capability echo.nonexistent\n",
+        "failure stderr must stay the single classic error line"
+    );
 }
 
 /// Builds the assistant turn that calls the one scripting tool.

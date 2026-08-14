@@ -465,6 +465,8 @@ mod tests {
             "otel-logs-test",
             "--otel-traces-index",
             "otel-traces-test",
+            "--otel-export-timeout-ms",
+            "2500",
             "inspect",
             "--provider",
             "echo.wasm",
@@ -478,7 +480,7 @@ mod tests {
         assert_eq!(cli.telemetry.otel_service_name, "dekopon-run-test");
         assert_eq!(cli.telemetry.otel_logs_index, "otel-logs-test");
         assert_eq!(cli.telemetry.otel_traces_index, "otel-traces-test");
-        assert_eq!(cli.telemetry.otel_export_timeout_ms, 5_000);
+        assert_eq!(cli.telemetry.otel_export_timeout_ms, 2_500);
     }
 
     /// Telemetry is opt-in, and every subcommand accepts the same global flags.
@@ -487,6 +489,17 @@ mod tests {
     /// per-subcommand argument group would have silently skipped it.
     #[test]
     fn telemetry_defaults_to_quickwit_0_9_indexes_on_every_subcommand() {
+        // Defaults are only observable with the env fallbacks unset, and scrubbing the process
+        // environment is off the table (`std::env::remove_var` is unsafe in edition 2024 and this
+        // workspace forbids unsafe code), so ambient OpenTelemetry configuration skips the test
+        // instead of failing it. CI runs with a clean environment and always pins the defaults.
+        if std::env::vars_os().any(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with("OTEL_") || name.starts_with("DEKOPON_OTEL_"))
+        }) {
+            eprintln!("skipping: ambient OTEL_*/DEKOPON_OTEL_* environment overrides the defaults");
+            return;
+        }
         for command in [
             vec!["inspect", "--provider", "echo.wasm"],
             vec!["shell", "--provider", "echo.wasm", "echo hi"],
