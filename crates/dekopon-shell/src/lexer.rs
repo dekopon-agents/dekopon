@@ -354,7 +354,12 @@ impl<'a> Lexer<'a> {
                 Ok(())
             }
             Some((_, character)) => {
-                self.push_literal(character);
+                // An escaped character is bash's one-character quote: `\*` and `'*'` are the same
+                // word. Recording it as a single-quoted part instead of erasing the backslash into
+                // plain literal text is what lets a `case` pattern tell `\*)` — match one literal
+                // asterisk — apart from the bare `*)` default branch, which would otherwise
+                // silently capture every subject.
+                self.push_part(RawPart::SingleQuoted(character.to_string()));
                 Ok(())
             }
             None => Err(LexError::new(
@@ -1157,8 +1162,12 @@ mod tests {
             assert!(error.message.contains("backtick"), "{source}: {error}");
             assert!(error.message.contains("$( ... )"), "{source}: {error}");
         }
-        // An escaped backtick is ordinary text in both bash and here.
-        assert_eq!(single_word(r"\`"), vec![RawPart::Literal("`".to_owned())]);
+        // An escaped backtick is ordinary text in both bash and here; escapes lex as
+        // single-quoted parts so words remember which characters were quoted.
+        assert_eq!(
+            single_word(r"\`"),
+            vec![RawPart::SingleQuoted("`".to_owned())]
+        );
         assert_eq!(
             single_word("'`echo hi`'"),
             vec![RawPart::SingleQuoted("`echo hi`".to_owned())]

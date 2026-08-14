@@ -1419,6 +1419,19 @@ mod tests {
 
         // Quoting is how bash itself spells "this asterisk is an asterisk", so it stays available.
         assert!(parse("case $f in '*') echo star ;; esac").is_ok());
+
+        // A backslash is bash's one-character quote: `\*` is the same pattern as `'*'`. It must
+        // classify as a literal match, never as the bare `*)` default branch — that would
+        // silently route every subject through the escaped clause.
+        let program = parse("case $f in \\*) echo star ;; esac").expect("valid script");
+        let Statement::Case(statement) = &program.statements[0] else {
+            panic!("expected a case statement");
+        };
+        assert!(matches!(
+            statement.clauses[0].patterns[0],
+            CasePattern::Literal(_)
+        ));
+        assert!(parse("case $f in a\\*b) echo star ;; esac").is_ok());
     }
 
     #[test]

@@ -588,6 +588,19 @@ fn case_matches_the_expanded_subject_and_reports_success_when_nothing_matches() 
 }
 
 #[test]
+fn an_escaped_case_pattern_matches_one_literal_character_like_bash() {
+    // `\*` is bash's spelling for a literal asterisk, exactly like `'*'`. Classifying it as the
+    // `*)` default branch would silently route every subject through the escaped clause.
+    let outcome = run("case hello in \\*) echo caught ;; esac");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "");
+
+    assert_eq!(output("case '*' in \\*) echo star ;; esac"), "star");
+    assert_eq!(output("case 'a*b' in a\\*b) echo mid ;; esac"), "mid");
+    assert_eq!(output("case '?' in \\?) echo mark ;; esac"), "mark");
+}
+
+#[test]
 fn case_composes_with_the_control_flow_around_it() {
     // `break` inside a `case` inside a loop unwinds the loop, exactly as in bash — the `case` is
     // not a scope that swallows it.
