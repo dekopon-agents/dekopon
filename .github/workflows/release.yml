@@ -43,7 +43,7 @@ jobs:
           toolchain: stable
           components: clippy,rustfmt
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - name: Verify tag and workspace versions
         shell: bash
         run: |
@@ -103,7 +103,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           key: release-${{ matrix.target }}
       - name: Build CLIs
