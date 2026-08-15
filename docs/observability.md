@@ -37,12 +37,24 @@ One generated OpenTelemetry trace links the command to spans such as:
 
 - `runner.command`, `runner.prompt`, `runner.shell`, and `prompt.session`;
 - `prompt.model_turn` and `model.complete`;
-- `prompt.script`; and
+- `prompt.script` and `shell.command`; and
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
 
-One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation. Per-builtin detail inside the interpreter is not recorded yet.
+One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation.
 
-Structured log records use stable `audit.event` attributes for command, session, model-turn, script-execution, and direct guest-invocation lifecycle events. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing a Quickwit log result to pivot to the corresponding performance trace.
+Inside it, `shell.command` is one span per command word the script actually ran, in execution order — a builtin, a capability call, a shell function, a word this shell refuses, or a word that resolved to nothing. A trace therefore reads as the ordered list of commands a script executed rather than as one opaque entry, and the reading survives constructs where one script word drives several executions: `xargs` mapping a command over ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is already named in this file's trace and log filters, so they flow to every configured sink with no further wiring. Each span carries:
+
+| Attribute | Value |
+|---|---|
+| `shell.command.name` | The command word, or `<withheld>`; see data minimization below |
+| `shell.command.kind` | `builtin`, `capability`, `function`, `control`, `rejected`, or `not-found` |
+| `shell.command.argument_count` | How many arguments the word received, never their values |
+| `shell.command.exit_code` | The status the command reported |
+| `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
+
+`outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code mapping; flattening them would hide an authorization refusal in the noise of ordinary failures. `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this shell excludes, and an exhausted sandbox budget.
+
+Structured log records use stable `audit.event` attributes for command, session, model-turn, script-execution, per-command, and direct guest-invocation lifecycle events. Each command emits a `shell.command.started` / `shell.command.completed` pair inside its span, the completed record adding `duration_ms` alongside the attributes above. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing a Quickwit log result to pivot to the corresponding performance trace.
 
 ## Data minimization
 
@@ -52,8 +64,11 @@ Telemetry includes operation names, model/provider/capability identifiers, bound
 - model response text and reasoning replay data;
 - model tool-call IDs and the script text a model authors, along with that script's output;
 - provider input and output;
+- command arguments, in every form and at every level;
 - bearer tokens and provider credentials; and
 - broker socket paths.
+
+Command arguments deserve their own line because `shell.command` is the newest place they could have leaked. A `curl -d '{"apiKey":...}'` body and a `cap some.id '{"token":...}'` object are capability input wearing argv's clothes, so only the argument *count* is recorded. The command word itself is recorded only when it came from a fixed vocabulary the interpreter owns — a builtin name, a control word, a word the shell refuses by name, or a capability identifier. A shell function's name and a word that resolved to nothing are whatever the script's author typed, so both are reported as the literal `<withheld>` and the resolution kind is left to say what happened.
 
 Model-selected invalid tool names are not copied into remote rejection events; a rejection records a stable category such as `unknown-tool` instead. Error telemetry records stable categories rather than raw errors, which may contain untrusted provider or transport text. Normal command stdout/stderr remains a separate output surface.
 

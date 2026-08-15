@@ -810,6 +810,7 @@ fn shell_limits(limits: &ShellLimitArgs) -> ShellLimits {
         timeout: Duration::from_millis(limits.shell_timeout_ms),
         max_capability_calls: limits.shell_max_capability_calls,
         max_value_bytes: limits.shell_max_value_bytes,
+        allow_clock: limits.shell_allow_clock,
     }
 }
 

@@ -140,6 +140,7 @@ for span_name in \
   prompt.model_turn \
   model.complete \
   prompt.script \
+  shell.command \
   provider.invoke
 do
   jq -e --arg span_name "$span_name" \
@@ -153,6 +154,8 @@ for audit_event in \
   agent.model.completed \
   agent.tool.invocation.started \
   agent.tool.invocation.completed \
+  shell.command.started \
+  shell.command.completed \
   agent.session.completed \
   runner.command.completed
 do
