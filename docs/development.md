@@ -33,12 +33,12 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
-| Direct runner, prompt loop, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `tests/otel-kind/e2e.sh` for Quickwit signals/redaction |
+| Direct runner, prompt loop, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 
-Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory holds only the repository-level Quickwit observability script described in [`../tests/README.md`](../tests/README.md).
+Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory remains a map to package-owned suites; the repository-level observability smoke test lives with its runnable example under `examples/otel-traces/`.
 
 ## Change maps
 
@@ -110,7 +110,7 @@ Immediate host:
 - `prompt --broker` adds a second dispatch leg for capabilities direct mode cannot serve. Direct capabilities are always preferred; the broker stays the sole authority, so its denials reach the script as exit code `126`.
 - `dekopon-run shell` runs `dekopon-shell` over the same registry. Its bounds are independent of the Wasm ones: Wasm fuel bounds one component call, while the interpreter's step, recursion, output, deadline, and capability-call ceilings bound how many such calls a script can drive. The interpreter never reads the host process environment.
 - The one exception to "no clock, no environment" inside a script is the off-by-default `--shell-allow-clock`, which grants the `date` builtin a UTC wall-clock reading and nothing else. Unset, `date` is "command not found"; it never consults an environment variable, so `TZ` stays unobservable either way. This bounds the interpreter only — the Wasm linker's clock import stays absent regardless.
-- Each command word a script runs emits a `shell.command` span with a `shell.command.started`/`.completed` pair. Changing that shape is a runner-telemetry change, so it needs `tests/otel-kind/e2e.sh` as well as the workspace suite.
+- Each command word a script runs emits a `shell.command` span with a `shell.command.started`/`.completed` pair. Changing that shape is a runner-telemetry change, so it needs `examples/otel-traces/smoke-test.sh` as well as the workspace suite.
 
 Privileged broker path:
 
@@ -156,17 +156,15 @@ cargo package --workspace --exclude dekopon-testkit --locked
 
 The immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs`, `tests/broker.rs`, or `tests/server.rs` is not included in the published package.
 
-### Quickwit OTLP end-to-end test
+### OpenObserve OTLP end-to-end test
 
-For runner telemetry, image, Kubernetes manifest, or observability CI changes, use a disposable kind cluster:
+For runner telemetry, OpenObserve example, or observability CI changes, run:
 
 ```console
-kind create cluster --name dekopon-otel --config deploy/quickwit-kind/kind.yaml
-KIND_CLUSTER_NAME=dekopon-otel tests/otel-kind/e2e.sh
-kind delete cluster --name dekopon-otel
+examples/otel-traces/smoke-test.sh
 ```
 
-The script builds the runner at the repository MSRV, deploys pinned Quickwit 0.9 plus PostgreSQL with ephemeral local splits, executes a two-turn model/script session, and searches both OTEL indexes for correlated spans and redacted lifecycle logs. Run `shellcheck tests/otel-kind/e2e.sh` and validate changed Kubernetes YAML before submission.
+The script builds the runner, starts one pinned OpenObserve container with an isolated Docker volume, executes a direct provider invocation, and searches the trace stream for required spans and absence of a sentinel provider input. It removes the container and volume afterward. Run `shellcheck examples/otel-traces/smoke-test.sh` and `docker compose -f examples/otel-traces/compose.yaml config` before submission.
 
 ### Provider example workspaces
 
