@@ -35,6 +35,20 @@
 //! reads the host process environment — including through `jq`, whose standard library exports an
 //! `env` filter that is deliberately not linked.
 //!
+//! # Observability
+//!
+//! Every command word a script runs emits a `shell.command` span with a `shell.command.started` /
+//! `shell.command.completed` event pair, so a trace reads as the ordered list of commands a script
+//! actually executed rather than as one opaque "a script ran" entry.
+//!
+//! This crate depends on `tracing` and nothing else for that. It knows no exporter, no collector,
+//! and no telemetry protocol; the embedding binary's own subscriber decides where these go, the
+//! same way `curl` here links no HTTP client and only assembles a request for one capability. The
+//! dependency does not compromise the synchronous design constraint below — `tracing` imposes no
+//! async runtime and is routinely used from fully synchronous code — but it does mean spans may
+//! leave the process, so `interp::telemetry` documents exactly which fields a command may carry:
+//! never an argument value, and never a model-authored command word.
+//!
 //! # Example
 //!
 //! ```
@@ -74,9 +88,9 @@ pub mod parser;
 pub mod value;
 
 pub use limits::{
-    DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS, DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT,
-    Limits,
+    DEFAULT_ALLOW_CLOCK, DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS,
+    DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT, Limits,
 };
 pub use parser::ParseError;
 
@@ -137,8 +151,9 @@ pub trait CapabilityInvoker {
 
     /// Invokes one capability synchronously.
     ///
-    /// Phase 1 is deliberately synchronous: this crate carries no async dependency, and the calling
-    /// binary's model tool loop is untouched.
+    /// This is deliberately synchronous: this crate carries no async runtime dependency, and the
+    /// calling binary's model tool loop is untouched. An implementation that is asynchronous
+    /// underneath bridges here itself, which is what `dekopon-run` does from its blocking task.
     fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult;
 }
 
