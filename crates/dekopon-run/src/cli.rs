@@ -377,6 +377,15 @@ pub struct ShellLimitArgs {
         value_name = "BYTES"
     )]
     pub shell_max_value_bytes: u64,
+
+    /// Let the `date` builtin read the host wall clock.
+    ///
+    /// Off by default, and the only ambient authority the interpreter has to grant: unlike `curl`,
+    /// which is bound to one operator-configured capability, there is no provider to authorize
+    /// "what time is it". With this unset, `date` reports "command not found" like any capability
+    /// this session was not granted, rather than returning a fabricated time a script would trust.
+    #[arg(long)]
+    pub shell_allow_clock: bool,
 }
 
 /// Bounded Wasmtime store settings.

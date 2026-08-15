@@ -23,6 +23,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 32;
 /// Default ceiling on the value bytes one script may materialize.
 pub const DEFAULT_MAX_VALUE_BYTES: u64 = 32 * 1024 * 1024;
+/// Whether a script may read the host wall clock by default. It may not.
+pub const DEFAULT_ALLOW_CLOCK: bool = false;
 
 /// Configurable execution bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +43,14 @@ pub struct Limits {
     pub max_capability_calls: u32,
     /// Maximum value bytes one script may materialize; see [`Budget::charge_value_bytes`].
     pub max_value_bytes: u64,
+    /// Whether the `date` builtin may read the host wall clock.
+    ///
+    /// This is the odd one out in this struct: it is a permission rather than a ceiling. It lives
+    /// here anyway because it travels the same path every other bound does, from one CLI flag
+    /// through one construction site, and a second parallel channel for a single boolean would be
+    /// one more place for the two to disagree. Off by default: reading the clock is ambient
+    /// authority, and with it off `date` is simply not a command this session has.
+    pub allow_clock: bool,
 }
 
 impl Default for Limits {
@@ -53,6 +63,7 @@ impl Default for Limits {
             timeout: DEFAULT_TIMEOUT,
             max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            allow_clock: DEFAULT_ALLOW_CLOCK,
         }
     }
 }

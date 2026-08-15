@@ -1,8 +1,8 @@
 //! Abstract syntax produced by [`crate::parser`] and walked by the evaluator.
 //!
 //! The shape covers exactly the grammar this sandbox keeps. Constructs that were deliberately
-//! dropped (backgrounding, subshells, here-documents, process substitution, `case`, `eval`, brace
-//! groups) have no representation here at all, so no evaluator path can accidentally implement one.
+//! dropped (backgrounding, subshells, process substitution, `eval`, brace groups) have no
+//! representation here at all, so no evaluator path can accidentally implement one.
 
 /// A parsed script or block.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +22,8 @@ pub enum Statement {
     For(ForLoop),
     /// `while LIST; do ...; done` or `until LIST; do ...; done`.
     While(WhileLoop),
+    /// `case WORD in PATTERN) ...;; esac`.
+    Case(CaseStatement),
     /// `name() { ... }`.
     Function(FunctionDefinition),
 }
@@ -65,6 +67,8 @@ pub struct SimpleCommand {
     pub words: Vec<Word>,
     /// `>` or `>>` into a named in-memory buffer.
     pub redirect: Option<Redirect>,
+    /// `<<DELIM` body, supplying this command's input in place of anything piped into it.
+    pub here_doc: Option<Word>,
 }
 
 /// A `NAME=value` assignment.
@@ -117,6 +121,44 @@ pub struct WhileLoop {
     pub body: Program,
     /// `true` for `until`, which iterates while the condition's status is non-zero.
     pub until: bool,
+}
+
+/// `case WORD in PATTERN) ...;; esac`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaseStatement {
+    /// The word each clause's patterns are matched against.
+    pub subject: Word,
+    /// Clauses in source order; the first whose pattern matches runs, and no other.
+    pub clauses: Vec<CaseClause>,
+}
+
+/// One `PATTERN|PATTERN) LIST ;;` clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaseClause {
+    /// Alternatives, any one of which selects this clause.
+    pub patterns: Vec<CasePattern>,
+    /// Body run when a pattern matches.
+    pub body: Program,
+}
+
+/// One `case` alternative.
+///
+/// Bash matches these as filename-style patterns. This shell matches literal text instead, for the
+/// same reason `builtins`' `grep` and `sed` take literal patterns: a partial wildcard is
+/// the pattern a literal matcher answers wrongly and silently, so it is rejected by name rather
+/// than quietly mismatched. A bare `*` is kept, because it is the default branch rather than a
+/// wildcard in any meaningful sense.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CasePattern {
+    /// A bare `*`: the catch-all branch, which matches every subject.
+    Any,
+    /// A constant pattern, already checked for pattern syntax when it was parsed.
+    Literal(Word),
+    /// A pattern built from expansions, checked for pattern syntax when it is expanded.
+    ///
+    /// It cannot be checked earlier, because its text does not exist until the script runs — the
+    /// same reason `grep "$pattern"` is checked at run time rather than at parse time.
+    Expanded(Word),
 }
 
 /// `name() { ... }`.

@@ -373,12 +373,12 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `break`/`continue`, functions with `$1`/`$@`/\
-`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, `exit`, both \
-quoting forms, and `>`/`>>` into named in-memory buffers all behave the way you expect. \
-Everything outside that curated set fails loudly and by name: `eval`, backticks, subshells, \
-`[[ ]]`, `case`, `set -e`, `2>&1`, here-documents, and `&` backgrounding are errors, never silent \
-no-ops. If a script ran, it did what it said.
+`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
+with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, \
+`exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
+`>`/`>>` into named in-memory buffers all behave the way you expect. Everything outside that \
+curated set fails loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `2>&1`, \
+`<<<`, and `&` backgrounding are errors, never silent no-ops. If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
@@ -394,10 +394,15 @@ in to work on it.
 tripping one ends the script with a message naming it.
 
 Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
-`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. `curl` opens no socket of its own — \
-it assembles a request for whichever HTTP capability this session was given, and is \"command not \
-found\" when it was given none. `grep` and `sed` patterns are literal text, not regular \
-expressions; use `jq` for real matching.
+`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them exist only when \
+this session was configured for them, and report \"command not found\" otherwise: `curl`, which \
+opens no socket of its own but assembles a request for whichever HTTP capability the session was \
+given, and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant.
+
+Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
+and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
+than a silent mismatch. Use `jq` for real matching. A here-document's body arrives as one JSON \
+string, so pipe it through `jq` when you want structure out of it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
 capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \
@@ -869,6 +874,12 @@ mod tests {
             vec!["http.get --url https://example.test".to_owned()]
         );
     }
+
+    // The companion assertion — that the interpreter's own spans nest under `prompt.script` across
+    // this same bridge — lives in `tests/prompt_tracing.rs` rather than here. `tracing` caches
+    // callsite interest globally and once, so a `prompt.script` first reached by one of the tests
+    // above (which install no subscriber) stays disabled for any later thread-local one; that made
+    // the assertion depend on test ordering. Its own binary removes the race.
 
     #[test]
     fn rejects_a_zero_step_session_before_contacting_the_model() {
