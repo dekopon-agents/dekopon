@@ -261,7 +261,14 @@ impl OtlpHttpClient {
 impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         let request: reqwest::blocking::Request = request.try_into()?;
-        let mut response = self.0.execute(request)?.error_for_status()?;
+        // Deliberately no `error_for_status()`, which upstream's adapter calls. The OTLP SDK has
+        // two failure branches: a status branch that reports the code, and a network branch whose
+        // message is the constant "network error". Turning a 4xx into an `Err` here forces every
+        // response down the network branch, so an expired token or a wrong org path arrives
+        // indistinguishable from a dead socket — and there is no second channel to recover it
+        // from, since the SDK's debug macros compile out without `internal-logs`. Returning the
+        // response lets the SDK classify it and say what to fix.
+        let mut response = self.0.execute(request)?;
         let headers = std::mem::take(response.headers_mut());
         let status = response.status();
         let mut response = Response::builder().status(status).body(response.bytes()?)?;
