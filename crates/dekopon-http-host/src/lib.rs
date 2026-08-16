@@ -295,21 +295,28 @@ impl BufferedHttpClient {
                 span.record("http.response.status_code", status);
             }
         }
-        span.record(
-            "outcome",
-            match &result {
-                Ok(_) => "succeeded",
-                Err(error) => match &error.code {
-                    ErrorCode::Denied => "denied",
-                    ErrorCode::HostCallLimit => "host-call-limit",
-                    ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
-                        "invalid-http-request"
-                    }
-                    ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => "byte-limit",
-                    _ => "failed",
+        span.record("outcome", outcome_label(&result));
+
+        // Accounting rather than lifecycle: the `http.request` span above already carries these
+        // fields and its own duration. This record exists to outlive trace retention and survive
+        // sampling, because an external request is a billed and rate-limited call, and "how many,
+        // to where, how big" is asked long after the trace has expired. Same sanitized set — no
+        // path, query, header, or body — for the same reason.
+        if let Some(evidence) = self.evidence.get(evidence_index) {
+            tracing::info!(
+                target: "dekopon_http_host::audit",
+                {
+                    audit.event = "accounting.http.request",
+                    "http.request.method" = evidence.method.as_str(),
+                    "server.address" = evidence.authority.as_str(),
+                    "http.response.status_code" = evidence.status.unwrap_or_default(),
+                    "http.request.body.size" = evidence.request_bytes,
+                    "http.response.body.size" = evidence.response_bytes,
+                    outcome = outcome_label(&result),
                 },
-            },
-        );
+                "external HTTP request accounted"
+            );
+        }
 
         if let Err(error) = &result {
             self.policy_violation = match &error.code {
@@ -854,6 +861,22 @@ fn bounded_message(message: &str) -> String {
         }
     }
     output
+}
+
+/// One outcome vocabulary for the span and the accounting record, so they cannot disagree.
+fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
+    match result {
+        Ok(_) => "succeeded",
+        Err(error) => match &error.code {
+            ErrorCode::Denied => "denied",
+            ErrorCode::HostCallLimit => "host-call-limit",
+            ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
+                "invalid-http-request"
+            }
+            ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => "byte-limit",
+            _ => "failed",
+        },
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,47 @@ the backend, correlated by trace context rather than by one relaying for the oth
 This is operational observability. It does not replace broker policy evidence, authorized
 invocation results, or the broker's durable hash-linked audit log.
 
+## Which signal carries what
+
+Dekopon emits three signals, and they answer different questions. Keeping them separate is what
+stops the log stream from becoming a worse copy of the trace.
+
+| Signal | Question | Lifetime |
+|---|---|---|
+| **Broker audit** | What was *authorized*? | Permanent, hash-chained, owner-only |
+| **Traces** | What did the code do, and how long did it take? | Sampled; expires with trace retention |
+| **Logs** | What could not be a span, and what must outlive one? | Retained independently |
+
+The rule that follows from this: **a span is a span of time; a log is a fact that is not a
+duration.** A log event has to justify itself as one of two things.
+
+- **A payload.** Text too large or too unbounded to belong in a span attribute — the model and tool
+  transcript below.
+- **A survivor.** Something still needed after traces expire or when traces are sampled — costs,
+  refusals, and errors.
+
+An `X.started` event is never either: the span's start time is strictly better, and it carries
+parent and duration besides. Dekopon used to emit a started/completed log pair for every span,
+which predated the OTLP exporter — when nothing exported traces, those pairs *were* the telemetry.
+They are gone. What remains is accounting, refusals, errors, and payloads.
+
+## Accounting
+
+Two events exist to survive trace expiry and sampling, because they record calls that cost money or
+consume a rate limit:
+
+| Event | Emitted by | Carries |
+|---|---|---|
+| `accounting.model.turn` | `dekopon-run` | turn index, duration, message and tool-call counts, outcome |
+| `accounting.http.request` | `dekopon-http-host` | method, authority, status, request/response bytes, outcome |
+
+Both duplicate fields that also appear on a span, and that is deliberate — the span answers "why
+was this request slow", the accounting record answers "how many did we make last month". Neither is
+a substitute for broker audit, which remains the only record of what was authorized.
+
+`accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
+URL path or query, no headers, no bodies.
+
 ## Enable OTLP export
 
 Export remains disabled unless an endpoint is configured:
@@ -145,7 +186,7 @@ trace fetch would drag the payload along, and a backend indexes log bodies for f
 rather than span fields. Both signals carry the same `trace_id` and `span_id`, so a log result
 still pivots to the turn it belongs to.
 
-With `telemetryPayloads` enabled, four events join the existing metadata ones:
+With `telemetryPayloads` enabled, four events join the accounting and refusal ones:
 
 | Event | Carries |
 |---|---|
@@ -154,9 +195,10 @@ With `telemetryPayloads` enabled, four events join the existing metadata ones:
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
 
-The metadata events (`agent.model.requested`, `agent.tool.invocation.started`, and the rest) are
-unchanged in either mode, so turn counts, durations, exit codes, and outcomes remain available
-without opting in to content.
+`accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
+available without opting in to content. The per-command detail that used to arrive as
+`shell.command.started`/`.completed` pairs now lives on the `shell.command` span, which carries the
+command word, its kind, its argument count, its exit code, and its outcome.
 
 ## Redacting secrets
 
@@ -204,7 +246,7 @@ Inside it, `shell.command` is one span per command word the script actually ran,
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code mapping; flattening them would hide an authorization refusal in the noise of ordinary failures. `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this shell excludes, and an exhausted sandbox budget.
 
-Structured log records use stable `audit.event` attributes for command, session, model-turn, script-execution, per-command, and direct guest-invocation lifecycle events. Each command emits a `shell.command.started` / `shell.command.completed` pair inside its span, the completed record adding `duration_ms` alongside the attributes above. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
+Structured log records use stable `audit.event` attributes. They no longer mirror spans: a command's start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream carries only accounting, refusals, errors, and — when opted in — payloads. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
 
 ## Data minimization
 

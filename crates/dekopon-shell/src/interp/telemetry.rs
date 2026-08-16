@@ -28,8 +28,6 @@
 //! reported as [`WITHHELD`] rather than copied, mirroring the runner's existing refusal to copy a
 //! model-selected invalid tool name into a rejection event.
 
-use std::time::Duration;
-
 use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded};
 
 /// Stands in for a command word this crate declines to copy into telemetry.
@@ -160,11 +158,6 @@ pub(crate) fn fatal_outcome(fatal: &FatalError) -> &'static str {
         FatalError::Limit(_) => "limit-exceeded",
         FatalError::Unsupported(_) => "rejected",
     }
-}
-
-/// Renders a duration the way every other `duration_ms` field in this workspace is rendered.
-pub(crate) fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]

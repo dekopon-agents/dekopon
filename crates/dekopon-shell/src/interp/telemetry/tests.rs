@@ -39,10 +39,6 @@ impl Captured {
     fn field(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }
-
-    fn audit_event(&self) -> Option<&str> {
-        self.field("audit.event")
-    }
 }
 
 /// Collects every field of a span or event as its rendered string.
@@ -148,15 +144,18 @@ impl Telemetry {
             .collect()
     }
 
-    /// The ordered `shell.command.started` events, as `(kind, name)` pairs.
-    fn started(&self) -> Vec<(&str, &str)> {
-        self.events
+    /// Every `shell.command` span, as `(kind, name)` pairs.
+    ///
+    /// Spans are captured on close, so these are in completion order: a command nested inside a
+    /// shell function closes before the function does.
+    fn commands(&self) -> Vec<(&str, &str)> {
+        self.spans
             .iter()
-            .filter(|event| event.audit_event() == Some("shell.command.started"))
-            .map(|event| {
+            .filter(|span| span.span.as_deref() == Some("shell.command"))
+            .map(|span| {
                 (
-                    event.field("shell.command.kind").unwrap_or("<missing>"),
-                    event.field("shell.command.name").unwrap_or("<missing>"),
+                    span.field("shell.command.kind").unwrap_or("<missing>"),
+                    span.field("shell.command.name").unwrap_or("<missing>"),
                 )
             })
             .collect()
@@ -202,7 +201,7 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
 }
 
 #[test]
-fn every_command_produces_one_span_and_one_started_completed_pair() {
+fn every_command_produces_exactly_one_span() {
     let telemetry =
         capture("greet() { echo hi; }\ngreet\njq -n 1\necho.echo --message two\nnosuchcommand\n:");
 
@@ -210,10 +209,12 @@ fn every_command_produces_one_span_and_one_started_completed_pair() {
     // call and the command inside it are both here — which is the point of instrumenting the one
     // seam every command passes through.
     assert_eq!(
-        telemetry.started(),
+        telemetry.commands(),
         vec![
-            ("function", WITHHELD),
+            // `echo` runs inside `greet`, so it closes first. Spans are captured on close, which
+            // makes this completion order rather than start order.
             ("builtin", "echo"),
+            ("function", WITHHELD),
             ("builtin", "jq"),
             ("capability", "echo.echo"),
             ("not-found", WITHHELD),
@@ -226,13 +227,7 @@ fn every_command_produces_one_span_and_one_started_completed_pair() {
         .iter()
         .filter(|span| span.span.as_deref() == Some("shell.command"))
         .count();
-    let completed = telemetry
-        .events
-        .iter()
-        .filter(|event| event.audit_event() == Some("shell.command.completed"))
-        .count();
     assert_eq!(spans, 6);
-    assert_eq!(completed, 6);
 }
 
 #[test]
@@ -265,9 +260,9 @@ fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
     ] {
         let telemetry = capture(script);
         let completed = telemetry
-            .events
+            .spans
             .iter()
-            .find(|event| event.audit_event() == Some("shell.command.completed"))
+            .find(|span| span.span.as_deref() == Some("shell.command"))
             .unwrap_or_else(|| panic!("{script}: a completed event"));
         assert_eq!(completed.field("outcome"), Some(outcome), "{script}");
         assert_eq!(
@@ -282,10 +277,10 @@ fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
 fn a_refused_word_reports_the_reason_it_aborted_the_script() {
     let telemetry = capture("eval 'echo hi'");
     let completed = telemetry
-        .events
+        .spans
         .iter()
-        .find(|event| event.audit_event() == Some("shell.command.completed"))
-        .expect("a completed event");
+        .find(|span| span.span.as_deref() == Some("shell.command"))
+        .expect("a shell.command span");
 
     assert_eq!(completed.field("shell.command.kind"), Some("rejected"));
     // The word comes from this crate's own refusal table, so naming it exports nothing the script
@@ -308,10 +303,10 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
         false,
     );
     let completed = telemetry
-        .events
+        .spans
         .iter()
-        .rfind(|event| event.audit_event() == Some("shell.command.completed"))
-        .expect("a completed event");
+        .rfind(|span| span.span.as_deref() == Some("shell.command"))
+        .expect("a shell.command span");
     assert_eq!(completed.field("outcome"), Some("limit-exceeded"));
 }
 
@@ -337,7 +332,7 @@ fn argument_values_never_reach_telemetry() {
 
     let telemetry = capture(&script);
     assert!(
-        !telemetry.spans.is_empty() && !telemetry.events.is_empty(),
+        !telemetry.spans.is_empty(),
         "the capture harness recorded nothing, so absence here would prove nothing"
     );
 
@@ -361,10 +356,11 @@ fn a_model_authored_command_word_is_withheld_but_its_kind_is_not() {
     let telemetry = capture("secret_helper() { echo hi; }\nsecret_helper\nsecret_typo");
 
     assert_eq!(
-        telemetry.started(),
+        telemetry.commands(),
         vec![
-            ("function", WITHHELD),
+            // Completion order: the body of `greet` closes before `greet` itself.
             ("builtin", "echo"),
+            ("function", WITHHELD),
             ("not-found", WITHHELD),
         ]
     );
@@ -383,7 +379,7 @@ fn xargs_records_every_command_it_actually_drove() {
     let telemetry = capture("echo.echo --a a --b b --c c | jq '[.a,.b,.c]' | xargs echo");
 
     let echoes = telemetry
-        .started()
+        .commands()
         .into_iter()
         .filter(|(kind, name)| *kind == "builtin" && *name == "echo")
         .count();

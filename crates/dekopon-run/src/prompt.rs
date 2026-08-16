@@ -105,32 +105,12 @@ where
         prompt.max_capability_calls = limits.max_capability_calls
     );
     let _session = session_span.enter();
-    tracing::info!(
-        target: "dekopon_run::audit",
-        {
-            audit.event = "agent.session.started",
-            prompt.max_steps = limits.max_steps,
-            prompt.max_capability_calls = limits.max_capability_calls,
-            tool.count = model_tools.len(),
-        },
-        "prompt session started"
-    );
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
 
     for model_turns in 1..=limits.max_steps {
         let model_span = tracing::info_span!("prompt.model_turn", model.turn = model_turns);
         let model_entered = model_span.enter();
-        tracing::info!(
-            target: "dekopon_run::audit",
-            {
-                audit.event = "agent.model.requested",
-                model.turn = model_turns,
-                message.count = messages.len(),
-                tool.count = model_tools.len(),
-            },
-            "model turn requested"
-        );
         // Verbatim transcript rides the log stream rather than span attributes: a conversation is
         // unbounded text, span attributes are the wrong container for it, and the log stream is
         // what a backend indexes for full-text search. Both carry the same trace and span IDs, so
@@ -153,7 +133,7 @@ where
                 tracing::error!(
                     target: "dekopon_run::audit",
                     {
-                        audit.event = "agent.model.completed",
+                        audit.event = "accounting.model.turn",
                         model.turn = model_turns,
                         duration_ms = milliseconds(model_started.elapsed()),
                         outcome = "failed",
@@ -163,12 +143,17 @@ where
                 return Err(error.into());
             }
         };
+        // Accounting rather than lifecycle: the `prompt.model_turn` span already says a turn
+        // happened and how long it took. This record exists to outlive trace retention and survive
+        // sampling, because a model turn is a billed call and "how many did we make, at what
+        // latency" is a question asked long after the trace is gone.
         tracing::info!(
             target: "dekopon_run::audit",
             {
-                audit.event = "agent.model.completed",
+                audit.event = "accounting.model.turn",
                 model.turn = model_turns,
                 duration_ms = milliseconds(model_started.elapsed()),
+                message.count = messages.len(),
                 tool_call.count = turn.tool_calls.len(),
                 answer.present = turn
                     .content
@@ -176,7 +161,7 @@ where
                     .is_some_and(|content| !content.trim().is_empty()),
                 outcome = "succeeded",
             },
-            "model turn completed"
+            "model turn accounted"
         );
         if dekopon_core::telemetry_payloads() {
             tracing::info!(
@@ -259,17 +244,6 @@ where
             );
             let outcome = {
                 let _entered = span.enter();
-                tracing::info!(
-                    target: "dekopon_run::audit",
-                    {
-                        audit.event = "agent.tool.invocation.started",
-                        model.turn = model_turns,
-                        tool_call.index = tool_call_index,
-                        script.max_capability_calls = remaining,
-                        script.bytes = script.len(),
-                    },
-                    "agent tool invocation started"
-                );
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
                         target: "dekopon_run::audit",
@@ -282,26 +256,10 @@ where
                         "agent tool script"
                     );
                 }
-                let started = Instant::now();
                 // `run_script` returns no `Result`: a failed script is an outcome the model reads
-                // and recovers from, so this pair always completes and reports `outcome` from the
-                // script's own exit code rather than from a host error.
+                // and recovers from, so the `prompt.script` span always closes normally and
+                // reports the script's own exit code rather than a host error.
                 let outcome = runtime.run_script(&script, remaining);
-                tracing::info!(
-                    target: "dekopon_run::audit",
-                    {
-                        audit.event = "agent.tool.invocation.completed",
-                        model.turn = model_turns,
-                        tool_call.index = tool_call_index,
-                        duration_ms = milliseconds(started.elapsed()),
-                        script.exit_code = outcome.exit_code.get(),
-                        script.steps = outcome.steps,
-                        script.capability_calls = outcome.capability_calls,
-                        script.truncated = outcome.truncated,
-                        outcome = script_outcome_label(&outcome),
-                    },
-                    "agent tool invocation completed"
-                );
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
                         target: "dekopon_run::audit",
