@@ -129,4 +129,75 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
             "{sentinel} leaked into a span field: {recorded}"
         );
     }
+
+    // Same client, payloads enabled. The URL now appears, because the operator asked for it — and
+    // headers and body still do not, because verbosity widens what spans carry, not everything.
+    dekopon_core::set_span_payloads(true);
+    let (verbose_authority, verbose_handle) = mock_http();
+    let mut verbose = BufferedHttpClient::authorized(
+        HttpConstraints {
+            allowed_hosts: vec![verbose_authority.clone()],
+            allowed_methods: vec!["POST".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+        },
+        HttpHostCeilings::default(),
+        Duration::from_secs(5),
+    )
+    .expect("verbose fixture client");
+
+    captured.0.lock().expect("capture sink").clear();
+    verbose
+        .send(Request {
+            method: "POST".to_owned(),
+            uri: format!("http://{verbose_authority}/VERBOSE_PATH?VERBOSE_QUERY=1"),
+            headers: vec![Header {
+                name: "x-probe".to_owned(),
+                value: b"STILL_SECRET_HEADER".to_vec(),
+            }],
+            body: b"STILL_SECRET_BODY".to_vec(),
+        })
+        .await
+        .expect("verbose loopback request succeeds");
+    verbose_handle.join().expect("verbose fixture exits");
+    dekopon_core::set_span_payloads(false);
+
+    let verbose_recorded = captured.0.lock().expect("capture sink").clone();
+    assert!(
+        verbose_recorded.contains("VERBOSE_PATH"),
+        "{verbose_recorded}"
+    );
+    assert!(
+        verbose_recorded.contains("VERBOSE_QUERY"),
+        "{verbose_recorded}"
+    );
+    for sentinel in ["STILL_SECRET_HEADER", "STILL_SECRET_BODY"] {
+        assert!(
+            !verbose_recorded.contains(sentinel),
+            "{sentinel} leaked even though only URLs were opted into: {verbose_recorded}"
+        );
+    }
+}
+
+/// A credential inside a payload stays redacted whichever mode the process runs in. This is the
+/// property that makes "the sink is in scope for our data" a safe statement to make: it is a
+/// statement about data, and a credential is not data the operator agreed to retain.
+#[test]
+fn redacted_values_survive_verbose_mode() {
+    use dekopon_core::Redacted;
+
+    let secret = Redacted::new("sk-live-abcdef0123456789".to_owned());
+    for enabled in [false, true] {
+        dekopon_core::set_span_payloads(enabled);
+        assert!(!format!("{secret}").contains("sk-live"));
+        assert!(!format!("{secret:?}").contains("sk-live"));
+        assert!(
+            !serde_json::to_string(&secret)
+                .expect("redacted serializes")
+                .contains("sk-live")
+        );
+    }
+    dekopon_core::set_span_payloads(false);
 }

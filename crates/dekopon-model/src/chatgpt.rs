@@ -15,6 +15,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dekopon_core::Redacted;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -109,7 +110,8 @@ impl ChatGptCodexModel {
         if !force && unix_time()? < refresh_at {
             return Ok(());
         }
-        *credentials = refresh_credentials(&self.agent, &self.endpoints, &credentials.refresh)?;
+        *credentials =
+            refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose())?;
         save_credentials(&self.auth_path, credentials)
     }
 
@@ -123,7 +125,10 @@ impl ChatGptCodexModel {
         let response = self
             .agent
             .post(&self.endpoints.responses)
-            .header("authorization", &format!("Bearer {}", credentials.access))
+            .header(
+                "authorization",
+                &format!("Bearer {}", credentials.access.expose()),
+            )
             .header("chatgpt-account-id", &credentials.account_id)
             .header("originator", "dekopon")
             .header(
@@ -310,14 +315,14 @@ struct DeviceAuthorizationResponse {
 }
 
 struct DeviceAuthorization {
-    code: String,
-    verifier: String,
+    code: Redacted<String>,
+    verifier: Redacted<String>,
 }
 
 #[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
+    access_token: Redacted<String>,
+    refresh_token: Redacted<String>,
     expires_in: u64,
 }
 
@@ -325,8 +330,12 @@ struct TokenResponse {
 #[serde(rename_all = "camelCase")]
 struct ChatGptCredentials {
     version: u32,
-    access: String,
-    refresh: String,
+    // The auth file is the one destination that must round-trip these in the clear. Opting in per
+    // field keeps the default safe: any other struct these end up in redacts them automatically.
+    #[serde(serialize_with = "dekopon_core::serialize_exposed")]
+    access: Redacted<String>,
+    #[serde(serialize_with = "dekopon_core::serialize_exposed")]
+    refresh: Redacted<String>,
     expires_at: u64,
     account_id: String,
 }
@@ -394,8 +403,8 @@ fn poll_device_login(
                 .read_json::<DeviceAuthorizationResponse>()
                 .map_err(|error| ChatGptError::Protocol(error.to_string()))?;
             return Ok(DeviceAuthorization {
-                code: response.authorization_code,
-                verifier: response.code_verifier,
+                code: Redacted::new(response.authorization_code),
+                verifier: Redacted::new(response.code_verifier),
             });
         }
         let body = read_error_body(response);
@@ -440,8 +449,8 @@ fn exchange_authorization(
         [
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
-            ("code", authorization.code.as_str()),
-            ("code_verifier", authorization.verifier.as_str()),
+            ("code", authorization.code.expose().as_str()),
+            ("code_verifier", authorization.verifier.expose().as_str()),
             ("redirect_uri", DEVICE_REDIRECT_URI),
         ],
     )
@@ -482,12 +491,12 @@ fn request_token<'a, const N: usize>(
         .body_mut()
         .read_json::<TokenResponse>()
         .map_err(|error| ChatGptError::Protocol(error.to_string()))?;
-    if token.access_token.is_empty() || token.refresh_token.is_empty() {
+    if token.access_token.expose().is_empty() || token.refresh_token.expose().is_empty() {
         return Err(ChatGptError::Protocol(
             "token response omitted required credentials".to_owned(),
         ));
     }
-    let account_id = extract_account_id(&token.access_token)?;
+    let account_id = extract_account_id(token.access_token.expose())?;
     Ok(ChatGptCredentials {
         version: AUTH_VERSION,
         access: token.access_token,
@@ -917,8 +926,8 @@ fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
             credentials.version
         )));
     }
-    if credentials.access.is_empty()
-        || credentials.refresh.is_empty()
+    if credentials.access.expose().is_empty()
+        || credentials.refresh.expose().is_empty()
         || credentials.account_id.is_empty()
     {
         return Err(ChatGptError::Configuration(
@@ -1115,6 +1124,8 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use dekopon_core::Redacted;
+
     use super::{
         AUTH_VERSION, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints, build_request_body,
         extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
@@ -1158,8 +1169,8 @@ mod tests {
         let path = temp.path().join("auth.json");
         let credentials = ChatGptCredentials {
             version: AUTH_VERSION,
-            access: fake_access("acct-test"),
-            refresh: "refresh-secret".to_owned(),
+            access: Redacted::new(fake_access("acct-test")),
+            refresh: Redacted::new("refresh-secret".to_owned()),
             expires_at: u64::MAX,
             account_id: "acct-test".to_owned(),
         };
@@ -1168,7 +1179,7 @@ mod tests {
         let loaded = load_credentials(&path).expect("load credentials");
 
         assert_eq!(loaded.account_id, "acct-test");
-        assert_eq!(loaded.refresh, "refresh-secret");
+        assert_eq!(loaded.refresh.expose(), "refresh-secret");
         let status = status(Some(&path)).expect("credential status");
         assert!(status.signed_in);
         assert!(!status.expired);
@@ -1296,7 +1307,7 @@ mod tests {
 
         let credentials = load_credentials(&path).expect("stored credentials");
         assert_eq!(credentials.account_id, "acct-login");
-        assert_eq!(credentials.refresh, "refresh-1");
+        assert_eq!(credentials.refresh.expose(), "refresh-1");
         let output = String::from_utf8(output).expect("UTF-8 login output");
         assert!(output.contains("CODE-1234"));
         let requests = server.requests.lock().expect("request lock");
@@ -1324,8 +1335,8 @@ mod tests {
             &path,
             &ChatGptCredentials {
                 version: AUTH_VERSION,
-                access: fake_access("acct-test"),
-                refresh: "refresh-secret".to_owned(),
+                access: Redacted::new(fake_access("acct-test")),
+                refresh: Redacted::new("refresh-secret".to_owned()),
                 expires_at: u64::MAX,
                 account_id: "acct-test".to_owned(),
             },
@@ -1378,8 +1389,8 @@ mod tests {
             &path,
             &ChatGptCredentials {
                 version: AUTH_VERSION,
-                access: fake_access("acct-old"),
-                refresh: "refresh-old".to_owned(),
+                access: Redacted::new(fake_access("acct-old")),
+                refresh: Redacted::new("refresh-old".to_owned()),
                 expires_at: 0,
                 account_id: "acct-old".to_owned(),
             },
@@ -1400,7 +1411,7 @@ mod tests {
         assert_eq!(turn.content.as_deref(), Some("refreshed"));
         let credentials = load_credentials(&path).expect("refreshed credentials persisted");
         assert_eq!(credentials.account_id, "acct-refreshed");
-        assert_eq!(credentials.refresh, "refresh-new");
+        assert_eq!(credentials.refresh.expose(), "refresh-new");
         let requests = server.requests.lock().expect("request lock");
         assert!(requests[0].contains("grant_type=refresh_token"));
         assert!(requests[1].contains("chatgpt-account-id: acct-refreshed"));
@@ -1419,8 +1430,8 @@ mod tests {
             &path,
             &ChatGptCredentials {
                 version: AUTH_VERSION,
-                access: fake_access("acct-test"),
-                refresh: "refresh-secret".to_owned(),
+                access: Redacted::new(fake_access("acct-test")),
+                refresh: Redacted::new("refresh-secret".to_owned()),
                 expires_at: u64::MAX,
                 account_id: "acct-test".to_owned(),
             },

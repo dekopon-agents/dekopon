@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use dekopon_core::Redacted;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -148,7 +150,7 @@ pub struct OpenAiChatModel {
     agent: Agent,
     endpoint: String,
     model: String,
-    bearer_token: Option<String>,
+    bearer_token: Option<Redacted<String>>,
 }
 
 impl OpenAiChatModel {
@@ -184,7 +186,7 @@ impl OpenAiChatModel {
         let agent = config.into();
         let bearer_token = bearer_token.and_then(|token| {
             let token = token.trim().to_owned();
-            (!token.is_empty()).then_some(token)
+            (!token.is_empty()).then_some(Redacted::new(token))
         });
         if bearer_token.is_some() && !allows_bearer_token(&endpoint) {
             return Err(ModelError::Configuration(
@@ -234,7 +236,9 @@ impl ChatModel for OpenAiChatModel {
             .post(&self.endpoint)
             .header("accept", "application/json");
         if let Some(token) = &self.bearer_token {
-            request = request.header("authorization", &format!("Bearer {token}"));
+            // One of the few places a credential leaves its wrapper, and it goes straight onto the
+            // wire rather than into a variable that could later be formatted somewhere else.
+            request = request.header("authorization", &format!("Bearer {}", token.expose()));
         }
         let mut response = request
             .send_json(&request_body)

@@ -47,7 +47,12 @@ telemetry:
   transport: grpc            # grpc | http
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
+  spanPayloads: false
 ```
+
+`spanPayloads: true` adds provider input and HTTP URLs to spans, declaring the telemetry sink in
+scope for the data this broker handles. It never exposes a credential: `Redacted` values render
+their marker in either mode, and durable audit records are unaffected either way.
 
 It has no credential field by design. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters

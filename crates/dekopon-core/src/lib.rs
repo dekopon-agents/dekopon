@@ -6,11 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+mod redaction;
+mod span_payloads;
+
 use std::{fmt, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
+
+pub use redaction::{Redacted, redaction_marker, serialize_exposed};
+pub use span_payloads::{set_span_payloads, span_payloads};
 
 const MAX_IDENTIFIER_LENGTH: usize = 253;
 

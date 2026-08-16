@@ -549,11 +549,18 @@ impl BrokerProviderRegistry {
                 &proposal.input,
                 authorized.constraints(),
             )
-            .instrument(tracing::info_span!(
-                "provider.invoke",
-                capability = %proposal.capability,
-                provider = %provider.manifest.id,
-            ))
+            .instrument({
+                let span = tracing::info_span!(
+                    "provider.invoke",
+                    capability = %proposal.capability,
+                    provider = %provider.manifest.id,
+                    input = tracing::field::Empty,
+                );
+                if dekopon_core::span_payloads() {
+                    span.record("input", tracing::field::display(&proposal.input));
+                }
+                span
+            })
             .await
     }
 }

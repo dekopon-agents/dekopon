@@ -269,8 +269,14 @@ impl BufferedHttpClient {
             "http.response.status_code" = tracing::field::Empty,
             "http.request.body.size" = tracing::field::Empty,
             "http.response.body.size" = tracing::field::Empty,
+            "url.full" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
+        // Opt-in only. `url.full` is the field that carries a path and query, which is exactly
+        // what the metadata-only default withholds.
+        if dekopon_core::span_payloads() {
+            span.record("url.full", request.uri.as_str());
+        }
         let _entered = span.enter();
 
         let evidence_index = self.evidence.len();

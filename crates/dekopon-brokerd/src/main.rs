@@ -4,7 +4,6 @@ use std::{io, path::PathBuf, process::ExitCode};
 #[cfg(unix)]
 use clap::Parser;
 #[cfg(unix)]
-use dekopon_telemetry::ExporterSettings;
 #[cfg(unix)]
 use opentelemetry::trace::TracerProvider as _;
 #[cfg(unix)]
@@ -47,7 +46,10 @@ async fn main() -> ExitCode {
         .ok()
         .flatten();
 
-    let tracer_provider = match settings.as_ref().map(ExporterSettings::tracer_provider) {
+    let tracer_provider = match settings
+        .as_ref()
+        .map(|telemetry| telemetry.settings.tracer_provider())
+    {
         Some(Ok(provider)) => Some(provider),
         // Telemetry must never keep the broker from starting. Authorization and audit are the
         // service's contract; observability is not, and failing closed here would trade a working

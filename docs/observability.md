@@ -119,6 +119,44 @@ none of them reach a span field.
 `provider.compile` covers startup component compilation rather than per-invocation work, so it
 answers "why was the broker slow to become ready" rather than "why was that call slow".
 
+## Span payloads
+
+Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope
+for the data a process handles can opt in to payload-bearing fields — `--otel-span-payloads true`
+on `dekopon-run`, `DEKOPON_OTEL_SPAN_PAYLOADS`, or `telemetry.spanPayloads: true` in `broker.yaml`.
+
+| Span | Field added |
+|---|---|
+| `broker.authorize` | `input` — the untrusted proposal payload |
+| `provider.invoke` | `input` — the payload passed to the component |
+| `http.request` | `url.full` — path and query, which the default withholds |
+
+This widens **data**, not credentials. Request and response headers and HTTP bodies stay out in
+both modes, and a `Redacted` value renders its marker in either mode because that is a property of
+the value rather than of the mode. Durable audit records are untouched by this setting: it changes
+telemetry only.
+
+## Redacting secrets
+
+`dekopon_core::Redacted<T>` wraps a value that must never be rendered in the clear. `Debug`,
+`Display`, and `Serialize` all produce a marker instead, and the value leaves only through the
+deliberately conspicuous `expose`. Persisting a real credential — the ChatGPT auth file is the one
+case — requires an explicit `#[serde(serialize_with = "dekopon_core::serialize_exposed")]` per
+field, so the safe behaviour is what you get by default and the exception is visible in review.
+
+The marker is padded to the character width of the value it replaces, so a redacted field keeps the
+shape of the record around it:
+
+```text
+sk-live-abcdef0123456789   ->  [     REDACTED     ]
+short                      ->  *****
+```
+
+Below the width of `[REDACTED]` the word cannot fit, so the marker degrades to asterisks rather
+than truncating into something that reads like a different token. Preserving width is a deliberate
+operator choice and it does leak one fact — how long the secret was — which can narrow down an
+issuer or credential class. It is a readability-for-metadata trade, not a free win.
+
 A short-lived runner uses batch exporters and explicitly shuts down both providers before returning. SDK-reported flush failures make the command fail instead of being silently ignored. `--trace <PATH>` can still produce a local Chrome/Perfetto trace alongside OTLP export.
 
 ## Trace and log model

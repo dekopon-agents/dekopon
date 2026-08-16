@@ -1168,7 +1168,14 @@ where
             invocation = %request.id,
             capability = %request.capability,
             outcome = tracing::field::Empty,
+            input = tracing::field::Empty,
         );
+        // Opt-in only. Provider input is the payload the metadata-only default withholds; a
+        // `Redacted` value inside it still renders its marker, because that is a property of the
+        // value rather than of this mode.
+        if dekopon_core::span_payloads() {
+            authorize.record("input", tracing::field::display(&request.input));
+        }
         let rule = {
             let _entered = authorize.enter();
             if !self.replay.reserve(&request.id).await? {

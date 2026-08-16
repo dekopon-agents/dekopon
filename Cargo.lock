@@ -616,9 +616,11 @@ name = "dekopon-http-host"
 version = "0.2.0"
 dependencies = [
  "dekopon-capability",
+ "dekopon-core",
  "futures-util",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
