@@ -25,7 +25,7 @@ cargo run -p dekopon-run -- invoke \
   echo.reverse --input '{"message":"stressed"}'
 
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:5080/api/default \
-OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,stream-name=dekopon' \
+OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,organization=default,stream-name=dekopon' \
   cargo run -p dekopon-run -- invoke \
     --provider examples/providers/echo-provider.wasm \
     echo.echo --input '{"message":"observed"}'

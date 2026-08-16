@@ -26,7 +26,7 @@ Open <http://127.0.0.1:5080/> and sign in with those credentials. OpenObserve st
 
 ## 2. Configure Dekopon
 
-OpenObserve expects the organization in the OTLP endpoint and authentication plus the target stream in headers. `dekopon-run` treats `OTEL_EXPORTER_OTLP_ENDPOINT` as a generic OTLP/HTTP base and appends `/v1/traces` and `/v1/logs` itself.
+OpenObserve reads the organization from the OTLP endpoint path over HTTP — over gRPC it must instead arrive as an `organization` header — and authentication plus the target stream from headers. `dekopon-run` treats `OTEL_EXPORTER_OTLP_ENDPOINT` as a generic OTLP/HTTP base and appends `/v1/traces` and `/v1/logs` itself.
 
 For this disposable local account, construct the Basic token from the root credentials:
 
@@ -36,7 +36,7 @@ auth_token="$(printf '%s:%s' \
   | base64 | tr -d '\r\n')"
 
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:5080/api/default
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20${auth_token},stream-name=dekopon"
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20${auth_token},organization=default,stream-name=dekopon"
 export OTEL_SERVICE_NAME=dekopon-run-local
 ```
 

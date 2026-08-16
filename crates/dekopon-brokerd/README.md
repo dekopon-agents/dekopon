@@ -56,7 +56,10 @@ their marker in either mode, and durable audit records are unaffected either way
 
 It has no credential field by design. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
-this configuration file, the process command line, or a span attribute. Export failures disable
+this configuration file, the process command line, or a span attribute. Receiver routing travels
+the same way: over gRPC OpenObserve reads the organization from an `organization` header and
+rejects exports without it, so include `organization=<org>` alongside the token and
+`stream-name`. Export failures disable
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 

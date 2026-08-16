@@ -82,7 +82,7 @@ run_started_us=$(( $(date +%s) * 1000000 - 60000000 ))
 sentinel="DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR"
 
 OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:$port/api/default" \
-OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20${auth_token},stream-name=${stream}" \
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20${auth_token},organization=default,stream-name=${stream}" \
 OTEL_SERVICE_NAME="$service_name" \
 OTEL_RESOURCE_ATTRIBUTES="deployment.environment.name=smoke,e2e.test.id=openobserve" \
   "$runner" \

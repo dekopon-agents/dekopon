@@ -62,7 +62,7 @@ Export remains disabled unless an endpoint is configured:
 
 ```console
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:5080/api/default
-export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,stream-name=dekopon'
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,organization=default,stream-name=dekopon'
 export OTEL_SERVICE_NAME=dekopon-run
 
 dekopon-run prompt ...
@@ -89,6 +89,16 @@ OpenTelemetry URL-encoded form; for example, `%20` represents the space in `Basi
 intentionally no header CLI flag and no header configuration field, because credentials must not be
 exposed in process arguments, retained in a parsed CLI value, or written into a configuration file.
 
+The example header set works unchanged on both transports. On OpenObserve (observed on v0.92.0)
+`stream-name` selects the stream for traces and logs alike over HTTP and gRPC, so signals land
+identically regardless of transport. The organization is the one asymmetry: HTTP reads it from the
+endpoint path (`/api/default`) and ignores the header, while gRPC has no path to carry it and
+requires the `organization` header — without it the receiver rejects every export with gRPC status
+`InvalidArgument`. The runner surfaces that only as a flush error on exit, and the broker silences
+transport crates entirely, so a missing organization looks like telemetry that simply never
+arrives. Keep `organization=<org>` in the header set unconditionally; over HTTP it is redundant,
+never harmful.
+
 Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals. HTTPS endpoints use WebPKI roots, and redirects are disabled so a receiver cannot forward an authorization header to another destination. Plain HTTP is suitable only for a loopback development receiver or an otherwise trusted isolated network because headers and telemetry are unencrypted.
 
 ## Broker export
@@ -108,6 +118,9 @@ telemetry:
 There is deliberately no credential field. The broker reads `OTEL_EXPORTER_OTLP_HEADERS` like the
 runner does, so a token never enters the configuration file the broker parses, its command line, or
 any span attribute — the same rule that keeps provider credentials out of prompts and audit fields.
+With `transport: grpc` the endpoint is an authority that names no organization, so the header set
+must carry `organization=<org>` — the receiver otherwise rejects every export, invisibly, because
+the broker's log filter silences transport crates.
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
 authorization and durable audit are the service's contract, and a missing dashboard must not cost a
