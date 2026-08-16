@@ -5,14 +5,11 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
-use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use dekopon_broker_protocol::TraceParent;
+use dekopon_telemetry::{ExporterSettings, TelemetryError};
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
-use opentelemetry_otlp::{
-    ExporterBuildError, LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
-};
-use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvider};
+use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider};
 use thiserror::Error;
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::{
@@ -27,47 +24,6 @@ const TRACE_FILTER: &str =
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
 /// feed its own export failures back into itself.
 const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
-
-/// Adapter around the workspace's existing TLS-enabled reqwest client.
-///
-/// `opentelemetry-otlp` otherwise selects its own newer reqwest line, duplicating the HTTP/TLS
-/// stack. Supplying the client also lets us reject redirects so an authorization header cannot be
-/// forwarded to a receiver-selected destination.
-#[derive(Clone, Debug)]
-struct OtlpHttpClient(reqwest::blocking::Client);
-
-impl OtlpHttpClient {
-    fn new(timeout: Duration) -> Result<Self, TraceError> {
-        // reqwest's blocking client owns a private runtime and refuses to create it from within
-        // Dekopon's Tokio runtime. Build it on a plain thread, as the upstream OTLP adapter does.
-        let client = std::thread::Builder::new()
-            .name("dekopon-otlp-http-client".to_owned())
-            .spawn(move || {
-                reqwest::blocking::Client::builder()
-                    .timeout(timeout)
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-            })
-            .map_err(TraceError::HttpClientThread)?
-            .join()
-            .map_err(|_| TraceError::HttpClientThreadPanicked)?
-            .map_err(TraceError::HttpClient)?;
-        Ok(Self(client))
-    }
-}
-
-#[async_trait]
-impl HttpClient for OtlpHttpClient {
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let request: reqwest::blocking::Request = request.try_into()?;
-        let mut response = self.0.execute(request)?.error_for_status()?;
-        let headers = std::mem::take(response.headers_mut());
-        let status = response.status();
-        let mut response = Response::builder().status(status).body(response.bytes()?)?;
-        *response.headers_mut() = headers;
-        Ok(response)
-    }
-}
 
 pub(crate) struct TraceGuard {
     chrome: Option<FlushGuard>,
@@ -197,56 +153,21 @@ pub(crate) fn initialize(
         ));
     }
 
-    let resource = Resource::builder()
-        .with_service_name(service_name.to_owned())
-        .with_attributes([
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new("process.executable.name", "dekopon-run"),
-        ])
-        .build();
+    let settings = ExporterSettings::new(
+        endpoint,
+        telemetry.otlp_transport,
+        service_name,
+        "dekopon-run",
+        shutdown_timeout,
+    )?;
 
-    // `--otlp-endpoint` follows the standard generic OTLP/HTTP endpoint contract. Signal paths
-    // are appended here because passing a programmatic endpoint to the SDK makes it exact rather
-    // than applying the environment variable's `/v1/<signal>` behavior.
-    let traces_endpoint = signal_endpoint(endpoint, "traces");
-    let logs_endpoint = signal_endpoint(endpoint, "logs");
-    let http_client = OtlpHttpClient::new(shutdown_timeout)?;
-
-    let span_exporter = SpanExporter::builder()
-        .with_http()
-        .with_http_client(http_client.clone())
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(traces_endpoint)
-        .with_timeout(shutdown_timeout)
-        .build()
-        .map_err(|source| TraceError::Exporter {
-            signal: "trace",
-            source,
-        })?;
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_resource(resource.clone())
-        .with_batch_exporter(span_exporter)
-        .build();
+    let tracer_provider = settings.tracer_provider()?;
     let tracer = tracer_provider.tracer("dekopon-run");
     let otel_trace_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(EnvFilter::new(TRACE_FILTER));
 
-    let log_exporter = LogExporter::builder()
-        .with_http()
-        .with_http_client(http_client)
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(logs_endpoint)
-        .with_timeout(shutdown_timeout)
-        .build()
-        .map_err(|source| TraceError::Exporter {
-            signal: "log",
-            source,
-        })?;
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource)
-        .with_batch_exporter(log_exporter)
-        .build();
+    let logger_provider = settings.logger_provider()?;
     let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
         .with_filter(EnvFilter::new(OTEL_LOG_FILTER));
 
@@ -272,8 +193,16 @@ pub(crate) fn initialize(
     })
 }
 
-fn signal_endpoint(base: &str, signal: &str) -> String {
-    format!("{}/v1/{signal}", base.trim_end_matches('/'))
+/// Trace context to send with a broker proposal, if this process is exporting one.
+///
+/// `None` is the ordinary state when export is disabled: the broker then records its own root
+/// span rather than a child of a trace nothing will ever receive.
+pub(crate) fn current_trace_parent() -> Option<TraceParent> {
+    let parts = dekopon_telemetry::current_trace_context()?;
+    // A context the SDK considers valid can still be rejected here (all-zero identifiers), and a
+    // malformed parent is worse than none: it would attach broker spans to a trace that does not
+    // exist. Dropping it degrades correlation instead of corrupting it.
+    TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok()
 }
 
 #[derive(Debug, Error)]
@@ -286,18 +215,8 @@ pub(crate) enum TraceError {
     },
     #[error("invalid telemetry configuration: {0}")]
     Configuration(String),
-    #[error("could not start OTLP HTTP client builder")]
-    HttpClientThread(#[source] io::Error),
-    #[error("OTLP HTTP client builder panicked")]
-    HttpClientThreadPanicked,
-    #[error("could not build OTLP HTTP client")]
-    HttpClient(#[source] reqwest::Error),
-    #[error("could not build OTLP {signal} exporter")]
-    Exporter {
-        signal: &'static str,
-        #[source]
-        source: ExporterBuildError,
-    },
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryError),
     #[error("could not install tracing subscriber: {0}")]
     Subscriber(String),
     #[error("could not flush OTLP telemetry: {0}")]
@@ -306,19 +225,13 @@ pub(crate) enum TraceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TraceError, initialize, signal_endpoint};
-    use crate::cli::TelemetryArgs;
+    use super::{TraceError, current_trace_parent, initialize};
+    use crate::cli::{TelemetryArgs, Transport};
 
+    /// Outside an exporting span there is no context to send, and the runner must not invent one.
     #[test]
-    fn generic_otlp_http_endpoint_gets_signal_paths() {
-        assert_eq!(
-            signal_endpoint("http://openobserve:5080/api/default", "traces"),
-            "http://openobserve:5080/api/default/v1/traces"
-        );
-        assert_eq!(
-            signal_endpoint("http://openobserve:5080/api/default/", "logs"),
-            "http://openobserve:5080/api/default/v1/logs"
-        );
+    fn trace_parent_is_absent_without_an_active_exporting_span() {
+        assert!(current_trace_parent().is_none());
     }
 
     /// A query or fragment would sit in front of the appended signal path, producing a URI that
@@ -331,6 +244,7 @@ mod tests {
         ] {
             let telemetry = TelemetryArgs {
                 otlp_endpoint: Some(endpoint.to_owned()),
+                otlp_transport: Transport::Http,
                 otel_service_name: "dekopon-run".to_owned(),
                 otel_export_timeout_ms: 5_000,
             };

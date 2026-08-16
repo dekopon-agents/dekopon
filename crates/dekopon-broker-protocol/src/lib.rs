@@ -60,6 +60,161 @@ pub enum ProtocolVersion {
     V1Alpha1,
 }
 
+/// W3C `traceparent`, carrying the client's OpenTelemetry span as a remote parent.
+///
+/// This is distinct from [`TraceId`] and does not replace it. `TraceId` identifies a Dekopon
+/// session for the audit chain and replay accounting; `TraceParent` exists only so broker spans
+/// join the client's trace instead of starting an unrelated one. Two identifiers, two jobs.
+///
+/// Like every other request field this is untrusted: it influences telemetry correlation and
+/// nothing else. It is never an authorization, routing, or replay input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceParent {
+    trace_id: [u8; 16],
+    parent_id: [u8; 8],
+    flags: u8,
+}
+
+impl TraceParent {
+    /// Builds a `traceparent` from raw identifier bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceParentError::ZeroTraceId`] or [`TraceParentError::ZeroParentId`] when an
+    /// identifier is all zeroes, which W3C defines as invalid.
+    pub const fn new(
+        trace_id: [u8; 16],
+        parent_id: [u8; 8],
+        flags: u8,
+    ) -> Result<Self, TraceParentError> {
+        if u128::from_be_bytes(trace_id) == 0 {
+            return Err(TraceParentError::ZeroTraceId);
+        }
+        if u64::from_be_bytes(parent_id) == 0 {
+            return Err(TraceParentError::ZeroParentId);
+        }
+        Ok(Self {
+            trace_id,
+            parent_id,
+            flags,
+        })
+    }
+
+    /// 16-byte trace identifier.
+    #[must_use]
+    pub const fn trace_id(&self) -> [u8; 16] {
+        self.trace_id
+    }
+
+    /// 8-byte identifier of the span that should parent the broker's work.
+    #[must_use]
+    pub const fn parent_id(&self) -> [u8; 8] {
+        self.parent_id
+    }
+
+    /// W3C trace flags; bit 0 is the sampled flag.
+    #[must_use]
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+}
+
+impl fmt::Display for TraceParent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("00-")?;
+        for byte in self.trace_id {
+            write!(formatter, "{byte:02x}")?;
+        }
+        formatter.write_str("-")?;
+        for byte in self.parent_id {
+            write!(formatter, "{byte:02x}")?;
+        }
+        write!(formatter, "-{:02x}", self.flags)
+    }
+}
+
+impl std::str::FromStr for TraceParent {
+    type Err = TraceParentError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Exactly four hyphen-separated fields. Longer forms belong to future `traceparent`
+        // versions this protocol does not accept.
+        let mut fields = value.split('-');
+        let (Some(version), Some(trace), Some(parent), Some(flags), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err(TraceParentError::Malformed);
+        };
+        if version != "00" {
+            return Err(TraceParentError::UnsupportedVersion {
+                version: version.to_owned(),
+            });
+        }
+        let mut trace_id = [0_u8; 16];
+        decode_hex(trace, &mut trace_id)?;
+        let mut parent_id = [0_u8; 8];
+        decode_hex(parent, &mut parent_id)?;
+        let mut flag_byte = [0_u8; 1];
+        decode_hex(flags, &mut flag_byte)?;
+        Self::new(trace_id, parent_id, flag_byte[0])
+    }
+}
+
+/// Decodes exact-width lowercase hex into `output`.
+fn decode_hex(text: &str, output: &mut [u8]) -> Result<(), TraceParentError> {
+    if text.len() != output.len() * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TraceParentError::Malformed);
+    }
+    // Uppercase hex is rejected: W3C specifies lowercase, and accepting both would let one logical
+    // context serialize two ways.
+    if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(TraceParentError::Malformed);
+    }
+    for (index, slot) in output.iter_mut().enumerate() {
+        let start = index * 2;
+        *slot = u8::from_str_radix(&text[start..start + 2], 16)
+            .map_err(|_| TraceParentError::Malformed)?;
+    }
+    Ok(())
+}
+
+impl Serialize for TraceParent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceParent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Failures raised while parsing a `traceparent`.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum TraceParentError {
+    /// The value was not four hyphen-separated fields of the expected widths.
+    #[error("traceparent must be `00-<32 hex>-<16 hex>-<2 hex>`")]
+    Malformed,
+    /// The version field named a version this protocol does not implement.
+    #[error("unsupported traceparent version {version:?}; only `00` is accepted")]
+    UnsupportedVersion {
+        /// Version field as received.
+        version: String,
+    },
+    /// The trace identifier was all zeroes.
+    #[error("traceparent trace identifier must not be all zeroes")]
+    ZeroTraceId,
+    /// The parent span identifier was all zeroes.
+    #[error("traceparent parent identifier must not be all zeroes")]
+    ZeroParentId,
+}
+
 /// Unprivileged invocation fields accepted from a broker client.
 ///
 /// Actor and principal are deliberately absent: the server derives them from transport identity.
@@ -72,6 +227,13 @@ pub struct InvocationRequest {
     pub capability: CapabilityId,
     /// End-to-end correlation identifier.
     pub trace: TraceId,
+    /// Client span that should parent broker telemetry for this invocation.
+    ///
+    /// Always written by Dekopon's own client; `null` and an omitted key both mean the client
+    /// exports no telemetry. Correlation-only, and untrusted: never an authorization, routing, or
+    /// replay input. A malformed value is a decode failure rather than a silent `None`, because
+    /// attaching broker spans to a trace that does not exist is worse than sending none.
+    pub trace_parent: Option<TraceParent>,
     /// Capability-specific untrusted input.
     pub input: Value,
 }

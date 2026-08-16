@@ -21,7 +21,7 @@ use thiserror::Error;
 pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
-    PeerIdentity, ResolvedConfig, ServerLimitsConfig,
+    PeerIdentity, ResolvedConfig, ServerLimitsConfig, TelemetryConfig,
 };
 pub use server::{BrokerServer, ServerError, ServerLimits};
 pub use socket::{SocketError, SocketGuard, current_uid};
@@ -33,6 +33,24 @@ pub struct AuditCheckpoint {
     pub records: usize,
     /// Current hash-chain head, absent only for an empty log.
     pub head: Option<String>,
+}
+
+/// Reads only the export settings, so the process can install its subscriber before serving.
+///
+/// The configuration is parsed again by [`run`], which reports every configuration failure with
+/// full context. Re-reading a bounded owner-only file is cheaper and clearer than threading a
+/// subscriber handle through the service, and this call decides one thing: whether an OTLP layer
+/// is installed at all.
+///
+/// # Errors
+///
+/// Returns the same configuration errors [`run`] would, so a caller that wants to fail fast may
+/// surface them; callers that prefer `run`'s reporting can discard this error.
+pub async fn telemetry_settings(
+    config_path: impl AsRef<Path>,
+    uid: u32,
+) -> Result<Option<dekopon_telemetry::ExporterSettings>, BrokerdError> {
+    Ok(config::load(config_path, uid).await?.telemetry)
 }
 
 /// Loads trusted configuration, builds the privileged host, and serves until shutdown.

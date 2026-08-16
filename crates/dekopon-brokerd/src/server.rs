@@ -7,6 +7,7 @@ use dekopon_broker_protocol::{
     read_frame, write_frame,
 };
 use dekopon_core::InvocationId;
+use dekopon_telemetry::TraceContextParts;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -14,6 +15,8 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
 
@@ -185,12 +188,37 @@ where
     };
     let response = match request.request {
         BrokerRequest::Capabilities => ResponseEnvelope::capabilities(broker.capabilities(context)),
-        BrokerRequest::Invoke { invocation } => match broker.invoke(context, invocation).await {
-            Ok(result) => ResponseEnvelope::invocation(result),
-            Err(error) => {
-                return write_broker_failure(&mut stream, limits, &error).await;
+        BrokerRequest::Invoke { invocation } => {
+            // Correlation identifiers only. Input, output, and every provider-facing value stay
+            // out of this span for the same reason they stay out of audit records: telemetry is a
+            // second egress path and must not carry what the audit chain deliberately redacts.
+            let span = tracing::info_span!(
+                "broker.invocation",
+                invocation = %invocation.id,
+                capability = %invocation.capability,
+                trace = %invocation.trace,
+            );
+            // An untrusted client chooses this parent. It reaches telemetry correlation and
+            // nothing else: policy, replay rejection, and audit never read it.
+            if let Some(parent) = invocation.trace_parent
+                && let Err(error) =
+                    span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
+                        trace_id: parent.trace_id(),
+                        span_id: parent.parent_id(),
+                        flags: parent.flags(),
+                    }))
+            {
+                // Losing correlation is not losing the invocation: the span still records, just as
+                // its own root, and the durable audit is unaffected either way.
+                tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
             }
-        },
+            match broker.invoke(context, invocation).instrument(span).await {
+                Ok(result) => ResponseEnvelope::invocation(result),
+                Err(error) => {
+                    return write_broker_failure(&mut stream, limits, &error).await;
+                }
+            }
+        }
     };
     write_frame(&mut stream, &response, limits)
         .await

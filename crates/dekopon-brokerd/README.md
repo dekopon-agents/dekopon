@@ -39,6 +39,22 @@ rules:
       maxOutputBytes: 1048576
 ```
 
+An optional `telemetry` section enables OTLP export of broker spans:
+
+```yaml
+telemetry:
+  endpoint: http://rpi.localdomain
+  transport: grpc            # grpc | http
+  serviceName: dekopon-brokerd
+  exportTimeoutMs: 5000
+```
+
+It has no credential field by design. Ingest authentication is read from the standard
+`OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
+this configuration file, the process command line, or a span attribute. Export failures disable
+telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
+stdout, filtered by `RUST_LOG`.
+
 Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata and each mapped capability response to fit the frame ceiling. Shutdown grace must cover one configured host deadline plus two complete frame deadlines.
 
 ```console

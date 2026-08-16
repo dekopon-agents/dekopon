@@ -14,6 +14,7 @@ use dekopon_shell::{
     DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS,
     DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT as DEFAULT_SHELL_TIMEOUT,
 };
+pub use dekopon_telemetry::Transport;
 
 /// Immediate-mode Dekopon runner.
 #[derive(Clone, Debug, Parser)]
@@ -261,6 +262,16 @@ pub struct TelemetryArgs {
         value_name = "URL"
     )]
     pub otlp_endpoint: Option<String>,
+
+    /// OTLP wire transport: `grpc` or `http`.
+    #[arg(
+        long,
+        global = true,
+        env = "OTEL_EXPORTER_OTLP_PROTOCOL_KIND",
+        default_value = "http",
+        value_name = "TRANSPORT"
+    )]
+    pub otlp_transport: Transport,
 
     /// OpenTelemetry service name attached to logs and traces.
     #[arg(

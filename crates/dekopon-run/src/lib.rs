@@ -715,6 +715,10 @@ impl CapabilityInvoker for BrokerLeg {
             id,
             capability: parsed,
             trace: self.identifiers.trace().clone(),
+            // Read on the blocking thread the prompt session entered, so the broker parents its
+            // spans to the script span that actually asked for this capability rather than to the
+            // session root.
+            trace_parent: crate::trace::current_trace_parent(),
             input,
         };
 
@@ -885,6 +889,7 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
                         id: invocation_id.clone(),
                         capability: capability.clone(),
                         trace: trace_id.clone(),
+                        trace_parent: crate::trace::current_trace_parent(),
                         input,
                     })
                     .await?;

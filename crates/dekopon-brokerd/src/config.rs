@@ -14,6 +14,7 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES,
 };
 use dekopon_core::{Actor, PrincipalId};
+use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
@@ -51,6 +52,40 @@ pub struct BrokerdConfig {
     pub broker_limits: BrokerLimits,
     #[serde(default)]
     pub server_limits: ServerLimitsConfig,
+    /// Optional OTLP export. Absent means the broker exports no telemetry.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Broker-owned OTLP export settings.
+///
+/// The credential is deliberately absent. Ingest authentication is read by the OpenTelemetry SDK
+/// from `OTEL_EXPORTER_OTLP_HEADERS`, so a token never enters this owner-readable configuration
+/// file, the process command line, or any span attribute.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TelemetryConfig {
+    /// OTLP receiver endpoint.
+    pub endpoint: String,
+    /// Wire transport: `grpc` or `http`.
+    pub transport: Transport,
+    /// OpenTelemetry service name attached to broker spans.
+    pub service_name: String,
+    /// Timeout for each OTLP export and the final shutdown flush.
+    pub export_timeout_ms: u64,
+}
+
+impl TelemetryConfig {
+    fn resolve(&self) -> Result<ExporterSettings, ConfigError> {
+        ExporterSettings::new(
+            &self.endpoint,
+            self.transport,
+            &self.service_name,
+            "dekopon-brokerd",
+            Duration::from_millis(self.export_timeout_ms),
+        )
+        .map_err(|source| ConfigError::Telemetry { source })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -184,6 +219,7 @@ pub struct ResolvedConfig {
     pub host_limits: BrokerHostLimits,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
+    pub telemetry: Option<ExporterSettings>,
 }
 
 pub async fn load(
@@ -375,6 +411,12 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         return Err(ConfigError::ShortShutdownGrace);
     }
 
+    let telemetry = config
+        .telemetry
+        .as_ref()
+        .map(TelemetryConfig::resolve)
+        .transpose()?;
+
     Ok(ResolvedConfig {
         source,
         socket_path,
@@ -389,6 +431,7 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         host_limits,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
+        telemetry,
     })
 }
 
@@ -457,4 +500,9 @@ pub enum ConfigError {
     SmallResponseFrame { minimum: usize },
     #[error("shutdown grace must cover one host deadline and two complete frame deadlines")]
     ShortShutdownGrace,
+    #[error("invalid broker telemetry configuration")]
+    Telemetry {
+        #[source]
+        source: TelemetryError,
+    },
 }
