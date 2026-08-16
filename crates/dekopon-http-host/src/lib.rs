@@ -257,8 +257,54 @@ impl BufferedHttpClient {
 
     /// Executes one request beneath both the broker grant and native ceilings.
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
+        // Fields mirror `HttpCallEvidence` exactly, and that is the point rather than a
+        // coincidence: this span is a second egress path for the same call the audit chain
+        // records, so it carries the same sanitized set and no more. URL paths and queries,
+        // request and response headers, and both bodies are absent here for the same reason they
+        // are absent from evidence — a trace backend is not an audit boundary.
+        let span = tracing::info_span!(
+            "http.request",
+            "http.request.method" = tracing::field::Empty,
+            "server.address" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "http.request.body.size" = tracing::field::Empty,
+            "http.response.body.size" = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+
+        let evidence_index = self.evidence.len();
         self.attempted = true;
         let result = self.send_checked(request).await;
+
+        // `prepare` is what learns the method and authority, so the evidence entry it pushed is
+        // the only sanitized source for them; a request rejected before that point simply has
+        // nothing safe to report beyond its outcome.
+        if let Some(evidence) = self.evidence.get(evidence_index) {
+            span.record("http.request.method", evidence.method.as_str());
+            span.record("server.address", evidence.authority.as_str());
+            span.record("http.request.body.size", evidence.request_bytes);
+            span.record("http.response.body.size", evidence.response_bytes);
+            if let Some(status) = evidence.status {
+                span.record("http.response.status_code", status);
+            }
+        }
+        span.record(
+            "outcome",
+            match &result {
+                Ok(_) => "succeeded",
+                Err(error) => match &error.code {
+                    ErrorCode::Denied => "denied",
+                    ErrorCode::HostCallLimit => "host-call-limit",
+                    ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
+                        "invalid-http-request"
+                    }
+                    ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => "byte-limit",
+                    _ => "failed",
+                },
+            },
+        );
+
         if let Err(error) = &result {
             self.policy_violation = match &error.code {
                 ErrorCode::Denied => Some("denied"),

@@ -24,6 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
+use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -268,12 +269,15 @@ impl fmt::Debug for BrokerWasmProvider {
 
 impl BrokerWasmProvider {
     async fn load(runtime: Arc<Runtime>, source: PathBuf) -> Result<Self, BrokerHostError> {
-        let component = Component::from_file(&runtime.engine, &source).map_err(|error| {
-            BrokerHostError::Compile {
+        // Compilation happens once per provider at startup rather than per invocation, so this
+        // span answers "why was the broker slow to become ready", not "why was that call slow".
+        let compile = tracing::info_span!("provider.compile");
+        let component = compile
+            .in_scope(|| Component::from_file(&runtime.engine, &source))
+            .map_err(|error| BrokerHostError::Compile {
                 path: source.clone(),
                 source: error,
-            }
-        })?;
+            })?;
         let manifest_json = describe_component(&runtime, &component, &source).await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
             return Err(BrokerHostError::OutputTooLarge {
@@ -536,12 +540,20 @@ impl BrokerProviderRegistry {
             }
             .into());
         }
+        // `proposal.input` is deliberately not a field here. It is the untrusted payload the whole
+        // authority boundary exists to contain, and a span is not a safer place for it than an
+        // audit record.
         provider
             .invoke(
                 &proposal.capability,
                 &proposal.input,
                 authorized.constraints(),
             )
+            .instrument(tracing::info_span!(
+                "provider.invoke",
+                capability = %proposal.capability,
+                provider = %provider.manifest.id,
+            ))
             .await
     }
 }
