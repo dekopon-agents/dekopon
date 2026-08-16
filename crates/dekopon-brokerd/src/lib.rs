@@ -21,7 +21,7 @@ use thiserror::Error;
 pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
-    PeerIdentity, ResolvedConfig, ServerLimitsConfig, TelemetryConfig,
+    PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, TelemetryConfig,
 };
 pub use server::{BrokerServer, ServerError, ServerLimits};
 pub use socket::{SocketError, SocketGuard, current_uid};
@@ -49,7 +49,7 @@ pub struct AuditCheckpoint {
 pub async fn telemetry_settings(
     config_path: impl AsRef<Path>,
     uid: u32,
-) -> Result<Option<dekopon_telemetry::ExporterSettings>, BrokerdError> {
+) -> Result<Option<ResolvedTelemetry>, BrokerdError> {
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
@@ -63,6 +63,14 @@ where
 {
     let uid = current_uid();
     let config = config::load(config_path, uid).await?;
+    // Span verbosity is process state rather than a parameter because it describes the deployment,
+    // not the call. Set before serving so no invocation is recorded under the wrong mode.
+    dekopon_core::set_span_payloads(
+        config
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry.span_payloads),
+    );
     let frame_limits = config.server_limits.frame_limits()?;
     for identity in &config.identities {
         if identity.uid != uid {

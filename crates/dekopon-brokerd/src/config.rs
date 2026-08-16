@@ -73,6 +73,20 @@ pub struct TelemetryConfig {
     pub service_name: String,
     /// Timeout for each OTLP export and the final shutdown flush.
     pub export_timeout_ms: u64,
+    /// Whether spans carry provider payloads and HTTP URLs.
+    ///
+    /// Enabling this declares the telemetry sink in scope for the data this broker handles. It
+    /// never exposes a credential: `Redacted` values render their marker in either mode.
+    pub span_payloads: bool,
+}
+
+/// Broker telemetry after validation.
+#[derive(Clone, Debug)]
+pub struct ResolvedTelemetry {
+    /// Exporter transport and endpoint.
+    pub settings: ExporterSettings,
+    /// Whether spans carry provider payloads and HTTP URLs.
+    pub span_payloads: bool,
 }
 
 impl TelemetryConfig {
@@ -219,7 +233,7 @@ pub struct ResolvedConfig {
     pub host_limits: BrokerHostLimits,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
-    pub telemetry: Option<ExporterSettings>,
+    pub telemetry: Option<ResolvedTelemetry>,
 }
 
 pub async fn load(
@@ -414,7 +428,12 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
     let telemetry = config
         .telemetry
         .as_ref()
-        .map(TelemetryConfig::resolve)
+        .map(|telemetry| {
+            Ok::<_, ConfigError>(ResolvedTelemetry {
+                settings: telemetry.resolve()?,
+                span_payloads: telemetry.span_payloads,
+            })
+        })
         .transpose()?;
 
     Ok(ResolvedConfig {

@@ -153,6 +153,9 @@ pub(crate) fn initialize(
         ));
     }
 
+    // Process state rather than a parameter: it describes the sink's retention scope, not the call.
+    dekopon_core::set_span_payloads(telemetry.otel_span_payloads);
+
     let settings = ExporterSettings::new(
         endpoint,
         telemetry.otlp_transport,
@@ -245,6 +248,7 @@ mod tests {
             let telemetry = TelemetryArgs {
                 otlp_endpoint: Some(endpoint.to_owned()),
                 otlp_transport: Transport::Http,
+                otel_span_payloads: false,
                 otel_service_name: "dekopon-run".to_owned(),
                 otel_export_timeout_ms: 5_000,
             };

@@ -145,37 +145,57 @@ async fn telemetry_section_is_optional_and_strict() {
         "endpoint": "http://rpi.localdomain",
         "transport": "grpc",
         "serviceName": "dekopon-brokerd",
-        "exportTimeoutMs": 5000
+        "exportTimeoutMs": 5000,
+        "spanPayloads": false
     });
     write(&enabled);
     let resolved = config::load(&path, uid)
         .await
         .expect("config with telemetry loads");
     let settings = resolved.telemetry.expect("telemetry resolved");
-    assert_eq!(settings.transport(), dekopon_telemetry::Transport::Grpc);
-    assert_eq!(settings.timeout(), std::time::Duration::from_millis(5_000));
+    assert_eq!(
+        settings.settings.transport(),
+        dekopon_telemetry::Transport::Grpc
+    );
+    assert_eq!(
+        settings.settings.timeout(),
+        std::time::Duration::from_millis(5_000)
+    );
+    assert!(!settings.span_payloads);
 
     // A partial section, an unknown transport, and a zero timeout are all rejected rather than
     // quietly defaulted; the section follows the same all-fields-required rule as every other one.
     for broken in [
         json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
+        // Every field is required once the section is present, so omitting only `spanPayloads`
+        // fails rather than defaulting to the quiet setting — an operator who meant to enable it
+        // and mistyped the key finds out at startup.
         json!({
             "endpoint": "http://rpi.localdomain",
-            "transport": "thrift",
+            "transport": "grpc",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000
         }),
         json!({
             "endpoint": "http://rpi.localdomain",
+            "transport": "thrift",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 5000,
+            "spanPayloads": false
+        }),
+        json!({
+            "endpoint": "http://rpi.localdomain",
             "transport": "http",
             "serviceName": "dekopon-brokerd",
-            "exportTimeoutMs": 0
+            "exportTimeoutMs": 0,
+            "spanPayloads": false
         }),
         json!({
             "endpoint": "  ",
             "transport": "http",
             "serviceName": "dekopon-brokerd",
-            "exportTimeoutMs": 5000
+            "exportTimeoutMs": 5000,
+            "spanPayloads": false
         }),
         // A credential has no slot here. It belongs in `OTEL_EXPORTER_OTLP_HEADERS`, which the
         // SDK reads directly, so an unknown field is the correct answer rather than a warning.

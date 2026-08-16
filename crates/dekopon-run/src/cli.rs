@@ -273,6 +273,20 @@ pub struct TelemetryArgs {
     )]
     pub otlp_transport: Transport,
 
+    /// Include provider payloads and HTTP URLs in span fields.
+    ///
+    /// Declares the telemetry sink in scope for the data this runner handles. Credentials are
+    /// unaffected: redacted values render their marker in either mode.
+    #[arg(
+        long,
+        global = true,
+        env = "DEKOPON_OTEL_SPAN_PAYLOADS",
+        value_name = "BOOL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    pub otel_span_payloads: bool,
+
     /// OpenTelemetry service name attached to logs and traces.
     #[arg(
         long,
