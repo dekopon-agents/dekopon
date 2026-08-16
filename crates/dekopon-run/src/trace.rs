@@ -176,6 +176,15 @@ pub(crate) fn initialize(
             "OTLP endpoint must not be empty".to_owned(),
         ));
     }
+    // The signal path is appended as text, so a query or fragment would end up behind it:
+    // `http://host/api/default?org=x` becomes `...?org=x/v1/traces`, which is a valid URI that
+    // silently posts to the wrong place. Reject it here rather than let it surface as a 404.
+    if let Some(index) = endpoint.find(['?', '#']) {
+        return Err(TraceError::Configuration(format!(
+            "OTLP endpoint must be a base URL without a query or fragment; found {:?} at byte {index}",
+            &endpoint[index..index + 1]
+        )));
+    }
     if shutdown_timeout.is_zero() {
         return Err(TraceError::Configuration(
             "OTLP export timeout must be greater than zero".to_owned(),
@@ -297,7 +306,8 @@ pub(crate) enum TraceError {
 
 #[cfg(test)]
 mod tests {
-    use super::signal_endpoint;
+    use super::{TraceError, initialize, signal_endpoint};
+    use crate::cli::TelemetryArgs;
 
     #[test]
     fn generic_otlp_http_endpoint_gets_signal_paths() {
@@ -309,5 +319,28 @@ mod tests {
             signal_endpoint("http://openobserve:5080/api/default/", "logs"),
             "http://openobserve:5080/api/default/v1/logs"
         );
+    }
+
+    /// A query or fragment would sit in front of the appended signal path, producing a URI that
+    /// parses and posts to the wrong place. Failing at configuration time names the real problem.
+    #[test]
+    fn endpoint_with_query_or_fragment_is_rejected() {
+        for endpoint in [
+            "http://openobserve:5080/api/default?org=x",
+            "http://openobserve:5080/api/default#frag",
+        ] {
+            let telemetry = TelemetryArgs {
+                otlp_endpoint: Some(endpoint.to_owned()),
+                otel_service_name: "dekopon-run".to_owned(),
+                otel_export_timeout_ms: 5_000,
+            };
+            let error = initialize(0, true, None, &telemetry)
+                .err()
+                .expect("endpoint with query or fragment is rejected");
+            assert!(
+                matches!(&error, TraceError::Configuration(message) if message.contains("query or fragment")),
+                "unexpected error for {endpoint}: {error}"
+            );
+        }
     }
 }

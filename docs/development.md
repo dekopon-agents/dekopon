@@ -110,7 +110,7 @@ Immediate host:
 - `prompt --broker` adds a second dispatch leg for capabilities direct mode cannot serve. Direct capabilities are always preferred; the broker stays the sole authority, so its denials reach the script as exit code `126`.
 - `dekopon-run shell` runs `dekopon-shell` over the same registry. Its bounds are independent of the Wasm ones: Wasm fuel bounds one component call, while the interpreter's step, recursion, output, deadline, and capability-call ceilings bound how many such calls a script can drive. The interpreter never reads the host process environment.
 - The one exception to "no clock, no environment" inside a script is the off-by-default `--shell-allow-clock`, which grants the `date` builtin a UTC wall-clock reading and nothing else. Unset, `date` is "command not found"; it never consults an environment variable, so `TZ` stays unobservable either way. This bounds the interpreter only — the Wasm linker's clock import stays absent regardless.
-- Each command word a script runs emits a `shell.command` span with a `shell.command.started`/`.completed` pair. Changing that shape is a runner-telemetry change, so it needs `examples/otel-traces/smoke-test.sh` as well as the workspace suite.
+- Each command word a script runs emits a `shell.command` span with a `shell.command.started`/`.completed` pair. That shape is pinned by the in-process Chrome-trace tests in `crates/dekopon-run/tests/cli.rs` and `crates/dekopon-run/tests/prompt_tracing.rs`, which are what a change to it must keep passing. `examples/otel-traces/smoke-test.sh` does **not** cover it: the script runs `invoke`, never a `shell` or `prompt` subcommand, so it asserts only the direct-invocation spans.
 
 Privileged broker path:
 
@@ -164,7 +164,14 @@ For runner telemetry, OpenObserve example, or observability CI changes, run:
 examples/otel-traces/smoke-test.sh
 ```
 
-The script builds the runner, starts one pinned OpenObserve container with an isolated Docker volume, executes a direct provider invocation, and searches the trace stream for required spans and absence of a sentinel provider input. It removes the container and volume afterward. Run `shellcheck examples/otel-traces/smoke-test.sh` and `docker compose -f examples/otel-traces/compose.yaml config` before submission.
+The script builds the runner, starts one pinned OpenObserve container with an isolated Docker volume, executes a direct provider invocation, and searches both streams: the trace stream for required spans and absence of a sentinel provider input, and the log stream for a lifecycle record carrying the same `trace_id`, which is what makes a log result pivot to its trace. It removes the container and volume afterward.
+
+Run `shellcheck examples/otel-traces/smoke-test.sh` before submission. Validating the Compose file needs the same credentials the stack does, because `compose.yaml` declares them with `:?` so a missing value fails loudly rather than starting an unauthenticated instance:
+
+```console
+OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
+  docker compose -f examples/otel-traces/compose.yaml config
+```
 
 ### Provider example workspaces
 

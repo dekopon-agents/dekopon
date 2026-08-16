@@ -143,6 +143,47 @@ trace_id="$(jq -r --arg service "$service_name" \
   "$temporary/search.json" | head -n 1)"
 test -n "$trace_id"
 
-printf 'OpenObserve OTLP smoke test passed: %s spans in trace %s\n' \
+# Logs are the other half of the exported contract, and the half nothing else covers. Delivery
+# alone is already implied by the runner exiting 0 (a logs flush failure is fatal), so what this
+# asserts is correlation: a lifecycle record must carry the same trace_id its spans did, which is
+# the whole basis for pivoting from a log result to its trace.
+logs_observed=0
+for _ in $(seq 1 60); do
+  end_time_us=$(( $(date +%s) * 1000000 + 60000000 ))
+  jq -nc \
+    --arg sql "$search_sql" \
+    --argjson start_time "$run_started_us" \
+    --argjson end_time "$end_time_us" \
+    '{query:{sql:$sql,start_time:$start_time,end_time:$end_time,from:0,size:200}}' \
+    >"$temporary/log-search-request.json"
+
+  if curl --fail --silent --show-error \
+    --header @"$temporary/openobserve-auth-header" \
+    --header 'Content-Type: application/json' \
+    --data-binary @"$temporary/log-search-request.json" \
+    "http://127.0.0.1:$port/api/default/_search?type=logs" \
+    >"$temporary/log-search.json" 2>/dev/null \
+    && jq -e --arg trace_id "$trace_id" \
+      'any(.hits[]?; .trace_id == $trace_id)' \
+      "$temporary/log-search.json" >/dev/null; then
+    logs_observed=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$logs_observed" -ne 1 ]; then
+  echo "timed out waiting for a log record carrying trace $trace_id" >&2
+  exit 1
+fi
+
+# Redaction has to hold on the log path too; the traces check above never reads this stream.
+if grep -Fq "$sentinel" "$temporary/log-search.json"; then
+  echo "provider input leaked into exported logs" >&2
+  exit 1
+fi
+
+printf 'OpenObserve OTLP smoke test passed: %s spans and %s correlated log records in trace %s\n' \
   "$(jq --arg service "$service_name" '[.hits[] | select(.service_name == $service)] | length' "$temporary/search.json")" \
+  "$(jq --arg trace_id "$trace_id" '[.hits[] | select(.trace_id == $trace_id)] | length' "$temporary/log-search.json")" \
   "$trace_id"
