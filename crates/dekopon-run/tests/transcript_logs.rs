@@ -151,10 +151,26 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
 
     let quiet = session_events(false);
 
-    // The metadata events still fire, so a failure below is about content rather than about the
-    // session having failed to run at all.
-    assert!(quiet.contains("agent.model.requested"), "{quiet}");
-    assert!(quiet.contains("agent.tool.invocation.started"), "{quiet}");
+    // The accounting record still fires in either mode, so a failure below is about content
+    // rather than about the session having failed to run at all.
+    assert!(quiet.contains("accounting.model.turn"), "{quiet}");
+
+    // The span-mirroring lifecycle events are gone: a span already carries start, end, duration,
+    // and parent, and a log pair repeating that is volume without information.
+    for mirrored in [
+        "agent.model.requested",
+        "agent.model.completed",
+        "agent.tool.invocation.started",
+        "agent.tool.invocation.completed",
+        "agent.session.started",
+        "shell.command.started",
+        "shell.command.completed",
+    ] {
+        assert!(
+            !quiet.contains(mirrored),
+            "{mirrored} still emitted; it mirrors a span: {quiet}"
+        );
+    }
 
     for event in TRANSCRIPT_EVENTS {
         assert!(

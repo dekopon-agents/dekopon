@@ -16,7 +16,6 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
-    time::Instant,
 };
 
 use serde_json::Value;
@@ -726,15 +725,7 @@ impl Evaluator<'_> {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        tracing::info!(
-            audit.event = "shell.command.started",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = arguments.len(),
-            "shell command started"
-        );
 
-        let started = Instant::now();
         let executed = self.dispatch_command(command, arguments, resolution, input, capture_output);
         let (status, outcome) = match &executed {
             Ok(Executed::Result(result)) => {
@@ -756,16 +747,6 @@ impl Evaluator<'_> {
         };
         span.record("shell.command.exit_code", status.get());
         span.record("outcome", outcome);
-        tracing::info!(
-            audit.event = "shell.command.completed",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = arguments.len(),
-            duration_ms = telemetry::milliseconds(started.elapsed()),
-            shell.command.exit_code = status.get(),
-            outcome,
-            "shell command completed"
-        );
         executed
     }
 

@@ -48,10 +48,7 @@ use tracing::Instrument as _;
 
 use crate::{
     cli::{BrokerCommand, BrokerConnectionArgs, Cli, Command, LimitArgs, ShellLimitArgs},
-    prompt::{
-        PromptError, PromptLimits, ScriptRuntime, format_script_outcome, run_prompt,
-        script_outcome_label,
-    },
+    prompt::{PromptError, PromptLimits, ScriptRuntime, format_script_outcome, run_prompt},
 };
 
 pub mod cli;
@@ -84,45 +81,25 @@ pub async fn run(cli: Cli) -> i32 {
     );
     let exit_code = {
         let _entered = command_span.enter();
-        tracing::info!(
-            target: "dekopon_run::audit",
-            {
-                audit.event = "runner.command.started",
-                command.name = command_name,
-            },
-            "runner command started"
-        );
 
         match evaluate(&cli).await {
-            Ok(output) => {
-                let exit_code = match write_output(&output.text) {
-                    Ok(()) => output.exit_code,
-                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
-                    Err(error) => {
-                        tracing::error!(
-                            target: "dekopon_run::audit",
-                            {
-                                audit.event = "runner.command.failed",
-                                command.name = command_name,
-                                error.type = "output-write",
-                            },
-                            "runner command failed"
-                        );
-                        eprintln!("error: could not write output: {error}");
-                        1
-                    }
-                };
-                tracing::info!(
-                    target: "dekopon_run::audit",
-                    {
-                        audit.event = "runner.command.completed",
-                        command.name = command_name,
-                        command.exit_code = exit_code,
-                    },
-                    "runner command completed"
-                );
-                exit_code
-            }
+            Ok(output) => match write_output(&output.text) {
+                Ok(()) => output.exit_code,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
+                Err(error) => {
+                    tracing::error!(
+                        target: "dekopon_run::audit",
+                        {
+                            audit.event = "runner.command.failed",
+                            command.name = command_name,
+                            error.type = "output-write",
+                        },
+                        "runner command failed"
+                    );
+                    eprintln!("error: could not write output: {error}");
+                    1
+                }
+            },
             Err(error) => {
                 tracing::error!(
                     target: "dekopon_run::audit",
@@ -210,15 +187,6 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                     invocation.iteration = iteration
                 );
                 let _entered = invocation_span.enter();
-                tracing::info!(
-                    target: "dekopon_run::audit",
-                    {
-                        audit.event = "guest.invocation.started",
-                        capability.id = %capability,
-                        invocation.iteration = iteration,
-                    },
-                    "guest provider invocation started"
-                );
                 let start = Instant::now();
                 match registry.invoke(capability, &input) {
                     Ok(output) => {
@@ -289,18 +257,6 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             let outcome = Interpreter::new(shell_limits(shell))
                 .with_curl_capability(curl_capability.as_ref().map(CapabilityId::to_string))
                 .run(script, &invoker);
-            tracing::info!(
-                target: "dekopon_run::audit",
-                {
-                    audit.event = "shell.script.completed",
-                    shell.exit_code = outcome.exit_code.get(),
-                    shell.steps = outcome.steps,
-                    provider.invocations = outcome.capability_calls,
-                    shell.truncated = outcome.truncated,
-                    outcome = script_outcome_label(&outcome),
-                },
-                "shell script completed"
-            );
             Ok(CommandOutput {
                 text: format_script_outcome(&outcome),
                 exit_code: i32::from(outcome.exit_code.get()),
@@ -410,17 +366,6 @@ async fn evaluate_prompt(
     .await
     .map_err(AppError::PromptTask)??;
 
-    tracing::info!(
-        target: "dekopon_run::audit",
-        {
-            audit.event = "agent.session.completed",
-            model.turns = outcome.model_turns,
-            script.calls = outcome.script_calls,
-            provider.invocations = outcome.capability_invocations,
-            outcome = "succeeded",
-        },
-        "prompt session completed"
-    );
     Ok(CommandOutput::success(outcome.answer))
 }
 
