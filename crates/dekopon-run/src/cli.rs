@@ -280,12 +280,12 @@ pub struct TelemetryArgs {
     #[arg(
         long,
         global = true,
-        env = "DEKOPON_OTEL_SPAN_PAYLOADS",
+        env = "DEKOPON_OTEL_TELEMETRY_PAYLOADS",
         value_name = "BOOL",
         default_value_t = false,
         action = ArgAction::Set
     )]
-    pub otel_span_payloads: bool,
+    pub otel_telemetry_payloads: bool,
 
     /// OpenTelemetry service name attached to logs and traces.
     #[arg(

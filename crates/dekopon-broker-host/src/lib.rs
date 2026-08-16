@@ -556,7 +556,7 @@ impl BrokerProviderRegistry {
                     provider = %provider.manifest.id,
                     input = tracing::field::Empty,
                 );
-                if dekopon_core::span_payloads() {
+                if dekopon_core::telemetry_payloads() {
                     span.record("input", tracing::field::display(&proposal.input));
                 }
                 span

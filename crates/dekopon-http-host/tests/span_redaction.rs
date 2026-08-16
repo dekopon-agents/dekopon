@@ -132,7 +132,7 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
 
     // Same client, payloads enabled. The URL now appears, because the operator asked for it — and
     // headers and body still do not, because verbosity widens what spans carry, not everything.
-    dekopon_core::set_span_payloads(true);
+    dekopon_core::set_telemetry_payloads(true);
     let (verbose_authority, verbose_handle) = mock_http();
     let mut verbose = BufferedHttpClient::authorized(
         HttpConstraints {
@@ -162,7 +162,7 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
         .await
         .expect("verbose loopback request succeeds");
     verbose_handle.join().expect("verbose fixture exits");
-    dekopon_core::set_span_payloads(false);
+    dekopon_core::set_telemetry_payloads(false);
 
     let verbose_recorded = captured.0.lock().expect("capture sink").clone();
     assert!(
@@ -190,7 +190,7 @@ fn redacted_values_survive_verbose_mode() {
 
     let secret = Redacted::new("sk-live-abcdef0123456789".to_owned());
     for enabled in [false, true] {
-        dekopon_core::set_span_payloads(enabled);
+        dekopon_core::set_telemetry_payloads(enabled);
         assert!(!format!("{secret}").contains("sk-live"));
         assert!(!format!("{secret:?}").contains("sk-live"));
         assert!(
@@ -199,5 +199,5 @@ fn redacted_values_survive_verbose_mode() {
                 .contains("sk-live")
         );
     }
-    dekopon_core::set_span_payloads(false);
+    dekopon_core::set_telemetry_payloads(false);
 }
