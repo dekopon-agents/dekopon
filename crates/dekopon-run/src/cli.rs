@@ -249,11 +249,11 @@ pub struct BrokerConnectionArgs {
     pub io_timeout_ms: u64,
 }
 
-/// Optional OTLP/gRPC export settings for runner traces and audit-safe logs.
+/// Optional OTLP/HTTP export settings for runner traces and audit-safe logs.
 #[derive(Clone, Debug, Args)]
 pub struct TelemetryArgs {
-    /// OTLP/gRPC endpoint. Export is disabled when this and
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` are unset.
+    /// Base OTLP/HTTP endpoint. `/v1/traces` and `/v1/logs` are appended.
+    /// Export is disabled when this and `OTEL_EXPORTER_OTLP_ENDPOINT` are unset.
     #[arg(
         long,
         global = true,
@@ -271,26 +271,6 @@ pub struct TelemetryArgs {
         value_name = "NAME"
     )]
     pub otel_service_name: String,
-
-    /// Quickwit index selected through the `qw-otel-logs-index` OTLP header.
-    #[arg(
-        long,
-        global = true,
-        env = "DEKOPON_OTEL_LOGS_INDEX",
-        default_value = "otel-logs-v0_9",
-        value_name = "INDEX"
-    )]
-    pub otel_logs_index: String,
-
-    /// Quickwit index selected through the `qw-otel-traces-index` OTLP header.
-    #[arg(
-        long,
-        global = true,
-        env = "DEKOPON_OTEL_TRACES_INDEX",
-        default_value = "otel-traces-v0_9",
-        value_name = "INDEX"
-    )]
-    pub otel_traces_index: String,
 
     /// Timeout for each OTLP export and final shutdown flush.
     #[arg(
@@ -467,13 +447,9 @@ mod tests {
         let cli = Cli::try_parse_from([
             "dekopon-run",
             "--otlp-endpoint",
-            "http://quickwit:7281",
+            "http://openobserve:5080/api/default",
             "--otel-service-name",
             "dekopon-run-test",
-            "--otel-logs-index",
-            "otel-logs-test",
-            "--otel-traces-index",
-            "otel-traces-test",
             "--otel-export-timeout-ms",
             "2500",
             "inspect",
@@ -484,11 +460,9 @@ mod tests {
 
         assert_eq!(
             cli.telemetry.otlp_endpoint.as_deref(),
-            Some("http://quickwit:7281")
+            Some("http://openobserve:5080/api/default")
         );
         assert_eq!(cli.telemetry.otel_service_name, "dekopon-run-test");
-        assert_eq!(cli.telemetry.otel_logs_index, "otel-logs-test");
-        assert_eq!(cli.telemetry.otel_traces_index, "otel-traces-test");
         assert_eq!(cli.telemetry.otel_export_timeout_ms, 2_500);
     }
 
@@ -497,7 +471,7 @@ mod tests {
     /// `shell` is the case worth pinning: it arrived after this feature was written, so a
     /// per-subcommand argument group would have silently skipped it.
     #[test]
-    fn telemetry_defaults_to_quickwit_0_9_indexes_on_every_subcommand() {
+    fn telemetry_defaults_to_disabled_on_every_subcommand() {
         // Defaults are only observable with the env fallbacks unset, and scrubbing the process
         // environment is off the table (`std::env::remove_var` is unsafe in edition 2024 and this
         // workspace forbids unsafe code), so ambient OpenTelemetry configuration skips the test
@@ -518,8 +492,6 @@ mod tests {
             let cli = Cli::try_parse_from(&arguments).expect("valid command line");
 
             assert!(cli.telemetry.otlp_endpoint.is_none(), "{arguments:?}");
-            assert_eq!(cli.telemetry.otel_logs_index, "otel-logs-v0_9");
-            assert_eq!(cli.telemetry.otel_traces_index, "otel-traces-v0_9");
             assert_eq!(cli.telemetry.otel_service_name, "dekopon-run");
         }
     }

@@ -5,14 +5,15 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use opentelemetry::{KeyValue, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{
-    ExporterBuildError, LogExporter, SpanExporter, WithExportConfig, WithTonicConfig,
+    ExporterBuildError, LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
 };
 use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvider};
 use thiserror::Error;
-use tonic::metadata::{MetadataMap, MetadataValue};
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
@@ -20,14 +21,53 @@ use tracing_subscriber::{
 
 use crate::cli::TelemetryArgs;
 
-/// Crates whose spans are worth a trace. `dekopon_shell` emits none today; naming it here means the
-/// interpreter's own instrumentation flows to both sinks the moment it exists, without a second
-/// edit to this file.
+/// Crates whose execution spans and lifecycle events belong in runner telemetry.
 const TRACE_FILTER: &str =
     "dekopon_run=trace,dekopon_model=trace,dekopon_provider_host=trace,dekopon_shell=trace";
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
 /// feed its own export failures back into itself.
-const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,tonic=off";
+const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
+
+/// Adapter around the workspace's existing TLS-enabled reqwest client.
+///
+/// `opentelemetry-otlp` otherwise selects its own newer reqwest line, duplicating the HTTP/TLS
+/// stack. Supplying the client also lets us reject redirects so an authorization header cannot be
+/// forwarded to a receiver-selected destination.
+#[derive(Clone, Debug)]
+struct OtlpHttpClient(reqwest::blocking::Client);
+
+impl OtlpHttpClient {
+    fn new(timeout: Duration) -> Result<Self, TraceError> {
+        // reqwest's blocking client owns a private runtime and refuses to create it from within
+        // Dekopon's Tokio runtime. Build it on a plain thread, as the upstream OTLP adapter does.
+        let client = std::thread::Builder::new()
+            .name("dekopon-otlp-http-client".to_owned())
+            .spawn(move || {
+                reqwest::blocking::Client::builder()
+                    .timeout(timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            })
+            .map_err(TraceError::HttpClientThread)?
+            .join()
+            .map_err(|_| TraceError::HttpClientThreadPanicked)?
+            .map_err(TraceError::HttpClient)?;
+        Ok(Self(client))
+    }
+}
+
+#[async_trait]
+impl HttpClient for OtlpHttpClient {
+    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        let request: reqwest::blocking::Request = request.try_into()?;
+        let mut response = self.0.execute(request)?.error_for_status()?;
+        let headers = std::mem::take(response.headers_mut());
+        let status = response.status();
+        let mut response = Response::builder().status(status).body(response.bytes()?)?;
+        *response.headers_mut() = headers;
+        Ok(response)
+    }
+}
 
 pub(crate) struct TraceGuard {
     chrome: Option<FlushGuard>,
@@ -136,6 +176,15 @@ pub(crate) fn initialize(
             "OTLP endpoint must not be empty".to_owned(),
         ));
     }
+    // The signal path is appended as text, so a query or fragment would end up behind it:
+    // `http://host/api/default?org=x` becomes `...?org=x/v1/traces`, which is a valid URI that
+    // silently posts to the wrong place. Reject it here rather than let it surface as a 404.
+    if let Some(index) = endpoint.find(['?', '#']) {
+        return Err(TraceError::Configuration(format!(
+            "OTLP endpoint must be a base URL without a query or fragment; found {:?} at byte {index}",
+            &endpoint[index..index + 1]
+        )));
+    }
     if shutdown_timeout.is_zero() {
         return Err(TraceError::Configuration(
             "OTLP export timeout must be greater than zero".to_owned(),
@@ -156,14 +205,19 @@ pub(crate) fn initialize(
         ])
         .build();
 
+    // `--otlp-endpoint` follows the standard generic OTLP/HTTP endpoint contract. Signal paths
+    // are appended here because passing a programmatic endpoint to the SDK makes it exact rather
+    // than applying the environment variable's `/v1/<signal>` behavior.
+    let traces_endpoint = signal_endpoint(endpoint, "traces");
+    let logs_endpoint = signal_endpoint(endpoint, "logs");
+    let http_client = OtlpHttpClient::new(shutdown_timeout)?;
+
     let span_exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint.to_owned())
+        .with_http()
+        .with_http_client(http_client.clone())
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(traces_endpoint)
         .with_timeout(shutdown_timeout)
-        .with_metadata(index_metadata(
-            "qw-otel-traces-index",
-            &telemetry.otel_traces_index,
-        )?)
         .build()
         .map_err(|source| TraceError::Exporter {
             signal: "trace",
@@ -179,13 +233,11 @@ pub(crate) fn initialize(
         .with_filter(EnvFilter::new(TRACE_FILTER));
 
     let log_exporter = LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint.to_owned())
+        .with_http()
+        .with_http_client(http_client)
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(logs_endpoint)
         .with_timeout(shutdown_timeout)
-        .with_metadata(index_metadata(
-            "qw-otel-logs-index",
-            &telemetry.otel_logs_index,
-        )?)
         .build()
         .map_err(|source| TraceError::Exporter {
             signal: "log",
@@ -220,21 +272,8 @@ pub(crate) fn initialize(
     })
 }
 
-fn index_metadata(header: &'static str, index: &str) -> Result<MetadataMap, TraceError> {
-    let index = index.trim();
-    if index.is_empty() {
-        return Err(TraceError::Configuration(format!(
-            "OpenTelemetry index for {header} must not be empty"
-        )));
-    }
-    let value = MetadataValue::try_from(index).map_err(|error| {
-        TraceError::Configuration(format!(
-            "OpenTelemetry index {index:?} is not a valid gRPC metadata value: {error}"
-        ))
-    })?;
-    let mut metadata = MetadataMap::new();
-    metadata.insert(header, value);
-    Ok(metadata)
+fn signal_endpoint(base: &str, signal: &str) -> String {
+    format!("{}/v1/{signal}", base.trim_end_matches('/'))
 }
 
 #[derive(Debug, Error)]
@@ -247,6 +286,12 @@ pub(crate) enum TraceError {
     },
     #[error("invalid telemetry configuration: {0}")]
     Configuration(String),
+    #[error("could not start OTLP HTTP client builder")]
+    HttpClientThread(#[source] io::Error),
+    #[error("OTLP HTTP client builder panicked")]
+    HttpClientThreadPanicked,
+    #[error("could not build OTLP HTTP client")]
+    HttpClient(#[source] reqwest::Error),
     #[error("could not build OTLP {signal} exporter")]
     Exporter {
         signal: &'static str,
@@ -261,27 +306,41 @@ pub(crate) enum TraceError {
 
 #[cfg(test)]
 mod tests {
-    use super::index_metadata;
+    use super::{TraceError, initialize, signal_endpoint};
+    use crate::cli::TelemetryArgs;
 
     #[test]
-    fn quickwit_index_metadata_is_signal_specific() {
-        let metadata = index_metadata("qw-otel-traces-index", "otel-traces-v0_9")
-            .expect("valid Quickwit index metadata");
-
+    fn generic_otlp_http_endpoint_gets_signal_paths() {
         assert_eq!(
-            metadata
-                .get("qw-otel-traces-index")
-                .expect("trace index header")
-                .to_str()
-                .expect("ASCII index"),
-            "otel-traces-v0_9"
+            signal_endpoint("http://openobserve:5080/api/default", "traces"),
+            "http://openobserve:5080/api/default/v1/traces"
         );
-        assert!(metadata.get("qw-otel-logs-index").is_none());
+        assert_eq!(
+            signal_endpoint("http://openobserve:5080/api/default/", "logs"),
+            "http://openobserve:5080/api/default/v1/logs"
+        );
     }
 
+    /// A query or fragment would sit in front of the appended signal path, producing a URI that
+    /// parses and posts to the wrong place. Failing at configuration time names the real problem.
     #[test]
-    fn quickwit_index_metadata_rejects_empty_or_non_ascii_values() {
-        assert!(index_metadata("qw-otel-logs-index", "  ").is_err());
-        assert!(index_metadata("qw-otel-logs-index", "logs-\n-forged").is_err());
+    fn endpoint_with_query_or_fragment_is_rejected() {
+        for endpoint in [
+            "http://openobserve:5080/api/default?org=x",
+            "http://openobserve:5080/api/default#frag",
+        ] {
+            let telemetry = TelemetryArgs {
+                otlp_endpoint: Some(endpoint.to_owned()),
+                otel_service_name: "dekopon-run".to_owned(),
+                otel_export_timeout_ms: 5_000,
+            };
+            let error = initialize(0, true, None, &telemetry)
+                .err()
+                .expect("endpoint with query or fragment is rejected");
+            assert!(
+                matches!(&error, TraceError::Configuration(message) if message.contains("query or fragment")),
+                "unexpected error for {endpoint}: {error}"
+            );
+        }
     }
 }

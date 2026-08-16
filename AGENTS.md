@@ -17,7 +17,7 @@ Finally, read the documents selected by the work:
 | Crate boundaries, dependencies, protocols, daemon/broker separation, async, Wasmtime, or Cedar | [`docs/architecture.md`](docs/architecture.md) | It maps design responsibilities to current and future implementation boundaries. |
 | Operator auth, catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator contract. |
 | Immediate providers, Wasm components, prompt tools, model endpoints, or limits | [`docs/run.md`](docs/run.md) | It defines the experimental current runner and the privileges it must not gain. |
-| Runner traces, OTLP logs, telemetry redaction, or Quickwit | [`docs/observability.md`](docs/observability.md) | It defines signal contents, configuration, audit limitations, and end-to-end coverage. |
+| Runner traces, OTLP logs, telemetry redaction, or OpenObserve | [`docs/observability.md`](docs/observability.md) | It defines signal contents, configuration, audit limitations, and end-to-end coverage. |
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md) | It records repository mechanics and validation traps that root workspace commands do not cover. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`docs/broker-http.md`](docs/broker-http.md) | It defines the accepted process boundary, buffered HTTP contract, authorization inputs, and staged delivery. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
