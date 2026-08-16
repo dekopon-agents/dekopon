@@ -52,6 +52,7 @@ use tokio::{
     io::{AsyncBufReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, BufReader},
     sync::Mutex,
 };
+use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
@@ -1159,17 +1160,40 @@ where
         context: &AuthenticatedContext,
         request: InvocationRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        if !self.replay.reserve(&request.id).await? {
-            return self.deny(context, &request, "replayed-invocation").await;
-        }
-        let Some(rule) = self
-            .policy
-            .matching_rule(context, &request.capability)
-            .cloned()
-        else {
-            return self.deny(context, &request, "policy-denied").await;
+        // Identifiers and the decision only. Request input never reaches a span field, exactly as
+        // it never reaches an audit field — a refusal must be visible without the payload that
+        // was refused being visible with it.
+        let authorize = tracing::info_span!(
+            "broker.authorize",
+            invocation = %request.id,
+            capability = %request.capability,
+            outcome = tracing::field::Empty,
+        );
+        let rule = {
+            let _entered = authorize.enter();
+            if !self.replay.reserve(&request.id).await? {
+                authorize.record("outcome", "replayed-invocation");
+                return self.deny(context, &request, "replayed-invocation").await;
+            }
+            match self
+                .policy
+                .matching_rule(context, &request.capability)
+                .cloned()
+            {
+                Some(rule) => {
+                    authorize.record("outcome", "allowed");
+                    rule
+                }
+                None => {
+                    authorize.record("outcome", "policy-denied");
+                    return self.deny(context, &request, "policy-denied").await;
+                }
+            }
         };
-        self.execute(context, request, rule).await
+        let provider = rule.provider.clone();
+        self.execute(context, request, rule)
+            .instrument(tracing::info_span!("broker.execute", provider = %provider))
+            .await
     }
 
     async fn deny(

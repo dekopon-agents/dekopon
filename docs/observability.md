@@ -97,6 +97,28 @@ input and output, URL paths and queries, headers, and bodies stay out of it for 
 they stay out of audit records: telemetry is a second egress path with none of the audit chain's
 guarantees, and it must not carry what audit deliberately redacts.
 
+## Broker execution spans
+
+`broker.invocation` is not a flat bar. Beneath it the broker's own crates emit:
+
+| Span | Crate | Fields |
+|---|---|---|
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `replayed-invocation`) |
+| `broker.execute` | `dekopon-broker` | provider |
+| `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
+| `provider.invoke` | `dekopon-broker-host` | capability, provider |
+| `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, request/response body sizes, `outcome` |
+
+`http.request` fields mirror `HttpCallEvidence` exactly, and that is deliberate rather than
+incidental: the span reports the same call the audit chain records, so it carries the same sanitized
+set and no more. URL paths and queries, request and response headers, and both bodies are absent
+here for the same reason they are absent from evidence. A test in `dekopon-http-host` drives a real
+loopback request whose path, query, header, and body are each a distinct sentinel and asserts that
+none of them reach a span field.
+
+`provider.compile` covers startup component compilation rather than per-invocation work, so it
+answers "why was the broker slow to become ready" rather than "why was that call slow".
+
 A short-lived runner uses batch exporters and explicitly shuts down both providers before returning. SDK-reported flush failures make the command fail instead of being silently ignored. `--trace <PATH>` can still produce a local Chrome/Perfetto trace alongside OTLP export.
 
 ## Trace and log model

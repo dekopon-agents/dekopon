@@ -32,7 +32,7 @@ struct Cli {
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
 /// feed its own export failures back into itself.
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,hyper=off,h2=off,opentelemetry=off,tonic=off,reqwest=off";
+const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,hyper=off,h2=off,opentelemetry=off,tonic=off,reqwest=off";
 
 #[cfg(unix)]
 #[tokio::main]
