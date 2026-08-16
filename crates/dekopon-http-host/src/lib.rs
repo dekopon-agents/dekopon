@@ -274,7 +274,7 @@ impl BufferedHttpClient {
         );
         // Opt-in only. `url.full` is the field that carries a path and query, which is exactly
         // what the metadata-only default withholds.
-        if dekopon_core::span_payloads() {
+        if dekopon_core::telemetry_payloads() {
             span.record("url.full", request.uri.as_str());
         }
         let _entered = span.enter();

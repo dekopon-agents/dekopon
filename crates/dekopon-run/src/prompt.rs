@@ -7,7 +7,9 @@
 
 use std::time::Instant;
 
-use dekopon_model::model::{ChatModel, ModelError, ModelMessage, ModelTool, assistant_message};
+use dekopon_model::model::{
+    ChatModel, ModelError, ModelMessage, ModelTool, ModelToolCall, assistant_message,
+};
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -129,6 +131,21 @@ where
             },
             "model turn requested"
         );
+        // Verbatim transcript rides the log stream rather than span attributes: a conversation is
+        // unbounded text, span attributes are the wrong container for it, and the log stream is
+        // what a backend indexes for full-text search. Both carry the same trace and span IDs, so
+        // a log result still pivots to the turn it belongs to.
+        if dekopon_core::telemetry_payloads() {
+            tracing::info!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "agent.model.prompt",
+                    model.turn = model_turns,
+                    messages = %transcript(&messages),
+                },
+                "model turn prompt"
+            );
+        }
         let model_started = Instant::now();
         let turn = match model.complete(&messages, &model_tools) {
             Ok(turn) => turn,
@@ -161,6 +178,18 @@ where
             },
             "model turn completed"
         );
+        if dekopon_core::telemetry_payloads() {
+            tracing::info!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "agent.model.answer",
+                    model.turn = model_turns,
+                    answer = turn.content.as_deref().unwrap_or_default(),
+                    tool_calls = %tool_calls_json(&turn.tool_calls),
+                },
+                "model turn answer"
+            );
+        }
         drop(model_entered);
         messages.push(assistant_message(&turn));
 
@@ -241,6 +270,18 @@ where
                     },
                     "agent tool invocation started"
                 );
+                if dekopon_core::telemetry_payloads() {
+                    tracing::info!(
+                        target: "dekopon_run::audit",
+                        {
+                            audit.event = "agent.tool.script",
+                            model.turn = model_turns,
+                            tool_call.index = tool_call_index,
+                            script = script.as_str(),
+                        },
+                        "agent tool script"
+                    );
+                }
                 let started = Instant::now();
                 // `run_script` returns no `Result`: a failed script is an outcome the model reads
                 // and recovers from, so this pair always completes and reports `outcome` from the
@@ -261,6 +302,18 @@ where
                     },
                     "agent tool invocation completed"
                 );
+                if dekopon_core::telemetry_payloads() {
+                    tracing::info!(
+                        target: "dekopon_run::audit",
+                        {
+                            audit.event = "agent.tool.output",
+                            model.turn = model_turns,
+                            tool_call.index = tool_call_index,
+                            output = outcome.output.as_str(),
+                        },
+                        "agent tool output"
+                    );
+                }
                 outcome
             };
             script_calls = script_calls.saturating_add(1);
@@ -486,6 +539,19 @@ impl PromptError {
             Self::MaxSteps { .. } => "max-steps",
         }
     }
+}
+
+/// Renders the conversation so far for the transcript log.
+///
+/// Serialization failure is reported inline rather than propagated: telemetry must not be able to
+/// end a session that is otherwise working.
+fn transcript(messages: &[ModelMessage]) -> String {
+    serde_json::to_string(messages).unwrap_or_else(|_| "<unserializable>".to_owned())
+}
+
+/// Renders requested tool calls for the transcript log.
+fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
+    serde_json::to_string(tool_calls).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
 
 #[cfg(test)]

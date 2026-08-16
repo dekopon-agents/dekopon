@@ -47,10 +47,10 @@ telemetry:
   transport: grpc            # grpc | http
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
-  spanPayloads: false
+  telemetryPayloads: false
 ```
 
-`spanPayloads: true` adds provider input and HTTP URLs to spans, declaring the telemetry sink in
+`telemetryPayloads: true` adds provider input and HTTP URLs to spans, declaring the telemetry sink in
 scope for the data this broker handles. It never exposes a credential: `Redacted` values render
 their marker in either mode, and durable audit records are unaffected either way.
 

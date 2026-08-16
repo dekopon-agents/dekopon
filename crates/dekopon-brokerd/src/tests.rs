@@ -146,7 +146,7 @@ async fn telemetry_section_is_optional_and_strict() {
         "transport": "grpc",
         "serviceName": "dekopon-brokerd",
         "exportTimeoutMs": 5000,
-        "spanPayloads": false
+        "telemetryPayloads": false
     });
     write(&enabled);
     let resolved = config::load(&path, uid)
@@ -161,13 +161,13 @@ async fn telemetry_section_is_optional_and_strict() {
         settings.settings.timeout(),
         std::time::Duration::from_millis(5_000)
     );
-    assert!(!settings.span_payloads);
+    assert!(!settings.telemetry_payloads);
 
     // A partial section, an unknown transport, and a zero timeout are all rejected rather than
     // quietly defaulted; the section follows the same all-fields-required rule as every other one.
     for broken in [
         json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
-        // Every field is required once the section is present, so omitting only `spanPayloads`
+        // Every field is required once the section is present, so omitting only `telemetryPayloads`
         // fails rather than defaulting to the quiet setting — an operator who meant to enable it
         // and mistyped the key finds out at startup.
         json!({
@@ -181,21 +181,21 @@ async fn telemetry_section_is_optional_and_strict() {
             "transport": "thrift",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000,
-            "spanPayloads": false
+            "telemetryPayloads": false
         }),
         json!({
             "endpoint": "http://rpi.localdomain",
             "transport": "http",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 0,
-            "spanPayloads": false
+            "telemetryPayloads": false
         }),
         json!({
             "endpoint": "  ",
             "transport": "http",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000,
-            "spanPayloads": false
+            "telemetryPayloads": false
         }),
         // A credential has no slot here. It belongs in `OTEL_EXPORTER_OTLP_HEADERS`, which the
         // SDK reads directly, so an unknown field is the correct answer rather than a warning.

@@ -1173,7 +1173,7 @@ where
         // Opt-in only. Provider input is the payload the metadata-only default withholds; a
         // `Redacted` value inside it still renders its marker, because that is a property of the
         // value rather than of this mode.
-        if dekopon_core::span_payloads() {
+        if dekopon_core::telemetry_payloads() {
             authorize.record("input", tracing::field::display(&request.input));
         }
         let rule = {

@@ -24,28 +24,28 @@ static SPAN_PAYLOADS: AtomicBool = AtomicBool::new(false);
 ///
 /// Call once during startup, before serving. Defaults to disabled, so a process that never calls
 /// this emits metadata-only spans.
-pub fn set_span_payloads(enabled: bool) {
+pub fn set_telemetry_payloads(enabled: bool) {
     SPAN_PAYLOADS.store(enabled, Ordering::Relaxed);
 }
 
 /// Reports whether payload-bearing span fields are enabled.
 #[must_use]
-pub fn span_payloads() -> bool {
+pub fn telemetry_payloads() -> bool {
     SPAN_PAYLOADS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{set_span_payloads, span_payloads};
+    use super::{set_telemetry_payloads, telemetry_payloads};
 
     /// Metadata-only is the default, so forgetting to configure telemetry cannot widen what a
     /// process emits.
     #[test]
     fn payloads_are_disabled_until_enabled() {
-        assert!(!span_payloads());
-        set_span_payloads(true);
-        assert!(span_payloads());
-        set_span_payloads(false);
-        assert!(!span_payloads());
+        assert!(!telemetry_payloads());
+        set_telemetry_payloads(true);
+        assert!(telemetry_payloads());
+        set_telemetry_payloads(false);
+        assert!(!telemetry_payloads());
     }
 }

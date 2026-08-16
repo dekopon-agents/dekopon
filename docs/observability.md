@@ -122,19 +122,41 @@ answers "why was the broker slow to become ready" rather than "why was that call
 ## Span payloads
 
 Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope
-for the data a process handles can opt in to payload-bearing fields — `--otel-span-payloads true`
-on `dekopon-run`, `DEKOPON_OTEL_SPAN_PAYLOADS`, or `telemetry.spanPayloads: true` in `broker.yaml`.
+for the data a process handles can opt in to payload-bearing fields — `--otel-telemetry-payloads true`
+on `dekopon-run`, `DEKOPON_OTEL_TELEMETRY_PAYLOADS`, or `telemetry.telemetryPayloads: true` in `broker.yaml`.
 
 | Span | Field added |
 |---|---|
 | `broker.authorize` | `input` — the untrusted proposal payload |
 | `provider.invoke` | `input` — the payload passed to the component |
 | `http.request` | `url.full` — path and query, which the default withholds |
+| model/tool log events | the verbatim transcript; see below |
 
 This widens **data**, not credentials. Request and response headers and HTTP bodies stay out in
 both modes, and a `Redacted` value renders its marker in either mode because that is a property of
 the value rather than of the mode. Durable audit records are untouched by this setting: it changes
 telemetry only.
+
+## Model and tool transcript
+
+The verbatim exchange between the model and its one tool rides the **log stream**, not span
+attributes. A conversation is unbounded text: span attributes are the wrong container for it, every
+trace fetch would drag the payload along, and a backend indexes log bodies for full-text search
+rather than span fields. Both signals carry the same `trace_id` and `span_id`, so a log result
+still pivots to the turn it belongs to.
+
+With `telemetryPayloads` enabled, four events join the existing metadata ones:
+
+| Event | Carries |
+|---|---|
+| `agent.model.prompt` | The full message list sent to the model for this turn |
+| `agent.model.answer` | Assistant text and the tool calls it requested, with arguments |
+| `agent.tool.script` | The script the model authored |
+| `agent.tool.output` | That script's combined output |
+
+The metadata events (`agent.model.requested`, `agent.tool.invocation.started`, and the rest) are
+unchanged in either mode, so turn counts, durations, exit codes, and outcomes remain available
+without opting in to content.
 
 ## Redacting secrets
 

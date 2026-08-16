@@ -77,7 +77,7 @@ pub struct TelemetryConfig {
     ///
     /// Enabling this declares the telemetry sink in scope for the data this broker handles. It
     /// never exposes a credential: `Redacted` values render their marker in either mode.
-    pub span_payloads: bool,
+    pub telemetry_payloads: bool,
 }
 
 /// Broker telemetry after validation.
@@ -86,7 +86,7 @@ pub struct ResolvedTelemetry {
     /// Exporter transport and endpoint.
     pub settings: ExporterSettings,
     /// Whether spans carry provider payloads and HTTP URLs.
-    pub span_payloads: bool,
+    pub telemetry_payloads: bool,
 }
 
 impl TelemetryConfig {
@@ -431,7 +431,7 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         .map(|telemetry| {
             Ok::<_, ConfigError>(ResolvedTelemetry {
                 settings: telemetry.resolve()?,
-                span_payloads: telemetry.span_payloads,
+                telemetry_payloads: telemetry.telemetry_payloads,
             })
         })
         .transpose()?;
