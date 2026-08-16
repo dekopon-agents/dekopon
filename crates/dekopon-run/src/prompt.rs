@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use dekopon_model::model::{
-    ChatModel, ModelError, ModelMessage, ModelTool, ModelToolCall, assistant_message,
+    ChatModel, ModelError, ModelMessage, ModelTool, ModelToolCall, ModelUsage, assistant_message,
 };
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
@@ -109,7 +109,18 @@ where
     let mut capability_invocations = 0_u32;
 
     for model_turns in 1..=limits.max_steps {
-        let model_span = tracing::info_span!("prompt.model_turn", model.turn = model_turns);
+        // Usage fields are declared empty and recorded once the provider answers: token counts
+        // are response data, and they belong on the turn span so a trace query can price a
+        // session without leaving the trace.
+        let model_span = tracing::info_span!(
+            "prompt.model_turn",
+            model.turn = model_turns,
+            usage.input_tokens = tracing::field::Empty,
+            usage.cached_input_tokens = tracing::field::Empty,
+            usage.output_tokens = tracing::field::Empty,
+            usage.reasoning_output_tokens = tracing::field::Empty,
+            usage.total_tokens = tracing::field::Empty,
+        );
         let model_entered = model_span.enter();
         // Verbatim transcript rides the log stream rather than span attributes: a conversation is
         // unbounded text, span attributes are the wrong container for it, and the log stream is
@@ -143,10 +154,13 @@ where
                 return Err(error.into());
             }
         };
+        if let Some(usage) = &turn.usage {
+            record_usage(&model_span, usage);
+        }
         // Accounting rather than lifecycle: the `prompt.model_turn` span already says a turn
         // happened and how long it took. This record exists to outlive trace retention and survive
         // sampling, because a model turn is a billed call and "how many did we make, at what
-        // latency" is a question asked long after the trace is gone.
+        // latency, for how many tokens" is a question asked long after the trace is gone.
         tracing::info!(
             target: "dekopon_run::audit",
             {
@@ -155,6 +169,11 @@ where
                 duration_ms = milliseconds(model_started.elapsed()),
                 message.count = messages.len(),
                 tool_call.count = turn.tool_calls.len(),
+                usage.input_tokens = turn.usage.as_ref().and_then(|usage| usage.input_tokens),
+                usage.cached_input_tokens = turn.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                usage.output_tokens = turn.usage.as_ref().and_then(|usage| usage.output_tokens),
+                usage.reasoning_output_tokens = turn.usage.as_ref().and_then(|usage| usage.reasoning_output_tokens),
+                usage.total_tokens = turn.usage.as_ref().and_then(|usage| usage.total_tokens),
                 answer.present = turn
                     .content
                     .as_ref()
@@ -503,6 +522,26 @@ impl PromptError {
 ///
 /// Serialization failure is reported inline rather than propagated: telemetry must not be able to
 /// end a session that is otherwise working.
+/// Records reported token counts on the turn span, leaving unreported fields empty rather than
+/// writing zeros the provider never sent.
+fn record_usage(span: &tracing::Span, usage: &ModelUsage) {
+    if let Some(tokens) = usage.input_tokens {
+        span.record("usage.input_tokens", tokens);
+    }
+    if let Some(tokens) = usage.cached_input_tokens {
+        span.record("usage.cached_input_tokens", tokens);
+    }
+    if let Some(tokens) = usage.output_tokens {
+        span.record("usage.output_tokens", tokens);
+    }
+    if let Some(tokens) = usage.reasoning_output_tokens {
+        span.record("usage.reasoning_output_tokens", tokens);
+    }
+    if let Some(tokens) = usage.total_tokens {
+        span.record("usage.total_tokens", tokens);
+    }
+}
+
 fn transcript(messages: &[ModelMessage]) -> String {
     serde_json::to_string(messages).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
@@ -621,6 +660,7 @@ mod tests {
                     arguments: json!({ "script": script }).to_string(),
                 },
             }],
+            usage: None,
             replay_items: Vec::new(),
         }
     }
@@ -629,6 +669,7 @@ mod tests {
         AssistantTurn {
             content: Some(text.to_owned()),
             tool_calls: Vec::new(),
+            usage: None,
             replay_items: Vec::new(),
         }
     }
@@ -759,6 +800,7 @@ mod tests {
                     arguments: "{}".to_owned(),
                 },
             }],
+            usage: None,
             replay_items: Vec::new(),
         }]);
         let runtime = RecordingRuntime::new(0);
@@ -783,6 +825,7 @@ mod tests {
                         arguments: arguments.to_owned(),
                     },
                 }],
+                usage: None,
                 replay_items: Vec::new(),
             }]);
             let runtime = RecordingRuntime::new(0);
@@ -813,6 +856,7 @@ mod tests {
         let model = ScriptedModel::new([AssistantTurn {
             content: None,
             tool_calls,
+            usage: None,
             replay_items: Vec::new(),
         }]);
         let runtime = RecordingRuntime::new(0);
@@ -949,6 +993,7 @@ mod tests {
                     arguments: json!({ "script": "echo hi" }).to_string(),
                 },
             }],
+            usage: None,
             replay_items: Vec::new(),
         }]);
         let runtime = RecordingRuntime::new(0);
@@ -971,6 +1016,7 @@ mod tests {
                     arguments: Value::String("echo hi".to_owned()).to_string(),
                 },
             }],
+            usage: None,
             replay_items: Vec::new(),
         }]);
         let runtime = RecordingRuntime::new(0);

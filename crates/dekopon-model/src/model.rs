@@ -123,6 +123,26 @@ pub struct ModelFunctionCall {
     pub arguments: String,
 }
 
+/// Token accounting for one billed model call, normalized across transports.
+///
+/// Every field is what the provider reported, or `None` when it reported nothing: these numbers
+/// determine cost, so inventing a zero would turn "the API said nothing" into "the API said free".
+/// Chat-completions responses call the halves `prompt_tokens`/`completion_tokens`; the Codex
+/// Responses API calls them `input_tokens`/`output_tokens`. Both normalize to the latter here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelUsage {
+    /// Tokens the request consumed, cached and uncached alike.
+    pub input_tokens: Option<u64>,
+    /// The subset of input tokens served from the provider's prompt cache.
+    pub cached_input_tokens: Option<u64>,
+    /// Tokens the response produced, reasoning included.
+    pub output_tokens: Option<u64>,
+    /// The subset of output tokens spent on reasoning.
+    pub reasoning_output_tokens: Option<u64>,
+    /// Provider-reported total for the call.
+    pub total_tokens: Option<u64>,
+}
+
 /// One assistant response, which may contain text or tool calls.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssistantTurn {
@@ -130,6 +150,8 @@ pub struct AssistantTurn {
     pub content: Option<String>,
     /// Requested tool calls.
     pub tool_calls: Vec<ModelToolCall>,
+    /// Token accounting for this call, when the provider reported it.
+    pub usage: Option<ModelUsage>,
     /// Provider-specific opaque response items required for safe replay.
     #[doc(hidden)]
     pub replay_items: Vec<Value>,
@@ -262,6 +284,7 @@ impl ChatModel for OpenAiChatModel {
         Ok(AssistantTurn {
             content: choice.message.content,
             tool_calls,
+            usage: response.usage.map(ModelUsage::from),
             replay_items: Vec::new(),
         })
     }
@@ -285,6 +308,53 @@ struct OpenAiTool<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<WireChatUsage>,
+}
+
+/// Chat-completions `usage` object, including the detail blocks that carry cache and reasoning
+/// counts. Every field defaults: a compatible endpoint that omits any of them still bills for the
+/// rest, so a partial report is worth keeping.
+#[derive(Debug, Deserialize)]
+struct WireChatUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<WireCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl From<WireChatUsage> for ModelUsage {
+    fn from(usage: WireChatUsage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            cached_input_tokens: usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
+            output_tokens: usage.completion_tokens,
+            reasoning_output_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            total_tokens: usage.total_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,7 +484,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ModelError, ModelToolCall, OpenAiChatModel, WireFunctionCall, WireToolCall, completion_url,
+        ChatResponse, ModelError, ModelToolCall, ModelUsage, OpenAiChatModel, WireFunctionCall,
+        WireToolCall, completion_url,
     };
 
     #[test]
@@ -483,6 +554,53 @@ mod tests {
                 Duration::from_secs(1),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn normalizes_chat_completion_usage() {
+        let response: ChatResponse = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_tokens_details": {"cached_tokens": 100, "audio_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 7}
+            }
+        }))
+        .expect("usage-bearing response deserializes");
+
+        assert_eq!(
+            ModelUsage::from(response.usage.expect("usage present")),
+            ModelUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(100),
+                output_tokens: Some(30),
+                reasoning_output_tokens: Some(7),
+                total_tokens: Some(150),
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_bare_usage_counts_from_minimal_endpoints() {
+        // llama.cpp and friends report the three counts with no detail blocks.
+        let response: ChatResponse = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+        }))
+        .expect("bare usage deserializes");
+
+        assert_eq!(
+            ModelUsage::from(response.usage.expect("usage present")),
+            ModelUsage {
+                input_tokens: Some(8),
+                cached_input_tokens: None,
+                output_tokens: Some(2),
+                reasoning_output_tokens: None,
+                total_tokens: Some(10),
+            }
         );
     }
 

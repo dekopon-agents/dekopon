@@ -63,6 +63,7 @@ impl ChatModel for ScriptedModel {
             return Ok(AssistantTurn {
                 content: Some("done".to_owned()),
                 tool_calls: Vec::new(),
+                usage: None,
                 replay_items: Vec::new(),
             });
         }
@@ -76,6 +77,7 @@ impl ChatModel for ScriptedModel {
                     arguments: json!({ "script": self.script }).to_string(),
                 },
             }],
+            usage: None,
             replay_items: Vec::new(),
         })
     }

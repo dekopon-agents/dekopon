@@ -22,7 +22,8 @@ use thiserror::Error;
 use ureq::{Agent, http};
 
 use crate::model::{
-    AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall,
+    AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
+    ModelToolCall, ModelUsage,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -608,6 +609,51 @@ struct StreamState {
     calls: BTreeMap<String, PendingCall>,
     call_order: Vec<String>,
     completed: bool,
+    usage: Option<ModelUsage>,
+}
+
+/// Responses-API `usage` object from the `response.completed` event. Every field defaults for the
+/// same reason as the chat-completions shape: a partial report still prices the call.
+#[derive(Debug, Deserialize)]
+struct WireResponsesUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<WireInputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<WireOutputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireOutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl From<WireResponsesUsage> for ModelUsage {
+    fn from(usage: WireResponsesUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage
+                .input_tokens_details
+                .and_then(|details| details.cached_tokens),
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage
+                .output_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            total_tokens: usage.total_tokens,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -690,6 +736,7 @@ fn parse_sse(reader: impl Read) -> Result<AssistantTurn, ChatGptError> {
     Ok(AssistantTurn {
         content,
         tool_calls,
+        usage: state.usage,
         replay_items: state.replay_items,
     })
 }
@@ -753,6 +800,13 @@ fn process_sse_data(data: &str, state: &mut StreamState) -> Result<(), ChatGptEr
                     "ChatGPT response finished with status {status}"
                 )));
             }
+            // Usage is accounting, not content: a malformed report is dropped rather than failing
+            // a turn whose text and tool calls arrived intact.
+            state.usage = event
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .and_then(|usage| serde_json::from_value::<WireResponsesUsage>(usage.clone()).ok())
+                .map(ModelUsage::from);
             state.completed = true;
         }
         "response.failed" | "response.incomplete" | "error" => {
@@ -1216,6 +1270,7 @@ mod tests {
         let mut assistant = crate::model::AssistantTurn {
             content: None,
             tool_calls: Vec::new(),
+            usage: None,
             replay_items: vec![json!({
                 "type": "reasoning",
                 "id": "rs_1",
@@ -1259,7 +1314,7 @@ mod tests {
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\",\"arguments\":\"\"}}\n\n",
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"message\\\":\\\"hello\\\"}\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":30,\"output_tokens_details\":{\"reasoning_tokens\":7},\"total_tokens\":150}}}\n\n",
             "data: [DONE]\n\n"
         );
 
@@ -1273,6 +1328,28 @@ mod tests {
         );
         assert_eq!(turn.replay_items[0]["type"], "reasoning");
         assert_eq!(turn.replay_items[1]["arguments"], r#"{"message":"hello"}"#);
+        assert_eq!(
+            turn.usage,
+            Some(crate::model::ModelUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(100),
+                output_tokens: Some(30),
+                reasoning_output_tokens: Some(7),
+                total_tokens: Some(150),
+            })
+        );
+    }
+
+    #[test]
+    fn a_usage_free_completion_leaves_usage_absent() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let turn = parse_sse(stream.as_bytes()).expect("valid response stream");
+
+        assert_eq!(turn.usage, None);
     }
 
     #[test]
