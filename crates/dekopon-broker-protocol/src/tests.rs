@@ -6,7 +6,7 @@ use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
     BrokerRequest, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, read_frame, write_frame,
+    ResponseEnvelope, TraceParent, TraceParentError, read_frame, write_frame,
 };
 
 fn invocation() -> InvocationRequest {
@@ -20,8 +20,97 @@ fn invocation() -> InvocationRequest {
         trace: "trace-test"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
+        trace_parent: None,
         input: json!({"message": "hello"}),
     }
+}
+
+const SAMPLE_TRACE_PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+#[test]
+fn trace_parent_round_trips_through_its_wire_form() {
+    let parsed = SAMPLE_TRACE_PARENT
+        .parse::<TraceParent>()
+        .expect("valid traceparent");
+
+    assert_eq!(parsed.to_string(), SAMPLE_TRACE_PARENT);
+    assert_eq!(parsed.flags(), 1);
+    assert_eq!(parsed.trace_id()[0], 0x4b);
+    assert_eq!(parsed.parent_id()[7], 0xb7);
+}
+
+/// Every rejection here is a value that would otherwise correlate broker spans to a trace that
+/// does not exist, or serialize one logical context two different ways.
+#[test]
+fn trace_parent_rejects_malformed_unsupported_and_zero_values() {
+    for invalid in [
+        "",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e47zz-00f067aa0ba902b7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+    ] {
+        assert!(
+            invalid.parse::<TraceParent>().is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+
+    assert_eq!(
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse::<TraceParent>()
+            .expect_err("future version is rejected"),
+        TraceParentError::UnsupportedVersion {
+            version: "01".to_owned()
+        }
+    );
+}
+
+/// `traceParent` is always written and decodes from both forms.
+///
+/// Serde treats an `Option` field as implicitly optional, so an omitted key and an explicit `null`
+/// both mean "this client exports no telemetry" — the same thing. That is the intended reading:
+/// absence is a real state, not a client bug worth failing a decode over. What must hold is that
+/// the field is never silently dropped when it *is* set.
+#[test]
+fn invocation_request_always_writes_trace_parent_and_decodes_both_forms() {
+    let complete = serde_json::to_value(invocation()).expect("request serializes");
+    assert_eq!(complete.get("traceParent"), Some(&json!(null)));
+
+    let mut omitted = complete.clone();
+    omitted
+        .as_object_mut()
+        .expect("request object")
+        .remove("traceParent");
+    assert!(
+        serde_json::from_value::<InvocationRequest>(omitted)
+            .expect("omitted traceparent decodes")
+            .trace_parent
+            .is_none()
+    );
+
+    let mut populated = complete;
+    populated
+        .as_object_mut()
+        .expect("request object")
+        .insert("traceParent".to_owned(), json!(SAMPLE_TRACE_PARENT));
+    let decoded =
+        serde_json::from_value::<InvocationRequest>(populated).expect("populated request decodes");
+    let parent = decoded.trace_parent.expect("traceparent present");
+    assert_eq!(parent.flags(), 1);
+    assert_eq!(parent.to_string(), SAMPLE_TRACE_PARENT);
+
+    // An invalid value is still a decode failure: a malformed parent would attach broker spans to
+    // a trace that does not exist, which is worse than sending none.
+    let mut malformed = serde_json::to_value(invocation()).expect("request serializes");
+    malformed
+        .as_object_mut()
+        .expect("request object")
+        .insert("traceParent".to_owned(), json!("not-a-traceparent"));
+    assert!(serde_json::from_value::<InvocationRequest>(malformed).is_err());
 }
 
 #[tokio::test]

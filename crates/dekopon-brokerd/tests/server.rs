@@ -75,6 +75,7 @@ fn request(id: &str) -> InvocationRequest {
         trace: "trace-brokerd"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
+        trace_parent: None,
         input: json!({"message": "hello through broker"}),
     }
 }

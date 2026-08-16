@@ -4,11 +4,17 @@ use std::{io, path::PathBuf, process::ExitCode};
 #[cfg(unix)]
 use clap::Parser;
 #[cfg(unix)]
+use dekopon_telemetry::ExporterSettings;
+#[cfg(unix)]
+use opentelemetry::trace::TracerProvider as _;
+#[cfg(unix)]
 use thiserror::Error;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 #[cfg(unix)]
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
 
 #[cfg(unix)]
 #[derive(Debug, Parser)]
@@ -23,22 +29,80 @@ struct Cli {
     config: PathBuf,
 }
 
+/// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
+/// feed its own export failures back into itself.
+#[cfg(unix)]
+const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,hyper=off,h2=off,opentelemetry=off,tonic=off,reqwest=off";
+
 #[cfg(unix)]
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-    match execute(Cli::parse()).await {
+    let cli = Cli::parse();
+
+    // Read the export settings before serving. A failure here is discarded rather than reported:
+    // `run` parses the same file and surfaces every configuration error with full context, so
+    // reporting it twice would only make the first message the confusing one.
+    let settings = dekopon_brokerd::telemetry_settings(&cli.config, dekopon_brokerd::current_uid())
+        .await
+        .ok()
+        .flatten();
+
+    let tracer_provider = match settings.as_ref().map(ExporterSettings::tracer_provider) {
+        Some(Ok(provider)) => Some(provider),
+        // Telemetry must never keep the broker from starting. Authorization and audit are the
+        // service's contract; observability is not, and failing closed here would trade a working
+        // authority boundary for a missing dashboard.
+        Some(Err(error)) => {
+            eprintln!("dekopon-brokerd: telemetry disabled: {error}");
+            None
+        }
+        None => None,
+    };
+
+    // Structured JSON on stdout is the log contract for now; a collector or shipper can pick it up
+    // without the broker holding a second credential.
+    let stdout_layer = fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_writer(io::stdout)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+
+    let otel_layer = tracer_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("dekopon-brokerd"))
+            .with_filter(EnvFilter::new(OTEL_TRACE_FILTER))
+    });
+
+    if tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(otel_layer)
+        .try_init()
+        .is_err()
+    {
+        eprintln!("dekopon-brokerd: could not install tracing subscriber");
+        return ExitCode::FAILURE;
+    }
+
+    let code = match execute(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(event = "broker_exit", error = %error);
             ExitCode::FAILURE
         }
+    };
+
+    if let Some(provider) = tracer_provider {
+        // Flush failures are reported but do not change the exit code: the broker's durable audit,
+        // not its telemetry, is the record of what happened.
+        if let Err(error) = provider.force_flush() {
+            tracing::error!(event = "broker_telemetry_flush_failed", error = %error);
+        }
+        if let Err(error) = provider.shutdown() {
+            tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
+        }
     }
+    code
 }
 
 #[cfg(unix)]

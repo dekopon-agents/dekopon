@@ -22,6 +22,7 @@ dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
 dekopon-shell.workspace = true
+dekopon-telemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-http.workspace = true

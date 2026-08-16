@@ -1,0 +1,32 @@
+[package]
+name = "dekopon-telemetry"
+description = "Shared OTLP exporter construction and W3C trace context for Dekopon processes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-telemetry"
+readme = "README.md"
+keywords = ["agents", "opentelemetry", "otlp", "tracing", "observability"]
+categories = ["development-tools::debugging"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+async-trait.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-http.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -96,6 +96,107 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     assert!(config::load(&path, uid).await.is_err());
 }
 
+/// Telemetry is optional, strict when present, and never a place to put a credential.
+#[tokio::test]
+async fn telemetry_section_is_optional_and_strict() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let base = json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "socketPath": "broker.sock",
+        "auditPath": "audit.jsonl",
+        "checkpointPath": "checkpoint.json",
+        "checkpointLockPath": "checkpoint.lock",
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "providers": ["echo.wasm"],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "rules": [serde_json::to_value(rule()).expect("rule serializes")]
+    });
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+
+    let write = |document: &serde_json::Value| {
+        fs::write(
+            &path,
+            serde_json::to_vec(document).expect("config serializes"),
+        )
+        .expect("write config fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("secure config fixture");
+    };
+
+    write(&base);
+    assert!(
+        config::load(&path, uid)
+            .await
+            .expect("config without telemetry loads")
+            .telemetry
+            .is_none()
+    );
+
+    let mut enabled = base.clone();
+    enabled["telemetry"] = json!({
+        "endpoint": "http://rpi.localdomain",
+        "transport": "grpc",
+        "serviceName": "dekopon-brokerd",
+        "exportTimeoutMs": 5000
+    });
+    write(&enabled);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("config with telemetry loads");
+    let settings = resolved.telemetry.expect("telemetry resolved");
+    assert_eq!(settings.transport(), dekopon_telemetry::Transport::Grpc);
+    assert_eq!(settings.timeout(), std::time::Duration::from_millis(5_000));
+
+    // A partial section, an unknown transport, and a zero timeout are all rejected rather than
+    // quietly defaulted; the section follows the same all-fields-required rule as every other one.
+    for broken in [
+        json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
+        json!({
+            "endpoint": "http://rpi.localdomain",
+            "transport": "thrift",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 5000
+        }),
+        json!({
+            "endpoint": "http://rpi.localdomain",
+            "transport": "http",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 0
+        }),
+        json!({
+            "endpoint": "  ",
+            "transport": "http",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 5000
+        }),
+        // A credential has no slot here. It belongs in `OTEL_EXPORTER_OTLP_HEADERS`, which the
+        // SDK reads directly, so an unknown field is the correct answer rather than a warning.
+        json!({
+            "endpoint": "http://rpi.localdomain",
+            "transport": "http",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 5000,
+            "authorization": "Basic c2VjcmV0"
+        }),
+    ] {
+        let mut invalid = base.clone();
+        invalid["telemetry"] = broken.clone();
+        write(&invalid);
+        assert!(
+            config::load(&path, uid).await.is_err(),
+            "accepted telemetry section {broken}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn configuration_rejects_symlinks_and_hard_links() {
     use std::os::unix::fs::symlink;

@@ -16,6 +16,7 @@ members = [
     "crates/dekopon-protocol",
     "crates/dekopon-run",
     "crates/dekopon-shell",
+    "crates/dekopon-telemetry",
     "crates/dekopon-testkit",
 ]
 exclude = ["examples/providers/echo"]
@@ -43,7 +44,7 @@ libc = "0.2.189"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-http = { version = "0.32.0", default-features = false }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "trace"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["process"] }
@@ -57,8 +58,9 @@ thiserror = "2.0.19"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-chrome = "0.7.2"
+tonic = { version = "0.14.1", default-features = false }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
-tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
@@ -77,6 +79,7 @@ dekopon-provider-http = { version = "0.2.0", path = "crates/dekopon-provider-htt
 dekopon-provider-sdk = { version = "0.2.0", path = "crates/dekopon-provider-sdk" }
 dekopon-protocol = { version = "0.2.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.2.0", path = "crates/dekopon-shell" }
+dekopon-telemetry = { version = "0.2.0", path = "crates/dekopon-telemetry" }
 dekopon-testkit = { version = "0.2.0", path = "crates/dekopon-testkit" }
 
 [workspace.lints.rust]

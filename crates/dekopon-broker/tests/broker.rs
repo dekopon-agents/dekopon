@@ -49,6 +49,7 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
         trace: "trace-test"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
+        trace_parent: None,
         input,
     }
 }

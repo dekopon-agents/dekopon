@@ -1,8 +1,19 @@
-# Runner observability
+# Observability
 
-`dekopon-run` can currently export its execution traces and audit-safe lifecycle logs over OTLP/HTTP with protobuf payloads. This covers the one-shot runner process, model turns, immediate Wasm compilation/description/invocation, model-authored script execution in both `prompt` and `shell` modes, and explicit broker-client calls. It does **not** collect telemetry from `dekopon-brokerd`, Kubernetes nodes, or other Rust processes; host-level collection remains separate work.
+`dekopon-run` and `dekopon-brokerd` each export their own execution traces over OTLP, using either
+gRPC or HTTP with protobuf payloads. Runner coverage is the one-shot runner process, model turns,
+immediate Wasm compilation/description/invocation, model-authored script execution in both `prompt`
+and `shell` modes, and explicit broker-client calls. Broker coverage is one span per decoded
+invocation from a mapped peer. Neither collects telemetry from Kubernetes nodes or other Rust
+processes; host-level collection remains separate work.
 
-This is operational observability for guest execution. It does not replace broker policy evidence, authorized invocation results, or the broker's durable hash-linked audit log.
+The two processes export **independently**. The broker only ever observes broker-mediated
+invocations, so it cannot stand in for the runner: a broker-only deployment loses every model turn,
+every direct-mode capability call, and every script span. They are separate emitters that meet in
+the backend, correlated by trace context rather than by one relaying for the other.
+
+This is operational observability. It does not replace broker policy evidence, authorized
+invocation results, or the broker's durable hash-linked audit log.
 
 ## Enable OTLP export
 
@@ -21,12 +32,70 @@ The global flags and environment equivalents are:
 | CLI | Environment | Default |
 |---|---|---|
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset; export disabled |
+| `--otlp-transport` | `OTEL_EXPORTER_OTLP_PROTOCOL_KIND` | `http` |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `dekopon-run` |
 | `--otel-export-timeout-ms` | `DEKOPON_OTEL_EXPORT_TIMEOUT_MS` | `5000` |
 
-The endpoint is a generic OTLP/HTTP base. The runner appends `/v1/traces` and `/v1/logs`, uses protobuf payloads, and reads the standard `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, and `OTEL_EXPORTER_OTLP_LOGS_HEADERS` variables directly through the exporter. Header values use the OpenTelemetry URL-encoded form; for example, `%20` represents the space in `Basic <token>`. There is intentionally no header CLI flag because credentials must not be exposed in process arguments or retained in the parsed CLI value.
+Both transports are first-class. `http` treats the endpoint as a generic OTLP/HTTP base and appends
+`/v1/traces` and `/v1/logs`. `grpc` treats it as an authority and takes its method paths from the
+OTLP protobuf service definition, which is what a receiver behind a path-routing reverse proxy
+needs — those paths are fixed by the protocol and cannot be reassigned, so the proxy rule matches
+`/opentelemetry.proto.collector.*` rather than a path of the operator's choosing.
+
+Both read the standard `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, and
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS` variables directly through the exporter. Header values use the
+OpenTelemetry URL-encoded form; for example, `%20` represents the space in `Basic <token>`. There is
+intentionally no header CLI flag and no header configuration field, because credentials must not be
+exposed in process arguments, retained in a parsed CLI value, or written into a configuration file.
 
 Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals. HTTPS endpoints use WebPKI roots, and redirects are disabled so a receiver cannot forward an authorization header to another destination. Plain HTTP is suitable only for a loopback development receiver or an otherwise trusted isolated network because headers and telemetry are unencrypted.
+
+## Broker export
+
+`dekopon-brokerd` exports through an optional `telemetry` section in its owner-controlled
+configuration. The section is absent by default, and when present every field is required, matching
+every other section in that file:
+
+```yaml
+telemetry:
+  endpoint: http://rpi.localdomain
+  transport: grpc            # grpc | http
+  serviceName: dekopon-brokerd
+  exportTimeoutMs: 5000
+```
+
+There is deliberately no credential field. The broker reads `OTEL_EXPORTER_OTLP_HEADERS` like the
+runner does, so a token never enters the configuration file the broker parses, its command line, or
+any span attribute — the same rule that keeps provider credentials out of prompts and audit fields.
+
+Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
+authorization and durable audit are the service's contract, and a missing dashboard must not cost a
+working authority boundary. Flush failures at shutdown are logged and do not change the exit code,
+because the audit chain rather than telemetry is the record of what happened.
+
+The broker's log output is structured JSON on stdout, filtered by `RUST_LOG` and defaulting to
+`info`. Shipping those logs to storage is deliberately left to whatever reads stdout, so the broker
+holds one credential rather than two.
+
+## Trace context across the socket
+
+`InvocationRequest` carries an optional W3C `traceParent`. The runner fills it from the span that
+actually requested the capability, and the broker opens `broker.invocation` beneath it as a remote
+parent, so one trace spans both processes instead of two unrelated traces appearing per run.
+
+This is separate from `TraceId`, which continues to identify a Dekopon session in the audit chain
+and replay accounting. Two identifiers, two jobs: `TraceId` is durable audit correlation and
+`traceParent` is telemetry correlation.
+
+`traceParent` is untrusted like every other request field. It reaches span parenting and nothing
+else — never policy, replay rejection, routing, or audit. A malformed value is a decode failure
+rather than a silent `None`, since attaching broker spans to a trace that does not exist is worse
+than sending none; an absent value simply means the client exports no telemetry.
+
+The broker span carries the invocation, capability, and trace identifiers and nothing more. Provider
+input and output, URL paths and queries, headers, and bodies stay out of it for exactly the reason
+they stay out of audit records: telemetry is a second egress path with none of the audit chain's
+guarantees, and it must not carry what audit deliberately redacts.
 
 A short-lived runner uses batch exporters and explicitly shuts down both providers before returning. SDK-reported flush failures make the command fail instead of being silently ignored. `--trace <PATH>` can still produce a local Chrome/Perfetto trace alongside OTLP export.
 
