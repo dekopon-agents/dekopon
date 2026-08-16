@@ -46,12 +46,19 @@ consume a rate limit:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `accounting.model.turn` | `dekopon-run` | turn index, duration, message and tool-call counts, outcome |
+| `accounting.model.turn` | `dekopon-run` | turn index, duration, message and tool-call counts, token usage, outcome |
 | `accounting.http.request` | `dekopon-http-host` | method, authority, status, request/response bytes, outcome |
 
 Both duplicate fields that also appear on a span, and that is deliberate — the span answers "why
 was this request slow", the accounting record answers "how many did we make last month". Neither is
 a substitute for broker audit, which remains the only record of what was authorized.
+
+Token usage is the cost half of that accounting. Whatever the provider reports lands as
+`usage.input_tokens`, `usage.cached_input_tokens`, `usage.output_tokens`,
+`usage.reasoning_output_tokens`, and `usage.total_tokens` — normalized across the
+chat-completions and Codex Responses wire shapes — on both the `prompt.model_turn` span and the
+`accounting.model.turn` record. A count the provider did not report is absent rather than zero, so
+a missing field means "unreported", never "free".
 
 `accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
 URL path or query, no headers, no bodies.

@@ -10,7 +10,8 @@
 use std::sync::{Arc, Mutex};
 
 use dekopon_model::model::{
-    AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall,
+    AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
+    ModelToolCall, ModelUsage,
 };
 use dekopon_run::prompt::{PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, run_prompt};
 use dekopon_shell::{Interpreter, Limits, ScriptOutcome};
@@ -63,6 +64,13 @@ impl ChatModel for ScriptedModel {
             return Ok(AssistantTurn {
                 content: Some(ANSWER_SENTINEL.to_owned()),
                 tool_calls: Vec::new(),
+                usage: Some(ModelUsage {
+                    input_tokens: Some(23),
+                    cached_input_tokens: Some(9),
+                    output_tokens: Some(4),
+                    reasoning_output_tokens: Some(2),
+                    total_tokens: Some(27),
+                }),
                 replay_items: Vec::new(),
             });
         }
@@ -76,6 +84,13 @@ impl ChatModel for ScriptedModel {
                     arguments: json!({ "script": format!("echo {SCRIPT_SENTINEL}") }).to_string(),
                 },
             }],
+            usage: Some(ModelUsage {
+                input_tokens: Some(11),
+                cached_input_tokens: None,
+                output_tokens: Some(3),
+                reasoning_output_tokens: None,
+                total_tokens: Some(14),
+            }),
             replay_items: Vec::new(),
         })
     }
@@ -154,6 +169,19 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
     // The accounting record still fires in either mode, so a failure below is about content
     // rather than about the session having failed to run at all.
     assert!(quiet.contains("accounting.model.turn"), "{quiet}");
+
+    // Token usage is accounting, not payload: the counts ride the accounting record even in quiet
+    // mode, one set per turn, exactly as the model reported them.
+    for usage in [
+        "usage.input_tokens=11",
+        "usage.total_tokens=14",
+        "usage.input_tokens=23",
+        "usage.cached_input_tokens=9",
+        "usage.reasoning_output_tokens=2",
+        "usage.total_tokens=27",
+    ] {
+        assert!(quiet.contains(usage), "{usage} missing: {quiet}");
+    }
 
     // The span-mirroring lifecycle events are gone: a span already carries start, end, duration,
     // and parent, and a log pair repeating that is volume without information.
