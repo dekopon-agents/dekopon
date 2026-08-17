@@ -4,7 +4,7 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** Chat-transport wakeups, attested routing, and bounded sessions are implemented and tested. Persistent conversations are **committed direction**: [Conversations](#conversations) below is the accepted design and no code in this tree implements it yet, so today each routed message is still one independent session that starts from an empty prompt. Agent memory that outlives a conversation is not designed at all.
+**Status: Current.** Chat-transport wakeups, attested routing, bounded sessions, and persistent conversations are implemented and tested. A route is `oneShot` unless its configuration says otherwise, so a deployment that never writes a `conversation:` block behaves exactly as it did before this existed. A dedicated gateway UID remains **committed direction**, and agent memory that outlives a conversation is not designed at all.
 
 Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
 
@@ -66,7 +66,7 @@ routes:
     agent: xaviers-rubber-stamper
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
     limits: { maxSteps: 8, maxCapabilityCalls: 16 }
-    conversation:                             # committed direction; default { mode: oneShot }
+    conversation:                             # optional; default { mode: oneShot }
       mode: persistent                        # oneShot | persistent
       idleTimeoutMs: 900000                   # optional, default 900000 (15 minutes)
       maxTurns: 12                            # optional, default 12 exchanges in the window
@@ -75,7 +75,7 @@ routes:
 sessions:
   maxConcurrent: 4                            # optional, default 4
   replyOnBusy: true                           # optional, default true
-  maxConversations: 1024                      # committed direction; default 1024 tracked
+  maxConversations: 1024                      # optional, default 1024 tracked
 
 shutdownGraceMs: 120000                       # optional, default 120000
 
@@ -87,7 +87,7 @@ telemetry:                                    # optional, identical in shape to 
   telemetryPayloads: false
 ```
 
-The two fields marked committed direction are the [Conversations](#conversations) design and are not decoded by any code in this tree. Because decoding is strict, writing them today is a startup failure on an unknown field rather than a setting that quietly does nothing — which is the behavior to want, and the reason they are documented here with their status attached instead of being left out until the implementation lands.
+The `conversation:` block is tagged on `mode`, and both halves are strict: an unknown mode and a window bound written next to `mode: oneShot` are equally decode failures. That is deliberate rather than incidental. A bound that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory the daemon does not have.
 
 ### No secrets in this file
 
@@ -105,7 +105,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a missing credential environment variable;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`.
 
-The `conversation:` block adds three more, and they arrive with it as committed direction:
+The `conversation:` block adds three more:
 
 - a `persistent` route with a zero idle timeout, a zero turn window, or a zero byte window — the same rule a zero step budget already follows, because a bound of zero is a bound nobody meant to write;
 - an idle timeout or a window bound on a `oneShot` route. The setting can never take effect there, and a setting that can never take effect is far more likely a mode typo than an intention;
@@ -143,7 +143,7 @@ $ nc -U /path/to/dekopond-dev.sock
 
 **This transport trusts its local caller to declare a subject.** That is the whole point of it — it exists so a developer can drive a routed session without a Slack workspace — and it is why it is a development tool rather than a production transport. It grants nothing by doing so: the declared subject is still only a claim carried into the broker's `invokeFor`, and the broker still needs an attestor grant covering that namespace plus an owner-controlled mapping before it resolves to a principal. Its `0600` mode keeps it reachable only by the owner's UID, which is the trust domain the broker socket already lives in.
 
-Once conversations exist, a declared subject also selects a *history*. A local caller can therefore name a subject some Slack sender created and have that person's compacted exchange replayed into its own prompt. No authority moves — the broker still decides every invocation for itself — but text does, which is a second reason this socket is `0600` and a development tool.
+A declared subject also selects a *history*. A local caller can therefore name a subject some Slack sender created and have that person's compacted exchange replayed into its own prompt. No authority moves — the broker still decides every invocation for itself — but text does, which is a second reason this socket is `0600` and a development tool.
 
 Every local message is a direct message; channel routes are a chat-service concept.
 
@@ -155,12 +155,12 @@ In a shared channel the bot must additionally be addressed: `<@BOT_USER_ID>` on 
 
 ## Sessions
 
-Each routed message runs one session. On a `oneShot` route — which is every route until the conversation work lands — that session is entirely independent, and the `persistent` clauses in steps 3 and 4 are the whole difference the other mode makes:
+Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `conversation:` block — that session is entirely independent, and the `persistent` clauses in steps 3 and 4 are the whole difference the other mode makes:
 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, channel, thread)` in-flight set stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
 2. **Authorization.** The session opens an attested broker leg with `capabilitiesFor(subject, agent)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
-3. **Execution.** On a `persistent` route the session first looks up its conversation, keyed on `(transport, channel, thread, the sender's canonical subject)`. An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, newest first until the window's turn and byte bounds are spent. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then, as before: the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, and `run_prompt` runs on a blocking task with the agent's `instructions` as the system prompt. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route.
-4. **Answer.** The session's final text goes back to chat. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route then writes the exchange back as one more `(question, answer)` pair, trims the window, and restarts the idle clock. Only an answered session writes: a refusal and a failure have no final answer, and storing the fixed failure line would teach the model to keep producing it.
+3. **Execution.** On a `persistent` route the session first looks up its conversation, keyed on `(transport, the conversation identity, the sender's canonical subject)`. An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then, as before: the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route.
+4. **Answer.** The session's final text goes back to chat. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route then writes the exchange back as one more remembered turn, trims the window, and restarts the idle clock. **The fixed failure line is never stored.** A session that reached the model and failed records its question with nothing in the answer's place, which is truthful and is what makes the retry after it answerable; a session refused at step 2 records nothing at all, because it never asked. What must never be remembered is this daemon's own failure sentence, since replaying it would teach the model to keep producing it.
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -168,9 +168,9 @@ At shutdown, transport readers are aborted and in-flight sessions get `shutdownG
 
 ## Conversations
 
-**Status: committed direction.** Nothing in this tree implements what follows. It is written down first because history is a new trust surface rather than a new feature flag, and [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
+**Status: current.** History is a trust surface rather than a feature flag, and [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
 
-A `persistent` route keeps a bounded history per sender and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. `oneShot` is the default and is exactly today's behavior.
+A `persistent` route keeps a bounded history per sender and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. `oneShot` is the default and is exactly the behavior every route had before this existed.
 
 ### The history lives in the gateway
 
@@ -180,15 +180,19 @@ That placement is the whole point rather than an implementation shortcut. The br
 
 ### The key includes the sender
 
-`(transport, channel, thread, the sender's canonical subject)`. The subject is in the key because the alternative replays one person's exchange into another person's prompt, and in a shared channel that is not a hypothetical.
+`(transport, the conversation identity, the sender's canonical subject)`. The subject is in the key because the alternative replays one person's exchange into another person's prompt, and in a shared channel that is not a hypothetical.
+
+The conversation identity is the transport-derived one, not `(channel, thread)`. Slack omits `thread_ts` on the message that *starts* a thread and sends it on every reply inside one, while the bot answers that first message in a thread rooted at it — so anything keyed on the raw thread identifier files the opening question apart from every reply to it and orphans the first turn of every threaded conversation. Each transport derives the identity because only a transport holds the service-native pieces it takes.
 
 This is deliberately *not* the admission key from step 1, which is `(transport, channel, thread)` and has no subject in it. The two keys answer different questions. Serialization asks "is this bot already busy on this thread", and two people talking at once in one thread are one thing to serialize. History asks "whose exchange was this", and the same two people are two histories.
 
-The visible consequence is that in a channel the bot remembers each person separately and remembers nothing about what it told somebody else in the same thread, which will occasionally read as forgetfulness. That is the correct trade.
+Because the two keys are different, admission does not serialize history access: a sender who replies in-thread to their own message before the bot answers admits twice under two keys and runs two sessions against one history. The store handles that itself. Both sessions read the same seed, and each *appends* its own exchange rather than writing back a whole window, so neither can erase the other's answer.
+
+The visible consequence of the subject in the key is that in a channel the bot remembers each person separately and remembers nothing about what it told somebody else in the same thread, which will occasionally read as forgetfulness. That is the correct trade.
 
 ### Prior turns are compacted
 
-A stored turn is `(the user's message, the final answer)`. Every intermediate step — the model's tool calls, the scripts it authored, and their output — is dropped at write-back and never replayed.
+A stored turn is `(the user's message, the final answer)`, or the message alone when the session failed before it produced one. Every intermediate step — the model's tool calls, the scripts it authored, and their output — is dropped at write-back and never replayed.
 
 The number that forces this: one script's combined output can reach 256 KiB, which is `dekopon-shell`'s default `max_output_bytes` in [`../crates/dekopon-shell/src/limits.rs`](../crates/dekopon-shell/src/limits.rs). Replaying full transcripts would let a single earlier turn cost more than the entire window budget, and it would do so most on exactly the sessions that did the most work.
 
@@ -208,6 +212,8 @@ The loss is real and worth naming: the model cannot re-read a command it ran thr
 
 `maxConversations` lives under `sessions:` rather than in the route block because it is a property of the process, not of a route, and `sessions:` is already where "what this daemon costs at once" is configured. It is a memory bound and not an admission bound: reaching it evicts the least recently used conversation rather than refusing a message, because a person talking now matters more than one who stopped an hour ago. An eviction is logged as `gateway_conversation_evicted` with a reason, so a ceiling set too low is visible as churn instead of as a bot that intermittently forgets.
 
+Neither eviction runs on a timer. There is no sweeper task and no shutdown hook: the idle timeout is checked by the lookup that would otherwise have used the entry, and the ceiling is enforced by the write that would otherwise have exceeded it. History is process memory and dies with the process, which is a documented property of where it lives rather than a gap in how it is cleaned up.
+
 ### Authorization is never cached
 
 Every message opens a fresh attested broker leg and gets a fresh `capabilitiesFor` answer, exactly as step 2 already describes. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
@@ -226,7 +232,7 @@ The default is 15 minutes, which resolves toward the person, because the user-vi
 
 ### What this means for retention
 
-On a `persistent` route, chat text sits in `dekopond`'s memory for the idle timeout after somebody stops talking. On the default that is fifteen minutes of a person's question, and the agent's answer, resident in a process that previously kept neither past the reply. The daemon writes none of it to disk; the operating system's own paging and core-dump behavior are outside what the daemon controls. Under the single-UID deployment described below, any process under the owner's UID can read that memory — "in memory only" is a durability property, not an isolation one.
+On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking. On the default that is fifteen minutes of a person's question, and the agent's answer, resident in a process that previously kept neither past the reply. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of it to disk; the operating system's own paging and core-dump behavior are outside what the daemon controls. Under the single-UID deployment described below, any process under the owner's UID can read that memory — "in memory only" is a durability property, not an isolation one.
 
 ## Authorization flow
 
@@ -256,15 +262,15 @@ Spans follow [`observability.md`](observability.md):
 | Span | Fields |
 |---|---|
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `reply-failed`) |
-| `gateway.session` | `agent`; wraps the broker leg and the model session |
+| `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's spans join the same trace through the proposal's `traceparent`.
 
 The metadata-only default carries transport, agent, and outcome and nothing else. Chat text and canonical subject identifiers appear **only** under `telemetryPayloads: true`, as the `gateway.message.received` log event — the same gate `dekopon-run` uses for prompts and script text. Enabling it declares the telemetry sink in scope for the messages this daemon handles.
 
-Conversations add to both lists when they land, and to one field that already exists. `gateway.session` gains `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text. `gateway_conversation_evicted` joins the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. The second-order effect is the one that catches people: `message.count` changes meaning, counting the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
+Conversations add to both lists, and change the meaning of one field that already exists. `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. The second-order effect is the one that catches people: on a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_transport_disconnected`, `gateway_stopped`. Failure events carry a stable category, never raw error text.
+Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_stopped`. Failure events carry a stable category, never raw error text, and an eviction carries a reason and nothing about the conversation it forgot.
 
 ## The single-UID caveat
 

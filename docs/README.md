@@ -27,7 +27,7 @@ Read in this order:
 | Source locations, tests, WIT, generated Wasm, CI, dependencies, packaging, or releases | [`development.md`](development.md) | Records the practical repository workflow and scope-specific checks. |
 | Operator auth, catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Immediate provider loading, direct invocation, or prompt tools | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
-| Chat transports, gateway configuration, routing, agent sessions, or conversation history | [`dekopond.md`](dekopond.md) | Records the daemon's configuration, transport semantics, session bounds, attested authorization flow, and the committed conversation contract. |
+| Chat transports, gateway configuration, routing, agent sessions, or conversation history | [`dekopond.md`](dekopond.md) | Records the daemon's configuration, transport semantics, session bounds, attested authorization flow, and the conversation contract. |
 | Runner tracing, OTLP logs, OpenObserve, or telemetry redaction | [`observability.md`](observability.md) | Records signal semantics, configuration, data minimization, and end-to-end validation. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`broker-http.md`](broker-http.md) | Records the accepted HTTP contract, process ownership, authorization, and delivery boundaries. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |

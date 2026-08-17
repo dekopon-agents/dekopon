@@ -173,7 +173,7 @@ attested context was derived.
 | Span | Fields |
 |---|---|
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `reply-failed`) |
-| `gateway.session` | `agent`; wraps the broker leg and the model session |
+| `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
 
@@ -181,9 +181,9 @@ Neither gateway span carries chat text or a subject identifier. `outcome` is the
 
 ### What conversation history changes
 
-Persistent conversations are committed direction rather than current behavior — the contract is in
-[`dekopond.md`](dekopond.md#conversations) — but they change the meaning of a field that already
-exists, and that is the kind of change a dashboard absorbs silently and wrongly.
+A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —
+changes the meaning of a field that already exists, and that is the kind of change a dashboard
+absorbs silently and wrongly. A route left on the `oneShot` default changes nothing here.
 
 **`message.count` is the field.** It appears on the `model.complete` span and on the
 `accounting.model.turn` record, and today it counts one exchange: the system prompt, the message a
@@ -198,9 +198,11 @@ same caution applies to `usage.input_tokens`, which rises for the same reason an
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how many prior exchanges
 this message replayed and how many bytes they occupied. Both are zero on a `oneShot` route and on
 the first message of any conversation, which makes "seeded or not" a filter rather than a guess.
-`gateway_conversation_evicted` joins the gateway lifecycle events with a reason of `idle`,
-`capacity`, or `grant-changed`, so a `maxConversations` ceiling set too low reads as eviction churn
-instead of as a bot that intermittently forgets.
+`gateway_conversation_evicted` is a gateway lifecycle event carrying a reason of `idle`, `capacity`,
+or `grant-changed` and nothing else, so a `maxConversations` ceiling set too low reads as eviction
+churn instead of as a bot that intermittently forgets. Its reason is the whole event on purpose: a
+key would carry a conversation identifier and a canonical subject, which are payload fields, and an
+eviction is not the place to leak them at the metadata level.
 
 The history itself is not a new signal. It is chat text and model output, already excluded by the
 data-minimization rules below, and it appears only where those already send it: with

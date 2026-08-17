@@ -46,10 +46,21 @@ routes:
       # A budget that cannot finish the job is a bug; a budget that can loop is a bill.
       maxSteps: 8
       maxCapabilityCalls: 16
+    conversation:
+      # Remembered, so "and the second one?" is a question this bot can answer. Omit this block
+      # entirely for `mode: oneShot`, where every message starts from an empty prompt. The window
+      # is what bounds the bill: it applies however long a conversation has been alive.
+      mode: persistent
+      idleTimeoutMs: 900000
+      maxTurns: 12
+      maxBytes: 65536
 
 sessions:
   maxConcurrent: 4
   replyOnBusy: true
+  # Conversations tracked at once, across every persistent route. Reaching it evicts the least
+  # recently used conversation rather than refusing a message.
+  maxConversations: 1024
 
 shutdownGraceMs: 120000
 

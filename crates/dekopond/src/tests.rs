@@ -7,10 +7,10 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::PromptLimits;
+use dekopon_agent::prompt::{ConversationTurn, HistoryLimits, PromptLimits};
 use dekopon_broker_protocol::{
     AvailableCapability, BrokerRequest, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame,
     write_frame,
@@ -23,7 +23,11 @@ use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
-    config::{self, ModelConfig, ResolvedBroker, RouteMatch, SocketDiscovery},
+    config::{
+        self, ConversationPolicy, ConversationWindow, ModelConfig, ResolvedBroker, RouteMatch,
+        SocketDiscovery,
+    },
+    conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
         BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
@@ -112,6 +116,31 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     assert_eq!(resolved.shutdown_grace, Duration::from_secs(120));
     assert_eq!(resolved.broker.server_uid, 501);
     assert!(resolved.telemetry.is_none());
+    // A route remembers nothing unless an operator says so, which is exactly the behavior every
+    // route had before conversations existed.
+    assert_eq!(resolved.sessions.max_conversations, 1024);
+    assert_eq!(resolved.routes[0].conversation, ConversationPolicy::OneShot);
+}
+
+#[tokio::test]
+async fn a_persistent_route_resolves_its_documented_window_defaults() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["conversation"] = json!({"mode": "persistent"});
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("a persistent route with no bounds resolves");
+
+    assert_eq!(
+        resolved.routes[0].conversation,
+        ConversationPolicy::Persistent(ConversationWindow {
+            idle_timeout: Duration::from_secs(900),
+            limits: HistoryLimits {
+                max_turns: 12,
+                max_bytes: 64 * 1024,
+            },
+        })
+    );
 }
 
 /// One table, one property: a configuration that says something the daemon does not understand, or
@@ -198,6 +227,55 @@ async fn invalid_configurations_fail_closed_at_startup() {
             "zero concurrency",
             mutate(|document| {
                 document["sessions"] = json!({"maxConcurrent": 0});
+            }),
+        ),
+        (
+            "unknown conversation mode",
+            mutate(|document| {
+                document["routes"][0]["conversation"] = json!({"mode": "amnesiac"});
+            }),
+        ),
+        (
+            "zero idle timeout on a persistent route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] =
+                    json!({"mode": "persistent", "idleTimeoutMs": 0});
+            }),
+        ),
+        (
+            "zero turn window on a persistent route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] =
+                    json!({"mode": "persistent", "maxTurns": 0});
+            }),
+        ),
+        (
+            "zero byte window on a persistent route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] =
+                    json!({"mode": "persistent", "maxBytes": 0});
+            }),
+        ),
+        (
+            // A window bound that can never take effect is far more likely a mode typo than an
+            // intention, and reading it as one silently would produce a bot that forgets everything
+            // while its configuration says otherwise.
+            "a window bound on a oneShot route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] = json!({"mode": "oneShot", "maxTurns": 12});
+            }),
+        ),
+        (
+            "an idle timeout on a oneShot route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] =
+                    json!({"mode": "oneShot", "idleTimeoutMs": 900_000});
+            }),
+        ),
+        (
+            "zero conversation ceiling",
+            mutate(|document| {
+                document["sessions"] = json!({"maxConversations": 0});
             }),
         ),
         (
@@ -548,17 +626,29 @@ fn a_long_answer_keeps_its_beginning_and_its_conclusion() {
 // Sessions
 // ---------------------------------------------------------------------------
 
-/// A model whose turns are fixed in advance, counting the requests it received.
+/// A model whose turns are fixed in advance, recording every request it received.
 struct ModelScript {
-    turns: Mutex<VecDeque<AssistantTurn>>,
+    /// Scripted turns, where `None` is a request this model refuses to answer.
+    turns: Mutex<VecDeque<Option<AssistantTurn>>>,
+    /// Every message list this model was handed, in order.
+    ///
+    /// Recorded rather than counted because a conversation is an assertion about *what* a later
+    /// session replayed and in which order, which a request count cannot express.
+    prompts: Mutex<Vec<Vec<ModelMessage>>>,
     requests: AtomicUsize,
     forbidden: bool,
 }
 
 impl ModelScript {
     fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Arc<Self> {
+        Self::scripted(turns.into_iter().map(Some))
+    }
+
+    /// A script in which some requests fail, so one message can break and the next recover.
+    fn scripted(turns: impl IntoIterator<Item = Option<AssistantTurn>>) -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
+            prompts: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: false,
         })
@@ -569,6 +659,7 @@ impl ModelScript {
     fn forbidden() -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(VecDeque::new()),
+            prompts: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: true,
         })
@@ -576,6 +667,26 @@ impl ModelScript {
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// One request's messages as `(role, content)` pairs, in the order the model saw them.
+    fn prompt(&self, index: usize) -> Vec<(String, String)> {
+        let prompts = self.prompts.lock().expect("recorded prompts");
+        let messages = prompts
+            .get(index)
+            .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
+        messages
+            .iter()
+            .map(|message| {
+                // `ModelMessage`'s fields are private and its serialized form is the contract the
+                // backends read, so this asserts on exactly what would go on the wire.
+                let value = serde_json::to_value(message).expect("a message serializes");
+                (
+                    value["role"].as_str().unwrap_or_default().to_owned(),
+                    value["content"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -590,16 +701,22 @@ struct ScriptedModel(Arc<ModelScript>);
 impl ChatModel for ScriptedModel {
     fn complete(
         &self,
-        _messages: &[ModelMessage],
+        messages: &[ModelMessage],
         _tools: &[ModelTool],
     ) -> Result<AssistantTurn, ModelError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
+        self.0
+            .prompts
+            .lock()
+            .expect("recorded prompts")
+            .push(messages.to_vec());
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         self.0
             .turns
             .lock()
             .expect("scripted turn lock")
             .pop_front()
+            .flatten()
             .ok_or(ModelError::NoChoices)
     }
 }
@@ -702,6 +819,26 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             max_steps: 4,
             max_capability_calls: 8,
         },
+        conversation: ConversationPolicy::OneShot,
+    }
+}
+
+/// The same route, remembering what it was told.
+fn persistent_route(model: ModelConfig, window: ConversationWindow) -> crate::routes::BoundRoute {
+    crate::routes::BoundRoute {
+        conversation: ConversationPolicy::Persistent(window),
+        ..route(model)
+    }
+}
+
+/// Bounds generous enough that only the property under test can drop anything.
+fn window() -> ConversationWindow {
+    ConversationWindow {
+        idle_timeout: Duration::from_secs(900),
+        limits: HistoryLimits {
+            max_turns: 12,
+            max_bytes: 64 * 1024,
+        },
     }
 }
 
@@ -747,11 +884,21 @@ fn runner_with(
     models: Arc<dyn ModelFactory>,
     max_concurrent: usize,
 ) -> Arc<SessionRunner> {
+    runner_tracking(broker, models, max_concurrent, 1024)
+}
+
+fn runner_tracking(
+    broker: ResolvedBroker,
+    models: Arc<dyn ModelFactory>,
+    max_concurrent: usize,
+    max_conversations: usize,
+) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
         broker,
         models,
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
+        conversations: ConversationStore::new(max_conversations),
     })
 }
 
@@ -1062,6 +1209,573 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     );
     assert!(replies[0].starts_with("BEGIN"));
     assert!(replies[0].ends_with("END"));
+}
+
+// ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+
+/// The same message from somebody else in the same conversation.
+fn message_from(subject: &str, text: &str) -> InboundMessage {
+    InboundMessage {
+        subject: subject.parse().expect("canonical subject fixture"),
+        ..message(text)
+    }
+}
+
+/// A prompt written the way a test reads it.
+fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .map(|(role, content)| ((*role).to_owned(), (*content).to_owned()))
+        .collect()
+}
+
+/// Every broker request the stub saw, asserting each one was a capability listing.
+///
+/// The count is the assertion that matters: `stub_broker` serves one connection per response, so
+/// "N messages produced N `capabilitiesFor` envelopes" is what proves authorization is asked again
+/// per message rather than remembered with the conversation.
+fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> usize {
+    let mut count = 0;
+    while let Ok(request) = observed.try_recv() {
+        assert!(
+            matches!(request.request, BrokerRequest::CapabilitiesFor { .. }),
+            "every session opens an attested leg: {request:?}"
+        );
+        count += 1;
+    }
+    count
+}
+
+/// One capability listing per message, so a two-message test needs two of them.
+fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
+    (0..count)
+        .map(|_| {
+            ResponseEnvelope::capabilities(
+                capabilities
+                    .iter()
+                    .map(|identifier| capability(identifier))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn granted(capabilities: &[&str]) -> Vec<String> {
+    capabilities
+        .iter()
+        .map(|capability| (*capability).to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt() {
+    // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
+    // because the exchange before it is in the prompt, in order, ahead of the new message.
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([
+        answer("Two things broke."),
+        answer("The second one was the database."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for text in ["what broke?", "and the second one?"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        replier.replies(),
+        vec![
+            "Two things broke.".to_owned(),
+            "The second one was the database.".to_owned()
+        ]
+    );
+    assert_eq!(
+        models.prompt(0),
+        transcript(&[("system", "Answer briefly."), ("user", "what broke?")]),
+        "the first message of a conversation starts clean"
+    );
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[
+            ("system", "Answer briefly."),
+            ("user", "what broke?"),
+            ("assistant", "Two things broke."),
+            ("user", "and the second one?"),
+        ]),
+        "instructions first, then what the conversation remembers, then the new message"
+    );
+    // Persistence remembers text and never a decision: both messages asked the broker for
+    // themselves.
+    assert_eq!(capability_listings(&mut observed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    for text in ["what broke?", "and the second one?"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[
+            ("system", "Answer briefly."),
+            ("user", "and the second one?")
+        ]),
+        "a oneShot route is exactly the behavior every route had before conversations existed"
+    );
+    assert_eq!(
+        runner.conversations.tracked(),
+        0,
+        "a oneShot route stores nothing at all"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_senders_in_one_conversation_never_see_each_others_history() {
+    // In a shared channel this is not a hypothetical. The admission key deliberately has no subject
+    // in it; the history key deliberately does, and this is the difference that makes.
+    const OTHER_SUBJECT: &str = "tel.16035550100";
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let models = ModelScript::new([
+        answer("Your deploy failed."),
+        answer("Yours is still running."),
+        answer("Still the deploy."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for message in [
+        message_from(SUBJECT, "what happened to mine?"),
+        message_from(OTHER_SUBJECT, "and mine?"),
+        message_from(SUBJECT, "and now?"),
+    ] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message,
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[("system", "Answer briefly."), ("user", "and mine?")]),
+        "the second sender's first message must not carry the first sender's exchange"
+    );
+    assert_eq!(
+        models.prompt(2),
+        transcript(&[
+            ("system", "Answer briefly."),
+            ("user", "what happened to mine?"),
+            ("assistant", "Your deploy failed."),
+            ("user", "and now?"),
+        ]),
+        "each sender continues their own conversation and nobody else's"
+    );
+    assert_eq!(runner.conversations.tracked(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
+    // Output fetched under a wider grant is sitting in the window. Narrowing what the subject may
+    // reach without dropping it would keep replaying that output after the capability that produced
+    // it was taken away.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo"), capability("gh.pr_view")]),
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")]),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        answer("Pull request 12 is open."),
+        answer("I can't see it."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for text in ["what is in pr 12?", "and now?"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[("system", "Answer briefly."), ("user", "and now?")]),
+        "a changed grant set starts a fresh conversation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_message() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")]),
+            ResponseEnvelope::capabilities(Vec::new()),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("Here is the secret plan.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        message("what is the plan?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert_eq!(runner.conversations.tracked(), 1);
+
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("remind me"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(
+        replier.replies().last().map(String::as_str),
+        Some(UNAUTHORIZED_REPLY)
+    );
+    assert_eq!(
+        models.requests(),
+        1,
+        "a revoked subject costs no model call"
+    );
+    assert_eq!(
+        runner.conversations.tracked(),
+        0,
+        "a revoked subject must not leave their exchange resident"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_session_records_the_question_it_could_not_answer() {
+    // The fixed failure line is this daemon's sentence rather than the agent's, and storing it
+    // would teach the model to keep producing it. The question still happened, though: dropping it
+    // would leave the retry with nothing to refer back to.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::scripted([None, Some(answer("It was the database."))]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        message("what broke?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("try again"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[
+            ("system", "Answer briefly."),
+            ("user", "what broke?"),
+            ("user", "try again"),
+        ]),
+        "an unanswered turn replays the question and nothing in the answer's place"
+    );
+    let replies = replier.replies();
+    assert!(
+        !replies
+            .iter()
+            .any(|reply| reply.contains(FAILURE_REPLY) && reply != FAILURE_REPLY),
+        "{replies:?}"
+    );
+}
+
+/// A factory whose model cannot be constructed, which is a session that asks nothing.
+struct UnbuildableModel;
+
+impl ModelFactory for UnbuildableModel {
+    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+        Err(SessionError::Model(ModelError::NoChoices))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_never_reached_a_model_remembers_nothing() {
+    // The turn a session commits is the one the prompt loop recorded. A session that failed before
+    // the loop recorded nothing, and must not commit the newest *seeded* turn in its place.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(UnbuildableModel) as Arc<dyn ModelFactory>,
+        4,
+    );
+
+    run_session(
+        Arc::clone(&runner),
+        persistent_route(model_config(), window()),
+        message("what broke?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+    assert_eq!(
+        runner.conversations.tracked(),
+        0,
+        "a message nothing was ever asked about leaves no exchange behind"
+    );
+}
+
+#[test]
+fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
+    // The clock is a parameter because `tokio::time::pause` does not reach
+    // `std::time::Instant::now()` inside a blocking task, so injecting it is the only way this is
+    // deterministic rather than a sleep.
+    let store = ConversationStore::new(8);
+    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let allowed = granted(&["echo.echo"]);
+    let start = Instant::now();
+    store.commit(
+        &key,
+        &allowed,
+        window(),
+        ConversationTurn::completed("what broke?", "two things"),
+        start,
+    );
+
+    let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(899));
+    assert_eq!(warm.len(), 1, "inside the timeout the exchange is replayed");
+
+    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    assert!(
+        cold.is_empty(),
+        "past the timeout the next message starts fresh"
+    );
+    assert_eq!(
+        store.tracked(),
+        0,
+        "an idle conversation is dropped rather than merely skipped"
+    );
+}
+
+#[test]
+fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing() {
+    // A person talking now matters more than one who stopped an hour ago, so a memory bound must
+    // not become an admission bound.
+    let store = ConversationStore::new(2);
+    let allowed = granted(&["echo.echo"]);
+    let start = Instant::now();
+    let keys = ["first", "second", "third"]
+        .map(|conversation| ConversationKey::new("dev", conversation, SUBJECT));
+    let turn = |text: &str| ConversationTurn::completed(text, "noted");
+
+    store.commit(&keys[0], &allowed, window(), turn("one"), start);
+    store.commit(
+        &keys[1],
+        &allowed,
+        window(),
+        turn("two"),
+        start + Duration::from_secs(1),
+    );
+    // Touching the oldest conversation makes the middle one the least recently used.
+    store.commit(
+        &keys[0],
+        &allowed,
+        window(),
+        turn("one again"),
+        start + Duration::from_secs(2),
+    );
+    store.commit(
+        &keys[2],
+        &allowed,
+        window(),
+        turn("three"),
+        start + Duration::from_secs(3),
+    );
+
+    let now = start + Duration::from_secs(4);
+    assert_eq!(store.tracked(), 2, "the ceiling holds");
+    assert!(
+        store.begin(&keys[1], &allowed, window(), now).is_empty(),
+        "the least recently used conversation is the one that goes"
+    );
+    assert_eq!(
+        store.begin(&keys[0], &allowed, window(), now).len(),
+        2,
+        "the conversation somebody is still having survives"
+    );
+    assert_eq!(store.begin(&keys[2], &allowed, window(), now).len(), 1);
+}
+
+#[test]
+fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
+    // Two bounds because they fail differently: twelve one-line exchanges and twelve
+    // paragraph-length ones are the same number of turns and very different prompts.
+    let allowed = granted(&["echo.echo"]);
+    let now = Instant::now();
+    let by_turns = ConversationWindow {
+        idle_timeout: Duration::from_secs(900),
+        limits: HistoryLimits {
+            max_turns: 2,
+            max_bytes: 64 * 1024,
+        },
+    };
+    // Each exchange below is a ten-byte question and a nine-byte answer, so two fit under this
+    // ceiling and three do not, while the turn count stays well inside `max_turns`.
+    let by_bytes = ConversationWindow {
+        idle_timeout: Duration::from_secs(900),
+        limits: HistoryLimits {
+            max_turns: 12,
+            max_bytes: 40,
+        },
+    };
+
+    for (window, name) in [(by_turns, "turn bound"), (by_bytes, "byte bound")] {
+        let store = ConversationStore::new(8);
+        let key = ConversationKey::new("dev", "dev", SUBJECT);
+        for text in ["question a", "question b", "question c"] {
+            store.commit(
+                &key,
+                &allowed,
+                window,
+                ConversationTurn::completed(text, "an answer"),
+                now,
+            );
+        }
+        let history = store.begin(&key, &allowed, window, now);
+        assert_eq!(history.len(), 2, "{name} keeps two exchanges");
+        assert_eq!(
+            history.turns()[0].user(),
+            "question b",
+            "{name} drops the oldest exchange first"
+        );
+    }
+}
+
+#[test]
+fn a_history_and_a_revoked_entry_are_two_different_removals() {
+    let store = ConversationStore::new(8);
+    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let allowed = granted(&["echo.echo"]);
+    let now = Instant::now();
+
+    assert!(
+        !store.remove(&key, EvictionReason::GrantChanged),
+        "removing a conversation nobody started is not an eviction"
+    );
+    store.commit(
+        &key,
+        &allowed,
+        window(),
+        ConversationTurn::completed("what broke?", "two things"),
+        now,
+    );
+    assert!(store.remove(&key, EvictionReason::GrantChanged));
+    assert_eq!(store.tracked(), 0);
+}
+
+#[test]
+fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
+    // Admission control does not serialize this: on Slack a message opening a thread and a reply
+    // inside it admit under different keys and share one conversation identity, so a sender
+    // replying to themselves before the bot answers runs two sessions against one history. Both
+    // read the same seed; neither may erase the other's answer.
+    let store = ConversationStore::new(8);
+    let key = ConversationKey::new("slack", "c0123abc:1700000000.000001", SUBJECT);
+    let allowed = granted(&["echo.echo"]);
+    let now = Instant::now();
+
+    let first = store.begin(&key, &allowed, window(), now);
+    let second = store.begin(&key, &allowed, window(), now);
+    assert!(first.is_empty() && second.is_empty());
+
+    store.commit(
+        &key,
+        &allowed,
+        window(),
+        ConversationTurn::completed("what broke?", "two things"),
+        now,
+    );
+    store.commit(
+        &key,
+        &allowed,
+        window(),
+        ConversationTurn::completed("still there?", "yes"),
+        now,
+    );
+
+    let history = store.begin(&key, &allowed, window(), now);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.turns()[0].user(), "what broke?");
+    assert_eq!(history.turns()[1].user(), "still there?");
+}
+
+#[test]
+fn the_store_prints_counts_rather_than_conversations() {
+    // `History` and `ConversationTurn` both derive `Debug`, so a derived impl here would put whole
+    // conversations into the log stream on one `tracing::debug!(?store)`.
+    let store = ConversationStore::new(8);
+    store.commit(
+        &ConversationKey::new("dev", "dev", SUBJECT),
+        &granted(&["echo.echo"]),
+        window(),
+        ConversationTurn::completed("the secret question", "the secret answer"),
+        Instant::now(),
+    );
+
+    let rendered = format!("{store:?}");
+    assert!(rendered.contains("conversations: 1"), "{rendered}");
+    assert!(rendered.contains("turns: 1"), "{rendered}");
+    assert!(!rendered.contains("secret"), "{rendered}");
+    assert!(!rendered.contains(SUBJECT), "{rendered}");
 }
 
 // ---------------------------------------------------------------------------

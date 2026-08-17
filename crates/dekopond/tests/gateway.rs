@@ -15,7 +15,7 @@ use std::{
     os::unix::{fs::PermissionsExt as _, net::UnixStream},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -146,7 +146,11 @@ fn gateway_config(directory: &Path, uid: u32, model_endpoint: &str) -> Value {
             "transport": "dev",
             "match": {"kind": "directMessage"},
             "agent": AGENT,
-            "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}
+            "limits": {"maxSteps": 4, "maxCapabilityCalls": 4},
+            // Persistent so one fixture covers both properties: an unauthorized subject is still
+            // refused before a model call, and a follow-up still reaches the model with the
+            // exchange before it in front of the question.
+            "conversation": {"mode": "persistent"}
         }],
         "sessions": {"maxConcurrent": 2},
         "shutdownGraceMs": 30_000
@@ -184,28 +188,36 @@ fn final_answer(text: &str) -> Value {
     })
 }
 
-/// Serves a fixed script of model responses on loopback and counts every request it received.
+/// Serves a fixed script of model responses on loopback, counting and keeping every request.
 ///
 /// The count is the assertion that matters for the refusal case: a gateway that refuses *after*
-/// contacting a model has already spent the money the refusal was supposed to save.
-fn spawn_model(responses: Vec<Value>) -> (String, Arc<AtomicUsize>) {
+/// contacting a model has already spent the money the refusal was supposed to save. The bodies are
+/// what a conversation assertion needs, since "this message was seeded with the last exchange" is a
+/// claim about the message list a request carried and not about how many requests there were.
+fn spawn_model(responses: Vec<Value>) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock model binds");
     let address = listener.local_addr().expect("mock model address");
     let requests = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&requests);
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&bodies);
     thread::spawn(move || {
         for response in responses {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             counted.fetch_add(1, Ordering::SeqCst);
-            if read_request(&mut stream).is_none() {
+            let Some(request) = read_request(&mut stream) else {
                 return;
-            }
+            };
+            recorded
+                .lock()
+                .expect("recorded model requests")
+                .push(request);
             respond(stream, &response);
         }
     });
-    (format!("http://{address}/v1"), requests)
+    (format!("http://{address}/v1"), requests, bodies)
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Value> {
@@ -321,11 +333,31 @@ struct Fixture {
     gateway: tokio::task::JoinHandle<Result<(), dekopond::DekopondError>>,
     stop_gateway: oneshot::Sender<()>,
     model_requests: Arc<AtomicUsize>,
+    model_prompts: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Fixture {
     fn socket(&self) -> PathBuf {
         self.directory.path().join("dev.sock")
+    }
+
+    /// One request's message list as `(role, content)` pairs, in the order the model saw them.
+    fn prompt(&self, index: usize) -> Vec<(String, String)> {
+        let prompts = self.model_prompts.lock().expect("recorded model requests");
+        let request = prompts
+            .get(index)
+            .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
+        request["messages"]
+            .as_array()
+            .expect("a chat-completions request carries messages")
+            .iter()
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap_or_default().to_owned(),
+                    message["content"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
     }
 
     fn audit(&self) -> PathBuf {
@@ -373,7 +405,7 @@ async fn boot(responses: Vec<Value>) -> Fixture {
         &directory.path().join("dekopon.yaml"),
         catalog_text().as_bytes(),
     );
-    let (endpoint, model_requests) = spawn_model(responses);
+    let (endpoint, model_requests, model_prompts) = spawn_model(responses);
     let gateway_path = directory.path().join("dekopond.json");
     write_owner_only(
         &gateway_path,
@@ -393,6 +425,7 @@ async fn boot(responses: Vec<Value>) -> Fixture {
         gateway,
         stop_gateway,
         model_requests,
+        model_prompts,
     }
 }
 
@@ -441,6 +474,53 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
     assert_eq!(decision["via"], GATEWAY_PRINCIPAL);
     let serialized = serde_json::to_string(&events).expect("audit serializes");
     assert!(!serialized.contains("say hi"), "{serialized}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
+    // The daemon assembled from its own configuration, not a hand-built runner: a second message on
+    // the same conversation reaches the model with the first exchange in front of the new question.
+    let fixture = boot(vec![
+        final_answer("Two things broke."),
+        final_answer("The second one was the database."),
+    ])
+    .await;
+
+    let socket = fixture.socket();
+    let asked = socket.clone();
+    let first = tokio::task::spawn_blocking(move || ask(&asked, MAPPED_SUBJECT, "what broke?"))
+        .await
+        .expect("the first request completes");
+    assert_eq!(first, "Two things broke.");
+    let second =
+        tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "and the second one?"))
+            .await
+            .expect("the follow-up completes");
+    assert_eq!(second, "The second one was the database.");
+
+    let follow_up = fixture.prompt(1);
+    assert_eq!(
+        follow_up
+            .iter()
+            .map(|(role, content)| (role.as_str(), content.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "system",
+                "Answer in one short sentence. You have no authority of your own."
+            ),
+            ("user", "what broke?"),
+            ("assistant", "Two things broke."),
+            ("user", "and the second one?"),
+        ]
+    );
+
+    let audit = fixture.audit();
+    let _directory = fixture.shutdown().await;
+    // Conversation text is gateway memory and nothing else: the broker's durable chain never saw a
+    // word of it.
+    let serialized = serde_json::to_string(&audit_events(&audit)).expect("audit serializes");
+    assert!(!serialized.contains("what broke"), "{serialized}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

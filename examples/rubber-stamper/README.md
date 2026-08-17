@@ -183,6 +183,14 @@ The session:
    A failed session says exactly one thing instead: `The agent could not complete this request.` A
    model's own error text, a provider message, and a transport diagnostic are all things chat is
    the last place for; the operator reads the category from telemetry.
+4. **What the next message remembers.** The route is `mode: persistent`, so this exchange is kept
+   as one `(question, answer)` pair in the gateway's memory and replayed ahead of the next message
+   from *this sender in this conversation* — which is what makes a follow-up like "and PR 8?"
+   answerable. Only the question and the answer are kept: the `gh pr view` output above is dropped
+   at write-back and never replayed. Nothing is written to disk, nothing reaches the broker, and
+   fifteen idle minutes or a narrowed grant drops it. Set the route to `mode: oneShot` — or leave
+   the `conversation:` block out, which means the same thing — and every message starts from an
+   empty prompt again.
 
 ### The refusals worth knowing
 

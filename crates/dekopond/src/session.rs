@@ -8,11 +8,12 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
-    prompt::{PromptError, run_prompt},
+    prompt::{History, PromptError, run_prompt_with_history},
 };
 use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
 use dekopon_model::{
@@ -26,6 +27,7 @@ use tracing::Instrument as _;
 
 use crate::{
     config::{ModelConfig, ResolvedBroker},
+    conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{ChatReplier, InboundMessage, bound_outbound},
 };
@@ -44,8 +46,12 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 /// the category from telemetry, and the sender reads a sentence.
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
 
-/// One conversation, for in-flight serialization.
-type ConversationKey = (String, String, Option<String>);
+/// One conversation, for in-flight serialization only.
+///
+/// Deliberately subject-free, and deliberately not the history key. Two people talking at once in
+/// one thread are one thing to serialize and two things to remember; `ConversationKey` in
+/// [`crate::conversation`] is the other question and carries the sender.
+type AdmissionKey = (String, String, Option<String>);
 
 /// Builds the model client one route selected.
 ///
@@ -99,7 +105,7 @@ impl ModelFactory for ConfiguredModels {
 /// person does when a bot seems slow and they send the same thing again.
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
-    in_flight: Arc<Mutex<BTreeSet<ConversationKey>>>,
+    in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
 
 impl SessionGate {
@@ -111,7 +117,7 @@ impl SessionGate {
     }
 
     /// Admits one session, or reports that this message must be refused.
-    pub fn admit(&self, key: ConversationKey) -> Option<SessionAdmission> {
+    pub fn admit(&self, key: AdmissionKey) -> Option<SessionAdmission> {
         let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
         let mut in_flight = self.in_flight.lock().expect("session in-flight registry");
         if !in_flight.insert(key.clone()) {
@@ -129,8 +135,8 @@ impl SessionGate {
 /// Holds one session's permit and conversation slot until it is dropped.
 pub(crate) struct SessionAdmission {
     _permit: OwnedSemaphorePermit,
-    key: ConversationKey,
-    in_flight: Arc<Mutex<BTreeSet<ConversationKey>>>,
+    key: AdmissionKey,
+    in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
 
 impl Drop for SessionAdmission {
@@ -148,6 +154,8 @@ pub(crate) struct SessionRunner {
     pub models: Arc<dyn ModelFactory>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
+    /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
+    pub conversations: ConversationStore,
 }
 
 /// Runs one routed message end to end, answering in chat whatever happens.
@@ -204,8 +212,16 @@ async fn execute(
         return "busy";
     };
 
+    // Both conversation fields are zero on a `oneShot` route and on the first message of any
+    // conversation, which makes "was this session seeded" a filter rather than a guess. They are a
+    // count and a byte total: the history itself is chat text and stays behind the payload gate.
     let outcome = session(&runner, &route, &message, &replier)
-        .instrument(tracing::info_span!("gateway.session", agent = %route.agent))
+        .instrument(tracing::info_span!(
+            "gateway.session",
+            agent = %route.agent,
+            conversation.turns = tracing::field::Empty,
+            conversation.bytes = tracing::field::Empty,
+        ))
         .await;
     drop(admission);
     outcome
@@ -241,14 +257,40 @@ async fn session(
             return "failed";
         }
     };
-    // The authorization gate, and it costs nothing: the broker already answered
-    // `capabilitiesFor` with what this subject may reach through this agent. An empty answer is a
-    // complete answer, so there is no model call to make.
-    if leg.granted().is_empty() {
+    // Never cached and never remembered as a permission: this is a fresh answer from the broker
+    // about what this subject may reach through this agent, on this message.
+    let granted = leg.granted();
+    let key = ConversationKey::new(
+        &message.transport,
+        &message.conversation_id,
+        &message.subject.canonical(),
+    );
+    // The authorization gate, and it costs nothing: an empty answer is a complete answer, so there
+    // is no model call to make. Removing the entry rather than only refusing is the other half —
+    // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
+    // holding exactly the text the revocation was about.
+    if granted.is_empty() {
+        runner
+            .conversations
+            .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(event = "gateway_session_rejected", reason = "unauthorized");
         answer(replier, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
+
+    // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
+    // grant to compare against. `Instant` is supplied by the caller rather than read inside the
+    // store so eviction has a clock a test can drive.
+    let window = route.conversation.window();
+    let seeded = match window {
+        Some(window) => runner
+            .conversations
+            .begin(&key, &granted, window, Instant::now()),
+        None => History::default(),
+    };
+    let span = tracing::Span::current();
+    span.record("conversation.turns", seeded.len());
+    span.record("conversation.bytes", seeded.bytes());
 
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
@@ -262,38 +304,72 @@ async fn session(
     // The prompt loop and the interpreter are both synchronous and both can block for a long time
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
-    let span = tracing::Span::current();
+    let blocking_span = span.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _entered = span.enter();
-        let model = models.build(&model_config)?;
+        let _entered = blocking_span.enter();
+        // Built before the accumulator exists, so a model client that cannot be constructed
+        // returns without a turn: nothing was asked, so there is no exchange to remember.
+        let model = match models.build(&model_config) {
+            Ok(model) => model,
+            Err(error) => return (Err(error), None),
+        };
         let runtime = ShellRuntime {
             invoker: leg,
             limits: shell,
             curl_capability: None,
         };
-        run_prompt(
+        // `history` is the accumulator rather than a return value, so this session's exchange is
+        // recorded into it whichever way the loop ends.
+        let mut history = seeded;
+        let outcome = run_prompt_with_history(
             model.as_ref(),
             &runtime,
             &text,
             instructions.as_deref(),
             limits,
+            &mut history,
         )
-        .map_err(SessionError::from)
+        .map_err(SessionError::from);
+        // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
+        // in the one module that owns it. The single exception is the message the loop refuses
+        // outright: a zero step budget builds no request, records nothing, and would otherwise make
+        // the newest *seeded* turn look like this session's — which strict configuration already
+        // rejects at startup, and which must not silently duplicate an exchange if it ever did not.
+        let turn = match &outcome {
+            Err(SessionError::Prompt(PromptError::ZeroSteps)) => None,
+            _ => history.turns().last().cloned(),
+        };
+        (outcome, turn)
     })
     .await;
 
-    let answer_text = match result {
-        Ok(Ok(outcome)) => outcome.answer,
-        Ok(Err(error)) => {
+    let (outcome, turn) = match result {
+        Ok(session) => session,
+        Err(_) => {
+            // The task itself died, so there is no history to trust and nothing to record.
+            tracing::error!(event = "gateway_session_failed", category = "session-task");
+            answer(replier, message, FAILURE_REPLY).await;
+            return "failed";
+        }
+    };
+    // The exchange when the session answered, and the bare question when it did not. The fixed
+    // failure line is never stored: it is this daemon's sentence rather than the agent's, and
+    // replaying it would teach the model to keep producing it.
+    if let Some(window) = window
+        && let Some(turn) = turn
+    {
+        runner
+            .conversations
+            .commit(&key, &granted, window, turn, Instant::now());
+    }
+
+    let answer_text = match outcome {
+        Ok(outcome) => outcome.answer,
+        Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category()
             );
-            answer(replier, message, FAILURE_REPLY).await;
-            return "failed";
-        }
-        Err(_) => {
-            tracing::error!(event = "gateway_session_failed", category = "session-task");
             answer(replier, message, FAILURE_REPLY).await;
             return "failed";
         }

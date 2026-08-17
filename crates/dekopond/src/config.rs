@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_agent::prompt::HistoryLimits;
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
@@ -36,6 +37,18 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
 /// Default grace given to in-flight sessions at shutdown.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+/// Default life of an untouched persistent conversation.
+///
+/// Fifteen minutes resolves toward the person rather than toward a provider's prompt cache, which
+/// clears within a few minutes. A bot that forgot four minutes ago is the failure people report;
+/// the cost control is the window below, not the cache.
+pub const DEFAULT_CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+/// Default exchanges a persistent route replays into the next prompt.
+pub const DEFAULT_CONVERSATION_MAX_TURNS: usize = 12;
+/// Default bytes of replayed conversation a persistent route carries.
+pub const DEFAULT_CONVERSATION_MAX_BYTES: usize = 64 * 1024;
+/// Default conversations this process tracks at once.
+pub const DEFAULT_MAX_CONVERSATIONS: usize = 1024;
 /// The only non-loopback Slack origin this daemon will talk to.
 pub const SLACK_ENDPOINT: &str = "https://slack.com";
 /// The only non-loopback Telegram origin this daemon will talk to.
@@ -239,6 +252,60 @@ const fn default_max_capability_calls() -> u32 {
     DEFAULT_MAX_CAPABILITY_CALLS
 }
 
+/// What a route remembers between one message and the next.
+///
+/// Tagged on `mode` in the house style, and strict on both halves, because the failure worth
+/// preventing is a *silent* one: a window bound written next to `mode: oneShot` can never take
+/// effect, and a setting that can never take effect is far more likely a mode typo than an
+/// intention. Rejecting it at decode is what turns that into a startup failure with a field name in
+/// it rather than a bot that quietly forgets everything.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(
+    tag = "mode",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ConversationConfig {
+    /// Every message is an independent session that starts from an empty prompt.
+    ///
+    /// A struct variant with no fields rather than a unit variant, deliberately. serde's internally
+    /// tagged *unit* variants accept and discard every key beside the tag, so `mode: oneShot` with
+    /// an `idleTimeoutMs` beside it would decode cleanly and do nothing — exactly the silence this
+    /// enum exists to prevent. An empty struct variant under `deny_unknown_fields` rejects it.
+    OneShot {},
+    /// A bounded per-sender history is replayed ahead of each new message.
+    Persistent {
+        /// How long an untouched conversation survives.
+        #[serde(default = "default_idle_timeout_ms")]
+        idle_timeout_ms: u64,
+        /// Exchanges the replayed window holds, oldest dropped first.
+        #[serde(default = "default_conversation_max_turns")]
+        max_turns: usize,
+        /// Bytes the replayed window holds, oldest dropped first.
+        #[serde(default = "default_conversation_max_bytes")]
+        max_bytes: usize,
+    },
+}
+
+impl Default for ConversationConfig {
+    fn default() -> Self {
+        Self::OneShot {}
+    }
+}
+
+const fn default_idle_timeout_ms() -> u64 {
+    DEFAULT_CONVERSATION_IDLE_TIMEOUT.as_secs() * 1_000
+}
+
+const fn default_conversation_max_turns() -> usize {
+    DEFAULT_CONVERSATION_MAX_TURNS
+}
+
+const fn default_conversation_max_bytes() -> usize {
+    DEFAULT_CONVERSATION_MAX_BYTES
+}
+
 /// One transport-and-conversation to agent binding.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -252,6 +319,54 @@ pub struct RouteConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub limits: RouteLimits,
+    /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
+    #[serde(default)]
+    pub conversation: ConversationConfig,
+}
+
+/// A persistent route's bounds, with `idleTimeoutMs` already resolved to a [`Duration`].
+///
+/// Both window bounds apply together, oldest exchanges dropping first until each holds. Two bounds
+/// because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the
+/// same number of turns and very different prompts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConversationWindow {
+    /// How long an untouched conversation survives before a lookup drops it.
+    pub idle_timeout: Duration,
+    /// What the replayed window holds.
+    pub limits: HistoryLimits,
+}
+
+/// What a route remembers, after validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationPolicy {
+    /// No history: every message is an independent session, which is every route's default.
+    OneShot,
+    /// A bounded per-sender history, replayed ahead of each new message.
+    Persistent(ConversationWindow),
+}
+
+impl ConversationPolicy {
+    /// The window this route replays, or `None` when it remembers nothing.
+    #[must_use]
+    pub const fn window(self) -> Option<ConversationWindow> {
+        match self {
+            Self::OneShot => None,
+            Self::Persistent(window) => Some(window),
+        }
+    }
+}
+
+/// One route after its agent, model, and conversation settings were validated.
+#[derive(Clone, Debug)]
+pub struct ResolvedRoute {
+    pub transport: String,
+    pub r#match: RouteMatch,
+    pub agent: AgentId,
+    /// Overrides model-class selection for this route.
+    pub model: Option<String>,
+    pub limits: RouteLimits,
+    pub conversation: ConversationPolicy,
 }
 
 /// Process-wide session admission bounds.
@@ -263,6 +378,15 @@ pub struct SessionsConfig {
     /// Whether a rejected message gets a short "try again" reply instead of silence.
     #[serde(default = "default_reply_on_busy")]
     pub reply_on_busy: bool,
+    /// Conversations this process tracks at once, across every persistent route.
+    ///
+    /// A memory bound rather than an admission bound: reaching it evicts the least recently used
+    /// conversation rather than refusing a message, because a person talking now matters more than
+    /// one who stopped an hour ago. It lives here rather than in a route block because it is a
+    /// property of the process, and `sessions:` is already where what this daemon costs at once is
+    /// configured.
+    #[serde(default = "default_max_conversations")]
+    pub max_conversations: usize,
 }
 
 impl Default for SessionsConfig {
@@ -270,12 +394,17 @@ impl Default for SessionsConfig {
         Self {
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
+            max_conversations: DEFAULT_MAX_CONVERSATIONS,
         }
     }
 }
 
 const fn default_max_concurrent() -> usize {
     DEFAULT_MAX_CONCURRENT_SESSIONS
+}
+
+const fn default_max_conversations() -> usize {
+    DEFAULT_MAX_CONVERSATIONS
 }
 
 const fn default_reply_on_busy() -> bool {
@@ -320,7 +449,7 @@ pub struct ResolvedConfig {
     pub broker: ResolvedBroker,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
-    pub routes: Vec<RouteConfig>,
+    pub routes: Vec<ResolvedRoute>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
@@ -539,10 +668,11 @@ pub(crate) fn resolve(
         }
     }
 
-    for route in &config.routes {
+    let mut routes = Vec::with_capacity(config.routes.len());
+    for route in config.routes {
         if !transport_names.contains(&route.transport) {
             return Err(ConfigError::UnknownRouteTransport {
-                transport: route.transport.clone(),
+                transport: route.transport,
             });
         }
         if let Some(model) = &route.model
@@ -557,10 +687,45 @@ pub(crate) fn resolve(
                 agent: route.agent.to_string(),
             });
         }
+        // A bound of zero is a bound nobody meant to write, exactly as a zero step budget already
+        // is. The other half of this check — a window setting on a `oneShot` route — is a decode
+        // failure rather than a check here, because there is no field it could have landed in.
+        let conversation = match route.conversation {
+            ConversationConfig::OneShot {} => ConversationPolicy::OneShot,
+            ConversationConfig::Persistent {
+                idle_timeout_ms,
+                max_turns,
+                max_bytes,
+            } => {
+                if idle_timeout_ms == 0 || max_turns == 0 || max_bytes == 0 {
+                    return Err(ConfigError::InvalidConversationBounds {
+                        agent: route.agent.to_string(),
+                    });
+                }
+                ConversationPolicy::Persistent(ConversationWindow {
+                    idle_timeout: Duration::from_millis(idle_timeout_ms),
+                    limits: HistoryLimits {
+                        max_turns,
+                        max_bytes,
+                    },
+                })
+            }
+        };
+        routes.push(ResolvedRoute {
+            transport: route.transport,
+            r#match: route.r#match,
+            agent: route.agent,
+            model: route.model,
+            limits: route.limits,
+            conversation,
+        });
     }
 
     if config.sessions.max_concurrent == 0 {
         return Err(ConfigError::InvalidSessionLimits);
+    }
+    if config.sessions.max_conversations == 0 {
+        return Err(ConfigError::InvalidMaxConversations);
     }
     let shutdown_grace = match config.shutdown_grace_ms {
         Some(0) => return Err(ConfigError::InvalidSessionLimits),
@@ -614,7 +779,7 @@ pub(crate) fn resolve(
         broker,
         transports,
         models: config.models,
-        routes: config.routes,
+        routes,
         sessions: config.sessions,
         shutdown_grace,
         telemetry,
@@ -741,6 +906,14 @@ pub enum ConfigError {
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
     InvalidSessionLimits,
+    #[error(
+        "route for agent {agent:?} declares a persistent conversation with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
+    )]
+    InvalidConversationBounds { agent: String },
+    #[error(
+        "sessions.maxConversations must be greater than zero; a zero ceiling evicts every conversation immediately and turns a persistent route into an expensive one-shot one"
+    )]
+    InvalidMaxConversations,
     #[error(
         "{name:?} is not a valid environment variable name; transports and models name variables, never secrets"
     )]
