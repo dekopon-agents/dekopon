@@ -20,6 +20,7 @@
 #![cfg(unix)]
 
 mod config;
+mod conversation;
 mod routes;
 mod session;
 mod transport;
@@ -34,8 +35,9 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
-    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, DekopondConfig, HARD_MAX_CONFIG_BYTES,
-    ResolvedConfig, ResolvedTelemetry, SocketDiscovery, TelemetryConfig,
+    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig, ConversationPolicy,
+    ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES, ResolvedConfig, ResolvedRoute,
+    ResolvedTelemetry, SocketDiscovery, TelemetryConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;
@@ -43,6 +45,7 @@ pub use transport::TransportError;
 
 use crate::{
     config::TransportConfig,
+    conversation::ConversationStore,
     routes::RoutingTable,
     session::{ConfiguredModels, SessionGate, SessionRunner},
     transport::{
@@ -143,6 +146,7 @@ where
         models: Arc::new(ConfiguredModels),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
+        conversations: ConversationStore::new(config.sessions.max_conversations),
     });
 
     let (sender, receiver) = mpsc::channel::<InboundMessage>(INBOUND_BUFFER);

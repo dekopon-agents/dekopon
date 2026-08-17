@@ -13,7 +13,7 @@ use dekopon_protocol::Agent;
 use thiserror::Error;
 
 use crate::{
-    config::{ModelConfig, ResolvedConfig, RouteMatch},
+    config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch},
     transport::ConversationKind,
 };
 
@@ -27,6 +27,8 @@ pub(crate) struct BoundRoute {
     pub instructions: Option<String>,
     pub model: Arc<ModelConfig>,
     pub limits: PromptLimits,
+    /// What this route remembers between messages.
+    pub conversation: ConversationPolicy,
 }
 
 /// Every bound route, consulted in declaration order.
@@ -92,6 +94,7 @@ impl RoutingTable {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,
                 },
+                conversation: route.conversation,
             });
         }
         Ok(Self { routes })

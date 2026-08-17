@@ -53,6 +53,17 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(route.transport, transport.name());
     assert_eq!(route.limits.max_steps, 8);
     assert_eq!(route.limits.max_capability_calls, 16);
+    // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to
+    // opt into: writing a window bound next to `mode: oneShot` would not decode at all.
+    assert_eq!(
+        route.conversation,
+        dekopond::ConversationConfig::Persistent {
+            idle_timeout_ms: 900_000,
+            max_turns: 12,
+            max_bytes: 65_536,
+        }
+    );
+    assert_eq!(config.sessions.max_conversations, 1024);
 
     // A route naming an agent the catalog does not contain, or one it disables, is a startup
     // failure. So is an agent with no resolvable model.
