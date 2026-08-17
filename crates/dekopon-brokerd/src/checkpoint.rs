@@ -438,6 +438,8 @@ mod tests {
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
             },
+            via: None,
+            attested_subject: None,
             capability: "echo.echo"
                 .parse::<CapabilityId>()
                 .expect("valid capability fixture"),
@@ -447,6 +449,8 @@ mod tests {
                 .expect("valid principal fixture"),
             decision_id: format!("decision-{invocation}"),
             policy_revision: "policy-checkpoint".to_owned(),
+            policy_ids: Vec::new(),
+            policy_digest: None,
             allowed: false,
             reason: Some("policy-denied".to_owned()),
             decision_digest: format!("sha256:{}", "a".repeat(64)),

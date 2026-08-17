@@ -20,6 +20,7 @@ Finally, read the documents selected by the work:
 | Runner traces, OTLP logs, telemetry redaction, or OpenObserve | [`docs/observability.md`](docs/observability.md) | It defines signal contents, configuration, audit limitations, and end-to-end coverage. |
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md) | It records repository mechanics and validation traps that root workspace commands do not cover. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`docs/broker-http.md`](docs/broker-http.md) | It defines the accepted process boundary, buffered HTTP contract, authorization inputs, and staged delivery. |
+| Chat transports, gateway configuration, routing, agent sessions, or attested proposals | [`docs/dekopond.md`](docs/dekopond.md) | It defines the unprivileged daemon's contract and the authority it deliberately does not hold. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
 
 [`docs/README.md`](docs/README.md) is the complete documentation map. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for validation and pull-request expectations.
@@ -31,7 +32,7 @@ Finally, read the documents selected by the work:
 - Read authority never implies write authority. External writes require explicit narrow capabilities.
 - Trusted actor identity comes from an authenticated envelope, never from model or repository content.
 - Provider credentials remain inside the broker boundary and out of prompts, config, evidence, and logs; model credentials stay inside the selected model client and never enter provider components.
-- `dekopond` and `dekopon-brokerd` remain separate processes once external-write authority exists.
+- `dekopond` and `dekopon-brokerd` remain separate processes. External-write authority exists now, so this is a live invariant rather than a future one: the gateway must never gain policy, provider credentials, or an authorization path of its own, and CI rejects any broker crate appearing in its normal dependency tree.
 - The direct `dekopon-run` provider path remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode. A broker-backed mode may submit proposals, but only the separate broker may resolve privileged imports or execute effects.
 - Do not describe unimplemented daemons, policy, privileged provider interfaces, or external effects as available.
 - Do not add empty crates or heavy future dependencies without meaningful, tested behavior.
@@ -40,6 +41,21 @@ Finally, read the documents selected by the work:
 - The SDK and host provider WIT files must remain identical. The SDK copy is also the source for the published `dekopon:provider` WIT package; preserve its import-free boundary and bump its WIT version before changing an already-published contract. The canonical `dekopon:http` WIT file and every checked-in guest or broker-host mirror must also remain identical. Never hand-edit generated provider `.wasm` files; rebuild them from their Rust source.
 - Root workspace commands do not cover the separate workspaces under `examples/providers/`; validate each affected provider workspace explicitly.
 - Do not publish crates, create releases, weaken branch protection, or add credentials without explicit human authorization.
+
+## Release and publication discipline
+
+Read the maintainer procedure in [`README.md`](README.md#maintainer-release-process) and the validation details in [`docs/development.md`](docs/development.md#dependencies-crates-ci-or-releases) before changing versions, tags, package metadata, or release automation.
+
+- Explicit authorization applies only to the release the human named; it is not standing permission for later versions.
+- Prepare from a clean, current `main`. Every public workspace package must share the release version, and the tag must be exactly `v<VERSION>`.
+- `cargo release` prepares the shared-version commit and tag. Repository configuration intentionally disables its publish and push phases; GitHub Actions owns release artifacts and crates.io trusted publication.
+- A tag push validates and publishes provenance-attested GitHub archives but does **not** publish crates.io packages. Crates publication requires a manual `Release` workflow dispatch with `publish_to_crates=true` and approval of the protected `crates-io` environment.
+- Keep `PUBLISH_CRATES` in [`.github/workflows/release.yml`](.github/workflows/release.yml) in package-dependency order, including internal build and dev dependencies that `cargo package` resolves. The validation job checks exact coverage, uniqueness, and ordering so a newly public crate cannot be silently omitted or published before a dependency needed for verification.
+- Every public package must have a crates.io GitHub trusted-publisher configuration for repository `dekopon-agents/dekopon`, workflow `release.yml`, and environment `crates-io`. A brand-new crate name cannot use OIDC before it exists: bootstrap it only with explicit authorization and a narrowly scoped credential, register that trusted publisher immediately, then revoke the bootstrap credential.
+- Before tagging, update release-facing status/install text in the root and crate READMEs, then run `cargo package --workspace --exclude dekopon-testkit --locked` in addition to the full test, lint, docs, and dependency checks. Package verification proves local archives; it does not prove the crates publication list is complete, which is why the workflow checks both.
+- Treat crate versions and Git tags as immutable. Never move a release tag, overwrite a published package, expose a long-lived token in a workflow, or print credentials while diagnosing publication. Routine publication uses the protected OIDC workflow; an explicitly authorized local recovery must use the narrowest credential available and revoke it when the recovery is complete.
+- The publication job may retry only crates.io's explicit new-package `429`, waiting until the server-provided retry time. Any other upload or API failure must stop rather than being hidden by a generic retry loop.
+- After publication, verify every public package through crates.io and test fresh version-pinned installs of `dekopon`, `dekopon-run`, and `dekopon-brokerd`. Do not announce success based only on an upload command.
 
 ## Working method
 

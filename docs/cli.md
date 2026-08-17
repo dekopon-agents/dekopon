@@ -1,6 +1,6 @@
 # CLI reference
 
-`dekopon` is the operator interface for local catalog inspection and model-account lifecycle. Version `0.1.0` is synchronous and does not contact a daemon. Catalog commands read a validated local catalog; `auth` commands instead contact the selected model provider's fixed authentication endpoint. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md).
+`dekopon` is the operator interface for local catalog inspection and model-account lifecycle. It is synchronous and contacts neither `dekopon-brokerd` nor `dekopond`; operator-CLI integration with either is committed direction, not current behavior. Catalog commands read a validated local catalog; `auth` commands instead contact the selected model provider's fixed authentication endpoint. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md).
 
 ## Commands
 

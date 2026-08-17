@@ -88,18 +88,18 @@ pub(crate) fn arguments_to_input(
         return Ok(Value::Object(serde_json::Map::new()));
     }
 
-    if let [single] = arguments {
-        if single.trim_start().starts_with('{') {
-            let parsed = serde_json::from_str::<Value>(single).map_err(|error| {
-                CommandFailure::usage(format!("{command}: input is not valid JSON: {error}"))
-            })?;
-            if !parsed.is_object() {
-                return Err(CommandFailure::usage(format!(
-                    "{command}: capability input must be a JSON object"
-                )));
-            }
-            return Ok(parsed);
+    if let [single] = arguments
+        && single.trim_start().starts_with('{')
+    {
+        let parsed = serde_json::from_str::<Value>(single).map_err(|error| {
+            CommandFailure::usage(format!("{command}: input is not valid JSON: {error}"))
+        })?;
+        if !parsed.is_object() {
+            return Err(CommandFailure::usage(format!(
+                "{command}: capability input must be a JSON object"
+            )));
         }
+        return Ok(parsed);
     }
 
     let mut pairs = Vec::new();

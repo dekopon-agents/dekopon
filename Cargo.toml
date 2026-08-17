@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/dekopon",
+    "crates/dekopon-agent",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",
     "crates/dekopon-broker-protocol",
@@ -10,6 +11,7 @@ members = [
     "crates/dekopon-core",
     "crates/dekopon-model",
     "crates/dekopon-http-host",
+    "crates/dekopon-policy",
     "crates/dekopon-provider-host",
     "crates/dekopon-provider-http",
     "crates/dekopon-provider-sdk",
@@ -18,6 +20,7 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-telemetry",
     "crates/dekopon-testkit",
+    "crates/dekopond",
 ]
 exclude = ["examples/providers/echo"]
 resolver = "3"
@@ -25,7 +28,7 @@ resolver = "3"
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.86.0"
+rust-version = "1.89.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dekopon-agents/dekopon"
 homepage = "https://github.com/dekopon-agents/dekopon"
@@ -34,6 +37,7 @@ authors = ["Dekopon contributors"]
 [workspace.dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
+cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
 fs2 = "0.4.3"
 futures-util = "0.3.31"
@@ -56,6 +60,7 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-chrome = "0.7.2"
 tonic = { version = "0.14.1", default-features = false }
@@ -65,6 +70,7 @@ ureq = { version = "3.3.0", default-features = false, features = ["json", "rustl
 wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
+dekopon-agent = { version = "0.2.0", path = "crates/dekopon-agent" }
 dekopon-broker = { version = "0.2.0", path = "crates/dekopon-broker" }
 dekopon-broker-host = { version = "0.2.0", path = "crates/dekopon-broker-host" }
 dekopon-broker-protocol = { version = "0.2.0", path = "crates/dekopon-broker-protocol" }
@@ -74,6 +80,7 @@ dekopon-config = { version = "0.2.0", path = "crates/dekopon-config" }
 dekopon-core = { version = "0.2.0", path = "crates/dekopon-core" }
 dekopon-http-host = { version = "0.2.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.2.0", path = "crates/dekopon-model" }
+dekopon-policy = { version = "0.2.0", path = "crates/dekopon-policy" }
 dekopon-provider-host = { version = "0.2.0", path = "crates/dekopon-provider-host" }
 dekopon-provider-http = { version = "0.2.0", path = "crates/dekopon-provider-http" }
 dekopon-provider-sdk = { version = "0.2.0", path = "crates/dekopon-provider-sdk" }
@@ -81,6 +88,7 @@ dekopon-protocol = { version = "0.2.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.2.0", path = "crates/dekopon-shell" }
 dekopon-telemetry = { version = "0.2.0", path = "crates/dekopon-telemetry" }
 dekopon-testkit = { version = "0.2.0", path = "crates/dekopon-testkit" }
+dekopond = { version = "0.2.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

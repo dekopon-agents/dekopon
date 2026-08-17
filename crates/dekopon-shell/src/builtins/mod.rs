@@ -26,6 +26,7 @@ pub(crate) mod cap;
 pub(crate) mod clock;
 pub(crate) mod curl;
 pub(crate) mod encode;
+pub(crate) mod gh;
 pub(crate) mod jq;
 pub(crate) mod misc;
 pub(crate) mod text;
@@ -204,6 +205,7 @@ pub(crate) enum BuiltinKind {
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &curl::Curl,
+    &gh::Gh,
     &clock::Date,
     &misc::Sleep,
     &text::Grep,
@@ -394,6 +396,7 @@ mod tests {
             "date",
             "echo",
             "false",
+            "gh",
             "grep",
             "jq",
             "printf",

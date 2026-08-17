@@ -1,0 +1,58 @@
+# Slack app manifest for the dekopond gateway.
+#
+# Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest",
+# pick the workspace, and paste this file. Rename the two display names first if you
+# want the bot addressed differently (e.g. `xavier-dekopon`).
+#
+# The manifest deliberately requests the minimum surface the gateway consumes:
+#
+# - Socket Mode, so events arrive over an outbound WebSocket wakeup and the gateway
+#   needs no public HTTP endpoint.
+# - `message.im` events (requires `im:history`), so direct messages reach DM routes.
+# - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
+#   when the bot is explicitly addressed — dekopond ignores unaddressed channel
+#   traffic by design.
+# - `chat:write`, so the gateway can reply.
+#
+# Two tokens exist after creation, and neither lives in any Dekopon config file —
+# dekopond reads both from environment variables named in its `transports` entry:
+#
+# 1. App-level token (`xapp-...`): "Basic Information" → "App-Level Tokens" →
+#    "Generate Token and Scopes" with the `connections:write` scope. Manifests cannot
+#    declare app-level tokens; this step is always manual. This token opens the
+#    Socket Mode connection.
+# 2. Bot token (`xoxb-...`): "Install App" → install to the workspace. This token
+#    sends replies.
+#
+# To extend later: seeing every message in a public channel (not just mentions) needs
+# the `channels:history` scope plus the `message.channels` event; private channels
+# need `groups:history` plus `message.groups`. Add them here and reinstall the app.
+display_information:
+  name: dekopond
+  description: Dekopon agent gateway — routes messages to broker-authorized agents
+  background_color: "#2c2d30"
+features:
+  # Without the messages tab, Slack renders "Sending messages to this app has been
+  # turned off" in the DM view and the gateway's primary route is unreachable.
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: dekopond
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - im:history
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

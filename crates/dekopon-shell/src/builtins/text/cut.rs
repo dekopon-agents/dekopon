@@ -135,12 +135,12 @@ impl Selection {
                     Some(parse_position(command, end)?),
                 ),
             };
-            if let (start, Some(end)) = parsed {
-                if start > end {
-                    return Err(CommandFailure::usage(format!(
-                        "{command}: selection {entry:?} ends before it starts"
-                    )));
-                }
+            if let (start, Some(end)) = parsed
+                && start > end
+            {
+                return Err(CommandFailure::usage(format!(
+                    "{command}: selection {entry:?} ends before it starts"
+                )));
             }
             ranges.push(parsed);
         }

@@ -27,11 +27,21 @@ wildcards = "deny"
 highlight = "all"
 deny = []
 skip = [
+  { crate = "block-buffer@0.10.4", reason = "Cedar's build-time lalrpop parser generator hashes with the RustCrypto 0.10 stack the workspace's own sha2 0.11 has moved past" },
+  { crate = "cpufeatures@0.2.17", reason = "transitive half of the same lalrpop/RustCrypto split" },
+  { crate = "crypto-common@0.1.7", reason = "transitive half of the same lalrpop/RustCrypto split" },
+  { crate = "digest@0.10.7", reason = "transitive half of the same lalrpop/RustCrypto split" },
   { crate = "getrandom@0.2.17", reason = "rustls uses ring's established getrandom 0.2 API while tempfile uses 0.4" },
   { crate = "getrandom@0.3.4", reason = "OpenTelemetry's rand 0.9 ID generator has not converged on tempfile's getrandom 0.4 API" },
   { crate = "hashbrown@0.15.5", reason = "Wasmtime's pinned compiler toolchain has not converged on indexmap's hashbrown 0.17" },
+  { crate = "itertools@0.14.0", reason = "prost's derive macro trails cedar-policy-core's itertools 0.15" },
+  { crate = "object@0.39.1", reason = "the ar_archive_writer used by psm's build script is one object release ahead of Wasmtime's" },
   { crate = "r-efi@5.3.0", reason = "getrandom 0.3 and 0.4 require different target-only UEFI adapters" },
+  { crate = "rand@0.9.5", reason = "OpenTelemetry's ID generator trails tungstenite's rand 0.10 frame masking" },
+  { crate = "rand_core@0.9.5", reason = "transitive half of the same OpenTelemetry/tungstenite rand split" },
+  { crate = "webpki-roots@0.26.11", reason = "tokio-tungstenite pins the pre-1.0 root bundle; reqwest is already on 1.0, so both TLS stacks trust the same roots from two copies" },
   { crate = "syn@2.0.119", reason = "Wasmtime and WIT macro dependencies have not converged on syn 3" },
+  { crate = "unicode-width@0.1.14", reason = "miette's diagnostic renderer trails the pretty printer cedar-policy-formatter uses" },
   { crate = "wit-bindgen@0.46.0", reason = "getrandom 0.3's target-only WASI adapter is newer than the published provider guest contract" },
   { crate = "windows-sys@0.52.0", reason = "ring's Windows support trails the current workspace Windows bindings" },
   { crate = "windows-sys@0.60.2", reason = "Wasmtime pins the preceding Windows bindings release" },

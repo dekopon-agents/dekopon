@@ -17,6 +17,7 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 [dependencies]
 async-trait.workspace = true
 clap.workspace = true
+dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true

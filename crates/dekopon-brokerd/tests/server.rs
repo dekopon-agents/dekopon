@@ -8,20 +8,29 @@ use std::{
 };
 
 use dekopon_broker::{
-    AuthenticatedContext, Broker, BrokerLimits, InMemoryAuditLog, InvocationRequest, PolicyRule,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, ConstraintCatalog,
+    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_broker_protocol::{BrokerClient, ClientError, FrameLimits};
+use dekopon_broker_protocol::{
+    BrokerClient, BrokerResponse, ClientError, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED,
+    FrameLimits, RequestEnvelope, ResponseEnvelope, SubjectAttestation, read_frame, write_frame,
+};
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
-    CheckpointError, ServerLimits, current_uid, run,
+    CheckpointError, MappedPeer, ServerLimits, current_uid, run,
 };
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
+    RiskLevel, TraceId,
 };
 use serde_json::{Value, json};
-use tokio::{net::UnixListener, sync::oneshot};
+use tokio::{
+    net::{UnixListener, UnixStream},
+    sync::oneshot,
+};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -41,27 +50,75 @@ fn context(principal: &str) -> AuthenticatedContext {
     .expect("trusted context binds")
 }
 
-fn rule() -> PolicyRule {
-    PolicyRule {
-        principal: "caller"
-            .parse::<PrincipalId>()
-            .expect("valid principal fixture"),
-        actor: Actor::Agent {
-            agent: "brokerd-test"
-                .parse::<AgentId>()
-                .expect("valid agent fixture"),
-        },
-        capability: "echo.echo"
-            .parse::<CapabilityId>()
-            .expect("valid capability fixture"),
+/// The direct grant: `caller`, as the agent its peer identity carries, may `echo.echo`.
+const DIRECT_POLICY: &str = r#"
+@id("caller-echo")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"echo.echo",
+       resource == Dekopon::Provider::"echo")
+when { context has agent && context.agent == "brokerd-test" }
+unless { context has via };
+"#;
+
+/// The attested twin, plus the session gate it now needs.
+///
+/// `via` names the *peer* principal `context("caller")` builds, because that is the identity the
+/// socket authenticates; the policy's own principal is the one the subject maps to.
+const ATTESTED_POLICY: &str = r#"
+@id("chat-agent-session")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent")
+when { context has via && context.via == "caller" };
+
+@id("chat-agent-echo")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"echo.echo",
+       resource == Dekopon::Provider::"echo")
+when { context has via && context.via == "caller"
+    && context has agent && context.agent == "chat-agent" };
+"#;
+
+fn echo_constraint_set() -> ConstraintSet {
+    ConstraintSet {
         provider: "echo"
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         idempotency: Idempotency::Idempotent,
+        credential: None,
         constraints: ExecutionConstraints::default(),
     }
+}
+
+fn echo_catalog() -> ConstraintCatalog {
+    ConstraintCatalog::new([(
+        "echo.echo"
+            .parse::<CapabilityId>()
+            .expect("valid capability fixture"),
+        echo_constraint_set(),
+    )])
+    .expect("one capability builds a catalog")
+}
+
+fn echo_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
+    let world = PolicyWorld::new(
+        principals.into_iter().map(|name| {
+            name.parse::<PrincipalId>()
+                .expect("valid principal fixture")
+        }),
+        [(
+            "echo.echo"
+                .parse::<CapabilityId>()
+                .expect("valid capability fixture"),
+            "echo"
+                .parse::<ProviderId>()
+                .expect("valid provider fixture"),
+        )],
+    )
+    .expect("distinct fixtures build a world");
+    PolicyEngine::new(policies, &world).expect("fixture policy validates")
 }
 
 fn request(id: &str) -> InvocationRequest {
@@ -78,6 +135,11 @@ fn request(id: &str) -> InvocationRequest {
         trace_parent: None,
         input: json!({"message": "hello through broker"}),
     }
+}
+
+fn write_owner_only(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).expect("write fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
 
 fn bind_fixture(path: &Path) -> UnixListener {
@@ -105,11 +167,70 @@ async fn broker_with_audit_bound(
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-test".to_owned(),
-            vec![rule()],
+            echo_engine(DIRECT_POLICY, ["caller"]),
+            echo_catalog(),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
             Arc::clone(&audit),
             BrokerLimits::default(),
         )
         .expect("broker starts"),
+    );
+    (broker, audit)
+}
+
+/// The canonical subject the attested fixtures speak for.
+const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
+
+fn subject() -> ExternalSubject {
+    SLACK_SUBJECT
+        .parse::<ExternalSubject>()
+        .expect("canonical subject fixture")
+}
+
+fn agent(name: &str) -> AgentId {
+    name.parse::<AgentId>().expect("valid agent fixture")
+}
+
+fn attestor_grant() -> AttestorGrant {
+    AttestorGrant {
+        namespaces: vec!["slack.t0123abc".to_owned()],
+    }
+}
+
+/// A broker carrying both the direct grant and its attested twin, plus the one owner-controlled
+/// mapping that turns the subject into a principal.
+async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+    let registry =
+        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("load echo fixture");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let identities = IdentityDirectory::new([(
+        subject(),
+        "cpetersen"
+            .parse::<PrincipalId>()
+            .expect("valid principal fixture"),
+    )])
+    .expect("one mapping builds a directory");
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-test".to_owned(),
+            echo_engine(
+                &format!("{DIRECT_POLICY}\n{ATTESTED_POLICY}"),
+                ["caller", "cpetersen"],
+            ),
+            echo_catalog(),
+            CredentialStore::empty(),
+            identities,
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("attested broker starts"),
     );
     (broker, audit)
 }
@@ -126,14 +247,20 @@ fn server_limits() -> ServerLimits {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_unix_peer_can_inspect_and_invoke_exact_policy() {
+async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create server fixture");
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = broker().await;
     let mut identities = BTreeMap::new();
-    identities.insert(uid, context("caller"));
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
@@ -194,6 +321,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let audit_path = directory.path().join("audit.jsonl");
     let checkpoint_path = directory.path().join("checkpoint.json");
     let checkpoint_lock_path = directory.path().join("checkpoint.lock");
+    let policies_path = directory.path().join("policies.cedar");
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
@@ -202,21 +330,23 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         "checkpointLockPath": &checkpoint_lock_path,
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
+        "policiesPath": &policies_path,
         "providers": [fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
-        "rules": [serde_json::to_value(rule()).expect("rule serializes")]
+        "constraintSets": {
+            "echo.echo": serde_json::to_value(echo_constraint_set())
+                .expect("constraint set serializes")
+        }
     });
-    fs::write(
+    write_owner_only(&policies_path, DIRECT_POLICY.as_bytes());
+    write_owner_only(
         &config_path,
-        serde_json::to_vec(&document).expect("config serializes"),
-    )
-    .expect("write service config");
-    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
-        .expect("secure service config");
+        &serde_json::to_vec(&document).expect("config serializes"),
+    );
 
     let (stop, stopped) = oneshot::channel::<()>();
     let first_config = config_path.clone();
@@ -322,7 +452,13 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     // Execution append is already doomed when the provider runs.
     let (broker, audit) = broker_with_audit_bound(1).await;
     let mut identities = BTreeMap::new();
-    identities.insert(uid, context("caller"));
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
@@ -364,4 +500,323 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
 
     shutdown_send.send(()).expect("signal clean shutdown");
     let _ = task.await.expect("server task exits");
+}
+
+/// The whole attested path over a real socket: the peer names a canonical subject, the broker
+/// maps it, and the invocation runs under the attested context. The peer never names a principal
+/// at any point — that mapping is not something the wire can express.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let result = client
+        .invoke_for(
+            request("invoke-attested-socket"),
+            subject(),
+            agent("chat-agent"),
+        )
+        .await
+        .expect("attested invocation completes");
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(
+        result.output,
+        Some(json!({"message": "hello through broker"}))
+    );
+
+    let records = audit.records().await;
+    assert_eq!(records.len(), 2);
+    let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
+    assert_eq!(encoded[0]["event"]["principal"], "cpetersen");
+    assert_eq!(encoded[0]["event"]["via"], "caller");
+    assert_eq!(encoded[0]["event"]["attested_subject"], SLACK_SUBJECT);
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// A peer with no attestor grant gets a completed invocation response carrying a denial, not a
+/// transport failure. The difference is the audit record: a denial is a decision the broker made
+/// and retained, and an error would leave the attempt with nothing accounting for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_for_from_a_peer_without_a_grant_is_denied_not_erred() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let result = client
+        .invoke_for(
+            request("invoke-ungranted-socket"),
+            subject(),
+            agent("chat-agent"),
+        )
+        .await
+        .expect("a refused attestation is still a completed invocation response");
+    assert_eq!(result.outcome, InvocationOutcome::Denied);
+    assert_eq!(result.error.as_deref(), Some("attestation-denied"));
+
+    let records = audit.records().await;
+    assert_eq!(records.len(), 1);
+    let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
+    assert_eq!(
+        encoded[0]["event"]["principal"], "caller",
+        "an unauthorized claim is recorded against the peer that made it"
+    );
+    assert_eq!(encoded[0]["event"]["reason"], "attestation-denied");
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// `BrokerClient` binds the attestation to its proposal by construction, so reaching the
+/// server-side check needs a hand-rolled frame. A claim that names a different invocation is a
+/// decode-level protocol error rather than a policy decision — nothing is authorized, and nothing
+/// consumes an identifier.
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_attestation_binding_is_a_protocol_error() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect to the fixture socket");
+    let envelope = RequestEnvelope::invoke_for(
+        request("invoke-bound-identifier"),
+        SubjectAttestation {
+            subject: subject(),
+            agent: agent("chat-agent"),
+            invocation: "invoke-some-other-proposal"
+                .parse::<InvocationId>()
+                .expect("valid invocation fixture"),
+        },
+    );
+    write_frame(&mut stream, &envelope, limits.frame)
+        .await
+        .expect("write the hand-rolled frame");
+    let response = read_frame::<_, ResponseEnvelope>(&mut stream, limits.frame)
+        .await
+        .expect("read the refusal");
+    let BrokerResponse::Error { code, .. } = response.response else {
+        panic!("a mismatched binding must not produce an invocation result");
+    };
+    assert_eq!(code, ERROR_INVALID_REQUEST);
+    assert!(
+        audit.records().await.is_empty(),
+        "a frame refused before dispatch is not a decision about anything"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// Inspection follows the same rule as invocation: an attestor peer sees the attested context's
+/// capabilities, and a peer without a grant is refused without learning whether the subject is
+/// mapped at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn capabilities_for_over_the_socket() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let limits = server_limits();
+
+    let granted_path = directory.path().join("granted.sock");
+    let granted_listener = bind_fixture(&granted_path);
+    let (broker, _audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let granted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (granted_stop, granted_stopped) = oneshot::channel::<()>();
+    let granted_task = tokio::spawn(granted.serve(granted_listener, async move {
+        let _ = granted_stopped.await;
+    }));
+
+    let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
+    let capabilities = client
+        .capabilities_for(subject(), agent("chat-agent"))
+        .await
+        .expect("an attestor peer may inspect the attested context");
+    assert_eq!(capabilities.len(), 1);
+    assert_eq!(capabilities[0].capability.id.as_str(), "echo.echo");
+    // The peer's own listing is a different answer produced by a different rule, which is what
+    // makes the two populations disjoint rather than merely ordered.
+    let own = client
+        .capabilities()
+        .await
+        .expect("the peer still sees its own grants");
+    assert_eq!(own.len(), 1);
+
+    granted_stop.send(()).expect("signal clean shutdown");
+    granted_task
+        .await
+        .expect("server task exits")
+        .expect("server shuts down");
+
+    let ungranted_path = directory.path().join("ungranted.sock");
+    let ungranted_listener = bind_fixture(&ungranted_path);
+    let (broker, _audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let ungranted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (ungranted_stop, ungranted_stopped) = oneshot::channel::<()>();
+    let ungranted_task = tokio::spawn(ungranted.serve(ungranted_listener, async move {
+        let _ = ungranted_stopped.await;
+    }));
+
+    let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
+    let refused = client
+        .capabilities_for(subject(), agent("chat-agent"))
+        .await
+        .expect_err("a peer without attestor authority is refused");
+    let ClientError::Remote { code, .. } = refused else {
+        panic!("expected a stable remote refusal, got {refused}");
+    };
+    assert_eq!(code, ERROR_UNAUTHENTICATED);
+
+    ungranted_stop.send(()).expect("signal clean shutdown");
+    ungranted_task
+        .await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// Cedar validates types, not instances, so a policy naming a principal nobody configured is
+/// perfectly well typed and would simply never match. The declared world is what turns that into a
+/// startup refusal — the same protection the exact engine's reachability check used to provide.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_naming_an_undeclared_principal_refuses_to_start() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create service fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure service directory");
+    let config_path = directory.path().join("broker.json");
+    let policies_path = directory.path().join("policies.cedar");
+    let document = json!({
+        "apiVersion": CONFIG_API_VERSION,
+        "socketPath": directory.path().join("broker.sock"),
+        "auditPath": directory.path().join("audit.jsonl"),
+        "checkpointPath": directory.path().join("checkpoint.json"),
+        "checkpointLockPath": directory.path().join("checkpoint.lock"),
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "policiesPath": &policies_path,
+        "providers": [fixture("echo-provider.wasm")],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "constraintSets": {
+            "echo.echo": serde_json::to_value(echo_constraint_set())
+                .expect("constraint set serializes")
+        }
+    });
+    write_owner_only(
+        &config_path,
+        &serde_json::to_vec(&document).expect("config serializes"),
+    );
+
+    for (policies, label) in [
+        (
+            r#"permit(principal == Dekopon::Principal::"nobody",
+                      action == Dekopon::Action::"echo.echo",
+                      resource == Dekopon::Provider::"echo");"#,
+            "an undeclared principal",
+        ),
+        (
+            r#"permit(principal == Dekopon::Principal::"caller",
+                      action == Dekopon::Action::"echo.nonexistent",
+                      resource == Dekopon::Provider::"echo");"#,
+            "an unloaded capability",
+        ),
+        (
+            r#"permit(principal == Dekopon::Principal::"caller",
+                      action == Dekopon::Action::"echo.reverse",
+                      resource == Dekopon::Provider::"echo");"#,
+            "a capability with no constraint set",
+        ),
+    ] {
+        write_owner_only(&policies_path, policies.as_bytes());
+        let error = run(&config_path, async {})
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label} must refuse startup"));
+        assert!(
+            matches!(
+                error,
+                BrokerdError::Policy { .. }
+                    | BrokerdError::Broker(BrokerBuildError::UnconstrainedCapability { .. })
+            ),
+            "{label} produced the wrong refusal: {error:?}"
+        );
+    }
+    assert!(!directory.path().join("broker.sock").exists());
 }

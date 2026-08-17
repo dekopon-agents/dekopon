@@ -29,7 +29,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 mod http;
-pub use http::HttpCallEvidence;
+pub use http::{BoundCredential, HttpCallEvidence};
 use http::{HttpCeilings, HttpState};
 
 pub(crate) mod bindings {
@@ -307,6 +307,7 @@ impl BrokerWasmProvider {
         capability: &CapabilityId,
         input: &Value,
         constraints: &ExecutionConstraints,
+        credential: Option<BoundCredential>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
@@ -341,6 +342,7 @@ impl BrokerWasmProvider {
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
         let http = HttpState::invoke(
             constraints.http.clone(),
+            credential,
             self.runtime.http_ceilings(),
             operation_timeout,
         )
@@ -519,9 +521,15 @@ impl BrokerProviderRegistry {
     }
 
     /// Consumes one broker-authorized proposal through its trusted capability route.
+    ///
+    /// `credential` rides alongside the authorization rather than inside it: an
+    /// `AuthorizedInvocation` is inert-serializable as evidence, and a secret must never share a
+    /// container with anything that can be rendered. The host injects it at the native HTTP
+    /// boundary only for destinations inside its binding; the guest never observes it.
     pub async fn invoke(
         &self,
         authorized: AuthorizedInvocation,
+        credential: Option<BoundCredential>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         let proposal = authorized.proposal();
         let provider_index = self
@@ -548,6 +556,7 @@ impl BrokerProviderRegistry {
                 &proposal.capability,
                 &proposal.input,
                 authorized.constraints(),
+                credential,
             )
             .instrument({
                 let span = tracing::info_span!(

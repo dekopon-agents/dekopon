@@ -20,6 +20,7 @@ pub struct AgentBuilder {
     name: String,
     description: String,
     enabled: bool,
+    instructions: Option<String>,
     capabilities: Vec<CapabilityId>,
     providers: Vec<ProviderId>,
     status: Option<AgentStatus>,
@@ -33,6 +34,7 @@ impl AgentBuilder {
             name: name.into(),
             description: "Test agent".to_owned(),
             enabled: true,
+            instructions: None,
             capabilities: Vec::new(),
             providers: Vec::new(),
             status: Some(AgentStatus::Ready),
@@ -43,6 +45,13 @@ impl AgentBuilder {
     #[must_use]
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    /// Sets the agent's standing orders, which are untrusted model text and grant nothing.
+    #[must_use]
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
         self
     }
 
@@ -77,6 +86,7 @@ impl AgentBuilder {
             spec: AgentSpec {
                 description: self.description,
                 enabled: self.enabled,
+                instructions: self.instructions,
                 capabilities: self.capabilities,
                 providers: self.providers,
                 model_class: None,

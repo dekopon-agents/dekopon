@@ -1,10 +1,11 @@
 # Observability
 
-`dekopon-run` and `dekopon-brokerd` each export their own execution traces over OTLP, using either
-gRPC or HTTP with protobuf payloads. Runner coverage is the one-shot runner process, model turns,
-immediate Wasm compilation/description/invocation, model-authored script execution in both `prompt`
-and `shell` modes, and explicit broker-client calls. Broker coverage is one span per decoded
-invocation from a mapped peer. Neither collects telemetry from Kubernetes nodes or other Rust
+`dekopon-run`, `dekopond`, and `dekopon-brokerd` each export their own execution traces over OTLP,
+using either gRPC or HTTP with protobuf payloads. Runner coverage is the one-shot runner process,
+model turns, immediate Wasm compilation/description/invocation, model-authored script execution in
+both `prompt` and `shell` modes, and explicit broker-client calls. Gateway coverage is one routed
+chat message and the bounded agent session it drives. Broker coverage is one span per decoded
+invocation from a mapped peer. None collects telemetry from Kubernetes nodes or other Rust
 processes; host-level collection remains separate work.
 
 The two processes export **independently**. The broker only ever observes broker-mediated
@@ -158,13 +159,33 @@ input and output, URL paths and queries, headers, and bodies stay out of it for 
 they stay out of audit records: telemetry is a second egress path with none of the audit chain's
 guarantees, and it must not carry what audit deliberately redacts.
 
+An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
+`subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
+derived the context through — the same values the audit chain keeps, for the same reason. All of
+them are canonical identifiers (`slack.t0123abc.u9xyz`), never the chat message that prompted the
+invocation. A refusal records the claimed subject and its `outcome` with no `via`, because no
+attested context was derived.
+
+## Gateway spans
+
+`dekopond` wraps each routed chat message in two spans of its own:
+
+| Span | Fields |
+|---|---|
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `reply-failed`) |
+| `gateway.session` | `agent`; wraps the broker leg and the model session |
+
+The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
+
+Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model was called, `busy` means admission control refused the message, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
+
 ## Broker execution spans
 
 `broker.invocation` is not a flat bar. Beneath it the broker's own crates emit:
 
 | Span | Crate | Fields |
 |---|---|---|
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `replayed-invocation`) |
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider |
 | `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
@@ -214,6 +235,7 @@ With `telemetryPayloads` enabled, four events join the accounting and refusal on
 | `agent.model.answer` | Assistant text and the tool calls it requested, with arguments |
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
+| `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |
 
 `accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
 available without opting in to content. The per-command detail that used to arrive as
@@ -276,6 +298,8 @@ Telemetry includes operation names, model/provider/capability identifiers, bound
 - model response text and reasoning replay data;
 - model tool-call IDs and the script text a model authors, along with that script's output;
 - provider input and output;
+- inbound chat message text and the canonical subject identifiers of the people who sent it;
+- chat bot tokens and the environment variable values behind every configured credential;
 - command arguments, in every form and at every level;
 - bearer tokens, OTLP authorization headers, and provider credentials; and
 - broker socket paths.
@@ -290,4 +314,10 @@ The immediate Wasm world has no logging import, so this records host-observed gu
 
 [`../examples/otel-traces/`](../examples/otel-traces/README.md) starts one pinned OpenObserve container with one Docker volume, documents authenticated OTLP/HTTP export, and explains how to inspect traces in the UI.
 
-`examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It starts an isolated OpenObserve instance, executes a real direct provider invocation, searches the trace stream, and asserts that the root runner span and provider spans arrived without the sentinel provider input. CI runs the same script and removes the container and volume afterward.
+`examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It starts an isolated OpenObserve instance, executes a real direct provider invocation, and searches both signal streams. The trace query asserts that the root runner span and provider spans arrived without the sentinel provider input; the log query asserts that a correlated record carrying the same trace ID arrived and that the sentinel stayed absent there too. CI runs the same script and removes the container and volume afterward.
+
+### Raspberry Pi storage snapshot
+
+A physical-allocation measurement on the project's Raspberry Pi OpenObserve deployment on 2026-08-16 found that the `dekopon` streams used to exercise a simple prompt occupied **200 KiB** of signal payload: **148 KiB of traces** and **52 KiB of logs**. The whole OpenObserve `stream/` tree occupied **1.22 MiB**, comprising 388 KiB of log/trace payload across all streams plus 860 KiB of indexes, metadata, bloom data, and directory overhead.
+
+These are allocated filesystem blocks, not sparse apparent sizes, and they are a point-in-time development sample rather than a per-prompt storage guarantee. Prompt turns, script/command count, payload opt-in, backend indexing and compaction, and retention all change the result as ingestion continues. The useful conclusion is the order of magnitude: metadata-first correlated telemetry is practical on small self-hosted hardware without pretending that indexes or other streams are free.

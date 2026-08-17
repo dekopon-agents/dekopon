@@ -26,6 +26,8 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         actor: Actor::Agent {
             agent: "reviewer".parse::<AgentId>().expect("valid agent fixture"),
         },
+        via: None,
+        attested_subject: None,
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
@@ -35,6 +37,8 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
             .expect("valid principal fixture"),
         decision_id: format!("decision-{invocation}"),
         policy_revision: "policy-test".to_owned(),
+        policy_ids: Vec::new(),
+        policy_digest: None,
         allowed,
         reason: (!allowed).then(|| "policy-denied".to_owned()),
         decision_digest: format!("sha256:{}", "a".repeat(64)),
@@ -263,5 +267,5 @@ fn policy_http_scope_values_are_bounded() {
         }),
         ..ExecutionConstraints::default()
     };
-    assert!(super::validate_rule_constraints(&constraints).is_err());
+    assert!(super::validate_set_constraints(&constraints).is_err());
 }

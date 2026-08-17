@@ -11,7 +11,10 @@ use std::{
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, sync::Arc};
 
 #[cfg(unix)]
-use dekopon_broker::{Broker, BrokerLimits, InMemoryAuditLog, PolicyRule};
+use dekopon_broker::{
+    Broker, BrokerLimits, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
+    InMemoryAuditLog, PolicyEngine, PolicyWorld,
+};
 #[cfg(unix)]
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 #[cfg(unix)]
@@ -25,6 +28,47 @@ use dekopon_core::{Actor, AgentId, PrincipalId, RiskLevel};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use tokio::{net::UnixListener, sync::oneshot};
+
+/// One policy engine over exactly the capabilities a broker fixture loads.
+#[cfg(unix)]
+fn broker_policy<'a>(
+    policies: &str,
+    principal: &str,
+    capabilities: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> PolicyEngine {
+    let world = PolicyWorld::new(
+        [principal.parse().expect("valid principal fixture")],
+        capabilities.into_iter().map(|(capability, provider)| {
+            (
+                capability.parse().expect("valid capability fixture"),
+                provider.parse().expect("valid provider fixture"),
+            )
+        }),
+    )
+    .expect("distinct fixtures build a world");
+    PolicyEngine::new(policies, &world).expect("fixture policy validates")
+}
+
+/// The execution bounds those capabilities run under, which policy can never widen.
+#[cfg(unix)]
+fn broker_constraints<'a>(
+    sets: impl IntoIterator<Item = (&'a str, &'a str, ExecutionConstraints)>,
+) -> ConstraintCatalog {
+    ConstraintCatalog::new(sets.into_iter().map(|(capability, provider, constraints)| {
+        (
+            capability.parse().expect("valid capability fixture"),
+            ConstraintSet {
+                provider: provider.parse().expect("valid provider fixture"),
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                idempotency: Idempotency::Idempotent,
+                credential: None,
+                constraints,
+            },
+        )
+    }))
+    .expect("distinct capability fixtures build a catalog")
+}
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dekopon-run"));
@@ -137,16 +181,27 @@ async fn explicit_broker_mode_uses_authenticated_client_without_loading_componen
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-runner-client".to_owned(),
-            vec![PolicyRule {
-                principal: principal.clone(),
-                actor: actor.clone(),
-                capability: "echo.echo".parse().expect("valid capability fixture"),
-                provider: "echo".parse().expect("valid provider fixture"),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
-                constraints: ExecutionConstraints::default(),
-            }],
+            broker_policy(
+                r#"permit(principal == Dekopon::Principal::"runner-client",
+                          action == Dekopon::Action::"echo.echo",
+                          resource == Dekopon::Provider::"echo");"#,
+                "runner-client",
+                [
+                    ("echo.echo", "echo"),
+                    ("echo.reverse", "echo"),
+                    ("echo.upcase", "echo"),
+                    ("echo.downcase", "echo"),
+                    ("echo.ransom-case", "echo"),
+                ],
+            ),
+            broker_constraints([
+                ("echo.echo", "echo", ExecutionConstraints::default()),
+                // Deployable but ungranted, so the denial stays a policy decision rather than
+                // "nothing knows how to run this".
+                ("echo.reverse", "echo", ExecutionConstraints::default()),
+            ]),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
             Arc::clone(&audit),
             BrokerLimits::default(),
         )
@@ -155,7 +210,11 @@ async fn explicit_broker_mode_uses_authenticated_client_without_loading_componen
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
-        dekopon_broker::AuthenticatedContext::new(principal, actor).expect("bind fixture context"),
+        dekopon_brokerd::MappedPeer {
+            context: dekopon_broker::AuthenticatedContext::new(principal, actor)
+                .expect("bind fixture context"),
+            attestor: None,
+        },
     );
     let limits = ServerLimits {
         frame: FrameLimits::default(),
@@ -345,17 +404,17 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-prompt-broker".to_owned(),
-            vec![PolicyRule {
-                principal: principal.clone(),
-                actor: actor.clone(),
-                capability: "http-probe.fetch"
-                    .parse()
-                    .expect("valid capability fixture"),
-                provider: "http-probe".parse().expect("valid provider fixture"),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
-                constraints: ExecutionConstraints {
+            broker_policy(
+                r#"permit(principal == Dekopon::Principal::"prompt-broker",
+                          action == Dekopon::Action::"http-probe.fetch",
+                          resource == Dekopon::Provider::"http-probe");"#,
+                "prompt-broker",
+                [("http-probe.fetch", "http-probe")],
+            ),
+            broker_constraints([(
+                "http-probe.fetch",
+                "http-probe",
+                ExecutionConstraints {
                     timeout_ms: 5_000,
                     max_output_bytes: 64 * 1024,
                     http: Some(HttpConstraints {
@@ -367,7 +426,9 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
                         allow_plaintext_loopback: true,
                     }),
                 },
-            }],
+            )]),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
             Arc::clone(&audit),
             BrokerLimits::default(),
         )
@@ -376,7 +437,11 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
-        dekopon_broker::AuthenticatedContext::new(principal, actor).expect("bind fixture context"),
+        dekopon_brokerd::MappedPeer {
+            context: dekopon_broker::AuthenticatedContext::new(principal, actor)
+                .expect("bind fixture context"),
+            attestor: None,
+        },
     );
     let server = BrokerServer::new(
         broker,

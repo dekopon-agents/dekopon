@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod redaction;
+mod subject;
 mod telemetry_payloads;
 
 use std::{fmt, str::FromStr};
@@ -16,9 +17,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
+pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
 
-const MAX_IDENTIFIER_LENGTH: usize = 253;
+pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
 
 /// The reason a Dekopon identifier could not be parsed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

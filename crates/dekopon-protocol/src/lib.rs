@@ -93,6 +93,14 @@ pub struct AgentSpec {
     /// Whether orchestration may schedule the agent.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// The agent's standing orders, handed to the model as its system prompt.
+    ///
+    /// This is untrusted model text by definition. It shapes how an agent answers and nothing
+    /// else: it can never assert identity or authority, name a principal, widen a capability, or
+    /// influence an authorization decision. Everything an agent may actually do comes from broker
+    /// policy, which never reads this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Capabilities the agent may propose. This list itself grants no provider authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityId>,
@@ -323,6 +331,7 @@ mod tests {
             spec: AgentSpec {
                 description: "Reviews pull requests".to_owned(),
                 enabled: true,
+                instructions: Some("Review the diff and comment; never approve.".to_owned()),
                 capabilities: vec![
                     "github.pull-request.read"
                         .parse()
@@ -348,6 +357,26 @@ mod tests {
         let from_yaml = serde_yaml::from_str::<Agent>(&yaml).expect("agent parses as YAML");
         assert_eq!(from_yaml, original);
         assert!(yaml.contains("apiVersion: dekopon.dev/v1alpha1"));
+        assert!(yaml.contains("instructions:"));
+    }
+
+    /// Standing orders are optional and absent rather than empty when unauthored.
+    ///
+    /// An agent with no `instructions` must serialize without the key at all, so a round trip
+    /// through the catalog cannot turn "the operator wrote none" into an empty system prompt.
+    #[test]
+    fn absent_instructions_stay_absent_through_a_round_trip() {
+        let mut original = agent();
+        original.spec.instructions = None;
+
+        let value = serde_json::to_value(&original).expect("agent serializes");
+        assert!(value["spec"].get("instructions").is_none(), "{value}");
+
+        let yaml = serde_yaml::to_string(&original).expect("agent serializes as YAML");
+        assert!(!yaml.contains("instructions"), "{yaml}");
+        let decoded = serde_yaml::from_str::<Agent>(&yaml).expect("agent parses as YAML");
+        assert_eq!(decoded, original);
+        assert!(decoded.spec.instructions.is_none());
     }
 
     #[test]

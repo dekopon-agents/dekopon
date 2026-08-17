@@ -1,0 +1,46 @@
+[package]
+name = "dekopond"
+description = "Unprivileged Dekopon chat gateway daemon: transports, routing, and bounded agent sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopond"
+readme = "README.md"
+keywords = ["agents", "daemon", "slack", "llm", "orchestration"]
+categories = ["command-line-utilities", "network-programming"]
+include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+clap.workspace = true
+dekopon-agent.workspace = true
+dekopon-broker-protocol.workspace = true
+dekopon-config.workspace = true
+dekopon-core.workspace = true
+dekopon-model.workspace = true
+dekopon-protocol.workspace = true
+dekopon-shell.workspace = true
+dekopon-telemetry.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+opentelemetry.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+dekopon-brokerd.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

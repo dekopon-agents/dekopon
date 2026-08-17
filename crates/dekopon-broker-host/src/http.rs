@@ -8,7 +8,7 @@ use dekopon_http_host::{
 
 use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Request, Response};
 
-pub use dekopon_http_host::HttpCallEvidence;
+pub use dekopon_http_host::{BoundCredential, HttpCallEvidence};
 
 pub(crate) type HttpCeilings = HttpHostCeilings;
 
@@ -27,11 +27,14 @@ impl HttpState {
 
     pub(crate) fn invoke(
         grant: Option<HttpConstraints>,
+        credential: Option<BoundCredential>,
         ceilings: HttpCeilings,
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         let client = match grant {
-            Some(grant) => BufferedHttpClient::authorized(grant, ceilings, timeout)?,
+            Some(grant) => BufferedHttpClient::authorized_with_credential(
+                grant, credential, ceilings, timeout,
+            )?,
             None => BufferedHttpClient::disabled(ceilings, timeout)?,
         };
         Ok(Self { client })

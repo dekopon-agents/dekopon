@@ -8,5 +8,9 @@
 !.env.example
 coverage/
 
+# The rubber-stamper walkthrough tells a reader to copy the .example beside this path and paste a
+# GitHub token into it. Ignoring it here means following the walkthrough cannot commit a secret.
+/examples/rubber-stamper/broker-credentials.yaml
+
 # Code-review artifacts; system of record is the vagus vault, not git history.
 /docs/review-2026-07/

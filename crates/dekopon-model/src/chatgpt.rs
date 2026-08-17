@@ -778,10 +778,10 @@ fn process_sse_data(data: &str, state: &mut StreamState) -> Result<(), ChatGptEr
                 .get("arguments")
                 .and_then(Value::as_str)
                 .filter(|arguments| !arguments.is_empty());
-            if let Some(arguments) = arguments {
-                if let Some(call) = pending_call_mut(state, item_id) {
-                    call.arguments = arguments.to_owned();
-                }
+            if let Some(arguments) = arguments
+                && let Some(call) = pending_call_mut(state, item_id)
+            {
+                call.arguments = arguments.to_owned();
             }
         }
         "response.output_item.done" => {

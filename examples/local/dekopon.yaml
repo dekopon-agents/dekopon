@@ -64,6 +64,11 @@ metadata:
 spec:
   description: Reviews pull requests without approval authority
   enabled: true
+  # Standing orders handed to the model as its system prompt. This is untrusted text: it
+  # shapes how the agent answers and can never grant, widen, or assert authority.
+  instructions: >-
+    Read the pull request, summarize the risky changes, and leave one review comment.
+    Never claim to have approved anything.
   capabilities:
     - github.pull-request.read
     - github.pull-request.comment

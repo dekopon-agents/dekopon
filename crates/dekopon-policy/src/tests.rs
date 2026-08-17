@@ -1,0 +1,528 @@
+use dekopon_capability::{EffectKind, Idempotency};
+use dekopon_core::RiskLevel;
+
+use super::{
+    AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
+    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
+};
+
+/// The workflow world: two principals, two echo capabilities.
+fn world() -> PolicyWorld {
+    PolicyWorld::new(
+        [
+            "cpetersen".parse().expect("valid principal fixture"),
+            "direct-caller".parse().expect("valid principal fixture"),
+        ],
+        [
+            (
+                "echo.echo".parse().expect("valid capability fixture"),
+                "echo".parse().expect("valid provider fixture"),
+            ),
+            (
+                "echo.reverse".parse().expect("valid capability fixture"),
+                "echo".parse().expect("valid provider fixture"),
+            ),
+        ],
+    )
+    .expect("distinct fixtures build a world")
+}
+
+fn capability_request(principal: &str, capability: &str, context: PolicyContext) -> PolicyRequest {
+    PolicyRequest {
+        principal: principal.parse().expect("valid principal fixture"),
+        target: PolicyTarget::Capability {
+            capability: capability.parse().expect("valid capability fixture"),
+            provider: "echo".parse().expect("valid provider fixture"),
+            effect: EffectKind::ReadOnly,
+            risk: RiskLevel::Low,
+            idempotency: Idempotency::Idempotent,
+        },
+        context,
+    }
+}
+
+fn prompt_request(principal: &str, agent: &str, context: PolicyContext) -> PolicyRequest {
+    PolicyRequest {
+        principal: principal.parse().expect("valid principal fixture"),
+        target: PolicyTarget::AgentPrompt {
+            agent: agent.parse().expect("valid agent fixture"),
+        },
+        context,
+    }
+}
+
+fn via(name: &str) -> PolicyContext {
+    PolicyContext {
+        via: Some(name.to_owned()),
+        ..PolicyContext::default()
+    }
+}
+
+/// An empty policy set is a valid deployment that permits nothing. This is the deny-by-default
+/// floor: a broker that has not been given policy yet must still start and still refuse.
+#[test]
+fn empty_policy_text_is_valid_and_permits_nothing() {
+    for source in ["", "   \n\t  "] {
+        let engine = PolicyEngine::new(source, &world()).expect("empty policy text is valid");
+        assert_eq!(engine.policy_count(), 0);
+        assert_eq!(engine.referenced_capabilities().count(), 0);
+        let decision = engine.authorize(capability_request(
+            "cpetersen",
+            "echo.echo",
+            PolicyContext::default(),
+        ));
+        assert_eq!(decision, PolicyDecision::default());
+        assert!(!decision.allowed);
+        assert!(!decision.errors_present);
+    }
+}
+
+/// The three ways a policy can name something that does not exist, each of which the exact engine
+/// used to catch structurally. A rule nothing can satisfy is a configuration mistake, and finding
+/// it at startup beats finding it in a denial log.
+#[test]
+fn undeclared_names_refuse_construction() {
+    let unknown_principal = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"nobody",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("an undeclared principal must refuse startup");
+    assert!(matches!(
+        unknown_principal,
+        PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"
+    ));
+
+    let unknown_provider = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"github");"#,
+        &world(),
+    )
+    .expect_err("an undeclared provider must refuse startup");
+    // Cedar's own validator reaches this one first: `echo.echo` does not apply to a resource type
+    // it has never seen paired with that action.
+    assert!(matches!(
+        unknown_provider,
+        PolicyBuildError::Validation { .. } | PolicyBuildError::UnknownProvider { .. }
+    ));
+
+    let unknown_action = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"gh.pull-request.approve",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("an undeclared action must refuse startup");
+    assert!(matches!(
+        unknown_action,
+        PolicyBuildError::Validation { .. } | PolicyBuildError::UnknownAction { .. }
+    ));
+
+    let unknown_type = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Robot::"hal",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("an undeclared entity type must refuse startup");
+    assert!(matches!(unknown_type, PolicyBuildError::Validation { .. }));
+}
+
+/// Strict validation is what keeps a policy from reading an attribute the request will never carry.
+/// `agent.prompt` has no capability classification, so a policy that inspects one is refused rather
+/// than silently erroring — and therefore denying — on every request.
+#[test]
+fn strict_validation_rejects_attributes_an_action_never_carries() {
+    let error = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"agent.prompt",
+                  resource == Dekopon::Agent::"reviewer")
+           when { context.effect == "read-only" };"#,
+        &world(),
+    )
+    .expect_err("agent.prompt carries no effect attribute");
+    assert!(matches!(error, PolicyBuildError::Validation { .. }));
+
+    // The mirror image: a required attribute may be read without a `has` guard, because every
+    // capability request carries it.
+    PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo")
+           when { context.effect == "read-only" };"#,
+        &world(),
+    )
+    .expect("a capability action always carries its classification");
+}
+
+/// `via` is the hinge that keeps attested and direct authority disjoint, and it has to hold in both
+/// directions: a policy written for a gateway must not authorize a direct peer, and vice versa.
+#[test]
+fn context_conditions_isolate_attested_and_direct_authority() {
+    let engine = PolicyEngine::new(
+        r#"
+        @id("attested-echo")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"echo.echo",
+               resource == Dekopon::Provider::"echo")
+        when { context has via && context.via == "dekopond-gateway" };
+
+        @id("direct-reverse")
+        permit(principal == Dekopon::Principal::"direct-caller",
+               action == Dekopon::Action::"echo.reverse",
+               resource == Dekopon::Provider::"echo")
+        unless { context has via };
+        "#,
+        &world(),
+    )
+    .expect("the workflow policy set validates");
+
+    let attested = engine.authorize(capability_request(
+        "cpetersen",
+        "echo.echo",
+        via("dekopond-gateway"),
+    ));
+    assert!(attested.allowed);
+    assert_eq!(attested.determining_policy_ids, ["attested-echo"]);
+
+    // The same principal, the same capability, arriving directly.
+    let direct = engine.authorize(capability_request(
+        "cpetersen",
+        "echo.echo",
+        PolicyContext::default(),
+    ));
+    assert!(!direct.allowed);
+    assert!(direct.determining_policy_ids.is_empty());
+
+    // A different gateway is not this gateway.
+    let other_gateway = engine.authorize(capability_request(
+        "cpetersen",
+        "echo.echo",
+        via("someone-elses-gateway"),
+    ));
+    assert!(!other_gateway.allowed);
+
+    let direct_grant = engine.authorize(capability_request(
+        "direct-caller",
+        "echo.reverse",
+        PolicyContext::default(),
+    ));
+    assert!(direct_grant.allowed);
+    assert_eq!(direct_grant.determining_policy_ids, ["direct-reverse"]);
+
+    // And the direct grant cannot be borrowed by an attested context.
+    let borrowed = engine.authorize(capability_request(
+        "direct-caller",
+        "echo.reverse",
+        via("dekopond-gateway"),
+    ));
+    assert!(!borrowed.allowed);
+}
+
+/// The session gate: permitting a principal to talk to an agent is its own explicit statement, and
+/// naming a different agent is not that statement.
+#[test]
+fn agent_prompt_matches_the_named_agent_only() {
+    let engine = PolicyEngine::new(
+        r#"
+        @id("prompt-gate")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"agent.prompt",
+               resource == Dekopon::Agent::"xaviers-rubber-stamper")
+        when { context has via && context.via == "dekopond-gateway" };
+        "#,
+        &world(),
+    )
+    .expect("the agent gate validates");
+
+    let allowed = engine.authorize(prompt_request(
+        "cpetersen",
+        "xaviers-rubber-stamper",
+        via("dekopond-gateway"),
+    ));
+    assert!(allowed.allowed);
+    assert_eq!(allowed.determining_policy_ids, ["prompt-gate"]);
+
+    assert!(
+        !engine
+            .authorize(prompt_request(
+                "cpetersen",
+                "some-other-agent",
+                via("dekopond-gateway"),
+            ))
+            .allowed,
+        "an agent the policy does not name is a different resource"
+    );
+    assert!(
+        !engine
+            .authorize(prompt_request(
+                "direct-caller",
+                "xaviers-rubber-stamper",
+                via("dekopond-gateway"),
+            ))
+            .allowed
+    );
+    assert_eq!(
+        engine.referenced_capabilities().count(),
+        0,
+        "agent.prompt is not a capability and needs no constraint set"
+    );
+}
+
+/// `forbid` beats `permit`, and the forbid is what the explanation names.
+#[test]
+fn forbid_overrides_permit_and_is_reported_as_the_reason() {
+    let engine = PolicyEngine::new(
+        r#"
+        @id("broad-permit")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action in [Dekopon::Action::"echo.echo", Dekopon::Action::"echo.reverse"],
+               resource == Dekopon::Provider::"echo");
+
+        @id("no-reverse")
+        forbid(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"echo.reverse",
+               resource == Dekopon::Provider::"echo");
+        "#,
+        &world(),
+    )
+    .expect("permit and forbid coexist");
+
+    let permitted = engine.authorize(capability_request(
+        "cpetersen",
+        "echo.echo",
+        PolicyContext::default(),
+    ));
+    assert!(permitted.allowed);
+    assert_eq!(permitted.determining_policy_ids, ["broad-permit"]);
+
+    let forbidden = engine.authorize(capability_request(
+        "cpetersen",
+        "echo.reverse",
+        PolicyContext::default(),
+    ));
+    assert!(!forbidden.allowed);
+    assert_eq!(forbidden.determining_policy_ids, ["no-reverse"]);
+}
+
+/// Every capability an `action in [...]` list names is reported, because each one needs an
+/// owner-authored constraint set before the broker will start.
+#[test]
+fn referenced_capabilities_cover_every_action_a_policy_names() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action in [Dekopon::Action::"echo.echo", Dekopon::Action::"echo.reverse"],
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("an action list validates");
+    assert_eq!(
+        engine
+            .referenced_capabilities()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        ["echo.echo", "echo.reverse"]
+    );
+}
+
+/// A policy that constrains no action names none, so nothing forces a constraint set into
+/// existence. The broker's decision-time `unconstrained-capability` refusal is what covers this,
+/// and this test pins the fact that the startup half cannot.
+#[test]
+fn an_unconstrained_action_scope_names_no_capability() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen", action, resource);"#,
+        &world(),
+    )
+    .expect("an unconstrained scope validates");
+    assert_eq!(engine.referenced_capabilities().count(), 0);
+    assert!(
+        engine
+            .authorize(capability_request(
+                "cpetersen",
+                "echo.echo",
+                PolicyContext::default()
+            ))
+            .allowed
+    );
+}
+
+/// Bounds are startup-fixed, so a policy file cannot become an unbounded parse cost.
+#[test]
+fn source_and_count_bounds_fail_closed() {
+    let oversized = "x".repeat(MAX_POLICY_BYTES + 1);
+    assert!(matches!(
+        PolicyEngine::new(&oversized, &world()).expect_err("oversized source is refused"),
+        PolicyBuildError::PolicyTooLarge { .. }
+    ));
+
+    assert!(matches!(
+        PolicyEngine::new("this is not cedar", &world())
+            .expect_err("unparseable source is refused"),
+        PolicyBuildError::Parse { .. }
+    ));
+
+    assert!(matches!(
+        PolicyEngine::new(
+            r#"permit(principal == ?principal,
+                      action == Dekopon::Action::"echo.echo",
+                      resource == Dekopon::Provider::"echo");"#,
+            &world(),
+        )
+        .expect_err("an unlinked template is refused"),
+        PolicyBuildError::TemplateUnsupported
+    ));
+}
+
+/// Policy identifiers are the explanation an audit record carries, so they must be unambiguous and
+/// bounded.
+#[test]
+fn policy_identifiers_are_bounded_and_unique() {
+    let duplicate = PolicyEngine::new(
+        r#"
+        @id("same")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"echo.echo",
+               resource == Dekopon::Provider::"echo");
+        @id("same")
+        permit(principal == Dekopon::Principal::"direct-caller",
+               action == Dekopon::Action::"echo.echo",
+               resource == Dekopon::Provider::"echo");
+        "#,
+        &world(),
+    )
+    .expect_err("two policies must not share one name");
+    assert!(matches!(
+        duplicate,
+        PolicyBuildError::DuplicatePolicyId { ref policy } if policy == "same"
+    ));
+
+    let invalid = PolicyEngine::new(
+        r#"
+        @id("has a space")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"echo.echo",
+               resource == Dekopon::Provider::"echo");
+        "#,
+        &world(),
+    )
+    .expect_err("a policy name must be a portable identifier");
+    assert!(matches!(invalid, PolicyBuildError::InvalidPolicyId { .. }));
+}
+
+/// The digest fingerprints the authorization surface: the same policies over the same world hash
+/// identically regardless of formatting, and any change to either side moves it.
+#[test]
+fn digest_is_stable_across_formatting_and_moves_with_meaning() {
+    let compact = r#"permit(principal == Dekopon::Principal::"cpetersen",action == Dekopon::Action::"echo.echo",resource == Dekopon::Provider::"echo");"#;
+    let spaced = "
+        permit(
+            principal == Dekopon::Principal::\"cpetersen\",
+            action    == Dekopon::Action::\"echo.echo\",
+            resource  == Dekopon::Provider::\"echo\"
+        );
+    ";
+    let baseline = PolicyEngine::new(compact, &world()).expect("compact source builds");
+    let reformatted = PolicyEngine::new(spaced, &world()).expect("spaced source builds");
+    assert_eq!(baseline.digest(), reformatted.digest());
+    assert!(baseline.digest().starts_with("sha256:"));
+    assert_eq!(baseline.digest().len(), "sha256:".len() + 64);
+
+    let different_policy = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"direct-caller",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("a different policy builds");
+    assert_ne!(baseline.digest(), different_policy.digest());
+
+    // The world is part of the fingerprint: the same text over a larger surface is not the same
+    // authorization decision procedure.
+    let wider = PolicyWorld::new(
+        [
+            "cpetersen".parse().expect("valid principal fixture"),
+            "direct-caller".parse().expect("valid principal fixture"),
+            "someone-else".parse().expect("valid principal fixture"),
+        ],
+        [
+            (
+                "echo.echo".parse().expect("valid capability fixture"),
+                "echo".parse().expect("valid provider fixture"),
+            ),
+            (
+                "echo.reverse".parse().expect("valid capability fixture"),
+                "echo".parse().expect("valid provider fixture"),
+            ),
+        ],
+    )
+    .expect("a wider world builds");
+    assert_ne!(
+        baseline.digest(),
+        PolicyEngine::new(compact, &wider)
+            .expect("the same text builds against a wider world")
+            .digest()
+    );
+
+    // Empty policy text still has a digest, and it is not the digest of a granted one.
+    assert_ne!(
+        baseline.digest(),
+        PolicyEngine::new("", &world())
+            .expect("empty text builds")
+            .digest()
+    );
+}
+
+/// The world declares what a policy may name, so its own construction has to fail closed too.
+#[test]
+fn world_construction_rejects_duplicates_and_reserved_names() {
+    let duplicate = PolicyWorld::new(
+        ["cpetersen".parse().expect("valid principal fixture")],
+        [
+            (
+                "echo.echo".parse().expect("valid capability fixture"),
+                "echo".parse().expect("valid provider fixture"),
+            ),
+            (
+                "echo.echo".parse().expect("valid capability fixture"),
+                "other".parse().expect("valid provider fixture"),
+            ),
+        ],
+    )
+    .expect_err("one capability must not route to two providers");
+    assert!(matches!(
+        duplicate,
+        PolicyBuildError::DuplicateCapability { .. }
+    ));
+
+    let reserved = PolicyWorld::new(
+        ["cpetersen".parse().expect("valid principal fixture")],
+        [(
+            AGENT_PROMPT_ACTION
+                .parse()
+                .expect("agent.prompt is a syntactically valid capability id"),
+            "agent".parse().expect("valid provider fixture"),
+        )],
+    )
+    .expect_err("a capability must not shadow the fixed session action");
+    assert!(matches!(reserved, PolicyBuildError::ReservedAction { .. }));
+}
+
+/// Debug output is reachable from the broker's own `Debug`; it must fingerprint the policy set
+/// rather than reproduce it.
+#[test]
+fn debug_output_carries_no_policy_source() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("the policy builds");
+    let rendered = format!("{engine:?}");
+    assert!(rendered.contains(engine.digest()));
+    assert!(!rendered.contains("permit"));
+    assert!(!rendered.contains("cpetersen"));
+}

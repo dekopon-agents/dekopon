@@ -203,19 +203,22 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
         .parse()
         .expect("valid capability fixture");
     let output = registry
-        .invoke(authorized(
-            capability,
-            json!({
-                "uri": format!("http://{authority}/resource?visible=no"),
-                "method": "PATCH",
-                "headers": [
-                    {"name": "x-probe", "value": "one"},
-                    {"name": "x-probe", "value": "two"}
-                ],
-                "body": "payload"
-            }),
-            http_constraints(authority.clone(), "PATCH"),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({
+                    "uri": format!("http://{authority}/resource?visible=no"),
+                    "method": "PATCH",
+                    "headers": [
+                        {"name": "x-probe", "value": "one"},
+                        {"name": "x-probe", "value": "two"}
+                    ],
+                    "body": "payload"
+                }),
+                http_constraints(authority.clone(), "PATCH"),
+            ),
+            None,
+        )
         .await
         .expect("authorized HTTP invocation succeeds");
 
@@ -261,16 +264,19 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     );
     let (get_authority, get_request, get_server) = mock_http(get_response.as_bytes());
     let get = registry
-        .invoke(authorized(
-            "jsonplaceholder.posts.get"
-                .parse()
-                .expect("valid get capability"),
-            json!({
-                "postId": 7,
-                "endpoint": format!("http://{get_authority}")
-            }),
-            http_constraints(get_authority.clone(), "GET"),
-        ))
+        .invoke(
+            authorized(
+                "jsonplaceholder.posts.get"
+                    .parse()
+                    .expect("valid get capability"),
+                json!({
+                    "postId": 7,
+                    "endpoint": format!("http://{get_authority}")
+                }),
+                http_constraints(get_authority.clone(), "GET"),
+            ),
+            None,
+        )
         .await
         .expect("authorized JSONPlaceholder read succeeds");
     assert_eq!(get.output["post"]["id"], 7);
@@ -292,18 +298,21 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     );
     let (create_authority, create_request, create_server) = mock_http(create_response.as_bytes());
     let create = registry
-        .invoke(authorized(
-            "jsonplaceholder.posts.create"
-                .parse()
-                .expect("valid create capability"),
-            json!({
-                "userId": 3,
-                "title": "created title",
-                "body": "created body",
-                "endpoint": format!("http://{create_authority}")
-            }),
-            http_constraints(create_authority.clone(), "POST"),
-        ))
+        .invoke(
+            authorized(
+                "jsonplaceholder.posts.create"
+                    .parse()
+                    .expect("valid create capability"),
+                json!({
+                    "userId": 3,
+                    "title": "created title",
+                    "body": "created body",
+                    "endpoint": format!("http://{create_authority}")
+                }),
+                http_constraints(create_authority.clone(), "POST"),
+            ),
+            None,
+        )
         .await
         .expect("authorized JSONPlaceholder write succeeds");
     assert_eq!(create.output["post"]["id"], 101);
@@ -338,11 +347,14 @@ async fn denies_http_when_authorization_has_no_http_grant() {
         .parse()
         .expect("valid capability fixture");
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({"uri": "https://example.com/"}),
-            ExecutionConstraints::default(),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"uri": "https://example.com/"}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+        )
         .await
         .expect_err("missing HTTP authorization must fail")
         .error;
@@ -368,11 +380,14 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
         .parse()
         .expect("valid capability fixture");
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({"uri": "http://127.0.0.1:9/"}),
-            http_constraints("127.0.0.1:10".to_owned(), "GET"),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"uri": "http://127.0.0.1:9/"}),
+                http_constraints("127.0.0.1:10".to_owned(), "GET"),
+            ),
+            None,
+        )
         .await
         .expect_err("different loopback port must be denied before connection")
         .error;
@@ -398,14 +413,17 @@ async fn rejects_guest_control_of_authorization_headers() {
         .parse()
         .expect("valid capability fixture");
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({
-                "uri": "http://127.0.0.1:9/",
-                "headers": [{"name": "authorization", "value": "Bearer secret"}]
-            }),
-            http_constraints("127.0.0.1:9".to_owned(), "GET"),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({
+                    "uri": "http://127.0.0.1:9/",
+                    "headers": [{"name": "authorization", "value": "Bearer secret"}]
+                }),
+                http_constraints("127.0.0.1:9".to_owned(), "GET"),
+            ),
+            None,
+        )
         .await
         .expect_err("guest authorization header must be rejected before connection")
         .error;
@@ -431,14 +449,17 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
         .parse()
         .expect("valid capability fixture");
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({
-                "uri": "http://127.0.0.1:9/",
-                "catchError": true
-            }),
-            http_constraints("127.0.0.1:10".to_owned(), "GET"),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({
+                    "uri": "http://127.0.0.1:9/",
+                    "catchError": true
+                }),
+                http_constraints("127.0.0.1:10".to_owned(), "GET"),
+            ),
+            None,
+        )
         .await
         .expect_err("host rejection remains terminal after the guest catches the WIT error")
         .error;
@@ -477,11 +498,14 @@ async fn enforces_response_bytes_while_streaming() {
         .expect("HTTP fixture grant")
         .max_response_bytes = 128;
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({"uri": format!("http://{authority}/large")}),
-            constraints,
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"uri": format!("http://{authority}/large")}),
+                constraints,
+            ),
+            None,
+        )
         .await
         .expect_err("oversized response must fail the invocation")
         .error;
@@ -511,11 +535,14 @@ async fn returns_redirects_without_following_them() {
         .parse()
         .expect("valid capability fixture");
     let output = registry
-        .invoke(authorized(
-            capability,
-            json!({"uri": format!("http://{authority}/redirect")}),
-            http_constraints(authority, "GET"),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"uri": format!("http://{authority}/redirect")}),
+                http_constraints(authority, "GET"),
+            ),
+            None,
+        )
         .await
         .expect("redirect response itself is returned");
 
@@ -532,11 +559,14 @@ async fn broker_host_also_runs_import_free_components() {
             .expect("import-free provider loads in the broker linker");
     let capability = "echo.echo".parse().expect("valid capability fixture");
     let output = registry
-        .invoke(authorized(
-            capability,
-            json!({"message": "hello"}),
-            ExecutionConstraints::default(),
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"message": "hello"}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+        )
         .await
         .expect("import-free provider runs without an HTTP grant");
 
@@ -552,12 +582,15 @@ async fn rejects_authorization_bound_to_a_different_provider() {
             .expect("echo provider loads");
     let capability = "echo.echo".parse().expect("valid capability fixture");
     let error = registry
-        .invoke(authorized_for(
-            "http-probe",
-            capability,
-            json!({"message": "hello"}),
-            ExecutionConstraints::default(),
-        ))
+        .invoke(
+            authorized_for(
+                "http-probe",
+                capability,
+                json!({"message": "hello"}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+        )
         .await
         .expect_err("authorization cannot be retargeted to the routed provider")
         .error;
@@ -604,14 +637,17 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
         .expect("provider loads beneath valid host ceilings");
     let capability = "echo.echo".parse().expect("valid capability fixture");
     let error = registry
-        .invoke(authorized(
-            capability,
-            json!({"message": "hello"}),
-            ExecutionConstraints {
-                timeout_ms: 101,
-                ..ExecutionConstraints::default()
-            },
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"message": "hello"}),
+                ExecutionConstraints {
+                    timeout_ms: 101,
+                    ..ExecutionConstraints::default()
+                },
+            ),
+            None,
+        )
         .await
         .expect_err("authorization cannot widen host timeout")
         .error;
@@ -640,11 +676,14 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
         ..http_constraints(authority.clone(), "GET")
     };
     let failure = registry
-        .invoke(authorized(
-            capability,
-            json!({"uri": format!("http://{authority}/")}),
-            constraints,
-        ))
+        .invoke(
+            authorized(
+                capability,
+                json!({"uri": format!("http://{authority}/")}),
+                constraints,
+            ),
+            None,
+        )
         .await
         .expect_err("an unanswered request cannot succeed");
 
@@ -664,4 +703,243 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
         failure.http_calls[0].status, None,
         "a call that never received a response records no status"
     );
+}
+
+/// Serves a fixed sequence of responses, one connection each, recording every request.
+///
+/// The gh provider's conditional writes are two-call capabilities (a pre-read pins the head SHA a
+/// write then carries), so a single-response mock cannot exercise them. Responses carry
+/// `Connection: close`, forcing the client onto a fresh connection per call.
+fn mock_http_sequence(
+    responses: Vec<Vec<u8>>,
+) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+    let address = listener.local_addr().expect("fixture address");
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set fixture timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected = None;
+            loop {
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let complete = header_end + 4 + content_length(&request[..header_end + 4]);
+                    expected = Some(complete);
+                    if request.len() >= complete {
+                        break;
+                    }
+                }
+                let read = stream.read(&mut buffer).expect("read fixture request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            if let Some(expected) = expected {
+                request.truncate(expected);
+            }
+            sender.send(request).expect("record fixture request");
+            stream.write_all(&response).expect("write fixture response");
+            stream.flush().expect("flush fixture response");
+        }
+    });
+    (format!("127.0.0.1:{}", address.port()), receiver, handle)
+}
+
+fn json_http_response(body: &serde_json::Value) -> Vec<u8> {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
+fn gh_pull_body() -> serde_json::Value {
+    json!({
+        "number": 7,
+        "title": "Add ferocious test coverage",
+        "state": "open",
+        "draft": false,
+        "merged": false,
+        "body": "A body",
+        "user": {"login": "cpetersen"},
+        "head": {"ref": "feature/x", "sha": "a".repeat(40)},
+        "base": {"ref": "main", "sha": "b".repeat(40)},
+        "additions": 10,
+        "deletions": 2,
+        "changed_files": 3,
+        "mergeable_state": "clean",
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z",
+    })
+}
+
+fn gh_approve_constraints(
+    authority: String,
+    methods: &[&str],
+    max_requests: u32,
+) -> ExecutionConstraints {
+    ExecutionConstraints {
+        timeout_ms: 5_000,
+        max_output_bytes: 1024 * 1024,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec![authority],
+            allowed_methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+            max_requests,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 256 * 1024,
+            allow_plaintext_loopback: true,
+        }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_approve_pins_the_observed_head_and_leaves_two_evidence_entries() {
+    let registry =
+        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("gh provider loads without host calls during describe");
+    let review = json!({
+        "id": 42,
+        "state": "APPROVED",
+        "commit_id": "a".repeat(40),
+        "user": {"login": "xavier"},
+        "submitted_at": "2026-08-02T01:00:00Z",
+    });
+    let (authority, recorded, server) = mock_http_sequence(vec![
+        json_http_response(&gh_pull_body()),
+        json_http_response(&review),
+    ]);
+
+    let output = registry
+        .invoke(
+            authorized(
+                "gh.pull-request.approve".parse().expect("valid capability"),
+                json!({
+                    "owner": "octo",
+                    "repo": "hello",
+                    "number": 7,
+                    "endpoint": format!("http://{authority}"),
+                }),
+                gh_approve_constraints(authority.clone(), &["GET", "POST"], 2),
+            ),
+            None,
+        )
+        .await
+        .expect("authorized two-call approve succeeds");
+
+    assert_eq!(output.provider.as_str(), "gh");
+    assert_eq!(output.output["state"], "APPROVED");
+    assert_eq!(output.output["reviewId"], 42);
+    assert_eq!(output.output["headSha"], "a".repeat(40));
+
+    // The trace of what actually happened: a pre-read, then a write pinned to the observed SHA.
+    assert_eq!(output.http_calls.len(), 2);
+    assert_eq!(output.http_calls[0].method, "GET");
+    assert_eq!(output.http_calls[1].method, "POST");
+    let pre_read = String::from_utf8(recorded.recv().expect("pre-read recorded"))
+        .expect("fixture request is UTF-8");
+    assert!(
+        pre_read.starts_with("GET /repos/octo/hello/pulls/7 "),
+        "{pre_read}"
+    );
+    let write = String::from_utf8(recorded.recv().expect("write recorded"))
+        .expect("fixture request is UTF-8");
+    assert!(
+        write.starts_with("POST /repos/octo/hello/pulls/7/reviews "),
+        "{write}"
+    );
+    assert!(
+        write.contains(&format!("\"commit_id\":\"{}\"", "a".repeat(40))),
+        "{write}"
+    );
+    assert!(write.contains("\"event\":\"APPROVE\""), "{write}");
+    server.join().expect("fixture server exits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
+    let registry =
+        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("gh provider loads");
+    let (authority, recorded, server) =
+        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+
+    let failure = registry
+        .invoke(
+            authorized(
+                "gh.pull-request.approve".parse().expect("valid capability"),
+                json!({
+                    "owner": "octo",
+                    "repo": "hello",
+                    "number": 7,
+                    "endpoint": format!("http://{authority}"),
+                }),
+                gh_approve_constraints(authority.clone(), &["GET"], 2),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a write without POST authority must fail");
+
+    // The denial is terminal even though the guest catches the HTTP error internally, and the
+    // evidence still shows exactly what ran: the pre-read happened, the write never did.
+    assert!(matches!(
+        failure.error,
+        BrokerHostError::HostCallRejected {
+            reason: "denied",
+            ..
+        }
+    ));
+    assert_eq!(failure.http_calls.len(), 1);
+    assert_eq!(failure.http_calls[0].method, "GET");
+    drop(recorded);
+    server.join().expect("fixture server exits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_approve_over_its_call_budget_trips_the_host_call_limit() {
+    let registry =
+        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("gh provider loads");
+    let (authority, recorded, server) =
+        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+
+    let failure = registry
+        .invoke(
+            authorized(
+                "gh.pull-request.approve".parse().expect("valid capability"),
+                json!({
+                    "owner": "octo",
+                    "repo": "hello",
+                    "number": 7,
+                    "endpoint": format!("http://{authority}"),
+                }),
+                gh_approve_constraints(authority.clone(), &["GET", "POST"], 1),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a second call over a one-call grant must fail");
+
+    assert!(matches!(
+        failure.error,
+        BrokerHostError::HostCallRejected {
+            reason: "host-call-limit",
+            ..
+        }
+    ));
+    assert_eq!(failure.http_calls.len(), 1);
+    drop(recorded);
+    server.join().expect("fixture server exits");
 }

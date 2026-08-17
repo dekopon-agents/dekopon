@@ -1,0 +1,8 @@
+package dekopon:gh@0.1.0;
+
+/// Narrow GitHub repository, pull-request, and issue operations that require
+/// broker-mediated HTTP.
+world provider {
+    include dekopon:provider/provider@0.1.0;
+    import dekopon:http/client@1.0.0;
+}

@@ -1,9 +1,9 @@
 //! The model tool loop, exposing one sandboxed scripting tool rather than one tool per capability.
 //!
-//! Phase 1 built the interpreter; this module is the model-facing half. A session offers exactly
-//! one tool, [`SCRIPT_TOOL_NAME`], whose single argument is a script. Everything a model wants to
-//! do — inspect what it can reach, loop, branch, parse JSON, call capabilities — happens inside
-//! that script instead of across many small tool calls.
+//! `dekopon-shell` is the interpreter; this module is the model-facing half. A session offers
+//! exactly one tool, [`SCRIPT_TOOL_NAME`], whose single argument is a script. Everything a model
+//! wants to do — inspect what it can reach, loop, branch, parse JSON, call capabilities — happens
+//! inside that script instead of across many small tool calls.
 
 use std::time::Instant;
 
@@ -128,7 +128,7 @@ where
         // a log result still pivots to the turn it belongs to.
         if dekopon_core::telemetry_payloads() {
             tracing::info!(
-                target: "dekopon_run::audit",
+                target: "dekopon_agent::audit",
                 {
                     audit.event = "agent.model.prompt",
                     model.turn = model_turns,
@@ -142,7 +142,7 @@ where
             Ok(turn) => turn,
             Err(error) => {
                 tracing::error!(
-                    target: "dekopon_run::audit",
+                    target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
                         model.turn = model_turns,
@@ -162,7 +162,7 @@ where
         // sampling, because a model turn is a billed call and "how many did we make, at what
         // latency, for how many tokens" is a question asked long after the trace is gone.
         tracing::info!(
-            target: "dekopon_run::audit",
+            target: "dekopon_agent::audit",
             {
                 audit.event = "accounting.model.turn",
                 model.turn = model_turns,
@@ -184,7 +184,7 @@ where
         );
         if dekopon_core::telemetry_payloads() {
             tracing::info!(
-                target: "dekopon_run::audit",
+                target: "dekopon_agent::audit",
                 {
                     audit.event = "agent.model.answer",
                     model.turn = model_turns,
@@ -211,7 +211,7 @@ where
         }
         if turn.tool_calls.len() > MAX_SCRIPT_CALLS_PER_TURN {
             tracing::error!(
-                target: "dekopon_run::audit",
+                target: "dekopon_agent::audit",
                 {
                     audit.event = "agent.tool.rejected",
                     model.turn = model_turns,
@@ -265,7 +265,7 @@ where
                 let _entered = span.enter();
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
-                        target: "dekopon_run::audit",
+                        target: "dekopon_agent::audit",
                         {
                             audit.event = "agent.tool.script",
                             model.turn = model_turns,
@@ -281,7 +281,7 @@ where
                 let outcome = runtime.run_script(&script, remaining);
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
-                        target: "dekopon_run::audit",
+                        target: "dekopon_agent::audit",
                         {
                             audit.event = "agent.tool.output",
                             model.turn = model_turns,
@@ -340,7 +340,7 @@ pub fn script_outcome_label(outcome: &ScriptOutcome) -> &'static str {
 /// exported telemetry.
 fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
     tracing::error!(
-        target: "dekopon_run::audit",
+        target: "dekopon_agent::audit",
         {
             audit.event = "agent.tool.rejected",
             model.turn = model_turn,
@@ -423,11 +423,13 @@ in to work on it.
 4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
 tripping one ends the script with a message naming it.
 
-Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
-`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them exist only when \
-this session was configured for them, and report \"command not found\" otherwise: `curl`, which \
-opens no socket of its own but assembles a request for whichever HTTP capability the session was \
-given, and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant.
+Builtins: `jq`, `curl`, `gh`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
+`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Three of them \
+depend on session configuration and report their exact missing prerequisite otherwise: `curl`, \
+which opens no socket of its own but assembles a request for whichever HTTP capability the session \
+was given; `gh`, which maps GitHub-CLI subcommands (`gh pr view 7 -R owner/repo`, `gh pr review 7 \
+-R owner/repo --approve`) onto the correspondingly named granted `gh.*` capabilities; and `date`, \
+which reads the host clock and renders `+%s` or an ISO-8601 instant.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
 and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
@@ -501,8 +503,10 @@ pub enum PromptError {
 impl PromptError {
     /// Stable, low-cardinality failure category for telemetry.
     ///
-    /// Several variants carry model-chosen text; the category returned here never does.
-    pub(crate) fn telemetry_kind(&self) -> &'static str {
+    /// Several variants carry model-chosen text; the category returned here never does. Embedding
+    /// binaries reuse it so a session failure is labeled identically wherever it is reported.
+    #[must_use]
+    pub fn telemetry_kind(&self) -> &'static str {
         match self {
             Self::ZeroSteps => "zero-steps",
             Self::Model(_) => "model",
@@ -883,9 +887,9 @@ mod tests {
 
     /// A runtime whose capability dispatch is genuinely asynchronous underneath.
     ///
-    /// This is the shape `dekopon-run` uses in production: a synchronous [`ScriptRuntime`] bridging
-    /// to an async broker round trip with `Handle::block_on`, which is correct only because the
-    /// whole loop runs on a blocking task rather than a runtime worker thread.
+    /// This is the shape embedding binaries use in production: a synchronous [`ScriptRuntime`]
+    /// bridging to an async broker round trip with `Handle::block_on`, which is correct only
+    /// because the whole loop runs on a blocking task rather than a runtime worker thread.
     struct BlockingBridgeRuntime {
         handle: tokio::runtime::Handle,
         dispatched: Arc<Mutex<Vec<String>>>,
@@ -944,10 +948,11 @@ mod tests {
     }
 
     // The companion assertion — that the interpreter's own spans nest under `prompt.script` across
-    // this same bridge — lives in `tests/prompt_tracing.rs` rather than here. `tracing` caches
-    // callsite interest globally and once, so a `prompt.script` first reached by one of the tests
-    // above (which install no subscriber) stays disabled for any later thread-local one; that made
-    // the assertion depend on test ordering. Its own binary removes the race.
+    // this same bridge — lives in `dekopon-run/tests/prompt_tracing.rs` rather than here.
+    // `tracing` caches callsite interest globally and once, so a `prompt.script` first reached by
+    // one of the tests above (which install no subscriber) stays disabled for any later
+    // thread-local one; that made the assertion depend on test ordering. Its own binary removes
+    // the race.
 
     #[test]
     fn rejects_a_zero_step_session_before_contacting_the_model() {

@@ -1,0 +1,63 @@
+# dekopond — the unprivileged half. It hears the question and asks the model; it decides nothing.
+#
+# It holds a Slack app token, a Slack bot token, and a model endpoint. It holds no provider
+# credential, no policy, and no authorization. Every capability call a session makes is submitted
+# to the broker as an on-behalf-of proposal naming the sender's canonical subject, and the broker
+# alone turns that subject into a principal.
+#
+# chmod 0600 dekopond.yaml. Relative paths resolve against this file's own directory.
+apiVersion: dekopon.dev/dekopond/v1alpha1
+
+catalogPath: dekopon.yaml
+
+broker:
+  # Must be the socketPath from broker.yaml. serverUid is the UID that owns the broker process;
+  # the client verifies it before sending anything.
+  socketPath: /home/xavier/.local/run/dekopon/broker.sock
+  serverUid: 501
+
+transports:
+  - name: workspace-slack
+    kind: slackSocketMode
+    # Environment variable NAMES, never values. Pasting a token here is a startup failure, and a
+    # missing variable is reported by name. See ../slack/README.md for creating the app and both
+    # tokens.
+    appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
+    botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+
+models:
+  - name: local-reasoning
+    kind: openaiCompatible
+    # Local Ollama. Any OpenAI-compatible chat-completions endpoint works here — llama.cpp, vLLM,
+    # a hosted API with `apiKeyEnv` naming the variable holding its key. The model never sees a
+    # provider credential either way; it only ever writes shell scripts.
+    endpoint: http://127.0.0.1:11434/v1
+    model: qwen3
+    timeoutMs: 120000
+    # Matched against the agent's `modelClass` when a route names no model explicitly.
+    classes: [reasoning]
+
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: xaviers-rubber-stamper
+    limits:
+      # One review is a handful of steps: view the pull request, read the files, approve, answer.
+      # A budget that cannot finish the job is a bug; a budget that can loop is a bill.
+      maxSteps: 8
+      maxCapabilityCalls: 16
+
+sessions:
+  maxConcurrent: 4
+  replyOnBusy: true
+
+shutdownGraceMs: 120000
+
+# Optional, same shape as broker.yaml's. `telemetryPayloads: true` would add chat text and the
+# canonical subject to spans, which declares the sink in scope for every message this gateway sees.
+# telemetry:
+#   endpoint: http://127.0.0.1:5080/api/default
+#   transport: http
+#   serviceName: dekopond
+#   exportTimeoutMs: 10000
+#   telemetryPayloads: false

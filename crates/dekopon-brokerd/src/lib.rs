@@ -8,12 +8,16 @@
 
 mod checkpoint;
 mod config;
+mod credentials;
 mod server;
 mod socket;
 
 use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
 
-use dekopon_broker::{AuditLog, Broker, FileAuditLog};
+use dekopon_broker::{
+    AuditLog, Broker, ConstraintCatalog, CredentialStore, FileAuditLog, IdentityDirectory,
+    PolicyBuildError, PolicyEngine, PolicyWorld,
+};
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use thiserror::Error;
@@ -21,9 +25,13 @@ use thiserror::Error;
 pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
-    PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, TelemetryConfig,
+    IdentityMapping, PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig,
+    TelemetryConfig,
 };
-pub use server::{BrokerServer, ServerError, ServerLimits};
+pub use credentials::{
+    CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
+};
+pub use server::{BrokerServer, MappedPeer, ServerError, ServerLimits};
 pub use socket::{SocketError, SocketGuard, current_uid};
 
 /// Verified durable chain state at clean shutdown.
@@ -87,6 +95,13 @@ where
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
     }
+    // Loaded before the policy is built so an unknown or unbindable credential is a startup
+    // refusal, never a per-invocation surprise. Absent path ⇒ empty store ⇒ credentialed
+    // constraint sets fail construction the same way.
+    let credential_store = match &config.credentials_path {
+        Some(path) => credentials::load(path, uid).await?,
+        None => CredentialStore::empty(),
+    };
 
     let (checkpoint_store, stored_checkpoint) = checkpoint::CheckpointStore::open(
         &config.checkpoint_path,
@@ -123,12 +138,45 @@ where
             .max_frame_bytes
             .saturating_sub(config::MINIMUM_RESPONSE_OVERHEAD_BYTES),
     )?;
+    let identity_directory = IdentityDirectory::new(
+        config
+            .identity_mappings
+            .iter()
+            .map(|mapping| (mapping.subject.clone(), mapping.principal.clone())),
+    )
+    .map_err(BrokerdError::Broker)?;
+    // The declared world is exactly what owner-controlled configuration names: the peers that can
+    // connect, the principals subjects map to, and the capabilities the loaded manifests expose.
+    // A policy naming anything outside it refuses startup rather than becoming latent dead policy.
+    let world = PolicyWorld::new(
+        config
+            .identities
+            .iter()
+            .map(|identity| identity.principal.clone())
+            .chain(
+                config
+                    .identity_mappings
+                    .iter()
+                    .map(|mapping| mapping.principal.clone()),
+            ),
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .map_err(|source| BrokerdError::Policy { source })?;
+    let policy = PolicyEngine::new(&config.policies, &world)
+        .map_err(|source| BrokerdError::Policy { source })?;
+    let constraints =
+        ConstraintCatalog::new(config.constraint_sets).map_err(BrokerdError::Broker)?;
     let broker = Arc::new(
         Broker::new_with_replay_ids(
             registry,
             config.broker_principal,
             config.policy_revision,
-            config.rules,
+            policy,
+            constraints,
+            credential_store,
+            identity_directory,
             Arc::clone(&audit),
             config.broker_limits,
             replay_ids,
@@ -139,7 +187,10 @@ where
     for identity in config.identities {
         identities.insert(
             identity.uid,
-            identity.context().map_err(BrokerdError::Context)?,
+            MappedPeer {
+                context: identity.context().map_err(BrokerdError::Context)?,
+                attestor: identity.attestor,
+            },
         );
     }
     validate_capability_responses(&broker, &identities, frame_limits.max_frame_bytes)?;
@@ -170,11 +221,11 @@ where
 
 fn validate_capability_responses<A: AuditLog>(
     broker: &Broker<A>,
-    identities: &BTreeMap<u32, dekopon_broker::AuthenticatedContext>,
+    identities: &BTreeMap<u32, MappedPeer>,
     maximum: usize,
 ) -> Result<(), BrokerdError> {
-    for context in identities.values() {
-        let response = ResponseEnvelope::capabilities(broker.capabilities(context));
+    for peer in identities.values() {
+        let response = ResponseEnvelope::capabilities(broker.capabilities(&peer.context));
         let length = serde_json::to_vec(&response)
             .map_err(|source| BrokerdError::CapabilityResponse { source })?
             .len();
@@ -216,6 +267,9 @@ pub enum BrokerdError {
     /// Strict owner-controlled configuration failed.
     #[error("broker configuration is invalid")]
     Config(#[from] ConfigError),
+    /// Owner-only credential storage failed hygiene, decoding, or resolution.
+    #[error("broker credentials are unavailable or invalid")]
+    Credentials(#[from] CredentialsError),
     /// Owner-only durable audit could not be opened and verified.
     #[error("broker durable audit is unavailable")]
     Audit(#[source] dekopon_broker::FileAuditError),
@@ -258,6 +312,13 @@ pub enum BrokerdError {
     /// Policy, restored replay state, or constraints were invalid.
     #[error("broker policy could not start")]
     Broker(#[source] dekopon_broker::BrokerBuildError),
+    /// The Cedar policy set could not be parsed, schema-validated, or bounded.
+    #[error("broker policy set is invalid")]
+    Policy {
+        /// Policy build failure.
+        #[source]
+        source: PolicyBuildError,
+    },
     /// A configured transport identity could not be bound.
     #[error("broker peer identity is invalid")]
     Context(#[source] dekopon_broker::ContextError),
