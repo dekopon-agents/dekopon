@@ -1,5 +1,5 @@
 # Workspace integration tests
 
-Executable CLI integration tests live with their packages in [`crates/dekopon/tests`](../crates/dekopon/tests) and [`crates/dekopon-run/tests`](../crates/dekopon-run/tests).
+Integration tests live with their packages under `crates/*/tests`. The CLI ones are in [`crates/dekopon/tests`](../crates/dekopon/tests) and [`crates/dekopon-run/tests`](../crates/dekopon-run/tests); the end-to-end one that boots a real `dekopon-brokerd` and a real `dekopond` against a mock model endpoint is [`crates/dekopond/tests/gateway.rs`](../crates/dekopond/tests/gateway.rs); the checked-in examples are pinned against the real machinery by [`crates/dekopon-brokerd/tests/examples.rs`](../crates/dekopon-brokerd/tests/examples.rs), [`crates/dekopon-config/tests/examples.rs`](../crates/dekopon-config/tests/examples.rs), and [`crates/dekopond/tests/examples.rs`](../crates/dekopond/tests/examples.rs).
 
 The repository-level black-box observability test lives with its runnable example at [`examples/otel-traces/smoke-test.sh`](../examples/otel-traces/smoke-test.sh). It starts one OpenObserve container, runs an instrumented provider invocation, and searches for expected payload-redacted traces.

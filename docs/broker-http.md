@@ -1,14 +1,14 @@
 # Broker-mediated HTTP providers
 
-This document records the implemented privileged host and local Unix broker foundation plus **committed direction** for credentials, client integration, and stronger deployment transports. Status is called out explicitly because local UID authentication is not a production multi-tenant boundary.
+This document records the implemented privileged host, local Unix broker, credential resolution, and Cedar authorization, plus **committed direction** for stronger deployment transports and independent checkpoint anchoring. Status is called out explicitly because local UID authentication is not a production multi-tenant boundary.
 
 ## Current foundation
 
 The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. The broker host compiles components once, creates fresh bounded stores, links only the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata.
 
-`dekopon-broker` now binds a separately supplied authenticated context to exact principal/actor/capability/provider rules, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
+`dekopon-broker` now binds a separately supplied authenticated context, asks a `dekopon-policy` Cedar engine whether it may act, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
-The versioned local wire format, explicit `dekopon-run broker` Unix client commands, `dekopon-brokerd` process, JSONPlaceholder demonstration provider, and atomic local audit checkpoint are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. Independent checkpoint retention/signing, credentials, and operator/agent integration remain committed direction.
+The versioned local wire format, explicit `dekopon-run broker` Unix client commands, `dekopon-brokerd` process, JSONPlaceholder demonstration provider, and atomic local audit checkpoint are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. Broker-owned destination-bound credential resolution is current, as is broker-side attested identity: owner-configured attestor grants, subject-to-principal mappings, and policy conditioned on `context.via`. The agent half of orchestration integration is current too: `dekopond` drives bounded sessions whose capability calls become attested proposals on this protocol ([`dekopond.md`](dekopond.md)). Independent checkpoint retention/signing, a dedicated gateway UID, and operator-CLI integration remain committed direction.
 
 ## Decision
 
@@ -57,7 +57,7 @@ model or direct dekopon-run request
        result + evidence + audit
 ```
 
-Explicit direct-runner proposal submission and the flow from authenticated socket acceptance downward are current; automatic model/agent orchestration integration remains future work. External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. The JSONPlaceholder component exposes `jsonplaceholder.posts.get` as read-only/idempotent and `jsonplaceholder.posts.create` as external-write/non-idempotent. It defaults to the exact production HTTPS origin, accepts only literal loopback HTTP overrides for deterministic tests, validates bounded typed inputs and responses, and still relies on independent exact broker authority/method grants. Automated tests never contact the public service. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
+Explicit direct-runner proposal submission and the flow from authenticated socket acceptance downward are current, and so is automatic agent orchestration: a `dekopond` session's capability calls arrive here as attested proposals with no human in the loop. Operator-CLI integration remains future work. External-write capabilities require this separate broker process even when a demonstration endpoint does not persist writes. The JSONPlaceholder component exposes `jsonplaceholder.posts.get` as read-only/idempotent and `jsonplaceholder.posts.create` as external-write/non-idempotent. It defaults to the exact production HTTPS origin, accepts only literal loopback HTTP overrides for deterministic tests, validates bounded typed inputs and responses, and still relies on independent exact broker authority/method grants. Automated tests never contact the public service. A provider manifest remains untrusted input; trusted policy and capability configuration determine whether an operation is authorized.
 
 ## Local broker protocol
 
@@ -69,9 +69,21 @@ The protocol exposes only the operations needed by a broker client:
 
 - inspect the broker's available provider capabilities;
 - submit one invocation proposal;
+- inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
+- submit one proposal attested on behalf of an external subject (`invokeFor`);
 - receive a denied, succeeded, or failed result with bounded public evidence metadata.
 
 `AuthorizedInvocation` is never accepted from or returned to the client. It is created and consumed inside the broker process.
+
+### Attested on-behalf-of operations
+
+`capabilitiesFor` and `invokeFor` carry a canonical external subject and an agent identity. They carry no principal, because the subject-to-principal mapping is owner-controlled broker state; a peer states *which authenticated external identity it is relaying*, and the broker decides who that is. Both are honored only for peers whose configuration grants attestor authority over the subject's namespace.
+
+`invokeFor` sends its claim as a separate `SubjectAttestation` rather than as fields on the invocation, so the invocation payload stays identity-free exactly as it is for `invoke`. The attestation's `invocation` must equal the accompanying proposal's identifier. They already travel in one frame, so this is defense in depth against a future refactor that separates them; a mismatch is a protocol error (`invalid-request`) rather than a policy decision, and nothing is authorized or accounted.
+
+The two refusals differ in kind. A refused attestation on `invokeFor` is a normal invocation response carrying a `Denied` outcome and a stable reason — `attestation-denied` for a missing or out-of-scope grant, `unmapped-subject` for a subject no mapping names — because it is a decision the broker made and durably recorded. A refused `capabilitiesFor` is an `unauthenticated` failure response instead: there is no invocation to decide about, and answering with an empty list would tell an ungranted peer whether the subject is mapped.
+
+The `operation` tag is the compatibility seam for this addition. Requests are strict-decoded, so a broker built before these operations existed rejects an unknown tag as a clean `invalid-request` rather than misreading it as an operation it does know. A client can therefore probe for attestation support without risking a misinterpreted proposal.
 
 ### Failure codes
 
@@ -119,19 +131,75 @@ Before performing a request, the broker host validates all of the following agai
 
 The native client does not inherit proxy configuration from the environment, does not follow redirects, and disables automatic decompression. DNS results are checked against destination rules and pinned into the client before connection, so a later resolver answer or redirect cannot escape that decision. Response headers and bodies, host calls, Wasm memory and fuel, serialized input/output, and wall-clock duration are bounded. Timing out an invocation drops the async Wasmtime/HTTP operation and releases its fresh store.
 
-Provider credentials remain broker-owned. A future credential resolver may inject destination-bound headers after guest headers and policy have been validated; raw credentials are never returned to the provider, model, client, trace, evidence, or normal audit fields.
+Provider credentials remain broker-owned, and the credential resolver is now current. An owner-only credentials file (strict `dekopon.dev/broker-credentials/v1alpha1`, mode `0600`, single-link, byte-capped) resolves symbolic names into destination-bound `authorization` values held in `Redacted` wrappers. A constraint set binds one name with `credential:`; construction fails closed unless the name exists, the set grants HTTP authority, and every `allowedHosts` entry appears verbatim in the credential's `destinations` — which makes a runtime destination mismatch unreachable. The native engine injects the header strictly after guest-header validation (a guest-supplied `authorization` is still rejected, never overwritten), only for requests whose resolved authority falls inside the binding, refusing rather than sending unauthenticated otherwise. The injected header counts against neither guest byte grants nor public evidence sizes; evidence and audit record only `credentialInjected: true`. Raw credentials are never returned to the provider, model, client, trace, evidence, or normal audit fields, and destination binding plus redaction are independently tested at the engine, broker, and service layers.
 
 ## Authorization policy
 
-The first broker policy is explicit and deny-by-default. Trusted operator configuration binds an authenticated principal to named capabilities and per-capability execution constraints. HTTP constraints include exact destination hosts, allowed methods, host-call count, request bytes, response bytes, and timeout.
+Broker policy is [Cedar](https://cedarpolicy.com), and it is deny-by-default at every layer. It
+answers exactly one question — may this principal take this action on this resource in this
+context — and it answers nothing about how the resulting invocation executes.
 
-A component's import table and manifest can narrow what it is able to request, but neither can widen policy. The broker rejects unknown imports before invocation. A provider that declares a read-only capability cannot use a method authorized only for an external-write capability, and one capability's grant is not reusable by another invocation.
+### Two files, two jobs
 
-Policy decisions produce a stable decision identifier and policy revision. Authorization binds that decision, the original proposal, the selected provider and capability, and the exact execution constraints used by the host.
+Execution constraints live in owner-authored **constraint sets**, one per capability, outside the
+policy language entirely. A constraint set names the provider route, the trusted
+effect/risk/idempotency classification, an optional symbolic credential, and the bounded execution
+authority: timeout, output ceiling, exact destination hosts, allowed methods, host-call count, and
+byte ceilings. Construction validates all of it against the loaded provider manifest, the component
+host's independent ceilings, and the credential store.
+
+The split is the point. A policy edit can broaden *who may act*; it can never widen a timeout,
+reach a new host, or bind a credential that was not already bound. And a capability with no
+constraint set is simply not deployable — the broker denies it `unconstrained-capability` before
+consulting policy, and refuses to start if any policy could ever permit it.
+
+### The entity model
+
+Everything is in the `Dekopon` namespace: `Dekopon::Principal`, `Dekopon::Provider`,
+`Dekopon::Agent`, one `Dekopon::Action::"<capability-id>"` per loaded capability, and the fixed
+`Dekopon::Action::"agent.prompt"`. Capability actions apply to a `Principal` over a `Provider`;
+`agent.prompt` applies to a `Principal` over an `Agent`. No entity carries attributes.
+
+Capability actions carry a context of `{ via?, subject?, agent?, effect, risk, idempotency }`;
+`agent.prompt` carries `{ via?, subject?, agent? }`. Every value is rendered by the broker from
+authenticated transport state or owner-controlled configuration. Message content and provider input
+are deliberately absent: conditioning authorization on untrusted JSON needs a settled schema
+treatment first, so until then no policy can be made to depend on a value the caller supplies.
+
+`agent.prompt` is the session gate. Permitting a principal to drive an agent is now its own
+explicit statement, checked before `capabilitiesFor` answers and before `invokeFor` authorizes
+anything; a denial is the audited reason `agent-denied` under the attested context.
+
+### Startup validation
+
+The schema is generated from the deployment's declared world — the principals its peer identities
+and subject mappings name, and the providers and capabilities its loaded manifests expose — and the
+policy set is validated against it in Cedar's strict mode. An unknown action, unknown entity type,
+or ill-typed expression refuses startup.
+
+Cedar's validator checks types, not instances, so the engine separately proves every entity literal
+against that world: `principal == Dekopon::Principal::"typo"` is well typed and would simply never
+match, and refusing it at startup is what the exact engine's reachability check used to buy.
+Templates are refused, source is capped at 1 MiB and 1024 policies, and empty policy text is valid
+and permits nothing.
+
+### Decisions
+
+A component's import table and manifest can narrow what it is able to request, but neither can
+widen policy. The broker rejects unknown imports before invocation. A provider that declares a
+read-only capability cannot use a method authorized only for an external-write capability, and one
+capability's grant is not reusable by another invocation.
+
+Every decision produces a stable decision identifier, the policy revision, the identifiers of the
+policies that determined it (`policy_ids`), and a digest of the evaluated policy set
+(`policy_digest`). Authorization binds that decision, the original proposal, the selected provider
+and capability, and the exact execution constraints used by the host. Any Cedar evaluation error
+denies, and surfaces as a stable flag rather than error text — a denial explanation must not become
+a per-request channel for policy source.
 
 ## Evidence and audit
 
-The current core appends one decision event for every decoded invocation from a mapped peer and a terminal execution event after each completed authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, effect/risk/idempotency classification, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
+The current core appends one decision event for every decoded invocation from a mapped peer and a terminal execution event after each completed authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, determining policy identifiers, policy-set digest, effect/risk/idempotency classification, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
 
 The bounded in-memory implementation hash-links events for tests. `FileAuditLog` persists exclusively writer-locked owner-only bounded JSONL, verifies the complete existing chain before append, synchronizes every decision/outcome, rejects partial writes, reconstructs replay IDs on restart, and can verify an exact count/head prefix. `dekopon-brokerd` maintains that count/head in a separate strict owner-only checkpoint under its own writer lock. It writes audit first, then synchronizes and atomically replaces the checkpoint; startup fails if a non-empty audit has no checkpoint or the checkpoint is not an exact verified prefix. A valid checkpoint exactly one record behind the audit is the recoverable crash window and is advanced before listening; a larger gap fails closed.
 
@@ -156,13 +224,15 @@ The behavior lands in reviewable slices without temporarily granting authority t
 1. **Implemented:** publish and validate the HTTP WIT contract and guest bindings.
 2. **Implemented:** generalize provider guest world generation and add an HTTP-importing fixture that the immediate host still rejects.
 3. **Implemented foundation:** add the bounded native engine and asynchronous broker-owned component host with loopback mock-server tests.
-4. **Implemented foundation:** add exact deny-by-default policy, trusted context binding, single-use authorization, bounded replay state, digest evidence, and an in-memory verifiable audit chain.
+4. **Implemented foundation:** add deny-by-default policy, trusted context binding, single-use authorization, bounded replay state, digest evidence, and an in-memory verifiable audit chain.
 5. **Implemented foundation:** add owner-only durable audit persistence, restart verification, checkpoints, and replay-ID restoration.
 6. **Implemented client foundation:** add strict bounded local framing and an unprivileged Unix client with no identity or authorization payload fields.
 7. **Implemented service foundation:** add the authenticated owner-only Unix listener, exact peer-UID context mapping, secure socket lifecycle, bounded concurrency/draining, and broker executable.
 8. **Implemented demonstration:** add mock-backed JSONPlaceholder post-read and external-write capabilities with exact method/authority policy and audit-redaction tests.
 9. **Implemented client integration:** add explicit `dekopon-run broker capabilities/invoke` commands that validate server UID and submit identity-free proposals without changing the direct linker.
 10. **Implemented durability foundation:** add a separately locked atomic checkpoint file, startup prefix verification, rollback rejection, and audit-ahead crash recovery.
-11. Add broker-owned credentials and independently retained, signed, or remote checkpoints before production claims.
+11. **Implemented credentials:** broker-owned destination-bound credential resolution with per-capability symbolic binding, construction-time coverage validation, post-validation header injection, and independently tested destination binding and redaction.
+12. **Implemented policy engine:** replace exact matching with Cedar over a generated, strictly validated schema; keep execution constraints in owner-authored constraint sets; add the `agent.prompt` session gate and determining-policy explanations in audit.
+13. Add independently retained, signed, or remote checkpoints before production claims.
 
 Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.

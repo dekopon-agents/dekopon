@@ -352,6 +352,13 @@ fn agent_description(description: &AgentDescription) -> String {
             "Policy:       {}",
             option_cell(agent.spec.policy_profile.as_deref())
         ),
+        // Standing orders belong here rather than in the table: they are prose, they are what a
+        // reader checks when an agent behaves oddly, and `cell_text` already collapses the
+        // newlines an operator will have authored into it.
+        format!(
+            "Instructions: {}",
+            option_cell(agent.spec.instructions.as_deref())
+        ),
         "Capabilities:".to_owned(),
     ];
 

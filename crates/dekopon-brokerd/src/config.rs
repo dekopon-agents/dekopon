@@ -1,19 +1,19 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use dekopon_broker::{
-    AuthenticatedContext, BrokerLimits, ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES,
-    DEFAULT_MAX_AUDIT_RECORDS, PolicyRule,
+    AttestorGrant, AuthenticatedContext, BrokerLimits, ConstraintSet, ContextError,
+    DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
 };
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES,
 };
-use dekopon_core::{Actor, PrincipalId};
+use dekopon_core::{Actor, CapabilityId, ExternalSubject, PrincipalId};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -21,6 +21,8 @@ use tokio::io::AsyncReadExt as _;
 
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/brokerd/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
+/// Ceiling on the owner-only Cedar policy file, matching `dekopon-policy`'s own source bound.
+pub const HARD_MAX_POLICY_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_CONNECTIONS: usize = 1_024;
 pub const HARD_MAX_PROVIDERS: usize = 64;
 pub const MINIMUM_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
@@ -43,9 +45,30 @@ pub struct BrokerdConfig {
     pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
+    /// Optional owner-only credentials file resolved into the broker's credential store.
+    ///
+    /// Absent means the broker holds no provider credentials, and any rule naming one fails
+    /// construction. The secret values live only in that file — never here.
+    #[serde(default)]
+    pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
     pub identities: Vec<PeerIdentity>,
-    pub rules: Vec<PolicyRule>,
+    /// Owner-controlled subject-to-principal mappings consulted for attested proposals.
+    #[serde(default)]
+    pub identity_mappings: Vec<IdentityMapping>,
+    /// Owner-only Cedar policy file evaluated for every authorization decision.
+    ///
+    /// Absent means an empty policy set, which permits nothing. Required once any constraint set
+    /// exists, because a deployment that declares executable capabilities and no policy is a
+    /// configuration mistake rather than a deliberate deny-everything.
+    #[serde(default)]
+    pub policies_path: Option<PathBuf>,
+    /// Execution constraints per capability, keyed by capability identifier.
+    ///
+    /// A capability with no entry is not deployable: the broker refuses it before consulting
+    /// policy, and refuses to start if policy could ever permit it.
+    #[serde(default)]
+    pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     #[serde(default)]
     pub host_limits: HostLimitsConfig,
     #[serde(default)]
@@ -108,12 +131,25 @@ pub struct PeerIdentity {
     pub uid: u32,
     pub principal: PrincipalId,
     pub actor: Actor,
+    /// Optional authority to attest external subjects inside canonical namespaces.
+    #[serde(default)]
+    pub attestor: Option<AttestorGrant>,
 }
 
 impl PeerIdentity {
     pub fn context(&self) -> Result<AuthenticatedContext, ContextError> {
         AuthenticatedContext::new(self.principal.clone(), self.actor.clone())
     }
+}
+
+/// One owner-controlled mapping from a canonical external subject to a stable principal.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IdentityMapping {
+    /// Canonical subject, e.g. `slack.t0123abc.u9xyz` or `tel.16034700182`.
+    pub subject: ExternalSubject,
+    /// The stable principal that subject resolves to.
+    pub principal: PrincipalId,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -227,9 +263,13 @@ pub struct ResolvedConfig {
     pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
+    pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
     pub identities: Vec<PeerIdentity>,
-    pub rules: Vec<PolicyRule>,
+    pub identity_mappings: Vec<IdentityMapping>,
+    pub policies_path: Option<PathBuf>,
+    pub policies: String,
+    pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     pub host_limits: BrokerHostLimits,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
@@ -241,52 +281,76 @@ pub async fn load(
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let path = absolute(path.as_ref())?;
+    let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
+    let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
+        .map_err(|source| ConfigError::Decode { source })?;
+    let mut resolved = resolve(config, path)?;
+    // The policy file gets the configuration's own hygiene: owner-owned, single-link, not
+    // group/world writable, no symlink following, byte-capped. It is trusted input in exactly the
+    // same sense the configuration is, so it is read under exactly the same rules.
+    if let Some(policies_path) = resolved.policies_path.clone() {
+        let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
+        resolved.policies = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 {
+            path: policies_path,
+        })?;
+    }
+    Ok(resolved)
+}
+
+/// Reads one owner-only, single-link, byte-capped regular file without following symlinks.
+async fn read_owner_only(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+) -> Result<Vec<u8>, ConfigError> {
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
     let file = options
-        .open(&path)
+        .open(path)
         .await
         .map_err(|source| ConfigError::Read {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
     let metadata = file.metadata().await.map_err(|source| ConfigError::Read {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
     if !metadata.file_type().is_file() {
-        return Err(ConfigError::NotRegular { path });
+        return Err(ConfigError::NotRegular {
+            path: path.to_path_buf(),
+        });
     }
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     if metadata.uid() != expected_uid
         || metadata.permissions().mode() & 0o022 != 0
         || metadata.nlink() != 1
     {
-        return Err(ConfigError::InsecureFile { path });
+        return Err(ConfigError::InsecureFile {
+            path: path.to_path_buf(),
+        });
     }
-    if metadata.len() > HARD_MAX_CONFIG_BYTES as u64 {
+    if metadata.len() > maximum as u64 {
         return Err(ConfigError::TooLarge {
             length: metadata.len(),
-            maximum: HARD_MAX_CONFIG_BYTES,
+            maximum,
         });
     }
     let mut bytes = Vec::new();
-    file.take((HARD_MAX_CONFIG_BYTES + 1) as u64)
+    file.take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(|source| ConfigError::Read {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
-    if bytes.len() > HARD_MAX_CONFIG_BYTES {
+    if bytes.len() > maximum {
         return Err(ConfigError::TooLarge {
             length: bytes.len() as u64,
-            maximum: HARD_MAX_CONFIG_BYTES,
+            maximum,
         });
     }
-    let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
-        .map_err(|source| ConfigError::Decode { source })?;
-    resolve(config, path)
+    Ok(bytes)
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -345,6 +409,18 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
     let checkpoint_path = resolve_future_path(resolve_path(config.checkpoint_path))?;
     let checkpoint_lock_path = resolve_future_path(resolve_path(config.checkpoint_lock_path))?;
     let checkpoint_temporary_path = sibling_with_suffix(&checkpoint_path, ".tmp")?;
+    let canonical = |path: Option<PathBuf>| {
+        path.map(|path| {
+            let unresolved = resolve_path(path);
+            std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
+                path: unresolved,
+                source,
+            })
+        })
+        .transpose()
+    };
+    let credentials_path = canonical(config.credentials_path)?;
+    let policies_path = canonical(config.policies_path)?;
     let mut provider_set = BTreeSet::new();
     let mut providers = Vec::with_capacity(config.providers.len());
     for provider in config.providers {
@@ -359,7 +435,7 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         }
         providers.push(provider);
     }
-    let reserved = [
+    let mut reserved = vec![
         source.clone(),
         socket_path.clone(),
         audit_path.clone(),
@@ -367,6 +443,12 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         checkpoint_lock_path.clone(),
         checkpoint_temporary_path,
     ];
+    if let Some(credentials_path) = &credentials_path {
+        reserved.push(credentials_path.clone());
+    }
+    if let Some(policies_path) = &policies_path {
+        reserved.push(policies_path.clone());
+    }
     if reserved.iter().collect::<BTreeSet<_>>().len() != reserved.len()
         || providers
             .iter()
@@ -383,15 +465,26 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         identity
             .context()
             .map_err(|source| ConfigError::Identity { source })?;
-    }
-    for rule in &config.rules {
-        if !config
-            .identities
-            .iter()
-            .any(|identity| identity.principal == rule.principal && identity.actor == rule.actor)
-        {
-            return Err(ConfigError::UnmappedRule);
+        if let Some(attestor) = &identity.attestor {
+            attestor
+                .validate()
+                .map_err(|source| ConfigError::Attestor { source })?;
         }
+    }
+    let mut mapped_subjects = BTreeSet::new();
+    for mapping in &config.identity_mappings {
+        if !mapped_subjects.insert(mapping.subject.canonical()) {
+            return Err(ConfigError::DuplicateSubject {
+                subject: mapping.subject.canonical(),
+            });
+        }
+    }
+    // A deployment that declares executable capabilities and no policy file would start and refuse
+    // everything, which is a configuration mistake dressed as deny-by-default. Every other check
+    // the old reachability validation performed now happens in policy-world construction: an
+    // undeclared principal, provider, or capability refuses `PolicyEngine::new` outright.
+    if !config.constraint_sets.is_empty() && policies_path.is_none() {
+        return Err(ConfigError::MissingPoliciesPath);
     }
     if config.server_limits.max_connections == 0
         || config.server_limits.max_connections > HARD_MAX_CONNECTIONS
@@ -444,9 +537,13 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         checkpoint_lock_path,
         broker_principal: config.broker_principal,
         policy_revision: config.policy_revision,
+        credentials_path,
         providers,
         identities: config.identities,
-        rules: config.rules,
+        identity_mappings: config.identity_mappings,
+        policies_path,
+        policies: String::new(),
+        constraint_sets: config.constraint_sets,
         host_limits,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
@@ -509,8 +606,20 @@ pub enum ConfigError {
         #[source]
         source: ContextError,
     },
-    #[error("every policy rule must match one configured peer identity exactly")]
-    UnmappedRule,
+    #[error(
+        "constraintSets requires a policiesPath; a broker with capabilities and no policy \
+             would refuse every request"
+    )]
+    MissingPoliciesPath,
+    #[error("broker policy file is not valid UTF-8: {path}")]
+    PolicyNotUtf8 { path: PathBuf },
+    #[error("peer attestor grant is invalid")]
+    Attestor {
+        #[source]
+        source: dekopon_broker::BrokerBuildError,
+    },
+    #[error("identity mapping duplicates subject {subject:?}")]
+    DuplicateSubject { subject: String },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
     #[error("host timeout must be positive")]

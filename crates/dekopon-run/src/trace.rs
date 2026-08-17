@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use dekopon_broker_protocol::TraceParent;
 use dekopon_telemetry::{ExporterSettings, TelemetryError};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -19,11 +18,10 @@ use tracing_subscriber::{
 use crate::cli::TelemetryArgs;
 
 /// Crates whose execution spans and lifecycle events belong in runner telemetry.
-const TRACE_FILTER: &str =
-    "dekopon_run=trace,dekopon_model=trace,dekopon_provider_host=trace,dekopon_shell=trace";
+const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_agent=trace,dekopon_model=trace,dekopon_provider_host=trace,dekopon_shell=trace";
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
 /// feed its own export failures back into itself.
-const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
+const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_agent=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
 
 pub(crate) struct TraceGuard {
     chrome: Option<FlushGuard>,
@@ -80,14 +78,17 @@ pub(crate) fn initialize(
         1 => "info",
         _ => "debug",
     };
-    // Lifecycle audit events target `dekopon_run::audit` so they reach the OTLP and Chrome sinks
-    // (whose `dekopon_run` directives match the prefix) without ever printing on the operator's
-    // stderr, which must stay byte-for-byte what it was before those events existed.
+    // Lifecycle audit events target `dekopon_run::audit` and `dekopon_agent::audit` so they reach
+    // the OTLP and Chrome sinks (whose crate directives match the prefix) without ever printing on
+    // the operator's stderr, which must stay byte-for-byte what it was before those events
+    // existed.
     let stderr_layer = fmt::layer()
         .with_ansi(!no_color)
         .with_target(verbosity > 1)
         .with_writer(io::stderr)
-        .with_filter(EnvFilter::new(format!("{level},dekopon_run::audit=off")));
+        .with_filter(EnvFilter::new(format!(
+            "{level},dekopon_run::audit=off,dekopon_agent::audit=off"
+        )));
 
     let (chrome_layer, chrome_guard) = if let Some(path) = chrome_trace {
         let file = File::create(path).map_err(|source| TraceError::Create {
@@ -196,18 +197,6 @@ pub(crate) fn initialize(
     })
 }
 
-/// Trace context to send with a broker proposal, if this process is exporting one.
-///
-/// `None` is the ordinary state when export is disabled: the broker then records its own root
-/// span rather than a child of a trace nothing will ever receive.
-pub(crate) fn current_trace_parent() -> Option<TraceParent> {
-    let parts = dekopon_telemetry::current_trace_context()?;
-    // A context the SDK considers valid can still be rejected here (all-zero identifiers), and a
-    // malformed parent is worse than none: it would attach broker spans to a trace that does not
-    // exist. Dropping it degrades correlation instead of corrupting it.
-    TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok()
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum TraceError {
     #[error("could not create trace file {}", path.display())]
@@ -228,14 +217,8 @@ pub(crate) enum TraceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TraceError, current_trace_parent, initialize};
+    use super::{TraceError, initialize};
     use crate::cli::{TelemetryArgs, Transport};
-
-    /// Outside an exporting span there is no context to send, and the runner must not invent one.
-    #[test]
-    fn trace_parent_is_absent_without_an_active_exporting_span() {
-        assert!(current_trace_parent().is_none());
-    }
 
     /// A query or fragment would sit in front of the appended signal path, producing a URI that
     /// parses and posts to the wrong place. Failing at configuration time names the real problem.

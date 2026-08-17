@@ -116,10 +116,10 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
         "method": method,
         "headers": Value::Array(headers),
     });
-    if let Some(body) = body {
-        if let Some(fields) = request.as_object_mut() {
-            fields.insert("body".to_owned(), Value::String(body));
-        }
+    if let Some(body) = body
+        && let Some(fields) = request.as_object_mut()
+    {
+        fields.insert("body".to_owned(), Value::String(body));
     }
     Ok(request)
 }

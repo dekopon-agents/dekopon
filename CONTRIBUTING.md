@@ -6,7 +6,7 @@ Read [`docs/design.md`](docs/design.md) before changing behavior or architecture
 
 ## Development setup
 
-Install stable Rust with `rustfmt` and Clippy. The workspace MSRV is 1.86.0.
+Install stable Rust with `rustfmt` and Clippy. The workspace MSRV is 1.89.0.
 
 ```console
 rustup component add rustfmt clippy
@@ -23,7 +23,7 @@ cargo install cargo-deny --locked
 cargo deny check
 ```
 
-Run `cargo +1.86.0 test --workspace --all-features --locked` for MSRV-sensitive changes. Run `cargo package --workspace --exclude dekopon-testkit --locked` from a clean tree when changing package metadata, crate dependencies, or include lists.
+Run `cargo +1.89.0 test --workspace --all-features --locked` for MSRV-sensitive changes. Run `cargo package --workspace --exclude dekopon-testkit --locked` from a clean tree when changing package metadata, crate dependencies, or include lists.
 
 ## Exercise changed behavior
 

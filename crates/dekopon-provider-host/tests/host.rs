@@ -126,7 +126,11 @@ fn reports_unknown_capabilities_without_entering_wasm() {
 
 #[test]
 fn immediate_host_rejects_components_requiring_http() {
-    for fixture in ["http-probe-provider.wasm", "jsonplaceholder-provider.wasm"] {
+    for fixture in [
+        "http-probe-provider.wasm",
+        "jsonplaceholder-provider.wasm",
+        "gh-provider.wasm",
+    ] {
         let error =
             ProviderRegistry::load([imported_provider_path(fixture)], HostLimits::default())
                 .expect_err("the immediate linker must not satisfy HTTP imports");

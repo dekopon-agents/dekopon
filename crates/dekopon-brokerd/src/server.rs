@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
-use dekopon_broker::{AuditLog, AuthenticatedContext, Broker, BrokerError};
+use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_protocol::{
     BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED,
     ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope, ResponseEnvelope,
@@ -20,6 +20,19 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
 
+/// One mapped peer: its trusted transport context and optional attestor authority.
+///
+/// The grant lives beside the context rather than inside it because it is authority *about
+/// identity derivation*, not identity: a peer with a grant still acts as itself on direct
+/// operations, and only `invokeFor`/`capabilitiesFor` consult the grant at all.
+#[derive(Clone, Debug)]
+pub struct MappedPeer {
+    /// The peer's own authenticated context.
+    pub context: AuthenticatedContext,
+    /// The peer's owner-configured attestor authority, when it has any.
+    pub attestor: Option<AttestorGrant>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ServerLimits {
     pub frame: FrameLimits,
@@ -32,7 +45,7 @@ where
     A: AuditLog,
 {
     broker: Arc<Broker<A>>,
-    identities: Arc<BTreeMap<u32, AuthenticatedContext>>,
+    identities: Arc<BTreeMap<u32, MappedPeer>>,
     limits: ServerLimits,
 }
 
@@ -42,7 +55,7 @@ where
 {
     pub fn new(
         broker: Arc<Broker<A>>,
-        identities: BTreeMap<u32, AuthenticatedContext>,
+        identities: BTreeMap<u32, MappedPeer>,
         limits: ServerLimits,
     ) -> Result<Self, ServerError> {
         limits
@@ -153,7 +166,7 @@ fn observe_task(
 async fn handle<A>(
     mut stream: UnixStream,
     broker: &Broker<A>,
-    identities: &BTreeMap<u32, AuthenticatedContext>,
+    identities: &BTreeMap<u32, MappedPeer>,
     limits: FrameLimits,
 ) -> Result<(), ConnectionError>
 where
@@ -163,7 +176,7 @@ where
         .peer_cred()
         .map_err(|source| ConnectionError::PeerCredentials { source })?;
     let uid = credentials.uid();
-    let Some(context) = identities.get(&uid) else {
+    let Some(peer) = identities.get(&uid) else {
         write_frame(
             &mut stream,
             &ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "peer is not mapped by broker policy"),
@@ -186,8 +199,68 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
     };
+    let context = &peer.context;
     let response = match request.request {
         BrokerRequest::Capabilities => ResponseEnvelope::capabilities(broker.capabilities(context)),
+        BrokerRequest::CapabilitiesFor { subject, agent } => {
+            match broker.capabilities_for(context, peer.attestor.as_ref(), &subject, &agent) {
+                Some(capabilities) => ResponseEnvelope::capabilities(capabilities),
+                // A refused attestation discloses nothing about what the attested context could
+                // have seen — not even whether the subject is mapped.
+                None => ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "attestation refused: no attestor authority for this subject",
+                ),
+            }
+        }
+        BrokerRequest::InvokeFor {
+            invocation,
+            attestation,
+        } => {
+            // Structural binding is already one frame; this check is defense in depth and makes
+            // a mismatched claim a protocol error rather than a policy decision.
+            if attestation.invocation != invocation.id {
+                write_frame(
+                    &mut stream,
+                    &ResponseEnvelope::error(
+                        ERROR_INVALID_REQUEST,
+                        "attestation is not bound to its proposal",
+                    ),
+                    limits,
+                )
+                .await
+                .map_err(ConnectionError::Write)?;
+                return Err(ConnectionError::InvalidRequest);
+            }
+            let span = tracing::info_span!(
+                "broker.invocation",
+                invocation = %invocation.id,
+                capability = %invocation.capability,
+                trace = %invocation.trace,
+                subject = %attestation.subject,
+                agent = %attestation.agent,
+            );
+            if let Some(parent) = invocation.trace_parent
+                && let Err(error) =
+                    span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
+                        trace_id: parent.trace_id(),
+                        span_id: parent.parent_id(),
+                        flags: parent.flags(),
+                    }))
+            {
+                tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
+            }
+            match broker
+                .invoke_for(context, peer.attestor.as_ref(), &attestation, invocation)
+                .instrument(span)
+                .await
+            {
+                Ok(result) => ResponseEnvelope::invocation(result),
+                Err(error) => {
+                    return write_broker_failure(&mut stream, limits, &error).await;
+                }
+            }
+        }
         BrokerRequest::Invoke { invocation } => {
             // Correlation identifiers only. Input, output, and every provider-facing value stay
             // out of this span for the same reason they stay out of audit records: telemetry is a

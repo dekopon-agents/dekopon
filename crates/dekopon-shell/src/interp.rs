@@ -1054,12 +1054,12 @@ impl Evaluator<'_> {
         if word.parts.is_empty() {
             return Ok(Value::String(String::new()));
         }
-        if let Some(WordPart::CommandSubstitution(program)) = word.parts.first() {
-            if word.is_bare_command_substitution() {
-                let (value, status) = self.run_substitution(program)?;
-                self.last_substitution_status = status;
-                return Ok(value);
-            }
+        if let Some(WordPart::CommandSubstitution(program)) = word.parts.first()
+            && word.is_bare_command_substitution()
+        {
+            let (value, status) = self.run_substitution(program)?;
+            self.last_substitution_status = status;
+            return Ok(value);
         }
         let expanded = self.expand_word(word)?;
         Ok(Value::String(expanded.join(" ")))

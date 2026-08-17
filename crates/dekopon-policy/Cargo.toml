@@ -1,0 +1,25 @@
+[package]
+name = "dekopon-policy"
+description = "Bounded, deterministic Cedar authorization adapter for the Dekopon broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-policy"
+readme = "README.md"
+keywords = ["agents", "authorization", "cedar", "policy", "security"]
+categories = ["authentication", "config"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+cedar-policy.workspace = true
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

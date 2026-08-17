@@ -38,7 +38,16 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
+      - name: Verify gateway excludes privileged broker machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -96,7 +105,7 @@ jobs:
         run: examples/otel-traces/smoke-test.sh
 
   msrv:
-    name: test (Rust 1.86.0)
+    name: test (Rust 1.89.0)
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -104,11 +113,11 @@ jobs:
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
-          toolchain: 1.86.0
+          toolchain: 1.89.0
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
-          key: msrv-1.86.0
+          key: msrv-1.89.0
       - name: Test workspace on MSRV
         run: cargo test --workspace --all-features --locked
 
@@ -140,7 +149,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - name: Build CLIs
-        run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd
+        run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Exercise generated help and example commands
         shell: bash
         run: |
@@ -148,6 +157,7 @@ jobs:
           bin=target/debug/dekopon
           runner=target/debug/dekopon-run
           broker=target/debug/dekopon-brokerd
+          gateway=target/debug/dekopond
           config=examples/local/dekopon.yaml
           provider=examples/providers/echo-provider.wasm
           "$bin" --help >/dev/null
@@ -165,6 +175,8 @@ jobs:
           "$runner" broker invoke --help >/dev/null
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
+          "$gateway" --help >/dev/null
+          "$gateway" --version >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
             "$bin" auth chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
@@ -196,9 +208,11 @@ jobs:
           cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
           cargo install --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
           cargo install --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
+          "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version
 
   deny:
     name: dependency policy

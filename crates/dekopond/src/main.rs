@@ -1,0 +1,164 @@
+#[cfg(unix)]
+use std::{io, process::ExitCode};
+
+#[cfg(unix)]
+use clap::Parser as _;
+#[cfg(unix)]
+use dekopond::cli::Cli;
+#[cfg(unix)]
+use opentelemetry::trace::TracerProvider as _;
+#[cfg(unix)]
+use thiserror::Error;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+#[cfg(unix)]
+use tracing_subscriber::{
+    EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
+
+/// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
+/// feed its own export failures back into itself, and a WebSocket library logs every frame.
+#[cfg(unix)]
+const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_shell=trace,dekopon_model=trace,hyper=off,h2=off,opentelemetry=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
+
+#[cfg(unix)]
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // Read the export settings before serving. A failure here is discarded rather than reported:
+    // `run` parses the same file and surfaces every configuration error with full context, so
+    // reporting it twice would only make the first message the confusing one.
+    let settings = dekopond::telemetry_settings(&cli.config, dekopond::current_uid())
+        .await
+        .ok()
+        .flatten();
+
+    let tracer_provider = match settings
+        .as_ref()
+        .map(|telemetry| telemetry.settings.tracer_provider())
+    {
+        Some(Ok(provider)) => Some(provider),
+        // Telemetry must never keep the gateway from starting. Answering messages under bounded
+        // authority is the service's contract; observability is not.
+        Some(Err(error)) => {
+            eprintln!("dekopond: telemetry disabled: {error}");
+            None
+        }
+        None => None,
+    };
+
+    // Structured JSON on stdout is the log contract, so a collector or shipper can pick it up
+    // without the daemon holding a second credential.
+    let stdout_layer = fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_writer(io::stdout)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+
+    let otel_layer = tracer_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("dekopond"))
+            .with_filter(EnvFilter::new(OTEL_TRACE_FILTER))
+    });
+
+    if tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(otel_layer)
+        .try_init()
+        .is_err()
+    {
+        eprintln!("dekopond: could not install tracing subscriber");
+        return ExitCode::FAILURE;
+    }
+
+    let code = match execute(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // The whole source chain, not just the top Display: "gateway service failed"
+            // without its cause sends an operator source-diving for what one log line
+            // could have said.
+            tracing::error!(
+                event = "gateway_exit",
+                error = %error,
+                cause = %error_chain(&error)
+            );
+            ExitCode::FAILURE
+        }
+    };
+
+    if let Some(provider) = tracer_provider {
+        // Flush failures are reported but do not change the exit code: the broker's durable audit,
+        // not this daemon's telemetry, is the record of what happened.
+        if let Err(error) = provider.force_flush() {
+            tracing::error!(event = "gateway_telemetry_flush_failed", error = %error);
+        }
+        if let Err(error) = provider.shutdown() {
+            tracing::error!(event = "gateway_telemetry_shutdown_failed", error = %error);
+        }
+    }
+    code
+}
+
+#[cfg(unix)]
+async fn execute(cli: Cli) -> Result<(), AppError> {
+    let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
+    let shutdown = async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_err() {
+                    tracing::error!(event = "gateway_signal_failed", signal = "interrupt");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    };
+    dekopond::run(cli.config, shutdown)
+        .await
+        .map_err(AppError::Gateway)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("could not install termination signal handler")]
+    Signal(#[source] io::Error),
+    #[error("gateway service failed")]
+    Gateway(#[source] dekopond::DekopondError),
+}
+
+/// Renders an error's source chain as one `a: b: c` line for the exit log.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = String::new();
+    let mut source = error.source();
+    while let Some(current) = source {
+        if !rendered.is_empty() {
+            rendered.push_str(": ");
+        }
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    if rendered.is_empty() {
+        rendered.push_str("no further detail");
+    }
+    rendered
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use clap::CommandFactory as _;
+    use dekopond::cli::Cli;
+
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("dekopond requires Unix peer credentials and Unix-domain sockets");
+    std::process::ExitCode::FAILURE
+}

@@ -1,14 +1,14 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. The initial `0.1.0` release provides a declarative local agent catalog, a kubectl-inspired operator and model-auth CLI, and an experimental immediate-mode runner for developing read-only WebAssembly providers. Future releases will add a separately deployed agent runtime and authorization broker.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.2.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** early and not production-ready. `dekopon` manages the local catalog and model-account login only. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or explicitly submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, enforces exact policy, and invokes privileged providers. The `dekopon` operator CLI is not broker-integrated.
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither. Cedar, broker-owned credentials, identity/attestation, and `dekopond` are current **in this tree** and are not part of the published `0.2.0`; see [Unreleased](#unreleased-in-this-tree).
 
 ## Design documentation
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works today
+## What works today in 0.2.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -22,13 +22,38 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
 
+## Unreleased (in this tree)
+
+Present, tested, and awaiting the next release. Everything below is real in a checkout and absent from the published `0.2.0`:
+
+- **Cedar authorization** (`dekopon-policy`). A schema generated from the deployment's declared world, strict startup validation, deny on any evaluation error, the determining `policy_ids` and a `policy_digest` in every audit record. It replaced the exact-match evaluator outright. Execution bounds stayed outside the policy language as owner-authored constraint sets, so a policy edit can broaden who may act and can never widen how far an action reaches.
+- **Broker-owned credentials.** Destination-bound secrets in a separate stricter owner-only file, bound per capability constraint set, injected inside the native HTTP engine after guest headers were validated. Audit and evidence record `credentialInjected: true` and never a value.
+- **Identity and attestation.** Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped policy that keeps attested and direct authority disjoint — adding a gateway cannot widen a grant that already existed.
+- **`dekopond`**, the unprivileged chat gateway: Slack Socket Mode, Telegram long-poll, and local development transports; configuration naming environment variables rather than secrets; first-match routing to catalog agents; admission-bounded sessions; and attested on-behalf-of proposals, so the broker's audit attributes an effect to the person who asked for it.
+- **`dekopon-agent`**, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`.
+- **A `gh` provider and a `gh` shell builtin.** Nineteen narrow GitHub capabilities in one checked-in component — SHA-pinned writes, no `gh.api.*` passthrough — reachable as `gh pr view 7 -R owner/repo` inside a sandboxed script.
+- **[`examples/rubber-stamper`](examples/rubber-stamper/README.md)**, the end-to-end walkthrough assembling all of it, pinned against the real machinery by three integration test suites.
+- Three new publishable crates (`dekopon-agent`, `dekopon-policy`, `dekopond`) bring the tree to 20, up from the 17 published at `0.2.0`.
+
 ## What does not work yet
 
-There is no unprivileged agent daemon, credential broker service, independently retained/signed/remote audit checkpoint service, task store, agent memory, or operator-CLI integration with the broker. Catalog provider and status resources remain declarations only. The immediate host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example.
+Conversation context and memory: each message a gateway session handles is independent, with no history. `dekopond` also runs under the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping rather than isolation; a dedicated gateway UID, where `via` becomes real separation, remains committed direction. See [`docs/dekopond.md`](docs/dekopond.md).
+
+There is still no independently retained/signed/remote audit checkpoint service, no task store, and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Catalog provider and status resources remain declarations only. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
 ## Install
 
-The workspace uses stable Rust (MSRV 1.86.0, edition 2024):
+The 17 public crates that made up `0.2.0` are published on [crates.io](https://crates.io/crates/dekopon). The tree now holds 20 publishable crates — `dekopon-agent`, `dekopon-policy`, and `dekopond` are new and awaiting the next release, so `dekopond` installs from a checkout rather than from crates.io. With stable Rust (MSRV 1.89.0, edition 2024), install the three released executables directly:
+
+```console
+cargo install --locked dekopon --version 0.2.0
+cargo install --locked dekopon-run --version 0.2.0
+cargo install --locked dekopon-brokerd --version 0.2.0
+dekopon version
+dekopon-run --version
+```
+
+Prebuilt, provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.2.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.2.0). To develop from a checkout instead:
 
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
@@ -36,11 +61,8 @@ cd dekopon
 cargo install --locked --path crates/dekopon
 cargo install --locked --path crates/dekopon-run
 cargo install --locked --path crates/dekopon-brokerd
-dekopon version
-dekopon-run --version
+cargo install --locked --path crates/dekopond      # unreleased; checkout only
 ```
-
-The `0.1.0` crates are published. The workspace now targets the `0.2.0` development line; install from the repository as shown above until that release is cut.
 
 `dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
 
@@ -50,7 +72,11 @@ dekopon-brokerd --config /path/to/broker.yaml
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-## Run the example
+## Run the flagship example
+
+[`examples/rubber-stamper`](examples/rubber-stamper/README.md) is the whole system in one deployment: a boss sends a Slack DM, the gateway attests to the sender's identity and decides nothing, the broker maps that identity to a principal, checks Cedar policy, injects a GitHub token bound to `api.github.com`, runs the `gh` component, and hash-links an audit record naming the person who asked. The token is never visible to the model, the shell session, or the component that uses it. The walkthrough is a complete, internally consistent configuration set — catalog, broker configuration, Cedar policy, credentials template, gateway configuration — pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+
+## Run the catalog example
 
 ```console
 dekopon --config examples/local/dekopon.yaml get agents
@@ -63,7 +89,7 @@ dekopon --config examples/local/dekopon.yaml validate
 dekopon --config examples/local/dekopon.yaml config view -o json
 ```
 
-The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. It has no pull-request approval capability. The disabled `snooper` has one read-only repository capability.
+The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. It has no pull-request approval capability — and that contrast is now load-bearing rather than illustrative: the rubber-stamper example above holds `gh.pull-request.approve` and this one deliberately does not, because approval is a separately named capability with its own policy statement rather than a stronger grade of "write". The disabled `snooper` has one read-only repository capability.
 
 See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
 
@@ -110,13 +136,25 @@ Every variable is a JSON value, every bound is hand-built and configurable, and 
 
 ## Security model
 
-A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-brokerd` establishes that context only from Unix peer credentials and an owner-controlled exact mapping; payloads cannot claim identity or authority. `dekopon-run` never creates or receives authorized invocations: direct mode executes only import-free components declaring `read-only`, while broker mode submits untrusted proposals and prints broker results.
+A model may propose an invocation, but only the broker may turn it into an authorized invocation. Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary. Rust type visibility reinforces this distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-brokerd` establishes that context only from Unix peer credentials and an owner-controlled exact mapping; payloads cannot claim identity or authority. Its authorization decisions come from Cedar and its execution bounds from a separate owner-authored constraint catalog, so a policy edit can broaden who may act and can never widen how far an action reaches. `dekopon-run` never creates or receives authorized invocations: direct mode executes only import-free components declaring `read-only`, while broker mode submits untrusted proposals and prints broker results.
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
 
 ## Roadmap
 
-The next architectural milestones are broker-owned credentials, independent checkpoint retention or signing, operator/agent integration, and a separate unprivileged `dekopond`. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and conversation context. Broker-owned credentials, Cedar, identity/attestation, and the unprivileged `dekopond` are done and in this tree. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+
+## Maintainer release process
+
+Releases deliberately separate preparation, GitHub artifacts, and crates.io publication:
+
+1. Start from a clean, current `main`. Update release-facing status/install text in the root and crate READMEs before tagging—the packaged README is immutable on crates.io. Run the full validation matrix in [`docs/development.md`](docs/development.md), including `cargo package --workspace --exclude dekopon-testkit --locked`.
+2. Use `cargo release <VERSION>` to preview the shared-version commit and tag, then `cargo release <VERSION> --execute` after review. [`release.toml`](release.toml) creates the commit and tag but intentionally does not push or publish anything.
+3. Land the version commit on `main`, then push the matching `v<VERSION>` tag. The `Release` workflow verifies tag/version alignment, formatting, clippy, tests, rustdoc, package contents, dependency policy, and the runner privilege boundary. It builds four CLI archives, attests them, and creates the GitHub release.
+4. A tag push **does not publish crates**. Ensure every public package has the crates.io GitHub trusted publisher `dekopon-agents/dekopon`, workflow `release.yml`, environment `crates-io`; a brand-new crate name must be bootstrapped with an explicitly authorized scoped credential, then registered immediately. Dispatch the same `Release` workflow with the existing tag and `publish_to_crates=true`, then approve the protected environment. The job obtains a short-lived OIDC token and publishes every public crate in checked dependency order. It skips an immutable version already present, making a partially completed publication recoverable; an explicit crates.io new-package `429` waits until the server's retry time, while every other publication failure stops the job.
+5. Verify the GitHub release, every crates.io package version, and fresh `cargo install --locked ... --version <VERSION>` commands before announcing the release.
+
+The dependency-ordered crate list lives in [`.github/workflows/release.yml`](.github/workflows/release.yml). Release validation fails if that list omits a publishable workspace crate, includes a private/unknown crate, contains duplicates, or places a dependent before its dependency. Never move an existing tag or attempt to overwrite a published crate version; fix release automation on `main` and cut a new patch version when published bytes must change.
 
 ## Organization and package names
 

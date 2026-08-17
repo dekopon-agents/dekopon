@@ -295,8 +295,11 @@ mod tests {
                 .expect("filter runs"),
             json!([3, 2])
         );
+        // Sorted explicitly: `to_entries` preserves object order, and whether a `serde_json::Map`
+        // is sorted or insertion-ordered is a workspace-wide feature decision rather than
+        // something this filter promises.
         assert_eq!(
-            filter("to_entries | map(.key)", &json!({"b": 2, "a": 1})).expect("filter runs"),
+            filter("to_entries | map(.key) | sort", &json!({"b": 2, "a": 1})).expect("filter runs"),
             json!(["a", "b"])
         );
     }

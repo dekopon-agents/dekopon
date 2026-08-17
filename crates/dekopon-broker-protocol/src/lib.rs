@@ -15,7 +15,7 @@ use std::{
 };
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult};
-use dekopon_core::{CapabilityId, InvocationId, ProviderId, TraceId};
+use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId};
 use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -251,6 +251,29 @@ pub struct AvailableCapability {
     pub capability: ProviderCapability,
 }
 
+/// One attested on-behalf-of claim accompanying a gateway's proposal.
+///
+/// This is deliberately a separate typed structure rather than fields on
+/// [`InvocationRequest`]: the invocation payload stays identity-free, and an attestation is a
+/// *claim* the server honors only when the connected peer's owner-controlled configuration
+/// grants it attestor authority over the subject's namespace. The subject itself is canonical
+/// routing metadata (`slack.t0123abc.u9xyz`), never message content, and the mapping from
+/// subject to principal happens on the broker side alone.
+///
+/// `invocation` must equal the accompanying proposal's identifier. The two already travel in one
+/// frame, so this is defense in depth against a future refactor separating them; a mismatch is a
+/// decode-level protocol error.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SubjectAttestation {
+    /// The transport-authenticated external subject the proposal is made on behalf of.
+    pub subject: ExternalSubject,
+    /// The named agent orchestrating on the subject's behalf.
+    pub agent: AgentId,
+    /// The proposal identifier this attestation is bound to.
+    pub invocation: InvocationId,
+}
+
 /// One strict untrusted client request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -279,6 +302,30 @@ impl RequestEnvelope {
             request: BrokerRequest::Invoke { invocation },
         }
     }
+
+    /// Creates an attested capability-inspection request.
+    #[must_use]
+    pub const fn capabilities_for(subject: ExternalSubject, agent: AgentId) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::CapabilitiesFor { subject, agent },
+        }
+    }
+
+    /// Creates an attested on-behalf-of proposal request.
+    #[must_use]
+    pub const fn invoke_for(
+        invocation: InvocationRequest,
+        attestation: SubjectAttestation,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::InvokeFor {
+                invocation,
+                attestation,
+            },
+        }
+    }
 }
 
 /// Operations accepted by the local broker.
@@ -291,6 +338,25 @@ pub enum BrokerRequest {
     Invoke {
         /// Proposal fields without principal or actor claims.
         invocation: InvocationRequest,
+    },
+    /// Lists capabilities for an attested on-behalf-of context.
+    ///
+    /// Honored only for peers whose owner-controlled configuration carries an attestor grant
+    /// covering the subject's namespace; any other peer receives a stable refusal. The
+    /// `operation` tag is the version seam: a broker without attestation support strict-decodes
+    /// this variant into a clean protocol error rather than misreading it.
+    CapabilitiesFor {
+        /// The transport-authenticated external subject.
+        subject: ExternalSubject,
+        /// The named agent that would orchestrate on the subject's behalf.
+        agent: AgentId,
+    },
+    /// Submits one proposal attested on behalf of an external subject.
+    InvokeFor {
+        /// Proposal fields without principal or actor claims.
+        invocation: InvocationRequest,
+        /// The gateway's on-behalf-of claim, honored only under an attestor grant.
+        attestation: SubjectAttestation,
     },
 }
 
@@ -597,6 +663,51 @@ impl BrokerClient {
         request: InvocationRequest,
     ) -> Result<InvocationResult, ClientError> {
         match self.exchange(RequestEnvelope::invoke(request)).await? {
+            BrokerResponse::Invocation { result } => Ok(result),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Returns capabilities visible to one attested on-behalf-of context.
+    ///
+    /// The claim is honored only when this client's peer identity carries a matching attestor
+    /// grant in the broker's owner-controlled configuration; otherwise the broker refuses with a
+    /// stable code and no capability information.
+    pub async fn capabilities_for(
+        &self,
+        subject: ExternalSubject,
+        agent: AgentId,
+    ) -> Result<Vec<AvailableCapability>, ClientError> {
+        match self
+            .exchange(RequestEnvelope::capabilities_for(subject, agent))
+            .await?
+        {
+            BrokerResponse::Capabilities { capabilities } => Ok(capabilities),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Submits one proposal attested on behalf of an external subject.
+    ///
+    /// The attestation binds to the proposal's own identifier here, so a caller cannot construct
+    /// a frame whose claim and proposal disagree.
+    pub async fn invoke_for(
+        &self,
+        request: InvocationRequest,
+        subject: ExternalSubject,
+        agent: AgentId,
+    ) -> Result<InvocationResult, ClientError> {
+        let attestation = SubjectAttestation {
+            subject,
+            agent,
+            invocation: request.id.clone(),
+        };
+        match self
+            .exchange(RequestEnvelope::invoke_for(request, attestation))
+            .await?
+        {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. } => Err(ClientError::UnexpectedResponse),

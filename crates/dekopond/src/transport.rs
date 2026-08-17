@@ -1,0 +1,236 @@
+//! The chat-service boundary: waiting for a message, and answering one.
+//!
+//! Everything a transport produces is untrusted except the subject, and the subject is trusted only
+//! in the narrow sense that the *service* authenticated it — it is canonical routing metadata that
+//! the broker alone maps to a principal. Message text is untrusted end to end and is bounded before
+//! it reaches a model.
+
+use std::sync::Arc;
+
+use dekopon_core::ExternalSubject;
+use futures_util::future::BoxFuture;
+use thiserror::Error;
+
+pub(crate) mod local;
+pub(crate) mod slack;
+pub(crate) mod telegram;
+
+/// Inbound chat text is bounded before prompting, because a chat service's own message ceiling is
+/// not a bound this daemon chose.
+pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
+/// Outbound answers are bounded because a model writes them and chat services reject or silently
+/// mangle oversized posts.
+pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
+
+/// One authenticated inbound chat message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InboundMessage {
+    /// The configured transport name this arrived on.
+    pub transport: String,
+    /// The sender, taken from the authenticated transport payload and nowhere else.
+    pub subject: ExternalSubject,
+    /// Service-native conversation identifier.
+    pub channel: String,
+    /// Service-native thread identifier, when the conversation has threads.
+    pub thread: Option<String>,
+    /// Service-native message identifier, used only to reject redeliveries.
+    pub message_id: String,
+    /// Untrusted message text, already bounded to [`MAX_INBOUND_TEXT_BYTES`].
+    pub text: String,
+    /// Whether this is a one-to-one conversation or a shared channel.
+    pub conversation: ConversationKind,
+    /// Whatever the transport needs to answer this message.
+    pub reply: ReplyTarget,
+}
+
+/// Whether a message arrived in a private conversation or a shared one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationKind {
+    /// A one-to-one conversation; every message is addressed to the bot.
+    DirectMessage,
+    /// A shared channel, where an unaddressed message is ambient traffic.
+    Channel(String),
+}
+
+/// Everything a transport needs to answer one message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyTarget {
+    Slack {
+        channel: String,
+        thread_ts: Option<String>,
+    },
+    Telegram {
+        chat_id: i64,
+        reply_to: Option<i64>,
+    },
+    /// The development transport answers on the connection the request arrived on.
+    Local {
+        connection: u64,
+    },
+}
+
+/// Who the bot is on one service, resolved at connect time for self-filtering and @-mentions.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransportIdentity {
+    /// Service-native user identifier of the bot itself, when the service has one.
+    pub user_id: Option<String>,
+    /// Service-native handle (`@name`) of the bot itself, when the service has one.
+    pub handle: Option<String>,
+}
+
+impl TransportIdentity {
+    /// Whether a message addresses the bot by identifier or handle.
+    ///
+    /// Deliberately one implementation for every service. Slack renders a mention as
+    /// `<@U0123ABC>`, Telegram as `@botname`; both are a literal substring test, and keeping the
+    /// two in one place is what stops a channel route from firing on ambient traffic on only one
+    /// of them.
+    pub fn is_addressed(&self, text: &str) -> bool {
+        if let Some(user_id) = &self.user_id
+            && text.contains(&format!("<@{user_id}>"))
+        {
+            return true;
+        }
+        if let Some(handle) = &self.handle {
+            let mention = format!("@{handle}");
+            if text
+                .to_ascii_lowercase()
+                .contains(&mention.to_ascii_lowercase())
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// One chat service this daemon waits on.
+///
+/// `next` is driven from one dedicated task per transport rather than from a `select!`, so a
+/// transport may keep partially consumed protocol state across calls: the daemon never drops the
+/// future. Shutdown aborts the task, which is why a transport must hold nothing that must be
+/// flushed to be correct — an acknowledgment is sent before the work it acknowledges begins.
+pub(crate) trait ChatTransport: Send {
+    /// The configured transport name routes refer to.
+    fn name(&self) -> &str;
+
+    /// Authenticates, resolves the bot's own identity, and opens the wakeup path.
+    fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>>;
+
+    /// Waits for the next routable message, reconnecting internally as needed.
+    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>>;
+
+    /// A cheaply cloned handle sessions use to answer.
+    ///
+    /// Replying is separated from the transport itself because a session answers minutes after the
+    /// message arrived, while `next` has long since gone back to waiting. Handing sessions a shared
+    /// handle is what lets both happen at once without a lock across the wait.
+    fn replier(&self) -> Arc<dyn ChatReplier>;
+}
+
+/// The answering half of a transport, shared by every in-flight session on it.
+pub(crate) trait ChatReplier: Send + Sync {
+    fn reply(&self, target: ReplyTarget, text: String)
+    -> BoxFuture<'_, Result<(), TransportError>>;
+}
+
+/// Transport-level failure.
+///
+/// Variants carry service-supplied text only where that text is a documented API error code; none
+/// of them carries a credential, and the daemon logs the category rather than the message.
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("transport credential environment variable {name} is not set")]
+    MissingCredential { name: String },
+    #[error("transport credential environment variable {name} is not UTF-8")]
+    NonUtf8Credential { name: String },
+    #[error("chat service request failed")]
+    Request(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("chat service returned an error: {code}")]
+    Service { code: String },
+    #[error("chat service response was not the expected shape")]
+    Response,
+    #[error("chat socket closed")]
+    Closed,
+    #[error("transport input/output failed")]
+    Io(#[source] std::io::Error),
+    #[error("transport socket path is not private, owner-owned, and single-link: {path}")]
+    InsecureSocket { path: String },
+    #[error("subject could not be represented canonically")]
+    Subject(#[source] dekopon_core::SubjectError),
+}
+
+impl TransportError {
+    /// Stable low-cardinality category for telemetry, never the underlying message.
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::MissingCredential { .. } => "missing-credential",
+            Self::NonUtf8Credential { .. } => "non-utf8-credential",
+            Self::Request(_) => "request",
+            Self::Service { .. } => "service",
+            Self::Response => "response",
+            Self::Closed => "closed",
+            Self::Io(_) => "io",
+            Self::InsecureSocket { .. } => "insecure-socket",
+            Self::Subject(_) => "subject",
+        }
+    }
+}
+
+/// Reads one credential by variable name, reporting the *name* and never the value.
+pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
+    let value = std::env::var_os(name).ok_or_else(|| TransportError::MissingCredential {
+        name: name.to_owned(),
+    })?;
+    value
+        .into_string()
+        .map_err(|_| TransportError::NonUtf8Credential {
+            name: name.to_owned(),
+        })
+}
+
+/// Bounds untrusted inbound text, keeping the head and saying so.
+///
+/// The head rather than the tail: a chat message states its request first and elaborates
+/// afterwards, so truncating the end loses the least. The marker is inside the text a model sees
+/// because a silently shortened prompt is worse than a visibly shortened one.
+pub(crate) fn bound_inbound(text: &str) -> String {
+    if text.len() <= MAX_INBOUND_TEXT_BYTES {
+        return text.to_owned();
+    }
+    let head = floor_boundary(text, MAX_INBOUND_TEXT_BYTES);
+    format!("{}\n[message truncated by the gateway]", &text[..head])
+}
+
+/// Bounds a model-authored answer, keeping both ends.
+///
+/// Head and tail rather than head alone: an answer's conclusion is usually its last line, and
+/// dropping it would leave a reader with the reasoning and none of the result.
+pub(crate) fn bound_outbound(text: &str) -> String {
+    if text.len() <= MAX_OUTBOUND_TEXT_BYTES {
+        return text.to_owned();
+    }
+    const MARKER: &str = "\n\n[...truncated by the gateway...]\n\n";
+    let budget = MAX_OUTBOUND_TEXT_BYTES.saturating_sub(MARKER.len());
+    let head = floor_boundary(text, budget / 2);
+    let tail = ceil_boundary(text, text.len() - (budget - budget / 2));
+    format!("{}{MARKER}{}", &text[..head], &text[tail..])
+}
+
+/// Largest character boundary at or below `index`.
+fn floor_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Smallest character boundary at or above `index`.
+fn ceil_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}

@@ -15,10 +15,11 @@ use std::{
 };
 
 use dekopon_capability::HttpConstraints;
+use dekopon_core::Redacted;
 use futures_util::StreamExt as _;
 use reqwest::{
     Method, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
     redirect,
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADERS: usize = 128;
 /// Default maximum aggregate header bytes in either direction (64 KiB).
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Maximum secret bytes accepted into one bound credential.
+pub const MAX_CREDENTIAL_BYTES: usize = 4096;
 
 /// One ordered byte-valued HTTP header.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +173,133 @@ pub enum ConfigurationError {
     /// Execution deadline could not be represented by the runtime clock.
     #[error("HTTP execution deadline is too large")]
     TimeoutOverflow,
+    /// A bound credential failed structural validation.
+    ///
+    /// The reason names the invalid *field*, never any part of the secret value.
+    #[error("bound credential is invalid: {reason}")]
+    InvalidCredential {
+        /// Which structural rule the credential violated.
+        reason: &'static str,
+    },
+}
+
+/// A broker-resolved secret pre-rendered as one `authorization` header value and bound to
+/// explicit destination authorities.
+///
+/// This is the carrier for "an agent may *use* a credential but never see it": the broker
+/// constructs one from owner-only storage, hands it to the execution context alongside the
+/// authorization grant, and [`BufferedHttpClient`] injects it after guest headers have been
+/// validated — a guest-supplied `authorization` header is still rejected, never overwritten. The
+/// value lives in a [`Redacted`] wrapper end to end, so no `Debug`, `Display`, or `Serialize`
+/// path renders it.
+///
+/// Destinations use the same authority grammar as `HttpConstraints::allowed_hosts` (`host` for
+/// HTTPS on 443, `host:port` otherwise) and are matched with the same rules, so a policy layer
+/// that requires every allowed host to appear verbatim in the credential's destinations makes a
+/// runtime mismatch unreachable by construction. The request-time check here remains as defense
+/// in depth and fails closed: a credentialed context never sends an unauthenticated request to a
+/// destination outside the binding.
+#[derive(Clone)]
+pub struct BoundCredential {
+    header_value: Redacted<String>,
+    destinations: Vec<String>,
+}
+
+impl fmt::Debug for BoundCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundCredential")
+            .field("header_value", &self.header_value)
+            .field("destinations", &self.destinations)
+            .finish()
+    }
+}
+
+impl BoundCredential {
+    /// Builds a scheme-prefixed credential such as `Bearer <secret>` or `token <secret>`.
+    pub fn bearer(
+        scheme: &str,
+        secret: Redacted<String>,
+        destinations: Vec<String>,
+    ) -> Result<Self, ConfigurationError> {
+        let invalid = |reason| ConfigurationError::InvalidCredential { reason };
+        if scheme.is_empty() || !scheme.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(invalid("scheme must be a printable ASCII token"));
+        }
+        {
+            let value = secret.expose();
+            if value.is_empty() {
+                return Err(invalid("secret must not be empty"));
+            }
+            if value.len() > MAX_CREDENTIAL_BYTES {
+                return Err(invalid("secret exceeds the credential byte limit"));
+            }
+            if !value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            {
+                return Err(invalid("secret contains bytes invalid in a header value"));
+            }
+        }
+        if destinations.is_empty() {
+            return Err(invalid("at least one destination is required"));
+        }
+        if !destinations
+            .iter()
+            .all(|destination| is_destination_scope(destination))
+        {
+            return Err(invalid(
+                "destinations must be host or host:port authorities",
+            ));
+        }
+        let header_value = Redacted::new(format!("{scheme} {}", secret.expose()));
+        Ok(Self {
+            header_value,
+            destinations,
+        })
+    }
+
+    /// The authorities this credential may be presented to, for policy-layer coverage checks.
+    #[must_use]
+    pub fn destinations(&self) -> &[String] {
+        &self.destinations
+    }
+
+    /// Whether one allowed-host scope is covered verbatim by this credential's destinations.
+    #[must_use]
+    pub fn covers(&self, allowed_host: &str) -> bool {
+        let allowed = allowed_host.trim().to_ascii_lowercase();
+        self.destinations
+            .iter()
+            .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
+    }
+
+    fn matches(&self, host: &str, port: u16, scheme: &str) -> bool {
+        self.destinations
+            .iter()
+            .any(|destination| authority_matches(destination, host, port, scheme))
+    }
+
+    /// Renders the header value, marked sensitive so the transport never debugs it.
+    fn render(&self) -> Result<HeaderValue, HttpError> {
+        let mut value = HeaderValue::from_str(self.header_value.expose()).map_err(|_| {
+            // Unreachable when construction validated the bytes; message carries no value detail.
+            http_error(ErrorCode::Internal, "credential could not be rendered")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+/// The `allowed_hosts` grammar, applied to credential destinations: a bare authority with no
+/// path, query, fragment, userinfo, wildcard, or whitespace.
+fn is_destination_scope(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        && !value.contains(['/', '?', '#', '@', '*'])
 }
 
 /// Sanitized metadata for one attempted native request.
@@ -184,15 +314,31 @@ pub struct HttpCallEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     /// Conservative request bytes accounted by the host.
+    ///
+    /// Counts guest-authored content only. A broker-injected credential header is deliberately
+    /// excluded: its length would leak into public evidence, and guest byte grants must not need
+    /// padding for a secret the guest cannot see.
     pub request_bytes: u64,
     /// Conservative response bytes accounted by the host.
     pub response_bytes: u64,
+    /// Whether the broker injected a destination-bound credential into this request.
+    ///
+    /// Presence is audit-relevant — the call transacted with broker-held authority — while the
+    /// value appears nowhere. Absent from records written before credentials existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub credential_injected: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Per-invocation buffered HTTP execution context.
 #[derive(Debug)]
 pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
+    credential: Option<BoundCredential>,
     ceilings: HttpHostCeilings,
     deadline: Instant,
     calls: u32,
@@ -208,7 +354,7 @@ impl BufferedHttpClient {
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         validate_configuration(None, &ceilings, timeout)?;
-        Self::new(None, ceilings, timeout)
+        Self::new(None, None, ceilings, timeout)
     }
 
     /// Creates a context constrained by one broker-produced HTTP grant.
@@ -218,11 +364,27 @@ impl BufferedHttpClient {
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         validate_configuration(Some(&grant), &ceilings, timeout)?;
-        Self::new(Some(grant), ceilings, timeout)
+        Self::new(Some(grant), None, ceilings, timeout)
+    }
+
+    /// Creates an authorized context that additionally presents one destination-bound credential.
+    ///
+    /// The credential is injected after every guest-facing check has run, only for requests whose
+    /// resolved authority falls inside the credential's destination binding; a request outside it
+    /// is refused rather than sent unauthenticated.
+    pub fn authorized_with_credential(
+        grant: HttpConstraints,
+        credential: Option<BoundCredential>,
+        ceilings: HttpHostCeilings,
+        timeout: Duration,
+    ) -> Result<Self, ConfigurationError> {
+        validate_configuration(Some(&grant), &ceilings, timeout)?;
+        Self::new(Some(grant), credential, ceilings, timeout)
     }
 
     fn new(
         grant: Option<HttpConstraints>,
+        credential: Option<BoundCredential>,
         ceilings: HttpHostCeilings,
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
@@ -231,6 +393,7 @@ impl BufferedHttpClient {
             .ok_or(ConfigurationError::TimeoutOverflow)?;
         Ok(Self {
             grant,
+            credential,
             ceilings,
             deadline,
             calls: 0,
@@ -347,7 +510,28 @@ impl BufferedHttpClient {
         }
         self.calls = self.calls.saturating_add(1);
 
-        let prepared = self.prepare(request, &grant).await?;
+        let mut prepared = self.prepare(request, &grant).await?;
+        // Injection happens strictly after `prepare`, so every guest-facing rule has already run:
+        // a guest-supplied `authorization` header was rejected (never overwritten), and the
+        // destination passed the grant. The credential's own binding is narrower than the grant's
+        // and fails closed — a credentialed context refuses to send an unauthenticated request to
+        // an allowed-but-unbound destination, because "quietly missing auth" reads as an outage
+        // at best and an unauthenticated write at worst.
+        let mut credential_injected = false;
+        if let Some(credential) = &self.credential {
+            let port = prepared
+                .url
+                .port_or_known_default()
+                .unwrap_or(DEFAULT_HTTPS_PORT);
+            if !credential.matches(&prepared.host, port, prepared.url.scheme()) {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    "destination is outside this credential's binding",
+                ));
+            }
+            prepared.headers.insert(AUTHORIZATION, credential.render()?);
+            credential_injected = true;
+        }
         let evidence_index = self.evidence.len();
         self.evidence.push(HttpCallEvidence {
             method: prepared.method.as_str().to_owned(),
@@ -355,6 +539,7 @@ impl BufferedHttpClient {
             status: None,
             request_bytes: prepared.request_bytes,
             response_bytes: 0,
+            credential_injected,
         });
 
         let result = self.execute(prepared, &grant).await;
@@ -890,10 +1075,12 @@ mod tests {
     };
 
     use dekopon_capability::HttpConstraints;
+    use dekopon_core::Redacted;
 
     use super::{
-        BufferedHttpClient, ConfigurationError, ErrorCode, Header, HttpHostCeilings, Request,
-        authority_matches, bounded_addresses, bounded_message, is_forbidden_public_destination,
+        BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
+        HttpCallEvidence, HttpHostCeilings, Request, authority_matches, bounded_addresses,
+        bounded_message, is_forbidden_public_destination,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -1141,6 +1328,205 @@ mod tests {
             .expect_err("guest authorization header must fail before connection");
         assert_eq!(error.code, ErrorCode::InvalidHeader);
         assert_eq!(client.policy_violation(), Some("invalid-http-request"));
+    }
+
+    fn credential_for(authority: &str) -> BoundCredential {
+        BoundCredential::bearer(
+            "Bearer",
+            Redacted::new("fixture-secret-value".to_owned()),
+            vec![authority.to_owned()],
+        )
+        .expect("valid fixture credential")
+    }
+
+    #[test]
+    fn bound_credentials_fail_closed_on_structural_problems() {
+        let secret = || Redacted::new("secret".to_owned());
+        let destinations = || vec!["api.example.test".to_owned()];
+        for (scheme, secret, destinations) in [
+            ("", secret(), destinations()),
+            ("Bea rer", secret(), destinations()),
+            ("Bearer", Redacted::new(String::new()), destinations()),
+            ("Bearer", Redacted::new("x".repeat(4097)), destinations()),
+            (
+                "Bearer",
+                Redacted::new("bad\r\nheader".to_owned()),
+                destinations(),
+            ),
+            ("Bearer", secret(), Vec::new()),
+            (
+                "Bearer",
+                secret(),
+                vec!["https://api.example.test/path".to_owned()],
+            ),
+            ("Bearer", secret(), vec!["*.example.test".to_owned()]),
+        ] {
+            assert!(matches!(
+                BoundCredential::bearer(scheme, secret, destinations),
+                Err(ConfigurationError::InvalidCredential { .. })
+            ));
+        }
+        // The one thing a credential error must never carry is the secret itself.
+        let error = BoundCredential::bearer(
+            "Bearer",
+            Redacted::new("tell-nobody\n".to_owned()),
+            destinations(),
+        )
+        .expect_err("control bytes are refused");
+        assert!(!error.to_string().contains("tell-nobody"), "{error}");
+    }
+
+    #[test]
+    fn bound_credentials_never_render_their_value() {
+        let credential = credential_for("api.example.test");
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("fixture-secret-value"), "{debug}");
+        assert!(debug.contains("api.example.test"), "{debug}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn injects_a_destination_bound_credential_after_guest_checks() {
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        // Twin requests, one credentialed and one not, so the accounting assertion below compares
+        // like with like: the injected header must change neither the guest-authored byte count
+        // nor anything else the evidence reports.
+        let (plain_authority, plain_recorded, plain_server) = mock_http(response);
+        let (authority, recorded, server) = mock_http(response);
+
+        let request_to = |authority: &str| Request {
+            method: "GET".to_owned(),
+            uri: format!("http://{authority}/pulls/7"),
+            headers: vec![Header {
+                name: "x-probe".to_owned(),
+                value: b"one".to_vec(),
+            }],
+            body: Vec::new(),
+        };
+
+        let mut plain = BufferedHttpClient::authorized(
+            grant(plain_authority.clone(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        plain
+            .send(request_to(&plain_authority))
+            .await
+            .expect("uncredentialed request succeeds");
+
+        let mut credentialed = BufferedHttpClient::authorized_with_credential(
+            grant(authority.clone(), "GET"),
+            Some(credential_for(&authority)),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        credentialed
+            .send(request_to(&authority))
+            .await
+            .expect("credentialed request succeeds");
+
+        let plain_request = String::from_utf8(plain_recorded.recv().expect("plain recorded"))
+            .expect("fixture request is UTF-8");
+        assert!(
+            !plain_request.to_ascii_lowercase().contains("authorization"),
+            "{plain_request}"
+        );
+        let request = String::from_utf8(recorded.recv().expect("request recorded"))
+            .expect("fixture request is UTF-8");
+        assert!(
+            request.contains("authorization: Bearer fixture-secret-value"),
+            "{request}"
+        );
+
+        let plain_evidence = plain.into_evidence();
+        let evidence = credentialed.into_evidence();
+        assert!(!plain_evidence[0].credential_injected);
+        assert!(evidence[0].credential_injected);
+        // Guest-authored accounting is identical: the credential is invisible to byte grants,
+        // so its length can neither starve a request nor leak into public evidence. The twin
+        // requests differ only by their fixture authorities, so normalize for that before
+        // comparing.
+        let authority_delta = authority.len() as i64 - plain_authority.len() as i64;
+        assert_eq!(
+            evidence[0].request_bytes as i64 - authority_delta,
+            plain_evidence[0].request_bytes as i64
+        );
+
+        plain_server.join().expect("plain fixture exits");
+        server.join().expect("fixture server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_destinations_outside_the_credential_binding() {
+        // The grant allows the destination; the credential does not. Sending without the
+        // credential would be the quiet failure mode, so the request must not happen at all.
+        let mut client = BufferedHttpClient::authorized_with_credential(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            Some(credential_for("other.example.test")),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "http://127.0.0.1:9/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("unbound destinations are refused, not sent unauthenticated");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(client.policy_violation(), Some("denied"));
+        assert!(client.into_evidence().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_authorization_is_rejected_not_overwritten_when_a_credential_exists() {
+        // Silently replacing a guest-supplied credential would train providers to attempt one.
+        let mut client = BufferedHttpClient::authorized_with_credential(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            Some(credential_for("127.0.0.1:9")),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "http://127.0.0.1:9/".to_owned(),
+                headers: vec![Header {
+                    name: "authorization".to_owned(),
+                    value: b"Bearer guest-supplied".to_vec(),
+                }],
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("guest authorization must still be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidHeader);
+    }
+
+    #[test]
+    fn credential_evidence_flag_defaults_for_old_records_and_serializes_compactly() {
+        let old_record = r#"{"method":"GET","authority":"api.example.test:443","requestBytes":10,"responseBytes":20}"#;
+        let evidence =
+            serde_json::from_str::<HttpCallEvidence>(old_record).expect("old records still parse");
+        assert!(!evidence.credential_injected);
+        // False stays absent so pre-credential chains and digests are byte-identical.
+        let serialized = serde_json::to_string(&evidence).expect("serializes");
+        assert!(!serialized.contains("credentialInjected"), "{serialized}");
+
+        let injected = HttpCallEvidence {
+            credential_injected: true,
+            ..evidence
+        };
+        let serialized = serde_json::to_string(&injected).expect("serializes");
+        assert!(
+            serialized.contains("\"credentialInjected\":true"),
+            "{serialized}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

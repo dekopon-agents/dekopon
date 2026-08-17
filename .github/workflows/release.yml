@@ -26,6 +26,29 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # One package-dependency-ordered source of truth for every public workspace crate.
+  # The validation job rejects omissions, duplicates, and normal/build/dev ordering mistakes.
+  PUBLISH_CRATES: >-
+    dekopon-core
+    dekopon-provider-http
+    dekopon-telemetry
+    dekopon-capability
+    dekopon-model
+    dekopon-shell
+    dekopon-http-host
+    dekopon-protocol
+    dekopon-provider-sdk
+    dekopon-broker-host
+    dekopon-broker-protocol
+    dekopon-agent
+    dekopon-config
+    dekopon-provider-host
+    dekopon
+    dekopon-policy
+    dekopon-broker
+    dekopon-brokerd
+    dekopon-run
+    dekopond
 
 jobs:
   validate:
@@ -51,6 +74,53 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dekopon") | .version')
           test "$RELEASE_TAG" = "v$version"
           test "$(cargo metadata --no-deps --format-version 1 | jq '[.packages[].version] | unique | length')" -eq 1
+      - name: Verify crates.io publication plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 - "$RUNNER_TEMP/metadata.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              metadata = json.load(source)
+
+          configured = os.environ["PUBLISH_CRATES"].split()
+          if len(configured) != len(set(configured)):
+              raise SystemExit("PUBLISH_CRATES contains a duplicate package")
+
+          members = set(metadata["workspace_members"])
+          packages = {
+              package["name"]: package
+              for package in metadata["packages"]
+              if package["id"] in members and package.get("publish") != []
+          }
+          missing = sorted(set(packages) - set(configured))
+          extra = sorted(set(configured) - set(packages))
+          if missing or extra:
+              raise SystemExit(
+                  f"PUBLISH_CRATES does not match publishable workspace packages; "
+                  f"missing={missing}, extra={extra}"
+              )
+
+          position = {name: index for index, name in enumerate(configured)}
+          for name, package in packages.items():
+              for dependency in package["dependencies"]:
+                  dependency_name = dependency["name"]
+                  if (
+                      dependency_name in packages
+                      and position[dependency_name] > position[name]
+                  ):
+                      raise SystemExit(
+                          f"{dependency_name} must be published before dependent package {name}"
+                      )
+
+          print("crates.io publication order:")
+          for index, name in enumerate(configured, start=1):
+              print(f"{index:>2}. {name}")
+          PY
       - name: Run release validation
         shell: bash
         run: |
@@ -63,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -192,23 +262,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "dekopon") | .version')
           publish() {
-            cargo publish --locked -p "$1"
+            crate="$1"
+            status=$(curl --silent --show-error --retry 3 \
+              --output /dev/null --write-out '%{http_code}' \
+              --user-agent "dekopon-release-workflow" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            case "$status" in
+              200)
+                printf 'Skipping %s %s; crates.io already has this immutable version.\n' \
+                  "$crate" "$version"
+                return
+                ;;
+              404) ;;
+              *)
+                printf 'crates.io returned HTTP %s while checking %s %s.\n' \
+                  "$status" "$crate" "$version" >&2
+                exit 1
+                ;;
+            esac
+            publish_output=$(mktemp)
+            while ! cargo publish --locked -p "$crate" 2>&1 | tee "$publish_output"; do
+              if ! grep -q '429 Too Many Requests' "$publish_output"; then
+                rm -f "$publish_output"
+                return 1
+              fi
+              delay=$(python3 -c 'import datetime, email.utils, re, sys; output = open(sys.argv[1], encoding="utf-8").read(); match = re.search(r"after (.+? GMT)", output); now = datetime.datetime.now(datetime.timezone.utc); print(max(5, int((email.utils.parsedate_to_datetime(match.group(1)) - now).total_seconds()) + 5) if match else 610)' "$publish_output")
+              printf 'crates.io new-package limit reached; retrying %s in %s seconds.\n' \
+                "$crate" "$delay"
+              sleep "$delay"
+              : > "$publish_output"
+            done
+            rm -f "$publish_output"
             # Allow the sparse index to make this dependency visible to the next package.
             sleep 30
           }
-          publish dekopon-core
-          publish dekopon-capability
-          publish dekopon-model
-          publish dekopon-provider-sdk
-          publish dekopon-broker-protocol
-          publish dekopon-provider-http
-          publish dekopon-provider-host
-          publish dekopon-http-host
-          publish dekopon-broker-host
-          publish dekopon-broker
-          publish dekopon-brokerd
-          publish dekopon-protocol
-          publish dekopon-config
-          publish dekopon-run
-          cargo publish --locked -p dekopon
+          for crate in $PUBLISH_CRATES; do
+            publish "$crate"
+          done

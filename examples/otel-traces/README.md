@@ -5,7 +5,7 @@ This example starts one local [OpenObserve](https://openobserve.ai/) container w
 ## Prerequisites
 
 - Docker with Compose
-- Rust 1.86 or newer
+- Rust 1.89 or newer
 - `curl`, `base64`, and `jq`
 
 The example pins the multi-architecture OpenObserve `v0.92.0` image by digest.
