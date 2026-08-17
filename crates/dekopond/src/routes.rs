@@ -118,13 +118,22 @@ impl RoutingTable {
     }
 
     /// First route claiming this conversation, or `None` for ambient traffic.
+    ///
+    /// Declaration order decides, and that is the whole precedence rule: a route matching one named
+    /// channel, written above a route matching any channel, keeps that channel for itself while the
+    /// catch-all takes everything else. No specificity ranking sorts them, because a hidden score is
+    /// how an operator ends up unable to explain which route answered — the file is read top to
+    /// bottom exactly as it looks.
+    ///
+    /// A catch-all is not a wakeup on its own. `dispatch` still requires channel traffic to address
+    /// the bot before any of this becomes a session.
     pub fn route(&self, transport: &str, conversation: &ConversationKind) -> Option<&BoundRoute> {
         self.routes.iter().find(|route| {
             route.transport == transport
                 && match (&route.r#match, conversation) {
-                    (RouteMatch::DirectMessage, ConversationKind::DirectMessage) => true,
+                    (RouteMatch::DirectMessage {}, ConversationKind::DirectMessage) => true,
                     (RouteMatch::Channel { channel }, ConversationKind::Channel(actual)) => {
-                        channel == actual
+                        channel.as_ref().is_none_or(|channel| channel == actual)
                     }
                     _ => false,
                 }

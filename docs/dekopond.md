@@ -60,9 +60,15 @@ models:
     timeoutMs: 120000
     classes: [reasoning]
 
-routes:
+routes:                                       # first match wins, so order these deliberately
   - transport: scientist-slack
-    match: { kind: directMessage }            # or { kind: channel, channel: c0123abc }
+    match: { kind: channel, channel: c0123abc }
+    agent: incident-responder                 # one named channel, its own agent
+  - transport: scientist-slack
+    match: { kind: channel }                  # any other channel the bot is invited to
+    agent: xaviers-rubber-stamper
+  - transport: scientist-slack
+    match: { kind: directMessage }
     agent: xaviers-rubber-stamper
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
     limits: { maxSteps: 8, maxCapabilityCalls: 16 }
@@ -102,6 +108,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
 - a transport endpoint override that is neither the one production origin nor a literal loopback `http://` URL;
+- a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
 - a missing credential environment variable;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`.
 
@@ -149,9 +156,19 @@ Every local message is a direct message; channel routes are a chat-service conce
 
 ## Routing
 
-First match wins on (transport name, direct message or named channel). Unmatched messages are ignored with a debug-level event — bots see ambient traffic, and silence is the correct answer.
+First match wins on (transport name, direct message or channel). The channel is optional: `{ kind: channel, channel: c0123abc }` claims that one channel, and `{ kind: channel }` claims **any** channel the bot is in. Unmatched messages are ignored with a debug-level event — bots see ambient traffic, and silence is the correct answer.
 
-In a shared channel the bot must additionally be addressed: `<@BOT_USER_ID>` on Slack, `@botname` on Telegram. A channel route that fired on every message would be noise and cost.
+Leaving `channel` out exists because naming them does not scale. One route per channel means enumerating service-native identifiers and editing this file again every time somebody creates a channel, and until an operator notices and redeploys, the bot is silent in the new one while appearing to be deployed workspace-wide. An absent `channel` says "wherever I am invited", which is membership the chat service already controls.
+
+**Declaration order is the whole precedence rule.** Routes are consulted top to bottom, so a named-channel route written above a catch-all keeps that channel for itself while the catch-all takes everything else — special handling in `#incidents`, the default everywhere else. Nothing sorts by specificity, deliberately: a hidden ranking is how an operator ends up unable to say which route answered.
+
+In a channel the bot must additionally be addressed: `<@BOT_USER_ID>` on Slack, `@botname` on Telegram. **A route decides which agent answers; the mention decides whether anything answers at all**, and widening the first leaves the second exactly where it stood. A channel route that fired on every message would be noise and cost. On Slack the app is not even offered the traffic — the manifest in [`../examples/slack/`](../examples/slack/README.md) subscribes to `app_mention` and not to channel history.
+
+### Being available in a channel is not authority
+
+A route matching every channel widens no authority whatsoever, and an operator reading "available in all channels" must not read it as "available to everyone". Every session still opens an attested broker leg naming the sender's canonical subject; the broker still maps that subject to a principal, still requires policy permitting `agent.prompt` for it, and still refuses an unmapped sender before any model call is made. A catch-all route changes *where* the mapped people can reach the bot. It does not change who they are, and somebody the owner never mapped gets the same refusal in a catch-all channel that they would have got in a named one.
+
+Nor do two people in one channel share a conversation. History is keyed on `(transport, the conversation identity, the sender's canonical subject)`, so the bot remembers each of them separately and remembers nothing of what it told the other — see [the key includes the sender](#the-key-includes-the-sender), which matters most in exactly the shared channel a catch-all makes easy to reach.
 
 ## Sessions
 
