@@ -211,6 +211,29 @@ on a seeded session now includes the replayed window. That event becomes larger 
 was — enabling payloads on a persistent route declares the sink in scope for a conversation rather
 than for a message.
 
+### Reading the prompt cache
+
+Every model request `dekopond` makes declares a `prompt_cache_key` — one per conversation on a
+`persistent` route, one per bound route on a `oneShot` one. [`dekopond.md`](dekopond.md#the-prompt-cache-key)
+has the contract; two things follow for telemetry.
+
+**`usage.cached_input_tokens` is how you find out whether it works.** It needs no new
+instrumentation: whatever the provider reports already lands on the `prompt.model_turn` span and on
+the `accounting.model.turn` record beside `usage.input_tokens`. Plot the ratio on a conversation's
+second and later turns, which are the requests that repeat a prefix worth caching. Do not expect a
+standing discount — provider prompt caches clear after minutes of inactivity, so a gateway
+answering a message every few hours misses on the first turn of every conversation regardless of
+the key, and what the key buys is the burst inside a live conversation. A window trim rewrites the
+front of the request and costs a miss by construction, so a run of misses on long conversations is
+`maxTurns` or `maxBytes` doing its job rather than a broken key. A count the provider never reported
+is absent rather than zero, so a missing field means "unreported" and not "nothing was cached".
+
+**The key itself is a payload field.** It rides `gateway.session.cache_key` with
+`telemetryPayloads` enabled, never the metadata-only default and never a span attribute. It carries
+nothing about the sender by construction, but within one process it does join one person's turns to
+each other, which is precisely the linkage the default withholds. It is emitted on its own event so
+that a key and a canonical subject never share a record.
+
 ## Broker execution spans
 
 `broker.invocation` is not a flat bar. Beneath it the broker's own crates emit:
@@ -259,7 +282,7 @@ trace fetch would drag the payload along, and a backend indexes log bodies for f
 rather than span fields. Both signals carry the same `trace_id` and `span_id`, so a log result
 still pivots to the turn it belongs to.
 
-With `telemetryPayloads` enabled, four events join the accounting and refusal ones:
+With `telemetryPayloads` enabled, these events join the accounting and refusal ones:
 
 | Event | Carries |
 |---|---|
@@ -268,6 +291,7 @@ With `telemetryPayloads` enabled, four events join the accounting and refusal on
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
 | `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |
+| `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 
 `accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
 available without opting in to content. The per-command detail that used to arrive as

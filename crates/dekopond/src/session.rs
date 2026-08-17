@@ -13,12 +13,12 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
-    prompt::{History, PromptError, run_prompt_with_history},
+    prompt::{History, PromptError, run_prompt_with_history_and_options},
 };
 use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
-    model::{ChatModel, ModelError, OpenAiChatModel},
+    model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
 };
 use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
 use thiserror::Error;
@@ -27,7 +27,7 @@ use tracing::Instrument as _;
 
 use crate::{
     config::{ModelConfig, ResolvedBroker},
-    conversation::{ConversationKey, ConversationStore, EvictionReason},
+    conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{ChatReplier, InboundMessage, bound_outbound},
 };
@@ -282,15 +282,40 @@ async fn session(
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
     let window = route.conversation.window();
-    let seeded = match window {
+    let ConversationSeed {
+        history: seeded,
+        cache_key,
+    } = match window {
         Some(window) => runner
             .conversations
             .begin(&key, &granted, window, Instant::now()),
-        None => History::default(),
+        // A route that remembers nothing has no conversation to name, so its messages route to the
+        // route's own lane: the instructions and tools ahead of every one of them are the only
+        // prefix they share, and they share all of it. `routes::BoundRoute::cache_key` has the
+        // argument for why that is not a sender leak.
+        None => ConversationSeed {
+            history: History::default(),
+            cache_key: route.cache_key.clone(),
+        },
     };
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
+    // The key names nobody, but it still joins one person's turns to each other, which is the
+    // linkage the metadata-only default exists to withhold. It rides the payload gate for that
+    // reason, and on a line of its own: the canonical subject is on `gateway.message.received`, and
+    // the two must never meet in one record.
+    if dekopon_core::telemetry_payloads() {
+        tracing::info!(
+            target: "dekopond::audit",
+            {
+                audit.event = "gateway.session.cache_key",
+                prompt.cache_key = cache_key.as_str(),
+                conversation.persistent = window.is_some(),
+            },
+            "gateway session prompt cache key"
+        );
+    }
 
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
@@ -301,6 +326,11 @@ async fn session(
         max_capability_calls: limits.max_capability_calls,
         ..ShellLimits::default()
     };
+    // Request-scoped and built here rather than handed to `ModelFactory::build`. The client is
+    // rebuilt per message today and the obvious optimization is to share one across sessions, at
+    // which point a key captured in a constructor would describe the first conversation forever
+    // while quietly mislabeling every later one.
+    let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
     // The prompt loop and the interpreter are both synchronous and both can block for a long time
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
@@ -321,13 +351,14 @@ async fn session(
         // `history` is the accumulator rather than a return value, so this session's exchange is
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
-        let outcome = run_prompt_with_history(
+        let outcome = run_prompt_with_history_and_options(
             model.as_ref(),
             &runtime,
             &text,
             instructions.as_deref(),
             limits,
             &mut history,
+            &options,
         )
         .map_err(SessionError::from);
         // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
@@ -360,7 +391,7 @@ async fn session(
     {
         runner
             .conversations
-            .commit(&key, &granted, window, turn, Instant::now());
+            .commit(&key, &granted, window, turn, &cache_key, Instant::now());
     }
 
     let answer_text = match outcome {

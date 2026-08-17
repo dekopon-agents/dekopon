@@ -5,7 +5,9 @@
 //!
 //! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
 //!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
-//!   bounded [`prompt::History`] for transports whose next message continues a conversation;
+//!   bounded [`prompt::History`] for transports whose next message continues a conversation, and
+//!   [`prompt::run_prompt_with_history_and_options`] adding the request-scoped routing metadata a
+//!   caller uses to point one conversation's turns at one provider cache lane;
 //! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
 //!   fresh `dekopon-shell` interpreter under a session-wide capability budget;
 //! - [`SessionInvoker`] — capability dispatch that prefers a local read-only leg and falls through

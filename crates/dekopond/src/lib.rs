@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod cache_key;
 mod config;
 mod conversation;
 mod routes;

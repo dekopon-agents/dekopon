@@ -17,12 +17,15 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
-use dekopon_model::model::{AssistantTurn, ChatModel, ModelError, ModelMessage, ModelTool};
+use dekopon_model::model::{
+    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelMessage, ModelTool,
+};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
+    cache_key,
     config::{
         self, ConversationPolicy, ConversationWindow, ModelConfig, ResolvedBroker, RouteMatch,
         SocketDiscovery,
@@ -472,6 +475,46 @@ async fn routes_bind_to_a_catalog_agent_and_a_class_matched_model() {
 }
 
 #[tokio::test]
+async fn every_bound_route_gets_its_own_prompt_cache_lane() {
+    // A route's lane is its instructions and its tools, and two routes are two of those even when
+    // they name the same agent — the second route here differs only in what it matches, and the
+    // daemon must still not merge their prefixes into one lane.
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"]
+        .as_array_mut()
+        .expect("routes array")
+        .push(json!({
+            "transport": "dev",
+            "match": {"kind": "channel", "channel": "ops"},
+            "agent": "reviewer"
+        }));
+    let config = resolved(directory.path(), &document).await;
+    let catalog = catalog(true, Some("reasoning"));
+
+    let table = RoutingTable::bind(&config, &catalog).expect("both routes bind");
+    let direct = table
+        .route("dev", &ConversationKind::DirectMessage)
+        .expect("the direct-message route matches");
+    let channel = table
+        .route("dev", &ConversationKind::Channel("ops".to_owned()))
+        .expect("the channel route matches");
+
+    assert!(!direct.cache_key.trim().is_empty());
+    assert_ne!(direct.cache_key, channel.cache_key);
+    // And a restart is a new lane: nothing about the key survives the process that minted it, so it
+    // never becomes a durable identifier for the traffic a route carries.
+    let rebound = RoutingTable::bind(&config, &catalog).expect("both routes bind again");
+    assert_ne!(
+        rebound
+            .route("dev", &ConversationKind::DirectMessage)
+            .expect("the direct-message route matches")
+            .cache_key,
+        direct.cache_key
+    );
+}
+
+#[tokio::test]
 async fn a_route_no_catalog_can_satisfy_fails_at_startup() {
     let directory = temporary();
     let config = resolved(directory.path(), &document(directory.path())).await;
@@ -635,6 +678,12 @@ struct ModelScript {
     /// Recorded rather than counted because a conversation is an assertion about *what* a later
     /// session replayed and in which order, which a request count cannot express.
     prompts: Mutex<Vec<Vec<ModelMessage>>>,
+    /// The prompt cache key each request declared, in the same order.
+    ///
+    /// Recorded from the options the loop actually passed rather than from a serialized body:
+    /// `ureq` pretty-prints what it sends, so a captured request is not comparable to a locally
+    /// serialized one, and every value compared here is computed in this binary.
+    cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
     forbidden: bool,
 }
@@ -649,6 +698,7 @@ impl ModelScript {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
             prompts: Mutex::new(Vec::new()),
+            cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: false,
         })
@@ -660,6 +710,7 @@ impl ModelScript {
         Arc::new(Self {
             turns: Mutex::new(VecDeque::new()),
             prompts: Mutex::new(Vec::new()),
+            cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: true,
         })
@@ -667,6 +718,18 @@ impl ModelScript {
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The cache key one request declared, failing the test when it declared none.
+    ///
+    /// A missing key is a failure rather than a `None` to compare, because two requests that both
+    /// sent nothing would satisfy every "same key" assertion below while carrying no key at all.
+    fn cache_key(&self, index: usize) -> String {
+        let keys = self.cache_keys.lock().expect("recorded cache keys");
+        keys.get(index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| panic!("request {index} declared a prompt cache key"))
     }
 
     /// One request's messages as `(role, content)` pairs, in the order the model saw them.
@@ -699,10 +762,22 @@ impl ModelFactory for Arc<ModelScript> {
 struct ScriptedModel(Arc<ModelScript>);
 
 impl ChatModel for ScriptedModel {
+    /// Every request the gateway makes arrives through `complete_with`; this exists because the
+    /// trait requires it, and it records a keyless request so a regression that stopped supplying
+    /// options would show up as a missing key rather than as a silently different code path.
     fn complete(
         &self,
         messages: &[ModelMessage],
+        tools: &[ModelTool],
+    ) -> Result<AssistantTurn, ModelError> {
+        self.complete_with(messages, tools, &CompletionOptions::default())
+    }
+
+    fn complete_with(
+        &self,
+        messages: &[ModelMessage],
         _tools: &[ModelTool],
+        options: &CompletionOptions,
     ) -> Result<AssistantTurn, ModelError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
         self.0
@@ -710,6 +785,11 @@ impl ChatModel for ScriptedModel {
             .lock()
             .expect("recorded prompts")
             .push(messages.to_vec());
+        self.0
+            .cache_keys
+            .lock()
+            .expect("recorded cache keys")
+            .push(options.prompt_cache_key().map(ToOwned::to_owned));
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         self.0
             .turns
@@ -820,6 +900,9 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             max_capability_calls: 8,
         },
         conversation: ConversationPolicy::OneShot,
+        // Minted the way `RoutingTable::bind` mints it, so a test that reuses one bound route
+        // across messages reuses one lane exactly as the daemon does.
+        cache_key: cache_key::for_route(),
     }
 }
 
@@ -1269,6 +1352,26 @@ fn granted(capabilities: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Records one exchange for the store tests whose subject is the history rather than the cache
+/// lane, minting the key the way the first session of a conversation supplies it.
+fn commit(
+    store: &ConversationStore,
+    key: &ConversationKey,
+    granted: &[String],
+    window: ConversationWindow,
+    turn: ConversationTurn,
+    now: Instant,
+) {
+    store.commit(
+        key,
+        granted,
+        window,
+        turn,
+        &cache_key::for_conversation(),
+        now,
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt() {
     // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
@@ -1583,7 +1686,8 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     let key = ConversationKey::new("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
-    store.commit(
+    commit(
+        &store,
         &key,
         &allowed,
         window(),
@@ -1592,11 +1696,15 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     );
 
     let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(899));
-    assert_eq!(warm.len(), 1, "inside the timeout the exchange is replayed");
+    assert_eq!(
+        warm.history.len(),
+        1,
+        "inside the timeout the exchange is replayed"
+    );
 
     let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
     assert!(
-        cold.is_empty(),
+        cold.history.is_empty(),
         "past the timeout the next message starts fresh"
     );
     assert_eq!(
@@ -1617,8 +1725,9 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
         .map(|conversation| ConversationKey::new("dev", conversation, SUBJECT));
     let turn = |text: &str| ConversationTurn::completed(text, "noted");
 
-    store.commit(&keys[0], &allowed, window(), turn("one"), start);
-    store.commit(
+    commit(&store, &keys[0], &allowed, window(), turn("one"), start);
+    commit(
+        &store,
         &keys[1],
         &allowed,
         window(),
@@ -1626,14 +1735,16 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
         start + Duration::from_secs(1),
     );
     // Touching the oldest conversation makes the middle one the least recently used.
-    store.commit(
+    commit(
+        &store,
         &keys[0],
         &allowed,
         window(),
         turn("one again"),
         start + Duration::from_secs(2),
     );
-    store.commit(
+    commit(
+        &store,
         &keys[2],
         &allowed,
         window(),
@@ -1644,15 +1755,21 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     let now = start + Duration::from_secs(4);
     assert_eq!(store.tracked(), 2, "the ceiling holds");
     assert!(
-        store.begin(&keys[1], &allowed, window(), now).is_empty(),
+        store
+            .begin(&keys[1], &allowed, window(), now)
+            .history
+            .is_empty(),
         "the least recently used conversation is the one that goes"
     );
     assert_eq!(
-        store.begin(&keys[0], &allowed, window(), now).len(),
+        store.begin(&keys[0], &allowed, window(), now).history.len(),
         2,
         "the conversation somebody is still having survives"
     );
-    assert_eq!(store.begin(&keys[2], &allowed, window(), now).len(), 1);
+    assert_eq!(
+        store.begin(&keys[2], &allowed, window(), now).history.len(),
+        1
+    );
 }
 
 #[test]
@@ -1682,7 +1799,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
         let store = ConversationStore::new(8);
         let key = ConversationKey::new("dev", "dev", SUBJECT);
         for text in ["question a", "question b", "question c"] {
-            store.commit(
+            commit(
+                &store,
                 &key,
                 &allowed,
                 window,
@@ -1690,7 +1808,7 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
                 now,
             );
         }
-        let history = store.begin(&key, &allowed, window, now);
+        let history = store.begin(&key, &allowed, window, now).history;
         assert_eq!(history.len(), 2, "{name} keeps two exchanges");
         assert_eq!(
             history.turns()[0].user(),
@@ -1711,7 +1829,8 @@ fn a_history_and_a_revoked_entry_are_two_different_removals() {
         !store.remove(&key, EvictionReason::GrantChanged),
         "removing a conversation nobody started is not an eviction"
     );
-    store.commit(
+    commit(
+        &store,
         &key,
         &allowed,
         window(),
@@ -1735,13 +1854,14 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
 
     let first = store.begin(&key, &allowed, window(), now);
     let second = store.begin(&key, &allowed, window(), now);
-    assert!(first.is_empty() && second.is_empty());
+    assert!(first.history.is_empty() && second.history.is_empty());
 
     store.commit(
         &key,
         &allowed,
         window(),
         ConversationTurn::completed("what broke?", "two things"),
+        &first.cache_key,
         now,
     );
     store.commit(
@@ -1749,13 +1869,20 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
         &allowed,
         window(),
         ConversationTurn::completed("still there?", "yes"),
+        &second.cache_key,
         now,
     );
 
-    let history = store.begin(&key, &allowed, window(), now);
-    assert_eq!(history.len(), 2);
-    assert_eq!(history.turns()[0].user(), "what broke?");
-    assert_eq!(history.turns()[1].user(), "still there?");
+    let resumed = store.begin(&key, &allowed, window(), now);
+    assert_eq!(resumed.history.len(), 2);
+    assert_eq!(resumed.history.turns()[0].user(), "what broke?");
+    assert_eq!(resumed.history.turns()[1].user(), "still there?");
+    // Two sessions opening one new conversation mint two lanes, and the one that created the entry
+    // is the lane the conversation keeps. The loser paid for one cache lookup on one message; the
+    // alternative — the last writer renaming the lane every message — would leave every request
+    // naming a lane no earlier request had ever used.
+    assert_ne!(first.cache_key, second.cache_key);
+    assert_eq!(resumed.cache_key, first.cache_key);
 }
 
 #[test]
@@ -1763,7 +1890,8 @@ fn the_store_prints_counts_rather_than_conversations() {
     // `History` and `ConversationTurn` both derive `Debug`, so a derived impl here would put whole
     // conversations into the log stream on one `tracing::debug!(?store)`.
     let store = ConversationStore::new(8);
-    store.commit(
+    commit(
+        &store,
         &ConversationKey::new("dev", "dev", SUBJECT),
         &granted(&["echo.echo"]),
         window(),
@@ -1776,6 +1904,231 @@ fn the_store_prints_counts_rather_than_conversations() {
     assert!(rendered.contains("turns: 1"), "{rendered}");
     assert!(!rendered.contains("secret"), "{rendered}");
     assert!(!rendered.contains(SUBJECT), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// Prompt cache keys
+// ---------------------------------------------------------------------------
+
+/// The same message, in a different conversation on the same transport.
+fn message_in(conversation: &str, text: &str) -> InboundMessage {
+    InboundMessage {
+        conversation_id: conversation.to_owned(),
+        ..message(text)
+    }
+}
+
+#[test]
+fn a_minted_cache_key_is_opaque_and_never_repeats() {
+    // Both prefixes are crate constants and `IdSequence::new` rejects a malformed one, in which
+    // case minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure
+    // is silent by design — a routing hint must not abort a message — so this is the test that
+    // keeps the constants valid.
+    let first = cache_key::for_conversation();
+    let second = cache_key::for_conversation();
+    let route = cache_key::for_route();
+
+    for key in [&first, &second, &route] {
+        assert!(!key.trim().is_empty(), "an empty key is no key at all");
+    }
+    assert_ne!(
+        first, second,
+        "two conversations minted in one process must not collide"
+    );
+    assert_ne!(route, cache_key::for_route());
+}
+
+#[test]
+fn a_cache_key_carries_nothing_about_the_sender() {
+    // The whole reason the key is minted rather than derived. A canonical subject can be a phone
+    // number, so sending it — or a hash of it, which is a stable pseudonym — would hand a model
+    // provider the sender's identity in exchange for routing that happens either way.
+    const DISTINCTIVE: &str = "tel.15558675309";
+    let store = ConversationStore::new(8);
+    let key = ConversationKey::new("dev", "c0123abc", DISTINCTIVE);
+    let seed = store.begin(&key, &granted(&["echo.echo"]), window(), Instant::now());
+
+    for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc"] {
+        assert!(
+            !seed.cache_key.contains(fragment),
+            "{fragment:?} reached the cache key: {}",
+            seed.cache_key
+        );
+    }
+    // Nor does the conversation the sender is in, which on a shared channel is barely less
+    // identifying than the sender.
+    assert!(!cache_key::for_route().contains("c0123abc"));
+}
+
+#[test]
+fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
+    // Rotation is what keeps the key from becoming a durable pseudonym, and it is also simply
+    // correct: an evicted conversation rebuilds a prompt sharing no prefix with the one it
+    // replaced, so naming the old lane would be a guaranteed miss.
+    let store = ConversationStore::new(8);
+    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let allowed = granted(&["echo.echo"]);
+    let start = Instant::now();
+
+    let first = store.begin(&key, &allowed, window(), start);
+    store.commit(
+        &key,
+        &allowed,
+        window(),
+        ConversationTurn::completed("what broke?", "two things"),
+        &first.cache_key,
+        start,
+    );
+
+    let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(60));
+    assert_eq!(
+        warm.cache_key, first.cache_key,
+        "a live conversation stays in the lane its own turns warmed"
+    );
+
+    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    assert!(
+        cold.history.is_empty(),
+        "the idle timeout dropped the entry"
+    );
+    assert_ne!(
+        cold.cache_key, first.cache_key,
+        "the same conversation identity must not keep naming a lane whose prefix is gone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_one() {
+    // The point of the key: the second message of a conversation repeats the whole first exchange
+    // as its prefix, and declaring the same lane is what lets the provider serve that prefix from
+    // its cache instead of reading it again.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let models = ModelScript::new([
+        answer("Two things broke."),
+        answer("The second one was the database."),
+        answer("Nothing is wrong over here."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for message in [
+        message_in("dev", "what broke?"),
+        message_in("dev", "and the second one?"),
+        message_in("dev-other", "anything wrong here?"),
+    ] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message,
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.cache_key(0),
+        models.cache_key(1),
+        "a follow-up must declare the lane its own earlier turn warmed"
+    );
+    assert_ne!(
+        models.cache_key(0),
+        models.cache_key(2),
+        "two conversations share no prefix, so pointing them at one lane only wastes lookups"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
+    // A `oneShot` route's shared prefix is the agent's instructions and the tool definitions —
+    // identical for everyone it answers and containing nothing about any of them — so one lane per
+    // route shares what was already common property. Per-message keys would name a lane holding one
+    // request and give up the only caching a stateless route can have.
+    const OTHER_SUBJECT: &str = "tel.16035550100";
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    // Bound once and cloned per message, exactly as the routing table hands it to a session.
+    let route = route(model_config());
+
+    for message in [
+        message_from(SUBJECT, "what broke?"),
+        message_from(OTHER_SUBJECT, "and for me?"),
+        message_from(SUBJECT, "still?"),
+    ] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message,
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(models.cache_key(0), route.cache_key);
+    assert_eq!(
+        models.cache_key(1),
+        route.cache_key,
+        "a second sender on one route uses the same lane, because the prefix is the route's"
+    );
+    assert_eq!(models.cache_key(2), route.cache_key);
+    assert_eq!(
+        runner.conversations.tracked(),
+        0,
+        "a lane is not a memory: a oneShot route still stores nothing"
+    );
+}
+
+/// A model that never heard of routing metadata, implementing only the required trait method.
+struct KeylessModel;
+
+impl ModelFactory for KeylessModel {
+    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+        Ok(Box::new(Self))
+    }
+}
+
+impl ChatModel for KeylessModel {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        _tools: &[ModelTool],
+    ) -> Result<AssistantTurn, ModelError> {
+        Ok(answer(
+            messages
+                .last()
+                .and_then(ModelMessage::content)
+                .unwrap_or_default(),
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
+    // `complete_with` is a provided method precisely so this keeps working: an implementation that
+    // ignores the options loses a cache lookup, never an answer.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner_with(broker, Arc::new(KeylessModel) as Arc<dyn ModelFactory>, 4);
+
+    run_session(
+        Arc::clone(&runner),
+        persistent_route(model_config(), window()),
+        message("what broke?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), vec!["what broke?".to_owned()]);
+    assert_eq!(
+        runner.conversations.tracked(),
+        1,
+        "and the conversation it answered is remembered like any other"
+    );
 }
 
 // ---------------------------------------------------------------------------
