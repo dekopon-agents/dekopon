@@ -2,8 +2,8 @@
 
 Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 
-Both `dekopon-run` and `dekopon-brokerd` export their own spans, so exporter construction lives
-here rather than being duplicated in each binary. The crate depends on no other Dekopon crate: it
+`dekopon-run`, `dekopon-brokerd`, and `dekopond` each export their own spans, so exporter
+construction lives here rather than being duplicated in each binary. The crate depends on no other Dekopon crate: it
 must stay linkable from the runner without pulling broker code into the runner's dependency tree,
 which CI rejects.
 

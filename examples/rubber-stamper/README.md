@@ -303,8 +303,9 @@ already act as the configured gateway peer. `via` and namespace scoping become r
 when the gateway has its own UID, and that deployment is committed direction rather than current
 behavior. [`../../docs/security-model.md`](../../docs/security-model.md) states this in full.
 
-Each message is also an independent session with no history: the agent does not remember the
-previous DM.
+This route is `mode: persistent`, so the gateway replays a bounded window of earlier turns
+from the same sender into the next prompt. Nothing carries beyond that conversation: the
+agent has no memory that outlives it.
 
 ## Related
 

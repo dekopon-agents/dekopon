@@ -1,14 +1,14 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.2.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.3.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither. Cedar, broker-owned credentials, identity/attestation, and `dekopond` are current **in this tree** and are not part of the published `0.2.0`; see [Unreleased](#unreleased-in-this-tree).
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
 ## Design documentation
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works today in 0.2.0
+## What works today in 0.3.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -22,38 +22,39 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
 
-## Unreleased (in this tree)
-
-Present, tested, and awaiting the next release. Everything below is real in a checkout and absent from the published `0.2.0`:
+New in 0.3.0:
 
 - **Cedar authorization** (`dekopon-policy`). A schema generated from the deployment's declared world, strict startup validation, deny on any evaluation error, the determining `policy_ids` and a `policy_digest` in every audit record. It replaced the exact-match evaluator outright. Execution bounds stayed outside the policy language as owner-authored constraint sets, so a policy edit can broaden who may act and can never widen how far an action reaches.
-- **Broker-owned credentials.** Destination-bound secrets in a separate stricter owner-only file, bound per capability constraint set, injected inside the native HTTP engine after guest headers were validated. Audit and evidence record `credentialInjected: true` and never a value.
+- **Broker-owned credentials.** Destination-bound secrets in a separate stricter owner-only file, bound per capability constraint set with optional per-agent overrides, injected inside the native HTTP engine after guest headers were validated. Audit and evidence record `credentialInjected: true` and never a value.
 - **Identity and attestation.** Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped policy that keeps attested and direct authority disjoint — adding a gateway cannot widen a grant that already existed.
-- **`dekopond`**, the unprivileged chat gateway: Slack Socket Mode, Telegram long-poll, and local development transports; configuration naming environment variables rather than secrets; first-match routing to catalog agents; admission-bounded sessions; and attested on-behalf-of proposals, so the broker's audit attributes an effect to the person who asked for it.
+- **`dekopond`**, the unprivileged chat gateway: Slack Socket Mode, Telegram long-poll, and local development transports; configuration naming environment variables rather than secrets; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals, so the broker's audit attributes an effect to the person who asked for it.
+- **Bounded conversation memory.** A gateway session keeps a bounded per-sender window of earlier turns and replays it into the next prompt, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key that is never derived from message content.
 - **`dekopon-agent`**, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`.
 - **A `gh` provider and a `gh` shell builtin.** Nineteen narrow GitHub capabilities in one checked-in component — SHA-pinned writes, no `gh.api.*` passthrough — reachable as `gh pr view 7 -R owner/repo` inside a sandboxed script.
+- **`dekopon-run chat`**, a client for the gateway's local development transport, so a gateway route can be exercised without a chat service.
 - **[`examples/rubber-stamper`](examples/rubber-stamper/README.md)**, the end-to-end walkthrough assembling all of it, pinned against the real machinery by three integration test suites.
-- Three new publishable crates (`dekopon-agent`, `dekopon-policy`, `dekopond`) bring the tree to 20, up from the 17 published at `0.2.0`.
+- Three new publishable crates (`dekopon-agent`, `dekopon-policy`, `dekopond`) bring the release to 20, up from the 17 published at `0.2.0`.
 
 ## What does not work yet
 
-Conversation context and memory: each message a gateway session handles is independent, with no history. `dekopond` also runs under the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping rather than isolation; a dedicated gateway UID, where `via` becomes real separation, remains committed direction. See [`docs/dekopond.md`](docs/dekopond.md).
+Agent memory that outlives a conversation. A gateway session replays a bounded per-sender window of earlier turns; nothing carries across conversations, and there is no task store. `dekopond` also runs under the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping rather than isolation; a dedicated gateway UID, where `via` becomes real separation, remains committed direction. See [`docs/dekopond.md`](docs/dekopond.md).
 
-There is still no independently retained/signed/remote audit checkpoint service, no task store, and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Catalog provider and status resources remain declarations only. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
+There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Catalog provider and status resources remain declarations only. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
 ## Install
 
-The 17 public crates that made up `0.2.0` are published on [crates.io](https://crates.io/crates/dekopon). The tree now holds 20 publishable crates — `dekopon-agent`, `dekopon-policy`, and `dekopond` are new and awaiting the next release, so `dekopond` installs from a checkout rather than from crates.io. With stable Rust (MSRV 1.89.0, edition 2024), install the three released executables directly:
+The 20 public crates that make up `0.3.0` are published on [crates.io](https://crates.io/crates/dekopon), three of them — `dekopon-agent`, `dekopon-policy`, and `dekopond` — for the first time. With stable Rust (MSRV 1.89.0, edition 2024), install the four released executables directly:
 
 ```console
-cargo install --locked dekopon --version 0.2.0
-cargo install --locked dekopon-run --version 0.2.0
-cargo install --locked dekopon-brokerd --version 0.2.0
+cargo install --locked dekopon --version 0.3.0
+cargo install --locked dekopon-run --version 0.3.0
+cargo install --locked dekopon-brokerd --version 0.3.0
+cargo install --locked dekopond --version 0.3.0
 dekopon version
 dekopon-run --version
 ```
 
-Prebuilt, provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.2.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.2.0). To develop from a checkout instead:
+Prebuilt, provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.3.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0). Each carries all four executables alongside the broker and gateway configuration contracts. To develop from a checkout instead:
 
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
@@ -61,7 +62,7 @@ cd dekopon
 cargo install --locked --path crates/dekopon
 cargo install --locked --path crates/dekopon-run
 cargo install --locked --path crates/dekopon-brokerd
-cargo install --locked --path crates/dekopond      # unreleased; checkout only
+cargo install --locked --path crates/dekopond
 ```
 
 `dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
@@ -142,7 +143,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history are done and in this tree. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

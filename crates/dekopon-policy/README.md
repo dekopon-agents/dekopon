@@ -96,3 +96,7 @@ would make an explanation ambiguous, so it refuses startup.
 sorted entity and action identifiers, domain-separated with `dekopon-policy-v1\0`. Two brokers
 reporting the same digest evaluated the same authorization surface. It is recorded alongside
 `policy_ids` as `policy_digest`, and it is a correlation aid rather than a wire-format contract.
+
+Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
+`docs/design.md` for the authority model and `docs/security-model.md` for the trust
+boundaries this adapter informs but never enforces.

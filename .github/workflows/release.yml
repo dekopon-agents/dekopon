@@ -137,6 +137,15 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify gateway excludes privileged broker machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
       - name: Check dependency policy
@@ -177,7 +186,7 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - name: Build CLIs
-        run: cargo build --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -188,8 +197,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/dekopon" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-run" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopond" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
+          cp crates/dekopond/README.md "staging/$archive/GATEWAY.md"
           cp examples/providers/jsonplaceholder-provider.wasm "staging/$archive/providers/"
           cp examples/providers/jsonplaceholder/README.md \
             "staging/$archive/providers/JSONPLACEHOLDER.md"

@@ -8,7 +8,7 @@ chat message and the bounded agent session it drives. Broker coverage is one spa
 invocation from a mapped peer. None collects telemetry from Kubernetes nodes or other Rust
 processes; host-level collection remains separate work.
 
-The two processes export **independently**. The broker only ever observes broker-mediated
+The three processes export **independently**. The broker only ever observes broker-mediated
 invocations, so it cannot stand in for the runner: a broker-only deployment loses every model turn,
 every direct-mode capability call, and every script span. They are separate emitters that meet in
 the backend, correlated by trace context rather than by one relaying for the other.

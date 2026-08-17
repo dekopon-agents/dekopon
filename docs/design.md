@@ -109,7 +109,7 @@ The agent daemon must not gain effect authority merely because it coordinates a 
 
 ## Current control paths
 
-The published `0.2.0` release retains the local catalog read path introduced in 0.1:
+The published `0.3.0` release retains the local catalog read path introduced in 0.1:
 
 ```text
 parse dekopon CLI
