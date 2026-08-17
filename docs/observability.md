@@ -179,6 +179,36 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model was called, `busy` means admission control refused the message, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
 
+### What conversation history changes
+
+Persistent conversations are committed direction rather than current behavior — the contract is in
+[`dekopond.md`](dekopond.md#conversations) — but they change the meaning of a field that already
+exists, and that is the kind of change a dashboard absorbs silently and wrongly.
+
+**`message.count` is the field.** It appears on the `model.complete` span and on the
+`accounting.model.turn` record, and today it counts one exchange: the system prompt, the message a
+person sent, and whatever the model and its tool have said back within this session. Once a session
+is seeded with history it counts the replayed window *plus* this exchange, so the same field on the
+same span means something different depending on a route's `conversation.mode`. A panel plotting it
+across the switchover shows a step change that is not a regression, and averaging across both is an
+average of two different quantities. Re-baseline deliberately rather than discovering it later; the
+same caution applies to `usage.input_tokens`, which rises for the same reason and for real money.
+
+**The history size gets its own fields** rather than being inferred from that step change.
+`gateway.session` carries `conversation.turns` and `conversation.bytes` — how many prior exchanges
+this message replayed and how many bytes they occupied. Both are zero on a `oneShot` route and on
+the first message of any conversation, which makes "seeded or not" a filter rather than a guess.
+`gateway_conversation_evicted` joins the gateway lifecycle events with a reason of `idle`,
+`capacity`, or `grant-changed`, so a `maxConversations` ceiling set too low reads as eviction churn
+instead of as a bot that intermittently forgets.
+
+The history itself is not a new signal. It is chat text and model output, already excluded by the
+data-minimization rules below, and it appears only where those already send it: with
+`telemetryPayloads` enabled, `agent.model.prompt` carries the full message list for the turn, which
+on a seeded session now includes the replayed window. That event becomes larger and older than it
+was — enabling payloads on a persistent route declares the sink in scope for a conversation rather
+than for a message.
+
 ## Broker execution spans
 
 `broker.invocation` is not a flat bar. Beneath it the broker's own crates emit:

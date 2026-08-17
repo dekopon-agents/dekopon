@@ -91,6 +91,57 @@ Chrome and OTLP trace/log fields omit prompts, model responses, component input/
 
 The single-UID caveat above applies unchanged: `dekopond` and `dekopon-brokerd` currently run as the same user, so the attestor grant buys attribution and blast-radius shape rather than isolation until the gateway has its own UID. See [`dekopond.md`](dekopond.md) for the complete contract.
 
+Persistent conversations add one more thing that would terminate in this daemon — chat text that outlives the message carrying it — and the next section states that surface before the code exists rather than after.
+
+## Conversation memory as a trust surface
+
+**Status: committed direction.** No code in this tree implements it. `dekopond` still runs each routed message as an independent session that starts from an empty prompt, and the design this section reviews is the [Conversations](dekopond.md#conversations) contract: a per-sender history, bounded by a sliding window and an idle timeout, held in the gateway process's memory and replayed into the next prompt.
+
+### Containment is unchanged
+
+The broker authorizes every invocation. A persistent conversation opens a fresh attested leg per message exactly as a one-shot session does — the same `capabilitiesFor` call, the same policy evaluation against the same `via`-scoped rules, the same audit record. No grant is cached, no decision is carried forward, and replayed history reaches the model as prompt text and never reaches the broker as authorization input.
+
+So persistence widens no authority. Everything a model can do with a remembered conversation, it can already do with a single message: propose. The invariant that a proposal is not authority is untouched, and this design does not ask for an exception to it.
+
+### What persistence widens is duration
+
+Prompt injection is not defended against, and this is the change that matters to it.
+
+Today an instruction embedded in a pull-request body, an issue comment, or a fetched page reaches the model, and it dies with the message that read it. The next message starts from an empty prompt, so an injection gets exactly one turn and its blast radius is one session's proposals.
+
+With history it stays. The injected text — or the model's own answer restating it — sits in the prompt for the rest of that conversation, up to `maxTurns`, up to `maxBytes`, up to the idle timeout, and every subsequent turn in that conversation is evaluated with it still present. A person who asks three follow-ups after the poisoned message is asking all three with the injection in scope. The exposure is the same in kind and longer in dwell time, and that is worth stating here rather than leaving to be discovered when a conversation behaves oddly on its fourth turn.
+
+The mitigations below shorten the dwell time. None of them detects the injection, because nothing in this project does.
+
+### The second-order case: history outliving its grant
+
+Tool output a session fetched under a broad grant is in the history. If the owner then narrows what that subject may reach, the text is still in the prompt even though the capability that produced it is gone — a quiet way for a revocation to be less complete than the owner believes.
+
+The mechanism that closes it: the granted capability set is stored with the conversation and compared against the fresh leg's grant on every message. Any difference drops the history and starts a new conversation; an empty grant removes the entry outright, which is the same refusal an unauthorized sender already gets, applied to what was remembered as well as to what may be done. It costs a cache miss on the first message after any policy change. That is the correct price: a narrowed grant is precisely the moment replaying old output is wrong, and paying for one extra round trip to be sure of it is a good trade.
+
+Two honest limits on that mechanism. It compares capability *identifiers*, so a policy edit that keeps the same capability list while tightening its owner-authored constraint set — a narrower allowed host, a smaller output ceiling, a different injected credential — produces an identical grant set and does not drop the history; text fetched under the older constraints survives until the window or the idle timeout removes it. And invalidation removes text from a future prompt, never from anywhere it was already shown: the answer that quoted it is in a chat transcript the daemon does not own.
+
+### The mitigations, as a set
+
+None of these is sufficient alone, and the design depends on all of them:
+
+- **Per-sender keying.** The conversation key includes the sender's canonical subject, so history is per-sender and never shared across the people in a channel. One person's exchange cannot enter another person's prompt, which also means a channel member cannot make the bot recite what it told a colleague.
+- **Idle timeout.** An untouched conversation is evicted, 15 minutes by default. It bounds how long an injection or a stale tool result can persist without anyone continuing the conversation that produced it.
+- **The window.** `maxTurns` and `maxBytes` bound what is replayed regardless of how long the conversation lives, so a long-running conversation does not accumulate an unbounded prompt and old turns fall out of scope on their own.
+- **Compaction.** A stored turn is `(the user's message, the final answer)`; intermediate tool calls, model-authored scripts, and their output are dropped. Materially less untrusted repository and provider text is replayed than the session actually read, and the replayed prompt cannot grow with the size of a tool result — one script's output alone can reach 256 KiB.
+- **In memory only.** History lives in the gateway process, is never written to disk by the daemon, is never sent to the broker, and dies with the process. There is no file to exfiltrate, no backup to age out of a retention policy, and nothing to recover after a restart.
+- **Grant-set invalidation.** Described above: the granted capability set travels with the conversation, and a change drops it.
+
+### Where the text deliberately does not go
+
+Not into the broker. `dekopon-brokerd` holds provider credentials and a metadata-only hash-linked audit chain in which a provider's output survives only as a digest, and its records deliberately exclude inputs, outputs, paths, queries, headers, and bodies. Putting conversation text in that process would place the most sensitive content in the system inside the most privileged one, next to a record built specifically not to contain it, and it would turn a chain that proves what was *authorized* into a store of what was *said*. The gateway already reads the message and writes the answer, so keeping the history there adds no new reader.
+
+Not into telemetry either. `conversation.turns` and `conversation.bytes` are a count and a byte total; the history itself follows the existing payload gate and appears only in `agent.model.prompt` under `telemetryPayloads: true`, where it makes that event both larger and older than it was. Enabling payloads on a persistent route declares the telemetry sink in scope for a conversation rather than for a message.
+
+### What this does not fix
+
+"In memory only" is a durability property and not an isolation one. In the current single-UID deployment any process running as the owner can read the gateway's memory, exactly as it can already act as the configured gateway peer. Operating-system paging and core dumps are outside what the daemon controls. And the development transport's declared subject selects a history as well as a subject, so a local caller inside that UID can address a conversation a Slack sender created and have it replayed into its own prompt. None of this is new authority; all of it is the single-UID caveat applying to a new kind of content, and a dedicated gateway UID is what turns it into a real boundary.
+
 ## Current privileged broker foundation
 
 `dekopon-broker-host` is the privileged component library used only by the separately deployed `dekopon-brokerd` process. It links only `dekopon:http@1.0.0`, consumes one non-cloneable `AuthorizedInvocation` at its public invocation boundary, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description receives a linked but disabled HTTP context, and any attempted description-time call rejects the component. Policy denials remain terminal even if guest code catches the typed WIT error.
@@ -115,7 +166,9 @@ The service performs no process attestation, independent remote/signed checkpoin
 
 ## Threat-model limitations
 
-The current project does not defend against a malicious process in the broker/client UID trust domain, a local user who can replace the binary, component, or owner-controlled config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; coordinated rollback of both local audit and checkpoint state; or side channels. The Wasmtime limits reduce invocation risk but are not a production sandbox claim. Prompt injection is explicitly not defended against: a chat message reaching `dekopond` can say anything to a model, and the containment is that the model can only propose, never authorize. The project has no provider secret-store integration, per-process/client attestation, dedicated gateway UID, conversation context or memory, independent audit checkpoint retention/signing service, external evidence store, key management, revocation, tenancy isolation, operator-CLI integration with the broker or the daemon, or incident-response automation.
+The current project does not defend against a malicious process in the broker/client UID trust domain, a local user who can replace the binary, component, or owner-controlled config; a compromised host; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; coordinated rollback of both local audit and checkpoint state; or side channels. The Wasmtime limits reduce invocation risk but are not a production sandbox claim. Prompt injection is explicitly not defended against: a chat message reaching `dekopond` can say anything to a model, and the containment is that the model can only propose, never authorize. Today an injected instruction dies with the message that read it, because each gateway message is one independent session; the committed conversation-memory design keeps it in the prompt for the rest of a conversation instead, which lengthens its dwell time without changing that containment. The project has no provider secret-store integration, per-process/client attestation, dedicated gateway UID, independent audit checkpoint retention/signing service, external evidence store, key management, revocation, tenancy isolation, operator-CLI integration with the broker or the daemon, or incident-response automation.
+
+Conversation memory is designed rather than absent, and rather than implemented. Each gateway message is still an independent session with no history; the trust surface the accepted design takes on is stated above, so the review is on record before the code is, and it becomes a live limitation on the change that lands it. Agent memory that outlives a conversation is neither designed nor implemented.
 
 The committed first privileged-provider design is documented in [`broker-http.md`](broker-http.md). It preserves the separate broker boundary, keeps direct `dekopon-run` execution import-free, and treats HTTP imports as structural requirements rather than authority.
 
