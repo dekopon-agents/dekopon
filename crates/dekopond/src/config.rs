@@ -220,9 +220,31 @@ impl ModelConfig {
 )]
 pub enum RouteMatch {
     /// One-to-one conversations with the bot.
-    DirectMessage,
-    /// One named channel or group, where the bot must additionally be @-mentioned.
-    Channel { channel: String },
+    ///
+    /// A struct variant with no fields rather than a unit variant, for the reason
+    /// [`ConversationConfig::OneShot`] is one: serde's internally tagged *unit* variants accept and
+    /// discard every key beside the tag, so `kind: directMessage` with a `channel` beside it would
+    /// decode cleanly and throw the channel away — leaving an operator believing they scoped a route
+    /// that in fact claims every direct message on the transport. An empty struct variant under
+    /// `deny_unknown_fields` makes that a startup failure with the field name in it.
+    DirectMessage {},
+    /// Channels the bot is summoned in: one named channel, or **any** of them when `channel` is
+    /// absent.
+    ///
+    /// The channel is optional because the alternative is one route per channel, enumerated by
+    /// service-native identifier and re-edited every time somebody creates a channel — a bot that
+    /// goes silent in the new channel until an operator notices and redeploys. An absent `channel`
+    /// says "wherever I am invited", which is the membership the chat service already controls.
+    ///
+    /// Widening *where* widens nothing about *who*. The bot must still be @-mentioned to be woken
+    /// at all, and every session still opens an attested broker leg that refuses a sender the owner
+    /// never mapped, before any model call. A catch-all route reaches exactly the people a named
+    /// one did.
+    Channel {
+        /// The one channel this route claims, or every channel when absent.
+        #[serde(default)]
+        channel: Option<String>,
+    },
 }
 
 /// Bounds one routed message's session.

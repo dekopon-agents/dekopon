@@ -189,6 +189,17 @@ async fn invalid_configurations_fail_closed_at_startup() {
             }),
         ),
         (
+            // serde's internally tagged *unit* variants accept and discard every key beside the
+            // tag, so this once decoded cleanly and threw the channel away — leaving an operator
+            // reading their own file convinced the route was scoped to one channel while it in
+            // fact claimed every direct message on the transport.
+            "a channel on a directMessage route",
+            mutate(|document| {
+                document["routes"][0]["match"] =
+                    json!({"kind": "directMessage", "channel": "c0123abc"});
+            }),
+        ),
+        (
             "duplicate transport name",
             mutate(|document| {
                 let duplicate = document["transports"][0].clone();
@@ -613,6 +624,89 @@ async fn channel_routes_match_only_their_own_channel() {
     );
 }
 
+#[tokio::test]
+async fn a_channel_route_with_no_channel_matches_every_channel() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["match"] = json!({"kind": "channel"});
+    let config = resolved(directory.path(), &document).await;
+    let table =
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
+
+    // Two channels this configuration never names, and a channel created after the daemon started
+    // would be a third. Enumerating them is exactly what leaving `channel` out avoids.
+    assert!(
+        table
+            .route("dev", &ConversationKind::Channel("c0123abc".to_owned()))
+            .is_some()
+    );
+    assert!(
+        table
+            .route("dev", &ConversationKind::Channel("c9999zzz".to_owned()))
+            .is_some()
+    );
+    // Wide, not indiscriminate. A direct message is not a channel, so no catch-all swallows one,
+    // and the transport name still bounds the whole thing.
+    assert!(
+        table
+            .route("dev", &ConversationKind::DirectMessage)
+            .is_none()
+    );
+    assert!(
+        table
+            .route("other", &ConversationKind::Channel("c0123abc".to_owned()))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_named_channel_route_declared_before_a_catch_all_keeps_its_own_channel() {
+    // The configuration an operator writes for "special handling in #incidents, the default
+    // everywhere else". Declaration order is the only rule: first match wins, as it always has.
+    let directory = temporary();
+    let mut document = document(directory.path());
+    let routes = document["routes"].as_array_mut().expect("routes array");
+    routes[0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    routes.push(json!({
+        "transport": "dev",
+        "match": {"kind": "channel"},
+        "agent": "reviewer"
+    }));
+    routes.push(json!({
+        "transport": "dev",
+        "match": {"kind": "directMessage"},
+        "agent": "reviewer"
+    }));
+    let config = resolved(directory.path(), &document).await;
+    let table =
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("every route binds");
+
+    assert_eq!(
+        table
+            .route("dev", &ConversationKind::Channel("c0123abc".to_owned()))
+            .expect("the named channel is routed")
+            .r#match,
+        RouteMatch::Channel {
+            channel: Some("c0123abc".to_owned())
+        }
+    );
+    assert_eq!(
+        table
+            .route("dev", &ConversationKind::Channel("c9999zzz".to_owned()))
+            .expect("every other channel is routed")
+            .r#match,
+        RouteMatch::Channel { channel: None }
+    );
+    // And the catch-all sitting above it takes nothing away from the direct-message route.
+    assert_eq!(
+        table
+            .route("dev", &ConversationKind::DirectMessage)
+            .expect("direct messages are routed")
+            .r#match,
+        RouteMatch::DirectMessage {}
+    );
+}
+
 #[test]
 fn a_shared_channel_message_counts_as_addressed_only_when_it_names_the_bot() {
     let slack = TransportIdentity {
@@ -891,7 +985,7 @@ async fn stub_broker(
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         transport: "dev".to_owned(),
-        r#match: RouteMatch::DirectMessage,
+        r#match: RouteMatch::DirectMessage {},
         agent: "reviewer".parse().expect("valid agent fixture"),
         instructions: Some("Answer briefly.".to_owned()),
         model: Arc::new(model),
@@ -2256,6 +2350,68 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         addressed,
     );
     assert_eq!(sessions.len(), 1, "an addressed message starts one session");
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
+    // The property a route matching every channel must not quietly cost: a route decides *which*
+    // agent answers, and the mention decides *whether* anything answers at all. Widening the first
+    // leaves the second exactly where it was, or the bot would run a session on every message in
+    // every channel it sits in.
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["match"] = json!({"kind": "channel"});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let replier = Arc::new(RecordingReplier::default());
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let repliers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )]);
+    let mut sessions = tokio::task::JoinSet::new();
+
+    // A channel this configuration never names, which is the whole point of the catch-all.
+    let mut ambient = message("just chatting with my colleagues");
+    ambient.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        &mut sessions,
+        ambient,
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "a matched channel is not a wakeup on its own"
+    );
+
+    let mut addressed = message("<@U0BOTBOT> what is the status?");
+    addressed.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        &mut sessions,
+        addressed,
+    );
+    assert_eq!(sessions.len(), 1, "and being summoned in one is");
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
 }
