@@ -22,8 +22,8 @@ use thiserror::Error;
 use ureq::{Agent, http};
 
 use crate::model::{
-    AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
-    ModelToolCall, ModelUsage,
+    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+    ModelTool, ModelToolCall, ModelUsage,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -121,8 +121,9 @@ impl ChatGptCodexModel {
         credentials: &ChatGptCredentials,
         messages: &[ModelMessage],
         tools: &[ModelTool],
+        options: &CompletionOptions,
     ) -> Result<AssistantTurn, ChatGptRequestError> {
-        let body = build_request_body(&self.model, messages, tools);
+        let body = build_request_body(&self.model, messages, tools, options);
         let response = self
             .agent
             .post(&self.endpoints.responses)
@@ -161,6 +162,15 @@ impl ChatModel for ChatGptCodexModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
     ) -> Result<AssistantTurn, ModelError> {
+        self.complete_with(messages, tools, &CompletionOptions::default())
+    }
+
+    fn complete_with(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+    ) -> Result<AssistantTurn, ModelError> {
         let span = tracing::info_span!(
             "model.complete",
             model = %self.model,
@@ -176,12 +186,12 @@ impl ChatModel for ChatGptCodexModel {
         self.refresh_if_needed(&mut credentials, false)
             .map_err(|error| ModelError::Request(error.to_string()))?;
 
-        match self.request_turn(&credentials, messages, tools) {
+        match self.request_turn(&credentials, messages, tools, options) {
             Ok(turn) => Ok(turn),
             Err(ChatGptRequestError::Unauthorized) => {
                 self.refresh_if_needed(&mut credentials, true)
                     .map_err(|error| ModelError::Request(error.to_string()))?;
-                self.request_turn(&credentials, messages, tools)
+                self.request_turn(&credentials, messages, tools, options)
                     .map_err(|error| ModelError::Request(error.to_string()))
             }
             Err(error) => Err(ModelError::Request(error.to_string())),
@@ -526,7 +536,12 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .ok_or_else(|| ChatGptError::Protocol("access token omitted ChatGPT account ID".to_owned()))
 }
 
-fn build_request_body(model: &str, messages: &[ModelMessage], tools: &[ModelTool]) -> Value {
+fn build_request_body(
+    model: &str,
+    messages: &[ModelMessage],
+    tools: &[ModelTool],
+    options: &CompletionOptions,
+) -> Value {
     let instructions = messages
         .iter()
         .filter(|message| message.role() == "system")
@@ -588,7 +603,7 @@ fn build_request_body(model: &str, messages: &[ModelMessage], tools: &[ModelTool
         })
         .collect::<Vec<_>>();
 
-    json!({
+    let mut body = json!({
         "model": model,
         "store": false,
         "stream": true,
@@ -599,7 +614,16 @@ fn build_request_body(model: &str, messages: &[ModelMessage], tools: &[ModelTool
         "parallel_tool_calls": true,
         "include": ["reasoning.encrypted_content"],
         "text": {"verbosity": "low"},
-    })
+    });
+    // Added only when a key exists, so a keyless request is byte-for-byte the request this
+    // transport sent before the field existed. `prompt_cache_key` routes toward a warm prefix and
+    // authorizes nothing; the conversation itself is already in `input` either way.
+    if let Some(key) = options.prompt_cache_key()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("prompt_cache_key".to_owned(), Value::String(key.to_owned()));
+    }
+    body
 }
 
 #[derive(Default)]
@@ -1185,7 +1209,7 @@ mod tests {
         extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
         save_credentials, status,
     };
-    use crate::model::{ChatModel as _, ModelMessage, ModelTool};
+    use crate::model::{ChatModel as _, CompletionOptions, ModelMessage, ModelTool};
 
     fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
@@ -1299,6 +1323,7 @@ mod tests {
                 description: "Echo".to_owned(),
                 parameters: json!({"type":"object"}),
             }],
+            &CompletionOptions::default(),
         );
 
         assert_eq!(body["instructions"], "Be concise");
@@ -1379,13 +1404,23 @@ mod tests {
             ModelMessage::system("Be concise."),
             ModelMessage::user("how many files are in the repository?"),
         ];
-        let mut bodies = vec![build_request_body("gpt-test", &messages, &tools)];
+        let mut bodies = vec![build_request_body(
+            "gpt-test",
+            &messages,
+            &tools,
+            &CompletionOptions::default(),
+        )];
         for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
             let call_id = format!("call_{turn}");
             let assistant = scripted_turn(turn, &call_id, script);
             messages.push(crate::model::assistant_message(&assistant));
             messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
-            bodies.push(build_request_body("gpt-test", &messages, &tools));
+            bodies.push(build_request_body(
+                "gpt-test",
+                &messages,
+                &tools,
+                &CompletionOptions::default(),
+            ));
         }
 
         for pair in bodies.windows(2) {
@@ -1436,8 +1471,9 @@ mod tests {
         let mut injected = history.clone();
         injected.insert(2, ModelMessage::system("Prefer relative paths."));
 
-        let plain = build_request_body("gpt-test", &history, &tools);
-        let hoisted = build_request_body("gpt-test", &injected, &tools);
+        let plain = build_request_body("gpt-test", &history, &tools, &CompletionOptions::default());
+        let hoisted =
+            build_request_body("gpt-test", &injected, &tools, &CompletionOptions::default());
 
         assert_eq!(
             request_text(&plain["input"]),
@@ -1464,7 +1500,7 @@ mod tests {
             ModelMessage::system(system),
         ];
 
-        let body = build_request_body("gpt-test", &messages, &[]);
+        let body = build_request_body("gpt-test", &messages, &[], &CompletionOptions::default());
 
         assert_eq!(body["instructions"], format!("{system}\n\n{system}"));
         assert_eq!(
@@ -1483,7 +1519,12 @@ mod tests {
         // here kept passing, so the assertion is written to be deleted deliberately rather than
         // edged past.
         let assistant = scripted_turn(1, "call_1", "ls | wc -l");
-        let opening = build_request_body("gpt-test", &[ModelMessage::user("hello")], &[]);
+        let opening = build_request_body(
+            "gpt-test",
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+        );
         let resumed = build_request_body(
             "gpt-test",
             &[
@@ -1492,12 +1533,142 @@ mod tests {
                 ModelMessage::tool("call_1", "12\n"),
             ],
             &[bash_tool()],
+            &CompletionOptions::default(),
         );
 
         for body in [&opening, &resumed] {
             assert_eq!(body["store"], false);
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
+    }
+
+    /// The conversation the cache-key tests below build requests from, kept in one place so the
+    /// only difference between the bodies they compare is the options value.
+    fn cached_conversation() -> Vec<ModelMessage> {
+        let assistant = scripted_turn(1, "call_1", "ls | wc -l");
+        vec![
+            ModelMessage::system("Be concise."),
+            ModelMessage::user("how many files are in the repository?"),
+            crate::model::assistant_message(&assistant),
+            ModelMessage::tool("call_1", "12\n"),
+        ]
+    }
+
+    #[test]
+    fn a_request_without_a_cache_key_carries_no_cache_field_at_all() {
+        // No caller supplies a key yet, so this is the body every real request still has: an
+        // absent key must serialize away completely rather than as a null or an empty string.
+        // Anything else would be a wire change shipped by a feature nobody has switched on.
+        let messages = cached_conversation();
+        let tools = vec![bash_tool()];
+        let plain =
+            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default());
+
+        assert!(
+            plain.get("prompt_cache_key").is_none(),
+            "a keyless request grew a cache field"
+        );
+        assert!(
+            !request_text(&plain).contains("prompt_cache_key"),
+            "the field name reached the wire without a key to carry"
+        );
+
+        // A caller deriving a key from an empty conversation ID must land on the same bytes rather
+        // than routing every such session into one shared empty lane.
+        let blank = build_request_body(
+            "gpt-test",
+            &messages,
+            &tools,
+            &CompletionOptions::default().with_prompt_cache_key("   "),
+        );
+        assert_eq!(request_text(&blank), request_text(&plain));
+    }
+
+    #[test]
+    fn a_cache_key_adds_one_field_and_disturbs_nothing_else() {
+        // The key is worth nothing if setting it edits the very prefix it is meant to match. Every
+        // field the previous request had must survive unchanged; the key may only be added.
+        let messages = cached_conversation();
+        let tools = vec![bash_tool()];
+        let plain =
+            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default());
+        let keyed = build_request_body(
+            "gpt-test",
+            &messages,
+            &tools,
+            &CompletionOptions::default().with_prompt_cache_key("session-7"),
+        );
+
+        assert_eq!(keyed["prompt_cache_key"], "session-7");
+        let plain_fields = plain.as_object().expect("request object");
+        let keyed_fields = keyed.as_object().expect("request object");
+        assert_eq!(
+            keyed_fields.len(),
+            plain_fields.len() + 1,
+            "the cache key added or removed a field other than its own"
+        );
+        for (field, value) in plain_fields {
+            assert_eq!(
+                request_text(value),
+                request_text(&keyed_fields[field]),
+                "the cache key rewrote {field}, which is part of the prefix it is supposed to hit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_codex_transport_sends_a_cache_key_only_when_a_caller_supplies_one() {
+        // Proves the plumbing reaches the socket and that plain `complete` still does not: the
+        // trait's keyless entry point delegates with default options, so today's callers send
+        // exactly what they sent before.
+        let completion = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let server = MockServer::start(vec![
+            MockResponse::sse(completion),
+            MockResponse::sse(completion),
+        ]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(
+            &path,
+            &ChatGptCredentials {
+                version: AUTH_VERSION,
+                access: Redacted::new(fake_access("acct-test")),
+                refresh: Redacted::new("refresh-secret".to_owned()),
+                expires_at: u64::MAX,
+                account_id: "acct-test".to_owned(),
+            },
+        )
+        .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+        let messages = vec![ModelMessage::user("hello")];
+
+        model.complete(&messages, &[]).expect("keyless turn");
+        model
+            .complete_with(
+                &messages,
+                &[],
+                &CompletionOptions::default().with_prompt_cache_key("session-7"),
+            )
+            .expect("keyed turn");
+
+        // Substrings rather than a body comparison: the exact spacing is the HTTP client's
+        // choice, and what matters here is only which request carried the key.
+        let requests = server.requests.lock().expect("request lock");
+        assert!(
+            !requests[0].contains("prompt_cache_key"),
+            "complete sent a cache key nobody asked for"
+        );
+        assert!(requests[1].contains("prompt_cache_key"));
+        assert!(requests[1].contains("session-7"));
     }
 
     #[test]

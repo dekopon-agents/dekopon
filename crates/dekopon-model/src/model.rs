@@ -157,6 +157,51 @@ pub struct AssistantTurn {
     pub replay_items: Vec<Value>,
 }
 
+/// Request-scoped routing metadata for one model call.
+///
+/// Deliberately separate from `messages` and `tools`: nothing here changes what the model is
+/// asked, only how the provider routes the request that carries it. Every field is optional and a
+/// transport that does not understand one omits it, so the worst outcome of a field going
+/// unrecognized is that the request costs more — never that it answers differently.
+///
+/// Options are passed per request rather than stored on a client. The model client is currently
+/// rebuilt for each gateway message, and the obvious optimization is to share one client across
+/// sessions; a value captured in a constructor would then describe the first conversation forever
+/// while quietly mislabeling every later one.
+///
+/// Fields are private so later routing metadata can join this struct without breaking callers that
+/// build it with [`CompletionOptions::default`] and the `with_*` methods.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompletionOptions {
+    prompt_cache_key: Option<String>,
+}
+
+impl CompletionOptions {
+    /// Groups this request with earlier requests carrying the same key.
+    ///
+    /// The key is a hint for the provider's automatic prefix cache: it tells the backend which
+    /// requests are likely to share a leading prefix so they can be routed to the same cache. It
+    /// is **not** an access-control boundary and grants nothing — the request still carries the
+    /// whole conversation, and a backend that ignores the field returns a byte-identical answer at
+    /// full price. Choose a value that is stable for one conversation and unshared between
+    /// unrelated ones; a key reused across conversations only wastes cache lookups.
+    ///
+    /// A blank key is dropped rather than sent, so a caller that computes an empty identifier
+    /// leaves the request exactly as it would have been with no key at all.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        self.prompt_cache_key = (!key.trim().is_empty()).then_some(key);
+        self
+    }
+
+    /// Returns the prompt cache key when one is set.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
+    }
+}
+
 /// Synchronous model boundary used by the immediate prompt loop.
 pub trait ChatModel {
     /// Requests the next assistant turn.
@@ -165,6 +210,27 @@ pub trait ChatModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
     ) -> Result<AssistantTurn, ModelError>;
+
+    /// Requests the next assistant turn with request-scoped routing metadata.
+    ///
+    /// Provided rather than required so that adding routing metadata does not force every
+    /// implementation — most of which are test doubles — to grow a parameter it has no use for.
+    /// The default discards `options` and calls [`ChatModel::complete`], which is the safe
+    /// degradation: an implementation that never learned about a field behaves exactly as it did
+    /// before, because nothing in [`CompletionOptions`] is required for a correct answer.
+    ///
+    /// Transports that do act on options should override this method and define `complete` as
+    /// delegating to it with [`CompletionOptions::default`], so one request-building path serves
+    /// both entry points and the two cannot drift apart.
+    fn complete_with(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+    ) -> Result<AssistantTurn, ModelError> {
+        let _ = options;
+        self.complete(messages, tools)
+    }
 }
 
 /// OpenAI-compatible chat-completions client.
@@ -231,6 +297,15 @@ impl ChatModel for OpenAiChatModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
     ) -> Result<AssistantTurn, ModelError> {
+        self.complete_with(messages, tools, &CompletionOptions::default())
+    }
+
+    fn complete_with(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+    ) -> Result<AssistantTurn, ModelError> {
         let span = tracing::info_span!(
             "model.complete",
             model = %self.model,
@@ -251,6 +326,7 @@ impl ChatModel for OpenAiChatModel {
             messages,
             tools: &tools,
             tool_choice: "auto",
+            prompt_cache_key: options.prompt_cache_key(),
         };
 
         let mut request = self
@@ -296,6 +372,10 @@ struct ChatRequest<'a> {
     messages: &'a [ModelMessage],
     tools: &'a [OpenAiTool<'a>],
     tool_choice: &'static str,
+    /// Skipped when absent so a request without a cache key serializes to the same bytes it did
+    /// before the field existed. Compatible endpoints that have never heard of it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -486,9 +566,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AssistantTurn, ChatRequest, ChatResponse, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, ModelUsage, OpenAiChatModel, OpenAiTool, WireFunctionCall,
-        WireToolCall, assistant_message, completion_url,
+        AssistantTurn, ChatModel, ChatRequest, ChatResponse, CompletionOptions, ModelError,
+        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage, OpenAiChatModel,
+        OpenAiTool, WireFunctionCall, WireToolCall, assistant_message, completion_url,
     };
 
     #[test]
@@ -662,6 +742,7 @@ mod tests {
                     messages: &messages,
                     tools: &tools,
                     tool_choice: "auto",
+                    prompt_cache_key: None,
                 })
                 .expect("serialize chat request"),
             );
@@ -706,6 +787,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_chat_request_carries_a_cache_key_only_when_one_is_set() {
+        // Same contract as the Codex transport: absent means the field is gone, not null, so an
+        // OpenAI-compatible endpoint that has never heard of `prompt_cache_key` keeps receiving
+        // the request it always received.
+        let tool = ModelTool {
+            name: "bash".to_owned(),
+            description: "Run a sandboxed script".to_owned(),
+            parameters: json!({"type": "object"}),
+        };
+        let tools = vec![OpenAiTool {
+            kind: "function",
+            function: &tool,
+        }];
+        let messages = vec![
+            ModelMessage::system("Be concise."),
+            ModelMessage::user("how many files are in the repository?"),
+        ];
+        let request = |prompt_cache_key| {
+            serde_json::to_value(ChatRequest {
+                model: "test-model",
+                messages: &messages,
+                tools: &tools,
+                tool_choice: "auto",
+                prompt_cache_key,
+            })
+            .expect("serialize chat request")
+        };
+
+        let plain = request(None);
+        let keyed = request(Some("session-7"));
+
+        assert!(
+            plain.get("prompt_cache_key").is_none(),
+            "a keyless request grew a cache field"
+        );
+        assert!(!request_text(&plain).contains("prompt_cache_key"));
+        assert_eq!(keyed["prompt_cache_key"], "session-7");
+        let plain_fields = plain.as_object().expect("request object");
+        let keyed_fields = keyed.as_object().expect("request object");
+        assert_eq!(
+            keyed_fields.len(),
+            plain_fields.len() + 1,
+            "the cache key added or removed a field other than its own"
+        );
+        for (field, value) in plain_fields {
+            assert_eq!(
+                request_text(value),
+                request_text(&keyed_fields[field]),
+                "the cache key rewrote {field}, which is part of the prefix it is supposed to hit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_cache_key_is_dropped_rather_than_routed() {
+        assert_eq!(CompletionOptions::default().prompt_cache_key(), None);
+        assert_eq!(
+            CompletionOptions::default()
+                .with_prompt_cache_key(" \t\n")
+                .prompt_cache_key(),
+            None,
+            "a caller that computed an empty identifier must send no key at all"
+        );
+        assert_eq!(
+            CompletionOptions::default()
+                .with_prompt_cache_key("session-7")
+                .prompt_cache_key(),
+            Some("session-7")
+        );
+    }
+
+    #[test]
+    fn a_model_that_only_implements_complete_still_answers_through_complete_with() {
+        // The whole reason `complete_with` is a provided method: a third-party or test model that
+        // never heard of routing metadata keeps compiling, and ignoring the options costs it a
+        // cache hit rather than an answer. This double is what the six test doubles elsewhere in
+        // the workspace look like, and none of them had to change.
+        struct KeylessModel;
+
+        impl ChatModel for KeylessModel {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                _tools: &[ModelTool],
+            ) -> Result<AssistantTurn, ModelError> {
+                Ok(AssistantTurn {
+                    content: messages.last().and_then(|message| {
+                        message.content().map(|content| content.to_uppercase())
+                    }),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    replay_items: Vec::new(),
+                })
+            }
+        }
+
+        let turn = KeylessModel
+            .complete_with(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default().with_prompt_cache_key("session-7"),
+            )
+            .expect("a keyless implementation still answers");
+
+        assert_eq!(turn.content.as_deref(), Some("HELLO"));
     }
 
     #[test]
