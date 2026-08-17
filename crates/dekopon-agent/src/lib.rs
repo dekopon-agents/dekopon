@@ -3,7 +3,9 @@
 //! `dekopon-run` drives one prompt session from a CLI; `dekopond` drives many from chat transports. Both need the same four pieces, and this crate is where they live so there is one
 //! authoritative copy:
 //!
-//! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool;
+//! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
+//!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
+//!   bounded [`prompt::History`] for transports whose next message continues a conversation;
 //! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
 //!   fresh `dekopon-shell` interpreter under a session-wide capability budget;
 //! - [`SessionInvoker`] — capability dispatch that prefers a local read-only leg and falls through

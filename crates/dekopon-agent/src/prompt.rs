@@ -16,6 +16,10 @@ use thiserror::Error;
 
 use crate::milliseconds;
 
+mod history;
+
+pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
+
 /// Model-facing name of the single scripting tool.
 ///
 /// Named for what it resembles rather than what it is. Models have overwhelming priors about a
@@ -77,6 +81,10 @@ pub struct PromptOutcome {
 /// This is synchronous on purpose. Both boundaries it sits between — `ChatModel` and
 /// [`ScriptRuntime`] — are synchronous by design, so the caller runs the whole loop on a blocking
 /// task rather than colouring these signatures `async`.
+///
+/// The session starts from an empty conversation and forgets it on the way out, which is what a
+/// one-shot invocation wants. Use [`run_prompt_with_history`] to continue a conversation across
+/// calls.
 pub fn run_prompt<M, R>(
     model: &M,
     runtime: &R,
@@ -88,16 +96,81 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
+    let mut history = History::default();
+    run_prompt_with_history(model, runtime, prompt, system, limits, &mut history)
+}
+
+/// Runs one bounded prompt/tool session as the continuation of an earlier conversation.
+///
+/// `history` is both the input and the output: the remembered exchanges are replayed ahead of
+/// `prompt`, and this session's own exchange is recorded into it before returning. It is an
+/// accumulator rather than a returned value on purpose. A session that fails still consumed the
+/// operator's message, and a signature returning `(PromptOutcome, History)` hands the history back
+/// only on the success path — every caller writing the natural `?` would silently drop the
+/// conversation exactly when a turn had gone wrong and the operator was about to retry. Borrowing
+/// the accumulator makes losing it impossible: whatever the caller does with the `Result`, the
+/// exchange is already recorded. See [`ConversationTurn::unanswered`] for what a failed turn
+/// leaves behind.
+///
+/// `system` is supplied fresh on every call and is never remembered; [`ConversationTurn`] explains
+/// the request corruption that separation prevents. The upside is that editing an agent's
+/// instructions takes effect on the next message without rewriting a single stored conversation.
+/// The matching obligation is on the caller: pass the *same* `system` for every call of one
+/// conversation unless a change is intended. Instructions are hoisted out of the message list
+/// entirely on the ChatGPT path, so changing them — including changing between `None` and
+/// `Some`, since an absent system prompt is replaced by that backend's own default rather than by
+/// nothing — rewrites the front of every subsequent request and discards the provider's prompt
+/// cache for the conversation.
+pub fn run_prompt_with_history<M, R>(
+    model: &M,
+    runtime: &R,
+    prompt: &str,
+    system: Option<&str>,
+    limits: PromptLimits,
+    history: &mut History,
+) -> Result<PromptOutcome, PromptError>
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
     if limits.max_steps == 0 {
+        // Nothing is recorded here: a zero-step session builds no request, so the prompt never
+        // reached a model and the conversation must not claim otherwise.
         return Err(PromptError::ZeroSteps);
     }
 
-    let model_tools = vec![script_tool()];
+    // Order matters and is fixed here rather than left to callers: instructions first, then what
+    // the conversation remembers, then what the operator just said.
     let mut messages = Vec::new();
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
     }
+    history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
+
+    let result = run_session(model, runtime, messages, limits);
+    history.record(match &result {
+        Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
+        Err(_) => ConversationTurn::unanswered(prompt),
+    });
+    result
+}
+
+/// Drives the model turns for one session over an already-seeded message vector.
+///
+/// Split out so that every exit path — answer, budget exhaustion, refused tool call, transport
+/// failure — funnels back through one caller that records the exchange.
+fn run_session<M, R>(
+    model: &M,
+    runtime: &R,
+    mut messages: Vec<ModelMessage>,
+    limits: PromptLimits,
+) -> Result<PromptOutcome, PromptError>
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
+    let model_tools = vec![script_tool()];
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -570,18 +643,23 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
+        ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits,
         PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, format_script_outcome,
-        run_prompt, script_tool,
+        run_prompt, run_prompt_with_history, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
     ///
     /// `Mutex` rather than `RefCell`: the loop now runs on a blocking task, so every fixture it
     /// touches has to cross a thread boundary.
+    ///
+    /// The whole `messages` slice is captured rather than a filtered projection of it. History
+    /// assertions are about ordering, role placement, and what is *absent* from a request, none of
+    /// which survive a filter applied before the test sees the request.
     struct ScriptedModel {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
-        observed_tool_messages: Mutex<Vec<String>>,
+        observed_messages: Mutex<Vec<Vec<ModelMessage>>>,
     }
 
     impl ScriptedModel {
@@ -589,8 +667,43 @@ mod tests {
             Self {
                 turns: Mutex::new(turns.into_iter().collect()),
                 observed_tools: Mutex::new(Vec::new()),
-                observed_tool_messages: Mutex::new(Vec::new()),
+                observed_messages: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Messages the model saw on its first request of the session.
+        fn first_request(&self) -> Vec<ModelMessage> {
+            self.observed_messages
+                .lock()
+                .expect("message observations lock")
+                .first()
+                .cloned()
+                .expect("the model was asked at least once")
+        }
+
+        /// `(role, content)` pairs from the first request, the shape most assertions want.
+        fn first_roles(&self) -> Vec<(&'static str, String)> {
+            self.first_request()
+                .iter()
+                .map(|message| {
+                    (
+                        message.role(),
+                        message.content().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Every tool result the model was handed, across every request.
+        fn tool_messages(&self) -> Vec<String> {
+            self.observed_messages
+                .lock()
+                .expect("message observations lock")
+                .iter()
+                .flatten()
+                .filter(|message| message.role() == "tool")
+                .filter_map(|message| message.content().map(str::to_owned))
+                .collect()
         }
     }
 
@@ -604,15 +717,10 @@ mod tests {
                 .lock()
                 .expect("tool observations lock")
                 .push(tools.to_vec());
-            self.observed_tool_messages
+            self.observed_messages
                 .lock()
-                .expect("tool message lock")
-                .extend(
-                    messages
-                        .iter()
-                        .filter(|message| message.role() == "tool")
-                        .filter_map(|message| message.content().map(str::to_owned)),
-                );
+                .expect("message observations lock")
+                .push(messages.to_vec());
             self.turns
                 .lock()
                 .expect("turn lock")
@@ -685,6 +793,442 @@ mod tests {
         }
     }
 
+    /// A conversation of `count` answered exchanges, every turn the same size.
+    fn conversation(count: usize) -> Vec<ConversationTurn> {
+        (1..=count)
+            .map(|index| {
+                ConversationTurn::completed(format!("ask {index}"), format!("answer {index}"))
+            })
+            .collect()
+    }
+
+    /// Asserts a replayed window is a request both backends accept.
+    ///
+    /// The two 400s this feature could produce are a `tool` result whose call was trimmed away and
+    /// an assistant `tool_calls` nothing answered. Neither is checked by reading the loop: both are
+    /// checked on the serialized message, because the serialized message is what a backend sees.
+    fn assert_window_is_well_formed(history: &History) {
+        let mut messages = Vec::new();
+        history.replay_into(&mut messages);
+
+        let expected = history
+            .turns()
+            .iter()
+            .map(|turn| 1 + usize::from(turn.is_answered()))
+            .sum::<usize>();
+        assert_eq!(messages.len(), expected);
+
+        for (index, message) in messages.iter().enumerate() {
+            let encoded = serde_json::to_value(message).expect("a message serializes");
+            let fields = encoded.as_object().expect("a message is a JSON object");
+            assert!(
+                matches!(message.role(), "user" | "assistant"),
+                "message {index} replays role {:?}",
+                message.role()
+            );
+            assert!(
+                !fields.contains_key("tool_calls"),
+                "message {index} replays a tool call nothing answers"
+            );
+            assert!(
+                !fields.contains_key("tool_call_id"),
+                "message {index} replays an orphaned tool result"
+            );
+            // A replayed message must carry its text on the wire. The ChatGPT backend emits an
+            // assistant message that carries provider replay items as *only* those items and
+            // discards its content, so a remembered answer reaching the request as anything other
+            // than plain content would disappear from it without an error.
+            assert!(
+                fields.contains_key("content"),
+                "message {index} replays without content"
+            );
+        }
+
+        let mut position = 0;
+        for turn in history.turns() {
+            assert_eq!(messages[position].role(), "user");
+            assert_eq!(messages[position].content(), Some(turn.user()));
+            position += 1;
+            if let Some(answer) = turn.answer() {
+                assert_eq!(messages[position].role(), "assistant");
+                assert_eq!(messages[position].content(), Some(answer));
+                position += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_window_is_bounded_in_both_dimensions() {
+        let limits = HistoryLimits::default();
+
+        assert_eq!(limits.max_turns, DEFAULT_MAX_TURNS);
+        assert_eq!(limits.max_bytes, DEFAULT_MAX_BYTES);
+        assert!(History::default().is_empty());
+        assert_eq!(History::default().limits(), limits);
+    }
+
+    #[test]
+    fn a_seeded_conversation_reaches_the_model_ahead_of_the_new_prompt() {
+        let model = ScriptedModel::new([answer("Two.")]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::from_turns(HistoryLimits::default(), conversation(2));
+
+        run_prompt_with_history(
+            &model,
+            &runtime,
+            "and now?",
+            Some("Be terse."),
+            limits(2, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(
+            model.first_roles(),
+            vec![
+                ("system", "Be terse.".to_owned()),
+                ("user", "ask 1".to_owned()),
+                ("assistant", "answer 1".to_owned()),
+                ("user", "ask 2".to_owned()),
+                ("assistant", "answer 2".to_owned()),
+                ("user", "and now?".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_instructions_are_prepended_once_per_call_and_never_remembered() {
+        // The failure this guards is silent rather than loud: the ChatGPT backend joins every
+        // `system` message it is handed into one `instructions` string, so a conversation that
+        // remembered the system prompt would send an agent its own instructions concatenated with
+        // themselves, one extra copy per exchange, with no error from anywhere.
+        let system = "You are Dekopon.";
+        let mut history = History::default();
+
+        for exchange in 1..=3 {
+            let model = ScriptedModel::new([answer(&format!("answer {exchange}"))]);
+            let runtime = RecordingRuntime::new(0);
+
+            run_prompt_with_history(
+                &model,
+                &runtime,
+                &format!("ask {exchange}"),
+                Some(system),
+                limits(2, 32),
+                &mut history,
+            )
+            .expect("prompt session succeeds");
+
+            let request = model.first_request();
+            let instructions = request
+                .iter()
+                .filter(|message| message.role() == "system")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                instructions.len(),
+                1,
+                "exchange {exchange} sent {} system messages",
+                instructions.len()
+            );
+            assert_eq!(instructions[0].content(), Some(system));
+            assert_eq!(request[0].role(), "system");
+        }
+
+        assert_eq!(history.len(), 3);
+        assert_window_is_well_formed(&history);
+        let mut replayed = Vec::new();
+        history.replay_into(&mut replayed);
+        assert!(replayed.iter().all(|message| message.role() != "system"));
+    }
+
+    #[test]
+    fn a_remembered_exchange_carries_no_tool_traffic() {
+        let model = ScriptedModel::new([
+            script_call("call-1", "one"),
+            script_call("call-2", "two"),
+            answer("I ran two scripts."),
+        ]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        run_prompt_with_history(
+            &model,
+            &runtime,
+            "do the work",
+            None,
+            limits(8, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        // The session itself saw every tool result, and the conversation kept none of them: one
+        // script's output can be 256 KiB, which is what replaying transcripts would cost.
+        assert!(!model.tool_messages().is_empty());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "do the work");
+        assert_eq!(history.turns()[0].answer(), Some("I ran two scripts."));
+        assert_window_is_well_formed(&history);
+
+        let next = ScriptedModel::new([answer("done")]);
+        run_prompt_with_history(
+            &next,
+            &RecordingRuntime::new(0),
+            "and again",
+            None,
+            limits(2, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(
+            next.first_roles(),
+            vec![
+                ("user", "do the work".to_owned()),
+                ("assistant", "I ran two scripts.".to_owned()),
+                ("user", "and again".to_owned()),
+            ]
+        );
+        assert!(next.tool_messages().is_empty());
+    }
+
+    #[test]
+    fn every_cut_point_leaves_whole_exchanges() {
+        let turns = conversation(6);
+        let total_bytes = turns.iter().map(ConversationTurn::bytes).sum::<usize>();
+
+        for max_turns in 0..=turns.len() {
+            let history = History::from_turns(
+                HistoryLimits {
+                    max_turns,
+                    max_bytes: usize::MAX,
+                },
+                turns.clone(),
+            );
+
+            assert_eq!(history.len(), max_turns);
+            assert_window_is_well_formed(&history);
+            // Trimming is oldest-first in whole exchanges, so survivors are always a suffix.
+            assert_eq!(history.turns(), &turns[turns.len() - max_turns..]);
+        }
+
+        for max_bytes in 0..=total_bytes + 1 {
+            let history = History::from_turns(
+                HistoryLimits {
+                    max_turns: usize::MAX,
+                    max_bytes,
+                },
+                turns.clone(),
+            );
+
+            assert!(history.bytes() <= max_bytes);
+            assert_window_is_well_formed(&history);
+            assert_eq!(history.turns(), &turns[turns.len() - history.len()..]);
+        }
+    }
+
+    #[test]
+    fn the_turn_bound_and_the_byte_bound_each_trim_on_their_own() {
+        let turns = conversation(4);
+
+        let by_turns = History::from_turns(
+            HistoryLimits {
+                max_turns: 2,
+                max_bytes: usize::MAX,
+            },
+            turns.clone(),
+        );
+        assert_eq!(by_turns.len(), 2);
+        assert_eq!(by_turns.turns()[0].user(), "ask 3");
+
+        let by_bytes = History::from_turns(
+            HistoryLimits {
+                max_turns: usize::MAX,
+                max_bytes: turns[0].bytes(),
+            },
+            turns.clone(),
+        );
+        assert_eq!(by_bytes.len(), 1);
+        assert_eq!(by_bytes.turns()[0].user(), "ask 4");
+    }
+
+    #[test]
+    fn an_exchange_too_large_for_the_window_leaves_it_empty_rather_than_half_present() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 8,
+            max_bytes: 4,
+        });
+
+        history.record(ConversationTurn::completed(
+            "a long question",
+            "a long answer",
+        ));
+
+        assert!(history.is_empty());
+        assert_window_is_well_formed(&history);
+    }
+
+    #[test]
+    fn a_running_conversation_trims_itself_as_it_grows() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 2,
+            max_bytes: usize::MAX,
+        });
+
+        for exchange in 1..=4 {
+            let model = ScriptedModel::new([answer(&format!("answer {exchange}"))]);
+            run_prompt_with_history(
+                &model,
+                &RecordingRuntime::new(0),
+                &format!("ask {exchange}"),
+                None,
+                limits(2, 32),
+                &mut history,
+            )
+            .expect("prompt session succeeds");
+        }
+
+        assert_eq!(history.len(), 2);
+        let model = ScriptedModel::new([answer("done")]);
+        run_prompt_with_history(
+            &model,
+            &RecordingRuntime::new(0),
+            "ask 5",
+            None,
+            limits(2, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(
+            model.first_roles(),
+            vec![
+                ("user", "ask 3".to_owned()),
+                ("assistant", "answer 3".to_owned()),
+                ("user", "ask 4".to_owned()),
+                ("assistant", "answer 4".to_owned()),
+                ("user", "ask 5".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_that_never_answers_still_remembers_what_it_was_asked() {
+        let model = ScriptedModel::new([
+            script_call("call-1", "echo one"),
+            script_call("call-2", "echo two"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_with_history(
+            &model,
+            &runtime,
+            "loop forever",
+            None,
+            limits(2, 32),
+            &mut history,
+        )
+        .expect_err("an answerless session must terminate");
+
+        assert!(matches!(error, PromptError::MaxSteps { maximum: 2 }));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "loop forever");
+        assert_eq!(history.turns()[0].answer(), None);
+        assert!(!history.turns()[0].is_answered());
+        assert_window_is_well_formed(&history);
+
+        // The retry knows what it is a retry of, and the abandoned attempt's tool traffic is gone.
+        let retry = ScriptedModel::new([answer("sorry about that")]);
+        run_prompt_with_history(
+            &retry,
+            &RecordingRuntime::new(0),
+            "try again",
+            None,
+            limits(2, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(
+            retry.first_roles(),
+            vec![
+                ("user", "loop forever".to_owned()),
+                ("user", "try again".to_owned()),
+            ]
+        );
+        assert!(retry.tool_messages().is_empty());
+    }
+
+    #[test]
+    fn a_broken_model_connection_still_remembers_what_it_was_asked() {
+        let model = ScriptedModel::new([]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_with_history(
+            &model,
+            &runtime,
+            "ask something",
+            None,
+            limits(2, 32),
+            &mut history,
+        )
+        .expect_err("a model failure ends the session");
+
+        assert!(matches!(error, PromptError::Model(_)));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "ask something");
+        assert!(!history.turns()[0].is_answered());
+    }
+
+    #[test]
+    fn a_zero_step_session_records_nothing() {
+        // A usage error, not a conversation event: no request was built, so nothing in the
+        // conversation may claim the model was asked.
+        let model = ScriptedModel::new([]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::from_turns(HistoryLimits::default(), conversation(1));
+
+        let error = run_prompt_with_history(
+            &model,
+            &runtime,
+            "nothing",
+            None,
+            limits(0, 32),
+            &mut history,
+        )
+        .expect_err("a zero-step session is a usage error");
+
+        assert!(matches!(error, PromptError::ZeroSteps));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "ask 1");
+    }
+
+    #[test]
+    fn run_prompt_starts_every_session_from_an_empty_conversation() {
+        for _ in 0..2 {
+            let model = ScriptedModel::new([answer("done")]);
+            let runtime = RecordingRuntime::new(0);
+
+            run_prompt(
+                &model,
+                &runtime,
+                "same question",
+                Some("Be terse."),
+                limits(2, 32),
+            )
+            .expect("prompt session succeeds");
+
+            assert_eq!(
+                model.first_roles(),
+                vec![
+                    ("system", "Be terse.".to_owned()),
+                    ("user", "same question".to_owned()),
+                ]
+            );
+        }
+    }
+
     #[test]
     fn offers_exactly_one_scripting_tool() {
         let tool = script_tool();
@@ -743,10 +1287,7 @@ mod tests {
         run_prompt(&model, &runtime, "run something", None, limits(4, 32))
             .expect("prompt session succeeds");
 
-        let messages = model
-            .observed_tool_messages
-            .lock()
-            .expect("tool message lock");
+        let messages = model.tool_messages();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], "ran 7 bytes\n[exit code: 0]");
     }

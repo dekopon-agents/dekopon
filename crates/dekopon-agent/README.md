@@ -7,6 +7,17 @@ authoritative copy of each:
 
 - `prompt::run_prompt` — the bounded model tool loop that offers a single sandboxed
   scripting tool (`bash`) instead of one tool per capability.
+- `prompt::run_prompt_with_history` — the same loop run as the continuation of a
+  `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
+  there is no tokenizer here and token counts only arrive after a call has been billed.
+  Only the prompt and the final answer of each exchange are remembered; the assistant
+  turns carrying `tool_calls` and the `tool` results answering them are dropped together,
+  which is both the cost control and what makes trimming safe. A `ConversationTurn` holds
+  text rather than messages, so it cannot remember a system prompt, cannot hold half a
+  tool call, and cannot carry provider replay state out of the session that produced it —
+  which is also what lets one conversation replay identically on either model backend
+  rather than losing encrypted reasoning silently on the way across. The session's own
+  exchange is recorded even when the session fails, so a failed turn is not silently lost.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
