@@ -223,12 +223,27 @@ impl SlackTransport {
                 Some(thread_ts.clone().unwrap_or_else(|| ts.to_owned()))
             }
         };
+        // The conversation is the thread the answer joins, never `thread_ts`. Slack omits
+        // `thread_ts` on the message that *starts* a thread and sends it on every reply inside one,
+        // so the first turn and the answers to it disagree about `thread` even though they are the
+        // same exchange. Deriving the identity from `reply_thread` — the value the bot actually
+        // replies into — is what keeps turn one attached to the thread it opened. Do not
+        // "simplify" this back to `thread_ts`; that is the bug.
+        //
+        // Prefixed with the channel because a Slack `ts` is only unique within its channel, and
+        // this identity has to stand on its own once it leaves the transport. A direct message has
+        // no thread to join, so the whole conversation is the DM channel.
+        let conversation_id = match &reply_thread {
+            Some(thread) => format!("{channel}:{thread}"),
+            None => channel.to_owned(),
+        };
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
             channel: channel.to_owned(),
             thread: thread_ts,
+            conversation_id,
             message_id: ts.to_owned(),
             text: bound_inbound(text),
             conversation,

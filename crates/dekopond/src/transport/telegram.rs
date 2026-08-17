@@ -129,12 +129,19 @@ impl TelegramTransport {
             ConversationKind::Channel(_) => Some(message_id),
         };
 
+        // The Bot API has no thread identifier on a plain message, so a conversation *is* its chat:
+        // one private chat and one group are each a single continuous exchange. Deriving it here
+        // anyway, rather than letting a caller assume the channel, keeps every transport answering
+        // the same question in its own terms.
+        let conversation_id = chat_id.to_string();
+
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
             subject: ExternalSubject::telegram(&user.to_string())
                 .map_err(TransportError::Subject)?,
             channel: chat_id.to_string(),
             thread: None,
+            conversation_id,
             message_id: message_id.to_string(),
             text: bound_inbound(text),
             conversation,

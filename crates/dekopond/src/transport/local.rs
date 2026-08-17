@@ -142,8 +142,13 @@ impl LocalTransport {
                 let message = InboundMessage {
                     transport: name.clone(),
                     subject: request.subject,
-                    channel: request.channel,
+                    channel: request.channel.clone(),
                     thread: None,
+                    // The caller names its own conversation, and `channel` defaults to `dev` when
+                    // it does not. There is nothing else here to derive one from — a local session
+                    // has no threads, and the connection number would restart the conversation
+                    // every time a developer reconnected.
+                    conversation_id: request.channel,
                     message_id: format!("{connection}-{sequence}"),
                     text: bound_inbound(&request.text),
                     // Always a direct message: a local caller is talking to the daemon
