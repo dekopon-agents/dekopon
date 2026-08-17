@@ -241,7 +241,7 @@ that a key and a canonical subject never share a record.
 | Span | Crate | Fields |
 |---|---|---|
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one |
 | `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, request/response body sizes, `outcome` |
@@ -255,6 +255,12 @@ none of them reach a span field.
 
 `provider.compile` covers startup component compilation rather than per-invocation work, so it
 answers "why was the broker slow to become ready" rather than "why was that call slow".
+
+`broker.execute`'s `credential` is the owner-authored symbolic name from `broker.yaml`, never the
+secret and never the header. It exists because one capability can present a different credential per
+acting agent, and a trace that named none of them would make two writes to two different
+organizations look identical — the same reason the terminal audit record carries it. A `Redacted`
+value renders its marker in either payload mode, so the value cannot arrive by another route.
 
 ## Span payloads
 

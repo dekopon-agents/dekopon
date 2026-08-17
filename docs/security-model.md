@@ -52,7 +52,7 @@ The trust model this accepts should be stated plainly. In the current single-UID
 - Provider permissions should be least privilege and independently enforced by provider credentials.
 - Authorization constraints bind timeout, output size, exact HTTP destinations/methods, call counts, and byte ceilings.
 - Retries account for declared idempotency and use provider-enforced idempotency keys where available.
-- Credentials do not appear in agent prompts, authored catalogs, invocation evidence, or normal logs.
+- Credential values do not appear in agent prompts, authored catalogs, invocation evidence, or normal logs. A credential's symbolic *name* is owner-authored configuration rather than secret material, and the broker records it in audit so an effect can be attributed to the authority that carried it.
 - A component import declares a required host interface; it never grants that interface or any transitive authority.
 - Broker HTTP authorization binds exact destinations, methods, host-call counts, byte limits, and deadlines to one invocation.
 
@@ -164,7 +164,31 @@ Decisions are explainable without being leaky. Every audit record carries `polic
 
 `dekopon-brokerd` now performs server-side Unix socket acceptance and derives `AuthenticatedContext` from the connected peer UID plus exact trusted configuration. It requires a private non-symlink parent, creates an owner-only socket, refuses unsafe/live replacement, limits concurrent one-request connections, drains under a configured grace period, restores replay IDs before listening, and removes only its own socket inode. Its strict configuration and provider files must be single-link, server-owned, and not group/world writable; provider parents must also be protected, writable non-sticky ancestors are rejected, and socket/audit/checkpoint/lock parents must be owner-only. The checkpoint has a dedicated single-writer lock, rejects symlinks and hard links, and uses synchronized temporary-file replacement plus parent-directory synchronization. Because mode `0600` makes the socket one UID trust domain, every process under that UID can use its configured actor—use a dedicated UID when this matters.
 
-The service performs no process attestation, independent remote/signed checkpoint anchoring, or non-Unix network transport. It does inject destination-bound provider credentials: secrets load from an owner-only `0600` credentials file into `Redacted` wrappers, bind to explicit destination authorities that must cover every allowed host of the constraint set naming them, and enter a request only inside the native HTTP engine after guest headers were validated — a guest-supplied `authorization` header remains rejected, never overwritten. Evidence, audit, spans, accounting logs, and public results record only that injection happened (`credentialInjected`), never the value, and redaction plus destination binding are independently tested. Its checkpoint is durable and externally inspectable, but locally rolling back or deleting both the audit and checkpoint can defeat comparison unless checkpoint generations are independently retained. Its presence does not expand direct `dekopon-run`: immediate subcommands retain the separate empty linker and reject HTTP-importing fixtures. Explicit broker subcommands load no component, require a trusted server UID, validate socket metadata/peer credentials, and send proposals with no identity, policy, constraint, credential, or authorization field. Their normal dependency path stops at the lightweight protocol/provider-metadata crates; CI rejects privileged broker, native-HTTP, or broker-service dependencies in the runner binary.
+The service performs no process attestation, independent remote/signed checkpoint anchoring, or non-Unix network transport. It does inject destination-bound provider credentials: secrets load from an owner-only `0600` credentials file into `Redacted` wrappers, bind to explicit destination authorities that must cover every allowed host of the constraint set naming them, and enter a request only inside the native HTTP engine after guest headers were validated — a guest-supplied `authorization` header remains rejected, never overwritten. A constraint set may name one default credential and per-agent overrides of it; every credential the set can select is proved against the store and against that set's allowed hosts at startup, so an override is exactly as validated as the default. Evidence, audit, spans, accounting logs, and public results record only that injection happened (`credentialInjected`) and, in the terminal audit record and the execution span, the credential's owner-authored symbolic name — never the value, and redaction plus destination binding are independently tested. Its checkpoint is durable and externally inspectable, but locally rolling back or deleting both the audit and checkpoint can defeat comparison unless checkpoint generations are independently retained. Its presence does not expand direct `dekopon-run`: immediate subcommands retain the separate empty linker and reject HTTP-importing fixtures. Explicit broker subcommands load no component, require a trusted server UID, validate socket metadata/peer credentials, and send proposals with no identity, policy, constraint, credential, or authorization field. Their normal dependency path stops at the lightweight protocol/provider-metadata crates; CI rejects privileged broker, native-HTTP, or broker-service dependencies in the runner binary.
+
+## Per-agent credentials, and where their boundary stops
+
+**Status: current.** A constraint set may present a different broker-held secret depending on which
+agent is acting. Combined with the mechanisms above — a route binding a transport and a channel
+match to an agent, a canonical subject mapping to its own principal, and a policy conditioned on
+`context.via` and `context.agent` — this is what makes two organizations reachable from one broker
+with two tokens, no capability duplicated and no token reachable from the wrong workspace.
+
+The selection input is trusted for the same reason `via` is. The agent name lives in the
+`AuthenticatedContext` the broker derived from an owner-configured attestor grant and identity
+mapping; it is never a payload field, and the map from agent to credential is owner-authored
+configuration in the same file as the timeouts and allowed hosts. A caller with no agent — a direct
+peer carrying `Actor::Service` — matches no override and takes the default. Policy cannot reach any
+of it: a policy edit can broaden who may drive an agent and can never bind a credential.
+
+Two limits are worth stating plainly. **Policy still cannot bind a path**, because provider input is
+deliberately absent from the policy context, so no statement can restrict an agent to one
+repository. A credential per agent narrows *who may use a token*, not *what that token can touch*:
+the token's own scope at the provider remains the boundary on which repositories are reachable, and
+a deployment that needs that boundary must obtain it from the token. And **the single-UID caveat is
+unchanged** — separating two organizations' tokens by agent is attribution and blast-radius shape
+until the gateway runs under its own UID, because any process under the owner's UID can already act
+as the configured peer.
 
 ## Threat-model limitations
 

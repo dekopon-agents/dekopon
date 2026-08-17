@@ -236,6 +236,7 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
     "effect": "external-write",
     "risk": "High",
     "idempotency": "conditional",
+    "credential": "github-pat",
     "outcome": "Succeeded",
     "duration_ms": 812,
     "output_digest": "sha256:9ab4…",
@@ -262,6 +263,10 @@ What each part is doing:
 - Two `http_calls` — the pre-read and the write, exactly the budget the constraint set allowed.
   `credentialInjected: true` says broker-held authority was presented; the value appears nowhere,
   and `requestBytes` deliberately excludes the injected header so its length cannot leak either.
+- `credential: github-pat` — *which* authority, by the symbolic name in `broker.yaml`. One example
+  has one token, so it reads as redundant here; a deployment whose constraint set names a different
+  credential per agent is one where the two organizations' writes would otherwise be identical
+  records.
 - No pull-request body, no diff, no review text, no Slack message, no URL path or query. The chain
   records that something happened and to what; provider output is a digest.
 

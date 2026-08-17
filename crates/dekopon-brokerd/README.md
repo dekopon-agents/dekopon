@@ -93,7 +93,8 @@ closed if a named credential is missing, the constraint set grants no HTTP autho
 `allowedHosts` entry is absent from the credential's `destinations`; at execution the native
 engine injects `authorization: <scheme> <secret>` only after guest headers were validated and
 only for destinations inside the binding. Evidence and audit record `credentialInjected: true`,
-never the value.
+never the value. The terminal audit record also names which credential the invocation selected —
+the symbolic name from this file, never the secret.
 
 ```yaml
 # broker.yaml
@@ -127,6 +128,51 @@ credentials:
     destinations: [api.github.com]
     secret: github_pat_...
 ```
+
+### One capability, one token per agent
+
+`credential:` is the default for every caller. `credentialByAgent:` overrides it per acting agent,
+which is what lets one capability reach two organizations without being duplicated under a second
+capability namespace:
+
+```yaml
+# broker.yaml
+constraintSets:
+  gh.issue.comment:
+    provider: gh
+    effect: external-write
+    risk: Medium
+    idempotency: non-idempotent
+    credential: github-pat                     # every agent that has no entry below
+    credentialByAgent:
+      nestedset-github: github-pat-scientist-hq
+    constraints:
+      timeoutMs: 15000
+      maxOutputBytes: 8192
+      http:
+        allowedHosts: [api.github.com]
+        allowedMethods: [GET, POST]
+        maxRequests: 2
+        maxRequestBytes: 16384
+        maxResponseBytes: 262144
+        allowPlaintextLoopback: false
+```
+
+The key is the agent, because a route already binds a transport and a match to an agent: one Slack
+workspace or one channel selects the agent that answers, and the agent selects the token. The name
+comes from the attested context the broker derived from this file's own `attestor` grant and
+`identityMappings`, so it is trusted configuration selecting on trusted identity — a request
+payload cannot ask for a different token. A caller with no agent, such as a direct `dekopon-run`
+peer, matches no override and takes the default.
+
+`credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
+transacts unauthenticated exactly as a set with no credential at all always has.
+
+Every credential the set can select is validated at startup, not just the default: an override
+naming a credential the store does not hold, or one whose `destinations` do not cover every
+`allowedHosts` entry of *this* set, refuses startup with the same errors the default does. An
+override naming an agent no policy can reach is not an error — the broker holds no agent catalog,
+and the name is inert until a route and a policy exist for it.
 
 A peer identity may carry an optional `attestor` grant, which lets it propose on behalf of an
 authenticated external chat identity. `identityMappings` is the other half: it is the only place a
@@ -259,8 +305,9 @@ The backing filesystem must honor Unix no-follow opens, advisory exclusive locks
 - Authorization decisions come from the Cedar policy set; execution bounds come from
   `constraintSets` and are validated against loaded manifests, host ceilings, and the credential
   store at startup. Neither file can widen the other.
-- Audit records carry the determining `policy_ids` and the `policy_digest` of the evaluated set.
+- Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
+  the symbolic name of the `credential` the invocation selected.
 - Generic WASI and ambient I/O imports remain unavailable.
 - The durable JSONL chain is mutation-evident and replay-restoring. The separate atomic checkpoint makes the retained head externally inspectable, but is not signed, remote, append-only, or a transparency service by itself.
-- Credential resolution is destination-bound and capability-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
+- Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
 - Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
