@@ -14,6 +14,10 @@ the answer.
   bounded model turns, bounded capability calls, and one fixed line on failure.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
+- **Conversations** — one independent session per message today. A per-sender history in
+  gateway memory, compacted to question-and-answer pairs inside a sliding window and
+  dropped on an idle timeout or a changed capability grant, is designed and is committed
+  direction; it caches no authorization.
 
 ## Authority
 
@@ -33,8 +37,9 @@ authenticated transport": it trusts its local caller to declare a subject. It gr
 nothing by doing so — the broker's attestor grant and identity mapping still gate
 everything — but it is a development tool, not a production transport.
 
-Configuration, transport semantics, session bounds, telemetry, and the single-UID caveat
-are documented in [`docs/dekopond.md`](../../docs/dekopond.md).
+Configuration, transport semantics, session bounds, telemetry, the committed conversation
+contract, and the single-UID caveat are documented in
+[`docs/dekopond.md`](../../docs/dekopond.md).
 
 ## Run
 
