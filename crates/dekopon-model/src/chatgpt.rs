@@ -1307,6 +1307,199 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call_output");
     }
 
+    /// Serializes one request fragment so a comparison is over the bytes a provider's prefix cache
+    /// would hash rather than over two parsed values that merely agree.
+    ///
+    /// Both sides always come from this same binary, which is what keeps this a relation between
+    /// two computed values instead of a golden string: `serde_json`'s `preserve_order` feature
+    /// reaches this crate through a dev-dependency, and under resolver 3 dev-dependency features
+    /// unify into `cargo test` but not `cargo build`. Object key order is therefore deterministic
+    /// within either binary — which is all prefix stability needs — but not necessarily the same
+    /// order in both, so a literal expected body would fail for a reason that has nothing to do
+    /// with the property under test.
+    fn request_text(fragment: &Value) -> String {
+        serde_json::to_string(fragment).expect("serialize request fragment")
+    }
+
+    /// The single scripting tool a real session offers, so the fixtures below grow the way
+    /// `dekopon-agent`'s prompt loop actually grows a conversation.
+    fn bash_tool() -> ModelTool {
+        ModelTool {
+            name: "bash".to_owned(),
+            description: "Run a sandboxed script".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"script": {"type": "string"}},
+                "required": ["script"],
+            }),
+        }
+    }
+
+    /// One assistant turn shaped the way the Codex transport reports it: encrypted reasoning and
+    /// the function call as opaque replay items, plus the same call surfaced as a tool call.
+    fn scripted_turn(turn: u32, call_id: &str, script: &str) -> crate::model::AssistantTurn {
+        let arguments = json!({"script": script}).to_string();
+        crate::model::AssistantTurn {
+            content: None,
+            tool_calls: vec![crate::model::ModelToolCall {
+                id: call_id.to_owned(),
+                kind: "function".to_owned(),
+                function: crate::model::ModelFunctionCall {
+                    name: "bash".to_owned(),
+                    arguments: arguments.clone(),
+                },
+            }],
+            usage: None,
+            replay_items: vec![
+                json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{turn}"),
+                    "encrypted_content": "opaque",
+                }),
+                json!({
+                    "type": "function_call",
+                    "id": format!("fc_{turn}"),
+                    "call_id": call_id,
+                    "name": "bash",
+                    "arguments": arguments,
+                }),
+            ],
+        }
+    }
+
+    #[test]
+    fn an_appended_turn_extends_the_request_input_and_leaves_its_prefix_untouched() {
+        // Automatic prefix caching keys on the leading bytes of a request: it pays only when turn
+        // N+1 is turn N with more appended and nothing at all rewritten. The prompt loop appends
+        // and never edits, so this holds today by construction — the point of pinning it is that a
+        // regression here is silent. No error, no wrong answer, just every turn of every session
+        // paying full price for a prompt the provider already had.
+        let tools = vec![bash_tool()];
+        let mut messages = vec![
+            ModelMessage::system("Be concise."),
+            ModelMessage::user("how many files are in the repository?"),
+        ];
+        let mut bodies = vec![build_request_body("gpt-test", &messages, &tools)];
+        for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
+            let call_id = format!("call_{turn}");
+            let assistant = scripted_turn(turn, &call_id, script);
+            messages.push(crate::model::assistant_message(&assistant));
+            messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
+            bodies.push(build_request_body("gpt-test", &messages, &tools));
+        }
+
+        for pair in bodies.windows(2) {
+            let (previous, next) = (&pair[0], &pair[1]);
+            assert_eq!(
+                request_text(&previous["instructions"]),
+                request_text(&next["instructions"]),
+                "an appended turn rewrote the instructions that open every request"
+            );
+            assert_eq!(
+                request_text(&previous["tools"]),
+                request_text(&next["tools"]),
+                "an appended turn rewrote the tool definitions"
+            );
+            let previous_input = previous["input"].as_array().expect("input array");
+            let next_input = next["input"].as_array().expect("input array");
+            assert!(
+                next_input.len() > previous_input.len(),
+                "an appended turn must extend the input rather than replace it"
+            );
+            for (index, item) in previous_input.iter().enumerate() {
+                assert_eq!(
+                    request_text(item),
+                    request_text(&next_input[index]),
+                    "input item {index} changed between turns; the cached prefix ends there"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_system_message_anywhere_in_history_rewrites_the_front_of_the_request() {
+        // `build_request_body` hoists *every* system message into the top-level `instructions`
+        // field, wherever it sits in the list, and emits nothing for it in `input`. A system
+        // message injected mid-conversation therefore appends nothing and edits the very first
+        // bytes of the request instead, voiding the whole cached prefix while `input` still looks
+        // perfectly append-only — which is why the two input arrays below are identical and the
+        // instructions are not. History must never carry a system message past the opening one,
+        // and this test is where that constraint is recorded.
+        let tools = vec![bash_tool()];
+        let assistant = scripted_turn(1, "call_1", "ls | wc -l");
+        let history = vec![
+            ModelMessage::system("Be concise."),
+            ModelMessage::user("how many files are in the repository?"),
+            crate::model::assistant_message(&assistant),
+            ModelMessage::tool("call_1", "12\n"),
+        ];
+        let mut injected = history.clone();
+        injected.insert(2, ModelMessage::system("Prefer relative paths."));
+
+        let plain = build_request_body("gpt-test", &history, &tools);
+        let hoisted = build_request_body("gpt-test", &injected, &tools);
+
+        assert_eq!(
+            request_text(&plain["input"]),
+            request_text(&hoisted["input"]),
+            "the injected system message is invisible in input, which is what makes this a trap"
+        );
+        assert_eq!(plain["instructions"], "Be concise.");
+        assert_eq!(
+            hoisted["instructions"], "Be concise.\n\nPrefer relative paths.",
+            "a mid-history system message is joined onto the front of the request"
+        );
+    }
+
+    #[test]
+    fn a_repeated_system_message_silently_doubles_the_instructions() {
+        // Nothing deduplicates and nothing complains. A caller that re-seeds the system prompt onto
+        // a conversation that already carries one sends the whole thing twice: double the
+        // instruction tokens on every subsequent turn, a prefix that no longer matches anything
+        // cached, and a model reading its own instructions in stereo.
+        let system = "Be concise.";
+        let messages = vec![
+            ModelMessage::system(system),
+            ModelMessage::user("how many files are in the repository?"),
+            ModelMessage::system(system),
+        ];
+
+        let body = build_request_body("gpt-test", &messages, &[]);
+
+        assert_eq!(body["instructions"], format!("{system}\n\n{system}"));
+        assert_eq!(
+            body["input"].as_array().expect("input array").len(),
+            1,
+            "neither system message reaches input, so the duplication is invisible there"
+        );
+    }
+
+    #[test]
+    fn codex_requests_never_ask_the_provider_to_retain_the_conversation() {
+        // `store: false` is a data-retention decision rather than a tuning knob. Nothing about a
+        // session is kept server-side, which is precisely why the transport has to carry encrypted
+        // reasoning back itself through `replay_items` and ask for it with `include`. Flipping the
+        // literal would move conversation content into someone else's storage while every test
+        // here kept passing, so the assertion is written to be deleted deliberately rather than
+        // edged past.
+        let assistant = scripted_turn(1, "call_1", "ls | wc -l");
+        let opening = build_request_body("gpt-test", &[ModelMessage::user("hello")], &[]);
+        let resumed = build_request_body(
+            "gpt-test",
+            &[
+                ModelMessage::user("how many files are in the repository?"),
+                crate::model::assistant_message(&assistant),
+                ModelMessage::tool("call_1", "12\n"),
+            ],
+            &[bash_tool()],
+        );
+
+        for body in [&opening, &resumed] {
+            assert_eq!(body["store"], false);
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        }
+    }
+
     #[test]
     fn parses_text_tool_calls_and_encrypted_reasoning() {
         let stream = concat!(
