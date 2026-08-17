@@ -1,5 +1,8 @@
 # dekopond
 
+**Status: current.** Chat-transport wakeups, attested routing, bounded sessions, and
+persistent conversations are implemented and tested.
+
 The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services,
 waits for a wakeup, routes each authenticated message to a named agent from the catalog,
 runs one bounded model session whose only tool is the sandboxed shell, and replies with

@@ -27,7 +27,17 @@ Version 0.2 shipped an exact-match policy evaluator. It has since been replaced 
 
 Version 0.2.0 is published as 17 public crates and provenance-attested CLI archives. The broker process is deployable for one local owner-UID trust domain and has an explicit unprivileged `dekopon-run` client; at that release the operator CLI and an agent daemon remained unintegrated, and it had no provider credential resolver.
 
-Since that release the tree has gained Cedar, broker-owned credentials, identity/attestation, and the `dekopond` gateway, and now holds 20 publishable crates. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
+## 0.3 — Cedar, credentials, identity, and the chat gateway (released)
+
+- Cedar authorization in `dekopon-policy`: a schema generated from the deployment's declared world, strict startup validation, deny on any evaluation error, and the determining `policy_ids` plus a `policy_digest` in every audit record. It replaced the exact-match evaluator outright.
+- Broker-owned destination-bound credentials in a separate stricter owner-only file, bound per capability constraint set with optional per-agent overrides, injected inside the native HTTP engine after guest headers were validated.
+- Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped rules that keep attested and direct authority disjoint.
+- `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
+- Bounded per-sender conversation history on `mode: persistent` routes, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key.
+- `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
+- A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/rubber-stamper` end-to-end walkthrough.
+
+Version 0.3.0 is published as 20 public crates and provenance-attested CLI archives. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
 
 ## Next milestones
 

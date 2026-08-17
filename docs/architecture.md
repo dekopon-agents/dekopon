@@ -2,9 +2,9 @@
 
 Read [`design.md`](design.md) first for the product model and accepted invariants. This document maps that design to current crate boundaries and the planned deployment topology; it does not make planned components current.
 
-## Published 0.2.0 foundation
+## Published 0.3.0 foundation
 
-The published `0.2.0` release retains the two deliberately separate synchronous execution surfaces introduced in 0.1 and adds a privileged asynchronous host, authorization/evidence/audit libraries, a separately deployed authenticated Unix broker, a sandboxed one-tool scripting surface, and cross-process OpenTelemetry. Explicit `dekopon-run broker` commands are unprivileged clients. Since then an unprivileged agent daemon, `dekopond`, has joined them: it connects to chat services and submits attested on-behalf-of proposals to the broker. The operator CLI is still not broker- or daemon-integrated. `dekopon-run` exports correlated OTLP traces and logs, while `dekopon-brokerd` and `dekopond` independently export their own trace legs and write structured JSON logs to stdout for an external collector; collecting Kubernetes node telemetry or unrelated process logs remains separate deployment work.
+The published `0.3.0` release retains the two deliberately separate synchronous execution surfaces introduced in 0.1, the privileged asynchronous host, authorization/evidence/audit libraries, separately deployed authenticated Unix broker, sandboxed one-tool scripting surface, and cross-process OpenTelemetry added in 0.2, and adds an unprivileged agent daemon, `dekopond`, that connects to chat services and submits attested on-behalf-of proposals to the broker. Explicit `dekopon-run broker` commands are unprivileged clients. The operator CLI is still not broker- or daemon-integrated. `dekopon-run` exports correlated OTLP traces and logs, while `dekopon-brokerd` and `dekopond` independently export their own trace legs and write structured JSON logs to stdout for an external collector; collecting Kubernetes node telemetry or unrelated process logs remains separate deployment work.
 
 The operator CLI retains its local catalog path:
 
@@ -71,8 +71,9 @@ The deployment is three operator-visible roles, two of which are now separate ru
 
 ```text
 dekopond
-    chat transports, routing, model interaction, bounded sessions
-    (context and memory remain committed direction)
+    chat transports, routing, model interaction, bounded sessions,
+    bounded per-conversation history
+    (agent memory outliving a conversation remains committed direction)
 
 dekopon-brokerd
     authorization, credentials, provider execution, external effects
