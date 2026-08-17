@@ -27,7 +27,7 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::IdentifierError;
-use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_core::{CapabilityId, ExternalSubject, ProviderId};
 use dekopon_model::{
     chatgpt::{ChatGptCodexModel, ChatGptError},
     model::{ChatModel, ModelError, OpenAiChatModel},
@@ -44,6 +44,8 @@ use tracing::Instrument as _;
 
 use crate::cli::{BrokerCommand, BrokerConnectionArgs, Cli, Command, LimitArgs, ShellLimitArgs};
 
+#[cfg(unix)]
+mod chat;
 pub mod cli;
 mod trace;
 
@@ -137,6 +139,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Broker {
             command: BrokerCommand::Invoke { .. },
         } => "broker.invoke",
+        Command::Chat { .. } => "chat",
     }
 }
 
@@ -310,7 +313,52 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 ))
                 .await
         }
+        Command::Chat {
+            gateway,
+            subject,
+            conversation,
+        } => {
+            // The span carries no fields on purpose. The two values a chat session is configured
+            // by are a socket path and a declared subject, and `docs/observability.md` keeps both
+            // filesystem paths and external identities out of exported telemetry.
+            evaluate_chat(gateway, subject, conversation.clone())
+                .instrument(tracing::info_span!("runner.chat"))
+                .await
+        }
     }
+}
+
+/// Runs one interactive gateway session on the blocking pool.
+///
+/// The loop is synchronous end to end — read a line, write a line, wait for a line — and the wait
+/// lasts as long as a whole agent session inside the daemon, so it belongs off the runtime's
+/// worker threads for exactly the reason a prompt session does.
+#[cfg(unix)]
+async fn evaluate_chat(
+    gateway: &Path,
+    subject: &ExternalSubject,
+    conversation: Option<String>,
+) -> Result<CommandOutput, AppError> {
+    let session = chat::ChatSession::new(gateway.to_path_buf(), subject.clone(), conversation)?;
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        chat::run(&session)
+    })
+    .await
+    .map_err(|error| AppError::Chat(chat::ChatError::Task(error)))??;
+
+    // Replies were printed as they arrived; there is nothing left for the caller to write.
+    Ok(CommandOutput::silent())
+}
+
+#[cfg(not(unix))]
+async fn evaluate_chat(
+    _gateway: &Path,
+    _subject: &ExternalSubject,
+    _conversation: Option<String>,
+) -> Result<CommandOutput, AppError> {
+    Err(AppError::ChatUnsupported)
 }
 
 /// Everything one prompt session needs, gathered before the blocking handoff.
@@ -415,6 +463,15 @@ struct CommandOutput {
 impl CommandOutput {
     fn success(text: String) -> Self {
         Self { text, exit_code: 0 }
+    }
+
+    /// A command that already streamed its own output and has nothing left to print.
+    #[cfg(unix)]
+    fn silent() -> Self {
+        Self {
+            text: String::new(),
+            exit_code: 0,
+        }
     }
 }
 
@@ -777,6 +834,11 @@ fn read_optional_secret(variable: &str) -> Result<Option<String>, AppError> {
 }
 
 fn write_output(output: &str) -> io::Result<()> {
+    // A command that printed as it went returns nothing here, and a bare newline would append a
+    // blank line to output it already finished.
+    if output.is_empty() {
+        return Ok(());
+    }
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     handle.write_all(output.as_bytes())?;
@@ -877,6 +939,12 @@ enum AppError {
     #[cfg(not(unix))]
     #[error("broker client mode requires Unix peer credentials and Unix-domain sockets")]
     BrokerUnsupported,
+    #[cfg(unix)]
+    #[error(transparent)]
+    Chat(#[from] chat::ChatError),
+    #[cfg(not(unix))]
+    #[error("the gateway chat client requires a Unix-domain socket")]
+    ChatUnsupported,
     #[error(
         "broker connection flags were supplied without --broker; \
          a prompt session contacts no broker until you ask it to"
@@ -939,6 +1007,12 @@ impl AppError {
             Self::BrokerSocketUnresolved => "broker-socket-unresolved",
             #[cfg(not(unix))]
             Self::BrokerUnsupported => "broker-unsupported",
+            // Delegated rather than flattened: a chat session fails in a dozen distinct ways and
+            // collapsing them to one category would hide which end of the socket went wrong.
+            #[cfg(unix)]
+            Self::Chat(error) => error.telemetry_kind(),
+            #[cfg(not(unix))]
+            Self::ChatUnsupported => "chat-unsupported",
             Self::BrokerFlagsWithoutOptIn => "broker-flags-without-opt-in",
             #[cfg(unix)]
             Self::SessionIdentifier(_) => "session-identifier",

@@ -173,6 +173,7 @@ jobs:
           "$runner" --help >/dev/null
           "$runner" broker --help >/dev/null
           "$runner" broker invoke --help >/dev/null
+          "$runner" chat --help >/dev/null
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null

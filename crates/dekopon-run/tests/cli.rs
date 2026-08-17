@@ -8,7 +8,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, sync::Arc};
+use std::{
+    collections::BTreeMap, io::BufRead as _, os::unix::fs::PermissionsExt as _, process::Stdio,
+    sync::Arc,
+};
 
 #[cfg(unix)]
 use dekopon_broker::{
@@ -1003,6 +1006,12 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Exact standard output, borrowed so a test can assert on both streams of one `Output`.
+#[cfg(unix)]
+fn stdout(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).expect("standard output is UTF-8")
+}
+
 // ---------------------------------------------------------------------------
 // Sandboxed shell subcommand
 // ---------------------------------------------------------------------------
@@ -1365,4 +1374,284 @@ fn shell_rejects_a_malformed_curl_capability_at_parse_time() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(!stderr.contains("capability not found"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// Gateway chat client
+// ---------------------------------------------------------------------------
+
+/// What the stub gateway does with one request it received.
+#[cfg(unix)]
+enum GatewayReply {
+    /// Answer with one well-formed `{"reply": ...}` line.
+    Reply(&'static str),
+    /// Answer with a line that is not a reply at all.
+    Malformed(&'static str),
+    /// Stop answering and close the connection.
+    HangUp,
+}
+
+/// A `0700` directory to hold a `0600` socket, matching the hygiene the transport itself requires.
+#[cfg(unix)]
+fn gateway_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temporary gateway directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure gateway directory");
+    directory
+}
+
+/// Stands up a stub of `dekopond`'s local transport: JSON lines in, `{"reply": ...}` lines out.
+///
+/// `chat` is a socket client, so its whole contract is exercisable with no gateway, broker, policy,
+/// or model behind it. The handle returns every request line the stub actually received, which is
+/// what makes the conversation identity assertable rather than merely plausible.
+#[cfg(unix)]
+fn stub_gateway(
+    socket: &std::path::Path,
+    script: Vec<GatewayReply>,
+) -> thread::JoinHandle<Vec<Value>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("stub gateway binds");
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .expect("secure stub gateway socket");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("stub gateway accepts");
+        let mut requests =
+            std::io::BufReader::new(stream.try_clone().expect("stub gateway clones its stream"));
+        let mut replies = stream;
+        let mut received = Vec::new();
+        for reply in script {
+            let mut line = String::new();
+            if requests.read_line(&mut line).expect("stub gateway reads") == 0 {
+                break;
+            }
+            received.push(serde_json::from_str(&line).expect("a request line is JSON"));
+            match reply {
+                GatewayReply::Reply(text) => {
+                    writeln!(replies, "{}", json!({ "reply": text })).expect("stub gateway writes");
+                }
+                GatewayReply::Malformed(line) => {
+                    writeln!(replies, "{line}").expect("stub gateway writes");
+                }
+                GatewayReply::HangUp => break,
+            }
+        }
+        received
+    })
+}
+
+/// Runs the binary with `input` on a piped standard input, which only `chat` needs.
+#[cfg(unix)]
+fn run_with_stdin(arguments: &[&str], input: &str) -> Output {
+    let mut child = binary()
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dekopon-run process starts");
+    let mut stdin = child.stdin.take().expect("piped standard input");
+    match stdin.write_all(input.as_bytes()) {
+        Ok(()) => {}
+        // A command that refuses a line stops reading and closes its end before we finish writing.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("standard input writes: {error}"),
+    }
+    drop(stdin);
+    child.wait_with_output().expect("dekopon-run process exits")
+}
+
+/// The property the whole feature rests on: one conversation identity, on every request.
+#[cfg(unix)]
+#[test]
+fn chat_answers_each_message_and_carries_one_conversation_through_the_session() {
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(
+        &socket,
+        vec![
+            GatewayReply::Reply("Nothing external."),
+            GatewayReply::Reply("Two read-only capability calls."),
+        ],
+    );
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "morning-standup",
+        ],
+        // The blank line in the middle is deliberate: it asks nothing, so it is never sent.
+        "what changed today?\n\nand what did it cost?\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "Nothing external.\nTwo read-only capability calls.\n"
+    );
+
+    let requests = gateway.join().expect("stub gateway completes");
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in &requests {
+        assert_eq!(request["subject"], "tel.16034700182");
+        assert_eq!(request["channel"], "morning-standup");
+    }
+    assert_eq!(requests[0]["text"], "what changed today?");
+    assert_eq!(requests[1]["text"], "and what did it cost?");
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_ends_cleanly_when_input_ends() {
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(&socket, Vec::new());
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "empty-session",
+        ],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert!(gateway.join().expect("stub gateway completes").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_reports_a_gateway_that_hangs_up_mid_session() {
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(
+        &socket,
+        vec![GatewayReply::Reply("still here"), GatewayReply::HangUp],
+    );
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "interrupted",
+        ],
+        "are you there?\nstill?\n",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    // The answer that did arrive is kept; only the unanswered request fails the session.
+    assert_eq!(stdout(&output), "still here\n");
+    assert!(
+        stderr(&output).contains("the gateway closed the connection"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(gateway.join().expect("stub gateway completes").len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_reports_a_line_that_is_not_a_reply() {
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(&socket, vec![GatewayReply::Malformed("<html>oops</html>")]);
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "wrong-socket",
+        ],
+        "hello?\n",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("not a reply"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(gateway.join().expect("stub gateway completes").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_announces_a_minted_conversation_and_sends_exactly_that_value() {
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(&socket, vec![GatewayReply::Reply("noted")]);
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "slack.t0123abc.u9xyz",
+        ],
+        "remember this\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // The identifier goes to standard error, so a piped consumer reads replies and nothing else.
+    assert_eq!(stdout(&output), "noted\n");
+    let announced = stderr(&output)
+        .strip_prefix("conversation: ")
+        .expect("a minted conversation identifier is announced")
+        .trim_end()
+        .to_owned();
+    assert!(announced.starts_with("chat-"), "{announced}");
+
+    // Announcing an identifier the requests do not carry would make the session unresumable.
+    let requests = gateway.join().expect("stub gateway completes");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["channel"], announced);
+    assert_eq!(requests[0]["subject"], "slack.t0123abc.u9xyz");
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_refuses_a_message_the_gateway_could_not_read() {
+    // The transport's answer to an over-long line is to close the connection without a diagnostic,
+    // so a client that sent one would report an unexplained hang-up instead of the real cause.
+    let directory = gateway_directory();
+    let socket = directory.path().join("dekopond-dev.sock");
+    let gateway = stub_gateway(&socket, vec![GatewayReply::Reply("unreachable")]);
+
+    let output = run_with_stdin(
+        &[
+            "chat",
+            "--gateway",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "oversize",
+        ],
+        &format!("{}\n", "x".repeat(70 * 1024)),
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains("65536"), "{}", stderr(&output));
+    assert!(gateway.join().expect("stub gateway completes").is_empty());
 }
