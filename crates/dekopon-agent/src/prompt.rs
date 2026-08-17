@@ -8,7 +8,8 @@
 use std::time::Instant;
 
 use dekopon_model::model::{
-    ChatModel, ModelError, ModelMessage, ModelTool, ModelToolCall, ModelUsage, assistant_message,
+    ChatModel, CompletionOptions, ModelError, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+    assistant_message,
 };
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
@@ -133,6 +134,47 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
+    run_prompt_with_history_and_options(
+        model,
+        runtime,
+        prompt,
+        system,
+        limits,
+        history,
+        &CompletionOptions::default(),
+    )
+}
+
+/// The same conversation continuation, carrying request-scoped routing metadata to every model
+/// call this session makes.
+///
+/// `options` is the [`CompletionOptions`] the loop hands to [`ChatModel::complete_with`], and it is
+/// deliberately a *request* input rather than session state: nothing in it changes what the model
+/// is asked, only how the provider routes the request that carries it. A caller passing
+/// [`CompletionOptions::default`] gets the byte-identical requests
+/// [`run_prompt_with_history`] has always produced, which is why that function is this one with a
+/// default rather than a separate implementation.
+///
+/// Every turn of the session sends the same options, which is the point of a prompt cache key: the
+/// tool-calling turns within one session share the longest prefix of all, and they are exactly the
+/// requests a per-session key routes to one cache lane.
+///
+/// A model that implements only [`ChatModel::complete`] still answers, because `complete_with` is a
+/// provided method that discards what it does not understand. The cost of that is a cache lookup,
+/// never an answer.
+pub fn run_prompt_with_history_and_options<M, R>(
+    model: &M,
+    runtime: &R,
+    prompt: &str,
+    system: Option<&str>,
+    limits: PromptLimits,
+    history: &mut History,
+    options: &CompletionOptions,
+) -> Result<PromptOutcome, PromptError>
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
     if limits.max_steps == 0 {
         // Nothing is recorded here: a zero-step session builds no request, so the prompt never
         // reached a model and the conversation must not claim otherwise.
@@ -148,7 +190,7 @@ where
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
-    let result = run_session(model, runtime, messages, limits);
+    let result = run_session(model, runtime, messages, limits, options);
     history.record(match &result {
         Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
         Err(_) => ConversationTurn::unanswered(prompt),
@@ -165,6 +207,7 @@ fn run_session<M, R>(
     runtime: &R,
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
+    options: &CompletionOptions,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
@@ -211,7 +254,7 @@ where
             );
         }
         let model_started = Instant::now();
-        let turn = match model.complete(&messages, &model_tools) {
+        let turn = match model.complete_with(&messages, &model_tools, options) {
             Ok(turn) => turn,
             Err(error) => {
                 tracing::error!(
@@ -636,8 +679,8 @@ mod tests {
     };
 
     use dekopon_model::model::{
-        AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
-        ModelToolCall,
+        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+        ModelTool, ModelToolCall,
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
@@ -645,7 +688,7 @@ mod tests {
     use super::{
         ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits,
         PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, format_script_outcome,
-        run_prompt, run_prompt_with_history, script_tool,
+        run_prompt, run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1227,6 +1270,111 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// A model that answers once per request and records the options each request carried.
+    ///
+    /// Deliberately overrides `complete_with` and leaves `complete` panicking: every other double
+    /// in this module implements only `complete`, which is what proves the provided-method default
+    /// still works, so this one exists to prove the other half — that the loop really does take the
+    /// `complete_with` path when it has options to pass.
+    struct OptionsObserver {
+        turns: Mutex<VecDeque<AssistantTurn>>,
+        observed: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ChatModel for OptionsObserver {
+        fn complete(
+            &self,
+            _messages: &[ModelMessage],
+            _tools: &[ModelTool],
+        ) -> Result<AssistantTurn, ModelError> {
+            panic!("the loop must reach a model through complete_with");
+        }
+
+        fn complete_with(
+            &self,
+            _messages: &[ModelMessage],
+            _tools: &[ModelTool],
+            options: &CompletionOptions,
+        ) -> Result<AssistantTurn, ModelError> {
+            self.observed
+                .lock()
+                .expect("options lock")
+                .push(options.prompt_cache_key().map(str::to_owned));
+            self.turns
+                .lock()
+                .expect("turn lock")
+                .pop_front()
+                .ok_or(ModelError::NoChoices)
+        }
+    }
+
+    #[test]
+    fn every_turn_of_a_session_carries_the_same_routing_metadata() {
+        // The tool-calling turns within one session share the longest prefix in the whole feature —
+        // each one repeats every message before it — so a key that reached only the first request
+        // would miss the requests it helps most.
+        let model = OptionsObserver {
+            turns: Mutex::new(
+                [
+                    script_call("call-1", "echo one"),
+                    script_call("call-2", "echo two"),
+                    answer("done"),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            observed: Mutex::new(Vec::new()),
+        };
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_with_history_and_options(
+            &model,
+            &runtime,
+            "ask",
+            Some("Be terse."),
+            limits(4, 32),
+            &mut history,
+            &CompletionOptions::default().with_prompt_cache_key("lane-7"),
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(outcome.model_turns, 3);
+        assert_eq!(
+            *model.observed.lock().expect("options lock"),
+            vec![
+                Some("lane-7".to_owned()),
+                Some("lane-7".to_owned()),
+                Some("lane-7".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_without_options_asks_exactly_what_it_always_asked() {
+        // The additive half of the contract: a caller that supplies nothing must be indistinguishable
+        // from the same caller before options existed, which is why the default carries no key
+        // rather than an empty one.
+        let observer = OptionsObserver {
+            turns: Mutex::new([answer("done")].into_iter().collect()),
+            observed: Mutex::new(Vec::new()),
+        };
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        run_prompt_with_history(
+            &observer,
+            &runtime,
+            "ask",
+            Some("Be terse."),
+            limits(2, 32),
+            &mut history,
+        )
+        .expect("prompt session succeeds");
+
+        assert_eq!(*observer.observed.lock().expect("options lock"), vec![None]);
     }
 
     #[test]

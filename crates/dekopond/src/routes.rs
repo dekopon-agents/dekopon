@@ -13,6 +13,7 @@ use dekopon_protocol::Agent;
 use thiserror::Error;
 
 use crate::{
+    cache_key,
     config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch},
     transport::ConversationKind,
 };
@@ -29,6 +30,21 @@ pub(crate) struct BoundRoute {
     pub limits: PromptLimits,
     /// What this route remembers between messages.
     pub conversation: ConversationPolicy,
+    /// The provider cache lane a message on this route uses when it has no conversation of its own.
+    ///
+    /// Minted once here, at bind time, and shared by every sender the route answers. That reads
+    /// alarming and is not, because of what a `oneShot` route's shared prefix actually is: the
+    /// agent's `instructions` and the tool definitions, and then this one message. Those are byte
+    /// for byte identical for everyone the route serves and contain nothing about any of them, so
+    /// pointing the route's traffic at one cache lane shares a prefix that was already common to
+    /// all of it. Nothing sender-specific can hit: a different sender's message diverges from the
+    /// first token that differs, and a cache key is a hint about a shared *prefix* rather than a
+    /// handle on somebody's answer. It is not an authorization boundary and confers nothing — every
+    /// message still opens its own attested broker leg.
+    ///
+    /// The alternative, a fresh key per message, names a lane holding exactly one request and gives
+    /// up the only caching a stateless route can have.
+    pub cache_key: String,
 }
 
 /// Every bound route, consulted in declaration order.
@@ -95,6 +111,7 @@ impl RoutingTable {
                     max_capability_calls: route.limits.max_capability_calls,
                 },
                 conversation: route.conversation,
+                cache_key: cache_key::for_route(),
             });
         }
         Ok(Self { routes })

@@ -17,6 +17,9 @@
 //!   grant stops being replayed once the grant narrows.
 //! - **Nothing here caches authorization.** The stored grant is an invalidation input and never a
 //!   permission: every message still opens its own attested leg and asks the broker again.
+//! - **The prompt cache key is minted, not derived.** It is stored beside the history so it lives
+//!   and dies with the prefix it names, and it carries nothing about the sender whose key it sits
+//!   under; [`crate::cache_key`] states why a hashed subject was refused.
 
 use std::{
     collections::HashMap,
@@ -27,7 +30,7 @@ use std::{
 
 use dekopon_agent::prompt::{ConversationTurn, History};
 
-use crate::config::ConversationWindow;
+use crate::{cache_key, config::ConversationWindow};
 
 /// One remembered conversation: a transport, the conversation on it, and whose exchange this is.
 ///
@@ -65,8 +68,35 @@ struct Conversation {
     /// A sorted deterministic `Vec<String>`, which is what `CapabilityInvoker::granted` returns, so
     /// comparing two of them is a comparison rather than a hash of one.
     granted: Vec<String>,
+    /// The provider cache lane every message of this conversation routes to.
+    ///
+    /// Minted with the entry and stored beside the history rather than derived from the key,
+    /// because the key contains a canonical subject and a cache key must contain nothing about the
+    /// sender; [`crate::cache_key`] has the whole argument. Held here so it shares the history's
+    /// lifetime exactly: the window of messages that genuinely share a prompt prefix is the window
+    /// worth routing together, and an entry that goes away takes its lane with it.
+    cache_key: String,
     /// Last time a message touched this conversation, for the idle timeout and the LRU ceiling.
     touched: Instant,
+}
+
+/// What one session needs to continue a conversation.
+///
+/// Two values rather than a tuple because they are read at different moments — the history seeds
+/// the prompt before the model client exists, and the cache key travels with every request the
+/// session then makes — and a named pair keeps a caller from silently swapping them.
+pub(crate) struct ConversationSeed {
+    /// The remembered exchanges to replay, empty on the first message of a conversation.
+    pub history: History,
+    /// The cache lane this session's model calls declare.
+    ///
+    /// For a conversation already on record this is the stored key, so a follow-up lands in the
+    /// lane its own earlier turns warmed. For a conversation that is not, it is freshly minted and
+    /// unstored: [`ConversationStore::commit`] takes it back and stores it if this session is the
+    /// one that creates the entry. Two sessions opening the same new conversation at once therefore
+    /// mint two keys and one of them wins the entry, which costs the loser a cache lookup on one
+    /// message and nothing after that.
+    pub cache_key: String,
 }
 
 /// Why a conversation stopped being remembered, as the lifecycle event records it.
@@ -117,13 +147,18 @@ impl ConversationStore {
     /// dropped rather than used. What survives comes back as a clone the session prompts with; the
     /// stored copy stays where it is so a concurrent session on the same conversation reads the same
     /// thing rather than racing for ownership of it.
+    ///
+    /// A dropped entry takes its cache key with it and the seed carries a fresh one. That is the
+    /// point of minting rather than deriving: the prompt an evicted conversation rebuilds shares no
+    /// prefix with the one it replaced, so continuing to name the old lane would be both useless and
+    /// a link between an identity's exchanges across the boundary that forgot them.
     pub fn begin(
         &self,
         key: &ConversationKey,
         granted: &[String],
         window: ConversationWindow,
         now: Instant,
-    ) -> History {
+    ) -> ConversationSeed {
         let mut entries = self.entries.lock().expect("conversation store");
         let stale = entries.get(key).and_then(|existing| {
             if expired(existing, window.idle_timeout, now) {
@@ -137,11 +172,20 @@ impl ConversationStore {
         if let Some(reason) = stale {
             entries.remove(key);
             evicted(reason);
-            return History::new(window.limits);
+            return ConversationSeed {
+                history: History::new(window.limits),
+                cache_key: cache_key::for_conversation(),
+            };
         }
         entries.get(key).map_or_else(
-            || History::new(window.limits),
-            |entry| entry.history.clone(),
+            || ConversationSeed {
+                history: History::new(window.limits),
+                cache_key: cache_key::for_conversation(),
+            },
+            |entry| ConversationSeed {
+                history: entry.history.clone(),
+                cache_key: entry.cache_key.clone(),
+            },
         )
     }
 
@@ -154,12 +198,18 @@ impl ConversationStore {
     /// `conversation_id`, so a sender replying to themselves before the bot answers runs two
     /// sessions against one history. Writing back a clone would silently discard whichever exchange
     /// finished first; appending lands both, ordered by when they were answered.
+    ///
+    /// `declared` is the cache key the finishing session actually sent, handed back from the
+    /// [`ConversationSeed`] it started with. It is stored only when this exchange creates the entry,
+    /// so a conversation keeps one lane for its whole life rather than renaming it every message —
+    /// which would leave every request naming a lane no earlier request had ever used.
     pub fn commit(
         &self,
         key: &ConversationKey,
         granted: &[String],
         window: ConversationWindow,
         turn: ConversationTurn,
+        declared: &str,
         now: Instant,
     ) {
         let mut entries = self.entries.lock().expect("conversation store");
@@ -171,6 +221,10 @@ impl ConversationStore {
                 existing.history = History::new(window.limits);
                 existing.granted = granted.to_vec();
                 existing.history.record(turn);
+                // A discarded window is a rewritten prefix, so the lane it warmed is dead and the
+                // conversation continues under a new one — the same rotation an eviction performs,
+                // for the same reason.
+                existing.cache_key = cache_key::for_conversation();
                 existing.touched = now;
                 evicted(EvictionReason::GrantChanged);
             }
@@ -186,6 +240,7 @@ impl ConversationStore {
                     Conversation {
                         history,
                         granted: granted.to_vec(),
+                        cache_key: declared.to_owned(),
                         touched: now,
                     },
                 );

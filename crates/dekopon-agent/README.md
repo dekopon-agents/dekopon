@@ -18,6 +18,10 @@ authoritative copy of each:
   which is also what lets one conversation replay identically on either model backend
   rather than losing encrypted reasoning silently on the way across. The session's own
   exchange is recorded even when the session fails, so a failed turn is not silently lost.
+- `prompt::run_prompt_with_history_and_options` — that same continuation carrying a
+  `CompletionOptions` to every model call it makes. The options are request-scoped routing
+  metadata such as a prompt cache key: they change how a provider routes the request, never
+  what the model is asked, so the default is byte-identical to the call without them.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
