@@ -1,6 +1,6 @@
 # Direct provider runner and broker client
 
-`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only import-free providers plus an explicit unprivileged client for `dekopon-brokerd`. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
+`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only import-free providers, plus explicit unprivileged clients for two separately running processes: `dekopon-brokerd` and `dekopond`. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
 
 ## Commands
 
@@ -11,8 +11,11 @@ dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> |
 dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SCRIPT>
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
+dekopon-run chat --gateway <SOCKET> --subject <SUBJECT> [--conversation <ID>]
 dekopon auth chatgpt <login | status | logout>
 ```
+
+**`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
 
 Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
@@ -109,6 +112,40 @@ dekopon-run broker invoke \
 ```
 
 The caller must generate and retain unique invocation IDs; reuse is durably denied. The client never retries automatically: after a lost response to an external write, treat the outcome as unknown and consult broker audit rather than issuing a new ID blindly. A broker failure response distinguishes the two cases explicitly — `broker-unavailable` means no provider work began, while `outcome-unaudited` means the effect may already have happened and was not recorded, so it must not be resubmitted under any identifier. See the failure-code table in `broker-http.md`. `--max-frame-bytes` and `--io-timeout-ms` constrain client allocation and each connect/frame operation. Broker results are `InvocationResult` JSON with policy decision linkage and evidence. Provider output is intentionally printed to the invoking client but remains absent from broker audit fields. Direct Wasm limits do not appear in broker subcommands because only broker policy and host ceilings constrain provider execution.
+
+## Gateway chat client
+
+`dekopon-run chat` holds an ongoing conversation with a running `dekopond` over its [local development transport](dekopond.md#local-development-transport). It is a socket client and nothing more: no Wasm component is loaded, no model is contacted, no script is executed, and no provider authority is held or requested. Each line of standard input becomes one `{"subject", "channel", "text"}` request, and the single `{"reply": "..."}` line that comes back is printed. That makes it the interactive counterpart of the `nc -U` session in [`dekopond.md`](dekopond.md), and it is the reason `chat` sits beside the direct provider path without touching the read-only, import-free rule that path lives by.
+
+```console
+dekopon-run chat \
+  --gateway "$HOME/.local/run/dekopon/dekopond-dev.sock" \
+  --subject tel.16034700182 \
+  --conversation morning-standup
+```
+
+- `--gateway <SOCKET>` is the path the gateway's `local` transport binds. There is no default and no discovery order: the path comes from the daemon's own configuration, and guessing one would connect to whatever happened to be there.
+- `--subject <SUBJECT>` is the canonical external subject the session claims, such as `tel.16034700182` or `slack.t0123abc.u9xyz`. It is parsed here, so a non-canonical value is a usage error exiting `2` rather than a line the gateway discards without answering — which would look like an unresponsive daemon.
+- `--conversation <ID>` is sent as the `channel` of **every** request in the session, and is the conversation's identity. Omitted, one is minted and announced on standard error as `conversation: chat-<hex>`, so the session can be resumed by passing that value back. It is announced on standard error rather than standard output because standard output is the reply stream and nothing else. The identifier is caller-chosen by design: a process identifier would be the wrong choice, because PIDs recycle and every invocation is a new process, so nothing derived from one survives to be resumed.
+
+Piped standard input is the same loop, so non-interactive use needs no separate mode:
+
+```console
+printf 'what changed today?\nand what did it cost?\n' \
+  | dekopon-run chat --gateway "$socket" --subject tel.16034700182 --conversation audit-2026-08-17
+```
+
+**Exactly one message is ever in flight.** The local protocol carries no correlation identifier, so a reply is matched to its request by ordering alone; this client therefore never pipelines and waits for each answer before reading the next line. A blank input line asks nothing and is skipped rather than sent. A message that would not fit the transport's 64 KiB line — counting the JSON envelope and the newline the gateway delimits by — is refused here with exit code `1`, because the transport's own reaction to an over-long line is to close the connection without a diagnostic, which would reach the operator as an unexplained hang-up.
+
+Exit codes follow the rest of the runner: `0` when standard input ends normally, `2` for a usage failure, and `1` for every session failure — the gateway closing the connection, a line from the socket that is not a reply, an over-long message, or a socket that will not connect. Replies already printed are kept; only the unanswered request fails the session. A consumer that stops reading (`| head -1`) ends the session cleanly rather than failing it.
+
+**This does not yet give the gateway a memory.** Every message is still an independent gateway session, so `chat` is useful immediately but not stateful: the daemon does not carry earlier turns into a later one. `--conversation` is the value a later change will key gateway-side history on, which is why it is the conversation's identity now rather than a label; when that arrives, the same command becomes a real conversation with no change here.
+
+Today the identifier's only visible effect is on the gateway's admission check, which keys an in-flight set on `(transport, channel, thread)`. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
+
+Nothing about this command widens what a caller can reach. The local transport trusts its caller to declare a subject — that is what makes it a development transport rather than a production one — and it grants nothing by doing so, because the declared subject is only a claim the broker must still map. The broker needs an attestor grant covering that namespace plus an owner-controlled mapping before the claim resolves to a principal, so a session reaches exactly the authority the owner already configured for the subject it names. The socket's `0600` mode keeps it reachable only by the owner's UID. See [`dekopond.md`](dekopond.md#local-development-transport) for the transport's side of that position.
+
+A chat session appears in traces as a single `runner.chat` span carrying no fields. The socket path, the declared subject, the conversation identifier, and every message and reply are all excluded, consistent with the rest of the runner's telemetry.
 
 ## Prompt mode
 

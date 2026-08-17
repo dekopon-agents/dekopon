@@ -2,9 +2,9 @@
 
 use std::{num::NonZeroU32, path::PathBuf};
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES};
-use dekopon_core::{CapabilityId, InvocationId, TraceId};
+use dekopon_core::{CapabilityId, ExternalSubject, InvocationId, TraceId};
 use dekopon_provider_host::{
     DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT,
@@ -184,6 +184,34 @@ pub enum Command {
         /// User prompt.
         #[arg(value_name = "PROMPT")]
         prompt: String,
+    },
+    /// Hold a conversation with a running `dekopond` over its local development transport.
+    ///
+    /// This runs no model or tool loop of its own and loads no provider: it is a client for a
+    /// gateway that already does all of that. Each line of standard input is sent as one request
+    /// and its single reply is printed.
+    Chat {
+        /// Owner-only Unix socket the gateway's `local` transport listens on.
+        #[arg(long, value_name = "PATH")]
+        gateway: PathBuf,
+
+        /// Canonical external subject this session claims, such as `tel.16034700182`.
+        ///
+        /// Typed so a malformed subject is a usage error here rather than a line the gateway
+        /// discards without answering, which would look like an unresponsive daemon.
+        #[arg(long, value_name = "SUBJECT")]
+        subject: ExternalSubject,
+
+        /// Conversation identity carried as the `channel` of every request.
+        ///
+        /// Minted and announced on standard error when omitted, so a session is resumable by
+        /// passing the same value back.
+        #[arg(
+            long,
+            value_name = "ID",
+            value_parser = NonEmptyStringValueParser::new()
+        )]
+        conversation: Option<String>,
     },
 }
 
@@ -511,6 +539,13 @@ mod tests {
         for command in [
             vec!["inspect", "--provider", "echo.wasm"],
             vec!["shell", "--provider", "echo.wasm", "echo hi"],
+            vec![
+                "chat",
+                "--gateway",
+                "/run/dekopon/dekopond-dev.sock",
+                "--subject",
+                "tel.16034700182",
+            ],
         ] {
             let mut arguments = vec!["dekopon-run"];
             arguments.extend(command);
@@ -611,6 +646,69 @@ mod tests {
             "forged",
         ])
         .expect_err("broker client has no payload principal argument");
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn parses_a_gateway_chat_session() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "chat",
+            "--gateway",
+            "/run/dekopon/dekopond-dev.sock",
+            "--subject",
+            "slack.t0123abc.u9xyz",
+            "--conversation",
+            "morning-standup",
+        ])
+        .expect("valid chat session");
+        let Command::Chat {
+            gateway,
+            subject,
+            conversation,
+        } = cli.command
+        else {
+            panic!("expected chat command");
+        };
+        assert_eq!(gateway, Path::new("/run/dekopon/dekopond-dev.sock"));
+        assert_eq!(subject.canonical(), "slack.t0123abc.u9xyz");
+        assert_eq!(conversation.as_deref(), Some("morning-standup"));
+    }
+
+    /// A subject the broker could never map is a usage error, not a silently discarded line.
+    ///
+    /// The transport drops a request it cannot deserialize without answering it, so a raw `String`
+    /// here would turn a typo into a session that simply never replies.
+    #[test]
+    fn rejects_a_subject_that_is_not_canonical() {
+        for subject in ["U9XYZ", "slack.T0123ABC", "tel.+16034700182"] {
+            let error = Cli::try_parse_from([
+                "dekopon-run",
+                "chat",
+                "--gateway",
+                "/run/dekopon/dekopond-dev.sock",
+                "--subject",
+                subject,
+            ])
+            .expect_err("subject must be canonical");
+            assert_eq!(error.exit_code(), 2, "{subject}");
+        }
+    }
+
+    /// An empty conversation identifier would silently merge unrelated sessions on the gateway.
+    #[test]
+    fn rejects_an_empty_conversation_identifier() {
+        let error = Cli::try_parse_from([
+            "dekopon-run",
+            "chat",
+            "--gateway",
+            "/run/dekopon/dekopond-dev.sock",
+            "--subject",
+            "tel.16034700182",
+            "--conversation",
+            "",
+        ])
+        .expect_err("conversation identifiers must not be empty");
         assert_eq!(error.exit_code(), 2);
     }
 
