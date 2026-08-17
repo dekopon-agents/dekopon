@@ -88,6 +88,7 @@ fn echo_constraint_set() -> ConstraintSet {
         risk: RiskLevel::Low,
         idempotency: Idempotency::Idempotent,
         credential: None,
+        credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),
     }
 }

@@ -9,7 +9,7 @@
 //! The `agent.prompt` rows have no exact-engine counterpart — the session gate is authority the
 //! Cedar migration adds — so they are asserted against their documented intent alone.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, ConstraintSet,
@@ -161,6 +161,7 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
             risk: RiskLevel::Low,
             idempotency: Idempotency::Idempotent,
             credential: None,
+            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )

@@ -269,3 +269,69 @@ fn policy_http_scope_values_are_bounded() {
     };
     assert!(super::validate_set_constraints(&constraints).is_err());
 }
+
+/// The authored spelling of a per-agent credential, and what selection does with it.
+///
+/// The map key is an `AgentId`, so a name no agent could carry is a decode failure rather than an
+/// override that silently never matches. An absent map stays off the wire, which keeps a
+/// constraint set written before this existed serializing exactly as it did.
+#[test]
+fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
+    let document = r#"{
+        "provider": "gh",
+        "effect": "external-write",
+        "risk": "Medium",
+        "idempotency": "non-idempotent",
+        "credential": "github-pat",
+        "credentialByAgent": { "nestedset-github": "github-pat-scientist-hq" },
+        "constraints": { "timeoutMs": 1000, "maxOutputBytes": 1024 }
+    }"#;
+    let set = serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
+    assert_eq!(
+        set.credential_by_agent
+            .get(&"nestedset-github".parse::<AgentId>().expect("valid agent")),
+        Some(&"github-pat-scientist-hq".to_owned())
+    );
+
+    let agent = |name: &str| Actor::Agent {
+        agent: name.parse::<AgentId>().expect("valid agent"),
+    };
+    assert_eq!(
+        set.credential_for(&agent("nestedset-github")),
+        Some("github-pat-scientist-hq")
+    );
+    assert_eq!(
+        set.credential_for(&agent("dekoponville-github")),
+        Some("github-pat")
+    );
+    // No agent, no override: the shape a direct `dekopon-run` peer arrives in.
+    assert_eq!(
+        set.credential_for(&Actor::Service {
+            principal: "local-user"
+                .parse::<PrincipalId>()
+                .expect("valid principal"),
+        }),
+        Some("github-pat")
+    );
+
+    assert!(
+        serde_json::from_str::<super::ConstraintSet>(
+            &document.replace("nestedset-github", "Nested Set")
+        )
+        .is_err(),
+        "a map key that is not a valid agent identifier must not decode"
+    );
+
+    let without = serde_json::from_str::<super::ConstraintSet>(&document.replace(
+        r#""credentialByAgent": { "nestedset-github": "github-pat-scientist-hq" },"#,
+        "",
+    ))
+    .expect("a set with no overrides decodes");
+    assert!(without.credential_by_agent.is_empty());
+    assert!(
+        !serde_json::to_string(&without)
+            .expect("serializes")
+            .contains("credentialByAgent"),
+        "an empty override map must stay off the wire"
+    );
+}

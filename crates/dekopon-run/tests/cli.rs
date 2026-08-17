@@ -63,6 +63,7 @@ fn broker_constraints<'a>(
                 risk: RiskLevel::Low,
                 idempotency: Idempotency::Idempotent,
                 credential: None,
+                credential_by_agent: BTreeMap::new(),
                 constraints,
             },
         )

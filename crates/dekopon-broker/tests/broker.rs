@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
@@ -118,6 +119,7 @@ fn set_with_metadata(
         risk,
         idempotency,
         credential: None,
+        credential_by_agent: BTreeMap::new(),
         constraints,
     }
 }
@@ -211,6 +213,29 @@ fn direct_provider_policy(
 
 fn direct_http_policy(name: &str, agent_name: &str, capability: &str) -> String {
     direct_provider_policy(name, agent_name, "http-probe", capability)
+}
+
+/// The same HTTP grant for a directly connected peer that is no agent at all — the shape
+/// `dekopon-run` arrives in, carrying `Actor::Service` and therefore no `context.agent`.
+const DIRECT_PEER_HTTP_POLICY: &str = r#"permit(principal == Dekopon::Principal::"direct-peer",
+       action == Dekopon::Action::"http-probe.fetch",
+       resource == Dekopon::Provider::"http-probe")
+unless { context has via };"#;
+
+/// One plaintext loopback GET against a fixture server.
+fn loopback_constraints(authority: &str) -> ExecutionConstraints {
+    ExecutionConstraints {
+        timeout_ms: 5_000,
+        max_output_bytes: 1024 * 1024,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec![authority.to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 1,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+        }),
+    }
 }
 
 /// The Cedar spelling of "this exact principal, as this exact agent, connected directly".
@@ -311,41 +336,56 @@ async fn attested_broker(
 }
 
 fn mock_http(response: &[u8]) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+    mock_http_serving(response, 1)
+}
+
+/// A loopback server answering exactly `calls` connections with the same response.
+///
+/// Requests arrive on the channel in the order they were served, which is the order the broker
+/// dispatched them: the tests below await one invocation at a time.
+fn mock_http_serving(
+    response: &[u8],
+    calls: usize,
+) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let response = response.to_vec();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
     let address = listener.local_addr().expect("fixture address");
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fixture request");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set fixture timeout");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        loop {
-            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                let body_length = String::from_utf8_lossy(&request[..header_end + 4])
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + 4 + body_length {
+        for _ in 0..calls {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set fixture timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let body_length = String::from_utf8_lossy(&request[..header_end + 4])
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + body_length {
+                        break;
+                    }
+                }
+                let read = stream.read(&mut buffer).expect("read fixture request");
+                if read == 0 {
                     break;
                 }
+                request.extend_from_slice(&buffer[..read]);
             }
-            let read = stream.read(&mut buffer).expect("read fixture request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
+            sender.send(request).expect("record fixture request");
+            stream.write_all(&response).expect("write fixture response");
+            stream.flush().expect("flush fixture response");
         }
-        sender.send(request).expect("record fixture request");
-        stream.write_all(&response).expect("write fixture response");
-        stream.flush().expect("flush fixture response");
     });
     (format!("127.0.0.1:{}", address.port()), receiver, handle)
 }
@@ -1005,18 +1045,7 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     let (authority, received, server) = mock_http(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
-    let constraints = ExecutionConstraints {
-        timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
-        http: Some(HttpConstraints {
-            allowed_hosts: vec![authority.clone()],
-            allowed_methods: vec!["GET".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 64 * 1024,
-            max_response_bytes: 64 * 1024,
-            allow_plaintext_loopback: true,
-        }),
-    };
+    let constraints = loopback_constraints(&authority);
     let credentials = CredentialStore::new([(
         "fetch-token".to_owned(),
         BoundCredential::bearer(
@@ -1092,6 +1121,260 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     assert!(!public.contains(SECRET), "result leaked the secret");
 }
 
+/// The per-agent axis, end to end: one capability, one constraint set, two organizations' tokens.
+///
+/// Selection keys on the agent in the trusted context, so all three shapes a caller can arrive in
+/// are here — an agent the set names, an agent it does not, and a direct peer that is no agent at
+/// all. The wire is the only place a secret may appear; the audit chain gets the symbolic name,
+/// which is what keeps the two writes from being indistinguishable after the fact.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
+    const DEFAULT_SECRET: &str = "dekopon-agents-token";
+    const OVERRIDE_SECRET: &str = "scientist-hq-token";
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let (authority, received, server) = mock_http_serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        3,
+    );
+    let credentials = CredentialStore::new([
+        (
+            "github-pat".to_owned(),
+            BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(DEFAULT_SECRET.to_owned()),
+                vec![authority.clone()],
+            )
+            .expect("valid credential fixture"),
+        ),
+        (
+            "github-pat-scientist-hq".to_owned(),
+            BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(OVERRIDE_SECRET.to_owned()),
+                vec![authority.clone()],
+            )
+            .expect("valid credential fixture"),
+        ),
+    ])
+    .expect("credential store builds");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        engine(
+            &format!(
+                "{}\n{}\n{}",
+                direct_http_policy("caller", "dekoponville-github", "http-probe.fetch"),
+                direct_http_policy("caller", "nestedset-github", "http-probe.fetch"),
+                DIRECT_PEER_HTTP_POLICY,
+            ),
+            ["caller", "direct-peer"],
+            [("http-probe.fetch", "http-probe")],
+        ),
+        catalog([(
+            "http-probe.fetch",
+            ConstraintSet {
+                credential: Some("github-pat".to_owned()),
+                credential_by_agent: BTreeMap::from([(
+                    agent("nestedset-github"),
+                    "github-pat-scientist-hq".to_owned(),
+                )]),
+                ..set("http-probe", loopback_constraints(&authority))
+            },
+        )]),
+        credentials,
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("both the default and the override match the store and its destinations");
+
+    let fetch = |id: &'static str, context: AuthenticatedContext| {
+        let authority = authority.clone();
+        let broker = &broker;
+        async move {
+            let result = broker
+                .invoke(
+                    &context,
+                    request(
+                        id,
+                        "http-probe.fetch",
+                        json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+                    ),
+                )
+                .await
+                .expect("the authorized request is accounted");
+            assert_eq!(
+                result.outcome,
+                dekopon_capability::InvocationOutcome::Succeeded
+            );
+        }
+    };
+    fetch(
+        "invoke-nestedset",
+        agent_context("caller", "nestedset-github"),
+    )
+    .await;
+    fetch(
+        "invoke-dekoponville",
+        agent_context("caller", "dekoponville-github"),
+    )
+    .await;
+    // A direct peer such as `dekopon-run` is an `Actor::Service`: no agent, no override, default.
+    fetch("invoke-direct", service_context("direct-peer")).await;
+
+    let wire = || {
+        String::from_utf8(received.recv().expect("fixture request recorded"))
+            .expect("fixture request is UTF-8")
+    };
+    for (index, (present, absent)) in [
+        (OVERRIDE_SECRET, DEFAULT_SECRET),
+        (DEFAULT_SECRET, OVERRIDE_SECRET),
+        (DEFAULT_SECRET, OVERRIDE_SECRET),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = wire();
+        assert!(
+            request.contains(&format!("authorization: Bearer {present}")),
+            "request {index} presented the wrong credential: {request}"
+        );
+        assert!(
+            !request.contains(absent),
+            "request {index} leaked the other organization's token: {request}"
+        );
+    }
+    server.join().expect("fixture server exits");
+
+    // Which authority a write used is exactly what an auditor needs; the value still is not.
+    let records = audit.records().await;
+    verify_audit_chain(&records).expect("audit chain verifies");
+    let encoded = serde_json::to_value(&records).expect("audit serializes");
+    let selected = encoded
+        .as_array()
+        .expect("records serialize as an array")
+        .iter()
+        .filter_map(|record| record["event"]["credential"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected,
+        ["github-pat-scientist-hq", "github-pat", "github-pat"],
+        "each terminal record names the credential its own invocation selected"
+    );
+    let serialized = serde_json::to_string(&records).expect("audit serializes");
+    for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
+        assert!(!serialized.contains(secret), "audit leaked a secret");
+    }
+    assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
+}
+
+/// A set may carry overrides and no default, and then "no credential" keeps its original meaning
+/// for every agent the overrides do not name: the capability transacts unauthenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
+    const SECRET: &str = "scientist-hq-token";
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let (authority, received, server) = mock_http_serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        2,
+    );
+    let credentials = CredentialStore::new([(
+        "github-pat-scientist-hq".to_owned(),
+        BoundCredential::bearer(
+            "Bearer",
+            Redacted::new(SECRET.to_owned()),
+            vec![authority.clone()],
+        )
+        .expect("valid credential fixture"),
+    )])
+    .expect("credential store builds");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&format!(
+            "{}\n{}",
+            direct_http_policy("caller", "dekoponville-github", "http-probe.fetch"),
+            direct_http_policy("caller", "nestedset-github", "http-probe.fetch"),
+        )),
+        catalog([(
+            "http-probe.fetch",
+            ConstraintSet {
+                credential: None,
+                credential_by_agent: BTreeMap::from([(
+                    agent("nestedset-github"),
+                    "github-pat-scientist-hq".to_owned(),
+                )]),
+                ..set("http-probe", loopback_constraints(&authority))
+            },
+        )]),
+        credentials,
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("an override with no default is a coherent set");
+
+    for (id, agent_name) in [
+        ("invoke-nestedset", "nestedset-github"),
+        ("invoke-dekoponville", "dekoponville-github"),
+    ] {
+        broker
+            .invoke(
+                &agent_context("caller", agent_name),
+                request(
+                    id,
+                    "http-probe.fetch",
+                    json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+                ),
+            )
+            .await
+            .expect("the authorized request is accounted");
+    }
+
+    let wire = || {
+        String::from_utf8(received.recv().expect("fixture request recorded"))
+            .expect("fixture request is UTF-8")
+    };
+    assert!(wire().contains(&format!("authorization: Bearer {SECRET}")));
+    let unauthenticated = wire();
+    assert!(
+        !unauthenticated
+            .to_ascii_lowercase()
+            .contains("authorization"),
+        "an unmatched agent must send no credential at all: {unauthenticated}"
+    );
+    server.join().expect("fixture server exits");
+
+    let records = audit.records().await;
+    verify_audit_chain(&records).expect("audit chain verifies");
+    let encoded = serde_json::to_value(&records).expect("audit serializes");
+    let selected = encoded
+        .as_array()
+        .expect("records serialize as an array")
+        .iter()
+        .filter_map(|record| record["event"]["credential"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected,
+        ["github-pat-scientist-hq"],
+        "an invocation with no credential names none, rather than naming the empty one"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let http = |hosts: Vec<String>| ExecutionConstraints {
@@ -1107,18 +1390,29 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         }),
     };
     let store = || {
-        CredentialStore::new([(
-            "fetch-token".to_owned(),
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new("secret".to_owned()),
-                vec!["api.example.test".to_owned()],
-            )
-            .expect("valid credential fixture"),
-        )])
+        CredentialStore::new([
+            (
+                "fetch-token".to_owned(),
+                BoundCredential::bearer(
+                    "Bearer",
+                    Redacted::new("secret".to_owned()),
+                    vec!["api.example.test".to_owned()],
+                )
+                .expect("valid credential fixture"),
+            ),
+            (
+                "other-token".to_owned(),
+                BoundCredential::bearer(
+                    "Bearer",
+                    Redacted::new("other-secret".to_owned()),
+                    vec!["other.example.test".to_owned()],
+                )
+                .expect("valid credential fixture"),
+            ),
+        ])
         .expect("credential store builds")
     };
-    let build = |credential: String, constraints: ExecutionConstraints, store: CredentialStore| {
+    let build_set = |set: ConstraintSet, store: CredentialStore| {
         let registry_limits = BrokerHostLimits::default();
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
         async move {
@@ -1135,19 +1429,32 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                     .expect("valid broker principal"),
                 "policy-test".to_owned(),
                 http_probe_engine(""),
-                catalog([(
-                    "http-probe.fetch",
-                    ConstraintSet {
-                        credential: Some(credential),
-                        ..set("http-probe", constraints)
-                    },
-                )]),
+                catalog([("http-probe.fetch", set)]),
                 store,
                 IdentityDirectory::empty(),
                 audit,
                 BrokerLimits::default(),
             )
         }
+    };
+    let build = |credential: String, constraints: ExecutionConstraints, store: CredentialStore| {
+        build_set(
+            ConstraintSet {
+                credential: Some(credential),
+                ..set("http-probe", constraints)
+            },
+            store,
+        )
+    };
+    let build_override = |credential: String, constraints: ExecutionConstraints| {
+        build_set(
+            ConstraintSet {
+                credential: Some("fetch-token".to_owned()),
+                credential_by_agent: BTreeMap::from([(agent("nestedset-github"), credential)]),
+                ..set("http-probe", constraints)
+            },
+            store(),
+        )
     };
 
     // An unnamed credential must fail before any invocation can reference it.
@@ -1159,6 +1466,18 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     .await
     .expect_err("unknown credential names are refused");
     assert!(matches!(error, BrokerBuildError::UnknownCredential { .. }));
+
+    // The same, for an override: a set is only as proven as the credential nobody validated.
+    let error = build_override(
+        "missing-token".to_owned(),
+        http(vec!["api.example.test".to_owned()]),
+    )
+    .await
+    .expect_err("an override naming an unknown credential is refused");
+    assert!(matches!(
+        error,
+        BrokerBuildError::UnknownCredential { name, .. } if name == "missing-token"
+    ));
 
     // A credential with no HTTP authority to ride on is a configuration contradiction.
     let error = build(
@@ -1188,6 +1507,20 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     assert!(matches!(
         error,
         BrokerBuildError::CredentialDestinationMismatch { host, .. } if host == "other.example.test"
+    ));
+
+    // An override is checked against this set's allowed hosts, not against the default's
+    // destinations: `other-token` reaches somewhere real, just not where this set may go.
+    let error = build_override(
+        "other-token".to_owned(),
+        http(vec!["api.example.test".to_owned()]),
+    )
+    .await
+    .expect_err("an override that does not cover the set's hosts is refused");
+    assert!(matches!(
+        error,
+        BrokerBuildError::CredentialDestinationMismatch { name, host, .. }
+            if name == "other-token" && host == "api.example.test"
     ));
 }
 
@@ -1660,6 +1993,35 @@ fn audit_events_written_before_attestation_decode_and_hash_unchanged() {
         serde_json::to_string(&event).expect("serializes"),
         legacy,
         "an absent attestation must not change the bytes a retained record hashes over"
+    );
+}
+
+/// The same requirement for the terminal record's `credential`, which per-agent selection added.
+///
+/// A durable chain written before it existed has to keep hashing to the same value, so the field
+/// has to be a skipped-when-absent option rather than a `null`. The name is recorded for the same
+/// reason `policy_ids` is: an auditor needs to know which authority a write used, and once one
+/// capability can present two, an unnamed one makes two organizations' writes identical.
+#[test]
+fn execution_records_written_before_per_agent_credentials_decode_and_hash_unchanged() {
+    let legacy = concat!(
+        r#"{"type":"execution","invocation":"invoke-legacy","trace":"trace-legacy","#,
+        r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
+        r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
+        r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","#,
+        r#""effect":"read-only","risk":"Low","idempotency":"idempotent","outcome":"Succeeded","#,
+        r#""duration_ms":3,"output_digest":"sha256-legacy"}"#,
+    );
+    let event =
+        serde_json::from_str::<AuditEvent>(legacy).expect("pre-credential records still decode");
+    let AuditEvent::Execution { credential, .. } = &event else {
+        panic!("the fixture is an execution event");
+    };
+    assert!(credential.is_none());
+    assert_eq!(
+        serde_json::to_string(&event).expect("serializes"),
+        legacy,
+        "an absent credential must not change the bytes a retained record hashes over"
     );
 }
 

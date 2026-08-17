@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::PermissionsExt as _, path::Path};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path};
 
 use dekopon_broker::ConstraintSet;
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
@@ -33,6 +33,7 @@ fn constraint_set() -> serde_json::Value {
         risk: RiskLevel::Low,
         idempotency: Idempotency::Idempotent,
         credential: None,
+        credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),
     })
     .expect("constraint set serializes")

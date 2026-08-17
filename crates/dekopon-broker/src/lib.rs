@@ -195,8 +195,8 @@ pub enum ContextError {
 ///
 /// A constraint set is not a grant. It answers "if some policy permits this capability, how
 /// narrowly does the broker execute it": which provider route, which trusted classification, which
-/// broker-held credential, and which timeout/output/HTTP bounds. Cedar decides whether anyone may
-/// reach it at all.
+/// broker-held credential — for everyone, or per acting agent — and which timeout/output/HTTP
+/// bounds. Cedar decides whether anyone may reach it at all.
 ///
 /// Splitting the two is what keeps a policy edit from widening an execution bound. Every field
 /// here is validated at construction against the loaded provider manifest, the component host's
@@ -216,13 +216,60 @@ pub struct ConstraintSet {
     ///
     /// Binding is per capability rather than per provider on purpose: the confused-deputy scenario
     /// is "same provider component, different operation", and only the capability knows both. A
-    /// set with no credential transacts unauthenticated. Construction validates the name against
-    /// the credential store and requires every allowed host to sit inside the credential's
-    /// destination binding.
+    /// set with no credential — and no [`credential_by_agent`](Self::credential_by_agent) entry for
+    /// the acting agent — transacts unauthenticated. Construction validates the name against the
+    /// credential store and requires every allowed host to sit inside the credential's destination
+    /// binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+    /// Per-agent overrides of [`credential`](Self::credential), keyed by acting agent.
+    ///
+    /// This is the second axis of credential binding, and it answers a different question from the
+    /// first. `credential` decides which secret an *operation* presents; this decides which secret
+    /// a *caller* presents for that operation, so one capability can reach two organizations
+    /// through two tokens without being duplicated under a second capability namespace.
+    ///
+    /// The key is the agent, because that is the identity the deployment already partitions on:
+    /// routes name agents, so a per-agent credential is per-team and per-channel scoping for free.
+    /// It is also trusted input rather than a caller claim — the agent name arrives in the
+    /// [`AuthenticatedContext`] the broker itself derived from an owner-configured attestor grant,
+    /// never from an invocation payload. A caller with no agent at all, such as a direct
+    /// `dekopon-run` peer carrying [`Actor::Service`], matches no override and takes the default.
+    ///
+    /// Every override is validated at construction exactly as the default is: the name must exist
+    /// in the credential store and its destinations must cover every allowed host of this set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_by_agent: BTreeMap<AgentId, String>,
     /// Execution and optional HTTP authority granted when this capability is permitted.
     pub constraints: ExecutionConstraints,
+}
+
+impl ConstraintSet {
+    /// Selects the symbolic credential this set presents for one trusted actor.
+    ///
+    /// An agent actor takes its [`credential_by_agent`](Self::credential_by_agent) entry when the
+    /// set declares one, and otherwise the default; every other actor takes the default. `None`
+    /// means this invocation transacts unauthenticated, which is what a set with no credential at
+    /// all has always meant.
+    #[must_use]
+    pub fn credential_for(&self, actor: &Actor) -> Option<&str> {
+        let selected = match actor {
+            Actor::Agent { agent } => self.credential_by_agent.get(agent),
+            Actor::Human { .. } | Actor::Service { .. } => None,
+        };
+        selected.or(self.credential.as_ref()).map(String::as_str)
+    }
+
+    /// Every credential this set could ever select, for construction-time validation.
+    ///
+    /// Validating the reachable set rather than only the default is what keeps an override from
+    /// being the one credential nobody proved: a name the store does not hold, or destinations
+    /// that do not cover this set's allowed hosts, must refuse startup wherever it appears.
+    fn selectable_credentials(&self) -> impl Iterator<Item = &String> {
+        self.credential
+            .iter()
+            .chain(self.credential_by_agent.values())
+    }
 }
 
 /// Every capability this broker knows how to execute, and how.
@@ -512,37 +559,45 @@ fn validate_trusted_metadata(
     Ok(())
 }
 
-/// Proves a credentialed constraint set's destination binding at construction time.
+/// Proves every credentialed constraint set's destination binding at construction time.
 ///
 /// The runtime injector refuses destinations outside the binding as defense in depth, but this
 /// check is the load-bearing one: with every `allowedHosts` entry required verbatim in the
 /// credential's destinations, no authorized request can ever reach the runtime mismatch path.
+///
+/// It runs over every credential the set can select — the default and each per-agent override —
+/// because selection happens per invocation and an unproven override is a credential the first
+/// caller to match it would discover at execution time.
 fn validate_set_credential(
     capability_id: &CapabilityId,
     set: &ConstraintSet,
     credentials: &CredentialStore,
 ) -> Result<(), BrokerBuildError> {
-    let Some(name) = &set.credential else {
+    let mut names = set.selectable_credentials().peekable();
+    if names.peek().is_none() {
         return Ok(());
-    };
-    let credential = credentials
-        .get(name)
-        .ok_or_else(|| BrokerBuildError::UnknownCredential {
-            capability: capability_id.clone(),
-            name: name.clone(),
-        })?;
+    }
     let Some(http) = &set.constraints.http else {
         return Err(BrokerBuildError::CredentialWithoutHttp {
             capability: capability_id.clone(),
         });
     };
-    for host in &http.allowed_hosts {
-        if !credential.covers(host) {
-            return Err(BrokerBuildError::CredentialDestinationMismatch {
-                capability: capability_id.clone(),
-                name: name.clone(),
-                host: host.clone(),
-            });
+    for name in names {
+        let credential =
+            credentials
+                .get(name)
+                .ok_or_else(|| BrokerBuildError::UnknownCredential {
+                    capability: capability_id.clone(),
+                    name: name.clone(),
+                })?;
+        for host in &http.allowed_hosts {
+            if !credential.covers(host) {
+                return Err(BrokerBuildError::CredentialDestinationMismatch {
+                    capability: capability_id.clone(),
+                    name: name.clone(),
+                    host: host.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -825,6 +880,15 @@ pub enum AuditEvent {
         risk: RiskLevel,
         /// Trusted retry classification.
         idempotency: Idempotency,
+        /// Symbolic name of the credential this invocation selected; absent when it had none.
+        ///
+        /// The name is owner-authored configuration that already sits in `broker.yaml`, not
+        /// secret material, and recording it is what keeps two external writes to two
+        /// organizations from producing identical records once one capability can present two
+        /// credentials. `credentialInjected` in the HTTP evidence still says whether a given call
+        /// actually presented it; this says which authority the broker selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
         /// Terminal execution outcome.
         outcome: InvocationOutcome,
         /// Bounded monotonic execution duration.
@@ -1792,8 +1856,19 @@ where
             (set, decision.determining_policy_ids)
         };
         let provider = set.provider.clone();
+        let execute = tracing::info_span!(
+            "broker.execute",
+            provider = %provider,
+            credential = tracing::field::Empty,
+        );
+        // The symbolic name only, exactly as the audit record carries it: once one capability can
+        // present two credentials, a trace that names neither cannot say which organization a
+        // write reached. `Redacted` keeps the value itself out of both.
+        if let Some(credential) = set.credential_for(context.actor()) {
+            execute.record("credential", credential);
+        }
         self.execute(context, request, set, policy_ids)
-            .instrument(tracing::info_span!("broker.execute", provider = %provider))
+            .instrument(execute)
             .await
     }
 
@@ -1920,14 +1995,15 @@ where
             .await
             .map_err(|source| BrokerError::DecisionAudit { source })?;
 
-        // Resolved by the symbolic name the capability's constraint set carries; construction
-        // proved the name exists and that every allowed host sits inside the credential's
-        // destination binding. The secret itself never enters the authorization, the audit chain,
-        // or the wire — it travels only from the store into the native HTTP boundary for this one
-        // invocation.
-        let credential = set
-            .credential
-            .as_ref()
+        // Selected by the acting agent, falling back to the set's default; construction proved
+        // every name the set can select exists and that every allowed host sits inside that
+        // credential's destination binding. The agent comes from the trusted context the broker
+        // derived, so this is owner-controlled configuration selecting on owner-controlled
+        // identity — a caller cannot ask for a different token by changing its payload. The secret
+        // itself never enters the authorization, the audit chain, or the wire: it travels only
+        // from the store into the native HTTP boundary for this one invocation.
+        let credential_name = set.credential_for(context.actor());
+        let credential = credential_name
             .and_then(|name| self.credentials.get(name))
             .cloned();
         let started = Instant::now();
@@ -1967,6 +2043,7 @@ where
                     &self.policy_digest,
                     &self.broker_principal,
                     &set,
+                    credential_name,
                     InvocationOutcome::Succeeded,
                     duration_ms,
                     None,
@@ -2013,6 +2090,7 @@ where
                     &self.policy_digest,
                     &self.broker_principal,
                     &set,
+                    credential_name,
                     InvocationOutcome::Failed,
                     duration_ms,
                     Some(error.clone()),
@@ -2073,6 +2151,7 @@ fn execution_event(
     policy_digest: &str,
     authorized_by: &PrincipalId,
     set: &ConstraintSet,
+    credential: Option<&str>,
     outcome: InvocationOutcome,
     duration_ms: u64,
     error: Option<String>,
@@ -2096,6 +2175,7 @@ fn execution_event(
         effect: set.effect,
         risk: set.risk,
         idempotency: set.idempotency,
+        credential: credential.map(str::to_owned),
         outcome,
         duration_ms,
         error,
