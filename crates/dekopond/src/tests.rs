@@ -722,6 +722,7 @@ fn message(text: &str) -> InboundMessage {
         subject: subject(),
         channel: "dev".to_owned(),
         thread: None,
+        conversation_id: "dev".to_owned(),
         message_id: "1".to_owned(),
         text: text.to_owned(),
         conversation: ConversationKind::DirectMessage,
@@ -1196,6 +1197,14 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
 // Slack Socket Mode
 // ---------------------------------------------------------------------------
 
+/// The next routable message from any transport, failing the test rather than hanging on it.
+async fn next_message(transport: &mut dyn ChatTransport) -> InboundMessage {
+    tokio::time::timeout(Duration::from_secs(5), transport.next())
+        .await
+        .expect("a message arrives before the test gives up")
+        .expect("a routable message")
+}
+
 /// A loopback HTTP mock serving Slack's token-only methods.
 ///
 /// Hand-rolled rather than a framework: this has to answer exactly what the transport asks for and
@@ -1371,6 +1380,25 @@ fn direct_message(user: &str, ts: &str, text: &str) -> Value {
         "ts": ts,
         "text": text
     })
+}
+
+/// One shared-channel message, threaded when `thread_ts` is given.
+///
+/// Slack sends `thread_ts` only on replies *inside* a thread; the message that starts one arrives
+/// without it, which is exactly the asymmetry the conversation identity has to absorb.
+fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
+    let mut event = json!({
+        "type": "message",
+        "channel": "c0123abc",
+        "channel_type": "channel",
+        "user": user,
+        "ts": ts,
+        "text": text
+    });
+    if let Some(thread_ts) = thread_ts {
+        event["thread_ts"] = json!(thread_ts);
+    }
+    event
 }
 
 /// One Slack transport pointed at loopback mocks.
@@ -1554,15 +1582,128 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
     assert_eq!(message.subject.canonical(), "slack.t0123abc.u9xyz");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
+    // The failure this field exists to prevent. Slack omits `thread_ts` on the message that starts
+    // a thread and sends it on every reply inside one, while the bot answers that first message
+    // *in* a thread rooted at it. Anything keyed on `thread` therefore files the opening question
+    // apart from every answer to it, orphaning the first turn of every threaded conversation.
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "envelope-1",
+            channel_message(
+                "u9xyz",
+                "1700000000.000001",
+                None,
+                "<@u0botbot> what broke?",
+            ),
+        ),
+        events_envelope(
+            "envelope-2",
+            channel_message(
+                "u9xyz",
+                "1700000000.000002",
+                Some("1700000000.000001"),
+                "<@u0botbot> and since when?",
+            ),
+        ),
+        events_envelope(
+            "envelope-3",
+            channel_message(
+                "u9xyz",
+                "1700000000.000003",
+                Some("1699999999.000009"),
+                "<@u0botbot> different subject entirely",
+            ),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let opening = next_message(&mut transport).await;
+    let reply = next_message(&mut transport).await;
+    let elsewhere = next_message(&mut transport).await;
+
+    // The asymmetry itself, so the derivation below has something to be right about.
+    assert_eq!(opening.thread, None);
+    assert_eq!(reply.thread.as_deref(), Some("1700000000.000001"));
+
+    assert_eq!(
+        opening.conversation_id, reply.conversation_id,
+        "the message that opened a thread and a reply inside it are one conversation"
+    );
+    assert_eq!(opening.conversation_id, "c0123abc:1700000000.000001");
+    assert_ne!(
+        opening.conversation_id, elsewhere.conversation_id,
+        "two threads in one channel are two conversations"
+    );
+    // The identity is the thread the *answer* joins, which is why it survives the first turn.
+    assert_eq!(
+        opening.reply,
+        ReplyTarget::Slack {
+            channel: "c0123abc".to_owned(),
+            thread_ts: Some("1700000000.000001".to_owned()),
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
+    // A DM has no thread to join and the transport deliberately answers outside one, so the whole
+    // conversation is the DM channel and stays that way however many messages arrive in it.
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "envelope-1",
+            direct_message("u9xyz", "1700000000.000001", "how are things?"),
+        ),
+        events_envelope(
+            "envelope-2",
+            direct_message("u9xyz", "1700000000.000002", "and one more thing"),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let first = next_message(&mut transport).await;
+    let second = next_message(&mut transport).await;
+
+    assert_eq!(first.conversation_id, "d0123abc");
+    assert_eq!(
+        first.conversation_id, second.conversation_id,
+        "a direct message is one conversation across its messages"
+    );
+    assert_eq!(
+        first.reply,
+        ReplyTarget::Slack {
+            channel: "d0123abc".to_owned(),
+            thread_ts: None,
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Telegram long polling
 // ---------------------------------------------------------------------------
 
 fn telegram_message(user: i64, is_bot: bool, message_id: i64, text: &str) -> Value {
+    telegram_chat_message(42, "private", user, is_bot, message_id, text)
+}
+
+/// The same message in a named chat, so a test can tell two conversations apart.
+fn telegram_chat_message(
+    chat: i64,
+    kind: &str,
+    user: i64,
+    is_bot: bool,
+    message_id: i64,
+    text: &str,
+) -> Value {
     json!({
         "message_id": message_id,
         "from": {"id": user, "is_bot": is_bot, "username": "someone"},
-        "chat": {"id": 42, "type": "private"},
+        "chat": {"id": chat, "type": kind},
         "text": text
     })
 }
@@ -1617,4 +1758,96 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
         "{:?}",
         http.calls()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
+    // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
+    // chat: consecutive messages continue one exchange, and a group is not the private chat.
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [
+                {"update_id": 200, "message": telegram_message(16034700182_i64, false, 1, "first")},
+                {"update_id": 201, "message": telegram_message(16034700182_i64, false, 2, "second")},
+                {"update_id": 202, "message": telegram_chat_message(-1001, "supergroup", 16034700182_i64, false, 3, "over here")}
+            ]});
+        }
+        json!({"ok": true, "result": []})
+    });
+
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+    )
+    .expect("telegram transport builds");
+    transport
+        .connect()
+        .await
+        .expect("telegram transport connects");
+
+    let first = next_message(&mut transport).await;
+    let second = next_message(&mut transport).await;
+    let group = next_message(&mut transport).await;
+
+    assert_eq!(first.conversation_id, "42");
+    assert_eq!(
+        first.conversation_id, second.conversation_id,
+        "two messages in one chat are one conversation"
+    );
+    assert_eq!(group.conversation_id, "-1001");
+    assert_ne!(first.conversation_id, group.conversation_id);
+}
+
+// ---------------------------------------------------------------------------
+// The development transport
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_local_transport_takes_its_conversation_from_the_caller() {
+    // Nothing here is service-native, so the caller names its own conversation and `dev` is the
+    // default. Deliberately not the connection number: a developer who reconnects is still in the
+    // same conversation, and one client driving several sessions needs to keep them apart.
+    let directory = temporary();
+    let socket_path = directory.path().join("dev.sock");
+    let mut transport =
+        crate::transport::local::LocalTransport::new("dev".to_owned(), socket_path.clone());
+    transport
+        .connect()
+        .await
+        .expect("the development transport binds");
+
+    use tokio::io::AsyncWriteExt as _;
+    let mut client = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("a local caller connects");
+    for request in [
+        json!({"subject": SUBJECT, "text": "first"}),
+        json!({"subject": SUBJECT, "text": "second"}),
+        json!({"subject": SUBJECT, "channel": "session-7", "text": "over here"}),
+    ] {
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("the request is written");
+    }
+
+    let first = next_message(&mut transport).await;
+    let second = next_message(&mut transport).await;
+    let named = next_message(&mut transport).await;
+
+    assert_eq!(first.text, "first");
+    assert_eq!(first.conversation_id, "dev");
+    assert_eq!(
+        first.conversation_id, second.conversation_id,
+        "two requests on one connection continue one conversation"
+    );
+    assert_ne!(
+        first.message_id, second.message_id,
+        "each request is still its own message"
+    );
+    assert_eq!(named.conversation_id, "session-7");
 }

@@ -33,6 +33,22 @@ pub(crate) struct InboundMessage {
     pub channel: String,
     /// Service-native thread identifier, when the conversation has threads.
     pub thread: Option<String>,
+    /// Stable identity of the conversation this message belongs to, unique within its transport.
+    ///
+    /// Deliberately not `(channel, thread)`. On Slack a message that *starts* a thread carries no
+    /// `thread_ts`, while the bot's answer to it opens a thread rooted at that message — so every
+    /// later turn does carry one. Anything keyed on [`Self::thread`] therefore files the opening
+    /// question under a different key than the replies inside the thread it started, orphaning the
+    /// first turn of every threaded conversation. This field is the thread the *answer* joins, which
+    /// is the same value for all of them.
+    ///
+    /// Each transport derives it, because only a transport holds the service-native pieces it takes
+    /// — Slack's per-message `ts` is one of them, and it is gone by the time a message is routed.
+    ///
+    /// This is not the admission key. Admission serializes a conversation against itself on
+    /// `(transport, channel, thread)` and is unchanged; this identity exists for per-conversation
+    /// state that has to survive across turns.
+    pub conversation_id: String,
     /// Service-native message identifier, used only to reject redeliveries.
     pub message_id: String,
     /// Untrusted message text, already bounded to [`MAX_INBOUND_TEXT_BYTES`].
