@@ -483,9 +483,12 @@ mod tests {
 
     use std::time::Duration;
 
+    use serde_json::Value;
+
     use super::{
-        ChatResponse, ModelError, ModelToolCall, ModelUsage, OpenAiChatModel, WireFunctionCall,
-        WireToolCall, completion_url,
+        AssistantTurn, ChatRequest, ChatResponse, ModelError, ModelFunctionCall, ModelMessage,
+        ModelTool, ModelToolCall, ModelUsage, OpenAiChatModel, OpenAiTool, WireFunctionCall,
+        WireToolCall, assistant_message, completion_url,
     };
 
     #[test]
@@ -617,6 +620,92 @@ mod tests {
         .expect("object arguments normalize");
 
         assert_eq!(call.function.arguments, r#"{"message":"hi"}"#);
+    }
+
+    /// Serializes one request fragment so the comparison is over the bytes a provider's prefix
+    /// cache would hash. Both sides come from this same binary, so key ordering — which
+    /// `serde_json`'s `preserve_order` feature makes a per-binary property — cannot make the
+    /// assertion fail for a reason unrelated to the property under test.
+    fn request_text(fragment: &Value) -> String {
+        serde_json::to_string(fragment).expect("serialize request fragment")
+    }
+
+    #[test]
+    fn an_appended_turn_extends_the_chat_request_without_disturbing_its_prefix() {
+        // The chat-completions transport serializes `messages` verbatim and in order, hoisting
+        // nothing, so an append-only history is an append-only request. Nothing enforces that but
+        // this test. A conversation feature has to be correct on both backends, and this is the
+        // half where a regression is hardest to notice: the request stays valid, the answers stay
+        // right, and the only symptom is that the provider's prompt cache stops hitting.
+        let tool = ModelTool {
+            name: "bash".to_owned(),
+            description: "Run a sandboxed script".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"script": {"type": "string"}},
+                "required": ["script"],
+            }),
+        };
+        let tools = vec![OpenAiTool {
+            kind: "function",
+            function: &tool,
+        }];
+        let mut messages = vec![
+            ModelMessage::system("Be concise."),
+            ModelMessage::user("how many files are in the repository?"),
+        ];
+        let mut bodies = Vec::new();
+        for turn in 1..=3_u32 {
+            bodies.push(
+                serde_json::to_value(ChatRequest {
+                    model: "test-model",
+                    messages: &messages,
+                    tools: &tools,
+                    tool_choice: "auto",
+                })
+                .expect("serialize chat request"),
+            );
+            let call_id = format!("call_{turn}");
+            messages.push(assistant_message(&AssistantTurn {
+                content: None,
+                tool_calls: vec![ModelToolCall {
+                    id: call_id.clone(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: "bash".to_owned(),
+                        arguments: r#"{"script":"ls | wc -l"}"#.to_owned(),
+                    },
+                }],
+                usage: None,
+                replay_items: Vec::new(),
+            }));
+            messages.push(ModelMessage::tool(call_id, "12\n"));
+        }
+
+        // Unlike the Codex transport, the system message keeps its authored position instead of
+        // being lifted into a separate top-level field, so growth here really is only growth.
+        assert_eq!(bodies[0]["messages"][0]["role"], "system");
+        for pair in bodies.windows(2) {
+            let (previous, next) = (&pair[0], &pair[1]);
+            assert_eq!(
+                request_text(&previous["tools"]),
+                request_text(&next["tools"]),
+                "an appended turn rewrote the tool definitions"
+            );
+            let previous_messages = previous["messages"].as_array().expect("messages array");
+            let next_messages = next["messages"].as_array().expect("messages array");
+            assert!(
+                next_messages.len() > previous_messages.len(),
+                "an appended turn must extend the messages rather than replace them"
+            );
+            for (index, message) in previous_messages.iter().enumerate() {
+                assert_eq!(
+                    request_text(message),
+                    request_text(&next_messages[index]),
+                    "message {index} changed between turns; the cached prefix ends there"
+                );
+            }
+        }
     }
 
     #[test]
