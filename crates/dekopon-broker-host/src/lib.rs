@@ -16,7 +16,7 @@ use std::{
 };
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
-use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
 pub use dekopon_provider_sdk::{
     ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
@@ -294,12 +294,85 @@ impl BrokerWasmProvider {
                 }
             })?;
         validate_manifest(&manifest, &source)?;
+        // A manifest that promises command words the component cannot rewrite would fail at the
+        // first `gh …` a model typed, in a session, hours later. Prove it at load instead.
+        if !manifest.command_words.is_empty()
+            && !exports_resolve_command(&runtime, &component, &source).await?
+        {
+            return Err(BrokerHostError::MissingResolveCommand {
+                provider: manifest.id.clone(),
+                path: source.clone(),
+            });
+        }
         Ok(Self {
             runtime,
             component,
             source,
             manifest,
         })
+    }
+
+    /// Rewrites one command word's argv into a capability proposal, inside the guest.
+    ///
+    /// Bounded exactly as `describe` is: import-free, timed out, and output-capped. The rewrite
+    /// runs *before* authorization, so a component that reaches for a host import here is refused
+    /// rather than trusted.
+    pub async fn resolve_command(&self, argv: &[String]) -> Result<String, BrokerHostError> {
+        let operation_timeout = self.runtime.limits.max_timeout;
+        let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
+            .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
+        let mut store = self.runtime.store(http)?;
+        let linker = self.runtime.linker()?;
+        let argv = argv.to_vec();
+        let operation = async {
+            let instance = linker
+                .instantiate_async(&mut store, &self.component)
+                .await
+                .map_err(|source| BrokerHostError::Instantiate {
+                    path: self.source.clone(),
+                    source,
+                })?;
+            let function = resolve_command_export(&mut store, &instance).ok_or_else(|| {
+                BrokerHostError::MissingResolveCommand {
+                    provider: self.manifest.id.clone(),
+                    path: self.source.clone(),
+                }
+            })?;
+            let (output,) = function
+                .call_async(&mut store, (argv,))
+                .await
+                .map_err(|source| BrokerHostError::ResolveCommand {
+                    provider: self.manifest.id.clone(),
+                    source,
+                })?;
+            function
+                .post_return_async(&mut store)
+                .await
+                .map_err(|source| BrokerHostError::ResolveCommand {
+                    provider: self.manifest.id.clone(),
+                    source,
+                })?;
+            Ok::<_, BrokerHostError>(output)
+        };
+        let output = timeout(operation_timeout, operation).await.map_err(|_| {
+            BrokerHostError::Timeout {
+                operation: format!("resolve-command {}", self.manifest.id),
+                timeout_ms: operation_timeout.as_millis() as u64,
+            }
+        })??;
+        if store.data().http.attempted() {
+            return Err(BrokerHostError::ResolveCommandUsedHostImport {
+                path: self.source.clone(),
+            });
+        }
+        if output.len() > self.runtime.limits.max_output_bytes {
+            return Err(BrokerHostError::OutputTooLarge {
+                provider: self.manifest.id.to_string(),
+                length: output.len(),
+                maximum: self.runtime.limits.max_output_bytes,
+            });
+        }
+        Ok(output)
     }
 
     async fn invoke(
@@ -443,6 +516,77 @@ impl BrokerWasmProvider {
     }
 }
 
+/// Everything wrong with one provider set, gathered so an operator sees it once.
+///
+/// Ambiguity is fatal in a way absence is not: a word or capability two providers both claim has no
+/// meaning the broker can pick without silently choosing for the operator. This reports rather than
+/// resolves, and reports *all of it* — fixing a provider directory should take one restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderConflicts {
+    /// Provider identities declared by more than one component.
+    pub providers: Vec<ProviderId>,
+    /// Capability identifiers declared by more than one component.
+    pub capabilities: Vec<CapabilityId>,
+    /// Command words that cannot be granted to the providers claiming them.
+    pub command_words: Vec<CommandWordConflict>,
+}
+
+impl ProviderConflicts {
+    /// Reports how many distinct conflicts this covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.providers.len() + self.capabilities.len() + self.command_words.len()
+    }
+
+    /// Reports whether there is nothing to complain about.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl fmt::Display for ProviderConflicts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "refusing to start \u{2014} {} provider conflict(s)",
+            self.len()
+        )?;
+        for provider in &self.providers {
+            writeln!(formatter, "\n  provider {provider}")?;
+            writeln!(formatter, "    declared by more than one component")?;
+            writeln!(
+                formatter,
+                "    fix: remove one, or drop it from the provider search path"
+            )?;
+        }
+        for capability in &self.capabilities {
+            writeln!(formatter, "\n  capability {capability}")?;
+            writeln!(formatter, "    declared by more than one component")?;
+            writeln!(
+                formatter,
+                "    fix: rename it in one provider, or drop that provider"
+            )?;
+        }
+        for conflict in &self.command_words {
+            writeln!(formatter, "\n  command word `{}`", conflict.word)?;
+            for claimant in &conflict.claimants {
+                writeln!(formatter, "    claimed by  {claimant}")?;
+            }
+            writeln!(formatter, "    {}", conflict.kind.explanation())?;
+            writeln!(formatter, "    fix: {}", conflict.kind.remedy())?;
+        }
+        if !self.command_words.is_empty() {
+            write!(
+                formatter,
+                "\nReserved words: {}",
+                dekopon_core::RESERVED_COMMAND_WORDS.join(" ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic capability registry owned by a privileged broker.
 #[derive(Debug)]
 pub struct BrokerProviderRegistry {
@@ -463,29 +607,88 @@ impl BrokerProviderRegistry {
         }
         let runtime = Arc::new(Runtime::new(limits)?);
         let mut providers = Vec::with_capacity(sources.len());
-        let mut provider_ids = BTreeSet::new();
         let mut routes = BTreeMap::new();
+        // Every conflict, then one failure. Returning on the first would make fixing a provider
+        // directory take one restart per mistake; an operator should see the whole picture once.
+        let mut duplicate_providers = BTreeSet::new();
+        let mut duplicate_capabilities = BTreeSet::new();
+        let mut provider_ids = BTreeSet::new();
+        let mut declared_words = Vec::new();
         for source in sources {
             let provider = BrokerWasmProvider::load(Arc::clone(&runtime), source).await?;
             if !provider_ids.insert(provider.manifest.id.clone()) {
-                return Err(BrokerHostError::DuplicateProvider {
-                    provider: provider.manifest.id.clone(),
-                });
+                duplicate_providers.insert(provider.manifest.id.clone());
             }
+            declared_words.push((
+                provider.manifest.id.to_string(),
+                provider.manifest.command_words.clone(),
+            ));
             let provider_index = providers.len();
             for capability in &provider.manifest.capabilities {
                 if routes
                     .insert(capability.id.clone(), provider_index)
                     .is_some()
                 {
-                    return Err(BrokerHostError::DuplicateCapability {
-                        capability: capability.id.clone(),
-                    });
+                    duplicate_capabilities.insert(capability.id.clone());
                 }
             }
             providers.push(provider);
         }
+
+        let command_words = dekopon_core::command_word_conflicts(&declared_words);
+        if !duplicate_providers.is_empty()
+            || !duplicate_capabilities.is_empty()
+            || !command_words.is_empty()
+        {
+            return Err(BrokerHostError::ConflictingProviders {
+                report: Box::new(ProviderConflicts {
+                    providers: duplicate_providers.into_iter().collect(),
+                    capabilities: duplicate_capabilities.into_iter().collect(),
+                    command_words,
+                }),
+            });
+        }
         Ok(Self { providers, routes })
+    }
+
+    /// Returns every command word the loaded providers contribute, in identifier order.
+    #[must_use]
+    pub fn command_words(&self) -> Vec<String> {
+        let mut words = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.manifest.command_words.iter().cloned())
+            .collect::<Vec<_>>();
+        words.sort();
+        words.dedup();
+        words
+    }
+
+    /// Rewrites one command word's argv through the provider that declared it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerHostError::UnknownCommandWord`] when no loaded provider declared it, and any
+    /// guest failure from the rewrite itself.
+    pub async fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Result<String, BrokerHostError> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| {
+                provider
+                    .manifest
+                    .command_words
+                    .iter()
+                    .any(|candidate| candidate == word)
+            })
+            .ok_or_else(|| BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            })?;
+        provider.resolve_command(argv).await
     }
 
     /// Returns validated manifests in component load order.
@@ -572,6 +775,41 @@ impl BrokerProviderRegistry {
             })
             .await
     }
+}
+
+/// Looks up the optional `resolve-command` export on an instantiated component.
+///
+/// Optional on purpose: `dekopon:provider@0.2.0` defines it in a separate `provider-commands`
+/// world so a component built against an earlier package version keeps loading, contributing no
+/// command words. Independent provider release cadence is the whole point of moving providers out
+/// of this repository, and it does not survive a contract that forces lockstep rebuilds.
+fn resolve_command_export(
+    store: &mut Store<StoreState>,
+    instance: &wasmtime::component::Instance,
+) -> Option<wasmtime::component::TypedFunc<(Vec<String>,), (String,)>> {
+    instance
+        .get_typed_func::<(Vec<String>,), (String,)>(&mut *store, "resolve-command")
+        .ok()
+}
+
+/// Reports whether a component exports `resolve-command`, by instantiating it once.
+async fn exports_resolve_command(
+    runtime: &Runtime,
+    component: &Component,
+    source: &Path,
+) -> Result<bool, BrokerHostError> {
+    let http = HttpState::describe(runtime.http_ceilings(), runtime.limits.max_timeout)
+        .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
+    let mut store = runtime.store(http)?;
+    let linker = runtime.linker()?;
+    let instance = linker
+        .instantiate_async(&mut store, component)
+        .await
+        .map_err(|error| BrokerHostError::Instantiate {
+            path: source.to_path_buf(),
+            source: error,
+        })?;
+    Ok(resolve_command_export(&mut store, &instance).is_some())
 }
 
 async fn describe_component(
@@ -804,6 +1042,51 @@ pub enum BrokerHostError {
     /// Provider attempted a host call while describing itself.
     #[error("provider component {} attempted a host import during describe", path.display())]
     DescribeUsedHostImport {
+        /// Component path.
+        path: PathBuf,
+    },
+    /// One or more providers conflict with each other or with the shell's reserved vocabulary.
+    #[error("{report}")]
+    ConflictingProviders {
+        /// Every conflict found, boxed to keep this enum small.
+        report: Box<ProviderConflicts>,
+    },
+    /// No loaded provider declared the requested command word.
+    #[error("no loaded provider declares the command word {word:?}")]
+    UnknownCommandWord {
+        /// The unclaimed word.
+        word: String,
+    },
+    /// Provider declared command words but exports no way to rewrite them.
+    #[error(
+        "provider {provider} declares command words but component {} exports no resolve-command; \
+         rebuild it against the dekopon:provider/provider-commands world",
+        path.display()
+    )]
+    MissingResolveCommand {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Component path.
+        path: PathBuf,
+    },
+    /// Rewriting a command word failed inside the guest.
+    #[error("provider {provider} failed while rewriting a command word")]
+    ResolveCommand {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Underlying trap or error.
+        #[source]
+        source: wasmtime::Error,
+    },
+    /// Provider attempted a host call while rewriting a command word.
+    ///
+    /// The rewrite runs before authorization, so a component reaching for host authority there is
+    /// refused rather than trusted.
+    #[error(
+        "provider component {} attempted a host import during resolve-command",
+        path.display()
+    )]
+    ResolveCommandUsedHostImport {
         /// Component path.
         path: PathBuf,
     },

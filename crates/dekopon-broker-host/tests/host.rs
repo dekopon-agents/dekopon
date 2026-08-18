@@ -943,3 +943,57 @@ async fn gh_approve_over_its_call_budget_trips_the_host_call_limit() {
     drop(recorded);
     server.join().expect("fixture server exits");
 }
+
+/// A component that exports no `resolve-command` loads and contributes nothing.
+///
+/// This is the compatibility guarantee that makes independent provider release cadence possible:
+/// `dekopon:provider@0.2.0` puts `resolve-command` in a separate `provider-commands` world, so the
+/// host looks it up by name at instantiation rather than requiring it of the bound world. Every
+/// checked-in fixture is such a component, which is why this can be asserted against all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_component_without_resolve_command_loads_and_declares_no_words() {
+    let registry = BrokerProviderRegistry::load(
+        [
+            fixture("echo-provider.wasm"),
+            fixture("jsonplaceholder-provider.wasm"),
+        ],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("components predating the command-word world still load");
+
+    assert!(
+        registry.command_words().is_empty(),
+        "a provider declaring no command words contributes none"
+    );
+    let error = registry
+        .resolve_command("gh", &["gh".to_owned()])
+        .await
+        .expect_err("no loaded provider owns this word");
+    assert!(
+        matches!(error, BrokerHostError::UnknownCommandWord { ref word } if word == "gh"),
+        "{error:?}"
+    );
+}
+
+/// Two providers declaring one capability are reported together, not one restart apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_providers_are_all_reported_in_one_failure() {
+    let error = BrokerProviderRegistry::load(
+        [fixture("echo-provider.wasm"), fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect_err("one component loaded twice conflicts with itself");
+
+    let BrokerHostError::ConflictingProviders { report } = error else {
+        panic!("expected a conflict report, got {error:?}");
+    };
+    // The same component twice is both a duplicate provider and five duplicate capabilities. A
+    // check that returned on the first would have named one of the six.
+    assert_eq!(report.providers.len(), 1, "{report:?}");
+    assert_eq!(report.capabilities.len(), 5, "{report:?}");
+    let rendered = report.to_string();
+    assert!(rendered.contains("6 provider conflict(s)"), "{rendered}");
+    assert!(rendered.contains("echo.ransom-case"), "{rendered}");
+}

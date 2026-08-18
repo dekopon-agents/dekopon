@@ -36,7 +36,7 @@ use crate::{
 
 use telemetry::CommandKind;
 
-mod telemetry;
+pub(crate) mod telemetry;
 
 /// Control-flow signals that unwind through the evaluator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -800,6 +800,41 @@ impl Evaluator<'_> {
                 }
             }
             Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
+            // The provider rewrites its own argv, then the result travels the identical path a
+            // direct capability word takes: same budget, same denial, same telemetry. The rewrite
+            // proposes; it does not grant.
+            Resolution::ProviderCommand => {
+                let (capability, input) = match self.invoker.resolve_command(command, arguments) {
+                    Some(Ok(resolved)) => resolved,
+                    Some(Err(message)) => {
+                        let status = self.absorb(CommandFailure::usage(message))?;
+                        return Ok(Executed::Result(CommandResult::status(status)));
+                    }
+                    // Resolution said a provider owned this word, so nothing owning it now means
+                    // the registry changed underneath the session. Fail closed and visibly.
+                    None => {
+                        self.write_line(&format!("dekopon-shell: {command}: command not found"));
+                        return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
+                    }
+                };
+                let outcome = {
+                    let mut context = BuiltinContext {
+                        invoker: self.invoker,
+                        budget: &mut self.budget,
+                        buffers: &mut self.buffers,
+                        curl_capability: self.curl_capability.as_deref(),
+                        allow_clock: self.allow_clock,
+                    };
+                    context.invoke_capability(&capability, input)
+                };
+                match outcome {
+                    Ok(result) => Ok(Executed::Result(result)),
+                    Err(failure) => {
+                        let status = self.absorb(failure)?;
+                        Ok(Executed::Result(CommandResult::status(status)))
+                    }
+                }
+            }
             Resolution::Capability => {
                 let input = match arguments_to_input(command, arguments) {
                     Ok(input) => input,

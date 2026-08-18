@@ -236,7 +236,11 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
         .map(|builtin| BuiltinKind::Simple(*builtin))
 }
 
-/// Returns every builtin name, for the namespace-disjointness invariant tests.
+/// Returns every builtin name, in sorted order.
+///
+/// Derived from [`REGISTRY`] rather than hand-listed, which is what makes the drift test against
+/// `dekopon_core::RESERVED_COMMAND_WORDS` meaningful: a builtin added or removed here changes what
+/// this returns, and the test then demands the mirrored list agree.
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = REGISTRY

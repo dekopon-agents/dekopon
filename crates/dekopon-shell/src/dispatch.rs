@@ -34,6 +34,8 @@ pub(crate) enum Resolution {
     Builtin(BuiltinKind),
     /// A granted capability, invoked through the fallback rule.
     Capability,
+    /// A command word a loaded provider contributed, rewritten by that provider into a proposal.
+    ProviderCommand,
     /// A capability identifier in a namespace this session holds, but not one it was granted.
     ///
     /// Dispatches exactly as [`Resolution::NotFound`] does — same message, same exit code. The
@@ -67,6 +69,15 @@ pub(crate) fn resolve(
     }
     if let Some(builtin) = builtins::lookup(word) {
         return Resolution::Builtin(builtin);
+    }
+    // After builtins, so a provider can never shadow one. A provider claiming a builtin name is
+    // refused at load rather than silently losing here; this ordering is the second line.
+    if invoker
+        .command_words()
+        .iter()
+        .any(|candidate| candidate == word)
+    {
+        return Resolution::ProviderCommand;
     }
     if looks_like_capability(word) {
         if invoker.is_granted(word) {
@@ -348,5 +359,48 @@ mod tests {
         let failure =
             arguments_to_input("cap", &arguments(&["bare"])).expect_err("bare words are rejected");
         assert!(format!("{failure:?}").contains("kebab-case"), "{failure:?}");
+    }
+}
+
+#[cfg(test)]
+mod reserved {
+    use std::collections::BTreeSet;
+
+    use crate::{builtins, interp::telemetry::CONTROL_WORDS, parser::REJECTED_COMMANDS};
+
+    /// `dekopon_core::RESERVED_COMMAND_WORDS` and this crate's live tables must agree exactly.
+    ///
+    /// The list lives in `dekopon-core` so the broker can report command-word conflicts at its own
+    /// startup without linking an interpreter it never runs. That mirroring is only safe while it
+    /// is checked, and it has to be checked in **both** directions.
+    ///
+    /// Missing a word means a provider could claim something the shell would then shadow, and the
+    /// manifest would be a lie. Reserving a word no table owns is the opposite failure and the one
+    /// worth naming: when the `gh` builtin is deleted and `gh` becomes an ordinary provider command
+    /// word, a stale entry here would keep the real `gh` provider from claiming its own name.
+    #[test]
+    fn the_reserved_list_matches_the_shells_own_tables() {
+        let live = builtins::names()
+            .into_iter()
+            .chain(CONTROL_WORDS.iter().copied())
+            .chain(REJECTED_COMMANDS.iter().map(|(word, _)| *word))
+            .collect::<BTreeSet<_>>();
+        let declared = dekopon_core::RESERVED_COMMAND_WORDS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let missing = live.difference(&declared).collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "dekopon_core::RESERVED_COMMAND_WORDS is missing {missing:?}; a provider could claim \
+             one and be silently shadowed"
+        );
+        let stale = declared.difference(&live).collect::<Vec<_>>();
+        assert!(
+            stale.is_empty(),
+            "dekopon_core::RESERVED_COMMAND_WORDS reserves {stale:?}, which no table owns; a \
+             provider that should be able to claim one cannot"
+        );
     }
 }

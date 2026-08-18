@@ -36,6 +36,7 @@ impl Provider for JsonPlaceholder {
                 .expect("static provider ID is valid"),
             description: "Reads and creates bounded JSONPlaceholder posts through broker HTTP"
                 .to_owned(),
+            command_words: Vec::new(),
             capabilities: vec![
                 ProviderCapability {
                     id: "jsonplaceholder.posts.get"

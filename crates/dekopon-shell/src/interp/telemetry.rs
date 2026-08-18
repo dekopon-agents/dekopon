@@ -66,6 +66,8 @@ pub(crate) enum CommandKind {
     Builtin,
     /// A granted capability, dispatched through the invoker seam.
     Capability,
+    /// A command word a loaded provider contributed.
+    ProviderCommand,
     /// A word this shell refuses by name, such as `eval`.
     Rejected,
     /// Nothing matched; the script sees exit code 127.
@@ -81,6 +83,7 @@ impl CommandKind {
             Resolution::Function => Self::Function,
             Resolution::Builtin(_) => Self::Builtin,
             Resolution::Capability => Self::Capability,
+            Resolution::ProviderCommand => Self::ProviderCommand,
             Resolution::NotGranted { .. } => Self::NotGranted,
             Resolution::Rejected(_) => Self::Rejected,
             Resolution::NotFound => Self::NotFound,
@@ -94,6 +97,7 @@ impl CommandKind {
             Self::Function => "function",
             Self::Builtin => "builtin",
             Self::Capability => "capability",
+            Self::ProviderCommand => "provider-command",
             Self::Rejected => "rejected",
             Self::NotFound => "not-found",
             Self::NotGranted => "not-granted",
@@ -108,7 +112,13 @@ impl CommandKind {
     /// an unresolved word are neither: they are whatever the script's author typed.
     pub(crate) const fn name_is_fixed_vocabulary(self) -> bool {
         match self {
-            Self::Control | Self::Builtin | Self::Rejected | Self::Capability => true,
+            // A provider command word came from a loaded manifest, so it is as much fixed
+            // vocabulary as a builtin name: the deployment chose it, not the script.
+            Self::Control
+            | Self::Builtin
+            | Self::Rejected
+            | Self::Capability
+            | Self::ProviderCommand => true,
             // `NotGranted` is the interesting one. Its *namespace* comes from the session's granted
             // set and is exported; the word itself is still whatever the script typed, so it is
             // still withheld. Knowing the model reached into `gh` and missed is the trend worth
