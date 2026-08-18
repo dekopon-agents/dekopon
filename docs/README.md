@@ -16,7 +16,8 @@ Read in this order:
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential across that boundary, from a local login to a pod.
 6. [`observability.md`](observability.md) — runner, broker, and gateway OTLP traces, audit-safe logs, data minimization, what conversation history and the prompt cache add, and the OpenObserve development example.
 7. [`broker-http.md`](broker-http.md) — implemented host/policy foundation and committed authenticated broker-process design, with status called out per slice.
-8. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
+8. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon: the 1Password service account, the External Secrets store already running against it, and the file hygiene no Kubernetes volume satisfies.
+9. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ### Change a specific area
 
@@ -31,6 +32,7 @@ Read in this order:
 | Immediate provider loading, direct invocation, or prompt tools | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
 | Chat transports, gateway configuration, routing, agent sessions, or conversation history | [`dekopond.md`](dekopond.md) | Records the daemon's configuration, transport semantics, session bounds, attested authorization flow, and the conversation contract. |
 | Runner tracing, OTLP logs, OpenObserve, or telemetry redaction | [`observability.md`](observability.md) | Records signal semantics, configuration, data minimization, and end-to-end validation. |
+| Deployment secrets, 1Password, External Secrets, or projecting a credential into a pod | [`1password-eso.md`](1password-eso.md) | Records the deployed secret-store configuration, the manual bootstrap a human owns, and why a mounted Secret is not yet a file a daemon will open. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`broker-http.md`](broker-http.md) | Records the accepted HTTP contract, process ownership, authorization, and delivery boundaries. |
 | Prioritization or a proposed new crate | [`roadmap.md`](roadmap.md) | Shows sequencing and deferred package names; roadmap entries are not implementation claims. |
 
