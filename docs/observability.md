@@ -343,10 +343,23 @@ Inside it, `shell.command` is one span per command word the script actually ran,
 | Attribute | Value |
 |---|---|
 | `shell.command.name` | The command word, or `<withheld>`; see data minimization below |
-| `shell.command.kind` | `builtin`, `capability`, `function`, `control`, `rejected`, or `not-found` |
+| `shell.command.kind` | `builtin`, `capability`, `function`, `control`, `rejected`, `not-granted`, or `not-found` |
+| `capability.namespace` | Present only on `not-granted`: the provider namespace, taken from the session's own granted set |
 | `shell.command.argument_count` | How many arguments the word received, never their values |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
+
+`not-granted` splits the swing-and-a-miss out of `not-found`. A word that parses as a capability
+identifier, in a namespace this session *does* hold but naming a capability it was not granted, is a
+different fact from a typo: it is a model repeatedly reaching for something an operator may want to
+grant. A trend of them in one namespace is the signal worth acting on.
+
+Only the **namespace** is exported, and it comes from the session's granted set rather than from the
+script — a string the deployment chose, never one the model composed. The word itself stays
+`<withheld>` unless payloads are enabled, because everything after the namespace is whatever the
+script typed. The script cannot tell the two apart: both print `command not found` and exit 127,
+since a model that could distinguish them would have an oracle for enumerating the deployment's
+capabilities one guess at a time.
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code mapping; flattening them would hide an authorization refusal in the noise of ordinary failures. `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this shell excludes, and an exhausted sandbox budget.
 

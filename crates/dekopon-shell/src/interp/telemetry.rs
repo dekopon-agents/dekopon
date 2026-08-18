@@ -70,6 +70,8 @@ pub(crate) enum CommandKind {
     Rejected,
     /// Nothing matched; the script sees exit code 127.
     NotFound,
+    /// A capability the session did not get, in a namespace it did; the script sees 127 too.
+    NotGranted,
 }
 
 impl CommandKind {
@@ -79,6 +81,7 @@ impl CommandKind {
             Resolution::Function => Self::Function,
             Resolution::Builtin(_) => Self::Builtin,
             Resolution::Capability => Self::Capability,
+            Resolution::NotGranted { .. } => Self::NotGranted,
             Resolution::Rejected(_) => Self::Rejected,
             Resolution::NotFound => Self::NotFound,
         }
@@ -93,6 +96,7 @@ impl CommandKind {
             Self::Capability => "capability",
             Self::Rejected => "rejected",
             Self::NotFound => "not-found",
+            Self::NotGranted => "not-granted",
         }
     }
 
@@ -105,14 +109,18 @@ impl CommandKind {
     pub(crate) const fn name_is_fixed_vocabulary(self) -> bool {
         match self {
             Self::Control | Self::Builtin | Self::Rejected | Self::Capability => true,
-            Self::Function | Self::NotFound => false,
+            // `NotGranted` is the interesting one. Its *namespace* comes from the session's granted
+            // set and is exported; the word itself is still whatever the script typed, so it is
+            // still withheld. Knowing the model reached into `gh` and missed is the trend worth
+            // having, and it costs no channel to record.
+            Self::Function | Self::NotFound | Self::NotGranted => false,
         }
     }
 }
 
 /// Returns the command word when exporting it is safe, and [`WITHHELD`] when it is not.
 pub(crate) fn traceable_name(kind: CommandKind, command: &str) -> &str {
-    if kind.name_is_fixed_vocabulary() {
+    if kind.name_is_fixed_vocabulary() || dekopon_core::telemetry_payloads() {
         command
     } else {
         WITHHELD

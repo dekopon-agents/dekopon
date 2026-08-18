@@ -722,8 +722,14 @@ impl Evaluator<'_> {
             shell.command.kind = kind.label(),
             shell.command.argument_count = arguments.len(),
             shell.command.exit_code = tracing::field::Empty,
+            capability.namespace = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
+        // Recorded only for `not-granted`, where it comes from the session's own granted set rather
+        // than from the script. See `telemetry::name_is_fixed_vocabulary`.
+        if let Some(Resolution::NotGranted { namespace }) = resolution.as_ref() {
+            span.record("capability.namespace", namespace.as_str());
+        }
         let _entered = span.enter();
 
         let executed = self.dispatch_command(command, arguments, resolution, input, capture_output);
@@ -820,7 +826,11 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Resolution::NotFound => {
+            // Byte for byte what `NotFound` reports, and that is the point: a model that could
+            // tell "no such command" from "you were not granted that" would have an oracle for
+            // enumerating the deployment's capabilities one guess at a time. The difference is
+            // recorded in the span and nowhere the script can read.
+            Resolution::NotFound | Resolution::NotGranted { .. } => {
                 self.write_line(&format!("dekopon-shell: {command}: command not found"));
                 Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
             }
