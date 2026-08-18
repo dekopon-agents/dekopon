@@ -25,6 +25,22 @@ use crate::{Interpreter, Limits, ScriptOutcome, interp::tests::Fixture};
 
 use super::{CONTROL_WORDS, WITHHELD};
 
+/// Serializes the tests whose expectations depend on the process-global payload switch.
+///
+/// `dekopon_core::telemetry_payloads` is one `AtomicBool` for the whole process, so a test that
+/// enables it would otherwise change what a concurrently running redaction test observes.
+static PAYLOADS: Mutex<()> = Mutex::new(());
+
+/// Takes the payload-switch lock, ignoring poisoning.
+///
+/// A test that fails while holding it has already reported its own failure; letting the poison
+/// cascade would turn one real failure into twelve misleading ones.
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    PAYLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// One span or event, flattened to the strings a remote collector would receive.
 #[derive(Clone, Debug)]
 struct Captured {
@@ -202,6 +218,7 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
 
 #[test]
 fn every_command_produces_exactly_one_span() {
+    let _serialized = serialized();
     let telemetry =
         capture("greet() { echo hi; }\ngreet\njq -n 1\necho.echo --message two\nnosuchcommand\n:");
 
@@ -232,6 +249,7 @@ fn every_command_produces_exactly_one_span() {
 
 #[test]
 fn a_span_carries_the_outcome_exit_code_and_argument_count() {
+    let _serialized = serialized();
     let telemetry = capture("echo one two three");
     let span = telemetry
         .spans
@@ -248,6 +266,7 @@ fn a_span_carries_the_outcome_exit_code_and_argument_count() {
 
 #[test]
 fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
+    let _serialized = serialized();
     // A refusal, a provider that ran and errored, and a capability that does not exist are three
     // different operational stories; `CapabilityCallResult` keeps them apart and so must this.
     for (script, outcome, exit_code) in [
@@ -275,6 +294,7 @@ fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
 
 #[test]
 fn a_refused_word_reports_the_reason_it_aborted_the_script() {
+    let _serialized = serialized();
     let telemetry = capture("eval 'echo hi'");
     let completed = telemetry
         .spans
@@ -292,6 +312,7 @@ fn a_refused_word_reports_the_reason_it_aborted_the_script() {
 
 #[test]
 fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
+    let _serialized = serialized();
     // The capability ceiling is the one a *command* trips. The step budget is charged between
     // statements, so it ends the script without any command span ever seeing it.
     let telemetry = capture_with(
@@ -312,6 +333,7 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
 
 #[test]
 fn argument_values_never_reach_telemetry() {
+    let _serialized = serialized();
     // The sentinels stand in for what argv really carries: a bearer token in a `curl -d` body, a
     // capability input object, a URL with a signed query string. Asserting their *absence* is the
     // test — asserting that the safe fields are present would pass just as happily while a
@@ -350,6 +372,7 @@ fn argument_values_never_reach_telemetry() {
 
 #[test]
 fn a_model_authored_command_word_is_withheld_but_its_kind_is_not() {
+    let _serialized = serialized();
     // A shell function's name and an unresolved word are both whatever the script's author typed.
     // The runner already refuses to copy a model-selected invalid tool name into a rejection
     // event; a command word is the same class of text and gets the same treatment.
@@ -372,6 +395,7 @@ fn a_model_authored_command_word_is_withheld_but_its_kind_is_not() {
 
 #[test]
 fn xargs_records_every_command_it_actually_drove() {
+    let _serialized = serialized();
     // One script word that maps a command over three items really did run three commands, so a
     // trace that showed one would be describing a script nobody wrote.
     // The list is built through `jq` rather than `echo`, because `echo` produces one string and
@@ -404,6 +428,7 @@ fn xargs_records_every_command_it_actually_drove() {
 
 #[test]
 fn command_spans_nest_under_the_callers_active_span() {
+    let _serialized = serialized();
     // `dekopon-run` enters `prompt.script` (or `runner.shell`) and calls straight into the
     // interpreter on the same thread, so nesting should need no propagation code at all. This
     // pins that; `crates/dekopon-run/src/prompt.rs` pins it again across a real `spawn_blocking`.
@@ -419,6 +444,7 @@ fn command_spans_nest_under_the_callers_active_span() {
 
 #[test]
 fn control_words_and_their_dispatcher_agree() {
+    let _serialized = serialized();
     // `run_argv` classifies a control word from `CONTROL_WORDS` and only then lets
     // `run_control_word` execute it, so a word dropped from the list stops running and says
     // "command not found" instead. That is the direction this covers.
@@ -442,5 +468,70 @@ fn control_words_and_their_dispatcher_agree() {
             .outcome
             .output
             .contains("command not found")
+    );
+}
+
+/// A word the session was not granted, in a namespace it holds, is a different fact from a typo.
+///
+/// The namespace comes from the session's own granted set, so exporting it reveals nothing the
+/// deployment did not already choose. The word stays withheld: everything after the namespace is
+/// whatever the script typed.
+#[test]
+fn an_ungranted_word_in_a_granted_namespace_reports_its_namespace() {
+    let _serialized = serialized();
+    let telemetry = capture("echo.nonexistent\nnosuch.capability");
+
+    assert_eq!(
+        telemetry.commands(),
+        vec![("not-granted", WITHHELD), ("not-found", WITHHELD)]
+    );
+
+    let namespaces = telemetry
+        .spans
+        .iter()
+        .filter(|span| span.span.as_deref() == Some("shell.command"))
+        .map(|span| span.field("capability.namespace"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        namespaces,
+        vec![Some("echo"), None],
+        "only a word inside a granted namespace carries one"
+    );
+
+    for value in telemetry.all_values() {
+        assert!(!value.contains("nonexistent"), "{value:?}");
+        assert!(!value.contains("nosuch"), "{value:?}");
+    }
+}
+
+/// The script must not be able to tell the two apart.
+///
+/// A model that could distinguish "no such command" from "you were not granted that" would have an
+/// oracle for enumerating the deployment's capabilities one guess at a time.
+#[test]
+fn a_script_cannot_distinguish_ungranted_from_unknown() {
+    let _serialized = serialized();
+    let ungranted =
+        Interpreter::new(Limits::default()).run("echo.nonexistent", &Fixture::default());
+    let unknown = Interpreter::new(Limits::default()).run("nosuch.capability", &Fixture::default());
+    assert_eq!(
+        ungranted.output.replace("echo.nonexistent", "WORD"),
+        unknown.output.replace("nosuch.capability", "WORD")
+    );
+    assert_eq!(ungranted.exit_code, unknown.exit_code);
+}
+
+/// The exact word is available, but only where an operator has accepted retention for data the
+/// model influences — the same switch that already governs provider payloads and HTTP queries.
+#[test]
+fn enabling_payloads_exports_the_missed_word() {
+    let _serialized = serialized();
+    dekopon_core::set_telemetry_payloads(true);
+    let telemetry = capture("echo.nonexistent");
+    dekopon_core::set_telemetry_payloads(false);
+
+    assert_eq!(
+        telemetry.commands(),
+        vec![("not-granted", "echo.nonexistent")]
     );
 }

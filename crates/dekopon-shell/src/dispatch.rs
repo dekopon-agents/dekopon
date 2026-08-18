@@ -34,6 +34,16 @@ pub(crate) enum Resolution {
     Builtin(BuiltinKind),
     /// A granted capability, invoked through the fallback rule.
     Capability,
+    /// A capability identifier in a namespace this session holds, but not one it was granted.
+    ///
+    /// Dispatches exactly as [`Resolution::NotFound`] does — same message, same exit code. The
+    /// distinction exists only for telemetry: it is the difference between "the model typed
+    /// nonsense" and "the model keeps reaching for something we never granted", and only the
+    /// second is a trend worth acting on.
+    NotGranted {
+        /// The provider namespace, taken from the session's own granted set.
+        namespace: String,
+    },
     /// A word this shell refuses, with the reason why.
     Rejected(&'static str),
     /// Nothing matched.
@@ -58,10 +68,38 @@ pub(crate) fn resolve(
     if let Some(builtin) = builtins::lookup(word) {
         return Resolution::Builtin(builtin);
     }
-    if looks_like_capability(word) && invoker.is_granted(word) {
-        return Resolution::Capability;
+    if looks_like_capability(word) {
+        if invoker.is_granted(word) {
+            return Resolution::Capability;
+        }
+        if let Some(namespace) = granted_namespace_of(word, invoker) {
+            return Resolution::NotGranted { namespace };
+        }
     }
     Resolution::NotFound
+}
+
+/// Returns the provider namespace of a word, when this session already holds that namespace.
+///
+/// Deliberately bounded by the session's *own* granted set rather than by anything global. The
+/// namespace it returns is therefore always a string the deployment chose, never one the model
+/// composed, which is what makes it safe to export while the word itself stays withheld. A word in
+/// a namespace the session does not hold reveals nothing and yields `None`.
+fn granted_namespace_of(word: &str, invoker: &dyn CapabilityInvoker) -> Option<String> {
+    let namespace = word.split('.').next()?;
+    if namespace.is_empty() || namespace == word {
+        return None;
+    }
+    invoker
+        .granted()
+        .iter()
+        .any(|granted| {
+            granted
+                .split('.')
+                .next()
+                .is_some_and(|candidate| candidate == namespace)
+        })
+        .then(|| namespace.to_owned())
 }
 
 /// Reports whether a word could be a capability identifier.
