@@ -20,11 +20,25 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget, TransportError,
-    TransportIdentity, bound_inbound,
+    TransportIdentity, bound_inbound, floor_boundary,
 };
 
 /// Redeliveries this transport remembers across reconnects.
 const DEDUP_CAPACITY: usize = 1024;
+/// Message subtypes that are a person making a new request rather than an event about a message.
+///
+/// An allowlist rather than a deny list: a subtype Slack introduces later is dropped until someone
+/// decides it is a request, which is the same default-deny posture the single `subtype` check had.
+/// What that check got wrong was treating *every* subtype as an event about a message. Three are
+/// not. `file_share` is the one that matters — an upload with a comment is a subtyped message, so
+/// asking a question with a screenshot attached produced no answer at all. `thread_broadcast` is a
+/// thread reply the sender also sent to the channel, and `me_message` is `/me`; both are ordinary
+/// text a person typed.
+const REQUEST_SUBTYPES: [&str; 3] = ["file_share", "me_message", "thread_broadcast"];
+/// Files named individually in one attachment note.
+const MAX_NAMED_ATTACHMENTS: usize = 10;
+/// Ceiling on one file name inside an attachment note.
+const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 /// Ceiling on reconnect backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// First reconnect delay; doubles up to [`MAX_BACKOFF`].
@@ -194,16 +208,22 @@ impl SlackTransport {
             return Ok(None);
         }
         // Edits, deletions, and joins arrive as subtyped messages; none of them is a new request.
-        if !event["subtype"].is_null() {
+        // The three in `REQUEST_SUBTYPES` are.
+        if let Some(subtype) = event["subtype"].as_str()
+            && !REQUEST_SUBTYPES.contains(&subtype)
+        {
             return Ok(None);
         }
-        let (Some(channel), Some(ts), Some(text)) = (
-            event["channel"].as_str(),
-            event["ts"].as_str(),
-            event["text"].as_str(),
-        ) else {
+        let (Some(channel), Some(ts)) = (event["channel"].as_str(), event["ts"].as_str()) else {
             return Ok(None);
         };
+        // Text is optional rather than required because an upload posted with no comment carries
+        // none, and the attachment note is then the whole message. A message with neither text nor
+        // a file is not a request and is dropped just below.
+        let text = compose_inbound(event["text"].as_str().unwrap_or_default(), &event["files"]);
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
         if !self.seen.insert(format!("{channel}:{ts}")) {
             return Ok(None);
         }
@@ -245,7 +265,7 @@ impl SlackTransport {
             thread: thread_ts,
             conversation_id,
             message_id: ts.to_owned(),
-            text: bound_inbound(text),
+            text,
             conversation,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
@@ -403,6 +423,65 @@ impl Dedup {
         }
         true
     }
+}
+
+/// The text a model sees for one message: what the sender typed, plus what they attached.
+///
+/// Bounded as a whole rather than in pieces, so the [`MAX_INBOUND_TEXT_BYTES`] invariant on
+/// [`InboundMessage::text`] still holds for a message that carries both. The note goes last
+/// because the comment is the request and the attachment is context for it.
+///
+/// [`MAX_INBOUND_TEXT_BYTES`]: crate::transport::MAX_INBOUND_TEXT_BYTES
+fn compose_inbound(text: &str, files: &Value) -> String {
+    match attachment_note(files) {
+        None => bound_inbound(text),
+        Some(note) if text.trim().is_empty() => bound_inbound(&note),
+        Some(note) => bound_inbound(&format!("{text}\n\n{note}")),
+    }
+}
+
+/// Describes the files on a message, because their existence is all the gateway knows about them.
+///
+/// Handed only the comment on an upload, a model answers as though nothing was attached — the
+/// sender watches their screenshot be denied rather than declined, which reads as the gateway
+/// having lost it. Saying what arrived and that it cannot be read is the honest version.
+///
+/// Contents are never fetched. Reading a Slack file needs the `files:read` scope, which the app
+/// manifest deliberately does not request, and a gateway that downloaded sender-supplied bytes on
+/// a model's behalf would be claiming an authority this process does not hold. Names and media
+/// types come from the event, so they are sender-controlled and untrusted exactly like the text
+/// they are appended to. A file the app cannot see at all arrives without a name; it still counts,
+/// because "one file you cannot read" is more accurate than silence.
+fn attachment_note(files: &Value) -> Option<String> {
+    let files = files.as_array()?;
+    let count = files.len();
+    if count == 0 {
+        return None;
+    }
+    let named: Vec<String> = files
+        .iter()
+        .take(MAX_NAMED_ATTACHMENTS)
+        .filter_map(|file| {
+            let name = file["name"].as_str()?;
+            let name = &name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)];
+            match file["mimetype"].as_str() {
+                Some(mimetype) => Some(format!("{name} ({mimetype})")),
+                None => Some(name.to_owned()),
+            }
+        })
+        .collect();
+    let noun = if count == 1 { "file" } else { "files" };
+    let mut note = format!("[gateway: the sender attached {count} {noun} the gateway cannot read");
+    if !named.is_empty() {
+        note.push_str(": ");
+        note.push_str(&named.join(", "));
+        let unnamed = count - named.len();
+        if unnamed > 0 {
+            note.push_str(&format!(", and {unnamed} more"));
+        }
+    }
+    note.push(']');
+    Some(note)
 }
 
 /// One HTTP client shared across a transport's calls, with redirects refused.

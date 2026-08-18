@@ -234,7 +234,7 @@ pub(crate) fn bound_outbound(text: &str) -> String {
 }
 
 /// Largest character boundary at or below `index`.
-fn floor_boundary(text: &str, index: usize) -> usize {
+pub(crate) fn floor_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
         index -= 1;
