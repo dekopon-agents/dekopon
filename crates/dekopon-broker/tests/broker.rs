@@ -1626,7 +1626,8 @@ async fn via_isolation_holds_in_both_directions() {
     // Capability listings agree with the invocation decisions on both sides of the boundary.
     let visible = broker
         .capabilities_for(&gateway, Some(&grant), &subject, &agent("some-agent"))
-        .expect("the attestation is honored");
+        .expect("the attestation is honored")
+        .0;
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].capability.id.as_str(), "echo.echo");
     let direct_visible = broker.capabilities(&context("caller"));
@@ -1887,7 +1888,8 @@ async fn capabilities_for_distinguishes_refusal_from_empty() {
 
     let granted = broker
         .capabilities_for(&gateway, Some(&grant), &mapped, &agent("some-agent"))
-        .expect("the attestation is honored");
+        .expect("the attestation is honored")
+        .0;
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].capability.id.as_str(), "echo.echo");
 
@@ -1900,7 +1902,8 @@ async fn capabilities_for_distinguishes_refusal_from_empty() {
             &subject("tel.16034700182"),
             &agent("some-agent"),
         )
-        .expect("the attestation is honored for every namespace in the grant");
+        .expect("the attestation is honored for every namespace in the grant")
+        .0;
     assert!(bare.is_empty());
 }
 
@@ -2278,5 +2281,74 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     assert_eq!(
         result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
+    );
+}
+
+/// Command words are filtered by policy exactly as capabilities are.
+///
+/// A session is never told a word exists that it could not use, so a principal granted nothing
+/// receives an empty vocabulary rather than a map of the deployment's providers.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_words_are_filtered_by_what_policy_allows() {
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, _) = Broker::start(
+        echo_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        echo_engine(
+            &direct_policy("caller", "provider-test", "echo.echo"),
+            ["caller", "stranger"],
+        ),
+        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Strict,
+        std::iter::empty(),
+    )
+    .expect("broker starts");
+
+    // The checked-in echo fixture declares no command words, so both are empty — but the granted
+    // and ungranted contexts must agree on that for the right reason, which the capability lists
+    // below establish.
+    assert!(broker.command_words(&context("caller")).is_empty());
+    assert!(broker.command_words(&context("stranger")).is_empty());
+    assert_eq!(broker.capabilities(&context("caller")).len(), 1);
+    assert!(
+        broker.capabilities(&context("stranger")).is_empty(),
+        "the ungranted context reaches nothing, which is what makes its empty vocabulary meaningful"
+    );
+}
+
+/// A word no loaded provider declares is refused before any component runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_command_word_is_refused_without_running_anything() {
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, _) = Broker::start(
+        echo_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        echo_engine(
+            &direct_policy("caller", "provider-test", "echo.echo"),
+            ["caller"],
+        ),
+        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Strict,
+        std::iter::empty(),
+    )
+    .expect("broker starts");
+
+    let error = broker
+        .resolve_command("gh", &["gh".to_owned(), "pr".to_owned()])
+        .await
+        .expect_err("no loaded provider declares this word");
+    assert!(
+        format!("{error}").contains("gh"),
+        "the refusal names the word: {error}"
     );
 }

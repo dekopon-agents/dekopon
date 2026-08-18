@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
+use dekopon_broker_host::CommandResolution;
 use dekopon_broker_protocol::{
     BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED,
-    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope, ResponseEnvelope,
-    read_frame, write_frame,
+    ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope,
+    ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_core::InvocationId;
 use dekopon_telemetry::TraceContextParts;
@@ -201,16 +202,46 @@ where
     };
     let context = &peer.context;
     let response = match request.request {
-        BrokerRequest::Capabilities => ResponseEnvelope::capabilities(broker.capabilities(context)),
+        BrokerRequest::Capabilities => ResponseEnvelope::capabilities(
+            broker.capabilities(context),
+            broker.command_words(context),
+        ),
         BrokerRequest::CapabilitiesFor { subject, agent } => {
             match broker.capabilities_for(context, peer.attestor.as_ref(), &subject, &agent) {
-                Some(capabilities) => ResponseEnvelope::capabilities(capabilities),
+                Some((capabilities, command_words)) => {
+                    ResponseEnvelope::capabilities(capabilities, command_words)
+                }
                 // A refused attestation discloses nothing about what the attested context could
                 // have seen — not even whether the subject is mapped.
                 None => ResponseEnvelope::error(
                     ERROR_UNAUTHENTICATED,
                     "attestation refused: no attestor authority for this subject",
                 ),
+            }
+        }
+        BrokerRequest::ResolveCommand { word, argv } => {
+            match broker.resolve_command(&word, &argv).await {
+                Ok(CommandResolution::Resolved { capability, input }) => {
+                    ResponseEnvelope::command_resolution(capability, input)
+                }
+                // The provider declined this argv. That is a usage error for the model to read,
+                // not a broker failure, so its own message travels back.
+                Ok(CommandResolution::Failed { error }) => {
+                    ResponseEnvelope::command_declined(error.message)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "dekopon_brokerd::audit",
+                        {
+                            audit.event = "command.resolve.failed",
+                            command.word = %word,
+                            error.kind = "provider",
+                        },
+                        "command-word rewrite failed"
+                    );
+                    let _ = error;
+                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be rewritten")
+                }
             }
         }
         BrokerRequest::InvokeFor {

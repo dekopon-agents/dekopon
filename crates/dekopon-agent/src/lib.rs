@@ -80,6 +80,10 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
             .with_curl_capability(self.curl_capability.clone())
             .run(script, &self.invoker)
     }
+
+    fn command_words(&self) -> Vec<String> {
+        self.invoker.command_words()
+    }
 }
 
 /// Dispatches a script's commands to direct-mode providers first and a broker second.
@@ -131,6 +135,29 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
             None => CapabilityCallResult::NotFound,
         }
     }
+
+    fn command_words(&self) -> Vec<String> {
+        let mut words = self.direct.command_words();
+        if let Some(broker) = &self.broker {
+            words.extend(broker.command_words());
+        }
+        words.sort_unstable();
+        words.dedup();
+        words
+    }
+
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, Value), String>> {
+        // Same precedence as `invoke`: whichever leg owns the word rewrites it. A word both legs
+        // claim cannot happen — the broker refuses to start on a duplicate, and direct mode loads
+        // its own registry through the same check.
+        self.direct
+            .resolve_command(word, argv)
+            .or_else(|| self.broker.as_ref()?.resolve_command(word, argv))
+    }
 }
 
 /// Trace context to send with a broker proposal, if this process is exporting one.
@@ -181,6 +208,12 @@ pub struct BrokerLeg {
     client: BrokerClient,
     runtime: tokio::runtime::Handle,
     capabilities: BTreeMap<String, CapabilityDescription>,
+    /// Command words loaded providers contribute, snapshotted with the capability set.
+    ///
+    /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
+    /// command word a script runs, and a round trip per word would make the interpreter's cost
+    /// depend on the network rather than on the script.
+    command_words: Vec<String>,
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
@@ -199,8 +232,14 @@ impl BrokerLeg {
     /// the leading component of the session's trace and invocation identifiers, so every call a
     /// session made is recoverable from the broker's audit log by prefix.
     pub async fn connect(client: BrokerClient, trace_prefix: &str) -> Result<Self, BrokerLegError> {
-        let capabilities = snapshot(client.capabilities().await?);
-        Self::build(client, trace_prefix, capabilities, None)
+        let (capabilities, command_words) = client.session_surface().await?;
+        Self::build(
+            client,
+            trace_prefix,
+            snapshot(capabilities),
+            command_words,
+            None,
+        )
     }
 
     /// Connects a leg that proposes on behalf of one transport-authenticated external subject.
@@ -219,15 +258,14 @@ impl BrokerLeg {
         subject: ExternalSubject,
         agent: AgentId,
     ) -> Result<Self, BrokerLegError> {
-        let capabilities = snapshot(
-            client
-                .capabilities_for(subject.clone(), agent.clone())
-                .await?,
-        );
+        let (capabilities, command_words) = client
+            .session_surface_for(subject.clone(), agent.clone())
+            .await?;
         Self::build(
             client,
             trace_prefix,
-            capabilities,
+            snapshot(capabilities),
+            command_words,
             Some(Attestation { subject, agent }),
         )
     }
@@ -236,12 +274,14 @@ impl BrokerLeg {
         client: BrokerClient,
         trace_prefix: &str,
         capabilities: BTreeMap<String, CapabilityDescription>,
+        command_words: Vec<String>,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
+            command_words,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
@@ -281,6 +321,31 @@ impl CapabilityInvoker for BrokerLeg {
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.capabilities.get(capability).cloned()
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        self.command_words.clone()
+    }
+
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, Value), String>> {
+        // Same visibility check the capability path makes, and for the same reason: the broker
+        // decides refusals, this only avoids spending a round trip on a word no provider owns.
+        if !self.command_words.iter().any(|candidate| candidate == word) {
+            return None;
+        }
+        // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
+        let resolved = self
+            .runtime
+            .block_on(self.client.resolve_command(word.to_owned(), argv.to_vec()));
+        match resolved {
+            Ok(Ok((capability, input))) => Some(Ok((capability.to_string(), input))),
+            Ok(Err(message)) => Some(Err(message)),
+            Err(error) => Some(Err(format!("{word}: {error}"))),
+        }
     }
 
     fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
@@ -644,6 +709,7 @@ mod tests {
                     .expect("stub broker client"),
                 runtime: tokio::runtime::Handle::current(),
                 capabilities,
+                command_words: Vec::new(),
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
             }

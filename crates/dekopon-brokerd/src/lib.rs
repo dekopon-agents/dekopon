@@ -267,7 +267,13 @@ fn validate_capability_responses<A: AuditLog>(
     maximum: usize,
 ) -> Result<(), BrokerdError> {
     for peer in identities.values() {
-        let response = ResponseEnvelope::capabilities(broker.capabilities(&peer.context));
+        // Command words ride in this response, so they count toward the frame bound. Leaving them
+        // out would let a provider directory with a large vocabulary pass startup and then fail to
+        // serve the very first session.
+        let response = ResponseEnvelope::capabilities(
+            broker.capabilities(&peer.context),
+            broker.command_words(&peer.context),
+        );
         let length = serde_json::to_vec(&response)
             .map_err(|source| BrokerdError::CapabilityResponse { source })?
             .len();
