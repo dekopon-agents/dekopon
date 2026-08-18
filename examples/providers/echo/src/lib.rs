@@ -12,6 +12,7 @@ impl Provider for EchoProvider {
             api_version: ProviderApiVersion::V1Alpha1,
             id: "echo".parse().expect("static provider ID is valid"),
             description: "Echoes structured input and transforms messages".to_owned(),
+            command_words: Vec::new(),
             capabilities: vec![
                 ProviderCapability {
                     id: "echo.echo".parse().expect("static capability ID is valid"),

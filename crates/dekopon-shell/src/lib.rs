@@ -143,6 +143,30 @@ pub trait CapabilityInvoker {
         self.granted().iter().any(|granted| granted == capability)
     }
 
+    /// Returns the command words loaded providers contribute, for dispatch and the prompt.
+    ///
+    /// Filtered by the embedder to providers this session already holds a grant on, so a principal
+    /// with no `gh.*` grant never sees the word and never reaches its rewrite.
+    fn command_words(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Rewrites one provider command word's argv into a capability proposal.
+    ///
+    /// `Some(Ok((capability, input)))` names the capability to invoke; `Some(Err(message))` is a
+    /// usage error the provider chose to report; `None` means no loaded provider owns the word.
+    ///
+    /// The rewrite grants nothing: what comes back is a proposal, invoked on exactly the path a
+    /// direct capability word takes, with the same budget, denial, and telemetry behavior.
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, Value), String>> {
+        let _ = (word, argv);
+        None
+    }
+
     /// Returns model-facing metadata for one capability, when the implementation has any.
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         let _ = capability;

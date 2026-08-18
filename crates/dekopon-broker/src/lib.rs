@@ -2429,7 +2429,13 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::InvalidHttpAuthorization
         | BrokerHostError::HttpConfiguration { .. } => "authorization-constraint",
         BrokerHostError::UnknownCapability { .. }
-        | BrokerHostError::ProviderDoesNotImplement { .. } => "capability-unavailable",
+        | BrokerHostError::ProviderDoesNotImplement { .. }
+        | BrokerHostError::UnknownCommandWord { .. } => "capability-unavailable",
+        // Startup-only failures. They cannot reach a caller — a broker holding a registry has
+        // already survived them — but naming them keeps this match exhaustive by proof rather than
+        // by a wildcard that would silently absorb a future variant into the wrong public reason.
+        BrokerHostError::ConflictingProviders { .. }
+        | BrokerHostError::MissingResolveCommand { .. } => "provider-configuration",
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
@@ -2437,6 +2443,8 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         BrokerHostError::OutputTooLarge { .. } | BrokerHostError::InvalidOutput { .. } => {
             "invalid-provider-output"
         }
+        BrokerHostError::ResolveCommand { .. }
+        | BrokerHostError::ResolveCommandUsedHostImport { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
         BrokerHostError::Invoke { .. } => "provider-trap",

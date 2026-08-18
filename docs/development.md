@@ -80,9 +80,9 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `examples/providers/jsonplaceholder/wit/deps/http.wit`
 - `examples/providers/gh/wit/deps/http.wit`
 
-The HTTP probe, JSONPlaceholder provider, gh provider, and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit`, `examples/providers/jsonplaceholder/wit/deps/provider.wit`, `examples/providers/gh/wit/deps/provider.wit`, and `crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.1.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.1.0`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+The HTTP probe, JSONPlaceholder provider, gh provider, and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit`, `examples/providers/jsonplaceholder/wit/deps/provider.wit`, `examples/providers/gh/wit/deps/provider.wit`, and `crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.1.0` world and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.2.0` worlds and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
 Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. `dekopon-broker-host` is the separate privileged adapter: it links only the project-owned HTTP interface, consumes `AuthorizedInvocation`, and maps WIT values to `dekopon-http-host`. The native engine consumes one exact HTTP grant beneath independent host ceilings, disables redirects, ambient proxies, and automatic decompression, validates and pins DNS results, and returns sanitized HTTP evidence metadata. Neither host authenticates callers, evaluates policy, constructs authorization, injects credentials, or writes audit records.
 
@@ -250,13 +250,13 @@ wasm-tools component wit target/wit-package/dekopon-provider.wasm
 wasm-tools component wit target/wit-package/dekopon-http.wasm
 ```
 
-The builds must leave both `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.1.0`, one `provider` world, two exports, and zero imports. The HTTP package must identify `dekopon:http@1.0.0`, one `client` interface with a single buffered `send` function, and no worlds. Exercise the configured fetch path with:
+The builds must leave both `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.2.0`, a `provider` world with two exports and zero imports, and a `provider-commands` world with three exports and zero imports. The HTTP package must identify `dekopon:http@1.0.0`, one `client` interface with a single buffered `send` function, and no worlds. Exercise the configured fetch path with:
 
 ```console
 wkg get \
   --config wkg/config.toml \
   --output target/wit-package/fetched-provider.wasm \
-  dekopon:provider@0.1.0
+  dekopon:provider@0.2.0
 wkg get \
   --config wkg/config.toml \
   --output target/wit-package/fetched-http.wasm \

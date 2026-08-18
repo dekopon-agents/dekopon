@@ -31,6 +31,7 @@ impl Provider for HttpProbe {
             api_version: ProviderApiVersion::V1Alpha1,
             id: "http-probe".parse().expect("static provider ID is valid"),
             description: "Exercises the versioned broker HTTP import".to_owned(),
+            command_words: Vec::new(),
             capabilities: vec![ProviderCapability {
                 id: "http-probe.fetch"
                     .parse()

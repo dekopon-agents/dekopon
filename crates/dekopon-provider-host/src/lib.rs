@@ -791,6 +791,7 @@ mod tests {
             api_version: ProviderApiVersion::V1Alpha1,
             id: "fixture".parse().expect("valid provider fixture"),
             description: "Fixture provider".to_owned(),
+            command_words: Vec::new(),
             capabilities: vec![ProviderCapability {
                 id: "fixture.run".parse().expect("valid capability fixture"),
                 description: "Runs a fixture".to_owned(),
