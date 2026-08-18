@@ -30,3 +30,21 @@ roll the pod:
 The gateway is disabled, so this is a broker with no caller. Set gateway.enabled=true with a
 dekopond.yaml and an agent catalog to give it one.
 {{- end }}
+{{- if include "dekopon.chatgptEnabled" . }}
+
+The ChatGPT credential is seeded ONCE into {{ include "dekopon.chatgptDir" . }}/{{ .Values.gateway.chatgpt.fileName }}
+on the persistent claim, and the init container never overwrites it again. dekopond rotates the
+refresh token from there, so after the first refresh the copy in your Secret or vault is a retired
+token. That is expected: the exported copy exists to seed a new deployment, not to restore a
+running one. Restoring it over a live credential breaks a working pod.
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dekopon.fullname" . }} -c prepare-files | grep chatgpt
+
+says whether this start seeded anything or left the live credential alone.
+{{- if .Values.gateway.chatgpt.reseed }}
+
+  !! gateway.chatgpt.reseed is TRUE. Every start discards the credential in the volume — which is
+     almost certainly fresher than the exported one — and copies the Secret in again. Set it back
+     to false once this pod has rolled.
+{{- end }}
+{{- end }}

@@ -1,5 +1,7 @@
 {{- include "dekopon.validate" . -}}
 {{- $files := include "dekopon.managedFiles" . | fromYamlArray -}}
+{{- $seed := include "dekopon.seedFiles" . | fromYamlArray -}}
+{{- $chatgptDir := include "dekopon.chatgptDir" . -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
 {{- $src := "/dekopon-source" -}}
@@ -40,6 +42,15 @@ spec:
         {{- if and .Values.gateway.enabled .Values.gateway.catalog.inline }}
         checksum/catalog: {{ include (print $.Template.BasePath "/configmap-catalog.yaml") . | sha256sum }}
         {{- end }}
+        {{- /*
+          There is deliberately no checksum for the ChatGPT credential Secret. Every other
+          checksum here exists to push a changed file into a pod that only reads at startup; the
+          seed is the one file whose whole point is NOT to be pushed in, because the copy in the
+          volume is the live one and the copy in the Secret goes stale at the first refresh. An
+          annotation would restart a working gateway to achieve nothing. The value that does
+          change behaviour, gateway.chatgpt.reseed, rolls the pod by itself: it changes the init
+          container's arguments, which are part of this pod template.
+        */}}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -118,6 +129,57 @@ spec:
               fi
               {{- end }}
 
+{{- if include "dekopon.chatgptEnabled" . }}
+{{- $seedFile := (first $seed).file }}
+
+              # The ChatGPT credential: seeded once, then never touched again.
+              #
+              # Unlike everything above, this file is mutable at runtime and authoritative after
+              # the first boot. dekopond refreshes it, the refresh token rotates, and the rotated
+              # value is written back — so the copy in the Secret is a retired token the moment
+              # the daemon refreshes, and copying it back in would hand a working gateway a dead
+              # credential. The `[ -e ]` test below is the entire mechanism, because `install`
+              # overwrites unconditionally. `-e` and not `-f` or `-s`: anything at that path, even
+              # zero bytes, means seeded — do not clobber it.
+              #
+              # It lives under {{ $state }} rather than in an emptyDir because an emptyDir dies
+              # with the pod, which would make this "seed on every reschedule" instead.
+              #
+              # The directory is reclaimed to root first for the same reason the others are: after
+              # a previous run it is 0700 and owned by $uid, and root without CAP_DAC_OVERRIDE
+              # cannot read through it to test whether the credential is there.
+              [ -d "{{ $chatgptDir }}" ] || mkdir -p "{{ $chatgptDir }}"
+              chown 0:0 "{{ $chatgptDir }}"
+              chmod 0700 "{{ $chatgptDir }}"
+{{- if .Values.gateway.chatgpt.reseed }}
+              # gateway.chatgpt.reseed is set. This discards the credential in the volume, which
+              # is almost certainly fresher than the exported one, and re-seeds from the Secret.
+              echo "reseed: discarding {{ $chatgptDir }}/{{ $seedFile }} and seeding from the Secret" >&2
+              rm -f "{{ $chatgptDir }}/{{ $seedFile }}"
+{{- end }}
+              if [ ! -e "{{ $chatgptDir }}/{{ $seedFile }}" ]; then
+                install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ $seedFile }}" "{{ $chatgptDir }}/{{ $seedFile }}"
+                echo "seeded {{ $chatgptDir }}/{{ $seedFile }}"
+              else
+                echo "{{ $chatgptDir }}/{{ $seedFile }} already exists; leaving the live credential alone"
+              fi
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $chatgptDir }}/{{ $seedFile }}")
+              if [ "$got" != "$uid:$gid:600:1:regular file" ]; then
+                echo "{{ $seedFile }}: got $got, want $uid:$gid:600:1:regular file" >&2
+                rc=1
+              fi
+              # 0700 on the directory is load-bearing, not hygiene: save_credentials creates a
+              # sibling temporary file here — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid>,
+              # the extension is replaced rather than appended — and renames it over the target.
+              chmod 0700 "{{ $chatgptDir }}"
+              chown "$uid:$gid" "{{ $chatgptDir }}"
+              got=$(stat -c '%u:%a:%F' "{{ $chatgptDir }}")
+              if [ "$got" != "$uid:700:directory" ]; then
+                echo "{{ $chatgptDir }}: got $got, want $uid:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
+
               # Socket, audit, checkpoint and checkpoint-lock parents must be 0700 and owned by
               # the runtime UID, and every ancestor up to / must be a directory that is not
               # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
@@ -166,6 +228,14 @@ spec:
             # clearer. Listed first so an operator entry of the same name wins.
             - name: DEKOPON_BROKER_SOCKET
               value: {{ $run }}/broker.sock
+{{- if include "dekopon.chatgptEnabled" . }}
+            # A chatgptSubscription model with no explicit authFile falls back to
+            # $XDG_CONFIG_HOME, then $HOME — which is on the read-only root filesystem, where
+            # save_credentials cannot create its temporary sibling. Naming it here means the
+            # fallback can never be reached. Naming authFile in dekopond.yaml is clearer still.
+            - name: DEKOPON_CHATGPT_AUTH_FILE
+              value: {{ $chatgptDir }}/{{ (first $seed).file }}
+{{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -187,6 +257,20 @@ spec:
             - name: catalog
               mountPath: {{ .Values.paths.catalogDir }}
               readOnly: true
+{{- if include "dekopon.chatgptEnabled" . }}
+            # The credential directory, and nothing else on the claim. subPath rather than the
+            # whole volume so the gateway cannot reach the audit chain at all — same UID, so this
+            # is reachability rather than isolation, but the unprivileged half has no business
+            # holding a path to the broker's durable state. Not read-only: rotating the refresh
+            # token means creating a temporary sibling here and renaming it over the target.
+            #
+            # The kubelet would create a missing subPath directory root-owned and 0755. It never
+            # has to: the init container creates it as {{ $uid }} with mode 0700 first, and init
+            # containers complete before this one starts.
+            - name: state
+              mountPath: {{ $chatgptDir }}
+              subPath: {{ .Values.gateway.chatgpt.subdir }}
+{{- end }}
             - name: tmp
               mountPath: /tmp
         {{- else }}
@@ -201,7 +285,7 @@ spec:
             # Octal. Only the root init container reads these, and it reads them once.
             defaultMode: 0400
             sources:
-              {{- range $files }}
+              {{- range (concat $files $seed) }}
               - secret:
                   name: {{ .secret }}
                   items:

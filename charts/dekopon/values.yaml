@@ -242,6 +242,48 @@ gateway:
       cpu: "1"
       memory: 512Mi
 
+  # Seed a ChatGPT subscription credential once, and never again.
+  #
+  # `dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
+  # human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription` model has
+  # to be handed a credential exported from a local login — `dekopon auth chatgpt export`, which
+  # lands with the auth-export change.
+  #
+  # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
+  # every refresh, `refresh_if_needed` returns the result of writing it back, so a failed write
+  # fails the model turn outright, and the copy in your vault is a dead token the moment the pod
+  # refreshes. That is expected, not broken: the exported copy exists to seed a NEW deployment, it
+  # is not a backup, and restoring it over a live credential breaks a working pod.
+  #
+  # So it is seeded once, into the persistent claim, and the init container refuses to overwrite
+  # it afterwards. It lives on the claim rather than an emptyDir precisely because an emptyDir
+  # dies with the pod, which would quietly turn "seed once" into "seed on every reschedule".
+  chatgpt:
+    enabled: false
+    # Prefer existingSecret. `dekopon auth chatgpt export --expose-credential --namespace <ns>`
+    # emits exactly this Secret, named dekopon-chatgpt-auth with the key chatgpt-auth.json; an
+    # External Secrets Operator ExternalSecret against a 1Password item projects the same shape.
+    # An inline value is stored in the release and returned by `helm get values`.
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: chatgpt-auth.json
+    # File name inside the credential directory. `save_credentials` derives its temporary sibling
+    # by REPLACING this extension — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid> — and renames
+    # over the target, so the daemon needs write access to the directory, not just the file.
+    fileName: chatgpt-auth.json
+    # Single path segment, joined onto paths.stateDir. It is not a free path on purpose: the
+    # credential must land on the claim, and a full path could be pointed at an emptyDir.
+    subdir: chatgpt
+    # Deliberate, destructive re-seed. Overwrites the credential in the volume with the one from
+    # the Secret, DISCARDING a refresh token that is almost certainly fresher than the exported
+    # copy — the pod's credential is the live one. Use it only after a deliberate local re-login
+    # and re-export.
+    #
+    # It is not self-clearing: while this is true, every restart re-seeds. Set it back to false
+    # once the pod has rolled. Changing it rolls the pod on its own, because it changes the init
+    # container's arguments.
+    reseed: false
+
   # dekopond.yaml names environment variable NAMES, never values, so every chat and model
   # credential is an ordinary secretKeyRef with no file hygiene involved. Example:
   #

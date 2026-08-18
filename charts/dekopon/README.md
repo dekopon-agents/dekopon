@@ -100,6 +100,11 @@ failure naming that file rather than a broker that starts and then refuses to se
   ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied.
 - **Provider components.** The image already bakes `/opt/dekopon/providers/*.wasm` owned by
   `65532:65532` under a `65532`-owned `0755` directory, which is what Tier B wants.
+- **The ChatGPT credential**, for the opposite reason from all of these. `load_credentials` is a
+  plain `File::open` — no `O_NOFOLLOW`, no owner comparison, no mode check — so a symlink farm
+  would read perfectly well. Reading was never the problem there; *writing* is, and that is a
+  different problem with a different answer:
+  [The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once).
 
 ## The UID is not a preference
 
@@ -124,6 +129,7 @@ files; it does not rewrite configuration.
 | checkpoint | `/var/lib/dekopon/audit-checkpoint.json` | A + C | the broker |
 | checkpoint lock | `/var/lib/dekopon/audit-checkpoint.lock` | A + C | the broker |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
+| ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
@@ -156,6 +162,112 @@ One consequence worth knowing: the probe runs `dekopon-run`, which reads
 `OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
 container, or every probe exports a trace. `OTEL_EXPORTER_OTLP_HEADERS` is safe and is what the
 broker's own telemetry block needs.
+
+## The ChatGPT credential is seeded once
+
+`dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
+waits for a human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription`
+model has to be handed a credential exported from a local login. `dekopon auth chatgpt export`
+produces it — that command lands with the auth-export change, and
+[`docs/chatgpt-credential.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/chatgpt-credential.md)
+is the full lifecycle.
+
+Set `gateway.chatgpt.enabled` and point it at the Secret:
+
+```yaml
+gateway:
+  chatgpt:
+    enabled: true
+    existingSecret: dekopon-chatgpt-auth   # what `dekopon auth chatgpt export` emits
+```
+
+The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65532`, in a
+`0700` directory owned by `65532`, **and never touches it again**.
+
+### Why this one file is different
+
+Every other file the init container writes is overwritten on every start, because the daemons only
+read them. This one the daemon *writes*. The refresh token rotates on every refresh —
+`refresh_credentials` builds a complete replacement record and there is no path that keeps the old
+token — and `refresh_if_needed` **returns** the result of writing it back, so a failed write does not
+degrade into a retry, it fails the model turn.
+
+Two consequences the chart is built around:
+
+- **After one refresh, the copy in your vault is a dead token.** Copying it back in would hand a
+  working gateway a credential the provider has already retired. An unguarded `install` would do
+  exactly that on every restart, and the symptom would not appear until the first reschedule — the
+  worst possible shape for this bug.
+- **The daemon needs a writable directory, not a writable file.** `save_credentials` creates a
+  sibling temporary file — `chatgpt-auth.json` becomes `chatgpt-auth.tmp-<pid>`, the extension is
+  *replaced*, not appended — writes and `sync_all`s it, then renames it over the target. A
+  `subPath` mount of a single file satisfies none of that. The `0700` **directory** mode is
+  load-bearing.
+
+So the guard is the whole mechanism, because `install` overwrites unconditionally:
+
+```sh
+[ -d /var/lib/dekopon/chatgpt ] || mkdir -p /var/lib/dekopon/chatgpt
+chown 0:0 /var/lib/dekopon/chatgpt && chmod 0700 /var/lib/dekopon/chatgpt
+if [ ! -e /var/lib/dekopon/chatgpt/chatgpt-auth.json ]; then
+  install -m 0600 -o 65532 -g 65532 \
+    /dekopon-source/chatgpt-auth.json /var/lib/dekopon/chatgpt/chatgpt-auth.json
+fi
+chmod 0700 /var/lib/dekopon/chatgpt && chown 65532:65532 /var/lib/dekopon/chatgpt
+```
+
+`-e`, not `-f` and not `-s`: anything at that path — zero bytes, odd type, a leftover from a crash —
+means *seeded*, and a credential this chart cannot interpret is not a credential it should
+overwrite. The directory is reclaimed to `root` first for the same reason the other directories
+are: after a previous run it is `0700` and owned by `65532`, and root without `DAC_OVERRIDE` cannot
+read through it to run the test at all.
+
+### It lives on the claim, and that is the point
+
+`gateway.chatgpt.subdir` is a single path segment joined onto `paths.stateDir`, not a free path.
+That is deliberate: an `emptyDir` dies with the pod, so a credential seeded there would be re-seeded
+on every reschedule — the same bug, just rarer and harder to see. Making the location composed
+rather than configured means it cannot be pointed somewhere ephemeral by accident.
+
+The gateway mounts that directory with `subPath`, so it gets the credential directory and nothing
+else on the claim — it never holds a path to the audit chain. Same UID, so this is reachability
+rather than isolation, but the unprivileged half has no business being able to open the broker's
+durable state.
+
+`DEKOPON_CHATGPT_AUTH_FILE` is set on the gateway container to that path. Without it, a model with
+no explicit `authFile` falls back to `$XDG_CONFIG_HOME` and then `$HOME`, which is on the read-only
+root filesystem, where `save_credentials` cannot create its temporary sibling. Naming `authFile` in
+`dekopond.yaml` is clearer still, and then neither the environment nor the fallback matters.
+
+### Re-seeding is deliberate
+
+`gateway.chatgpt.reseed: true` discards whatever is in the volume and copies the Secret in again.
+It is separate because it is destructive: the credential in the volume is the live one, and the
+exported copy is almost certainly older. Use it after a deliberate local re-login and re-export.
+
+It is not self-clearing — while it is `true`, every restart re-seeds — so set it back to `false`
+once the pod has rolled. It rolls the pod on its own, because it changes the init container's
+arguments, which are part of the pod template.
+
+There is deliberately **no `checksum/` annotation for the credential Secret**, unlike every other
+file the chart writes. Those annotations exist to push a changed file into a pod that only reads at
+startup. This is the one file whose entire purpose is *not* to be pushed in: the copy in the volume
+is authoritative, so an annotation would restart a working gateway to achieve nothing at all.
+
+### One replica, now for two reasons
+
+`replicas: 1` and `strategy: Recreate` were already forced by the broker's exclusive `flock` on the
+audit log and checkpoint. With this model kind they are load-bearing a second time:
+`ChatGptCodexModel` serializes refreshes behind a per-process mutex and cannot coordinate across
+processes, so two pods sharing one credential file would race the rotation and the loser would be
+left holding an invalidated refresh token. Neither value is exposed.
+
+### The exported copy goes stale, and that is correct
+
+Nothing detects the drift and nothing repairs it. The exported copy has one job — seeding a *new*
+deployment. It is not a backup, and restoring it over a live credential is a way to break a working
+pod, not to fix one. Deliberate rotation is: log in locally again, re-export, update the Secret,
+then either delete the file in the volume and restart, or set `reseed` for one roll.
 
 ## Sizing the audit volume
 
@@ -208,8 +320,9 @@ still loads; the failure mode is a trap inside the JIT, not a clean error.
 
 `readOnlyRootFilesystem` is `true` for every container. Neither daemon writes outside its mounted
 volumes, and a memory-backed `/tmp` is mounted anyway so an incidental temporary file cannot turn
-into a crash. One exception: the `chatgptSubscription` model kind reads — and may refresh — a device
-credential file, and this chart provisions no writable location for it. Mount your own if you use it.
+into a crash. The one thing a daemon does write — the ChatGPT credential, when that model kind is
+in use — gets its own writable directory on the claim; see
+[The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once).
 
 ## Two version numbers
 
@@ -352,6 +465,7 @@ or a reference to an object that already exists. Setting both is an error.
 | `broker-credentials.yaml` | `broker.credentials.inline` | `broker.credentials.existingSecret` / `.existingSecretKey` |
 | `dekopond.yaml` | `gateway.config.inline` | `gateway.config.existingSecret` / `.existingSecretKey` |
 | agent catalog | `gateway.catalog.inline` | `gateway.catalog.existingConfigMap` / `.existingConfigMapKey` |
+| ChatGPT credential | `gateway.chatgpt.inline` | `gateway.chatgpt.existingSecret` / `.existingSecretKey` |
 
 Use `existingSecret` for credentials. An inline value is stored in the release, returned by
 `helm get values`, and usually committed.
@@ -400,9 +514,10 @@ chain on its own volume.
 ## What is not proven
 
 - Nothing has been applied to a cluster. The chart has been linted, rendered, and schema-validated
-  with `kubeconform` against Kubernetes 1.33, and the init container's rendered command has been run
-  verbatim in a `linux/arm64` container under its rendered `securityContext` against a fixture built
-  to match a projected volume's symlink layout, but no `kubectl apply` has happened.
+  with `kubeconform` against Kubernetes 1.29, 1.33 and 1.36, and the init container's rendered
+  command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
+  `securityContext` against a fixture built to match a projected volume's symlink layout, but no
+  `kubectl apply` has happened.
 - No image exists to pull yet. The daemons have never been started from this configuration.
 - **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
   `chart-publish.yml` has never run and nothing exists at
@@ -413,5 +528,11 @@ chain on its own volume.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a
   separate rpi-homelab change.
+- The ChatGPT seed-once behaviour is proven against the rendered init container across a cold
+  start, a simulated rotation, two restart shapes, and the gated re-seed — including a negative
+  control confirming that removing the `[ -e ]` test does revert the credential. But no real
+  `dekopond` has refreshed a real token through it. What was exercised is the file-level contract
+  (`0600`, owner `65532`, one link, a `0700` directory, temp sibling plus rename by UID 65532), not
+  a live refresh against OpenAI.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.

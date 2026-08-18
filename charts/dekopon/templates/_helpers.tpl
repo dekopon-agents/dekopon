@@ -93,6 +93,35 @@ Whether each optional file has a source at all.
 {{- if or .Values.broker.config.inline .Values.broker.policies.inline (and .Values.gateway.enabled .Values.gateway.config.inline) -}}true{{- end -}}
 {{- end -}}
 
+{{- define "dekopon.chatgptSecretName" -}}
+{{- printf "%s-chatgpt" (include "dekopon.fullname" .) -}}
+{{- end -}}
+
+{{/*
+The ChatGPT credential directory, always a subdirectory of the persistent claim. Composed rather
+than configured: an emptyDir here would turn seed-once into seed-per-reschedule.
+*/}}
+{{- define "dekopon.chatgptDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.chatgpt.subdir -}}
+{{- end -}}
+
+{{- define "dekopon.chatgptEnabled" -}}
+{{- if and .Values.gateway.enabled .Values.gateway.chatgpt.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The seed-once file, as a YAML list of zero or one {file, secret, key}. Kept apart from
+managedFiles because the handling is the opposite: managedFiles are overwritten on every start,
+this one must survive every start after the first.
+*/}}
+{{- define "dekopon.seedFiles" -}}
+{{- if include "dekopon.chatgptEnabled" . }}
+- file: {{ .Values.gateway.chatgpt.fileName }}
+  secret: {{ default (include "dekopon.chatgptSecretName" .) .Values.gateway.chatgpt.existingSecret }}
+  key: {{ if .Values.gateway.chatgpt.existingSecret }}{{ .Values.gateway.chatgpt.existingSecretKey }}{{ else }}{{ .Values.gateway.chatgpt.fileName }}{{ end }}
+{{- end }}
+{{- end -}}
+
 {{/*
 The files the init container turns into real owner-only regular files, as a YAML list of
 {file, secret, key}. The projected source volume and the init script both iterate this, so they
@@ -169,6 +198,27 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if and (not .Values.gateway.catalog.inline) (not .Values.gateway.catalog.existingConfigMap) -}}
 {{- fail "gateway.enabled is true, so an agent catalog is required: set gateway.catalog.inline or gateway.catalog.existingConfigMap" -}}
 {{- end -}}
+{{- end -}}
+
+{{- if include "dekopon.chatgptEnabled" . -}}
+{{- if and .Values.gateway.chatgpt.inline .Values.gateway.chatgpt.existingSecret -}}
+{{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
+{{- end -}}
+{{- if and (not .Values.gateway.chatgpt.inline) (not .Values.gateway.chatgpt.existingSecret) -}}
+{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopon auth chatgpt export`." -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.subdir) -}}
+{{- fail (printf "gateway.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.gateway.chatgpt.subdir) -}}
+{{- end -}}
+{{- if or (eq .Values.gateway.chatgpt.subdir ".") (eq .Values.gateway.chatgpt.subdir "..") -}}
+{{- fail "gateway.chatgpt.subdir must not be . or .." -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.fileName) -}}
+{{- fail (printf "gateway.chatgpt.fileName must be one path segment, got %q" .Values.gateway.chatgpt.fileName) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.gateway.chatgpt.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
 {{- end -}}
 
 {{- range $key, $path := .Values.paths -}}
