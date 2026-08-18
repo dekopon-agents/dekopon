@@ -2806,6 +2806,188 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_slack_upload_with_a_comment_is_routed_and_names_what_it_carried() {
+    // The reported failure. Slack stamps `subtype: "file_share"` on any message carrying an
+    // upload, so a question asked with a screenshot attached was dropped by the subtype filter
+    // before it was ever routed — the sender saw no answer at all, then watched the bot answer the
+    // plain-text message that followed it.
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        json!({
+            "type": "message",
+            "subtype": "file_share",
+            "channel": "d0123abc",
+            "channel_type": "im",
+            "user": "u9xyz",
+            "ts": "1700000000.000001",
+            "text": "Can you see my attached screenshot?",
+            "files": [{ "name": "image.png", "mimetype": "image/png" }]
+        }),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert!(
+        message
+            .text
+            .starts_with("Can you see my attached screenshot?")
+    );
+    // Named, and named as unreadable: a model handed only the comment denies the screenshot
+    // exists, which reads to the sender as the gateway having lost it.
+    assert!(
+        message.text.contains(
+            "[gateway: the sender attached 1 file the gateway cannot read: image.png (image/png)]"
+        ),
+        "unexpected composed text: {}",
+        message.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_upload_with_no_comment_is_still_a_request() {
+    // An upload posted with no comment carries an empty `text`. The attachment note is then the
+    // whole message, because dropping it would be the same silence the subtype filter produced.
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        json!({
+            "type": "message",
+            "subtype": "file_share",
+            "channel": "d0123abc",
+            "channel_type": "im",
+            "user": "u9xyz",
+            "ts": "1700000000.000001",
+            "text": "",
+            "files": [
+                { "name": "one.png", "mimetype": "image/png" },
+                { "name": "two.txt", "mimetype": "text/plain" }
+            ]
+        }),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(
+        message.text,
+        "[gateway: the sender attached 2 files the gateway cannot read: one.png (image/png), two.txt (text/plain)]"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_file_the_app_cannot_see_is_counted_rather_than_named() {
+    // Without the `files:read` scope Slack can withhold the file's metadata. The count is still
+    // true and still worth saying; inventing a name for it would not be.
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        json!({
+            "type": "message",
+            "subtype": "file_share",
+            "channel": "d0123abc",
+            "channel_type": "im",
+            "user": "u9xyz",
+            "ts": "1700000000.000001",
+            "text": "have a look",
+            "files": [{ "id": "F0123", "file_access": "check_file_info" }]
+        }),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(
+        message.text,
+        "have a look\n\n[gateway: the sender attached 1 file the gateway cannot read]"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_subtypes_that_are_events_about_a_message_are_still_dropped() {
+    // The allowlist has to stay an allowlist. An edit, a deletion, and a channel join are events
+    // *about* messages, and routing any of them would answer a question twice or answer nobody.
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "envelope-1",
+            json!({
+                "type": "message",
+                "subtype": "message_changed",
+                "channel": "d0123abc",
+                "channel_type": "im",
+                "user": "u9xyz",
+                "ts": "1700000000.000001",
+                "text": "an edit"
+            }),
+        ),
+        events_envelope(
+            "envelope-2",
+            json!({
+                "type": "message",
+                "subtype": "message_deleted",
+                "channel": "d0123abc",
+                "channel_type": "im",
+                "user": "u9xyz",
+                "ts": "1700000000.000002",
+                "text": "a deletion"
+            }),
+        ),
+        events_envelope(
+            "envelope-3",
+            json!({
+                "type": "message",
+                "subtype": "channel_join",
+                "channel": "d0123abc",
+                "channel_type": "im",
+                "user": "u9xyz",
+                "ts": "1700000000.000003",
+                "text": "u9xyz has joined the channel"
+            }),
+        ),
+        events_envelope(
+            "envelope-4",
+            direct_message("u9xyz", "1700000000.000004", "a real question"),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.text, "a real question");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_message_with_neither_text_nor_a_file_is_not_a_request() {
+    // Text became optional so an uncommented upload could route. Nothing else may ride in on that:
+    // an empty message is not a question and must not start a session.
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "envelope-1",
+            json!({
+                "type": "message",
+                "channel": "d0123abc",
+                "channel_type": "im",
+                "user": "u9xyz",
+                "ts": "1700000000.000001",
+                "text": "   "
+            }),
+        ),
+        events_envelope(
+            "envelope-2",
+            direct_message("u9xyz", "1700000000.000002", "a real question"),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.text, "a real question");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
     // The failure this field exists to prevent. Slack omits `thread_ts` on the message that starts
     // a thread and sends it on every reply inside one, while the bot answers that first message
