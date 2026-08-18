@@ -27,6 +27,7 @@ Read in this order:
 | Capabilities, identity, policy, providers, credentials, evidence, effects, or retained conversation text | [`security-model.md`](security-model.md) | Defines trust boundaries and threats the change must address. |
 | Crates, protocols, daemon/broker split, or dependencies | [`architecture.md`](architecture.md) | Defines implementation and deployment boundaries and explains intentionally absent machinery. |
 | Source locations, tests, WIT, generated Wasm, CI, dependencies, packaging, or releases | [`development.md`](development.md) | Records the practical repository workflow and scope-specific checks. |
+| The container image, its publication workflow, or a container deployment | [`container-image.md`](container-image.md) | Records that the image reuses the published release archives, what it contains, the numeric runtime UID, the baked provider paths, and the directory ownership both daemons demand. |
 | Operator auth, catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Getting a ChatGPT subscription credential into a cluster | [`chatgpt-credential.md`](chatgpt-credential.md) | Records why an interactive login cannot run in a pod, and the seed-once lifecycle that follows from a rotating refresh token. |
 | Immediate provider loading, direct invocation, or prompt tools | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |

@@ -19,3 +19,16 @@ updates:
       timezone: Etc/UTC
     open-pull-requests-limit: 5
     rebase-strategy: auto
+
+  # The Dockerfile's runtime base, pinned by tag and digest. It is the only image the container
+  # build depends on; the binaries come from a published release. A bump to a different Debian
+  # changes the glibc the release binaries must fit inside; see docs/container-image.md.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    rebase-strategy: auto

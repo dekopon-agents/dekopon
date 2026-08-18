@@ -14,3 +14,8 @@ coverage/
 
 # Code-review artifacts; system of record is the vagus vault, not git history.
 /docs/review-2026-07/
+
+# Container image build input, in case a release is ever extracted into the checkout rather than
+# into the scratch directory ci/stage-image-context.sh stages. Never repository content; see
+# docs/container-image.md.
+/dist/
