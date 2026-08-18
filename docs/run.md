@@ -12,7 +12,7 @@ dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SC
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
 dekopon-run chat --gateway <SOCKET> --subject <SUBJECT> [--conversation <ID>]
-dekopon auth chatgpt <login | status | logout>
+dekopon auth chatgpt <login | status | logout | export>
 ```
 
 **`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
@@ -215,6 +215,8 @@ target/release/dekopon-run prompt \
 ```
 
 Use an exact model exposed to the signed-in Codex account; `gpt-5.5` is a recovery choice when the account does not expose GPT-5.6. Dekopon automatically refreshes an expiring access token and replays opaque encrypted reasoning items only in memory when a tool call requires another model turn.
+
+Dekopon refreshes an expiring access token by rotating the refresh token and writing the replacement back, so the credential file's directory has to be writable. [`chatgpt-credential.md`](chatgpt-credential.md) follows what that means for a container, including `dekopon auth chatgpt export`.
 
 The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE`, `dekopon auth chatgpt ... --auth-file`, or `dekopon-run prompt --chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
 

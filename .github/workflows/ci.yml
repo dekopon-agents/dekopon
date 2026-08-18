@@ -178,12 +178,36 @@ jobs:
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null
           "$gateway" --version >/dev/null
+          "$bin" auth chatgpt export --help >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
             "$bin" auth chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
           "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
           "$runner" invoke --provider "$provider" echo.ransom-case \
             --input '{"message":"Hello, World!"}' >/dev/null
+      - name: Verify credential export emits an applicable Secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth="$RUNNER_TEMP/dekopon-chatgpt-export-auth.json"
+          cat >"$auth" <<'JSON'
+          {"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","expiresAt":1700000000,"accountId":"acct-fixture"}
+          JSON
+          target/debug/dekopon auth chatgpt export --auth-file "$auth" \
+            --expose-credential --namespace dekopon >"$RUNNER_TEMP/chatgpt-secret.yaml"
+          grep -q '^apiVersion: v1$' "$RUNNER_TEMP/chatgpt-secret.yaml"
+          grep -q '^kind: Secret$' "$RUNNER_TEMP/chatgpt-secret.yaml"
+          grep -q '^  namespace: dekopon$' "$RUNNER_TEMP/chatgpt-secret.yaml"
+          # The Secret must carry the credential document itself, not a rendering of it.
+          sed -n 's/^  chatgpt-auth.json: //p' "$RUNNER_TEMP/chatgpt-secret.yaml" \
+            | base64 -d | diff - "$auth"
+          # An export with no credential must fail rather than emit a half-formed secret.
+          set +e
+          target/debug/dekopon auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
+            --expose-credential >/dev/null 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 1
       - name: Verify invalid configuration exit behavior
         shell: bash
         run: |

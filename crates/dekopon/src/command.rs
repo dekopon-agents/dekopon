@@ -1,6 +1,7 @@
 //! Typed command execution, independent of rendering.
 
 use dekopon_config::CatalogSnapshot;
+use dekopon_core::Redacted;
 use dekopon_model::chatgpt::ChatGptAuthStatus;
 use dekopon_protocol::{Agent, Capability, Provider};
 use serde::Serialize;
@@ -17,6 +18,12 @@ pub enum CommandResult {
     Version(VersionInfo),
     /// Model-account authentication state.
     Auth(ModelAuthStatus),
+    /// A credential document printed in the clear on an explicit operator instruction.
+    ///
+    /// The rendered document stays inside [`Redacted`] all the way to the writer, so no `Debug`,
+    /// diagnostic, or serialization path between here and standard output can print it by
+    /// accident. Only [`crate::render`] unwraps it.
+    CredentialExport(Redacted<String>),
     /// Agent list.
     Agents(Vec<Agent>),
     /// One agent.
