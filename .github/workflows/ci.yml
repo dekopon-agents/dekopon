@@ -226,3 +226,36 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+  chart:
+    name: helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show Helm version
+        run: helm version
+      - name: Lint the chart
+        run: helm lint charts/dekopon
+      - name: Render with default and realistic values
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm template dekopon charts/dekopon > "$RUNNER_TEMP/default.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/ci/rubber-stamper-values.yaml > "$RUNNER_TEMP/realistic.yaml"
+      - name: Validate rendered manifests against Kubernetes schemas
+        run: |
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/default.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/realistic.yaml"
+      # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
+      # and mode check. This runs the init container's real command in a real container and
+      # asserts every permission tier dekopon-brokerd enforces.
+      - name: Prove the init container's output
+        run: PLATFORM=linux/amd64 charts/dekopon/ci/verify-init-permissions.sh

@@ -1,0 +1,32 @@
+{{ include "dekopon.fullname" . }} is installed.
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "dekopon.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dekopon.fullname" . }} -c prepare-files
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dekopon.fullname" . }} -c broker
+{{- if .Values.gateway.enabled }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dekopon.fullname" . }} -c gateway
+{{- end }}
+
+Image: {{ include "dekopon.image" . }}
+{{- if and (not .Values.image.digest) (not .Values.image.tag) }}
+
+  Container images are published on version tags only, and v0.3.0 predates that workflow. If
+  v{{ .Chart.AppVersion }} has not been tagged yet, this reference cannot be pulled and the pod
+  will sit in ImagePullBackOff. Set image.tag or image.digest to something that exists.
+{{- end }}
+
+The broker refuses to start rather than serving with a path it does not trust, so read the
+prepare-files and broker logs before assuming the image or the network is at fault.
+{{- if or .Values.broker.config.existingSecret .Values.broker.policies.existingSecret .Values.broker.credentials.existingSecret (and .Values.gateway.enabled .Values.gateway.config.existingSecret) }}
+
+Configuration is copied once, by the init container, at pod start. This release reads at least one
+existing Secret, whose contents the chart cannot checksum, so editing it changes nothing until you
+roll the pod:
+
+  kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "dekopon.fullname" . }}
+{{- end }}
+{{- if not .Values.gateway.enabled }}
+
+The gateway is disabled, so this is a broker with no caller. Set gateway.enabled=true with a
+dekopond.yaml and an agent catalog to give it one.
+{{- end }}

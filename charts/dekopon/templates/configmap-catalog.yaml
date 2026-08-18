@@ -1,0 +1,14 @@
+{{- if and .Values.gateway.enabled .Values.gateway.catalog.inline }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dekopon.catalogConfigMapName" . }}
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+# The agent catalog is the only file with no hygiene rules: dekopond reads catalogPath with a
+# plain read_to_string, so a ConfigMap volume's symlinks and root ownership are irrelevant. It is
+# mounted directly and never copied.
+data:
+  {{ .Values.gateway.catalog.fileName }}: |
+    {{- .Values.gateway.catalog.inline | nindent 4 }}
+{{- end }}
