@@ -21,6 +21,7 @@ Finally, read the documents selected by the work:
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md) | It records repository mechanics and validation traps that root workspace commands do not cover. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`docs/broker-http.md`](docs/broker-http.md) | It defines the accepted process boundary, buffered HTTP contract, authorization inputs, and staged delivery. |
 | Chat transports, gateway configuration, routing, agent sessions, or attested proposals | [`docs/dekopond.md`](docs/dekopond.md) | It defines the unprivileged daemon's contract and the authority it deliberately does not hold. |
+| Deployment secrets, 1Password, External Secrets, or delivering a credential file into a cluster | [`docs/1password-eso.md`](docs/1password-eso.md) | It records the deployed secret-store configuration, the bootstrap a human owns, and the file hygiene no Kubernetes volume satisfies. |
 | Scope, priority, package names, or a proposed new crate | [`docs/roadmap.md`](docs/roadmap.md) | It records sequencing and explicit non-goals; it does not make future components current. |
 
 [`docs/README.md`](docs/README.md) is the complete documentation map. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for validation and pull-request expectations.
