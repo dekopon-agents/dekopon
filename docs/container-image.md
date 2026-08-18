@@ -7,8 +7,8 @@ still read owner-owned files that the deployment provides.
 **Status: current.** [`../Dockerfile`](../Dockerfile) and
 [`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) are in the
 repository and build locally today against the `v0.3.0` archives. Publication runs when a release
-is published, so the first published image is the first release after this workflow lands;
-`v0.3.0` predates it.
+is published, and `v0.4.0` is the first release it runs for; `v0.3.0` predates the workflow and has
+no image.
 
 ## What it is
 

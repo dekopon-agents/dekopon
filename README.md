@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.3.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.4.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works today in 0.3.0
+## What works today in 0.4.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -21,6 +21,14 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+
+New in 0.4.0 — distribution rather than authority. No new crates, no new privileges, and nothing moved across the broker boundary:
+
+- **A container image.** `ghcr.io/dekopon-agents/dekopon` carries all four executables for `linux/amd64` and `linux/arm64`, copied byte for byte out of this release's own archives rather than compiled a second time, alongside the checked-in provider components. It runs as UID 65532 and ships no configuration, policy, credentials, or audit state. See [`docs/container-image.md`](docs/container-image.md).
+- **A Helm chart.** [`charts/dekopon`](charts/dekopon/README.md) runs `dekopon-brokerd` and `dekopond` as one pod sharing the broker's `0600` Unix socket, because `SO_PEERCRED` across a shared filesystem namespace is the only transport the broker has. The chart is versioned and tagged separately from the application.
+- **A Homebrew tap.** `brew install dekopon` from [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap) installs all four executables and the example component, from a formula regenerated out of the archives each release actually published rather than a hand-maintained platform list.
+- **`dekopon auth chatgpt export`.** Prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized `dekopond` can be seeded with a credential its interactive device-authorization flow cannot obtain in a pod. It is the only command whose output is credential material in the clear: `--expose-credential` is mandatory, a terminal on standard output is refused, and both forms warn that the copy goes stale the moment the live credential refreshes.
+- **Three release archives, not four.** macOS on Intel left the release matrix; macOS ARM64, Linux ARM64, and Linux x86-64 remain.
 
 New in 0.3.0:
 
@@ -61,20 +69,20 @@ From there, [`examples/rubber-stamper`](examples/rubber-stamper/README.md) is th
 
 ### Prebuilt archives
 
-Provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.3.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.4.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.4.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.3.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.3.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.3.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.4.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.4.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.4.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.3.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.3.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.4.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.4.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-**`0.3.0` is not on crates.io.** The tag and the GitHub release exist; crates.io publication is a deliberately separate manual workflow dispatch (see [Maintainer release process](#maintainer-release-process)) that has not been run for this version. `cargo install --locked dekopon` today installs `0.2.0`, and the three crates new in `0.3.0` — `dekopon-agent`, `dekopon-policy`, and `dekopond` — do not exist on crates.io under any version. Use Homebrew, the release archives, or a checkout to get `0.3.0`.
+**`0.4.0` is not on crates.io, and neither is `0.3.0`.** Both tags and both GitHub releases exist; crates.io publication is a deliberately separate manual workflow dispatch (see [Maintainer release process](#maintainer-release-process)) that has not been run for either version. `cargo install --locked dekopon` today installs `0.2.0`, and the three crates added in `0.3.0` — `dekopon-agent`, `dekopon-policy`, and `dekopond` — do not exist on crates.io under any version. Use Homebrew, the release archives, the container image, or a checkout to get `0.4.0`.
 
 ### From a checkout
 
@@ -93,7 +101,7 @@ dekopon-run --version
 
 ### Container image
 
-A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published, starting with the first release after [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) lands—`v0.3.0` predates it. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside the checked-in provider components. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
+A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published. `v0.4.0` is the first release [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) runs for; `v0.3.0` predates the workflow and has no image. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside the checked-in provider components. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
 
 ### Before running the broker
 
@@ -105,7 +113,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Nothing has been applied to a cluster and no chart tag exists yet; the chart also depends on a container image that only exists from the first release tagged after the image workflow, so `v0.3.0` cannot run it.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Nothing has been applied to a cluster and no chart tag exists yet. Its `appVersion` is `0.4.0`, the first release the image workflow runs for, because `v0.3.0` has no image for the chart to pull.
 
 ## Run the flagship example
 
@@ -177,7 +185,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

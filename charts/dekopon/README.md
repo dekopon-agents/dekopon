@@ -339,9 +339,9 @@ They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1`
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
 force an application release, and an application release should not republish an unchanged chart.
 
-`appVersion` is `0.4.0`, which is the **first release that will have an image**, not the latest
-release that exists. `v0.3.0` predates the container-image workflow and no image was ever published
-for it. Setting `appVersion: 0.3.0` would ship a chart whose default pulls nothing.
+`appVersion` is `0.4.0`, the **first release the container-image workflow runs for**. `v0.3.0`
+predates that workflow and no image was ever published for it, so setting `appVersion: 0.3.0` would
+ship a chart whose default pulls nothing.
 
 The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
 therefore renders `v` + `appVersion`:
