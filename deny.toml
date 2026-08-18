@@ -27,6 +27,7 @@ wildcards = "deny"
 highlight = "all"
 deny = []
 skip = [
+  { crate = "base64@0.22.1", reason = "hyper-util, jaq-std, reqwest, tonic, and ureq still decode with base64 0.22 while this workspace has moved to 0.23; removable once those crates ship releases built on base64 0.23" },
   { crate = "block-buffer@0.10.4", reason = "Cedar's build-time lalrpop parser generator hashes with the RustCrypto 0.10 stack the workspace's own sha2 0.11 has moved past" },
   { crate = "cpufeatures@0.2.17", reason = "transitive half of the same lalrpop/RustCrypto split" },
   { crate = "crypto-common@0.1.7", reason = "transitive half of the same lalrpop/RustCrypto split" },
