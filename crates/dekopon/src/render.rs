@@ -28,6 +28,10 @@ pub fn render(result: &CommandResult, format: OutputFormat) -> Result<String, Re
     match result {
         CommandResult::Version(info) => render_version(info, format),
         CommandResult::Auth(status) => render_auth(status, format),
+        // The one place this binary prints a credential in the clear. `--output` deliberately does
+        // not apply: the form was already chosen by `--format`, and both gates on
+        // `dekopon auth chatgpt export` are checked before a result reaches here.
+        CommandResult::CredentialExport(document) => Ok(document.expose().clone()),
         CommandResult::Agents(agents) => render_agents(agents, format),
         CommandResult::Agent(agent) => render_agent(agent, format),
         CommandResult::Capabilities(capabilities) => render_capabilities(capabilities, format),

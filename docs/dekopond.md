@@ -57,6 +57,7 @@ models:
     kind: chatgptSubscription
     model: gpt-5-codex
     authFile: /path/to/chatgpt-auth.json      # optional; defaults to Dekopon's own credential file
+                                              # must be in a writable directory: refreshing rewrites it
     timeoutMs: 120000
     classes: [reasoning]
 
