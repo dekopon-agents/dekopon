@@ -1,0 +1,12 @@
+# There is no denylist to maintain here. The build context is constructed by
+# ci/stage-image-context.sh, which copies in the Dockerfile, the release executables, the provider
+# components, and the two licences, and asserts that the result is exactly that. Docker reads the
+# .dockerignore inside the context it is given, and the staged context has none, so everything
+# staged is included — which is the point.
+#
+# This file only affects someone who types `docker build .` in the repository root out of habit.
+# That cannot work: the Dockerfile's COPY paths refer to the staged layout. Excluding everything
+# makes it fail immediately with a missing source, rather than after uploading a Cargo target
+# directory that reaches tens of gigabytes. It never needs updating, because it never makes a
+# judgement about any particular file.
+*

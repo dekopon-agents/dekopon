@@ -65,6 +65,8 @@ cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopond
 ```
 
+A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published, starting with the first release after [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) lands—`v0.3.0` predates it. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside the checked-in provider components. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
+
 `dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
 
 ```console

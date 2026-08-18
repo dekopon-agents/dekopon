@@ -1,0 +1,302 @@
+# Publishes ghcr.io/dekopon-agents/dekopon: one image, all four binaries, linux/amd64 and
+# linux/arm64.
+#
+# The image is assembled from the release archives, not compiled here. `release.yml` already
+# builds, checksums, and provenance-attests the four executables for both Linux targets, so this
+# workflow verifies those archives and copies their contents into an image. Recompiling would
+# produce a second set of binaries nobody has verified, from a toolchain that can drift, and would
+# cost a native build matrix to arrive somewhere less trustworthy than the artifacts users already
+# download.
+#
+# `release: published` rather than the `v*.*.*` tag push: the tag push is what starts `release.yml`,
+# so triggering on it would race the archives this workflow needs. It is the same signal
+# `homebrew-tap.yml` uses, for the same reason. `workflow_dispatch` re-runs an existing release.
+#
+# Consequences of having nothing to compile, each one deliberate:
+#   * Every Dockerfile instruction is a COPY, so one runner assembles both platforms in a single
+#     build. No per-architecture matrix, no push-by-digest, no digest hand-off between jobs, no
+#     `imagetools` stitch, and therefore no `provenance: false` — buildx emits real provenance and
+#     an SBOM per platform instead.
+#   * The build context is constructed by `ci/stage-image-context.sh` rather than filtered out of
+#     a checkout, so nothing can reach a layer or slow a build by being added to the repository
+#     later. That script is also the only implementation of the fetch-and-verify path; a human
+#     building locally runs the same one.
+#   * No registry layer cache. The layers are a distroless base and three small COPYs; there is
+#     nothing expensive left to cache.
+#   * Both platform images are loaded and inspected before anything is pushed. The one claim this
+#     design rests on — that the binaries in the image are byte-identical to the published
+#     archives — is checked for both architectures, and the amd64 binaries are executed, because
+#     the runner is amd64 and can.
+#
+# A pull request that touches the image inputs runs the same steps against the newest published
+# release and pushes nothing.
+name: Container image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v0.3.0)
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/container-image.yml"
+      - "Dockerfile"
+      - "ci/stage-image-context.sh"
+      - "LICENSE-*"
+      - "examples/providers/*.wasm"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    name: container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Resolve the release to package
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          PUBLISHED_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            release)
+              tag="$PUBLISHED_TAG"
+              push=true
+              ;;
+            workflow_dispatch)
+              tag="$DISPATCH_TAG"
+              push=true
+              ;;
+            *)
+              # A pull request has no release of its own. Building its Dockerfile and its
+              # checked-in components against the newest published release proves the part a
+              # pull request can break, before a release depends on it.
+              tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+              push=false
+              ;;
+          esac
+          if [ -z "$tag" ]; then
+            echo "::error::could not resolve a release tag for event $EVENT"
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "push=$push"
+            # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
+            # cannot push to the wrong package. The published WIT packages are separate GHCR
+            # packages under the same owner (dekopon/provider, dekopon/http) and are unaffected.
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            # Publishing checks out the tag so the baked components and the Dockerfile match the
+            # release; a pull request checks out itself, which is the point.
+            if [ "$push" = "true" ]; then echo "checkout_ref=$tag"; else echo "checkout_ref="; fi
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::packaging $tag (push=$push)"
+
+      - name: Check out the source to package
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.plan.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Stage the build context
+        id: stage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # One script, run identically here and by a human building locally: it downloads the
+          # release archives, checks each against its published .sha256 and its attestation,
+          # refuses any binary needing a glibc newer than the runtime base, and stages a context
+          # holding the Dockerfile, the executables, the components, and the licences — asserting
+          # that the result is exactly that file set. Two implementations of this would drift.
+          work="$RUNNER_TEMP/image"
+          rm -rf "$work"
+          mkdir -p "$work"
+          ci/stage-image-context.sh "$TAG" "$work"
+          {
+            echo "work=$work"
+            echo "context=$work/context"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and load both platforms
+        shell: bash
+        env:
+          CONTEXT: ${{ steps.stage.outputs.context }}
+        run: |
+          set -euo pipefail
+          # No emulation is involved: nothing runs during the build, so a foreign-architecture
+          # image can be assembled and loaded on this runner and its filesystem inspected. Only
+          # executing it would need QEMU, and only the amd64 image is executed below.
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load \
+              --tag "dekopon-proof:$arch" "$CONTEXT"
+          done
+
+      - name: Verify the image against the published archives
+        shell: bash
+        env:
+          CONTEXT: ${{ steps.stage.outputs.context }}
+          WORK: ${{ steps.stage.outputs.work }}
+        run: |
+          set -euo pipefail
+          # The staged executables are still the ones the verified archives produced.
+          ( cd "$CONTEXT" && sha256sum --check --strict "$WORK/binaries.sha256" )
+          for arch in amd64 arm64; do
+            rootfs="$RUNNER_TEMP/rootfs-$arch.tar"
+            container=$(docker create "dekopon-proof:$arch" unused)
+            docker export "$container" > "$rootfs"
+            docker rm "$container" > /dev/null
+
+            # The claim this whole design rests on: the executable in the image is the executable
+            # the release published, byte for byte.
+            for binary in dekopon dekopon-run dekopon-brokerd dekopond; do
+              in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
+              in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
+              if [ "$in_image" != "$in_release" ]; then
+                echo "::error::$arch $binary in the image is $in_image; the release published $in_release"
+                exit 1
+              fi
+              echo "$arch $binary $in_image matches the release archive"
+            done
+
+            # dekopon-brokerd refuses a provider file that is not owned by its euid, is group- or
+            # world-writable, or is not a plain single-link file, and it applies the owner rule to
+            # the directory too. The image has no shell, so this is read from outside it.
+            tar -tvf "$rootfs" | awk '
+              $NF ~ /^opt\/dekopon\/providers\// {
+                seen++
+                if ($1 != "-rw-r--r--" && $1 != "drwxr-xr-x") { print "unexpected mode " $1 " on " $NF; bad++ }
+                if ($2 != "65532/65532") { print "unexpected owner " $2 " on " $NF; bad++ }
+              }
+              END {
+                if (seen != 5) { print "expected 5 provider entries, found " seen; exit 1 }
+                if (bad) { exit 1 }
+                print "provider components are 65532-owned and not group- or world-writable"
+              }'
+          done
+
+          # The runner is amd64, so that image runs here for real.
+          docker run --rm dekopon-proof:amd64 dekopon version
+          docker run --rm dekopon-proof:amd64 dekopon-run --version
+          docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
+          docker run --rm dekopon-proof:amd64 dekopond --version
+          # Components compile lazily through Cranelift, so only an actual component load proves
+          # Wasmtime works under the runtime image's constraints. `echo` is the one baked component
+          # the direct runner can load: the other three import dekopon:http/client and the
+          # immediate linker is empty by design, so they are broker-only.
+          docker run --rm dekopon-proof:amd64 dekopon-run inspect \
+            --provider /opt/dekopon/providers/echo-provider.wasm > /dev/null
+          docker run --rm dekopon-proof:amd64 dekopon-run invoke \
+            --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}' > /dev/null
+          bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
+          human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
+          {
+            echo "| checked | result |"
+            echo "|---|---|"
+            echo "| binaries byte-identical to the archives | amd64 4/4, arm64 4/4 |"
+            echo "| provider components 65532-owned, not group/world writable | both |"
+            echo "| binaries executed (amd64) | 4/4 plus a component load |"
+            echo "| unpacked size | $human |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GHCR
+        if: steps.plan.outputs.push == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the manifest list
+        id: publish
+        if: steps.plan.outputs.push == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          # The same staged context the two proof builds used, so this pushes what was verified.
+          context: ${{ steps.stage.outputs.context }}
+          # One build, one manifest list, both platforms. The layers are already in the builder
+          # from the proof builds above, so this pushes what was just verified.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Only the release tag. There is no `latest`: release tags are immutable here, a moving
+          # pointer would contradict that, and it would let a prerelease become the default pull.
+          tags: ${{ steps.plan.outputs.image }}:${{ steps.plan.outputs.tag }}
+          # Nothing has to flatten this index, so buildx can attach its own provenance and SBOM.
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.plan.outputs.tag }}
+
+      - name: Verify the published tag
+        id: published
+        if: steps.plan.outputs.push == 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          BUILD_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+          # Kept even though nothing stitches the index any more: it is the assertion that what
+          # was published carries both architectures, whatever produced it. `unknown` is filtered
+          # because the provenance and SBOM attestations are manifests in the same index.
+          platforms=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' \
+            | jq -r '[.manifests[]?.platform | select(.architecture != "unknown") | "\(.os)/\(.architecture)"] | sort | join(",")')
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::published platform set is '$platforms'; expected exactly linux/amd64,linux/arm64"
+            exit 1
+          fi
+          # Read back from the registry rather than trusting the build's own output, then require
+          # the two to agree: the attested subject must be what a pull of this tag resolves to.
+          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          if [ "$digest" != "$BUILD_DIGEST" ]; then
+            echo "::error::$IMAGE:$TAG resolves to $digest but this build pushed $BUILD_DIGEST"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "Published \`$IMAGE:$TAG\`"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| digest | \`$digest\` |"
+            echo "| platforms | \`$platforms\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the published index
+        if: steps.plan.outputs.push == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Buildx provenance is registry-native but not a sigstore bundle. This is the one
+          # `gh attestation verify oci://...` consumes, which is the posture release.yml already
+          # gives the archives the image is built from.
+          subject-name: ${{ steps.plan.outputs.image }}
+          subject-digest: ${{ steps.published.outputs.digest }}
+          push-to-registry: true

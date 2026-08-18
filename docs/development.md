@@ -42,6 +42,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
 | End-to-end deployment example | `examples/rubber-stamper/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
+| Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
 Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory remains a map to package-owned suites; the repository-level observability smoke test lives with its runnable example under `examples/otel-traces/`.
 
@@ -261,6 +262,46 @@ wkg get \
 ```
 
 `.github/workflows/wit-package.yml` performs local publish/fetch round trips for both packages on pull requests. When the relevant files reach `main`, it publishes the immutable packages to GHCR and verifies that fetching each package returns identical bytes.
+
+### Container image
+
+The image is assembled from the executables a release already published, into a context that is
+constructed rather than filtered. One script does the whole fetch-verify-stage path, and CI runs
+the same one. Contract and deployment details are in [`container-image.md`](container-image.md).
+
+```console
+actionlint .github/workflows/container-image.yml
+shellcheck ci/stage-image-context.sh
+work=$(mktemp -d)
+ci/stage-image-context.sh v0.3.0 "$work"
+docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
+docker buildx build --platform linux/amd64 --load -t dekopon:local-amd64 "$work/context"
+docker run --rm dekopon:local dekopon version
+docker run --rm dekopon:local dekopon-run invoke \
+  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
+docker export "$(docker create dekopon:local unused)" | tar -tvf - opt/dekopon/providers
+```
+
+The script prints the fifteen files it staged and the digest of each executable, then the build
+context is exactly those files: there is no `.dockerignore` denylist to keep correct as the
+repository grows. The repository root cannot be used as a context and fails in about a second if
+someone tries.
+
+Neither build needs emulation: every instruction is a `COPY`, so a foreign-architecture image can
+be assembled and its filesystem inspected anywhere. Only *running* one needs QEMU, so run the
+image that matches the machine.
+
+Do not add a compile stage to the Dockerfile: the point of the image is that its binaries are the
+release's binaries, verifiable with `sha256sum` against the published archive. The workflow checks
+exactly that for all eight before it pushes anything, and the staging script refuses to stage a
+binary that needs a glibc newer than the runtime base provides.
+
+`echo` is the only baked component the direct runner can load — the other three import
+`dekopon:http/client@1.0.0` and the immediate linker is empty — and loading one matters because
+components compile lazily through Cranelift, so a clean startup proves nothing. The `docker
+export` listing is how ownership and mode are read: the image has no shell. The four components
+must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
+group- or world-writable, or `dekopon-brokerd` refuses to start.
 
 ## Before opening a pull request
 
