@@ -79,9 +79,19 @@ An optional `@id("…")` annotation names a policy. That name is what audit reco
 `policy_ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
 `policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
 
-Every capability a policy references needs a `constraintSets` entry, or startup fails with
-`policy permits capability X, which has no constraint set`. At decision time a capability with no
-constraint set is denied `unconstrained-capability` before Cedar is consulted at all.
+At decision time a capability with no constraint set is denied `unconstrained-capability` before
+Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
+
+`strict` (default `false`) decides whether startup *also* complains. Left alone, a policy naming a
+capability no loaded provider offers, and a constraint set naming one, are both warnings: the
+deployment starts, and each is logged as an `audit.event` so the mismatch is visible in traces.
+This is what lets you ship policy for a provider you have not dropped in yet. Set `strict: true`
+for a deployment whose provider set is fixed, where a mismatch means someone made a mistake — then
+every one of those warnings is the startup refusal it used to be.
+
+One thing stays fatal in both modes: a policy naming a principal that no `identities` or
+`identityMappings` entry declares. Principals come from this file rather than from a loaded
+component, so an undeclared one is always a typo.
 
 Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar strict validation.
 Evaluation errors deny.

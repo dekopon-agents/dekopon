@@ -52,6 +52,16 @@ pub struct BrokerdConfig {
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
+    /// Whether configuration naming something no loaded provider offers refuses startup.
+    ///
+    /// Defaults to `false`, which warns and continues so a deployment can ship policy and
+    /// constraint sets that anticipate a provider it has not dropped in yet. Set it for a
+    /// deployment whose provider set is fixed, where a mismatch means someone made a mistake.
+    ///
+    /// Tolerating grants nothing either way: a capability nothing routes is denied
+    /// `unconstrained-capability` at invocation regardless of this setting.
+    #[serde(default)]
+    pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     /// Owner-controlled subject-to-principal mappings consulted for attested proposals.
     #[serde(default)]
@@ -265,6 +275,7 @@ pub struct ResolvedConfig {
     pub policy_revision: String,
     pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
+    pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     pub identity_mappings: Vec<IdentityMapping>,
     pub policies_path: Option<PathBuf>,
@@ -539,6 +550,7 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
         policy_revision: config.policy_revision,
         credentials_path,
         providers,
+        strict: config.strict,
         identities: config.identities,
         identity_mappings: config.identity_mappings,
         policies_path,

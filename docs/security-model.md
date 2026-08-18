@@ -28,6 +28,7 @@ Trusted inputs are expected to include:
 - broker configuration installed by an authorized operator;
 - the owner-only Cedar policy file, read under the configuration's own hygiene rules (server-owned, single-link, not group/world writable, no symlink following, byte-capped) — it is authorization input in exactly the sense the configuration is;
 - owner-authored execution constraint sets, validated at startup against loaded provider manifests, component-host ceilings, and the credential store;
+- a `strict` startup posture choosing whether configuration that *cannot apply* refuses startup or is reported and ignored. It governs complaint, never enforcement: a capability no loaded provider routes is denied `unconstrained-capability` before Cedar is consulted in either mode, and a policy naming one is registered as a schema-only phantom that no constraint set can bind and no route can reach. An undeclared *principal* stays fatal in both modes, because principals come from owner-authored configuration rather than from a loaded component;
 - broker-generated authorization receipts and audit sequencing;
 - secrets obtained by the broker from an approved secret store.
 

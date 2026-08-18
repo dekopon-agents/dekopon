@@ -123,6 +123,11 @@ pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
+    /// Capability names a policy referenced that no loaded provider routes. See
+    /// [`PolicyWorld::with_phantoms`].
+    phantom_capabilities: BTreeSet<CapabilityId>,
+    /// Provider names a policy referenced that no loaded manifest declares.
+    phantom_providers: BTreeSet<ProviderId>,
 }
 
 impl PolicyWorld {
@@ -178,9 +183,46 @@ impl PolicyWorld {
     }
 
     /// Returns the provider a declared capability routes to.
+    ///
+    /// A phantom name routes nowhere and returns `None`, which is the whole point of keeping
+    /// phantoms out of the route map.
     #[must_use]
     pub fn provider_for(&self, capability: &CapabilityId) -> Option<&ProviderId> {
         self.capabilities.get(capability)
+    }
+
+    /// Extends this world with names a policy referenced that no loaded provider declares.
+    ///
+    /// A deployment may ship policy that anticipates a provider it has not dropped in yet. Cedar's
+    /// strict validator rejects a policy naming an action outside the schema, so such a name is
+    /// registered here as a *phantom*: it exists in the generated schema and nowhere else.
+    ///
+    /// The alternative — dropping the offending policy — is wrong, and worth saying why. A policy
+    /// reading `action in [gh.pull-request.read, gh.issue.create]` with only the first loaded would
+    /// lose *both* grants, silently revoking authority the operator still has every reason to
+    /// expect. A phantom keeps the policy whole and takes away exactly the missing capability.
+    ///
+    /// A phantom can never authorize an execution. It routes to no provider, the broker refuses any
+    /// constraint set naming an unrouted capability, and an invocation naming one is denied
+    /// `unconstrained-capability` before Cedar is consulted at all.
+    #[must_use]
+    fn with_phantoms(&self, unresolved: &[UnresolvedName]) -> Self {
+        let mut world = self.clone();
+        for entry in unresolved {
+            match entry.kind {
+                UnresolvedKind::Capability => {
+                    if let Ok(capability) = entry.name.parse::<CapabilityId>() {
+                        world.phantom_capabilities.insert(capability);
+                    }
+                }
+                UnresolvedKind::Provider => {
+                    if let Ok(provider) = entry.name.parse::<ProviderId>() {
+                        world.phantom_providers.insert(provider);
+                    }
+                }
+            }
+        }
+        world
     }
 
     /// Renders the Cedar schema this world implies.
@@ -206,8 +248,15 @@ impl PolicyWorld {
             }
         });
 
+        // Phantom capabilities are indistinguishable from routed ones *here*, and only here: the
+        // schema is what strict validation checks a policy against, so a phantom is what lets a
+        // policy naming an unloaded capability stay whole. Nothing downstream can execute one.
         let mut actions = serde_json::Map::new();
-        for capability in self.capabilities.keys() {
+        for capability in self
+            .capabilities
+            .keys()
+            .chain(self.phantom_capabilities.iter())
+        {
             actions.insert(
                 capability.as_str().to_owned(),
                 json!({
@@ -332,6 +381,51 @@ impl PolicyDecision {
     }
 }
 
+/// Which kind of declared name a policy referenced but the world does not contain.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum UnresolvedKind {
+    /// A Cedar action, which is a capability identifier.
+    Capability,
+    /// A provider resource.
+    Provider,
+}
+
+impl UnresolvedKind {
+    /// Returns the stable label used in operator-facing diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Capability => "capability",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// One provider-derived name a policy references that no loaded provider declares.
+///
+/// Reported by [`PolicyEngine::new_lenient`] so a deployment can warn about policy that anticipates
+/// a provider it has not dropped in yet, instead of refusing to start. Principals are deliberately
+/// absent from this type: they come from owner-authored identities rather than a loaded component,
+/// so an undeclared principal is a typo and stays fatal in both modes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedName {
+    /// Identifier of the policy that named it.
+    pub policy: String,
+    /// The undeclared name, exactly as the policy spelled it.
+    pub name: String,
+    /// Whether it was named as an action or as a resource.
+    pub kind: UnresolvedKind,
+}
+
+/// How a policy naming a provider-derived entity the world does not declare is handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Handling {
+    /// Refuse to build. Every undeclared name is a [`PolicyBuildError`].
+    Refuse,
+    /// Register the name as a phantom and report it. See [`PolicyWorld::with_phantoms`].
+    Tolerate,
+}
+
 /// A validated, startup-fixed Cedar policy set with its generated schema and entity store.
 pub struct PolicyEngine {
     policies: PolicySet,
@@ -372,6 +466,41 @@ impl PolicyEngine {
     /// to parse, contains a template, fails strict schema validation, or names an entity the world
     /// does not declare.
     pub fn new(policy_text: &str, world: &PolicyWorld) -> Result<Self, PolicyBuildError> {
+        let (engine, unresolved) = Self::build(policy_text, world, Handling::Refuse)?;
+        debug_assert!(
+            unresolved.is_empty(),
+            "Handling::Refuse returns an error rather than tolerating a name"
+        );
+        Ok(engine)
+    }
+
+    /// Parses and validates one policy set, tolerating names no loaded provider declares.
+    ///
+    /// Identical to [`PolicyEngine::new`] except that a policy naming an undeclared capability or
+    /// provider is kept and the name reported, rather than refusing to start. This lets a
+    /// deployment ship policy that anticipates a provider it has not dropped in yet; the caller is
+    /// expected to warn about every returned [`UnresolvedName`].
+    ///
+    /// Tolerating a name grants nothing. See [`PolicyWorld::with_phantoms`] for why a phantom can
+    /// never authorize an execution, and why this is preferable to dropping the policy.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`PolicyEngine::new`], minus [`PolicyBuildError::UnknownAction`] and
+    /// [`PolicyBuildError::UnknownProvider`]. An undeclared *principal* remains an error here:
+    /// principals come from owner-authored configuration, not from a loaded component.
+    pub fn new_lenient(
+        policy_text: &str,
+        world: &PolicyWorld,
+    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+        Self::build(policy_text, world, Handling::Tolerate)
+    }
+
+    fn build(
+        policy_text: &str,
+        world: &PolicyWorld,
+        handling: Handling,
+    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
         if policy_text.len() > MAX_POLICY_BYTES {
             return Err(PolicyBuildError::PolicyTooLarge {
                 length: policy_text.len(),
@@ -396,7 +525,13 @@ impl PolicyEngine {
         }
         let policies = apply_annotated_ids(&policies)?;
 
-        let schema = Schema::from_json_value(world.schema_json()).map_err(|source| {
+        // Classification runs *before* schema generation, which is the whole reordering. Cedar's
+        // strict validator rejects a policy naming an action outside the schema, so a tolerated
+        // name has to be in the schema by the time validation runs.
+        let (referenced_capabilities, unresolved) = classify_policies(&policies, world, handling)?;
+        let effective = world.with_phantoms(&unresolved);
+
+        let schema = Schema::from_json_value(effective.schema_json()).map_err(|source| {
             PolicyBuildError::Schema {
                 message: source.to_string(),
             }
@@ -411,19 +546,21 @@ impl PolicyEngine {
             return Err(PolicyBuildError::Validation { messages });
         }
 
-        let referenced_capabilities = validate_entity_references(&policies, world)?;
-        let entities = build_entities(world, &schema)?;
-        let digest = policy_digest(&policies, world);
+        let entities = build_entities(&effective, &schema)?;
+        let digest = policy_digest(&policies, world, &unresolved);
 
-        Ok(Self {
-            policy_count: policies.num_of_policies(),
-            policies,
-            schema,
-            entities,
-            authorizer: Authorizer::new(),
-            referenced_capabilities,
-            digest,
-        })
+        Ok((
+            Self {
+                policy_count: policies.num_of_policies(),
+                policies,
+                schema,
+                entities,
+                authorizer: Authorizer::new(),
+                referenced_capabilities,
+                digest,
+            },
+            unresolved,
+        ))
     }
 
     /// Decides one request; every failure path denies.
@@ -583,11 +720,29 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
 ///
 /// Agents are the deliberate exception: the agent catalog belongs to the gateway, so the broker
 /// declares the type and matches instances by UID without enumerating them.
-fn validate_entity_references(
+/// Classifies every policy's entity literals against the declared world.
+///
+/// Returns the capabilities the policy set references, plus every provider-derived name the world
+/// does not contain. Cedar's own validator checks entity *types*, not instances, which is why this
+/// exists at all.
+///
+/// Two classes of name are treated differently on purpose:
+///
+/// - **Principals** come from owner-authored identities and subject mappings, never from a loaded
+///   component. An undeclared one is a typo, and stays fatal in both modes.
+/// - **Actions and providers** are derived from loaded provider manifests. An undeclared one means
+///   that provider is not loaded, which is a legitimate state for a deployment whose policy
+///   anticipates it. Under [`Handling::Tolerate`] it is reported and registered as a phantom.
+///
+/// An entity type outside the Dekopon namespace is a grammar error, not an absence, and is fatal
+/// in both modes.
+fn classify_policies(
     policies: &PolicySet,
     world: &PolicyWorld,
-) -> Result<BTreeSet<CapabilityId>, PolicyBuildError> {
+    handling: Handling,
+) -> Result<(BTreeSet<CapabilityId>, Vec<UnresolvedName>), PolicyBuildError> {
     let mut referenced_capabilities = BTreeSet::new();
+    let mut unresolved = Vec::new();
     for policy in policies.policies() {
         let id = policy.id().to_string();
         for uid in policy.entity_literals() {
@@ -609,36 +764,51 @@ fn validate_entity_references(
                     }
                 }
                 PROVIDER_TYPE => {
-                    let provider = value.parse::<ProviderId>().map_err(|_| {
-                        PolicyBuildError::UnknownProvider {
-                            policy: id.clone(),
-                            provider: value.clone(),
+                    let declared = value
+                        .parse::<ProviderId>()
+                        .is_ok_and(|provider| world.providers.contains(&provider));
+                    if !declared {
+                        match handling {
+                            Handling::Refuse => {
+                                return Err(PolicyBuildError::UnknownProvider {
+                                    policy: id.clone(),
+                                    provider: value,
+                                });
+                            }
+                            Handling::Tolerate => unresolved.push(UnresolvedName {
+                                policy: id.clone(),
+                                name: value,
+                                kind: UnresolvedKind::Provider,
+                            }),
                         }
-                    })?;
-                    if !world.providers.contains(&provider) {
-                        return Err(PolicyBuildError::UnknownProvider {
-                            policy: id.clone(),
-                            provider: value,
-                        });
                     }
                 }
                 ACTION_TYPE => {
                     if value == AGENT_PROMPT_ACTION {
                         continue;
                     }
-                    let capability = value.parse::<CapabilityId>().map_err(|_| {
-                        PolicyBuildError::UnknownAction {
-                            policy: id.clone(),
-                            action: value.clone(),
+                    match value
+                        .parse::<CapabilityId>()
+                        .ok()
+                        .filter(|capability| world.capabilities.contains_key(capability))
+                    {
+                        Some(capability) => {
+                            referenced_capabilities.insert(capability);
                         }
-                    })?;
-                    if !world.capabilities.contains_key(&capability) {
-                        return Err(PolicyBuildError::UnknownAction {
-                            policy: id.clone(),
-                            action: value,
-                        });
+                        None => match handling {
+                            Handling::Refuse => {
+                                return Err(PolicyBuildError::UnknownAction {
+                                    policy: id.clone(),
+                                    action: value,
+                                });
+                            }
+                            Handling::Tolerate => unresolved.push(UnresolvedName {
+                                policy: id.clone(),
+                                name: value,
+                                kind: UnresolvedKind::Capability,
+                            }),
+                        },
                     }
-                    referenced_capabilities.insert(capability);
                 }
                 // The schema already rejects an unknown entity type, and `Agent` instances are
                 // intentionally unenumerated.
@@ -652,7 +822,7 @@ fn validate_entity_references(
             }
         }
     }
-    Ok(referenced_capabilities)
+    Ok((referenced_capabilities, unresolved))
 }
 
 fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, PolicyBuildError> {
@@ -671,6 +841,7 @@ fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, Poli
             world
                 .providers
                 .iter()
+                .chain(world.phantom_providers.iter())
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
         ),
@@ -694,7 +865,11 @@ fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, Poli
     })
 }
 
-fn policy_digest(policies: &PolicySet, world: &PolicyWorld) -> String {
+fn policy_digest(
+    policies: &PolicySet,
+    world: &PolicyWorld,
+    unresolved: &[UnresolvedName],
+) -> String {
     // Cedar's structural JSON rather than the source text: two spellings of one policy must
     // fingerprint identically, so reformatting a policy file does not look like a policy change.
     // `Display` and `to_cedar` both round-trip the original bytes and would not do that.
@@ -738,6 +913,22 @@ fn policy_digest(policies: &PolicySet, world: &PolicyWorld) -> String {
     actions.sort_unstable();
     for action in actions {
         hasher.update(action.as_bytes());
+        hasher.update([0]);
+    }
+
+    // Tolerated names, recorded explicitly. The `actions` section above already moves when a
+    // capability stops being loaded, so this is belt-and-braces rather than load-bearing today; it
+    // states "this deployment tolerated an absent name" directly instead of leaving it to be
+    // inferred from what the world section omits.
+    hasher.update(b"phantoms\0");
+    let mut phantoms = unresolved
+        .iter()
+        .map(|entry| format!("{}::{}", entry.kind.label(), entry.name))
+        .collect::<Vec<_>>();
+    phantoms.sort_unstable();
+    phantoms.dedup();
+    for phantom in phantoms {
+        hasher.update(phantom.as_bytes());
         hasher.update([0]);
     }
 

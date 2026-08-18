@@ -16,7 +16,7 @@ use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
 
 use dekopon_broker::{
     AuditLog, Broker, ConstraintCatalog, CredentialStore, FileAuditLog, IdentityDirectory,
-    PolicyBuildError, PolicyEngine, PolicyWorld,
+    Leniency, PolicyBuildError, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
@@ -147,7 +147,13 @@ where
     .map_err(BrokerdError::Broker)?;
     // The declared world is exactly what owner-controlled configuration names: the peers that can
     // connect, the principals subjects map to, and the capabilities the loaded manifests expose.
-    // A policy naming anything outside it refuses startup rather than becoming latent dead policy.
+    //
+    // What happens when configuration names something outside it depends on `strict`. Strict
+    // refuses to start, which is the right posture for a deployment whose provider set is fixed.
+    // The default tolerates it and warns, so an operator can ship policy and constraint sets that
+    // anticipate a provider they have not dropped in yet. Tolerating grants nothing: an
+    // anticipated capability routes nowhere, so every invocation of it is denied
+    // `unconstrained-capability` before Cedar is consulted.
     let world = PolicyWorld::new(
         config
             .identities
@@ -164,25 +170,61 @@ where
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
     .map_err(|source| BrokerdError::Policy { source })?;
-    let policy = PolicyEngine::new(&config.policies, &world)
-        .map_err(|source| BrokerdError::Policy { source })?;
+    let leniency = if config.strict {
+        Leniency::Strict
+    } else {
+        Leniency::Tolerant
+    };
+    let policy = if config.strict {
+        PolicyEngine::new(&config.policies, &world)
+            .map_err(|source| BrokerdError::Policy { source })?
+    } else {
+        let (policy, unresolved) = PolicyEngine::new_lenient(&config.policies, &world)
+            .map_err(|source| BrokerdError::Policy { source })?;
+        for entry in &unresolved {
+            tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                {
+                    audit.event = "policy.name.unresolved",
+                    policy.id = %entry.policy,
+                    name.kind = entry.kind.label(),
+                    name = %entry.name,
+                },
+                "policy names {} {:?}, which no loaded provider declares; it can never match",
+                entry.kind.label(),
+                entry.name
+            );
+        }
+        policy
+    };
     let constraints =
         ConstraintCatalog::new(config.constraint_sets).map_err(BrokerdError::Broker)?;
-    let broker = Arc::new(
-        Broker::new_with_replay_ids(
-            registry,
-            config.broker_principal,
-            config.policy_revision,
-            policy,
-            constraints,
-            credential_store,
-            identity_directory,
-            Arc::clone(&audit),
-            config.broker_limits,
-            replay_ids,
-        )
-        .map_err(BrokerdError::Broker)?,
-    );
+    let (broker, warnings) = Broker::start(
+        registry,
+        config.broker_principal,
+        config.policy_revision,
+        policy,
+        constraints,
+        credential_store,
+        identity_directory,
+        Arc::clone(&audit),
+        config.broker_limits,
+        leniency,
+        replay_ids,
+    )
+    .map_err(BrokerdError::Broker)?;
+    for warning in &warnings {
+        tracing::warn!(
+            target: "dekopon_brokerd::audit",
+            {
+                audit.event = "config.startup.warning",
+                reason = warning.reason(),
+                capability.id = %warning.capability(),
+            },
+            "{warning}"
+        );
+    }
+    let broker = Arc::new(broker);
     let mut identities = BTreeMap::new();
     for identity in config.identities {
         identities.insert(
