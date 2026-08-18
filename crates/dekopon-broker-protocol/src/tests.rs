@@ -243,7 +243,7 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
         assert!(matches!(request.request, BrokerRequest::Capabilities));
         write_frame(
             &mut stream,
-            &ResponseEnvelope::capabilities(Vec::new()),
+            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
             limits,
         )
         .await

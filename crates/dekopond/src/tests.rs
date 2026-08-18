@@ -1149,9 +1149,10 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(vec![capability(
-            "echo.echo",
-        )])],
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
     )
     .await;
     let models = ModelScript::new([answer("Everything looks fine.")]);
@@ -1185,7 +1186,7 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new())],
+        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
     )
     .await;
     let models = ModelScript::forbidden();
@@ -1312,9 +1313,10 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(vec![capability(
-            "echo.echo",
-        )])],
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
     )
     .await;
     // An empty script: the first turn fails, which is a broken session rather than a failed script.
@@ -1360,9 +1362,10 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(vec![capability(
-            "echo.echo",
-        )])],
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
     )
     .await;
     let long = format!("BEGIN{}END", "y".repeat(MAX_OUTBOUND_TEXT_BYTES * 2));
@@ -1434,6 +1437,7 @@ fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
                     .iter()
                     .map(|identifier| capability(identifier))
                     .collect(),
+                Vec::new(),
             )
         })
         .collect()
@@ -1607,8 +1611,11 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo"), capability("gh.pr_view")]),
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")]),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo"), capability("gh.pr_view")],
+                Vec::new(),
+            ),
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
         ],
     )
     .await;
@@ -1643,8 +1650,8 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")]),
-            ResponseEnvelope::capabilities(Vec::new()),
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
         ],
     )
     .await;
@@ -2668,9 +2675,10 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
 
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(vec![capability(
-            "echo.echo",
-        )])],
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
     )
     .await;
     let model = BlockedModel::new("All good.");
@@ -3109,9 +3117,10 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
 
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(vec![capability(
-            "echo.echo",
-        )])],
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
     )
     .await;
     let answer_text = "**Puñeta** is *vulgar*.\n\n| a | b |\n|---|---|\n| 1 | 2 |";

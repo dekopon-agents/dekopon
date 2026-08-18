@@ -46,6 +46,12 @@ pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
 /// No provider work began, so the same work may be resubmitted under a fresh invocation
 /// identifier without risking a duplicate external effect.
 pub const ERROR_BROKER_UNAVAILABLE: &str = "broker-unavailable";
+
+/// A loaded provider failed to rewrite a command word.
+///
+/// Deliberately opaque: the guest's own failure text is provider-controlled and reaches no caller
+/// through this path. An operator correlates the code with the audit event that names the word.
+pub const ERROR_PROVIDER: &str = "provider-error";
 /// Stable failure code: provider work may already have completed and its outcome was not audited.
 ///
 /// The external effect may have taken place. The request must **not** be resubmitted under any
@@ -294,6 +300,15 @@ impl RequestEnvelope {
         }
     }
 
+    /// Creates a command-word rewrite request.
+    #[must_use]
+    pub const fn resolve_command(word: String, argv: Vec<String>) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::ResolveCommand { word, argv },
+        }
+    }
+
     /// Creates an untrusted invocation proposal request.
     #[must_use]
     pub const fn invoke(invocation: InvocationRequest) -> Self {
@@ -358,6 +373,19 @@ pub enum BrokerRequest {
         /// The gateway's on-behalf-of claim, honored only under an attestor grant.
         attestation: SubjectAttestation,
     },
+    /// Rewrites one command word's arguments into a capability proposal.
+    ///
+    /// Deliberately not gated on the caller's grants. The rewrite is a pure function inside the
+    /// declaring component — no imports, bounded by fuel and timeout — and what it returns is a
+    /// *proposal*, authorized on exactly the path any other proposal takes. Gating it would add a
+    /// principal check to a function that grants nothing; what stops an unauthorized caller is the
+    /// authorization of the invocation that follows, not the arithmetic that shaped it.
+    ResolveCommand {
+        /// The command word, which must belong to a loaded provider.
+        word: String,
+        /// Arguments as the script supplied them, `argv[0]` being the word itself.
+        argv: Vec<String>,
+    },
 }
 
 /// One strict public broker response.
@@ -373,10 +401,42 @@ pub struct ResponseEnvelope {
 impl ResponseEnvelope {
     /// Creates a successful capability response.
     #[must_use]
-    pub const fn capabilities(capabilities: Vec<AvailableCapability>) -> Self {
+    pub const fn capabilities(
+        capabilities: Vec<AvailableCapability>,
+        command_words: Vec<String>,
+    ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha1,
-            response: BrokerResponse::Capabilities { capabilities },
+            response: BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+            },
+        }
+    }
+
+    /// Creates a successful command-word rewrite response.
+    #[must_use]
+    pub const fn command_resolution(capability: CapabilityId, input: serde_json::Value) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            response: BrokerResponse::CommandResolution {
+                capability: Some(capability),
+                input: Some(input),
+                message: None,
+            },
+        }
+    }
+
+    /// Creates a response for a provider that declined to rewrite an argv.
+    #[must_use]
+    pub const fn command_declined(message: String) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            response: BrokerResponse::CommandResolution {
+                capability: None,
+                input: None,
+                message: Some(message),
+            },
         }
     }
 
@@ -410,11 +470,33 @@ pub enum BrokerResponse {
     Capabilities {
         /// Deterministically sorted capabilities.
         capabilities: Vec<AvailableCapability>,
+        /// Command words this context may use, sorted.
+        ///
+        /// Carried here rather than fetched separately so a session costs one round trip, and
+        /// filtered the same way the capabilities are: a word appears only when policy allows this
+        /// context at least one capability of the provider declaring it. A principal granted
+        /// nothing receives an empty vocabulary rather than a map of the deployment.
+        ///
+        /// Defaulted so a client of this version reads a broker that predates it.
+        #[serde(default)]
+        command_words: Vec<String>,
     },
     /// Terminal invocation result.
     Invocation {
         /// Denied, failed, or succeeded result with public evidence.
         result: InvocationResult,
+    },
+    /// One command word rewritten into a capability proposal.
+    ///
+    /// The provider may also decline, which is a usage error rather than a failure: `outcome`
+    /// carries the provider's own message for the model to read.
+    CommandResolution {
+        /// The capability the word maps to, absent when the provider declined.
+        capability: Option<CapabilityId>,
+        /// The input object assembled from the arguments, absent when the provider declined.
+        input: Option<serde_json::Value>,
+        /// The provider's message when it declined to rewrite this argv.
+        message: Option<String>,
     },
     /// Protocol or broker infrastructure failure.
     Error {
@@ -648,12 +730,75 @@ impl BrokerClient {
         })
     }
 
+    /// Rewrites one command word's arguments into a capability proposal.
+    ///
+    /// `Ok(Ok((capability, input)))` is a proposal to submit; `Ok(Err(message))` is the provider
+    /// declining, which the caller reports to the model as a usage error.
+    pub async fn resolve_command(
+        &self,
+        word: String,
+        argv: Vec<String>,
+    ) -> Result<Result<(CapabilityId, serde_json::Value), String>, ClientError> {
+        match self
+            .exchange(RequestEnvelope::resolve_command(word, argv))
+            .await?
+        {
+            BrokerResponse::CommandResolution {
+                capability: Some(capability),
+                input: Some(input),
+                ..
+            } => Ok(Ok((capability, input))),
+            BrokerResponse::CommandResolution {
+                message: Some(message),
+                ..
+            } => Ok(Err(message)),
+            BrokerResponse::CommandResolution { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Returns capabilities and command words visible to this authenticated peer.
+    pub async fn session_surface(
+        &self,
+    ) -> Result<(Vec<AvailableCapability>, Vec<String>), ClientError> {
+        match self.exchange(RequestEnvelope::capabilities()).await? {
+            BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+            } => Ok((capabilities, command_words)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Returns capabilities and command words for one attested on-behalf-of context.
+    pub async fn session_surface_for(
+        &self,
+        subject: ExternalSubject,
+        agent: AgentId,
+    ) -> Result<(Vec<AvailableCapability>, Vec<String>), ClientError> {
+        match self
+            .exchange(RequestEnvelope::capabilities_for(subject, agent))
+            .await?
+        {
+            BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+            } => Ok((capabilities, command_words)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Returns capabilities exact policy makes visible to this authenticated peer.
     pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
         match self.exchange(RequestEnvelope::capabilities()).await? {
-            BrokerResponse::Capabilities { capabilities } => Ok(capabilities),
+            BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Invocation { .. } | BrokerResponse::CommandResolution { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -665,7 +810,9 @@ impl BrokerClient {
         match self.exchange(RequestEnvelope::invoke(request)).await? {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandResolution { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -683,9 +830,11 @@ impl BrokerClient {
             .exchange(RequestEnvelope::capabilities_for(subject, agent))
             .await?
         {
-            BrokerResponse::Capabilities { capabilities } => Ok(capabilities),
+            BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Invocation { .. } | BrokerResponse::CommandResolution { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -710,7 +859,9 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandResolution { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
