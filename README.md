@@ -43,18 +43,42 @@ There is still no independently retained/signed/remote audit checkpoint service 
 
 ## Install
 
-The 20 public crates that make up `0.3.0` are published on [crates.io](https://crates.io/crates/dekopon), three of them — `dekopon-agent`, `dekopon-policy`, and `dekopond` — for the first time. With stable Rust (MSRV 1.89.0, edition 2024), install the four released executables directly:
+### Homebrew (macOS and Linux)
 
 ```console
-cargo install --locked dekopon --version 0.3.0
-cargo install --locked dekopon-run --version 0.3.0
-cargo install --locked dekopon-brokerd --version 0.3.0
-cargo install --locked dekopond --version 0.3.0
-dekopon version
-dekopon-run --version
+brew tap dekopon-agents/tap
+brew trust dekopon-agents/tap
+brew install dekopon
 ```
 
-Prebuilt, provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.3.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0). Each carries all four executables alongside the broker and gateway configuration contracts. To develop from a checkout instead:
+That installs **all four** executables — `dekopon`, `dekopon-run`, `dekopon-brokerd`, and `dekopond` — plus the example JSONPlaceholder provider component, so one machine can run the broker and the gateway and actually exercise the authority boundary rather than only read the catalog. `brew install` prints where `BROKER.md`, `GATEWAY.md`, and the component landed. `brew trust` is not optional: Homebrew 6 refuses to load a formula from a non-official tap until you trust it.
+
+The tap is [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap), and its formula is regenerated from the archives each release actually publishes rather than from a platform list maintained by hand. It covers **macOS on ARM64, and Linux on ARM64 and x86-64**.
+
+Not Intel Macs. `0.3.0` did ship an `x86_64-apple-darwin` archive, but [#74](https://github.com/dekopon-agents/dekopon/pull/74) removed that target from the release matrix, so `0.4.0` onward has none. Offering the `0.3.0` archive would install cleanly on an Intel Mac and then dead-end at the next `brew upgrade`, which is worse than being plainly unsupported. Download the [v0.3.0 archive](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0) directly or build from a checkout instead.
+
+From there, [`examples/rubber-stamper`](examples/rubber-stamper/README.md) is the next step: it is the only walkthrough that puts the gateway, the broker, policy, and a credential-holding provider to work together.
+
+### Prebuilt archives
+
+Provenance-attested archives for Linux and macOS on x86-64 and ARM64 are attached to the [v0.3.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+
+```console
+gh release download v0.3.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.3.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.3.0-aarch64-apple-darwin.tar.gz.sha256
+gh attestation verify --repo dekopon-agents/dekopon \
+  dekopon-0.3.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.3.0-aarch64-apple-darwin.tar.gz
+```
+
+### crates.io
+
+**`0.3.0` is not on crates.io.** The tag and the GitHub release exist; crates.io publication is a deliberately separate manual workflow dispatch (see [Maintainer release process](#maintainer-release-process)) that has not been run for this version. `cargo install --locked dekopon` today installs `0.2.0`, and the three crates new in `0.3.0` — `dekopon-agent`, `dekopon-policy`, and `dekopond` — do not exist on crates.io under any version. Use Homebrew, the release archives, or a checkout to get `0.3.0`.
+
+### From a checkout
+
+With stable Rust (MSRV 1.89.0, edition 2024):
 
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
@@ -63,9 +87,15 @@ cargo install --locked --path crates/dekopon
 cargo install --locked --path crates/dekopon-run
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopond
+dekopon version
+dekopon-run --version
 ```
 
+### Container image
+
 A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published, starting with the first release after [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) lands—`v0.3.0` predates it. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside the checked-in provider components. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
+
+### Before running the broker
 
 `dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
 
@@ -160,6 +190,31 @@ Releases deliberately separate preparation, GitHub artifacts, and crates.io publ
 5. Verify the GitHub release, every crates.io package version, and fresh `cargo install --locked ... --version <VERSION>` commands before announcing the release.
 
 The dependency-ordered crate list lives in [`.github/workflows/release.yml`](.github/workflows/release.yml). Release validation fails if that list omits a publishable workspace crate, includes a private/unknown crate, contains duplicates, or places a dependent before its dependency. Never move an existing tag or attempt to overwrite a published crate version; fix release automation on `main` and cut a new patch version when published bytes must change.
+
+## Homebrew tap automation
+
+Publishing a release also updates [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap). [`.github/workflows/homebrew-tap.yml`](.github/workflows/homebrew-tap.yml) runs on `release: published`, and on manual dispatch against an existing tag. It renders `Formula/dekopon.rb` with [`.github/scripts/render-homebrew-formula.py`](.github/scripts/render-homebrew-formula.py) from the archives that release actually attached, taking each `sha256` from the published `.sha256` sidecar rather than recomputing it.
+
+It derives platforms from the release rather than from a list held here, so adding a target needs no change to the tap. A target the generator cannot place in a Homebrew `on_macos`/`on_linux` block is a hard error rather than a silently dropped platform. The one hand-maintained entry is the generator's `RETIRED` set, holding targets a past release shipped that the tap must stop offering — currently `x86_64-apple-darwin`, dropped from the matrix in [#74](https://github.com/dekopon-agents/dekopon/pull/74). Re-running the same release renders identical bytes and commits nothing; re-running an *older* release is refused rather than rolling the tap backwards; a release marked prerelease is skipped, because the tap tracks stable releases.
+
+It is a separate workflow rather than a job in `release.yml` because a tap failure must not mark an already-published release red, because `release: published` cannot race the release the formula has to describe, and because re-running only the tap update avoids repeating the whole build matrix.
+
+### The cross-repository credential
+
+`GITHUB_TOKEN` is scoped to the repository running the workflow, so it cannot push to the tap. The workflow mints a short-lived installation token from a GitHub App instead. **This is one-time manual setup by a maintainer.** Until `TAP_APP_ID` exists, the workflow logs a warning and skips; it never fails a release.
+
+In the `dekopon-agents` organization, at **Settings → Developer settings → GitHub Apps → New GitHub App**:
+
+1. Name it, for example, `dekopon-tap-updater`.
+2. **Uncheck Webhook → Active.** The default is on, and a webhook with no listener is noise.
+3. Under **Permissions → Repository permissions**, grant **Contents: Read and write**, and nothing else.
+4. Create the app and note the numeric **App ID**.
+5. **Generate a private key.** GitHub offers the `.pem` download exactly once; save it before leaving the page, and generate a replacement if it is lost.
+6. **Install the app** — creating it grants nothing. Choose **Install App → dekopon-agents → Only select repositories → `homebrew-tap`**. Skipping this produces a `404` on push that reads like a permissions bug.
+
+Then add two repository secrets to `dekopon-agents/dekopon` under **Settings → Secrets and variables → Actions**: `TAP_APP_ID`, the numeric App ID, and `TAP_APP_PRIVATE_KEY`, the full `.pem` contents including the `-----BEGIN`/`-----END` lines.
+
+An App rather than a personal access token: the minted token expires within the hour and carries one permission on one repository, so a leaked log leaks something already expiring; the credential belongs to the organization rather than to one maintainer, so it survives that person rotating their own; and it will not quietly expire a year later and break releases.
 
 ## Organization and package names
 

@@ -1,0 +1,140 @@
+name: Homebrew tap
+
+# A published release ends by pointing dekopon-agents/homebrew-tap at it.
+#
+# This is a separate workflow rather than a job in `release.yml` for three
+# reasons: the tap update is a downstream effect on another repository, so a tap
+# failure must not mark an already-published release red; `release: published`
+# is an exact signal that cannot race the release the formula must describe;
+# and re-running only the tap update costs nothing, while re-running `release.yml`
+# repeats the whole build matrix.
+#
+# It reads the release's assets and derives the formula's platforms from them.
+# Adding or dropping a target changes the release, and the next run follows it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+  TAP_REPOSITORY: dekopon-agents/homebrew-tap
+
+jobs:
+  formula:
+    name: update the dekopon formula
+    runs-on: ubuntu-24.04
+    steps:
+      # The `secrets` context is not available to a job- or step-level `if`, so
+      # the credential check has to be a step that publishes an output.
+      - name: Decide whether to update the tap
+        id: credential
+        env:
+          TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$RELEASE_TAG is a prerelease; the tap tracks stable releases only."
+          elif [ -z "$TAP_APP_ID" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TAP_APP_ID is unset; skipping the Homebrew tap update." \
+              "See README.md#homebrew-tap-automation to install the tap GitHub App."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the release tag
+        if: steps.credential.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          path: source
+
+      - name: Collect the release's published checksums
+        if: steps.credential.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p checksums
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > assets.json
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz.sha256' --dir checksums --clobber
+          ls -1 checksums
+
+      - name: Mint a short-lived tap installation token
+        id: tap-token
+        if: steps.credential.outputs.present == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: dekopon-agents
+          repositories: homebrew-tap
+
+      - name: Check out the tap
+        if: steps.credential.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          token: ${{ steps.tap-token.outputs.token }}
+          persist-credentials: true
+          path: tap
+
+      - name: Render and push the formula
+        if: steps.credential.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+
+          # Re-running an older release must not roll the tap backwards. The
+          # formula carries no explicit `version` stanza (brew audit --strict
+          # rejects restating what it scans), so read it back out of a URL.
+          existing=$(sed -n 's|.*/releases/download/v\([^/]*\)/.*|\1|p' \
+            tap/Formula/dekopon.rb | head -n 1)
+          if [ -n "$existing" ] && [ "$existing" != "$version" ]; then
+            newest=$(printf '%s\n%s\n' "$existing" "$version" | sort -V | tail -n 1)
+            if [ "$newest" = "$existing" ]; then
+              echo "::notice::Tap already describes $existing, which is newer than $version; leaving it alone."
+              exit 0
+            fi
+          fi
+
+          python3 source/.github/scripts/render-homebrew-formula.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --checksums checksums \
+            --assets assets.json \
+            --output tap/Formula/dekopon.rb
+
+          cd tap
+          # Re-running the same release renders identical bytes and commits nothing.
+          if git diff --quiet -- Formula/dekopon.rb; then
+            echo "::notice::Formula already matches $RELEASE_TAG; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/dekopon.rb
+          git commit -m "chore: update dekopon to ${version}" \
+            -m "Rendered from the archives ${RELEASE_TAG} published in ${GITHUB_REPOSITORY}."
+          git push origin HEAD:main
