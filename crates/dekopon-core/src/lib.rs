@@ -22,6 +22,13 @@ pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
 
+/// File extension a Dekopon provider component is recognized by.
+///
+/// Shared so the privileged broker and the direct runner cannot disagree about which files in a
+/// provider directory are components. Each does its own directory read — one under owner-only
+/// rules, one unprivileged — but both select by this.
+pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
+
 /// The reason a Dekopon identifier could not be parsed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum IdentifierError {

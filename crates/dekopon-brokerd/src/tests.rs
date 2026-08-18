@@ -454,3 +454,180 @@ async fn stale_socket_is_replaced_but_guard_never_removes_a_new_inode() {
     drop(listener);
     fs::remove_file(path).expect("remove replacement fixture");
 }
+
+/// Builds a minimal valid configuration document whose `providers` list is caller-supplied.
+fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value {
+    json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "socketPath": "broker.sock",
+        "auditPath": "audit.jsonl",
+        "checkpointPath": "checkpoint.json",
+        "checkpointLockPath": "checkpoint.lock",
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "providers": providers,
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+    })
+}
+
+/// A directory entry loads every `*.wasm` directly inside it, in filename order.
+///
+/// The sort is the point. The registry builds its capability route table in load order, so
+/// readdir order would make two runs over one directory disagree about which provider claimed a
+/// duplicate capability.
+#[tokio::test]
+async fn a_provider_directory_expands_in_filename_order() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let providers = directory.path().join("providers");
+    fs::create_dir(&providers).expect("create provider directory");
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+
+    // Written in an order that is neither sorted nor reverse-sorted.
+    for name in ["middle.wasm", "alpha.wasm", "zulu.wasm"] {
+        fs::write(providers.join(name), b"component fixture").expect("write component fixture");
+    }
+    // Neither of these is a component: one has the wrong extension, one is a directory.
+    fs::write(providers.join("notes.txt"), b"not a component").expect("write decoy");
+    fs::create_dir(providers.join("nested.wasm")).expect("create decoy directory");
+
+    write_config(&path, &provider_config(uid, json!(["providers"])));
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("directory config loads");
+    let canonical = fs::canonicalize(&providers).expect("canonical provider directory");
+    assert_eq!(
+        resolved.providers,
+        [
+            canonical.join("alpha.wasm"),
+            canonical.join("middle.wasm"),
+            canonical.join("zulu.wasm"),
+        ]
+    );
+}
+
+/// A directory anyone can write to is a directory anyone can add a provider to, and a provider is
+/// code the broker compiles and runs.
+///
+/// The ownership half of the same check cannot be exercised without a second UID, and it is the
+/// adjacent condition in the same expression as the mode check this proves.
+#[tokio::test]
+async fn a_group_writable_provider_directory_refuses_to_load() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let providers = directory.path().join("providers");
+    fs::create_dir(&providers).expect("create provider directory");
+    fs::write(providers.join("echo.wasm"), b"component fixture").expect("write component fixture");
+    write_config(&path, &provider_config(uid, json!(["providers"])));
+
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o775))
+        .expect("loosen provider directory");
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a group-writable provider directory refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::InsecureProviderDirectory { .. }),
+        "{error:?}"
+    );
+
+    // The same directory, tightened, loads. This is what proves the refusal was about the mode.
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+    config::load(&path, uid)
+        .await
+        .expect("a private provider directory loads");
+}
+
+/// An empty directory is almost certainly a mount that did not happen or a build that did not run,
+/// so it gets its own error rather than the generic "no providers".
+#[tokio::test]
+async fn an_empty_provider_directory_is_named_in_its_own_error() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let providers = directory.path().join("providers");
+    fs::create_dir(&providers).expect("create provider directory");
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+    write_config(&path, &provider_config(uid, json!(["providers"])));
+
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("an empty provider directory refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::EmptyProviderDirectory { .. }),
+        "{error:?}"
+    );
+}
+
+/// Files and directories mix in one list, and a component reachable two ways is still one provider.
+#[tokio::test]
+async fn file_and_directory_entries_mix_and_still_deduplicate() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let providers = directory.path().join("providers");
+    fs::create_dir(&providers).expect("create provider directory");
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+    fs::write(providers.join("echo.wasm"), b"component fixture").expect("write component fixture");
+    fs::write(directory.path().join("solo.wasm"), b"component fixture").expect("write solo");
+
+    write_config(
+        &path,
+        &provider_config(uid, json!(["solo.wasm", "providers"])),
+    );
+    let resolved = config::load(&path, uid).await.expect("mixed config loads");
+    assert_eq!(resolved.providers.len(), 2);
+
+    // The same component named directly and reached through the directory is one provider, and
+    // naming it twice is the configuration mistake `DuplicateProviderPath` exists for.
+    write_config(
+        &path,
+        &provider_config(uid, json!(["providers/echo.wasm", "providers"])),
+    );
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("one component reached two ways is a duplicate");
+    assert!(
+        matches!(error, config::ConfigError::DuplicateProviderPath { .. }),
+        "{error:?}"
+    );
+}
+
+/// The pre-expansion bound limits what the file may say; this one limits what it resolves to.
+#[tokio::test]
+async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let providers = directory.path().join("providers");
+    fs::create_dir(&providers).expect("create provider directory");
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+    for index in 0..=config::HARD_MAX_PROVIDERS {
+        fs::write(
+            providers.join(format!("component-{index:03}.wasm")),
+            b"component fixture",
+        )
+        .expect("write component fixture");
+    }
+
+    // One entry in the file, so the pre-expansion check passes and only the post-expansion one
+    // can catch this.
+    write_config(&path, &provider_config(uid, json!(["providers"])));
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("expanding past the ceiling refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::TooManyProviders { .. }),
+        "{error:?}"
+    );
+}
