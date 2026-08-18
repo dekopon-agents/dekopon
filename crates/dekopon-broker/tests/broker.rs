@@ -11,8 +11,8 @@ use std::{
 use dekopon_broker::{
     AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits,
     ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, SubjectAttestation,
-    verify_audit_chain,
+    InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld, StartupWarning,
+    SubjectAttestation, verify_audit_chain,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
@@ -2150,4 +2150,133 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     assert_eq!(encoded[2]["event"]["reason"], "policy-denied");
     assert!(encoded[2]["event"].get("policy_ids").is_none());
     assert_eq!(encoded[2]["event"]["policy_digest"], json!(digest));
+}
+
+/// Leniency moves *when* the broker complains, never *whether* it enforces.
+///
+/// The configuration here is byte for byte what
+/// [`a_capability_without_a_constraint_set_fails_closed_at_both_layers`] proves refuses startup.
+/// Tolerating it must still deny the invocation with the same reason: the startup check is a
+/// tripwire, and the decision path is the enforcement.
+#[tokio::test(flavor = "multi_thread")]
+async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, warnings) = Broker::start(
+        echo_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        echo_engine(
+            &direct_policy("caller", "provider-test", "echo.reverse"),
+            ["caller"],
+        ),
+        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Tolerant,
+        std::iter::empty(),
+    )
+    .expect("tolerating an unexecutable grant starts");
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(matches!(
+        &warnings[0],
+        StartupWarning::UnconstrainedCapability { capability }
+            if capability.as_str() == "echo.reverse"
+    ));
+
+    // The part that matters: enforcement is untouched.
+    let result = broker
+        .invoke(
+            &context("caller"),
+            request("invoke-tolerated", "echo.reverse", json!({"message": "x"})),
+        )
+        .await
+        .expect("the refusal is accounted");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(result.error.as_deref(), Some("unconstrained-capability"));
+    assert!(
+        broker
+            .capabilities(&context("caller"))
+            .iter()
+            .all(|available| available.capability.id.as_str() == "echo.echo"),
+        "a tolerated capability is still never listed"
+    );
+}
+
+/// A constraint set for a provider that is not loaded is inert either way; tolerating it lets an
+/// operator keep configuration for a provider they have not dropped in yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
+    let unrouted = [
+        ("echo.echo", set("echo", ExecutionConstraints::default())),
+        (
+            "gh.pull-request.read",
+            set("gh", ExecutionConstraints::default()),
+        ),
+    ];
+
+    let error = Broker::new(
+        echo_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        echo_engine(
+            &direct_policy("caller", "provider-test", "echo.echo"),
+            ["caller"],
+        ),
+        catalog(unrouted.clone()),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
+        BrokerLimits::default(),
+    )
+    .expect_err("strict startup refuses a set naming no loaded route");
+    assert!(matches!(
+        error,
+        BrokerBuildError::UnknownCapability { capability }
+            if capability.as_str() == "gh.pull-request.read"
+    ));
+
+    let (broker, warnings) = Broker::start(
+        echo_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        echo_engine(
+            &direct_policy("caller", "provider-test", "echo.echo"),
+            ["caller"],
+        ),
+        catalog(unrouted),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
+        BrokerLimits::default(),
+        Leniency::Tolerant,
+        std::iter::empty(),
+    )
+    .expect("tolerating an unrouted constraint set starts");
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(matches!(
+        &warnings[0],
+        StartupWarning::UnroutedConstraintSet { capability }
+            if capability.as_str() == "gh.pull-request.read"
+    ));
+    assert_eq!(warnings[0].reason(), "unrouted-constraint-set");
+
+    // The routed half of the same catalog still works.
+    let result = broker
+        .invoke(
+            &context("caller"),
+            request("invoke-routed", "echo.echo", json!({"message": "x"})),
+        )
+        .await
+        .expect("the routed capability still executes");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
 }

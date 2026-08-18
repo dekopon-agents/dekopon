@@ -3,7 +3,7 @@ use dekopon_core::RiskLevel;
 
 use super::{
     AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
+    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, UnresolvedKind,
 };
 
 /// The workflow world: two principals, two echo capabilities.
@@ -127,7 +127,12 @@ fn undeclared_names_refuse_construction() {
         &world(),
     )
     .expect_err("an undeclared entity type must refuse startup");
-    assert!(matches!(unknown_type, PolicyBuildError::Validation { .. }));
+    // Classification now runs before schema generation, so our own check reaches this before
+    // Cedar's validator does and reports the more specific variant.
+    assert!(matches!(
+        unknown_type,
+        PolicyBuildError::Validation { .. } | PolicyBuildError::UnknownEntityType { .. }
+    ));
 }
 
 /// Strict validation is what keeps a policy from reading an attribute the request will never carry.
@@ -525,4 +530,136 @@ fn debug_output_carries_no_policy_source() {
     assert!(rendered.contains(engine.digest()));
     assert!(!rendered.contains("permit"));
     assert!(!rendered.contains("cpetersen"));
+}
+
+/// The reason a policy naming an unloaded capability is *kept* rather than dropped.
+///
+/// A grant reading `action in [a, b]` with only `a` loaded must keep granting `a`. Dropping the
+/// whole policy would silently revoke authority the operator has every reason to still expect,
+/// turning "one provider is missing" into "this agent can do nothing".
+#[test]
+fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
+    let text = r#"@id("workflow")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action in [Dekopon::Action::"echo.echo",
+                          Dekopon::Action::"gh.pull-request.approve"],
+               resource == Dekopon::Provider::"echo");"#;
+
+    let (engine, unresolved) =
+        PolicyEngine::new_lenient(text, &world()).expect("an unloaded capability is tolerated");
+
+    assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+    assert_eq!(unresolved[0].name, "gh.pull-request.approve");
+    assert_eq!(unresolved[0].kind, UnresolvedKind::Capability);
+    assert_eq!(unresolved[0].policy, "workflow");
+
+    // The surviving half of the same policy still grants.
+    assert!(
+        engine
+            .authorize(capability_request(
+                "cpetersen",
+                "echo.echo",
+                PolicyContext::default()
+            ))
+            .allowed,
+        "the loaded capability in a tolerating policy must still be granted"
+    );
+}
+
+/// A tolerated name is not a referenced capability, so it never reaches the broker's requirement
+/// that every capability a policy could permit have an owner-authored constraint set.
+#[test]
+fn a_tolerated_capability_is_never_reported_as_referenced() {
+    let (engine, unresolved) = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action in [Dekopon::Action::"echo.echo",
+                             Dekopon::Action::"gh.pull-request.approve"],
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("an unloaded capability is tolerated");
+
+    assert_eq!(unresolved.len(), 1);
+    let referenced = engine
+        .referenced_capabilities()
+        .map(|capability| capability.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(referenced, ["echo.echo"]);
+}
+
+/// Leniency is a startup posture, not a weakening of the grammar. Everything strict mode refuses
+/// for a *provider-derived* reason is exactly what lenient mode tolerates, and nothing else.
+#[test]
+fn strict_construction_refuses_precisely_what_lenient_tolerates() {
+    let text = r#"permit(principal == Dekopon::Principal::"cpetersen",
+                          action == Dekopon::Action::"gh.pull-request.approve",
+                          resource == Dekopon::Provider::"gh");"#;
+
+    let strict = PolicyEngine::new(text, &world()).expect_err("strict mode refuses an absent name");
+    assert!(
+        matches!(
+            strict,
+            PolicyBuildError::UnknownAction { .. } | PolicyBuildError::UnknownProvider { .. }
+        ),
+        "{strict:?}"
+    );
+
+    let (_, unresolved) =
+        PolicyEngine::new_lenient(text, &world()).expect("lenient mode tolerates");
+    let mut kinds = unresolved
+        .iter()
+        .map(|entry| entry.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        [UnresolvedKind::Capability, UnresolvedKind::Provider],
+        "both the action and the resource are provider-derived"
+    );
+}
+
+/// Principals come from owner-authored identities, never from a loaded component, so an undeclared
+/// one is a typo in any mode. Leniency must not turn a misspelled principal into a silent no-match.
+#[test]
+fn an_undeclared_principal_stays_fatal_under_leniency() {
+    let error = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"nobody",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("an undeclared principal refuses startup even when lenient");
+    assert!(
+        matches!(error, PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"),
+        "{error:?}"
+    );
+}
+
+/// A `forbid` naming an unloaded capability must not fail open once that provider is loaded.
+///
+/// Keeping the policy whole is what makes this safe: the same text refuses the capability the
+/// moment the world declares it, with no restart-ordering subtlety.
+#[test]
+fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
+    let text = r#"permit(principal == Dekopon::Principal::"cpetersen",
+                          action in [Dekopon::Action::"echo.echo",
+                                     Dekopon::Action::"echo.reverse"],
+                          resource == Dekopon::Provider::"echo");
+                  forbid(principal == Dekopon::Principal::"cpetersen",
+                         action == Dekopon::Action::"echo.reverse",
+                         resource == Dekopon::Provider::"echo");"#;
+
+    let (engine, unresolved) =
+        PolicyEngine::new_lenient(text, &world()).expect("world declares all");
+    assert!(unresolved.is_empty(), "{unresolved:?}");
+    assert!(
+        !engine
+            .authorize(capability_request(
+                "cpetersen",
+                "echo.reverse",
+                PolicyContext::default()
+            ))
+            .allowed,
+        "a forbid must override the permit it overlaps"
+    );
 }

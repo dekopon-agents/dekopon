@@ -25,6 +25,13 @@ policyRevision: rubber-stamper-2026-01
 credentialsPath: broker-credentials.yaml
 policiesPath: policies.cedar
 
+# This deployment's provider set is fixed and checked in, so anything in this file naming a
+# capability the gh manifest does not declare is a mistake, not an anticipation. Refuse to start
+# rather than warn. Drop this line (the default) when you want to ship policy for a provider you
+# have not dropped in yet; a capability nothing routes is denied `unconstrained-capability` at
+# invocation either way.
+strict: true
+
 providers:
   # The checked-in gh component: 19 narrow GitHub capabilities, no `gh.api.*` passthrough.
   # Must be a regular single-link file owned by this UID under owner-owned directories.
