@@ -222,6 +222,10 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    outputs:
+      # The tag this job actually published, handed to the jobs that package it. A reusable
+      # workflow reads `github.*` from its caller, so it cannot re-derive the tag itself.
+      tag: ${{ steps.published.outputs.tag }}
     steps:
       - name: Download CLI archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -240,6 +244,50 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: dist/*
+      - name: Record the published tag
+        id: published
+        shell: bash
+        run: echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  # `release: published` never reaches these two. GitHub does not create workflow runs from
+  # events raised by `GITHUB_TOKEN`, and the job above publishes the release with exactly that
+  # token, so its `release` event is dispatched to nothing: at v0.4.0 both workflows produced no
+  # run at all. Calling them as jobs makes the ordering a declared dependency instead of an
+  # emergent property of event plumbing. `needs: github-release` is what guarantees the archives
+  # and their `.sha256` sidecars are attached — and their attestations recorded, one step
+  # earlier in the same job — before either one downloads and verifies them.
+  #
+  # Both keep their own `workflow_dispatch` for recovery, and each is called only from the tag
+  # push. A `workflow_dispatch` of this workflow exists to publish crates against an already
+  # released tag; republishing the image there would overwrite an immutable release tag with a
+  # freshly built digest, and the tap render would be a no-op.
+  container-image:
+    name: publish container image
+    needs: github-release
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    # No `secrets: inherit`: it authenticates to GHCR with `GITHUB_TOKEN`, which a called
+    # workflow always has, and it needs no repository secret.
+    uses: ./.github/workflows/container-image.yml
+    with:
+      tag: ${{ needs.github-release.outputs.tag }}
+
+  homebrew-tap:
+    name: update Homebrew tap
+    needs: github-release
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+    # Inherited for TAP_APP_ID and TAP_APP_PRIVATE_KEY; the App token it mints from them is what
+    # reaches the other repository, never this workflow's `GITHUB_TOKEN`.
+    secrets: inherit
+    uses: ./.github/workflows/homebrew-tap.yml
+    with:
+      tag: ${{ needs.github-release.outputs.tag }}
 
   crates-io:
     name: publish crates.io packages

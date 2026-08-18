@@ -2,19 +2,30 @@ name: Homebrew tap
 
 # A published release ends by pointing dekopon-agents/homebrew-tap at it.
 #
-# This is a separate workflow rather than a job in `release.yml` for three
-# reasons: the tap update is a downstream effect on another repository, so a tap
-# failure must not mark an already-published release red; `release: published`
-# is an exact signal that cannot race the release the formula must describe;
-# and re-running only the tap update costs nothing, while re-running `release.yml`
-# repeats the whole build matrix.
+# `release.yml` calls this workflow with `needs: github-release` rather than this workflow
+# triggering on `release: published`. That event cannot fire in this repository: the release is
+# created by `softprops/action-gh-release` authenticated with `GITHUB_TOKEN`, and GitHub does not
+# start workflow runs from events raised by its own token. At v0.4.0 the release was published,
+# `release.yml` went green, and this workflow produced no run at all — not skipped, never created.
+# A `needs` edge states the ordering instead of inferring it from event plumbing, and it still
+# cannot race the release the formula has to describe: every asset is attached before this starts.
+#
+# It remains a separate workflow file rather than steps inside the release job because re-running
+# only the tap update costs nothing, while re-running `release.yml` repeats the whole build matrix.
+# The `needs` edge does change one thing: the release object already exists when this runs, so a
+# failure here reddens a run whose release was published. That is the accurate report for a
+# release deliverable, which is why an unfinished tap credential setup skips rather than fails.
 #
 # It reads the release's assets and derives the formula's platforms from them.
 # Adding or dropping a target changes the release, and the next run follows it.
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag to describe (for example v0.4.0)
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -26,11 +37,14 @@ permissions:
   contents: read
 
 concurrency:
+  # One tap update at a time, and never cancelled. Deliberately not `release.yml`'s
+  # `release-<tag>` group: a called workflow queued behind its own caller would deadlock.
   group: homebrew-tap
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+  # Both entry points declare the same required input, so there is no event payload to read.
+  RELEASE_TAG: ${{ inputs.tag }}
   TAP_REPOSITORY: dekopon-agents/homebrew-tap
 
 jobs:
@@ -43,24 +57,72 @@ jobs:
       - name: Decide whether to update the tap
         id: credential
         env:
+          GH_TOKEN: ${{ github.token }}
           TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          # Compared as a rendered boolean so the key itself never reaches the shell.
+          TAP_APP_KEY_SET: ${{ secrets.TAP_APP_PRIVATE_KEY != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$IS_PRERELEASE" = "true" ]; then
+          # Read from the API rather than a release event payload: neither entry point carries
+          # one. This doubles as the assertion that the release exists — a tag with no release
+          # fails here rather than three steps later with a confusing download error.
+          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isPrerelease --jq .isPrerelease)
+          if [ "$prerelease" = "true" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$RELEASE_TAG is a prerelease; the tap tracks stable releases only."
-          elif [ -z "$TAP_APP_ID" ]; then
+          elif [ -z "$TAP_APP_ID" ] || [ "$TAP_APP_KEY_SET" != "true" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::TAP_APP_ID is unset; skipping the Homebrew tap update." \
+            echo "::warning::TAP_APP_ID or TAP_APP_PRIVATE_KEY is unset; skipping the Homebrew tap update." \
               "See README.md#homebrew-tap-automation to install the tap GitHub App."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check out the release tag
+      # Minted before anything is downloaded so an unfinished App setup costs one step. It is
+      # allowed to fail: holding both secrets says the App exists, not that it was installed on
+      # the tap, and `create-github-app-token` answers that with a 404 the next step translates.
+      - name: Mint a short-lived tap installation token
+        id: tap-token
         if: steps.credential.outputs.present == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: dekopon-agents
+          repositories: homebrew-tap
+
+      - name: Confirm the App can act on the tap
+        id: installed
+        if: steps.credential.outputs.present == 'true'
+        env:
+          MINT: ${{ steps.tap-token.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A missing installation is the same operator situation as a missing secret: the
+          # credential half of the setup is not finished. It gets the same skip-with-explanation
+          # rather than an action stack trace, because nothing about the release is wrong.
+          if [ "$MINT" = "success" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::Could not mint an installation token for $TAP_REPOSITORY; skipping the Homebrew tap update." \
+            "Both secrets are set, so the App exists but is probably not installed on $TAP_REPOSITORY." \
+            "See README.md#the-cross-repository-credential, step 6."
+          {
+            echo "### Homebrew tap skipped"
+            echo
+            echo "\`$RELEASE_TAG\` published, but no installation token could be minted for"
+            echo "\`$TAP_REPOSITORY\`. Install the tap GitHub App on that repository, then re-run"
+            echo "this workflow from the Actions tab with tag \`$RELEASE_TAG\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the release tag
+        if: steps.installed.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
@@ -68,7 +130,7 @@ jobs:
           path: source
 
       - name: Collect the release's published checksums
-        if: steps.credential.outputs.present == 'true'
+        if: steps.installed.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -80,18 +142,8 @@ jobs:
             --pattern '*.tar.gz.sha256' --dir checksums --clobber
           ls -1 checksums
 
-      - name: Mint a short-lived tap installation token
-        id: tap-token
-        if: steps.credential.outputs.present == 'true'
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.TAP_APP_ID }}
-          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
-          owner: dekopon-agents
-          repositories: homebrew-tap
-
       - name: Check out the tap
-        if: steps.credential.outputs.present == 'true'
+        if: steps.installed.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.TAP_REPOSITORY }}
@@ -100,7 +152,7 @@ jobs:
           path: tap
 
       - name: Render and push the formula
-        if: steps.credential.outputs.present == 'true'
+        if: steps.installed.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
