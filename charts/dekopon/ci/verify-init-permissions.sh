@@ -15,7 +15,7 @@
 set -euo pipefail
 
 chart_dir=$(cd "$(dirname "$0")/.." && pwd)
-values="$chart_dir/ci/rubber-stamper-values.yaml"
+values="$chart_dir/values-rubber-stamper.yaml"
 work=$(mktemp -d)
 trap 'rm -rf "$work"; docker volume rm -f dkv-src dkv-etc dkv-run dkv-state >/dev/null 2>&1 || true' EXIT
 

@@ -51,10 +51,6 @@ spec:
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
-      {{- with .Values.image.pullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}

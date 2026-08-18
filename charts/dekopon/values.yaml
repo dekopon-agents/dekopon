@@ -14,7 +14,9 @@ image:
   # Prefer a digest once one exists; it pins across the arm64/amd64 index.
   digest: ""
   pullPolicy: IfNotPresent
-  pullSecrets: []
+  # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
+  # chart itself — are public, so every pull on this path is anonymous. A dangling
+  # imagePullSecrets field would only suggest a credential is required.
 
 # The init container. Distroless has no shell, so a second image with one does the copy that turns
 # projected-volume symlinks into real owner-only files. Pinned by index digest so both

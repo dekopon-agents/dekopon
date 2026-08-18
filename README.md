@@ -73,7 +73,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is not published to a chart repository and nothing has been applied to a cluster; it also depends on a container image that only exists from the first release tagged after the image workflow, so `v0.3.0` cannot run it.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Nothing has been applied to a cluster and no chart tag exists yet; the chart also depends on a container image that only exists from the first release tagged after the image workflow, so `v0.3.0` cannot run it.
 
 ## Run the flagship example
 

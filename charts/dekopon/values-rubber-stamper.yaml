@@ -4,7 +4,7 @@
 #
 # Every value that is a real secret is a reference. Nothing here holds a token.
 #
-#   helm template dekopon charts/dekopon -f charts/dekopon/ci/rubber-stamper-values.yaml
+#   helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
 
 broker:
   config:

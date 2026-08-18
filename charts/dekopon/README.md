@@ -3,12 +3,16 @@
 A Helm chart that runs `dekopon-brokerd` and `dekopond` as one pod on a single-node arm64 k3s
 cluster.
 
-**Status: current, but unapplied.** Every claim below about rendered YAML, file ownership, and file
-modes was verified locally. Nothing in this chart has been installed on a cluster, and no released
-container image exists for it to pull yet — see [Image and appVersion](#image-and-appversion).
+**Status: current, but unapplied and unpublished.** Every claim below about rendered YAML, file
+ownership, and file modes was verified locally. Nothing in this chart has been installed on a
+cluster; no released container image exists for it to pull yet, and no chart has been pushed to
+GHCR — see [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
 
-Read [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) and
-[`../../docs/dekopond.md`](../../docs/dekopond.md) first. The chart places files and sets
+The chart is published to GHCR over OCI on `dekopon-chart-*` tags and is consumed from ArgoCD by
+registry path, not by Git path. Both GHCR packages are public.
+
+Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/dekopon/blob/main/crates/dekopon-brokerd/README.md) and
+[`docs/dekopond.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/dekopond.md) first. The chart places files and sets
 permissions; it does not define or validate their contents, and the two daemons' own documentation
 is the only description of what goes in them.
 
@@ -207,14 +211,27 @@ volumes, and a memory-backed `/tmp` is mounted anyway so an incidental temporary
 into a crash. One exception: the `chatgptSubscription` model kind reads — and may refresh — a device
 credential file, and this chart provisions no writable location for it. Mount your own if you use it.
 
-## Image and appVersion
+## Two version numbers
+
+The chart and the application it deploys are versioned independently, and both numbers are real.
+
+| | Where it comes from | What it means |
+|---|---|---|
+| **chart version** (`Chart.yaml: version`) | a `dekopon-chart-*` Git tag | the version of *this chart* — its templates, defaults, and documentation |
+| **appVersion** (`Chart.yaml: appVersion`) | the application release the chart deploys | what `image.tag` defaults to, and what the pod actually runs |
+
+They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1` and changes no
+`appVersion`; a new application release moves `appVersion` and, with it, the image the chart pulls.
+`v*.*.*` tags publish crates, release archives, and the container image; `dekopon-chart-*` tags
+publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
+force an application release, and an application release should not republish an unchanged chart.
 
 `appVersion` is `0.4.0`, which is the **first release that will have an image**, not the latest
 release that exists. `v0.3.0` predates the container-image workflow and no image was ever published
 for it. Setting `appVersion: 0.3.0` would ship a chart whose default pulls nothing.
 
-The workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag` therefore
-renders `v` + `appVersion`:
+The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
+therefore renders `v` + `appVersion`:
 
 ```
 ghcr.io/dekopon-agents/dekopon:v0.4.0
@@ -222,6 +239,106 @@ ghcr.io/dekopon-agents/dekopon:v0.4.0
 
 There is no `latest`. Prefer `image.digest` once a release exists; it pins across the
 `linux/amd64` + `linux/arm64` index, and the index digest is what `gh attestation verify` attests.
+
+## Publishing
+
+[`.github/workflows/chart-publish.yml`](https://github.com/dekopon-agents/dekopon/blob/main/.github/workflows/chart-publish.yml)
+triggers on `dekopon-chart-*` tags only. It takes the version from the tag
+(`VERSION="${GITHUB_REF_NAME#dekopon-chart-}"`), refuses to continue unless `Chart.yaml` declares
+that same version, packages the chart, lints and renders the **tarball** rather than the working
+tree, and only then pushes:
+
+```console
+helm package charts/dekopon --version "$VERSION"
+helm push "dekopon-$VERSION.tgz" oci://ghcr.io/dekopon-agents/charts
+```
+
+Helm 3.8+ speaks OCI natively, so there is no plugin, no chart index, and no repository server —
+the registry is the repository. Authentication is the same `GITHUB_TOKEN` login the container image
+workflow already uses, so the chart adds no credential. It never passes `--app-version`: a chart tag
+must not silently move which application release the chart deploys.
+
+The published coordinates are:
+
+```
+oci://ghcr.io/dekopon-agents/charts/dekopon
+```
+
+**Nothing has been published yet.** Like the container image, this path is unproven until the first
+`dekopon-chart-*` tag exists. The packaging half is proven — CI packages the chart on every run and
+diffs the archive's rendered output against the source tree's — but no push to GHCR has happened.
+
+### Both GHCR packages are public, and that is a manual step
+
+A GHCR package is **private when it is first published** and stays private until someone changes it
+in the repository's package settings. That has to be done once per package, after the first publish:
+
+- `ghcr.io/dekopon-agents/dekopon` — the container image
+- `ghcr.io/dekopon-agents/charts/dekopon` — this chart
+
+Both are meant to be public, and everything downstream is designed for anonymous pull: the chart
+carries no `imagePullSecrets` and needs no registry credential in ArgoCD. Do the flip early, because
+a private package fails confusingly — an anonymous pull of a private GHCR package is reported as
+*not found*, not as *forbidden*, so it reads like a typo in the chart name or the version.
+
+## Consuming it from ArgoCD
+
+Verified against the target cluster, which runs **ArgoCD v3.3.6** on k3s v1.36.3:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dekopon
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
+    chart: dekopon
+    targetRevision: 0.1.0                    # the CHART version, not appVersion
+    helm:
+      valueFiles: []
+      values: |
+        ...
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dekopon
+```
+
+Two mechanics that are easy to get wrong, both checked against 3.3 rather than assumed:
+
+**`repoURL` must be the bare registry path.** Argo CD 3.3 has two different OCI source shapes. A
+Helm chart (`spec.source.chart` set) takes a bare path and the documentation says outright that
+"the repository URL should not contain the OCI scheme prefix `oci://`". The `oci://` spelling
+belongs to the *other* shape — a plain OCI artifact source with `spec.source.path` and no `chart`,
+registered with `--type oci` — which reads manifests out of an artifact and does not run Helm at
+all. Writing `oci://` on a chart source is not a stylistic choice this version accepts.
+
+**A Repository registration is required even though the package is public.** Argo decides OCI mode
+from the repository's `EnableOCI` field, not from the URL — `reposerver` trims an `oci://` prefix
+only when matching credentials — and `db.GetRepository` returns a bare `Repository{Repo: url}` for
+any URL that is not registered, so `EnableOCI` is false and the registry is treated as a classic
+HTTP Helm repository. Being public removes the need for a `username` and `password`; it does not
+remove the need to register. So the follow-up homelab change needs this prerequisite alongside its
+`Application`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dekopon-charts
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  name: dekopon-charts
+  url: ghcr.io/dekopon-agents/charts
+  type: helm
+  enableOCI: "true"
+```
+
+No credential fields: the package is public and the pull is anonymous.
 
 ## Configuration values
 
@@ -254,16 +371,29 @@ model endpoint, and an agent catalog, and the chart can invent none of them.
 
 ## Install
 
+From the registry, once a `dekopon-chart-*` tag has been published and the package made public:
+
+```console
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.1.0
+helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
+  --version 0.1.0 -n dekopon --create-namespace -f my-values.yaml
+```
+
+`helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
+unrelated to what an ArgoCD `Application` accepts in `repoURL`, which is the bare path.
+
+From a checkout:
+
 ```console
 helm lint charts/dekopon
 helm template dekopon charts/dekopon
-helm template dekopon charts/dekopon -f charts/dekopon/ci/rubber-stamper-values.yaml
+helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
 helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
   -f my-values.yaml
 ```
 
-[`ci/rubber-stamper-values.yaml`](ci/rubber-stamper-values.yaml) is the
-[rubber-stamper](../../examples/rubber-stamper/README.md) deployment expressed as chart values:
+[`values-rubber-stamper.yaml`](values-rubber-stamper.yaml) is the
+[rubber-stamper](https://github.com/dekopon-agents/dekopon/blob/main/examples/rubber-stamper/README.md) deployment expressed as chart values:
 Slack in, one agent, two `gh` capabilities, a broker-injected token by reference, and the audit
 chain on its own volume.
 
@@ -274,5 +404,14 @@ chain on its own volume.
   verbatim in a `linux/arm64` container under its rendered `securityContext` against a fixture built
   to match a projected volume's symlink layout, but no `kubectl apply` has happened.
 - No image exists to pull yet. The daemons have never been started from this configuration.
+- **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
+  `chart-publish.yml` has never run and nothing exists at
+  `oci://ghcr.io/dekopon-agents/charts/dekopon`. What *is* proven is packaging: CI packages the
+  chart, lints the archive, and diffs the archive's rendered output against the source tree's for
+  both value sets, so the tarball that would be pushed is known to be complete and to render
+  identically.
+- The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
+  against the running v3.3.6, but no `Application` has been created — the real one lands in a
+  separate rpi-homelab change.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.

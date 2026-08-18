@@ -7,7 +7,9 @@ description: Dekopon capability broker and chat gateway as one pod, sharing a Un
 # reach the broker through a shared filesystem namespace — one pod, one UID.
 type: application
 
-# Chart version. Independent of the application: this moves when the chart changes.
+# Chart version. Independent of the application: this moves when the chart changes, and it is
+# published by a `dekopon-chart-<version>` tag. chart-publish.yml refuses to publish unless the tag
+# and this field agree, so the tree never disagrees with the registry about which version it is.
 version: 0.1.0
 
 # The first tag the container-image workflow publishes. v0.3.0 predates that workflow and has no
