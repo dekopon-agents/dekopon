@@ -209,6 +209,224 @@ fn chatgpt_auth_status_does_not_require_configuration() {
     assert_eq!(status["credentialFile"], auth_file.display().to_string());
 }
 
+/// One deterministic credential file, written in the field order the export re-serializes, so the
+/// exported document is byte-identical to the fixture.
+const CREDENTIAL_FIXTURE: &str = concat!(
+    r#"{"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","#,
+    r#""expiresAt":1700000000,"accountId":"acct-fixture"}"#,
+    "\n"
+);
+
+/// The same document, base64-encoded, as the emitted Secret must carry it.
+const CREDENTIAL_FIXTURE_BASE64: &str = concat!(
+    "eyJ2ZXJzaW9uIjoxLCJhY2Nlc3MiOiJhY2Nlc3MtdG9rZW4tZml4dHVyZSIsInJlZnJlc2giOiJy",
+    "ZWZyZXNoLXRva2VuLWZpeHR1cmUiLCJleHBpcmVzQXQiOjE3MDAwMDAwMDAsImFjY291bnRJZCI6",
+    "ImFjY3QtZml4dHVyZSJ9Cg=="
+);
+
+fn credential_fixture(directory: &std::path::Path, contents: &str) -> PathBuf {
+    let path = directory.join("chatgpt-auth.json");
+    std::fs::write(&path, contents).expect("write credential fixture");
+    path
+}
+
+fn export(auth_file: &std::path::Path, arguments: &[&str]) -> Output {
+    binary()
+        .args(["auth", "chatgpt", "export", "--no-color", "--auth-file"])
+        .arg(auth_file)
+        .args(arguments)
+        .output()
+        .expect("CLI process starts")
+}
+
+/// The Secret manifest is applied by `kubectl` and diffed by hand, so its bytes are the contract.
+/// The comment header is part of it: a manifest saved to a file outlives the terminal that warned.
+#[test]
+fn chatgpt_export_emits_an_exact_secret_manifest() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(&auth_file, &["--expose-credential"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "# Exported by `dekopon auth chatgpt export`. This manifest carries a live ChatGPT access token and\n\
+             # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.\n\
+             #\n\
+             # The refresh token rotates: whichever process refreshes next invalidates this copy. Seed it once\n\
+             # into a writable directory, never overwrite a newer credential file with it, and re-export after\n\
+             # a deliberate rotation.\n\
+             apiVersion: v1\n\
+             kind: Secret\n\
+             metadata:\n  \
+               name: dekopon-chatgpt-auth\n  \
+               labels:\n    \
+                 app.kubernetes.io/component: chatgpt-credential\n    \
+                 app.kubernetes.io/managed-by: dekopon-auth-export\n    \
+                 app.kubernetes.io/name: dekopon\n\
+             type: Opaque\n\
+             data:\n  \
+               chatgpt-auth.json: {CREDENTIAL_FIXTURE_BASE64}\n"
+        )
+    );
+}
+
+/// `--namespace` is the only shape change the manifest accepts, and it must land in `metadata`
+/// rather than anywhere a reader would miss it.
+#[test]
+fn chatgpt_export_places_the_secret_in_a_namespace() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(
+        &auth_file,
+        &[
+            "--expose-credential",
+            "--namespace",
+            "dekopon",
+            "--secret-name",
+            "chatgpt-seed",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("  name: chatgpt-seed\n  namespace: dekopon\n"));
+}
+
+/// The raw form is pasted into a password-manager field and later projected back into a file, so
+/// it must be exactly the document a login would have written — no wrapper, no re-indentation.
+#[test]
+fn chatgpt_export_emits_the_exact_credential_document() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(&auth_file, &["--expose-credential", "--format", "raw"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), CREDENTIAL_FIXTURE);
+}
+
+/// Every export must say that the copy it just produced dies at the next refresh, and must say it
+/// on standard error so the document stays pipeable.
+#[test]
+fn chatgpt_export_warns_that_the_exported_copy_rotates() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(&auth_file, &["--expose-credential", "--format", "raw"]);
+
+    let diagnostics = stderr(&output);
+    assert!(diagnostics.contains("rotates"), "{diagnostics}");
+    assert!(diagnostics.contains("in the clear"), "{diagnostics}");
+    assert!(!stdout(&output).contains("rotates"));
+}
+
+/// Printing a credential must be typed out, not defaulted into.
+#[test]
+fn chatgpt_export_requires_the_credential_acknowledgement() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(&auth_file, &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--expose-credential"));
+    assert!(stdout(&output).is_empty());
+}
+
+/// No credential must fail loudly. An empty or half-formed Secret is the failure that survives
+/// into a cluster and fails later, somewhere less obvious.
+#[test]
+fn chatgpt_export_without_a_credential_fails() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = directory.path().join("missing-auth.json");
+
+    let output = export(&auth_file, &["--expose-credential"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("not logged in to ChatGPT"));
+    assert!(stdout(&output).is_empty());
+}
+
+/// A credential file that is not credential JSON must name the file rather than emit a manifest.
+#[test]
+fn chatgpt_export_rejects_a_malformed_credential_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), "{ not json");
+
+    let output = export(&auth_file, &["--expose-credential"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("could not parse ChatGPT credentials"));
+    assert!(stdout(&output).is_empty());
+}
+
+/// Valid JSON with empty tokens is the more dangerous malformed case, because it would otherwise
+/// produce a structurally perfect Secret carrying nothing.
+#[test]
+fn chatgpt_export_rejects_an_incomplete_credential_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(
+        directory.path(),
+        r#"{"version":1,"access":"","refresh":"","expiresAt":0,"accountId":""}"#,
+    );
+
+    let output = export(&auth_file, &["--expose-credential"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("incomplete"));
+    assert!(stdout(&output).is_empty());
+}
+
+/// `--quiet` would suppress the document and still exit zero, so a scripted seeding step would
+/// store nothing and believe it had succeeded.
+#[test]
+fn chatgpt_export_refuses_to_be_quiet() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(&auth_file, &["--expose-credential", "--quiet"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("--quiet"));
+}
+
+/// A name the API server would reject must fail before the credential is read, not after it has
+/// been printed and piped somewhere.
+#[test]
+fn chatgpt_export_rejects_an_invalid_secret_name() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+
+    let output = export(
+        &auth_file,
+        &["--expose-credential", "--secret-name", "Not_A_Name"],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+}
+
+/// The command's own help must say that it prints credential material.
+#[test]
+fn chatgpt_export_help_states_that_it_prints_a_credential() {
+    let output = binary()
+        .args(["auth", "chatgpt", "export", "--help"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    let help = stdout(&output);
+    assert!(
+        help.contains("prints real credential material in the clear"),
+        "{help}"
+    );
+    assert!(help.contains("--expose-credential"), "{help}");
+}
+
 #[test]
 fn version_does_not_require_configuration() {
     let directory = tempfile::tempdir().expect("temporary directory");

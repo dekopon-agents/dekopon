@@ -273,6 +273,76 @@ pub fn logout(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     }
 }
 
+/// Dekopon's ChatGPT credentials, read back in the clear for a deliberate operator export.
+///
+/// Every other path in Dekopon keeps this material inside [`Redacted`], and the `0600` credential
+/// file is the only destination trusted to hold it in the clear. This type is the second
+/// exception, and it exists for one reason: device authorization needs a human at a browser, so a
+/// containerized `dekopond` can only ever receive a credential an operator carried out of a local
+/// login.
+///
+/// The document stays wrapped, so `Debug` still renders a marker. It leaves only through the
+/// deliberately conspicuous [`ChatGptCredentialExport::expose_document`].
+#[derive(Debug)]
+pub struct ChatGptCredentialExport {
+    path: PathBuf,
+    document: Redacted<String>,
+}
+
+impl ChatGptCredentialExport {
+    /// Path the credentials were read from.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the credential document in the clear.
+    ///
+    /// Named to be conspicuous at call sites and in review, exactly like [`Redacted::expose`]:
+    /// every use is a place where a live ChatGPT access token and a rotating refresh token leave
+    /// their wrapper.
+    #[must_use]
+    pub fn expose_document(&self) -> &str {
+        self.document.expose()
+    }
+}
+
+/// Reads Dekopon's ChatGPT credentials back as the exact document a login writes.
+///
+/// This is a credential read rather than a status check: the returned document carries a live
+/// access token and a *rotating* refresh token. Each refresh mints a replacement and invalidates
+/// its predecessor, so an exported copy is stale the moment the credential it came from refreshes.
+/// A caller must gate this behind an explicit operator instruction and must say that out loud;
+/// [`crate::chatgpt`]'s operator surface, `dekopon auth chatgpt export`, requires
+/// `--expose-credential`, refuses a terminal destination, and warns on standard error.
+///
+/// The bytes are identical to what [`login`] would have written, so a file seeded from this
+/// document is indistinguishable from a locally created one.
+///
+/// # Errors
+///
+/// Returns [`ChatGptError::NotLoggedIn`] when no credential file exists, [`ChatGptError::ReadAuth`]
+/// when one exists but cannot be read, [`ChatGptError::ParseAuth`] when it is not credential JSON,
+/// and [`ChatGptError::Configuration`] when it is an unsupported version or is missing a required
+/// field. Every one of those fails instead of emitting a partial document.
+pub fn export_credentials(
+    auth_path: Option<&Path>,
+) -> Result<ChatGptCredentialExport, ChatGptError> {
+    let path = resolve_auth_path(auth_path)?;
+    let credentials = load_credentials(&path)?;
+    let document = serde_json::to_string(&credentials)
+        .map(|json| format!("{json}\n"))
+        .map_err(|source| ChatGptError::SerializeAuth {
+            path: path.clone(),
+            source,
+        })?;
+
+    Ok(ChatGptCredentialExport {
+        path,
+        document: Redacted::new(document),
+    })
+}
+
 #[derive(Clone)]
 struct ChatGptEndpoints {
     device_code: String,
@@ -1206,8 +1276,8 @@ mod tests {
 
     use super::{
         AUTH_VERSION, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints, build_request_body,
-        extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
-        save_credentials, status,
+        export_credentials, extract_account_id, load_credentials, login_with_endpoints, logout,
+        parse_sse, save_credentials, status,
     };
     use crate::model::{ChatModel as _, CompletionOptions, ModelMessage, ModelTool};
 
@@ -1993,6 +2063,91 @@ mod tests {
         reader.read_exact(&mut body).expect("read request body");
         request.push_str(&String::from_utf8(body).expect("UTF-8 request"));
         request
+    }
+
+    fn export_fixture(path: &Path) {
+        let credentials = ChatGptCredentials {
+            version: AUTH_VERSION,
+            access: Redacted::new(fake_access("acct-export")),
+            refresh: Redacted::new("refresh-secret".to_owned()),
+            expires_at: 1_700_000_000,
+            account_id: "acct-export".to_owned(),
+        };
+        save_credentials(path, &credentials).expect("save credentials");
+    }
+
+    /// An exported document must be byte-identical to what a login wrote, so a file seeded from it
+    /// is indistinguishable from a locally created one.
+    #[test]
+    fn export_returns_the_exact_bytes_a_login_would_have_written() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        export_fixture(&path);
+
+        let export = export_credentials(Some(&path)).expect("export credentials");
+
+        assert_eq!(export.path(), path.as_path());
+        assert_eq!(
+            export.expose_document(),
+            fs::read_to_string(&path).expect("read credential file")
+        );
+        assert!(export.expose_document().ends_with('\n'));
+        assert!(export.expose_document().contains("refresh-secret"));
+    }
+
+    /// The export wrapper must not quietly become a new way to print a credential: only the named
+    /// accessor exposes it.
+    #[test]
+    fn export_debug_rendering_stays_redacted() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        export_fixture(&path);
+
+        let export = export_credentials(Some(&path)).expect("export credentials");
+
+        assert!(!format!("{export:?}").contains("refresh-secret"));
+        assert!(format!("{export:?}").contains("REDACTED"));
+    }
+
+    /// Exporting nothing must fail loudly rather than emit an empty document a seeding step would
+    /// happily store.
+    #[test]
+    fn export_without_a_login_fails_with_the_login_instruction() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("missing-auth.json");
+
+        let error = export_credentials(Some(&path)).expect_err("missing credentials must fail");
+
+        assert!(error.to_string().contains("dekopon auth chatgpt login"));
+    }
+
+    /// A credential file that parses but carries empty tokens must fail too; a half-formed export
+    /// is the failure mode that survives into a cluster.
+    #[test]
+    fn export_rejects_an_incomplete_credential_file() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"access":"","refresh":"","expiresAt":0,"accountId":""}"#,
+        )
+        .expect("write incomplete fixture");
+
+        let error = export_credentials(Some(&path)).expect_err("incomplete credentials must fail");
+
+        assert!(error.to_string().contains("incomplete"), "{error}");
+    }
+
+    /// Malformed JSON must name the file rather than produce a document.
+    #[test]
+    fn export_rejects_a_malformed_credential_file() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        fs::write(&path, "{ not json").expect("write malformed fixture");
+
+        let error = export_credentials(Some(&path)).expect_err("malformed credentials must fail");
+
+        assert!(error.to_string().contains("could not parse"), "{error}");
     }
 
     #[allow(dead_code)]

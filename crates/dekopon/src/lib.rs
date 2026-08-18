@@ -12,11 +12,11 @@ use std::{
 };
 
 use dekopon_config::{ConfigError, load_discovered};
-use dekopon_model::chatgpt::ChatGptError;
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    auth::AuthError,
     catalog::{CatalogError, LocalConfigReader},
     cli::{Cli, Command},
     command::{execute, version_result},
@@ -117,7 +117,7 @@ fn initialize_tracing(verbosity: u8, no_color: bool) {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(transparent)]
-    Auth(#[from] ChatGptError),
+    Auth(#[from] AuthError),
     #[error(transparent)]
     Config(Box<ConfigError>),
     #[error(transparent)]
