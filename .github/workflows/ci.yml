@@ -250,3 +250,71 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+  chart:
+    name: helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show Helm version
+        run: helm version
+      - name: Lint the chart
+        run: helm lint charts/dekopon
+      - name: Render with default and realistic values
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm template dekopon charts/dekopon > "$RUNNER_TEMP/default.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-rubber-stamper.yaml > "$RUNNER_TEMP/realistic.yaml"
+          # The seed-once path adds a Secret, a projected source, an init block, and a subPath
+          # mount, none of which the two renders above reach.
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-rubber-stamper.yaml \
+            --set gateway.chatgpt.enabled=true \
+            --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth > "$RUNNER_TEMP/chatgpt.yaml"
+      - name: Validate rendered manifests against Kubernetes schemas
+        run: |
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/default.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/realistic.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/chatgpt.yaml"
+      # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
+      # goes in it. Package the chart and prove the archive renders byte-identically to the
+      # source directory, so a file dropped from the package is a CI failure rather than a
+      # surprise for whoever pulls it from GHCR.
+      - name: Package the chart and prove the archive renders identically
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(helm show chart charts/dekopon | awk '$1 == "version:" { print $2; exit }')
+          helm package charts/dekopon --destination "$RUNNER_TEMP"
+          tarball="$RUNNER_TEMP/dekopon-$version.tgz"
+          helm lint "$tarball"
+          for args in "" "-f charts/dekopon/values-rubber-stamper.yaml"; do
+            # shellcheck disable=SC2086
+            helm template dekopon charts/dekopon $args > "$RUNNER_TEMP/from-source.yaml"
+            # shellcheck disable=SC2086
+            helm template dekopon "$tarball" $args > "$RUNNER_TEMP/from-package.yaml"
+            diff -u "$RUNNER_TEMP/from-source.yaml" "$RUNNER_TEMP/from-package.yaml"
+          done
+          # The README and the example values are documentation a consumer only has if they are
+          # inside the archive.
+          tar -tzf "$tarball" | grep -qx 'dekopon/README.md'
+          tar -tzf "$tarball" | grep -qx 'dekopon/values-rubber-stamper.yaml'
+      # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
+      # and mode check. This runs the init container's real command in a real container and
+      # asserts every permission tier dekopon-brokerd enforces, then seeds a ChatGPT credential,
+      # rotates it the way save_credentials does, restarts twice, and asserts the rotated bytes
+      # survived — which is the only assertion that actually tests seed-once.
+      - name: Prove the init container's output
+        run: PLATFORM=linux/amd64 charts/dekopon/ci/verify-init-permissions.sh

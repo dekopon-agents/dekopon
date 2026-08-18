@@ -1,0 +1,37 @@
+apiVersion: v2
+name: dekopon
+description: Dekopon capability broker and chat gateway as one pod, sharing a Unix socket
+
+# The two daemons are one deployment because dekopon-brokerd binds a 0600 Unix socket and
+# authenticates its peer with SO_PEERCRED. There is no TCP transport, so the gateway can only
+# reach the broker through a shared filesystem namespace — one pod, one UID.
+type: application
+
+# Chart version. Independent of the application: this moves when the chart changes, and it is
+# published by a `dekopon-chart-<version>` tag. chart-publish.yml refuses to publish unless the tag
+# and this field agree, so the tree never disagrees with the registry about which version it is.
+version: 0.1.0
+
+# The first tag the container-image workflow publishes. v0.3.0 predates that workflow and has no
+# image at all; see README.md ("Image and appVersion"). The image tag is the Git tag, so the
+# rendered reference is v<appVersion>, not <appVersion>.
+appVersion: "0.4.0"
+
+# The broker is a sidecar container (an initContainer with restartPolicy: Always) so it is
+# started and probed before dekopond runs, and torn down after it. Native sidecars are beta and
+# enabled by default from 1.29 and stable from 1.33. Below 1.29 the field is silently dropped and
+# the pod deadlocks on an init container that never exits, so refuse to install instead.
+kubeVersion: ">=1.29.0-0"
+
+keywords:
+  - dekopon
+  - broker
+  - agent
+  - capability
+  - cedar
+home: https://github.com/dekopon-agents/dekopon
+sources:
+  - https://github.com/dekopon-agents/dekopon
+annotations:
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/license: MIT OR Apache-2.0

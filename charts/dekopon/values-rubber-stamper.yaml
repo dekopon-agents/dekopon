@@ -1,0 +1,227 @@
+# A realistic override set: the rubber-stamper deployment from examples/rubber-stamper/, moved
+# onto the chart's paths. Slack in, one agent, five gh capabilities, a broker-injected GitHub
+# token, and the audit chain on its own volume.
+#
+# Every value that is a real secret is a reference. Nothing here holds a token.
+#
+#   helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
+
+broker:
+  config:
+    inline: |
+      apiVersion: dekopon.dev/brokerd/v1alpha1
+      socketPath: /run/dekopon/broker.sock
+      auditPath: /var/lib/dekopon/audit.jsonl
+      checkpointPath: /var/lib/dekopon/audit-checkpoint.json
+      checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
+      brokerPrincipal: local-broker
+      policyRevision: rubber-stamper-2026-01
+      credentialsPath: /etc/dekopon/broker-credentials.yaml
+      policiesPath: /etc/dekopon/policies.cedar
+      providers:
+        - /opt/dekopon/providers/gh-provider.wasm
+      identities:
+        - uid: 65532
+          principal: dekopond-gateway
+          actor:
+            type: service
+            principal: dekopond-gateway
+          attestor:
+            namespaces: [slack.t0123abcd]
+      identityMappings:
+        - subject: slack.t0123abcd.u0123abcd
+          principal: cpetersen
+      constraintSets:
+        gh.pull-request.read:
+          provider: gh
+          effect: read-only
+          risk: Low
+          idempotency: idempotent
+          credential: github-pat
+          constraints:
+            timeoutMs: 10000
+            maxOutputBytes: 262144
+            http:
+              allowedHosts: [api.github.com]
+              allowedMethods: [GET]
+              maxRequests: 1
+              maxRequestBytes: 16384
+              maxResponseBytes: 2097152
+              allowPlaintextLoopback: false
+        gh.pull-request.approve:
+          provider: gh
+          effect: external-write
+          risk: High
+          idempotency: conditional
+          credential: github-pat
+          constraints:
+            timeoutMs: 15000
+            maxOutputBytes: 8192
+            http:
+              allowedHosts: [api.github.com]
+              allowedMethods: [GET, POST]
+              maxRequests: 2
+              maxRequestBytes: 16384
+              maxResponseBytes: 262144
+              allowPlaintextLoopback: false
+      serverLimits:
+        maxFrameBytes: 2097152
+        ioTimeoutMs: 30000
+        maxConnections: 64
+        auditMaxRecords: 200000
+        auditMaxLineBytes: 8192
+        shutdownGraceMs: 120000
+      telemetry:
+        endpoint: http://rpi.localdomain
+        transport: grpc
+        serviceName: dekopon-brokerd
+        exportTimeoutMs: 5000
+        telemetryPayloads: false
+
+  policies:
+    inline: |
+      @id("rubber-stamper-session")
+      permit(principal == Dekopon::Principal::"cpetersen",
+             action == Dekopon::Action::"agent.prompt",
+             resource == Dekopon::Agent::"xaviers-rubber-stamper")
+      when { context has via && context.via == "dekopond-gateway" };
+
+      @id("rubber-stamper-github")
+      permit(principal == Dekopon::Principal::"cpetersen",
+             action in [Dekopon::Action::"gh.pull-request.read",
+                        Dekopon::Action::"gh.pull-request.approve"],
+             resource == Dekopon::Provider::"gh")
+      when { context has agent && context.agent == "xaviers-rubber-stamper"
+          && context has via && context.via == "dekopond-gateway" };
+
+  # Created out of band, so the token is never in a values file or in the release:
+  #   kubectl create secret generic dekopon-broker-credentials \
+  #     --from-file=broker-credentials.yaml=./broker-credentials.yaml
+  credentials:
+    existingSecret: dekopon-broker-credentials
+    existingSecretKey: broker-credentials.yaml
+
+  env:
+    - name: RUST_LOG
+      value: info
+    # Ingest auth for the telemetry block above. It never enters broker.yaml, the command line, or
+    # a span attribute; OpenObserve's gRPC receiver also requires the organization header.
+    - name: OTEL_EXPORTER_OTLP_HEADERS
+      valueFrom:
+        secretKeyRef:
+          name: dekopon-otel
+          key: headers
+
+gateway:
+  enabled: true
+  config:
+    inline: |
+      apiVersion: dekopon.dev/dekopond/v1alpha1
+      catalogPath: /etc/dekopon-catalog/dekopon.yaml
+      broker:
+        socketPath: /run/dekopon/broker.sock
+        serverUid: 65532
+      transports:
+        - name: workspace-slack
+          kind: slackSocketMode
+          appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
+          botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+      models:
+        - name: hosted-reasoning
+          kind: openaiCompatible
+          endpoint: https://api.openai.com/v1
+          model: gpt-5
+          apiKeyEnv: OPENAI_API_KEY
+          timeoutMs: 120000
+          classes: [reasoning]
+      routes:
+        - transport: workspace-slack
+          match: { kind: directMessage }
+          agent: xaviers-rubber-stamper
+          limits:
+            maxSteps: 8
+            maxCapabilityCalls: 16
+          conversation:
+            mode: persistent
+            idleTimeoutMs: 900000
+            maxTurns: 12
+            maxBytes: 65536
+      sessions:
+        maxConcurrent: 4
+        replyOnBusy: true
+        maxConversations: 1024
+      shutdownGraceMs: 120000
+
+  catalog:
+    inline: |
+      apiVersion: dekopon.dev/v1alpha1
+      kind: Provider
+      metadata:
+        name: gh
+      spec:
+        description: Narrow GitHub pull-request operations over broker HTTP
+        type: github
+        credentialRef: github-pat
+      status: Unknown
+      ---
+      apiVersion: dekopon.dev/v1alpha1
+      kind: Capability
+      metadata:
+        name: gh.pull-request.read
+      spec:
+        description: Reads one pull request
+        provider: gh
+        effect: read-only
+        risk: Low
+        idempotency: idempotent
+        permissions:
+          - operation: pull_requests:read
+      status: Unknown
+      ---
+      apiVersion: dekopon.dev/v1alpha1
+      kind: Capability
+      metadata:
+        name: gh.pull-request.approve
+      spec:
+        description: Approves a pull request at an observed head SHA
+        provider: gh
+        effect: external-write
+        risk: High
+        idempotency: conditional
+        permissions:
+          - operation: pull_requests:write
+      status: Unknown
+      ---
+      apiVersion: dekopon.dev/v1alpha1
+      kind: Agent
+      metadata:
+        name: xaviers-rubber-stamper
+      spec:
+        description: Reviews and approves pull requests on request
+        modelClass: reasoning
+        capabilities:
+          - gh.pull-request.read
+          - gh.pull-request.approve
+      status: Unknown
+
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: DEKOPOND_SLACK_APP_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: dekopon-slack
+          key: appToken
+    - name: DEKOPOND_SLACK_BOT_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: dekopon-slack
+          key: botToken
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: dekopon-model
+          key: apiKey
+
+state:
+  size: 2Gi

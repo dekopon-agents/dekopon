@@ -1,0 +1,128 @@
+# Publishes charts/dekopon to GHCR as an OCI artifact.
+#
+# Separate tag namespace on purpose. `v*.*.*` publishes crates, release archives, and the
+# container image; `dekopon-chart-*` publishes only the chart. A chart fix therefore ships without
+# forcing an application release, and an application release does not republish an unchanged
+# chart. The two version numbers are independent and both are real:
+#
+#   dekopon-chart-0.1.1  ->  chart version 0.1.1, whose appVersion still names the app release it
+#                            deploys and whose image tag still comes from that appVersion.
+#
+# Helm 3.8+ pushes to an OCI registry natively, so there is no plugin to install and no chart
+# index to maintain. Authentication is the same GITHUB_TOKEN login the container image workflow
+# uses, so this adds no credential.
+name: Chart publish
+
+on:
+  push:
+    tags:
+      - "dekopon-chart-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a publish. A cancelled push can leave a partially written package.
+  group: chart-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish chart to GHCR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.19.0
+
+      - name: Resolve the chart version from the tag
+        id: resolve
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#dekopon-chart-}"
+          if [ "$version" = "$REF_NAME" ] || [ -z "$version" ]; then
+            echo "::error::tag $REF_NAME does not carry a version after the dekopon-chart- prefix"
+            exit 1
+          fi
+          # helm package rejects a non-semver version anyway; failing here says why.
+          if ! printf %s "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::$version is not a semantic version"
+            exit 1
+          fi
+          # The tag is authoritative for what gets published, but Chart.yaml must agree, so the
+          # tree never disagrees with the registry about which chart version it is.
+          declared=$(helm show chart charts/dekopon | awk '$1 == "version:" { print $2; exit }')
+          if [ "$declared" != "$version" ]; then
+            echo "::error::charts/dekopon/Chart.yaml declares version $declared but the tag asks for $version; bump Chart.yaml and retag"
+            exit 1
+          fi
+          # Derived, not hardcoded, so a fork cannot push to this repository's package.
+          registry="ghcr.io/${OWNER,,}/charts"
+          {
+            echo "version=$version"
+            echo "registry=$registry"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Package the chart
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # No --app-version. appVersion names the application release this chart deploys and the
+          # image tag it renders; the chart tag must not silently move it.
+          helm package charts/dekopon --version="${VERSION}" --destination "${RUNNER_TEMP}"
+
+      - name: Prove the packaged chart before publishing anything
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A published OCI tag is immutable, so the tarball is linted and rendered from the
+          # archive — not from the working tree — before it is pushed.
+          tarball="${RUNNER_TEMP}/dekopon-${VERSION}.tgz"
+          helm lint "$tarball"
+          helm template dekopon "$tarball" > /dev/null
+          helm template dekopon "$tarball" -f charts/dekopon/values-rubber-stamper.yaml > /dev/null
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the chart
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          REGISTRY: ${{ steps.resolve.outputs.registry }}
+        run: |
+          set -euo pipefail
+          # helm appends the chart name, so this lands at <registry>/dekopon:<version>.
+          helm push "${RUNNER_TEMP}/dekopon-${VERSION}.tgz" "oci://${REGISTRY}"
+
+      - name: Read the published chart back
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          REGISTRY: ${{ steps.resolve.outputs.registry }}
+        run: |
+          set -euo pipefail
+          # Proves the tag resolves and the artifact is a chart, rather than trusting the push's
+          # own exit code. This runs authenticated; a new GHCR package is private until someone
+          # makes it public, which is a one-time manual step per package.
+          helm show chart "oci://${REGISTRY}/dekopon" --version "${VERSION}"

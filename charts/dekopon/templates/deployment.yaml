@@ -1,0 +1,339 @@
+{{- include "dekopon.validate" . -}}
+{{- $files := include "dekopon.managedFiles" . | fromYamlArray -}}
+{{- $seed := include "dekopon.seedFiles" . | fromYamlArray -}}
+{{- $chatgptDir := include "dekopon.chatgptDir" . -}}
+{{- $uid := .Values.podSecurityContext.runAsUser | int -}}
+{{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
+{{- $src := "/dekopon-source" -}}
+{{- $cfg := .Values.paths.configDir -}}
+{{- $run := .Values.paths.runtimeDir -}}
+{{- $state := .Values.paths.stateDir -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dekopon.fullname" . }}
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+spec:
+  # Not configurable. dekopon-brokerd is a singleton: it holds an exclusive flock on the audit log
+  # and a second on the checkpoint lock, and a second broker against the same volume cannot start.
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    # Never RollingUpdate. A rollout that briefly runs two brokers cannot work — the new one fails
+    # to take the lock — and the RWO volume cannot be attached twice either.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "dekopon.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # The init container copies configuration once, at start. Nothing propagates into a
+        # running pod, so a configuration change has to roll the pod, and that is what this does.
+        # It cannot see into an existingSecret / existingConfigMap: roll the pod yourself after
+        # editing one.
+        {{- if include "dekopon.hasInlineConfig" . }}
+        checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.broker.credentials.inline }}
+        checksum/credentials: {{ include (print $.Template.BasePath "/secret-credentials.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if and .Values.gateway.enabled .Values.gateway.catalog.inline }}
+        checksum/catalog: {{ include (print $.Template.BasePath "/configmap-catalog.yaml") . | sha256sum }}
+        {{- end }}
+        {{- /*
+          There is deliberately no checksum for the ChatGPT credential Secret. Every other
+          checksum here exists to push a changed file into a pod that only reads at startup; the
+          seed is the one file whose whole point is NOT to be pushed in, because the copy in the
+          volume is the live one and the copy in the Secret goes stale at the first refresh. An
+          annotation would restart a working gateway to achieve nothing. The value that does
+          change behaviour, gateway.chatgpt.reseed, rolls the pod by itself: it changes the init
+          container's arguments, which are part of this pod template.
+        */}}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "dekopon.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # Turn projected-volume entries into files dekopon-brokerd and dekopond will accept.
+        #
+        # A Secret or ConfigMap volume is a symlink farm — key -> ..data/key -> ..timestamp/key —
+        # and both daemons open configuration with O_NOFOLLOW, so a mounted key fails with ELOOP
+        # before any mode is examined. subPath defeats the symlink but hands back a root-owned
+        # 0644 file, which fails the owner check (uid must equal the daemon's euid) and, for the
+        # credentials file, the mode check as well. fsGroup makes it worse: it adds group access,
+        # and 0o040 is exactly what `mode & 0o077 != 0` rejects.
+        #
+        # `install` writes a fresh regular file, one link, mode 0600, owner 65532 — which is what
+        # every tier wants. Losing update propagation costs nothing: each of these files is read
+        # once, at startup.
+        - name: prepare-files
+          image: {{ include "dekopon.initImage" . }}
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.initSecurityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              umask 077
+              uid={{ $uid }}
+              gid={{ $gid }}
+              rc=0
+
+              # Take the directories back before writing anything. An emptyDir outlives an
+              # in-place pod restart, and after a previous run these are 0700 and owned by $uid,
+              # which root without CAP_DAC_OVERRIDE can neither enter nor write. Reclaiming them
+              # keeps the capability set at CHOWN plus FOWNER instead of adding DAC_OVERRIDE.
+              for d in {{ $cfg }} {{ $run }} {{ $state }}; do
+                chown 0:0 "$d"
+                chmod 0700 "$d"
+              done
+              # Only the configuration directory is rewritten. Never the state directory: it holds
+              # the audit chain, and deleting audit.jsonl and audit-checkpoint.json together is an
+              # undetectable rollback.
+              rm -f {{ $cfg }}/*
+
+              # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
+              # 0600, owner $uid — no symlink for O_NOFOLLOW to reject, no root ownership for the
+              # euid comparison to reject, no group bits for `mode & 0o077` to reject.
+              {{- range $files }}
+              install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
+              {{- end }}
+
+              # Assert what the daemons assert, so a wrong file is an init failure naming the file
+              # rather than a broker that starts and then refuses to serve. `stat` does not follow
+              # symlinks here, so "regular file" is also the no-symlink assertion.
+              #
+              # This runs BEFORE the directories are handed over, on purpose: once {{ $cfg }} is
+              # 0700 and owned by $uid, root without CAP_DAC_OVERRIDE can no longer descend into
+              # it, which is exactly the property being established.
+              {{- range $files }}
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $cfg }}/{{ .file }}")
+              if [ "$got" != "$uid:$gid:600:1:regular file" ]; then
+                echo "{{ .file }}: got $got, want $uid:$gid:600:1:regular file" >&2
+                rc=1
+              fi
+              {{- end }}
+
+{{- if include "dekopon.chatgptEnabled" . }}
+{{- $seedFile := (first $seed).file }}
+
+              # The ChatGPT credential: seeded once, then never touched again.
+              #
+              # Unlike everything above, this file is mutable at runtime and authoritative after
+              # the first boot. dekopond refreshes it, the refresh token rotates, and the rotated
+              # value is written back — so the copy in the Secret is a retired token the moment
+              # the daemon refreshes, and copying it back in would hand a working gateway a dead
+              # credential. The `[ -e ]` test below is the entire mechanism, because `install`
+              # overwrites unconditionally. `-e` and not `-f` or `-s`: anything at that path, even
+              # zero bytes, means seeded — do not clobber it.
+              #
+              # It lives under {{ $state }} rather than in an emptyDir because an emptyDir dies
+              # with the pod, which would make this "seed on every reschedule" instead.
+              #
+              # The directory is reclaimed to root first for the same reason the others are: after
+              # a previous run it is 0700 and owned by $uid, and root without CAP_DAC_OVERRIDE
+              # cannot read through it to test whether the credential is there.
+              [ -d "{{ $chatgptDir }}" ] || mkdir -p "{{ $chatgptDir }}"
+              chown 0:0 "{{ $chatgptDir }}"
+              chmod 0700 "{{ $chatgptDir }}"
+{{- if .Values.gateway.chatgpt.reseed }}
+              # gateway.chatgpt.reseed is set. This discards the credential in the volume, which
+              # is almost certainly fresher than the exported one, and re-seeds from the Secret.
+              echo "reseed: discarding {{ $chatgptDir }}/{{ $seedFile }} and seeding from the Secret" >&2
+              rm -f "{{ $chatgptDir }}/{{ $seedFile }}"
+{{- end }}
+              if [ ! -e "{{ $chatgptDir }}/{{ $seedFile }}" ]; then
+                install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ $seedFile }}" "{{ $chatgptDir }}/{{ $seedFile }}"
+                echo "seeded {{ $chatgptDir }}/{{ $seedFile }}"
+              else
+                echo "{{ $chatgptDir }}/{{ $seedFile }} already exists; leaving the live credential alone"
+              fi
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $chatgptDir }}/{{ $seedFile }}")
+              if [ "$got" != "$uid:$gid:600:1:regular file" ]; then
+                echo "{{ $seedFile }}: got $got, want $uid:$gid:600:1:regular file" >&2
+                rc=1
+              fi
+              # 0700 on the directory is load-bearing, not hygiene: save_credentials creates a
+              # sibling temporary file here — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid>,
+              # the extension is replaced rather than appended — and renames it over the target.
+              chmod 0700 "{{ $chatgptDir }}"
+              chown "$uid:$gid" "{{ $chatgptDir }}"
+              got=$(stat -c '%u:%a:%F' "{{ $chatgptDir }}")
+              if [ "$got" != "$uid:700:directory" ]; then
+                echo "{{ $chatgptDir }}: got $got, want $uid:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
+
+              # Socket, audit, checkpoint and checkpoint-lock parents must be 0700 and owned by
+              # the runtime UID, and every ancestor up to / must be a directory that is not
+              # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
+              # 0777 and a local-path volume arrives root-owned and 0777, so both need this.
+              for d in {{ $cfg }} {{ $run }} {{ $state }}; do
+                chmod 0700 "$d"
+                chown "$uid:$gid" "$d"
+                got=$(stat -c '%u:%a:%F' "$d")
+                if [ "$got" != "$uid:700:directory" ]; then
+                  echo "$d: got $got, want $uid:700:directory" >&2
+                  rc=1
+                fi
+              done
+              exit "$rc"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: config-source
+              mountPath: {{ $src }}
+              readOnly: true
+            - name: config
+              mountPath: {{ $cfg }}
+            - name: runtime
+              mountPath: {{ $run }}
+            - name: state
+              mountPath: {{ $state }}
+        {{- if .Values.gateway.enabled }}
+        {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" true) | nindent 8 }}
+        {{- end }}
+      containers:
+        {{- if .Values.gateway.enabled }}
+        - name: gateway
+          image: {{ include "dekopon.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["dekopond"]
+          args: ["--config", "{{ $cfg }}/dekopond.yaml"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Only used when dekopond.yaml omits broker.socketPath; naming it in the file is
+            # clearer. Listed first so an operator entry of the same name wins.
+            - name: DEKOPON_BROKER_SOCKET
+              value: {{ $run }}/broker.sock
+{{- if include "dekopon.chatgptEnabled" . }}
+            # A chatgptSubscription model with no explicit authFile falls back to
+            # $XDG_CONFIG_HOME, then $HOME — which is on the read-only root filesystem, where
+            # save_credentials cannot create its temporary sibling. Naming it here means the
+            # fallback can never be reached. Naming authFile in dekopond.yaml is clearer still.
+            - name: DEKOPON_CHATGPT_AUTH_FILE
+              value: {{ $chatgptDir }}/{{ (first $seed).file }}
+{{- end }}
+            {{- with .Values.gateway.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.gateway.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # No probes. dekopond serves no HTTP and binds no socket of its own, and it already
+          # probes the broker once at startup and exits non-zero when the broker does not answer,
+          # so "is it healthy" is the same question as "is the process still running".
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: {{ $cfg }}
+              readOnly: true
+            - name: runtime
+              mountPath: {{ $run }}
+            - name: catalog
+              mountPath: {{ .Values.paths.catalogDir }}
+              readOnly: true
+{{- if include "dekopon.chatgptEnabled" . }}
+            # The credential directory, and nothing else on the claim. subPath rather than the
+            # whole volume so the gateway cannot reach the audit chain at all — same UID, so this
+            # is reachability rather than isolation, but the unprivileged half has no business
+            # holding a path to the broker's durable state. Not read-only: rotating the refresh
+            # token means creating a temporary sibling here and renaming it over the target.
+            #
+            # The kubelet would create a missing subPath directory root-owned and 0755. It never
+            # has to: the init container creates it as {{ $uid }} with mode 0700 first, and init
+            # containers complete before this one starts.
+            - name: state
+              mountPath: {{ $chatgptDir }}
+              subPath: {{ .Values.gateway.chatgpt.subdir }}
+{{- end }}
+            - name: tmp
+              mountPath: /tmp
+        {{- else }}
+        # No gateway, so the broker is the pod's only regular container. A pod needs at least one,
+        # and with nothing to order against, the sidecar shape buys nothing.
+        {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" false) | nindent 8 }}
+        {{- end }}
+      volumes:
+        # Read-only symlink farm. Only the init container ever sees it.
+        - name: config-source
+          projected:
+            # Octal. Only the root init container reads these, and it reads them once.
+            defaultMode: 0400
+            sources:
+              {{- range (concat $files $seed) }}
+              - secret:
+                  name: {{ .secret }}
+                  items:
+                    - key: {{ .key }}
+                      path: {{ .file }}
+              {{- end }}
+        # Memory-backed, so broker-credentials.yaml never reaches the node's disk.
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.config }}
+        - name: runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.runtime }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.tmp }}
+        # Audit, checkpoint and checkpoint lock, together on one real filesystem. The backing
+        # store has to honour no-follow opens, advisory exclusive locks, same-directory atomic
+        # rename, and file and directory fsync. tmpfs does not qualify and neither does anything
+        # networked; local-path on ext4 does.
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ include "dekopon.stateClaimName" . }}
+        {{- if .Values.gateway.enabled }}
+        - name: catalog
+          {{- if .Values.gateway.catalog.existingConfigMap }}
+          configMap:
+            name: {{ .Values.gateway.catalog.existingConfigMap }}
+            items:
+              - key: {{ .Values.gateway.catalog.existingConfigMapKey }}
+                path: {{ .Values.gateway.catalog.fileName }}
+          {{- else }}
+          configMap:
+            name: {{ include "dekopon.catalogConfigMapName" . }}
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

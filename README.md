@@ -73,6 +73,8 @@ dekopon-brokerd --config /path/to/broker.yaml
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Nothing has been applied to a cluster and no chart tag exists yet; the chart also depends on a container image that only exists from the first release tagged after the image workflow, so `v0.3.0` cannot run it.
+
 ## Run the flagship example
 
 [`examples/rubber-stamper`](examples/rubber-stamper/README.md) is the whole system in one deployment: a boss sends a Slack DM, the gateway attests to the sender's identity and decides nothing, the broker maps that identity to a principal, checks Cedar policy, injects a GitHub token bound to `api.github.com`, runs the `gh` component, and hash-links an audit record naming the person who asked. The token is never visible to the model, the shell session, or the component that uses it. The walkthrough is a complete, internally consistent configuration set — catalog, broker configuration, Cedar policy, credentials template, gateway configuration — pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.

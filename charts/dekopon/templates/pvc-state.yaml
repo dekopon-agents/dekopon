@@ -1,0 +1,26 @@
+{{- if not .Values.state.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dekopon.stateClaimName" . }}
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.state.keepOnUninstall }}
+    # The audit chain outlives the release. A non-empty audit whose checkpoint is missing or is
+    # not a prefix of the chain makes dekopon-brokerd fail closed and demand operator recovery, so
+    # `helm uninstall` deleting this volume would either destroy evidence or wedge the next
+    # install. Delete it deliberately or not at all.
+    helm.sh/resource-policy: keep
+    {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.state.accessModes | nindent 4 }}
+  {{- with .Values.state.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      # local-path has ALLOWVOLUMEEXPANSION false. This size is final for the life of the volume.
+      storage: {{ .Values.state.size | quote }}
+{{- end }}

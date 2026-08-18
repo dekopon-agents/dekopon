@@ -1,0 +1,344 @@
+# Dekopon — one pod, two containers, one UID.
+#
+# Read charts/dekopon/README.md before changing anything here. Most of the values below are
+# constrained by what the daemons check at startup, not by taste: dekopon-brokerd validates the
+# owner, mode, link count and every path ancestor of every file it touches, and refuses to serve
+# when one is wrong. A pod that "looks configured" and never becomes ready is the normal symptom.
+
+image:
+  repository: ghcr.io/dekopon-agents/dekopon
+  # Empty means "v" + .Chart.AppVersion. The published tag is the Git tag, so it carries the v.
+  # There is no `latest` and there is no image for v0.3.0 — the image workflow landed after that
+  # release. Until the next version tag exists, this chart renders a reference that cannot pull.
+  tag: ""
+  # Prefer a digest once one exists; it pins across the arm64/amd64 index.
+  digest: ""
+  pullPolicy: IfNotPresent
+  # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
+  # chart itself — are public, so every pull on this path is anonymous. A dangling
+  # imagePullSecrets field would only suggest a credential is required.
+
+# The init container. Distroless has no shell, so a second image with one does the copy that turns
+# projected-volume symlinks into real owner-only files. Pinned by index digest so both
+# architectures resolve.
+initImage:
+  repository: busybox
+  tag: 1.37.0-musl
+  digest: sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------------------------
+# 65532 is not a preference. The image bakes /opt/dekopon/providers/*.wasm owned by 65532:65532,
+# and dekopon-brokerd compares a provider file's owner against its own euid before loading it. Any
+# other UID makes every provider fail to load and the broker refuse to start. Changing this is
+# only meaningful with a custom image that bakes providers under the same UID; the chart refuses
+# the combination of a changed UID and the stock image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    # wasmtime JITs through Cranelift and needs mmap with PROT_EXEC, mprotect, memfd_create, and
+    # SIGSEGV/SIGBUS handlers for guard-page traps. RuntimeDefault permits all of that. Do not
+    # narrow this to a hand-written profile without proving a provider still loads.
+    type: RuntimeDefault
+  # fsGroup is deliberately absent, and setting it breaks the broker. It makes mounted files
+  # group-readable, and 0o040 trips the credentials file's `mode & 0o077 != 0` refusal.
+
+securityContext:
+  allowPrivilegeEscalation: false
+  # Neither daemon writes outside its mounted volumes. A tmpfs /tmp is mounted anyway so an
+  # incidental temporary file cannot turn into a crash.
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# The init container is the one thing in this chart that runs as root, because chowning an
+# emptyDir or a local-path volume root to 65532 requires CAP_CHOWN, and re-chmodding an already
+# 65532-owned directory on a restart requires CAP_FOWNER. Everything else is dropped.
+initSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+    add: [CHOWN, FOWNER]
+  seccompProfile:
+    type: RuntimeDefault
+
+# ---------------------------------------------------------------------------------------------
+# Paths the chart owns
+# ---------------------------------------------------------------------------------------------
+# These are the directories the chart creates and hands to the daemons. Your broker.yaml and
+# dekopond.yaml must name files inside them — the chart places files, it does not rewrite configs.
+#
+#   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
+#   <configDir>/policies.cedar            0600 65532  (Tier B)
+#   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
+#   <configDir>/dekopond.yaml             0600 65532  (Tier B)
+#   <runtimeDir>/broker.sock              0700 dir, 65532-owned; broker binds the 0600 socket
+#   <stateDir>/audit.jsonl                0700 dir, 65532-owned; broker creates the 0600 file
+#   <stateDir>/audit-checkpoint.json      same directory — the checkpoint stages to a sibling
+#   <stateDir>/audit-checkpoint.lock      .tmp and renames atomically, so it cannot be split
+#   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
+paths:
+  configDir: /etc/dekopon
+  runtimeDir: /run/dekopon
+  stateDir: /var/lib/dekopon
+  catalogDir: /etc/dekopon-catalog
+
+# ---------------------------------------------------------------------------------------------
+# Broker
+# ---------------------------------------------------------------------------------------------
+broker:
+  # Every file below is supplied either inline (the chart writes a Secret) or by naming an object
+  # that already exists. Inline and existing are mutually exclusive; setting both is an error.
+  #
+  # The chart never parses or generates these files. Their formats are documented in
+  # crates/dekopon-brokerd/README.md, and examples/rubber-stamper/ is a complete working set.
+  config:
+    # Chart default: the echo example from crates/dekopon-brokerd/README.md, repointed at the
+    # chart's paths. It is a real, deny-by-default configuration that starts and authorizes
+    # exactly one read-only capability for this pod's own UID — a broker you can install and
+    # watch become ready before you give it anything that matters. Replace it.
+    inline: |
+      apiVersion: dekopon.dev/brokerd/v1alpha1
+      socketPath: /run/dekopon/broker.sock
+      auditPath: /var/lib/dekopon/audit.jsonl
+      checkpointPath: /var/lib/dekopon/audit-checkpoint.json
+      checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
+      brokerPrincipal: local-broker
+      policyRevision: chart-default
+      policiesPath: /etc/dekopon/policies.cedar
+      providers:
+        - /opt/dekopon/providers/echo-provider.wasm
+      identities:
+        # Must equal podSecurityContext.runAsUser. dekopon-brokerd refuses to start if a
+        # configured peer UID is not its own euid; there is only one trust domain.
+        - uid: 65532
+          principal: dekopon-pod
+          actor:
+            type: service
+            principal: dekopon-pod
+      constraintSets:
+        echo.echo:
+          provider: echo
+          effect: read-only
+          risk: Low
+          idempotency: idempotent
+          constraints:
+            timeoutMs: 30000
+            maxOutputBytes: 1048576
+      serverLimits:
+        # A present section requires every field. These are the daemon's own defaults except
+        # auditMaxLineBytes, which the chart lowers so the record cap binds before the volume
+        # does — see "Sizing the audit volume" in README.md.
+        maxFrameBytes: 2097152
+        ioTimeoutMs: 30000
+        maxConnections: 64
+        auditMaxRecords: 200000
+        auditMaxLineBytes: 8192
+        shutdownGraceMs: 120000
+    existingSecret: ""
+    existingSecretKey: broker.yaml
+
+  # Cedar policy set. Required whenever broker.yaml declares any constraintSets, because a broker
+  # that declares executable capabilities and no policy refuses every request while looking
+  # configured. An @id("…") annotation is what audit records carry as policy_ids.
+  policies:
+    inline: |
+      @id("pod-echo")
+      permit(principal == Dekopon::Principal::"dekopon-pod",
+             action == Dekopon::Action::"echo.echo",
+             resource == Dekopon::Provider::"echo")
+      unless { context has via };
+    existingSecret: ""
+    existingSecretKey: policies.cedar
+
+  # Provider secrets. The only file in this chart that is a secret at rest, and the one the
+  # permission rules are strictest about. Leave both empty when broker.yaml names no
+  # credentialsPath. Prefer existingSecret: putting a token in a values file puts it in the
+  # release, in `helm get values`, and probably in Git.
+  credentials:
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: broker-credentials.yaml
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Headroom for Cranelift: every pod start recompiles every .wasm component from scratch,
+      # there is no compilation cache, and that work is what the startup probe waits on.
+      cpu: "2"
+      memory: 1Gi
+
+  # Plain env entries. Slack and model tokens are NOT here — they belong to the gateway. What the
+  # broker wants is RUST_LOG and, if broker.yaml has a telemetry section, OTEL_EXPORTER_OTLP_HEADERS
+  # (the OpenTelemetry SDK reads ingest auth from there so a token never enters the config file).
+  #
+  # Do not set OTEL_EXPORTER_OTLP_ENDPOINT on this container: the readiness probe runs dekopon-run,
+  # which reads that variable and would export a trace on every probe.
+  env:
+    - name: RUST_LOG
+      value: info
+  envFrom: []
+
+  # There is no HTTP health endpoint and the image has no shell, so both probes run a real broker
+  # client: `dekopon-run broker capabilities` connects over the socket, passes SO_PEERCRED both
+  # ways, and gets an authorized capability list back. It appends no audit record.
+  #
+  # The startup probe is also the ordering primitive: Kubernetes does not start dekopond until the
+  # broker sidecar's startup probe succeeds.
+  startupProbe:
+    periodSeconds: 5
+    timeoutSeconds: 10
+    # 5 minutes. Component compilation on a Raspberry Pi 5 is seconds, not minutes; the margin is
+    # there because a startup probe that gives up restarts the container, and a restart loop
+    # against durable audit state is the worst failure this chart can produce.
+    failureThreshold: 60
+  readinessProbe:
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  # No liveness probe, on purpose. Nothing routes traffic to this pod, so a restart fixes nothing
+  # a human would not fix better, and it would kill a broker mid-invocation.
+
+# ---------------------------------------------------------------------------------------------
+# Gateway
+# ---------------------------------------------------------------------------------------------
+gateway:
+  # Off by default. Unlike the broker, dekopond cannot have a working default: it needs a chat
+  # transport, a model endpoint, and an agent catalog, and the chart can invent none of them.
+  enabled: false
+
+  config:
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: dekopond.yaml
+
+  # catalogPath is the one file with no hygiene rules at all — dekopond reads it with a plain
+  # read_to_string. A ConfigMap mount is fine and nothing is copied.
+  catalog:
+    inline: ""
+    existingConfigMap: ""
+    existingConfigMapKey: dekopon.yaml
+    # Filename the catalog is mounted as, and therefore the leaf your catalogPath must name.
+    fileName: dekopon.yaml
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  # Seed a ChatGPT subscription credential once, and never again.
+  #
+  # `dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
+  # human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription` model has
+  # to be handed a credential exported from a local login — `dekopon auth chatgpt export`, which
+  # lands with the auth-export change.
+  #
+  # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
+  # every refresh, `refresh_if_needed` returns the result of writing it back, so a failed write
+  # fails the model turn outright, and the copy in your vault is a dead token the moment the pod
+  # refreshes. That is expected, not broken: the exported copy exists to seed a NEW deployment, it
+  # is not a backup, and restoring it over a live credential breaks a working pod.
+  #
+  # So it is seeded once, into the persistent claim, and the init container refuses to overwrite
+  # it afterwards. It lives on the claim rather than an emptyDir precisely because an emptyDir
+  # dies with the pod, which would quietly turn "seed once" into "seed on every reschedule".
+  chatgpt:
+    enabled: false
+    # Prefer existingSecret. `dekopon auth chatgpt export --expose-credential --namespace <ns>`
+    # emits exactly this Secret, named dekopon-chatgpt-auth with the key chatgpt-auth.json; an
+    # External Secrets Operator ExternalSecret against a 1Password item projects the same shape.
+    # An inline value is stored in the release and returned by `helm get values`.
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: chatgpt-auth.json
+    # File name inside the credential directory. `save_credentials` derives its temporary sibling
+    # by REPLACING this extension — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid> — and renames
+    # over the target, so the daemon needs write access to the directory, not just the file.
+    fileName: chatgpt-auth.json
+    # Single path segment, joined onto paths.stateDir. It is not a free path on purpose: the
+    # credential must land on the claim, and a full path could be pointed at an emptyDir.
+    subdir: chatgpt
+    # Deliberate, destructive re-seed. Overwrites the credential in the volume with the one from
+    # the Secret, DISCARDING a refresh token that is almost certainly fresher than the exported
+    # copy — the pod's credential is the live one. Use it only after a deliberate local re-login
+    # and re-export.
+    #
+    # It is not self-clearing: while this is true, every restart re-seeds. Set it back to false
+    # once the pod has rolled. Changing it rolls the pod on its own, because it changes the init
+    # container's arguments.
+    reseed: false
+
+  # dekopond.yaml names environment variable NAMES, never values, so every chat and model
+  # credential is an ordinary secretKeyRef with no file hygiene involved. Example:
+  #
+  #   env:
+  #     - name: DEKOPOND_SLACK_APP_TOKEN
+  #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: appToken } }
+  #     - name: DEKOPOND_SLACK_BOT_TOKEN
+  #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: botToken } }
+  #     - name: OPENAI_API_KEY
+  #       valueFrom: { secretKeyRef: { name: dekopon-model, key: apiKey } }
+  env:
+    - name: RUST_LOG
+      value: info
+  envFrom: []
+
+# ---------------------------------------------------------------------------------------------
+# Audit state
+# ---------------------------------------------------------------------------------------------
+# Audit, checkpoint, and checkpoint lock live in one directory on one volume, because the
+# checkpoint stages to a same-directory temporary file and renames it atomically. Splitting them
+# across volumes breaks the atomicity the recovery rules depend on.
+state:
+  # local-path is the target cluster's only StorageClass. It is RWO and — this is the part that
+  # matters — ALLOWVOLUMEEXPANSION is false. This claim CANNOT BE GROWN LATER. Replacing it means
+  # copying audit.jsonl and audit-checkpoint.json to the new volume together: deleting one to
+  # dodge recovery makes the broker fail closed, and deleting both is an undetectable rollback.
+  storageClassName: local-path
+  accessModes: [ReadWriteOnce]
+  # Arithmetic in README.md ("Sizing the audit volume"). Short version: a measured external-write
+  # record with two HTTP calls is 1,279 bytes, the record cap is 200,000, so a realistic full log
+  # is ~250 MiB; 2Gi leaves room for ~10.7 KiB per record before the disk, rather than the
+  # daemon's own bound, is what stops the broker.
+  size: 2Gi
+  # Named annotation, not a comment: helm uninstall must not delete the audit chain.
+  keepOnUninstall: true
+  # Bring your own claim instead. The chart still chowns its root to 65532 and chmods it 0700.
+  existingClaim: ""
+
+# tmpfs sizes. Both are memory-backed so the credentials file and the socket never touch the
+# node's disk; both count against the pod's memory limit, which is why they are small.
+volumeSizes:
+  config: 8Mi
+  runtime: 1Mi
+  tmp: 16Mi
+
+# dekopond's own shutdownGraceMs defaults to 120000 and the containers terminate in order —
+# gateway first, then the broker sidecar — so this has to cover both drains end to end.
+terminationGracePeriodSeconds: 180
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+
+# No Service and no Ingress, deliberately. Neither daemon serves HTTP or listens on a TCP port;
+# the only endpoint in this chart is a Unix socket inside the pod.
