@@ -2907,6 +2907,60 @@ async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// Slack markdown rendering
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_answer_is_posted_as_a_markdown_block() {
+    // A model writes CommonMark. Slack's `text` field is mrkdwn, a proprietary syntax where bold is
+    // `*one asterisk*`, so an answer posted through it alone arrives with `**bold**` rendered as
+    // four literal asterisks. The `markdown` block hands the translation to Slack, which is the one
+    // party that knows what its own client renders.
+    let directory = temporary();
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        direct_message("u9xyz", "1700000000.000001", "what is the slang?"),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(vec![capability(
+            "echo.echo",
+        )])],
+    )
+    .await;
+    let answer_text = "**Puñeta** is *vulgar*.\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+    let models = ModelScript::new([answer(answer_text)]);
+    let replier = transport.replier();
+    let message = next_message(&mut transport).await;
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message,
+        replier,
+    )
+    .await;
+
+    let posted = http
+        .calls()
+        .into_iter()
+        .find(|(path, _)| path == "/api/chat.postMessage")
+        .expect("the answer was posted to chat");
+    let body = serde_json::from_str::<Value>(&posted.1).expect("post body is JSON");
+    // Verbatim: anything this process rewrote would be a second translation of what Slack is about
+    // to translate, and the table would not survive one.
+    assert_eq!(body["blocks"][0]["type"], "markdown");
+    assert_eq!(body["blocks"][0]["text"], answer_text);
+    // The fallback a push notification shows, which is the one place blocks do not render.
+    assert_eq!(body["text"], answer_text);
+    assert_eq!(body["channel"], "d0123abc");
+}
+
+// ---------------------------------------------------------------------------
 // Telegram long polling
 // ---------------------------------------------------------------------------
 

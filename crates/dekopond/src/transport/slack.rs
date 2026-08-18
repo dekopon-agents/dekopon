@@ -338,7 +338,19 @@ impl ChatReplier for SlackReplier {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
             };
-            let mut body = json!({ "channel": channel, "text": text });
+            // A `markdown` block, so Slack translates the model's CommonMark instead of this
+            // process doing it. Slack's `text` field is mrkdwn — a proprietary syntax where bold is
+            // `*one asterisk*` — so an answer posted through it arrives with its formatting as
+            // literal punctuation. The block exists for exactly this case and renders tables and
+            // task lists that mrkdwn cannot express at all.
+            //
+            // `text` stays as the notification fallback, which is the one place blocks do not
+            // render. It carries the answer unchanged rather than a second translation of it.
+            let mut body = json!({
+                "channel": channel,
+                "text": text,
+                "blocks": [{ "type": "markdown", "text": text }],
+            });
             if let Some(thread_ts) = thread_ts {
                 body["thread_ts"] = Value::String(thread_ts);
             }
