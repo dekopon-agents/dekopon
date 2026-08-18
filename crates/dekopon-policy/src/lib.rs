@@ -481,8 +481,11 @@ impl PolicyEngine {
     /// deployment ship policy that anticipates a provider it has not dropped in yet; the caller is
     /// expected to warn about every returned [`UnresolvedName`].
     ///
-    /// Tolerating a name grants nothing. See [`PolicyWorld::with_phantoms`] for why a phantom can
-    /// never authorize an execution, and why this is preferable to dropping the policy.
+    /// Tolerating a name grants nothing. The name is registered as a phantom: it routes to no
+    /// provider, the broker refuses any constraint set naming an unrouted capability, and an
+    /// invocation naming one is denied `unconstrained-capability` before Cedar is consulted at
+    /// all. Dropping the offending policy instead would silently revoke the grants it makes
+    /// alongside the missing one.
     ///
     /// # Errors
     ///
