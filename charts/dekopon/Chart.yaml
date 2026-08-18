@@ -12,7 +12,7 @@ type: application
 # and this field agree, so the tree never disagrees with the registry about which version it is.
 version: 0.1.0
 
-# The first tag the container-image workflow publishes. v0.3.0 predates that workflow and has no
+# The first tag the container-image workflow runs for. v0.3.0 predates that workflow and has no
 # image at all; see README.md ("Image and appVersion"). The image tag is the Git tag, so the
 # rendered reference is v<appVersion>, not <appVersion>.
 appVersion: "0.4.0"

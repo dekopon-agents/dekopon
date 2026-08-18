@@ -37,7 +37,17 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
 - A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/rubber-stamper` end-to-end walkthrough.
 
-Version 0.3.0 is published as 20 public crates and provenance-attested CLI archives. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
+Version 0.3.0 is published as provenance-attested CLI archives and a Git tag covering 20 public crates. Those crates were never uploaded: crates.io publication is a separate manual dispatch that has not been run, so crates.io still holds the 17 packages of `0.2.0`. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
+
+## 0.4 — distribution: image, chart, and tap (released)
+
+- A multi-architecture container image assembled from the release archives rather than compiled a second time, verified byte for byte against them before anything is pushed.
+- A Helm chart running `dekopon-brokerd` and `dekopond` as one pod sharing the broker's `0600` Unix socket, versioned and tagged separately from the application.
+- A Homebrew tap whose formula is regenerated from the archives each release actually published.
+- `dekopon auth chatgpt export`, which prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized gateway can be seeded with a credential an interactive device flow cannot obtain in a pod.
+- macOS on Intel dropped from the release matrix, leaving three archives.
+
+Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the same process boundary, the same deny-by-default broker. It is a packaging release, and it is likewise not on crates.io.
 
 ## Next milestones
 
