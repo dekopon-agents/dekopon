@@ -1,10 +1,12 @@
 //! Command-line syntax for `dekopon-run`.
 
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{io, num::NonZeroU32, path::PathBuf};
 
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES};
-use dekopon_core::{CapabilityId, ExternalSubject, InvocationId, TraceId};
+use dekopon_core::{
+    CapabilityId, ExternalSubject, InvocationId, PROVIDER_COMPONENT_EXTENSION, TraceId,
+};
 use dekopon_provider_host::{
     DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT,
@@ -15,6 +17,7 @@ use dekopon_shell::{
     DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT as DEFAULT_SHELL_TIMEOUT,
 };
 pub use dekopon_telemetry::Transport;
+use thiserror::Error;
 
 /// Immediate-mode Dekopon runner.
 #[derive(Clone, Debug, Parser)]
@@ -336,12 +339,68 @@ pub struct TelemetryArgs {
     pub otel_export_timeout_ms: u64,
 }
 
+/// Failure to expand a `--provider` argument into component files.
+#[derive(Debug, Error)]
+#[error("could not read provider directory {}", path.display())]
+pub struct ProviderArgsError {
+    /// The directory argument that could not be read.
+    pub path: PathBuf,
+    /// The underlying filesystem failure.
+    #[source]
+    pub source: io::Error,
+}
+
 /// Repeatable provider component arguments.
 #[derive(Clone, Debug, Args)]
 pub struct ProviderArgs {
-    /// Wasm component implementing the Dekopon provider world; repeat for multiple providers.
+    /// Wasm component or directory of them; repeat for multiple providers.
     #[arg(long, required = true, action = ArgAction::Append, value_name = "COMPONENT")]
     pub provider: Vec<PathBuf>,
+}
+
+impl ProviderArgs {
+    /// Expands each argument into the component files it names, in load order.
+    ///
+    /// A file is itself; a directory is every `*.wasm` directly inside it, in filename order. The
+    /// selection rule is [`PROVIDER_COMPONENT_EXTENSION`] and the sort is deliberate: the registry
+    /// builds its capability route table in load order, so readdir order would make two runs over
+    /// one directory disagree about which provider claimed a duplicate capability.
+    ///
+    /// Unlike the broker, this runner is unprivileged and loads components the invoking user
+    /// already owns, so there is no ownership or permission check here. `dekopon-brokerd` applies
+    /// those to its own provider directories, where the components run under broker authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from reading a directory argument.
+    pub fn components(&self) -> Result<Vec<PathBuf>, ProviderArgsError> {
+        let mut components = Vec::with_capacity(self.provider.len());
+        for entry in &self.provider {
+            if !entry.is_dir() {
+                components.push(entry.clone());
+                continue;
+            }
+            let read = |source| ProviderArgsError {
+                path: entry.clone(),
+                source,
+            };
+            let mut found = Vec::new();
+            for candidate in std::fs::read_dir(entry).map_err(read)? {
+                let candidate = candidate.map_err(read)?;
+                if candidate
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == PROVIDER_COMPONENT_EXTENSION)
+                    && candidate.file_type().map_err(read)?.is_file()
+                {
+                    found.push(candidate.path());
+                }
+            }
+            found.sort();
+            components.extend(found);
+        }
+        Ok(components)
+    }
 }
 
 /// Bounded interpreter settings for `shell`.
@@ -467,7 +526,52 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{BrokerCommand, Cli, Command};
+    use super::{BrokerCommand, Cli, Command, ProviderArgs};
+
+    /// A `--provider` directory expands to the components inside it, in filename order, and a
+    /// plain file argument still means itself.
+    ///
+    /// The runner applies no ownership check where `dekopon-brokerd` does: this loads components
+    /// the invoking user already owns, under their own authority.
+    #[test]
+    fn a_provider_directory_argument_expands_in_filename_order() {
+        let directory = tempfile::tempdir().expect("create provider fixture");
+        let nested = directory.path().join("bundled");
+        std::fs::create_dir(&nested).expect("create bundled directory");
+        for name in ["middle.wasm", "alpha.wasm"] {
+            std::fs::write(nested.join(name), b"component fixture").expect("write component");
+        }
+        std::fs::write(nested.join("notes.txt"), b"not a component").expect("write decoy");
+        let solo = directory.path().join("solo.wasm");
+        std::fs::write(&solo, b"component fixture").expect("write solo component");
+
+        let arguments = ProviderArgs {
+            provider: vec![solo.clone(), nested.clone()],
+        };
+        assert_eq!(
+            arguments.components().expect("expansion succeeds"),
+            [solo, nested.join("alpha.wasm"), nested.join("middle.wasm")]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_provider_directory_names_itself() {
+        let directory = tempfile::tempdir().expect("create provider fixture");
+        let missing = directory.path().join("absent");
+        std::fs::create_dir(&missing).expect("create directory");
+        std::fs::remove_dir(&missing).expect("remove directory");
+        // A path that is neither a file nor a readable directory is passed through as a component
+        // path; the registry reports it, not the argument parser.
+        let arguments = ProviderArgs {
+            provider: vec![missing.clone()],
+        };
+        assert_eq!(
+            arguments
+                .components()
+                .expect("a missing path is not expanded"),
+            [missing]
+        );
+    }
 
     #[test]
     fn clap_definition_is_internally_consistent() {

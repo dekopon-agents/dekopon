@@ -22,6 +22,7 @@ policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
 providers:
   - /home/dekopon/lib/dekopon/echo-provider.wasm
+  - /opt/dekopon/providers          # a directory loads every *.wasm directly inside it
 identities:
   - uid: 1000
     principal: local-user
@@ -78,6 +79,19 @@ message content or provider input.
 An optional `@id("…")` annotation names a policy. That name is what audit records carry as
 `policy_ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
 `policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
+
+Each `providers` entry is a component file or a directory of them. A directory loads every
+`*.wasm` directly inside it — not recursively — in **filename order**, which matters because the
+registry builds its capability route table in load order: readdir order would let two runs over one
+directory disagree about which provider claimed a duplicate capability. A directory must be owned
+by this UID and not group- or world-writable, because anyone who can write it can add a provider
+the broker will compile and run. Every file the scan yields is then checked on its own exactly as a
+directly-named one is. An empty directory is an error rather than a silent zero providers; it
+almost always means a mount that did not happen or a build that did not run.
+
+There is no implicit provider search path. The broker loads code, so every directory it loads from
+is named in this owner-only file and nowhere else — pointing at a shipped directory is one line,
+and that line is the record of the decision.
 
 At decision time a capability with no constraint set is denied `unconstrained-capability` before
 Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.

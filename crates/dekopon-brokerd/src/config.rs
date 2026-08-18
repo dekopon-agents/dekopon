@@ -13,7 +13,9 @@ use dekopon_broker_host::BrokerHostLimits;
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES,
 };
-use dekopon_core::{Actor, CapabilityId, ExternalSubject, PrincipalId};
+use dekopon_core::{
+    Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
+};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -295,7 +297,7 @@ pub async fn load(
     let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
-    let mut resolved = resolve(config, path)?;
+    let mut resolved = resolve(config, path, expected_uid)?;
     // The policy file gets the configuration's own hygiene: owner-owned, single-link, not
     // group/world writable, no symlink following, byte-capped. It is trusted input in exactly the
     // same sense the configuration is, so it is read under exactly the same rules.
@@ -390,7 +392,76 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf, ConfigError
     Ok(path.with_file_name(sibling))
 }
 
-fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, ConfigError> {
+/// Expands one configured provider entry into the component files it names.
+///
+/// A regular file is itself. A directory is every `*.wasm` directly inside it — not recursively, so
+/// a nested directory is a place to park something, not a place it loads from — **in filename
+/// order**. That sort is load-bearing rather than tidiness: the registry builds its capability
+/// route table in load order, so readdir order would make two runs over an identical directory
+/// disagree about which provider claimed a duplicate capability.
+///
+/// A directory is held to the same standard as every other trusted input this file reads: owned by
+/// the expected UID and not group- or world-writable. A directory anyone can write to is a
+/// directory anyone can add a provider to, and a provider is code this broker compiles and runs.
+/// Each file the scan yields is checked again on its own by `socket::validate_owned_file` before
+/// anything is loaded.
+fn expand_provider_entry(path: &Path, expected_uid: u32) -> Result<Vec<PathBuf>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // `symlink_metadata` rather than `metadata`: the path is already canonical, so a symlink here
+    // would be one planted between canonicalization and now.
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| ConfigError::ResolvePath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(ConfigError::InsecureProviderDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let entries = std::fs::read_dir(path).map_err(|source| ConfigError::ResolvePath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut providers = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ConfigError::ResolvePath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let candidate = entry.path();
+        if candidate
+            .extension()
+            .is_some_and(|extension| extension == PROVIDER_COMPONENT_EXTENSION)
+            && entry
+                .file_type()
+                .map_err(|source| ConfigError::ResolvePath {
+                    path: candidate.clone(),
+                    source,
+                })?
+                .is_file()
+        {
+            providers.push(candidate);
+        }
+    }
+    if providers.is_empty() {
+        return Err(ConfigError::EmptyProviderDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    providers.sort();
+    Ok(providers)
+}
+
+fn resolve(
+    config: BrokerdConfig,
+    source: PathBuf,
+    expected_uid: u32,
+) -> Result<ResolvedConfig, ConfigError> {
     if config.providers.is_empty() {
         return Err(ConfigError::NoProviders);
     }
@@ -434,17 +505,29 @@ fn resolve(config: BrokerdConfig, source: PathBuf) -> Result<ResolvedConfig, Con
     let policies_path = canonical(config.policies_path)?;
     let mut provider_set = BTreeSet::new();
     let mut providers = Vec::with_capacity(config.providers.len());
-    for provider in config.providers {
-        let unresolved = resolve_path(provider);
-        let provider =
+    for entry in config.providers {
+        let unresolved = resolve_path(entry);
+        let entry =
             std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
                 path: unresolved,
                 source,
             })?;
-        if !provider_set.insert(provider.clone()) {
-            return Err(ConfigError::DuplicateProviderPath { path: provider });
+        for provider in expand_provider_entry(&entry, expected_uid)? {
+            if !provider_set.insert(provider.clone()) {
+                return Err(ConfigError::DuplicateProviderPath { path: provider });
+            }
+            providers.push(provider);
         }
-        providers.push(provider);
+    }
+    // The pre-expansion bound above limits what this file may say; this one limits what it
+    // actually resolves to, which is what the component host will be asked to compile.
+    if providers.len() > HARD_MAX_PROVIDERS {
+        return Err(ConfigError::TooManyProviders {
+            maximum: HARD_MAX_PROVIDERS,
+        });
+    }
+    if providers.is_empty() {
+        return Err(ConfigError::NoProviders);
     }
     let mut reserved = vec![
         source.clone(),
@@ -601,6 +684,21 @@ pub enum ConfigError {
     },
     #[error("broker configuration must name at least one provider")]
     NoProviders,
+    /// A provider directory was group- or world-writable, or owned by another user.
+    #[error(
+        "provider directory {path} is not owned by this user or is group/world writable; anyone \
+         who can write it can add a provider this broker would execute"
+    )]
+    InsecureProviderDirectory {
+        /// The offending directory.
+        path: PathBuf,
+    },
+    /// A configured provider directory held no `*.wasm` component.
+    #[error("provider directory {path} contains no *.wasm component")]
+    EmptyProviderDirectory {
+        /// The empty directory.
+        path: PathBuf,
+    },
     #[error("broker configuration has too many providers; maximum is {maximum}")]
     TooManyProviders { maximum: usize },
     #[error("broker configuration must map at least one peer identity")]
