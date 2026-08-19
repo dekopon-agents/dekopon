@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.5.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.6.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works in this tree
+## What works today in 0.6.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -23,9 +23,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
 
-Current development after 0.5.0:
+New in 0.6.0 — operational visibility without moving authority:
 
-- **`dekopon-webui`**, embedded in `dekopon-brokerd` and enabled explicitly with `--http-bind`. `/` redirects to `/ui`; the GET-only unauthenticated view shows bounded gateway-reported agents and token counts, complete loaded-provider documentation, host-observed Wasmtime statistics/ceilings, and credential-free OTLP configuration. The network around the selected bind address is the access boundary.
+- **An explicitly enabled web UI.** `dekopon-webui` is embedded in `dekopon-brokerd` behind `--http-bind`; without that flag there is no TCP listener. `/` redirects to `/ui`, and the unauthenticated surface accepts only GET and HEAD. The network around the selected bind address is the access boundary.
+- **Provider documentation from the loaded components.** The index and rustdoc-like detail pages show validated manifests, capability schemas and command words, plus the local artifact path, byte length, SHA-256 digest, and Wasmtime-visible component imports and exports.
+- **Process-local runtime visibility.** Host-observed compilation, store, instantiation, invocation, fuel, resource-limiter, and HTTP counters appear beside every configured host ceiling. Credential-free OTLP endpoint, transport, service, timeout, and payload settings are shown without header or resource-attribute values.
+- **Content-free gateway reporting.** `dekopond` best-effort reports a bounded normalized agent inventory and provider-reported model usage. Those summaries reset with the broker and never feed identity, Cedar policy, constraints, credentials, execution, evidence, replay, or durable audit.
 
 New in 0.5.0 — chat that can see what you sent it. One documented invariant was deliberately rewritten to get there, and it is the only thing in this release that moved:
 
@@ -62,26 +65,26 @@ From there, [`examples/pr-summarizer-linter`](examples/pr-summarizer-linter/READ
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.5.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.5.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.6.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.6.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.5.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.5.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.5.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.6.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.6.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.6.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.5.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.5.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.6.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.6.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-All twenty public crates are on crates.io at `0.5.0`:
+The workspace contains twenty-one public crates at `0.6.0`. After the separate crates.io publication dispatch completes:
 
 ```console
-cargo install --locked dekopon
-cargo install --locked dekopon-run
-cargo install --locked dekopon-brokerd
-cargo install --locked dekopond
+cargo install --locked --version 0.6.0 dekopon
+cargo install --locked --version 0.6.0 dekopon-run
+cargo install --locked --version 0.6.0 dekopon-brokerd
+cargo install --locked --version 0.6.0 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
