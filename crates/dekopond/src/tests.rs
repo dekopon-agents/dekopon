@@ -3193,12 +3193,12 @@ fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
     let now = Instant::now();
     let first = store.assets_for("c1", vec![pending("a.png", "image/png", 10)], true, now);
     let second = store.assets_for("c1", vec![pending("b.png", "image/png", 20)], true, now);
-    assert_eq!(first.refs[0].id, 1);
-    assert_eq!(second.refs[0].id, 2);
+    assert_eq!(first.inventory[0].id, 1);
+    assert_eq!(second.arrived, vec![2]);
 
     // A different conversation numbers from one again, and cannot see the first one's files.
     let other = store.assets_for("c2", vec![pending("c.png", "image/png", 30)], true, now);
-    assert_eq!(other.refs[0].id, 1);
+    assert_eq!(other.inventory[0].id, 1);
     assert_eq!(
         store.get("c2", 2, now).map(|asset| asset.name),
         None,
@@ -3229,7 +3229,7 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
         true,
         now,
     );
-    let note = asset::reference_note(&registered.refs, true).expect("a note for three files");
+    let note = asset::reference_note(&registered, true).expect("a note for three files");
 
     assert!(
         note.contains("Chat Asset #1 — shot.png (image/png, 2 KB)"),
@@ -3258,7 +3258,7 @@ fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
         false,
         Instant::now(),
     );
-    let note = asset::reference_note(&registered.refs, false).expect("a note");
+    let note = asset::reference_note(&registered, false).expect("a note");
 
     assert!(!registered.fetchable);
     assert!(!note.contains("Chat Asset #"), "{note}");
@@ -3286,8 +3286,8 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
     // The follow-up: no attachment, same conversation.
     let second = store.assets_for("c1", Vec::new(), true, now);
     assert!(
-        second.refs.is_empty(),
-        "a message that carried nothing describes nothing"
+        second.arrived.is_empty(),
+        "a message that carried nothing brought nothing"
     );
     assert!(
         second.fetchable,
@@ -3301,6 +3301,59 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
     // A conversation that never had one still offers nothing.
     let elsewhere = store.assets_for("c2", Vec::new(), true, now);
     assert!(!elsewhere.fetchable);
+}
+
+#[test]
+fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
+    // The bug this pins, observed in a real conversation: a PDF is sent, ordinary chatter follows,
+    // and nine messages later the model answers that it has never been sent a PDF. It was telling
+    // the truth about the prompt it could see. The reference line naming `Chat Asset #3` lived only
+    // in the turn that carried it, and a twelve-turn history window had trimmed that turn away —
+    // while the store still held the file for another hour. A number a model cannot see is a file
+    // it cannot open.
+    let store = asset_store();
+    let now = Instant::now();
+    store.assets_for(
+        "c1",
+        vec![PendingAsset {
+            name: "recipe.pdf".to_owned(),
+            mime: "application/pdf".to_owned(),
+            size: 1024,
+            source: Some(AssetSourceRef::Slack {
+                file_id: "F-pdf".to_owned(),
+                url: "https://files.slack.com/f/recipe".to_owned(),
+            }),
+        }],
+        true,
+        now,
+    );
+
+    // Chatter. None of these messages carries anything.
+    for _ in 0..9 {
+        store.assets_for("c1", Vec::new(), true, now);
+    }
+
+    // A later message brings its own file, and the note still has to name both.
+    let registered = store.assets_for(
+        "c1",
+        vec![pending("shot.png", "image/png", 2048)],
+        true,
+        now,
+    );
+    let note = asset::reference_note(&registered, true).expect("a note");
+
+    assert!(note.contains("Chat Asset #1 — recipe.pdf"), "{note}");
+    assert!(note.contains("Chat Asset #2 — shot.png"), "{note}");
+    // Marked, so "is this a good recipe?" reaches for the file that came with the question rather
+    // than one from twenty messages ago.
+    assert!(
+        note.contains("shot.png (image/png, 2 KB) — attached to this message"),
+        "{note}"
+    );
+    assert!(
+        !note.contains("recipe.pdf (application/pdf, 1 KB) — attached to this message"),
+        "the older file must not claim to be new: {note}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3574,7 +3627,7 @@ fn a_document_does_not_need_the_image_modality() {
         false,
         Instant::now(),
     );
-    let note = asset::reference_note(&registered.refs, false).expect("a note");
+    let note = asset::reference_note(&registered, false).expect("a note");
 
     assert!(registered.fetchable, "the document is still fetchable");
     assert!(note.contains("Chat Asset #1 — spec.pdf"), "{note}");
@@ -3593,7 +3646,7 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
         true,
         Instant::now(),
     );
-    let note = asset::reference_note(&registered.refs, true).expect("a note");
+    let note = asset::reference_note(&registered, true).expect("a note");
 
     assert!(!registered.fetchable);
     assert!(note.contains("clip.mov"), "{note}");
