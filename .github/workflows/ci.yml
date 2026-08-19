@@ -28,7 +28,7 @@ jobs:
           toolchain: stable
           components: clippy,rustfmt
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint all targets
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: stable
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: otel-openobserve
       - name: Export runner traces to OpenObserve
@@ -126,7 +126,7 @@ jobs:
         with:
           toolchain: 1.89.0
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: msrv-1.89.0
       - name: Test workspace on MSRV
@@ -143,7 +143,7 @@ jobs:
         with:
           toolchain: stable
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
 
@@ -158,7 +158,7 @@ jobs:
         with:
           toolchain: stable
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build CLIs
         run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Exercise generated help and example commands
