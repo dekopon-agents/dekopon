@@ -487,7 +487,11 @@ impl AssetFetcher for SlackReplier {
         source: &AssetSourceRef,
         max_bytes: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
-        let AssetSourceRef::Slack { url, .. } = source;
+        // A reference belonging to another transport is a routing mistake rather than a fetch
+        // failure, and the daemon looks a fetcher up by the message's own transport name.
+        let AssetSourceRef::Slack { url, .. } = source else {
+            return Box::pin(async { Err(TransportError::Response) });
+        };
         let url = url.clone();
         Box::pin(async move {
             let mut response = self.get_file(&url).await?;

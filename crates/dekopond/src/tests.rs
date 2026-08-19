@@ -3425,6 +3425,146 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_telegram_photo_is_routed_with_its_largest_size() {
+    // A photo arrives as the same image at several sizes, smallest first, and its words live in
+    // `caption` rather than `text`. Reading only `text` made the whole message invisible; taking
+    // the first size would hand a model a thumbnail it cannot read.
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [{
+                "update_id": 300,
+                "message": {
+                    "message_id": 9,
+                    "from": {"id": 16034700182_i64, "is_bot": false},
+                    "chat": {"id": 4242, "type": "private"},
+                    "caption": "what does this say?",
+                    "photo": [
+                        {"file_id": "thumb", "file_size": 900},
+                        {"file_id": "full", "file_size": 214_000}
+                    ]
+                }
+            }]});
+        }
+        json!({"ok": true, "result": []})
+    });
+
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("telegram connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.text, "what does this say?");
+    assert_eq!(
+        message.assets,
+        vec![PendingAsset {
+            name: "photo.jpg".to_owned(),
+            mime: "image/jpeg".to_owned(),
+            size: 214_000,
+            source: Some(AssetSourceRef::Telegram {
+                file_id: "full".to_owned(),
+            }),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_telegram_document_keeps_its_own_name_and_media_type() {
+    // Unlike a photo, a document is passed through rather than re-encoded, so Telegram reports
+    // both and neither has to be inferred.
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [{
+                "update_id": 301,
+                "message": {
+                    "message_id": 10,
+                    "from": {"id": 16034700182_i64, "is_bot": false},
+                    "chat": {"id": 4242, "type": "private"},
+                    "document": {
+                        "file_id": "doc-1",
+                        "file_name": "spec.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 5000
+                    }
+                }
+            }]});
+        }
+        json!({"ok": true, "result": []})
+    });
+
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("telegram connects");
+
+    // No caption: the attachment is the whole message, and dropping it would be silence.
+    let message = next_message(&mut transport).await;
+    assert!(message.text.is_empty());
+    assert_eq!(message.assets[0].name, "spec.pdf");
+    assert_eq!(message.assets[0].mime, "application/pdf");
+}
+
+#[test]
+fn a_document_does_not_need_the_image_modality() {
+    // Gating a PDF on the vision modality would refuse it to a model perfectly able to read one.
+    // Only images need it.
+    let store = asset_store();
+    let registered = store.assets_for(
+        "c1",
+        vec![
+            PendingAsset {
+                name: "spec.pdf".to_owned(),
+                mime: "application/pdf".to_owned(),
+                size: 5000,
+                source: Some(AssetSourceRef::Telegram {
+                    file_id: "doc-1".to_owned(),
+                }),
+            },
+            pending("shot.png", "image/png", 2048),
+        ],
+        false,
+        Instant::now(),
+    );
+    let note = asset::reference_note(&registered.refs, false).expect("a note");
+
+    assert!(registered.fetchable, "the document is still fetchable");
+    assert!(note.contains("Chat Asset #1 — spec.pdf"), "{note}");
+    assert!(!note.contains("Chat Asset #2"), "{note}");
+    assert!(note.contains("cannot be shown images"), "{note}");
+}
+
+#[test]
+fn an_unsupported_media_type_is_named_but_never_numbered() {
+    // A chat service will deliver anything. The allowlist is the narrow end of the intersection
+    // with what a model actually accepts.
+    let store = asset_store();
+    let registered = store.assets_for(
+        "c1",
+        vec![pending("clip.mov", "video/quicktime", 700 * 1024 * 1024)],
+        true,
+        Instant::now(),
+    );
+    let note = asset::reference_note(&registered.refs, true).expect("a note");
+
+    assert!(!registered.fetchable);
+    assert!(note.contains("clip.mov"), "{note}");
+    assert!(!note.contains("Chat Asset #"), "{note}");
+    assert!(!note.contains("fetch_chat_asset"), "{note}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
     // chat: consecutive messages continue one exchange, and a group is not the private chat.
