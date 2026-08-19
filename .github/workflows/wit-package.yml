@@ -152,8 +152,9 @@ jobs:
             ((.worlds[1].imports | keys) == []) and
             ((.worlds[1].exports | keys) == ["describe", "invoke", "resolve-command"]) and
             (.worlds[1].exports."resolve-command".function.params == [
-              {"name": "argv", "type": {"list": "string"}}
+              {"name": "argv", "type": 0}
             ]) and
+            (.types[0].kind == {"list": "string"}) and
             (.worlds[1].exports."resolve-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
