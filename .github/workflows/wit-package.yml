@@ -52,7 +52,7 @@ env:
   WKG_SHA256: 8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a
   WASM_TOOLS_VERSION: 1.236.1
   WASM_TOOLS_SHA256: 2ea92231826976cb001c6c6d8708ff54e1ef1ea7229968a75a2119ff26c4cd6f
-  PROVIDER_WIT_PACKAGE: dekopon:provider@0.1.0
+  PROVIDER_WIT_PACKAGE: dekopon:provider@0.2.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
 
 jobs:
@@ -136,8 +136,8 @@ jobs:
           jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" '
             (.packages | length == 1) and
             (.packages[0].name == $package) and
-            (.packages[0].worlds == {"provider": 0}) and
-            (.worlds | length == 1) and
+            (.packages[0].worlds == {"provider": 0, "provider-commands": 1}) and
+            (.worlds | length == 2) and
             (.worlds[0].name == "provider") and
             ((.worlds[0].imports | keys) == []) and
             ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
@@ -147,7 +147,15 @@ jobs:
               {"name": "capability", "type": "string"},
               {"name": "input-json", "type": "string"}
             ]) and
-            (.worlds[0].exports.invoke.function.result == "string")
+            (.worlds[0].exports.invoke.function.result == "string") and
+            (.worlds[1].name == "provider-commands") and
+            ((.worlds[1].imports | keys) == []) and
+            ((.worlds[1].exports | keys) == ["describe", "invoke", "resolve-command"]) and
+            (.worlds[1].exports."resolve-command".function.params == [
+              {"name": "argv", "type": 0}
+            ]) and
+            (.types[0].kind == {"list": "string"}) and
+            (.worlds[1].exports."resolve-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
       - name: Verify buffered HTTP interface

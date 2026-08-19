@@ -53,6 +53,15 @@ pub trait ScriptRuntime {
     /// The ceiling is supplied per call rather than fixed at construction because the prompt loop
     /// spends one session-wide budget across every script it runs.
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome;
+
+    /// Returns the command words loaded providers contribute to this session.
+    ///
+    /// Defaulted to none so an embedder with no providers, and every existing implementor, is
+    /// unaffected. What comes back is already filtered to providers the session holds a grant on,
+    /// so a principal granted nothing is never told a word exists.
+    fn command_words(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Bounds on one prompt session.
@@ -213,7 +222,7 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
-    let model_tools = vec![script_tool()];
+    let model_tools = vec![script_tool(&runtime.command_words())];
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -468,10 +477,21 @@ fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'stati
 }
 
 /// Builds the one tool a prompt session offers.
-fn script_tool() -> ModelTool {
+///
+/// `command_words` are the words loaded providers contribute on top of the fixed builtins. They are
+/// appended rather than interpolated into the prose so the description stays one constant plus a
+/// list, and so a session with no providers reads exactly as it did before.
+fn script_tool(command_words: &[String]) -> ModelTool {
+    let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
+    if !command_words.is_empty() {
+        description.push_str(&format!(
+            "\n\nThis session's providers add these command words: {}.              Each takes its own arguments; `cap --describe` does not cover them.",
+            command_words.join(", ")
+        ));
+    }
     ModelTool {
         name: SCRIPT_TOOL_NAME.to_owned(),
-        description: SCRIPT_TOOL_DESCRIPTION.to_owned(),
+        description,
         parameters: json!({
             "type": "object",
             "properties": {
@@ -545,7 +565,8 @@ depend on session configuration and report their exact missing prerequisite othe
 which opens no socket of its own but assembles a request for whichever HTTP capability the session \
 was given; `gh`, which maps GitHub-CLI subcommands (`gh pr view 7 -R owner/repo`, `gh pr review 7 \
 -R owner/repo --approve`) onto the correspondingly named granted `gh.*` capabilities; and `date`, \
-which reads the host clock and renders `+%s` or an ISO-8601 instant.
+which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may contribute \
+further command words; any this session has are listed at the end of this description.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
 and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
@@ -1377,9 +1398,19 @@ mod tests {
         assert_eq!(*observer.observed.lock().expect("options lock"), vec![None]);
     }
 
+    /// A provider's command words reach the model, or it has no way to know they exist.
+    ///
+    /// `cap --list` enumerates capabilities, not the ergonomic words a provider layers over them,
+    /// so a word absent from this description is a word the model will never type.
+    #[test]
+    fn provider_command_words_are_offered_to_the_model() {
+        let tool = script_tool(&["gh".to_owned(), "fly".to_owned()]);
+        assert!(tool.description.contains("gh, fly"), "{}", tool.description);
+    }
+
     #[test]
     fn offers_exactly_one_scripting_tool() {
-        let tool = script_tool();
+        let tool = script_tool(&[]);
 
         assert_eq!(tool.name, "bash");
         assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
@@ -1389,6 +1420,12 @@ mod tests {
         // way to learn which capabilities this session can reach.
         assert!(tool.description.contains("cap --list"));
         assert!(tool.description.contains("cap --describe"));
+        // A session with no provider command words reads exactly as it always did.
+        assert!(
+            !tool
+                .description
+                .contains("providers add these command words")
+        );
         // ...and it must not invent a discovery command the interpreter does not implement. There
         // is no `help` builtin, so advertising one would spend a tool call on "command not found".
         assert!(tool.description.contains("There is no `help`"));

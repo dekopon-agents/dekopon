@@ -35,6 +35,17 @@ pub struct ProviderManifest {
     pub description: String,
     /// Read-only capabilities implemented by this component.
     pub capabilities: Vec<ProviderCapability>,
+    /// Command words this provider contributes to the sandboxed shell.
+    ///
+    /// Each is a bare word a model may type, resolved through [`Provider::resolve_command`]. A
+    /// manifest that declares one without the component exporting `resolve-command` is refused at
+    /// load, and a word colliding with a shell builtin, a refused word, a control word, or another
+    /// provider's is a startup failure naming every conflict at once.
+    ///
+    /// Defaulted so a component built against `dekopon:provider@0.1.0` still loads, contributing
+    /// none.
+    #[serde(default)]
+    pub command_words: Vec<String>,
 }
 
 /// One prompt-visible capability exported by a provider component.
@@ -65,6 +76,37 @@ pub trait Provider {
     /// The immediate host supplies no ambient I/O. This function should be deterministic unless
     /// an eventual host interface explicitly provides a bounded source of nondeterminism.
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError>;
+
+    /// Rewrites one argv into a capability proposal.
+    ///
+    /// This is where a provider implements the ergonomic spelling of its own capabilities —
+    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. `argv[0]`
+    /// is the command word the model typed, which is always one this provider declared.
+    ///
+    /// It is a **pure rewrite and grants nothing**. What it returns is a proposal, authorized on
+    /// exactly the path a direct `cap <id> {…}` call takes: constraint-set lookup, Cedar
+    /// evaluation, credential injection at the native HTTP boundary. Naming a capability the
+    /// caller was not granted produces a denial, not an escalation. It runs before authorization,
+    /// so it must not depend on host imports; a host may refuse a component that touches one here.
+    ///
+    /// The default refuses, which is correct for the majority of providers: one that declares no
+    /// command words can never be asked.
+    fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
+        let _ = argv;
+        Err(ProviderError::new(
+            "unsupported-command",
+            "this provider declares no command words",
+        ))
+    }
+}
+
+/// One capability proposal produced by [`Provider::resolve_command`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandInvocation {
+    /// The capability the command word maps to.
+    pub capability: CapabilityId,
+    /// The input object assembled from the arguments.
+    pub input: Value,
 }
 
 /// Provider-declared invocation failure.
@@ -131,6 +173,24 @@ pub struct ComponentFailure {
     pub message: String,
 }
 
+/// JSON result of a command-word rewrite, returned across the WIT boundary.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CommandResolution {
+    /// The argv maps to one capability proposal.
+    Resolved {
+        /// Capability the command word named.
+        capability: CapabilityId,
+        /// Input object assembled from the arguments.
+        input: Value,
+    },
+    /// The provider declined to rewrite this argv.
+    Failed {
+        /// Stable failure detail, reported to the model as a usage error.
+        error: ComponentFailure,
+    },
+}
+
 #[doc(hidden)]
 pub mod __wit {
     wit_bindgen::generate!({
@@ -177,6 +237,26 @@ pub fn __invoke<P: Provider>(capability: String, input_json: String) -> String {
 
     serde_json::to_string(&response).unwrap_or_else(|_error| {
         r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"provider response could not be serialized"}}"#.to_owned()
+    })
+}
+
+#[doc(hidden)]
+pub fn __resolve_command<P: Provider>(argv: Vec<String>) -> String {
+    let resolution = match P::resolve_command(&argv) {
+        Ok(invocation) => CommandResolution::Resolved {
+            capability: invocation.capability,
+            input: invocation.input,
+        },
+        Err(error) => CommandResolution::Failed {
+            error: ComponentFailure {
+                code: error.code,
+                message: error.message,
+            },
+        },
+    };
+
+    serde_json::to_string(&resolution).unwrap_or_else(|_error| {
+        r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command resolution could not be serialized"}}"#.to_owned()
     })
 }
 
@@ -237,6 +317,41 @@ macro_rules! export_provider_with_bindings {
     };
 }
 
+/// Exports a [`Provider`] that also contributes command words, through caller-generated bindings.
+///
+/// The bindings module must describe a world including `dekopon:provider/provider-commands`, so it
+/// exports `resolve-command` alongside `describe` and `invoke`. Use this when the provider declares
+/// `commandWords` in its manifest; [`export_provider_with_bindings!`] is the right macro otherwise.
+#[macro_export]
+macro_rules! export_provider_with_commands {
+    ($provider:ty, $bindings:ident) => {
+        struct __DekoponProviderComponent;
+
+        impl $bindings::Guest for __DekoponProviderComponent {
+            fn describe() -> ::std::string::String {
+                $crate::__describe::<$provider>()
+            }
+
+            fn invoke(
+                capability: ::std::string::String,
+                input_json: ::std::string::String,
+            ) -> ::std::string::String {
+                $crate::__invoke::<$provider>(capability, input_json)
+            }
+
+            fn resolve_command(
+                argv: ::std::vec::Vec<::std::string::String>,
+            ) -> ::std::string::String {
+                $crate::__resolve_command::<$provider>(argv)
+            }
+        }
+
+        $bindings::export!(
+            __DekoponProviderComponent with_types_in $bindings
+        );
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -254,6 +369,7 @@ mod tests {
                 api_version: ProviderApiVersion::V1Alpha1,
                 id: "echo".parse().expect("valid provider fixture"),
                 description: "Echoes input".to_owned(),
+                command_words: Vec::new(),
                 capabilities: vec![ProviderCapability {
                     id: "echo.echo".parse().expect("valid capability fixture"),
                     description: "Echoes input".to_owned(),

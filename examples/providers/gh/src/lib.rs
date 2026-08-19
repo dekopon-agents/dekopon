@@ -93,6 +93,7 @@ impl Provider for Gh {
             description:
                 "Narrow GitHub repository, pull-request, and issue operations over broker HTTP"
                     .to_owned(),
+            command_words: Vec::new(),
             capabilities: capabilities(),
         }
     }

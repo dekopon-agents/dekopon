@@ -25,7 +25,7 @@ The default `export_provider!` macro targets the SDK's import-free world. A prov
 
 ```wit
 world provider {
-    include dekopon:provider/provider@0.1.0;
+    include dekopon:provider/provider@0.2.0;
     import dekopon:http/client@1.0.0;
 }
 ```
@@ -47,13 +47,13 @@ The composed world must retain the root `describe` and `invoke` exports. Additio
 
 ## WIT package
 
-The same import-free world is published as `dekopon:provider@0.1.0`. Fetch it through Dekopon's public registry metadata:
+The same import-free world is published as `dekopon:provider@0.2.0`, alongside a `provider-commands` world adding the optional `resolve-command` export. Fetch it through Dekopon's public registry metadata:
 
 ```console
 wkg get \
   --registry dekopon-agents.github.io \
   --output provider.wasm \
-  dekopon:provider@0.1.0
+  dekopon:provider@0.2.0
 ```
 
 The package contains exactly the `describe` and `invoke` exports and no imports. Publishing it makes the existing authoring contract available to component tooling; it does not add host functions or runtime authority.
