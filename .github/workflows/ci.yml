@@ -57,10 +57,14 @@ jobs:
         env:
           CARGO_TARGET_DIR: target/provider-example-native
         run: |
-          for manifest in \
-            examples/providers/echo/Cargo.toml \
-            examples/providers/http-probe/Cargo.toml \
-            examples/providers/jsonplaceholder/Cargo.toml
+          shopt -s nullglob
+          manifests=(examples/providers/*/Cargo.toml)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo 'no provider workspaces matched examples/providers/*/Cargo.toml' >&2
+            exit 1
+          fi
+          printf 'checking %s\n' "${manifests[@]}"
+          for manifest in "${manifests[@]}"
           do
             cargo fmt --manifest-path "$manifest" -- --check
             cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
@@ -72,9 +76,16 @@ jobs:
         env:
           CARGO_TARGET_DIR: target/provider-example
         run: |
-          cargo check --locked --manifest-path examples/providers/echo/Cargo.toml --target wasm32-unknown-unknown
-          cargo check --locked --manifest-path examples/providers/http-probe/Cargo.toml --target wasm32-unknown-unknown
-          cargo check --locked --manifest-path examples/providers/jsonplaceholder/Cargo.toml --target wasm32-unknown-unknown
+          shopt -s nullglob
+          manifests=(examples/providers/*/Cargo.toml)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo 'no provider workspaces matched examples/providers/*/Cargo.toml' >&2
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"
+          do
+            cargo check --locked --manifest-path "$manifest" --target wasm32-unknown-unknown
+          done
       - name: Check HTTP guest bindings for Wasm
         run: cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
       - name: Check observability smoke-test script
