@@ -1,10 +1,10 @@
-# A realistic override set: the rubber-stamper deployment from examples/rubber-stamper/, moved
+# A realistic override set: the conditional-write deployment from examples/conditional-write/, moved
 # onto the chart's paths. Slack in, one agent, five gh capabilities, a broker-injected GitHub
 # token, and the audit chain on its own volume.
 #
 # Every value that is a real secret is a reference. Nothing here holds a token.
 #
-#   helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
+#   helm template dekopon charts/dekopon -f charts/dekopon/values-conditional-write.yaml
 
 broker:
   config:
@@ -15,11 +15,11 @@ broker:
       checkpointPath: /var/lib/dekopon/audit-checkpoint.json
       checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
       brokerPrincipal: local-broker
-      policyRevision: rubber-stamper-2026-01
+      policyRevision: conditional-write-2026-01
       credentialsPath: /etc/dekopon/broker-credentials.yaml
       policiesPath: /etc/dekopon/policies.cedar
       providers:
-        - /opt/dekopon/providers/gh-provider.wasm
+        - /opt/dekopon/providers/http-probe-provider.wasm
       identities:
         - uid: 65532
           principal: dekopond-gateway
@@ -32,33 +32,33 @@ broker:
         - subject: slack.t0123abcd.u0123abcd
           principal: cpetersen
       constraintSets:
-        gh.pull-request.read:
-          provider: gh
+        http-probe.fetch:
+          provider: http-probe
           effect: read-only
           risk: Low
           idempotency: idempotent
-          credential: github-pat
+          credential: api-token
           constraints:
             timeoutMs: 10000
             maxOutputBytes: 262144
             http:
-              allowedHosts: [api.github.com]
+              allowedHosts: [api.example.com]
               allowedMethods: [GET]
               maxRequests: 1
               maxRequestBytes: 16384
               maxResponseBytes: 2097152
               allowPlaintextLoopback: false
-        gh.pull-request.approve:
-          provider: gh
+        http-probe.conditional-write:
+          provider: http-probe
           effect: external-write
           risk: High
           idempotency: conditional
-          credential: github-pat
+          credential: api-token
           constraints:
             timeoutMs: 15000
             maxOutputBytes: 8192
             http:
-              allowedHosts: [api.github.com]
+              allowedHosts: [api.example.com]
               allowedMethods: [GET, POST]
               maxRequests: 2
               maxRequestBytes: 16384
@@ -80,18 +80,18 @@ broker:
 
   policies:
     inline: |
-      @id("rubber-stamper-session")
+      @id("conditional-write-session")
       permit(principal == Dekopon::Principal::"cpetersen",
              action == Dekopon::Action::"agent.prompt",
-             resource == Dekopon::Agent::"xaviers-rubber-stamper")
+             resource == Dekopon::Agent::"xaviers-conditional-write")
       when { context has via && context.via == "dekopond-gateway" };
 
-      @id("rubber-stamper-github")
+      @id("conditional-write-github")
       permit(principal == Dekopon::Principal::"cpetersen",
-             action in [Dekopon::Action::"gh.pull-request.read",
-                        Dekopon::Action::"gh.pull-request.approve"],
-             resource == Dekopon::Provider::"gh")
-      when { context has agent && context.agent == "xaviers-rubber-stamper"
+             action in [Dekopon::Action::"http-probe.fetch",
+                        Dekopon::Action::"http-probe.conditional-write"],
+             resource == Dekopon::Provider::"http-probe")
+      when { context has agent && context.agent == "xaviers-conditional-write"
           && context has via && context.via == "dekopond-gateway" };
 
   # Created out of band, so the token is never in a values file or in the release:
@@ -137,7 +137,7 @@ gateway:
       routes:
         - transport: workspace-slack
           match: { kind: directMessage }
-          agent: xaviers-rubber-stamper
+          agent: xaviers-conditional-writer
           limits:
             maxSteps: 8
             maxCapabilityCalls: 16
@@ -161,16 +161,16 @@ gateway:
       spec:
         description: Narrow GitHub pull-request operations over broker HTTP
         type: github
-        credentialRef: github-pat
+        credentialRef: api-token
       status: Unknown
       ---
       apiVersion: dekopon.dev/v1alpha1
       kind: Capability
       metadata:
-        name: gh.pull-request.read
+        name: http-probe.fetch
       spec:
         description: Reads one pull request
-        provider: gh
+        provider: http-probe
         effect: read-only
         risk: Low
         idempotency: idempotent
@@ -181,10 +181,10 @@ gateway:
       apiVersion: dekopon.dev/v1alpha1
       kind: Capability
       metadata:
-        name: gh.pull-request.approve
+        name: http-probe.conditional-write
       spec:
         description: Approves a pull request at an observed head SHA
-        provider: gh
+        provider: http-probe
         effect: external-write
         risk: High
         idempotency: conditional
@@ -195,13 +195,13 @@ gateway:
       apiVersion: dekopon.dev/v1alpha1
       kind: Agent
       metadata:
-        name: xaviers-rubber-stamper
+        name: xaviers-conditional-writer
       spec:
         description: Reviews and approves pull requests on request
         modelClass: reasoning
         capabilities:
-          - gh.pull-request.read
-          - gh.pull-request.approve
+          - http-probe.fetch
+          - http-probe.conditional-write
       status: Unknown
 
   env:

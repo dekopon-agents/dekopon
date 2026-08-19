@@ -96,7 +96,7 @@ jobs:
           tarball="${RUNNER_TEMP}/dekopon-${VERSION}.tgz"
           helm lint "$tarball"
           helm template dekopon "$tarball" > /dev/null
-          helm template dekopon "$tarball" -f charts/dekopon/values-rubber-stamper.yaml > /dev/null
+          helm template dekopon "$tarball" -f charts/dekopon/values-conditional-write.yaml > /dev/null
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

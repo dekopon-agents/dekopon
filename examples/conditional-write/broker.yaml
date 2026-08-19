@@ -1,6 +1,6 @@
 # dekopon-brokerd — the only process in this example that holds any authority.
 #
-# It owns the socket, the policy, the constraint sets, the GitHub credential, and the audit chain.
+# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit chain.
 # The gateway holds none of those; it holds a Slack token and a model endpoint.
 #
 # Hygiene, all checked at startup and all fatal:
@@ -18,10 +18,10 @@ checkpointPath: /home/xavier/.local/state/dekopon/audit-checkpoint.json
 checkpointLockPath: /home/xavier/.local/state/dekopon/audit-checkpoint.lock
 
 brokerPrincipal: local-broker
-policyRevision: rubber-stamper-2026-01
+policyRevision: conditional-write-2026-01
 
 # Relative to this file's directory. Copy broker-credentials.yaml.example, fill in the PAT, and
-# `chmod 600` it. Startup fails closed if it is missing, group-readable, or names no `github-pat`.
+# `chmod 600` it. Startup fails closed if it is missing, group-readable, or names no `api-token`.
 credentialsPath: broker-credentials.yaml
 policiesPath: policies.cedar
 
@@ -33,9 +33,9 @@ policiesPath: policies.cedar
 strict: true
 
 providers:
-  # The checked-in gh component: 19 narrow GitHub capabilities, no `gh.api.*` passthrough.
+  # The checked-in probe component: one read and one conditional write.
   # Must be a regular single-link file owned by this UID under owner-owned directories.
-  - ../providers/gh-provider.wasm
+  - ../providers/http-probe-provider.wasm
 
 identities:
   # 501 is the server's own UID, which is what the owner-only socket currently permits: every
@@ -61,92 +61,41 @@ identityMappings:
 
 constraintSets:
   # One entry per capability the policy may reach. A capability with no entry is denied
-  # `unconstrained-capability` before Cedar is consulted, and a policy naming one refuses startup.
+  # `unconstrained-capability` before Cedar is consulted, and a policy naming one refuses startup
+  # when `strict` is set.
   #
-  # Every read carries `credential: github-pat` as well: a private repository returns 404 to an
-  # unauthenticated read, so a read-only capability that cannot authenticate cannot see the pull
-  # request it is about to be asked to approve. The credential is destination-bound to
-  # api.github.com in the credentials file and injected inside the native HTTP engine; the model,
-  # the shell session, and the guest component never observe it.
-  gh.content.read:
-    provider: gh
+  # The credential is destination-bound in the credentials file and injected inside the native HTTP
+  # engine; the model, the shell session, and the guest component never observe it.
+  http-probe.fetch:
+    provider: http-probe
     effect: read-only
     risk: Low
     idempotency: idempotent
-    credential: github-pat
+    credential: api-token
     constraints:
       timeoutMs: 10000
       maxOutputBytes: 262144
       http:
-        allowedHosts: [api.github.com]
+        allowedHosts: [api.example.com]
         allowedMethods: [GET]
         maxRequests: 1
         maxRequestBytes: 16384
         maxResponseBytes: 2097152
         allowPlaintextLoopback: false
-  gh.pull-request.list:
-    provider: gh
-    effect: read-only
-    risk: Low
-    idempotency: idempotent
-    credential: github-pat
-    constraints:
-      timeoutMs: 10000
-      maxOutputBytes: 65536
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET]
-        maxRequests: 1
-        maxRequestBytes: 16384
-        maxResponseBytes: 524288
-        allowPlaintextLoopback: false
-  gh.pull-request.read:
-    provider: gh
-    effect: read-only
-    risk: Low
-    idempotency: idempotent
-    credential: github-pat
-    constraints:
-      timeoutMs: 10000
-      maxOutputBytes: 32768
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET]
-        maxRequests: 1
-        maxRequestBytes: 16384
-        maxResponseBytes: 262144
-        allowPlaintextLoopback: false
-  gh.pull-request.files:
-    provider: gh
-    effect: read-only
-    risk: Low
-    idempotency: idempotent
-    credential: github-pat
-    constraints:
-      timeoutMs: 10000
-      maxOutputBytes: 131072
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET]
-        maxRequests: 1
-        maxRequestBytes: 16384
-        maxResponseBytes: 1048576
-        allowPlaintextLoopback: false
-  gh.pull-request.approve:
-    provider: gh
+  http-probe.conditional-write:
+    provider: http-probe
     effect: external-write
     risk: High
     idempotency: conditional
-    credential: github-pat
+    credential: api-token
     constraints:
       timeoutMs: 15000
       maxOutputBytes: 8192
       http:
-        allowedHosts: [api.github.com]
-        # Two calls and two methods because the write pre-reads: one GET for the pull request,
-        # one POST carrying the head SHA it just observed. That pre-read is what makes the
-        # capability `conditional` and what lets it refuse a draft, a closed pull request, or a
-        # head that moved, before anything is written.
+        # Two calls and two methods because the write pre-reads: one GET for the resource, one
+        # POST carrying the etag it just observed. That pre-read is what makes the capability
+        # `conditional` and what lets it refuse a resource that moved, before anything is written.
+        allowedHosts: [api.example.com]
         allowedMethods: [GET, POST]
         maxRequests: 2
         maxRequestBytes: 16384

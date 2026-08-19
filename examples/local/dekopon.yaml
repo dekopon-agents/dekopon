@@ -1,4 +1,9 @@
 # A local-only Dekopon catalog. Credential values are never stored here.
+#
+# The `github.*` capability names below are illustrative. This example is catalog-only: nothing
+# here loads a component or contacts a broker, so the names exist to show the shape of a narrow
+# grant rather than to match a shipped manifest. The real GitHub provider uses the `gh.*` namespace
+# and lives at https://github.com/dekopon-agents/dekopon-provider-gh.
 apiVersion: dekopon.dev/v1alpha1
 kind: Provider
 metadata:

@@ -4,7 +4,7 @@
 surface the gateway consumes: DM events, explicit @-mentions in channels, and reply
 authority. The manifest's own comments walk through creation and the two tokens.
 
-This is step one of the [rubber-stamper walkthrough](../rubber-stamper/README.md), which
+This is step one of the [conditional-write walkthrough](../conditional-write/README.md), which
 carries it through to a boss DMing a bot and a pull request getting approved under a
 broker-held credential nothing in the session can see.
 

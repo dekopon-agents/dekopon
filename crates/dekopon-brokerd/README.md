@@ -124,17 +124,17 @@ the symbolic name from this file, never the secret.
 # broker.yaml
 credentialsPath: /home/dekopon/.config/dekopon/broker-credentials.yaml
 constraintSets:
-  gh.pull-request.approve:
+  http-probe.conditional-write:
     provider: gh
     effect: external-write
     risk: High
     idempotency: conditional
-    credential: github-pat
+    credential: api-token
     constraints:
       timeoutMs: 15000
       maxOutputBytes: 8192
       http:
-        allowedHosts: [api.github.com]
+        allowedHosts: [api.example.com]
         allowedMethods: [GET, POST]
         maxRequests: 2
         maxRequestBytes: 16384
@@ -146,10 +146,10 @@ constraintSets:
 # broker-credentials.yaml — chmod 0600
 apiVersion: dekopon.dev/broker-credentials/v1alpha1
 credentials:
-  - name: github-pat
+  - name: api-token
     kind: bearerToken
     scheme: Bearer
-    destinations: [api.github.com]
+    destinations: [api.example.com]
     secret: github_pat_...
 ```
 
@@ -162,19 +162,19 @@ capability namespace:
 ```yaml
 # broker.yaml
 constraintSets:
-  gh.issue.comment:
+  http-probe.conditional-write:
     provider: gh
     effect: external-write
     risk: Medium
     idempotency: non-idempotent
-    credential: github-pat                     # every agent that has no entry below
+    credential: api-token                     # every agent that has no entry below
     credentialByAgent:
-      nestedset-github: github-pat-scientist-hq
+      nestedset-github: api-token-scientist-hq
     constraints:
       timeoutMs: 15000
       maxOutputBytes: 8192
       http:
-        allowedHosts: [api.github.com]
+        allowedHosts: [api.example.com]
         allowedMethods: [GET, POST]
         maxRequests: 2
         maxRequestBytes: 16384
@@ -217,17 +217,17 @@ identityMappings:
     principal: cpetersen               # the only place a subject becomes a principal
 constraintSets:
   # One entry per capability the policy below may reach; the reads are elided here.
-  gh.pull-request.approve:
+  http-probe.conditional-write:
     provider: gh
     effect: external-write
     risk: High
     idempotency: conditional
-    credential: github-pat
+    credential: api-token
     constraints:
       timeoutMs: 15000
       maxOutputBytes: 8192
       http:
-        allowedHosts: [api.github.com]
+        allowedHosts: [api.example.com]
         allowedMethods: [GET, POST]
         maxRequests: 2
         maxRequestBytes: 16384
@@ -242,21 +242,21 @@ constraintSets:
 // person drive this agent at all, and through which gateway. The second is what that session may
 // then reach. Neither implies the other.
 
-@id("rubber-stamper-session")
+@id("conditional-write-session")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"xaviers-rubber-stamper")
+       resource == Dekopon::Agent::"xaviers-conditional-write")
 when { context has via && context.via == "dekopond-gateway" };
 
-@id("rubber-stamper-github")
+@id("conditional-write-github")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action in [Dekopon::Action::"gh.content.read",
-                  Dekopon::Action::"gh.pull-request.read",
-                  Dekopon::Action::"gh.pull-request.list",
-                  Dekopon::Action::"gh.pull-request.files",
-                  Dekopon::Action::"gh.pull-request.approve"],
-       resource == Dekopon::Provider::"gh")
-when { context has agent && context.agent == "xaviers-rubber-stamper"
+       action in [Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.conditional-write"],
+       resource == Dekopon::Provider::"http-probe")
+when { context has agent && context.agent == "xaviers-conditional-write"
     && context has via && context.via == "dekopond-gateway" };
 ```
 

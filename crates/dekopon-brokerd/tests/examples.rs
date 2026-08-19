@@ -1,4 +1,4 @@
-//! The `examples/rubber-stamper/` walkthrough, held against the real machinery it documents.
+//! The `examples/conditional-write/` walkthrough, held against the real machinery it documents.
 //!
 //! The example is a configuration a reader copies and runs, and its whole claim is that five
 //! narrow GitHub capabilities are reachable by one person, through one gateway, driving one agent
@@ -27,25 +27,21 @@ use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
 use serde::Deserialize;
 
 /// The five Tier-1 capabilities the example grants, in the order its files list them.
-const GRANTED: [&str; 5] = [
-    "gh.content.read",
-    "gh.pull-request.list",
-    "gh.pull-request.read",
-    "gh.pull-request.files",
-    "gh.pull-request.approve",
-];
-/// A capability the `gh` manifest exposes and the example deliberately does not grant.
-const UNGRANTED: &str = "gh.pull-request.merge";
+const GRANTED: [&str; 2] = ["http-probe.fetch", "http-probe.conditional-write"];
+/// A capability the probe manifest exposes and the example deliberately does not grant.
+const UNGRANTED: &str = "http-probe.purge";
 const PRINCIPAL: &str = "cpetersen";
 const GATEWAY: &str = "dekopond-gateway";
-const AGENT: &str = "xaviers-rubber-stamper";
+const AGENT: &str = "xaviers-conditional-writer";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn example(name: &str) -> PathBuf {
-    repository_root().join("examples/rubber-stamper").join(name)
+    repository_root()
+        .join("examples/conditional-write")
+        .join(name)
 }
 
 fn read(name: &str) -> String {
@@ -59,9 +55,9 @@ fn config() -> BrokerdConfig {
         .expect("the example broker configuration decodes under the broker's own strict decoder")
 }
 
-async fn gh_registry() -> BrokerProviderRegistry {
+async fn probe_registry() -> BrokerProviderRegistry {
     BrokerProviderRegistry::load(
-        [repository_root().join("examples/providers/gh-provider.wasm")],
+        [repository_root().join("examples/providers/http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -135,9 +131,9 @@ fn prompt_request(agent: &str, context: PolicyContext) -> PolicyRequest {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_example_policy_compiles_against_the_checked_in_gh_provider() {
+async fn the_example_policy_compiles_against_the_checked_in_probe_provider() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let world = world(&config, &registry);
 
     let policy = PolicyEngine::new(&read("policies.cedar"), &world)
@@ -167,7 +163,7 @@ async fn the_example_policy_compiles_against_the_checked_in_gh_provider() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let world = world(&config, &registry);
     let policy = PolicyEngine::new(&read("policies.cedar"), &world).expect("example policy loads");
     let sets = &config.constraint_sets;
@@ -177,7 +173,7 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
     assert!(session.allowed, "the boss may drive the agent");
     assert_eq!(
         session.determining_policy_ids,
-        vec!["boss-may-prompt-rubber-stamper".to_owned()],
+        vec!["boss-may-prompt-conditional-writer".to_owned()],
         "the audit record names the rule a reader can find in policies.cedar"
     );
 
@@ -190,7 +186,7 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
         assert!(decision.allowed, "{name} is granted");
         assert_eq!(
             decision.determining_policy_ids,
-            vec!["rubber-stamper-gh-surface".to_owned()],
+            vec!["conditional-writer-surface".to_owned()],
             "{name}"
         );
         assert!(!decision.errors_present, "{name}");
@@ -246,7 +242,7 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
         principal: PRINCIPAL.parse::<PrincipalId>().expect("valid principal"),
         target: PolicyTarget::Capability {
             capability: merge,
-            provider: "gh".parse::<ProviderId>().expect("valid provider"),
+            provider: "http-probe".parse::<ProviderId>().expect("valid provider"),
             effect: EffectKind::ExternalWrite,
             risk: RiskLevel::High,
             idempotency: Idempotency::Conditional,
@@ -259,7 +255,7 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_against() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let manifest = registry
         .capabilities()
         .map(|(provider, capability)| (capability.id.clone(), (provider.clone(), capability)))
@@ -298,13 +294,13 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             .unwrap_or_else(|| panic!("{id} grants HTTP authority"));
         assert_eq!(
             http.allowed_hosts,
-            vec!["api.github.com".to_owned()],
+            vec!["api.example.com".to_owned()],
             "{id}"
         );
         assert!(!http.allow_plaintext_loopback, "{id} talks to GitHub only");
         assert_eq!(
             set.credential.as_deref(),
-            Some("github-pat"),
+            Some("api-token"),
             "{id} presents the broker-held credential; private repositories need it even to read"
         );
         // The write pre-reads its pull request, which is exactly one extra GET and the reason the
@@ -325,7 +321,7 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
 ///
 /// The real file is `broker-credentials.yaml`, which is deliberately absent from the repository —
 /// it is the one file holding a secret. The `.example` beside it is what a reader edits, so it is
-/// the one worth pinning: if it stops naming `github-pat`, or stops binding `api.github.com`,
+/// the one worth pinning: if it stops naming `api-token`, or stops binding `api.example.com`,
 /// following the walkthrough produces a broker that refuses to start.
 #[test]
 fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
@@ -350,7 +346,7 @@ fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     let entry = file
         .credentials
         .iter()
-        .find(|entry| entry.name == "github-pat")
+        .find(|entry| entry.name == "api-token")
         .expect("the example names the credential every constraint set binds");
     assert_eq!(entry.kind, "bearerToken");
     assert_eq!(entry.scheme, "Bearer");
@@ -386,7 +382,7 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
     let config = config();
     assert_eq!(
         config.providers,
-        vec![PathBuf::from("../providers/gh-provider.wasm")]
+        vec![PathBuf::from("../providers/http-probe-provider.wasm")]
     );
     assert_eq!(
         config.policies_path,

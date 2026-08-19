@@ -40,7 +40,7 @@ models:
 routes:
   - transport: workspace-slack
     match: { kind: directMessage }
-    agent: xaviers-rubber-stamper
+    agent: xaviers-conditional-writer
     limits:
       # One review is a handful of steps: view the pull request, read the files, approve, answer.
       # A budget that cannot finish the job is a bug; a budget that can loop is a bill.

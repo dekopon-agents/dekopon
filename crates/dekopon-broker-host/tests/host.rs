@@ -762,27 +762,18 @@ fn json_http_response(body: &serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
-fn gh_pull_body() -> serde_json::Value {
-    json!({
-        "number": 7,
-        "title": "Add ferocious test coverage",
-        "state": "open",
-        "draft": false,
-        "merged": false,
-        "body": "A body",
-        "user": {"login": "cpetersen"},
-        "head": {"ref": "feature/x", "sha": "a".repeat(40)},
-        "base": {"ref": "main", "sha": "b".repeat(40)},
-        "additions": 10,
-        "deletions": 2,
-        "changed_files": 3,
-        "mergeable_state": "clean",
-        "created_at": "2026-08-01T00:00:00Z",
-        "updated_at": "2026-08-02T00:00:00Z",
-    })
+/// A response carrying the etag the conditional write pins itself to.
+fn etagged_response(etag: &str) -> Vec<u8> {
+    let body = "{}";
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: \
+         {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
-fn gh_approve_constraints(
+fn conditional_write_constraints(
     authority: String,
     methods: &[&str],
     max_requests: u32,
@@ -802,89 +793,67 @@ fn gh_approve_constraints(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_pins_the_observed_head_and_leaves_two_evidence_entries() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads without host calls during describe");
-    let review = json!({
-        "id": 42,
-        "state": "APPROVED",
-        "commit_id": "a".repeat(40),
-        "user": {"login": "xavier"},
-        "submitted_at": "2026-08-02T01:00:00Z",
-    });
+async fn a_two_request_capability_leaves_two_evidence_entries() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("the probe loads without host calls during describe");
     let (authority, recorded, server) = mock_http_sequence(vec![
-        json_http_response(&gh_pull_body()),
-        json_http_response(&review),
+        etagged_response("\"v1\""),
+        json_http_response(&json!({"written": true})),
     ]);
 
     let output = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET", "POST"], 2),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET", "POST"], 2),
             ),
             None,
         )
         .await
-        .expect("authorized two-call approve succeeds");
+        .expect("authorized two-call conditional write succeeds");
 
-    assert_eq!(output.provider.as_str(), "gh");
-    assert_eq!(output.output["state"], "APPROVED");
-    assert_eq!(output.output["reviewId"], 42);
-    assert_eq!(output.output["headSha"], "a".repeat(40));
+    assert_eq!(output.provider.as_str(), "http-probe");
+    assert_eq!(output.output["observedEtag"], "\"v1\"");
 
-    // The trace of what actually happened: a pre-read, then a write pinned to the observed SHA.
+    // The trace of what actually happened: a pre-read, then a write pinned to what it observed.
     assert_eq!(output.http_calls.len(), 2);
     assert_eq!(output.http_calls[0].method, "GET");
     assert_eq!(output.http_calls[1].method, "POST");
     let pre_read = String::from_utf8(recorded.recv().expect("pre-read recorded"))
         .expect("fixture request is UTF-8");
-    assert!(
-        pre_read.starts_with("GET /repos/octo/hello/pulls/7 "),
-        "{pre_read}"
-    );
+    assert!(pre_read.starts_with("GET /resource "), "{pre_read}");
     let write = String::from_utf8(recorded.recv().expect("write recorded"))
         .expect("fixture request is UTF-8");
-    assert!(
-        write.starts_with("POST /repos/octo/hello/pulls/7/reviews "),
-        "{write}"
-    );
-    assert!(
-        write.contains(&format!("\"commit_id\":\"{}\"", "a".repeat(40))),
-        "{write}"
-    );
-    assert!(write.contains("\"event\":\"APPROVE\""), "{write}");
+    assert!(write.starts_with("POST /resource "), "{write}");
+    assert!(write.contains("if-match: \"v1\""), "{write}");
     server.join().expect("fixture server exits");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads");
-    let (authority, recorded, server) =
-        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("gh provider loads");
+    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
 
     let failure = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET"], 2),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET"], 2),
             ),
             None,
         )
@@ -907,25 +876,23 @@ async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_over_its_call_budget_trips_the_host_call_limit() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads");
-    let (authority, recorded, server) =
-        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("gh provider loads");
+    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
 
     let failure = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET", "POST"], 1),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET", "POST"], 1),
             ),
             None,
         )

@@ -48,9 +48,13 @@ COPY --chmod=0755 \
      dist/${TARGETARCH}/dekopond \
      /usr/local/bin/
 
-# Provider components come from the tagged checkout rather than the archive: they are checked-in
-# artifacts, not build outputs, and the archive ships only `jsonplaceholder`. They are copied
-# verbatim and never regenerated.
+# In-tree provider components come from the tagged checkout rather than the archive: they are
+# checked-in artifacts, not build outputs, and the archive ships only `jsonplaceholder`. They are
+# copied verbatim and never regenerated.
+#
+# These are fixtures and demonstrations. Real integrations live in their own repositories with
+# their own release cadence — see `providers/README.md` in the build context for the pinned
+# out-of-tree components staged alongside them.
 #
 # `dekopon-brokerd` refuses to load a provider whose file is not owned by its own euid, is group-
 # or world-writable, or has more than one link, and it stats with `symlink_metadata`, so a symlink
@@ -61,7 +65,6 @@ COPY --chmod=0755 \
 # context, which the staging script normalises to 0644.
 COPY --chown=65532:65532 \
      providers/echo-provider.wasm \
-     providers/gh-provider.wasm \
      providers/http-probe-provider.wasm \
      providers/jsonplaceholder-provider.wasm \
      /opt/dekopon/providers/

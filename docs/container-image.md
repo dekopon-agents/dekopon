@@ -202,7 +202,6 @@ rather than asserted in prose:
           1064  LICENSE-MIT
        4764024  dist/amd64/dekopon
        ...
-        707070  providers/gh-provider.wasm
 ```
 
 Both platforms build anywhere, because nothing executes during the build:

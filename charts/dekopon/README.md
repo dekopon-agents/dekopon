@@ -501,14 +501,14 @@ From a checkout:
 ```console
 helm lint charts/dekopon
 helm template dekopon charts/dekopon
-helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
+helm template dekopon charts/dekopon -f charts/dekopon/values-conditional-write.yaml
 helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
   -f my-values.yaml
 ```
 
-[`values-rubber-stamper.yaml`](values-rubber-stamper.yaml) is the
-[rubber-stamper](https://github.com/dekopon-agents/dekopon/blob/main/examples/rubber-stamper/README.md) deployment expressed as chart values:
-Slack in, one agent, two `gh` capabilities, a broker-injected token by reference, and the audit
+[`values-conditional-write.yaml`](values-conditional-write.yaml) is the
+[conditional-write](https://github.com/dekopon-agents/dekopon/blob/main/examples/conditional-write/README.md) deployment expressed as chart values:
+Slack in, one agent, two `http-probe` capabilities, a broker-injected token by reference, and the audit
 chain on its own volume.
 
 ## What is not proven

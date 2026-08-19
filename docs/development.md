@@ -21,7 +21,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Domain identifiers and enums | `crates/dekopon-core/src/lib.rs` | Inline unit and compile-fail tests |
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
-| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/rubber-stamper/dekopon.yaml` |
+| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/conditional-write/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, and environment-credential tests |
 | Operator CLI and model auth commands | `crates/dekopon/src/` | `crates/dekopon/tests/cli.rs` |
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE tests |
@@ -32,15 +32,15 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/rubber-stamper/` against the loaded `gh` manifest and the Cedar grammar |
+| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `gh` manifest and the Cedar grammar |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
 | Shared prompt loop and session capability dispatch | `crates/dekopon-agent/src/` | Inline prompt-loop, composite-dispatch, and stub-broker-socket leg tests |
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Chat gateway configuration, transports, routing, bounded agent sessions, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, conversation replay and eviction, cache-key minting and rotation, and loopback Slack/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
-| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
-| End-to-end deployment example | `examples/rubber-stamper/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
+| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
+| End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
@@ -78,9 +78,8 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `crates/dekopon-broker-host/wit/deps/http.wit`
 - `examples/providers/http-probe/wit/deps/http.wit`
 - `examples/providers/jsonplaceholder/wit/deps/http.wit`
-- `examples/providers/gh/wit/deps/http.wit`
 
-The HTTP probe, JSONPlaceholder provider, gh provider, and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit`, `examples/providers/jsonplaceholder/wit/deps/provider.wit`, `examples/providers/gh/wit/deps/provider.wit`, and `crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+The HTTP probe, JSONPlaceholder provider, and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit`, `examples/providers/jsonplaceholder/wit/deps/provider.wit`, ``crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.2.0` worlds and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
@@ -93,7 +92,6 @@ The checked-in components are generated:
 | `examples/providers/echo/src/lib.rs` | `examples/providers/echo/build.sh` | `examples/providers/echo-provider.wasm` |
 | `examples/providers/http-probe/src/lib.rs` | `examples/providers/http-probe/build.sh` | `examples/providers/http-probe-provider.wasm` |
 | `examples/providers/jsonplaceholder/src/lib.rs` | `examples/providers/jsonplaceholder/build.sh` | `examples/providers/jsonplaceholder-provider.wasm` |
-| `examples/providers/gh/src/` | `examples/providers/gh/build.sh` | `examples/providers/gh-provider.wasm` |
 
 Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Both HTTP-importing components must decode to the two provider exports, exactly one `dekopon:http/client@1.0.0` import, and no WASI imports; direct-host tests prove that the empty linker rejects them.
 
@@ -207,14 +205,11 @@ cargo install wasm-tools --version 1.236.1 --locked
 examples/providers/echo/build.sh
 examples/providers/http-probe/build.sh
 examples/providers/jsonplaceholder/build.sh
-examples/providers/gh/build.sh
 wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools validate examples/providers/jsonplaceholder-provider.wasm
-wasm-tools validate examples/providers/gh-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/jsonplaceholder-provider.wasm
-wasm-tools component wit examples/providers/gh-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked

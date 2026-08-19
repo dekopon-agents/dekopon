@@ -15,10 +15,10 @@
 //
 // This is checked before `capabilitiesFor` answers and before any capability is authorized, so a
 // sender the owner never permitted to use this agent is refused before a model call is paid for.
-@id("boss-may-prompt-rubber-stamper")
+@id("boss-may-prompt-conditional-writer")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"xaviers-rubber-stamper")
+       resource == Dekopon::Agent::"xaviers-conditional-writer")
 when { context has via && context.via == "dekopond-gateway" };
 
 // What that session may then reach. The two statements are independent: driving the agent implies
@@ -31,13 +31,10 @@ when { context has via && context.via == "dekopond-gateway" };
 //
 // `context.agent` pins the surface to this one agent. A second agent added to the catalog later
 // starts with nothing, even under the same principal and the same gateway.
-@id("rubber-stamper-gh-surface")
+@id("conditional-writer-surface")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action in [Dekopon::Action::"gh.content.read",
-                  Dekopon::Action::"gh.pull-request.list",
-                  Dekopon::Action::"gh.pull-request.read",
-                  Dekopon::Action::"gh.pull-request.files",
-                  Dekopon::Action::"gh.pull-request.approve"],
-       resource == Dekopon::Provider::"gh")
-when { context has agent && context.agent == "xaviers-rubber-stamper"
+       action in [Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.conditional-write"],
+       resource == Dekopon::Provider::"http-probe")
+when { context has agent && context.agent == "xaviers-conditional-writer"
     && context has via && context.via == "dekopond-gateway" };

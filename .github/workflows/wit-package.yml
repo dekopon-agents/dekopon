@@ -10,8 +10,6 @@ on:
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
-      - "examples/providers/gh/**"
-      - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
@@ -28,8 +26,6 @@ on:
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
-      - "examples/providers/gh/**"
-      - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
@@ -95,7 +91,6 @@ jobs:
             crates/dekopon-provider-sdk/wit/provider.wit \
             crates/dekopon-provider-host/wit/provider.wit
           for mirror in \
-            examples/providers/gh/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/jsonplaceholder/wit/deps/provider.wit
           do
@@ -105,7 +100,6 @@ jobs:
             wit/http/http.wit \
             crates/dekopon-provider-http/wit/deps/http.wit
           for mirror in \
-            examples/providers/gh/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit \
             examples/providers/jsonplaceholder/wit/deps/http.wit
           do

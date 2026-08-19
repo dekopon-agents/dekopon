@@ -1,11 +1,11 @@
 # The rubber stamper
 
-Xavier's boss sends a Slack DM — "approve PR 7 in owner/repo" — and a pull request gets an
-`APPROVE` review submitted with Xavier's GitHub token, under the boss's name, on the record.
+Xavier's boss sends a Slack DM — "approve PR 7 in owner/repo" — and a resource gets an
+`APPROVE` review submitted with Xavier's the upstream API token, under the boss's name, on the record.
 
 The gateway authenticates the message and vouches for the sender; it decides nothing. The broker
 maps that Slack identity to the principal `cpetersen`, checks a Cedar policy, resolves the five
-capabilities that policy permits, injects a GitHub token bound to `api.github.com`, executes the
+capabilities that policy permits, injects a the upstream API token bound to `api.example.com`, executes the
 `gh` WebAssembly component, and hash-links the result into an audit chain naming the person who
 asked. The token is never visible to the model, the shell session, the agent, or the component
 that uses it — the broker's native HTTP engine adds the header after the guest's own headers have
@@ -16,7 +16,7 @@ been validated, and audit records `credentialInjected: true` and never a value.
 | [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, five capabilities, one provider | `dekopond`, `dekopon` |
 | [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
 | [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
-| [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The GitHub token, after you copy it | `dekopon-brokerd` |
+| [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The the upstream API token, after you copy it | `dekopon-brokerd` |
 | [`dekopond.yaml`](dekopond.yaml) | Gateway configuration: transport, model, route | `dekopond` |
 
 Nothing here is a mock. `crates/dekopon-brokerd/tests/examples.rs` loads the checked-in `gh`
@@ -32,10 +32,10 @@ member ID. Socket Mode means no public HTTP endpoint and no inbound firewall hol
 
 ## 2. Create the token and the credentials file
 
-A GitHub fine-grained personal access token, scoped to the repositories the agent may review:
+A the upstream API fine-grained personal access token, scoped to the repositories the agent may review:
 
-- **Contents: Read-only** — `gh.content.read`
-- **Pull requests: Read and write** — the three read capabilities, and `gh.pull-request.approve`
+- **Contents: Read-only** — `http-probe.fetch`
+- **Pull requests: Read and write** — the three read capabilities, and `http-probe.conditional-write`
 
 Then:
 
@@ -50,7 +50,7 @@ rejects group or world *readability*, not just writability — and refuses to st
 `broker-credentials.yaml` is deliberately absent from the repository and is in `.gitignore`, so
 following this step cannot commit a secret.
 
-GitHub will not let a token approve its own user's pull requests, so test with one opened by
+the upstream API will not let a token approve its own user's resources, so test with one opened by
 someone else.
 
 ## 3. Adjust the placeholders
@@ -74,7 +74,7 @@ configuration file's own directory, so `../providers/gh-provider.wasm`, `policie
 Two names appear in several files and must agree with each other rather than with anything of
 yours: the principal `cpetersen` (`broker.yaml` mapping, both statements in `policies.cedar`), the
 gateway principal `dekopond-gateway` (`broker.yaml` identity, both `via` conditions), and the agent
-`xaviers-rubber-stamper` (`dekopon.yaml` metadata, `dekopond.yaml` route, both policy statements).
+`xaviers-conditional-write` (`dekopon.yaml` metadata, `dekopond.yaml` route, both policy statements).
 Rename them together or not at all.
 
 Then make the directories private and the configurations owner-only:
@@ -91,7 +91,7 @@ The catalog half is checkable before anything runs:
 $ dekopon --config dekopon.yaml validate
 configuration valid: 1 agent(s), 5 capability(ies), 1 provider(s)
 
-$ dekopon --config dekopon.yaml describe agent xaviers-rubber-stamper
+$ dekopon --config dekopon.yaml describe agent xaviers-conditional-writer
 ```
 
 That validates cross-references and capability metadata, and nothing else — the `dekopon` CLI reads
@@ -148,7 +148,7 @@ The session:
 1. **Attestation.** `dekopond` derives the canonical subject `slack.t0123abcd.u0123abcd` from the
    authenticated Slack envelope and opens a broker leg with `capabilitiesFor(subject, agent)`. The
    broker checks its attestor grant covers that namespace, maps the subject to `cpetersen`, checks
-   `agent.prompt` on `Dekopon::Agent::"xaviers-rubber-stamper"`, and answers with five
+   `agent.prompt` on `Dekopon::Agent::"xaviers-conditional-write"`, and answers with five
    capabilities. A sender who fails any of those steps gets `You're not authorized to use this
    agent.` and **no model call is made**.
 2. **The session.** The agent's `instructions` become the system prompt, and its only tool is the
@@ -194,12 +194,12 @@ The session:
 
 ### The refusals worth knowing
 
-`gh.pull-request.approve` re-reads the pull request before it writes anything and pins the head SHA
+`http-probe.conditional-write` re-reads the resource before it writes anything and pins the etag
 it observed into the review body. Three refusals happen before any write leaves the component:
 
 | Code | When |
 |---|---|
-| `pr-closed` | the pull request is closed or already merged |
+| `pr-closed` | the resource is closed or already merged |
 | `pr-draft` | it is a draft; approving a draft is refused outright |
 | `head-changed` | the caller passed `--expected-head-sha` and the head has moved since |
 
@@ -223,27 +223,27 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
     "invocation": "dekopond-session-9f1c4a7b0e35d268-3",
     "trace": "dekopond-session-9f1c4a7b0e35d268",
     "principal": "cpetersen",
-    "actor": { "type": "agent", "agent": "xaviers-rubber-stamper" },
+    "actor": { "type": "agent", "agent": "xaviers-conditional-write" },
     "via": "dekopond-gateway",
     "attested_subject": "slack.t0123abcd.u0123abcd",
-    "capability": "gh.pull-request.approve",
+    "capability": "http-probe.conditional-write",
     "provider": "gh",
     "authorized_by": "local-broker",
     "decision_id": "allow-dekopond-session-9f1c4a7b0e35d268-3",
-    "policy_revision": "rubber-stamper-2026-01",
-    "policy_ids": ["rubber-stamper-gh-surface"],
+    "policy_revision": "conditional-write-2026-01",
+    "policy_ids": ["conditional-write-gh-surface"],
     "policy_digest": "sha256:7c31…",
     "effect": "external-write",
     "risk": "High",
     "idempotency": "conditional",
-    "credential": "github-pat",
+    "credential": "api-token",
     "outcome": "Succeeded",
     "duration_ms": 812,
     "output_digest": "sha256:9ab4…",
     "http_calls": [
-      { "method": "GET",  "authority": "api.github.com", "status": 200,
+      { "method": "GET",  "authority": "api.example.com", "status": 200,
         "requestBytes": 214, "responseBytes": 8931, "credentialInjected": true },
-      { "method": "POST", "authority": "api.github.com", "status": 200,
+      { "method": "POST", "authority": "api.example.com", "status": 200,
         "requestBytes": 486, "responseBytes": 1204, "credentialInjected": true }
     ]
   },
@@ -263,7 +263,7 @@ What each part is doing:
 - Two `http_calls` — the pre-read and the write, exactly the budget the constraint set allowed.
   `credentialInjected: true` says broker-held authority was presented; the value appears nowhere,
   and `requestBytes` deliberately excludes the injected header so its length cannot leak either.
-- `credential: github-pat` — *which* authority, by the symbolic name in `broker.yaml`. One example
+- `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. One example
   has one token, so it reads as redundant here; a deployment whose constraint set names a different
   credential per agent is one where the two organizations' writes would otherwise be identical
   records.
@@ -284,9 +284,9 @@ the broker verifies the entire chain on every start.
 | The same reply, but the log says `"reason":"unauthorized"` | attested, mapped, and permitted to drive the agent — and policy grants it zero capabilities. Usually the second policy statement's `context.agent` or `context.via` disagreeing with the first's. | gateway stdout |
 | The agent answers that it could not approve | the write was denied or refused | a `decision` with `"allowed": false` and a `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `unconstrained-capability`, or an empty `policy_ids` deny-by-default), or a `pr-draft` / `pr-closed` / `head-changed` provider error |
 | Broker exits: `policy permits capability X, which has no constraint set` | `policies.cedar` names a capability `broker.yaml` does not constrain | startup, before the socket is bound |
-| Broker exits: `constraint set for X names unknown credential "github-pat"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
+| Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
 | Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |
-| Broker exits: `constraint set for X allows host "…" outside credential "github-pat" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
+| Broker exits: `constraint set for X allows host "…" outside credential "api-token" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
 | Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN` or `DEKOPOND_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 

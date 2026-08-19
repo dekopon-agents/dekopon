@@ -1,12 +1,16 @@
 # Provider examples
 
+These are **fixtures and demonstrations**, not shipped integrations. They exist so the SDK, both
+component hosts, and the example configurations have something to run against without a network or
+a credential. A provider meant for real use lives in its own repository with its own tags, issues,
+and release cadence — [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh)
+is the first.
+
 - [`echo/`](echo/) is the Rust source for a provider implementing `dekopon_provider_sdk::Provider` with plain echo and deterministic reverse, uppercase, lowercase, and ransom-case capabilities.
 - [`echo-provider.wasm`](echo-provider.wasm) is the generated component checked in so `dekopon-run` is usable without first installing a Wasm build toolchain.
-- [`http-probe/`](http-probe/) composes the provider exports with `dekopon:http/client@1.0.0` and validates the generalized SDK world adapter plus the broker component host.
+- [`http-probe/`](http-probe/) composes the provider exports with `dekopon:http/client@1.0.0` and validates the generalized SDK world adapter plus the broker component host. `http-probe.conditional-write` pre-reads a resource and writes only if the etag it observed still matches, which is the in-tree capability that makes *two* authorized calls in one invocation — the shape that exercises `maxRequests`, per-call evidence, and the host-call limit. `http-probe.purge` exists so the manifest exposes more than any one deployment grants.
 - [`http-probe-provider.wasm`](http-probe-provider.wasm) is its generated component fixture. The direct runner intentionally rejects it because the immediate linker remains empty; broker-host tests execute it only against ephemeral loopback servers under exact constraints.
 - [`jsonplaceholder/`](jsonplaceholder/) implements separately named post-read and external-write operations with bounded typed inputs and production-origin or literal-loopback endpoint validation.
 - [`jsonplaceholder-provider.wasm`](jsonplaceholder-provider.wasm) is its generated component. Native and broker tests use injected or ephemeral loopback mocks and never contact the public JSONPlaceholder service.
-- [`gh/`](gh/) is the "fake `gh`" GitHub provider: nineteen separately named repository, pull-request, and issue capabilities with fixed request shapes, bounded output projections, and SHA-pinned review/merge writes. There is deliberately no `gh.api.*` passthrough. The guest never sets `authorization`; the broker injects a destination-bound credential at the native HTTP boundary, where no guest can observe it. [`../rubber-stamper/`](../rubber-stamper/README.md) is the end-to-end deployment that does exactly that.
-- [`gh-provider.wasm`](gh-provider.wasm) is its generated component. Native tests script exact request/response exchanges; nothing contacts the public GitHub API.
 
 Regenerate each component with the commands in its source README. Do not edit `.wasm` artifacts directly.

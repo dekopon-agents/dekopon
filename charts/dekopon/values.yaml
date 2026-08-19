@@ -102,7 +102,7 @@ broker:
   # that already exists. Inline and existing are mutually exclusive; setting both is an error.
   #
   # The chart never parses or generates these files. Their formats are documented in
-  # crates/dekopon-brokerd/README.md, and examples/rubber-stamper/ is a complete working set.
+  # crates/dekopon-brokerd/README.md, and examples/conditional-write/ is a complete working set.
   config:
     # Chart default: the echo example from crates/dekopon-brokerd/README.md, repointed at the
     # chart's paths. It is a real, deny-by-default configuration that starts and authorizes
