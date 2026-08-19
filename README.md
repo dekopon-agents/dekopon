@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.4.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.5.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works today in 0.4.0
+## What works today in 0.5.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -20,28 +20,17 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
+- A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
 
-New in 0.4.0 — distribution rather than authority. No new crates, no new privileges, and nothing moved across the broker boundary:
+New in 0.5.0 — chat that can see what you sent it. One documented invariant was deliberately rewritten to get there, and it is the only thing in this release that moved:
 
-- **A container image.** `ghcr.io/dekopon-agents/dekopon` carries all four executables for `linux/amd64` and `linux/arm64`, copied byte for byte out of this release's own archives rather than compiled a second time, alongside the checked-in provider components. It runs as UID 65532 and ships no configuration, policy, credentials, or audit state. See [`docs/container-image.md`](docs/container-image.md).
-- **A Helm chart.** [`charts/dekopon`](charts/dekopon/README.md) runs `dekopon-brokerd` and `dekopond` as one pod sharing the broker's `0600` Unix socket, because `SO_PEERCRED` across a shared filesystem namespace is the only transport the broker has. The chart is versioned and tagged separately from the application.
-- **A Homebrew tap.** `brew install dekopon` from [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap) installs all four executables and the example component, from a formula regenerated out of the archives each release actually published rather than a hand-maintained platform list.
-- **`dekopon auth chatgpt export`.** Prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized `dekopond` can be seeded with a credential its interactive device-authorization flow cannot obtain in a pod. It is the only command whose output is credential material in the clear: `--expose-credential` is mandatory, a terminal on standard output is refused, and both forms warn that the copy goes stale the moment the live credential refreshes.
-- **Three release archives, not four.** macOS on Intel left the release matrix; macOS ARM64, Linux ARM64, and Linux x86-64 remain.
-
-New in 0.3.0:
-
-- **Cedar authorization** (`dekopon-policy`). A schema generated from the deployment's declared world, strict startup validation, deny on any evaluation error, the determining `policy_ids` and a `policy_digest` in every audit record. It replaced the exact-match evaluator outright. Execution bounds stayed outside the policy language as owner-authored constraint sets, so a policy edit can broaden who may act and can never widen how far an action reaches.
-- **Broker-owned credentials.** Destination-bound secrets in a separate stricter owner-only file, bound per capability constraint set with optional per-agent overrides, injected inside the native HTTP engine after guest headers were validated. Audit and evidence record `credentialInjected: true` and never a value.
-- **Identity and attestation.** Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped policy that keeps attested and direct authority disjoint — adding a gateway cannot widen a grant that already existed.
-- **`dekopond`**, the unprivileged chat gateway: Slack Socket Mode, Telegram long-poll, and local development transports; configuration naming environment variables rather than secrets; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals, so the broker's audit attributes an effect to the person who asked for it.
-- **Bounded conversation memory.** A gateway session keeps a bounded per-sender window of earlier turns and replays it into the next prompt, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key that is never derived from message content.
-- **`dekopon-agent`**, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`.
-- **A `gh` provider and a `gh` shell builtin.** Nineteen narrow GitHub capabilities in one checked-in component — SHA-pinned writes, no `gh.api.*` passthrough — reachable as `gh pr view 7 -R owner/repo` inside a sandboxed script.
-- **`dekopon-run chat`**, a client for the gateway's local development transport, so a gateway route can be exercised without a chat service.
-- **[`examples/rubber-stamper`](examples/rubber-stamper/README.md)**, the end-to-end walkthrough assembling all of it, pinned against the real machinery by three integration test suites.
-- Three new publishable crates (`dekopon-agent`, `dekopon-policy`, `dekopond`) bring the release to 20, up from the 17 published at `0.2.0`.
+- **Files in chat.** A message carrying a screenshot used to be dropped before it was routed, because Slack stamps `subtype: file_share` on any upload. It routes now, and each attachment becomes a numbered chat asset named in the prompt — `Chat Asset #1 — screenshot.png (image/png, 214 KB)` — that a model opens with a `fetch_chat_asset` tool. Pull rather than push: bytes cost tokens on every turn they appear in, most turns do not need them, and one base64 screenshot is larger than a conversation's entire history budget. The audit log records `agent.asset.fetched`, so "did it actually look" is a question with an answer. Images and documents, over Slack and Telegram. See [`docs/dekopond.md`](docs/dekopond.md#chat-assets).
+- **The gateway fetches attachment bytes**, which three documents previously recorded as a deliberate refusal. The argument replacing it: an attachment is part of the message that carried it, and a chat service delivers it by reference rather than by value, so resolving that reference is how the gateway hears the whole request — with the bot token the daemon already holds. No policy, no provider credential, no authorization path, no write. What bounds it is arithmetic rather than authority: a media-type allowlist, 8 MiB per attachment enforced while the response streams rather than after it, four fetches per session, and a per-conversation ceiling on how many stay addressable. [`docs/security-model.md`](docs/security-model.md) records the change and the reasoning.
+- **Slack answers render.** A model writes CommonMark; Slack's `text` field is mrkdwn, so every answer arrived with its formatting as literal punctuation. Answers post in a Block Kit `markdown` block, which Slack renders itself — and which carries tables and task lists that mrkdwn cannot express at all.
+- **Providers bring their own command words.** A provider declares the words its capabilities answer to, and those words cross the local protocol instead of being fixed by the shell.
+- **A broker loads providers from a directory** rather than an enumerated list, and policy tolerates names no loaded provider declares, so adding a provider is one change rather than two.
+- **`dekopon-model` carries images and documents.** A message is text unless it is built with parts, and a text message serializes to exactly the bytes it did before. The public `Serialize` is now the redacted audit rendering rather than the chat-completions wire shape — the two were one type, which put a base64 attachment one careless `to_string` from the audit log.
 
 ## What does not work yet
 
@@ -69,20 +58,20 @@ From there, [`examples/rubber-stamper`](examples/rubber-stamper/README.md) is th
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.4.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.4.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.5.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.5.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.4.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.4.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.4.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.5.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.5.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.5.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.4.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.4.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.5.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.5.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-All twenty public crates are on crates.io at `0.4.0`:
+All twenty public crates are on crates.io at `0.5.0`:
 
 ```console
 cargo install --locked dekopon

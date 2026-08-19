@@ -47,7 +47,17 @@ Version 0.3.0 is published as provenance-attested CLI archives and a Git tag cov
 - `dekopon auth chatgpt export`, which prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized gateway can be seeded with a credential an interactive device flow cannot obtain in a pod.
 - macOS on Intel dropped from the release matrix, leaving three archives.
 
-Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the same process boundary, the same deny-by-default broker. It is a packaging release, and it is likewise not on crates.io.
+Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the same process boundary, the same deny-by-default broker. It is a packaging release.
+
+## 0.5 — files in chat (released)
+
+- Chat assets: an image or a document attached to a message becomes a numbered reference in the prompt, which a model opens on demand through a `fetch_chat_asset` tool rather than carrying on every turn. Slack and Telegram, images and the document types a model API accepts.
+- Slack answers post in a Block Kit `markdown` block, so a model's CommonMark renders instead of arriving as literal punctuation.
+- `dekopon-model` messages can carry content parts. A text message still serializes to exactly the bytes it did before, and the public `Serialize` became the redacted audit rendering rather than the wire shape.
+- Providers declare their own command words, and those words cross the local broker protocol.
+- The broker loads providers from a directory, and policy tolerates names no loaded provider declares.
+
+Version 0.5.0 adds no crate and no process boundary, and it is the first release to move a documented authority line: the gateway now fetches the bytes of a file attached to a message it was already receiving. That is bounded by media type, per-attachment size enforced while streaming, per-session fetch count, and a per-conversation ceiling — never by policy, which the gateway still does not hold. [`security-model.md`](security-model.md) carries the argument.
 
 ## Next milestones
 
