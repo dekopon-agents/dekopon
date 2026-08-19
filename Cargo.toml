@@ -104,4 +104,5 @@ unimplemented = "deny"
 [profile.release]
 lto = "thin"
 strip = "symbols"
-codegen-units = 1
+# Preserve cross-crate optimization while letting release runners codegen in parallel.
+codegen-units = 4

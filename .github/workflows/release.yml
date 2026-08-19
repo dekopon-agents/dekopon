@@ -26,35 +26,33 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  # One package-dependency-ordered source of truth for every public workspace crate.
-  # The validation job rejects omissions, duplicates, and normal/build/dev ordering mistakes.
-  PUBLISH_CRATES: >-
-    dekopon-core
-    dekopon-provider-http
-    dekopon-telemetry
-    dekopon-capability
-    dekopon-model
-    dekopon-shell
-    dekopon-http-host
-    dekopon-protocol
-    dekopon-provider-sdk
-    dekopon-broker-host
-    dekopon-broker-protocol
-    dekopon-agent
-    dekopon-config
-    dekopon-provider-host
-    dekopon
-    dekopon-policy
-    dekopon-broker
-    dekopon-brokerd
-    dekopon-run
-    dekopond
 
 jobs:
+  # Branch protection makes the pull-request CI run the expensive formatting, lint, test,
+  # documentation, package, and dependency-policy checks. A release only needs to prove that the
+  # immutable tag agrees with the already-reviewed workspace and publication plan.
   validate:
     name: validate release
     runs-on: ubuntu-24.04
     steps:
+      # A manual recovery can target a release older than these helper files. Stage the automation
+      # from the workflow revision before replacing the worktree with the immutable release tag.
+      - name: Check out release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Stage release automation
+        shell: bash
+        run: |
+          set -euo pipefail
+          automation="$RUNNER_TEMP/release-automation"
+          rm -rf "$automation"
+          mkdir -p "$automation"
+          cp .github/release-crates.txt \
+            .github/scripts/prepare-package-cache.sh \
+            .github/scripts/verify-release-metadata.py \
+            "$automation/"
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,98 +62,23 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
-          components: clippy,rustfmt
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-      - name: Verify tag and workspace versions
+      - name: Verify release metadata
         shell: bash
         run: |
           set -euo pipefail
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dekopon") | .version')
-          test "$RELEASE_TAG" = "v$version"
-          test "$(cargo metadata --no-deps --format-version 1 | jq '[.packages[].version] | unique | length')" -eq 1
-      - name: Verify crates.io publication plan
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
-          python3 - "$RUNNER_TEMP/metadata.json" <<'PY'
-          import json
-          import os
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as source:
-              metadata = json.load(source)
-
-          configured = os.environ["PUBLISH_CRATES"].split()
-          if len(configured) != len(set(configured)):
-              raise SystemExit("PUBLISH_CRATES contains a duplicate package")
-
-          members = set(metadata["workspace_members"])
-          packages = {
-              package["name"]: package
-              for package in metadata["packages"]
-              if package["id"] in members and package.get("publish") != []
-          }
-          missing = sorted(set(packages) - set(configured))
-          extra = sorted(set(configured) - set(packages))
-          if missing or extra:
-              raise SystemExit(
-                  f"PUBLISH_CRATES does not match publishable workspace packages; "
-                  f"missing={missing}, extra={extra}"
-              )
-
-          position = {name: index for index, name in enumerate(configured)}
-          for name, package in packages.items():
-              for dependency in package["dependencies"]:
-                  dependency_name = dependency["name"]
-                  if (
-                      dependency_name in packages
-                      and position[dependency_name] > position[name]
-                  ):
-                      raise SystemExit(
-                          f"{dependency_name} must be published before dependent package {name}"
-                      )
-
-          print("crates.io publication order:")
-          for index, name in enumerate(configured, start=1):
-              print(f"{index:>2}. {name}")
-          PY
-      - name: Run release validation
-        shell: bash
-        run: |
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo test --workspace --all-features --locked
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-      - name: Verify runner excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          plan=.github/release-crates.txt
+          if [[ ! -f "$plan" ]]; then
+            plan="$RUNNER_TEMP/release-automation/release-crates.txt"
           fi
-      - name: Verify gateway excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
-          fi
-      - name: Package every publishable crate
-        run: cargo package --workspace --exclude dekopon-testkit --locked
-      - name: Check dependency policy
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check
-          arguments: --all-features
+          "$RUNNER_TEMP/release-automation/verify-release-metadata.py" \
+            --metadata "$RUNNER_TEMP/metadata.json" \
+            --plan "$plan" \
+            --tag "$RELEASE_TAG"
 
   artifacts:
     name: build ${{ matrix.target }}
+    if: github.event_name == 'push'
     needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
@@ -179,10 +102,14 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      # GitHub scopes caches created on a tag to that tag, so this cannot warm a later release.
+      # Keep workspace outputs to make a retry of this immutable release fast instead.
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: release-${{ matrix.target }}
+          cache-workspace-crates: true
+          cache-bin: false
       - name: Build CLIs
         run: cargo build --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
       - name: Create archive and checksum
@@ -216,6 +143,7 @@ jobs:
 
   github-release:
     name: publish GitHub release
+    if: github.event_name == 'push'
     needs: [validate, artifacts]
     runs-on: ubuntu-24.04
     permissions:
@@ -270,6 +198,7 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     # No `secrets: inherit`: it authenticates to GHCR with `GITHUB_TOKEN`, which a called
     # workflow always has, and it needs no repository secret.
     uses: ./.github/workflows/container-image.yml
@@ -299,6 +228,22 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Check out release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Stage release automation
+        shell: bash
+        run: |
+          set -euo pipefail
+          automation="$RUNNER_TEMP/release-automation"
+          rm -rf "$automation"
+          mkdir -p "$automation"
+          cp .github/release-crates.txt \
+            .github/scripts/prepare-package-cache.sh \
+            .github/scripts/verify-release-metadata.py \
+            "$automation/"
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -308,6 +253,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
+      # Manual publication runs from main, so this cache can accelerate later releases instead of
+      # being isolated under a one-off tag ref. It shares its shape with the PR packaging gate.
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: package
+          cache-bin: false
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
       - name: Request short-lived crates.io credential
@@ -356,6 +308,13 @@ jobs:
             # Allow the sparse index to make this dependency visible to the next package.
             sleep 30
           }
-          for crate in $PUBLISH_CRATES; do
+          plan=.github/release-crates.txt
+          if [[ ! -f "$plan" ]]; then
+            plan="$RUNNER_TEMP/release-automation/release-crates.txt"
+          fi
+          mapfile -t crates < <(grep -Ev '^[[:space:]]*(#|$)' "$plan")
+          for crate in "${crates[@]}"; do
             publish "$crate"
           done
+      - name: Prepare package cache for saving
+        run: '"$RUNNER_TEMP/release-automation/prepare-package-cache.sh"'

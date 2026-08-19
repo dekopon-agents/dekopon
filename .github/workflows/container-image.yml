@@ -81,6 +81,8 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      # Lets actions/attest link the published OCI digest to the organization without warning.
+      artifact-metadata: write
     steps:
       - name: Resolve the release to package
         id: plan

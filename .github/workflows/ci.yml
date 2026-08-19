@@ -1,8 +1,8 @@
 name: CI
 
+# Branch protection makes this the pre-merge gate. Running the same seven expensive jobs again on
+# the resulting main commit adds no coverage; tag workflows perform only publication work.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -156,8 +156,21 @@ jobs:
           toolchain: stable
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: package
+          cache-bin: false
+      - name: Verify release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          .github/scripts/verify-release-metadata.py \
+            --metadata "$RUNNER_TEMP/metadata.json" \
+            --plan .github/release-crates.txt
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
+      - name: Prepare package cache for saving
+        run: .github/scripts/prepare-package-cache.sh
 
   cli-smoke:
     name: CLI smoke tests
