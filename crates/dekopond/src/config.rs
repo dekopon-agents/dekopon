@@ -170,6 +170,13 @@ pub enum ModelConfig {
         /// Model classes this endpoint satisfies, matched against an agent's `modelClass`.
         #[serde(default)]
         classes: Vec<String>,
+        /// What this endpoint can be shown besides text.
+        ///
+        /// Defaults to nothing. An OpenAI-compatible endpoint is very often a small local model
+        /// that will either error or hallucinate when handed an image, and the default has to be
+        /// the one that is safe on the endpoint an operator did not think about.
+        #[serde(default)]
+        modalities: Vec<Modality>,
     },
     /// OpenAI's Codex Responses endpoint using Dekopon's own device-flow credential file.
     ChatgptSubscription {
@@ -180,7 +187,22 @@ pub enum ModelConfig {
         timeout_ms: u64,
         #[serde(default)]
         classes: Vec<String>,
+        /// What this endpoint can be shown besides text.
+        ///
+        /// Still opt-in rather than assumed. Every current Codex model reads images, but a
+        /// configuration that silently gained a capability when a default changed underneath it is
+        /// the thing this file's strict decoding exists to prevent.
+        #[serde(default)]
+        modalities: Vec<Modality>,
     },
+}
+
+/// Something a model can be shown that is not text.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum Modality {
+    /// The model accepts images as message content.
+    Image,
 }
 
 impl ModelConfig {
@@ -189,6 +211,15 @@ impl ModelConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::OpenaiCompatible { name, .. } | Self::ChatgptSubscription { name, .. } => name,
+        }
+    }
+
+    /// Whether this endpoint may be shown an image.
+    #[must_use]
+    pub fn accepts_images(&self) -> bool {
+        match self {
+            Self::OpenaiCompatible { modalities, .. }
+            | Self::ChatgptSubscription { modalities, .. } => modalities.contains(&Modality::Image),
         }
     }
 

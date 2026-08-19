@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{ConversationTurn, HistoryLimits, PromptLimits};
+use dekopon_agent::prompt::{AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits};
 use dekopon_broker_protocol::{
     AvailableCapability, BrokerRequest, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame,
     write_frame,
@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
+    asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
         self, ConversationPolicy, ConversationWindow, ModelConfig, ResolvedBroker, RouteMatch,
@@ -1027,6 +1028,8 @@ fn model_config() -> ModelConfig {
         api_key_env: None,
         timeout_ms: 1_000,
         classes: vec!["reasoning".to_owned()],
+        // Text only, which is the default and the right one for a local endpoint.
+        modalities: Vec::new(),
     }
 }
 
@@ -1039,6 +1042,7 @@ fn message(text: &str) -> InboundMessage {
         conversation_id: "dev".to_owned(),
         message_id: "1".to_owned(),
         text: text.to_owned(),
+        assets: Vec::new(),
         conversation: ConversationKind::DirectMessage,
         reply: ReplyTarget::Local { connection: 1 },
     }
@@ -1076,6 +1080,11 @@ fn runner_tracking(
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
+        assets: Arc::new(AssetStore::new(
+            max_conversations,
+            Duration::from_secs(60 * 60),
+        )),
+        asset_fetchers: HashMap::new(),
     })
 }
 
@@ -2814,11 +2823,10 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_slack_upload_with_a_comment_is_routed_and_names_what_it_carried() {
-    // The reported failure. Slack stamps `subtype: "file_share"` on any message carrying an
-    // upload, so a question asked with a screenshot attached was dropped by the subtype filter
-    // before it was ever routed — the sender saw no answer at all, then watched the bot answer the
-    // plain-text message that followed it.
+async fn a_slack_upload_is_routed_and_described_for_numbering() {
+    // The transport reports what arrived and stops there. Numbering belongs to the asset store,
+    // because two transports minting their own identifiers would collide inside one conversation,
+    // so the reference line a model reads is composed later by the session.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -2829,7 +2837,13 @@ async fn a_slack_upload_with_a_comment_is_routed_and_names_what_it_carried() {
             "user": "u9xyz",
             "ts": "1700000000.000001",
             "text": "Can you see my attached screenshot?",
-            "files": [{ "name": "image.png", "mimetype": "image/png" }]
+            "files": [{
+                "id": "F0123",
+                "name": "image.png",
+                "mimetype": "image/png",
+                "size": 2048,
+                "url_private_download": "https://files.slack.com/f/F0123/image.png"
+            }]
         }),
     )]);
     let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
@@ -2837,26 +2851,25 @@ async fn a_slack_upload_with_a_comment_is_routed_and_names_what_it_carried() {
     transport.connect().await.expect("slack transport connects");
 
     let message = next_message(&mut transport).await;
-    assert!(
-        message
-            .text
-            .starts_with("Can you see my attached screenshot?")
-    );
-    // Named, and named as unreadable: a model handed only the comment denies the screenshot
-    // exists, which reads to the sender as the gateway having lost it.
-    assert!(
-        message.text.contains(
-            "[gateway: the sender attached 1 file the gateway cannot read: image.png (image/png)]"
-        ),
-        "unexpected composed text: {}",
-        message.text
+    assert_eq!(message.text, "Can you see my attached screenshot?");
+    assert_eq!(
+        message.assets,
+        vec![PendingAsset {
+            name: "image.png".to_owned(),
+            mime: "image/png".to_owned(),
+            size: 2048,
+            source: Some(AssetSourceRef::Slack {
+                file_id: "F0123".to_owned(),
+                url: "https://files.slack.com/f/F0123/image.png".to_owned(),
+            }),
+        }]
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_upload_with_no_comment_is_still_a_request() {
-    // An upload posted with no comment carries an empty `text`. The attachment note is then the
-    // whole message, because dropping it would be the same silence the subtype filter produced.
+    // An upload posted with no comment carries an empty `text`, and the attachment is the whole
+    // message. Dropping it would be the same silence the subtype filter used to produce.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -2867,10 +2880,13 @@ async fn a_slack_upload_with_no_comment_is_still_a_request() {
             "user": "u9xyz",
             "ts": "1700000000.000001",
             "text": "",
-            "files": [
-                { "name": "one.png", "mimetype": "image/png" },
-                { "name": "two.txt", "mimetype": "text/plain" }
-            ]
+            "files": [{
+                "id": "F0123",
+                "name": "one.png",
+                "mimetype": "image/png",
+                "size": 10,
+                "url_private_download": "https://files.slack.com/f/F0123/one.png"
+            }]
         }),
     )]);
     let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
@@ -2878,16 +2894,15 @@ async fn a_slack_upload_with_no_comment_is_still_a_request() {
     transport.connect().await.expect("slack transport connects");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(
-        message.text,
-        "[gateway: the sender attached 2 files the gateway cannot read: one.png (image/png), two.txt (text/plain)]"
-    );
+    assert!(message.text.is_empty());
+    assert_eq!(message.assets.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_slack_file_the_app_cannot_see_is_counted_rather_than_named() {
-    // Without the `files:read` scope Slack can withhold the file's metadata. The count is still
-    // true and still worth saying; inventing a name for it would not be.
+async fn a_slack_file_the_app_cannot_see_is_described_without_a_source() {
+    // Slack withholds the id and the URL for a file the token has no access to. It is still
+    // described, because "there is something here I cannot open" is a better answer than silence —
+    // and it carries no source, so nothing can try to fetch it.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -2898,7 +2913,7 @@ async fn a_slack_file_the_app_cannot_see_is_counted_rather_than_named() {
             "user": "u9xyz",
             "ts": "1700000000.000001",
             "text": "have a look",
-            "files": [{ "id": "F0123", "file_access": "check_file_info" }]
+            "files": [{ "file_access": "check_file_info" }]
         }),
     )]);
     let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
@@ -2906,10 +2921,9 @@ async fn a_slack_file_the_app_cannot_see_is_counted_rather_than_named() {
     transport.connect().await.expect("slack transport connects");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(
-        message.text,
-        "have a look\n\n[gateway: the sender attached 1 file the gateway cannot read]"
-    );
+    assert_eq!(message.text, "have a look");
+    assert_eq!(message.assets.len(), 1);
+    assert!(message.assets[0].source.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3149,6 +3163,188 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     // The fallback a push notification shows, which is the one place blocks do not render.
     assert_eq!(body["text"], answer_text);
     assert_eq!(body["channel"], "d0123abc");
+}
+
+// ---------------------------------------------------------------------------
+// Chat assets
+// ---------------------------------------------------------------------------
+
+fn pending(name: &str, mime: &str, size: u64) -> PendingAsset {
+    PendingAsset {
+        name: name.to_owned(),
+        mime: mime.to_owned(),
+        size,
+        source: Some(AssetSourceRef::Slack {
+            file_id: format!("F-{name}"),
+            url: format!("https://files.slack.com/f/{name}"),
+        }),
+    }
+}
+
+fn asset_store() -> AssetStore {
+    AssetStore::new(4, Duration::from_secs(600))
+}
+
+#[test]
+fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
+    // The number is the whole interface a model has to an attachment, so it has to mean one file
+    // for as long as the reference line naming it is still being replayed.
+    let store = asset_store();
+    let now = Instant::now();
+    let first = store.assets_for("c1", vec![pending("a.png", "image/png", 10)], true, now);
+    let second = store.assets_for("c1", vec![pending("b.png", "image/png", 20)], true, now);
+    assert_eq!(first.refs[0].id, 1);
+    assert_eq!(second.refs[0].id, 2);
+
+    // A different conversation numbers from one again, and cannot see the first one's files.
+    let other = store.assets_for("c2", vec![pending("c.png", "image/png", 30)], true, now);
+    assert_eq!(other.refs[0].id, 1);
+    assert_eq!(
+        store.get("c2", 2, now).map(|asset| asset.name),
+        None,
+        "a number must not resolve across conversations"
+    );
+    assert_eq!(
+        store.get("c1", 1, now).map(|asset| asset.name),
+        Some("a.png".to_owned())
+    );
+}
+
+#[test]
+fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
+    let store = asset_store();
+    let now = Instant::now();
+    let registered = store.assets_for(
+        "c1",
+        vec![
+            pending("shot.png", "image/png", 2048),
+            pending("clip.mov", "video/quicktime", 700 * 1024 * 1024),
+            PendingAsset {
+                name: "hidden".to_owned(),
+                mime: String::new(),
+                size: 0,
+                source: None,
+            },
+        ],
+        true,
+        now,
+    );
+    let note = asset::reference_note(&registered.refs, true).expect("a note for three files");
+
+    assert!(
+        note.contains("Chat Asset #1 — shot.png (image/png, 2 KB)"),
+        "{note}"
+    );
+    // Named, and named as unreadable. Ignoring it is what produced the flat denial in the first
+    // place; a number it cannot use would be worse.
+    assert!(note.contains("clip.mov"), "{note}");
+    assert!(!note.contains("Chat Asset #2"), "{note}");
+    assert!(
+        note.contains("the gateway cannot see this file at all"),
+        "{note}"
+    );
+    assert!(note.contains("fetch_chat_asset"), "{note}");
+    assert!(registered.fetchable);
+}
+
+#[test]
+fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
+    // The route's model decides this, not the media type. A local endpoint handed an image either
+    // errors or invents an answer, and the default for `modalities` is deliberately empty.
+    let store = asset_store();
+    let registered = store.assets_for(
+        "c1",
+        vec![pending("shot.png", "image/png", 2048)],
+        false,
+        Instant::now(),
+    );
+    let note = asset::reference_note(&registered.refs, false).expect("a note");
+
+    assert!(!registered.fetchable);
+    assert!(!note.contains("Chat Asset #"), "{note}");
+    assert!(note.contains("cannot be shown images"), "{note}");
+    assert!(!note.contains("fetch_chat_asset"), "{note}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
+    // A model that asked for the wrong number can say so and carry on. Ending the session would
+    // turn a recoverable turn into the fixed failure line.
+    let store = Arc::new(asset_store());
+    store.assets_for(
+        "c1",
+        vec![pending("shot.png", "image/png", 10)],
+        true,
+        Instant::now(),
+    );
+    let assets = SessionAssets::new(
+        Arc::clone(&store),
+        "c1".to_owned(),
+        None,
+        tokio::runtime::Handle::current(),
+        true,
+        true,
+    );
+
+    let refusal = tokio::task::spawn_blocking(move || assets.fetch(99).expect_err("no such asset"))
+        .await
+        .expect("the blocking task completes");
+    assert!(refusal.contains("no Chat Asset #99"), "{refusal}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
+    // Four is a working allowance, not a tour of the conversation. The refusal is readable so the
+    // model answers with what it has rather than retrying.
+    let store = Arc::new(asset_store());
+    let arriving = (0..8)
+        .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
+        .collect();
+    store.assets_for("c1", arriving, true, Instant::now());
+    let assets = SessionAssets::new(
+        Arc::clone(&store),
+        "c1".to_owned(),
+        None,
+        tokio::runtime::Handle::current(),
+        true,
+        true,
+    );
+
+    let refusal = tokio::task::spawn_blocking(move || {
+        // No fetcher is wired, so each of these fails for its own reason; what matters is that the
+        // budget is spent by the attempt rather than by the success.
+        for id in 1..=4 {
+            let _ = assets.fetch(id);
+        }
+        assets.fetch(5).expect_err("the budget is spent")
+    })
+    .await
+    .expect("the blocking task completes");
+    assert!(refusal.contains("already opened"), "{refusal}");
+}
+
+#[test]
+fn a_redirect_away_from_slack_is_not_followed() {
+    // `client()` refuses redirects globally so a bearer token is never forwarded by policy. The
+    // one hop this transport follows by hand has to check the host itself, and a prefix comparison
+    // would accept the lookalike below.
+    assert!(crate::transport::slack::is_slack_file_url(
+        "https://files.slack.com/f/F0123/shot.png"
+    ));
+    assert!(!crate::transport::slack::is_slack_file_url(
+        "https://files.slack.com.evil.test/f/F0123/shot.png"
+    ));
+    assert!(!crate::transport::slack::is_slack_file_url(
+        "https://evil.test/?x=files.slack.com"
+    ));
+    // Credentials in the authority must not smuggle a host past the check either.
+    assert!(!crate::transport::slack::is_slack_file_url(
+        "https://files.slack.com@evil.test/f/F0123"
+    ));
+    // Plaintext would put the token on the wire in clear.
+    assert!(!crate::transport::slack::is_slack_file_url(
+        "http://files.slack.com/f/F0123"
+    ));
 }
 
 // ---------------------------------------------------------------------------

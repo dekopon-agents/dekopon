@@ -18,9 +18,12 @@ use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
-use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget, TransportError,
-    TransportIdentity, bound_inbound, floor_boundary,
+use crate::{
+    asset::{AssetSourceRef, PendingAsset},
+    transport::{
+        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget,
+        TransportError, TransportIdentity, bound_inbound, floor_boundary,
+    },
 };
 
 /// Redeliveries this transport remembers across reconnects.
@@ -35,8 +38,8 @@ const DEDUP_CAPACITY: usize = 1024;
 /// thread reply the sender also sent to the channel, and `me_message` is `/me`; both are ordinary
 /// text a person typed.
 const REQUEST_SUBTYPES: [&str; 3] = ["file_share", "me_message", "thread_broadcast"];
-/// Files named individually in one attachment note.
-const MAX_NAMED_ATTACHMENTS: usize = 10;
+/// Attachments taken from one message.
+const MAX_ATTACHMENTS: usize = 10;
 /// Ceiling on one file name inside an attachment note.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 /// Ceiling on reconnect backoff.
@@ -218,10 +221,11 @@ impl SlackTransport {
             return Ok(None);
         };
         // Text is optional rather than required because an upload posted with no comment carries
-        // none, and the attachment note is then the whole message. A message with neither text nor
-        // a file is not a request and is dropped just below.
-        let text = compose_inbound(event["text"].as_str().unwrap_or_default(), &event["files"]);
-        if text.trim().is_empty() {
+        // none, and the attachment is then the whole message. A message with neither text nor a
+        // file is not a request and is dropped just below.
+        let text = bound_inbound(event["text"].as_str().unwrap_or_default());
+        let assets = pending_assets(&event["files"]);
+        if text.trim().is_empty() && assets.is_empty() {
             return Ok(None);
         }
         if !self.seen.insert(format!("{channel}:{ts}")) {
@@ -266,6 +270,7 @@ impl SlackTransport {
             conversation_id,
             message_id: ts.to_owned(),
             text,
+            assets,
             conversation,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
@@ -338,6 +343,10 @@ impl ChatTransport for SlackTransport {
 
     fn replier(&self) -> Arc<dyn ChatReplier> {
         Arc::clone(&self.replier) as Arc<dyn ChatReplier>
+    }
+
+    fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
+        Some(Arc::clone(&self.replier) as Arc<dyn AssetFetcher>)
     }
 }
 
@@ -425,63 +434,139 @@ impl Dedup {
     }
 }
 
-/// The text a model sees for one message: what the sender typed, plus what they attached.
+/// Describes the files on one message so the session can number them.
 ///
-/// Bounded as a whole rather than in pieces, so the [`MAX_INBOUND_TEXT_BYTES`] invariant on
-/// [`InboundMessage::text`] still holds for a message that carries both. The note goes last
-/// because the comment is the request and the attachment is context for it.
+/// Name and media type come from the event and are sender-controlled, so they are untrusted
+/// exactly like the message text. A file the app cannot see at all arrives without an id or a URL —
+/// Slack withholds both when the token lacks `files:read` on it — and is skipped rather than
+/// registered as an asset nothing could resolve.
+fn pending_assets(files: &Value) -> Vec<PendingAsset> {
+    let Some(files) = files.as_array() else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .take(MAX_ATTACHMENTS)
+        .map(|file| {
+            // `url_private_download` rather than `url_private`: the former serves the bytes, the
+            // latter serves Slack's own viewer page for some types. Both are absent, along with the
+            // id, when the token has no access to this file — the asset is still described, with no
+            // way to resolve it.
+            let source = file["id"].as_str().zip(
+                file["url_private_download"]
+                    .as_str()
+                    .or_else(|| file["url_private"].as_str()),
+            );
+            let name = file["name"].as_str().unwrap_or("attachment");
+            let name = name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)].to_owned();
+            PendingAsset {
+                name,
+                mime: file["mimetype"].as_str().unwrap_or_default().to_owned(),
+                size: file["size"].as_u64().unwrap_or_default(),
+                source: source.map(|(file_id, url)| AssetSourceRef::Slack {
+                    file_id: file_id.to_owned(),
+                    url: url.to_owned(),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// The one redirect hop a Slack file download is allowed to take.
 ///
-/// [`MAX_INBOUND_TEXT_BYTES`]: crate::transport::MAX_INBOUND_TEXT_BYTES
-fn compose_inbound(text: &str, files: &Value) -> String {
-    match attachment_note(files) {
-        None => bound_inbound(text),
-        Some(note) if text.trim().is_empty() => bound_inbound(&note),
-        Some(note) => bound_inbound(&format!("{text}\n\n{note}")),
+/// `client()` refuses redirects globally, which is the right default for an API call carrying a
+/// bearer token — a redirect there would forward the credential to whatever host answered.
+/// `url_private_download` genuinely does redirect, to Slack's own file host, so this transport
+/// follows exactly one hop and only to a host it recognises, re-attaching the token itself rather
+/// than letting a redirect policy carry it anywhere.
+const SLACK_FILE_HOSTS: [&str; 2] = ["files.slack.com", "slack.com"];
+
+impl AssetFetcher for SlackReplier {
+    fn fetch(
+        &self,
+        source: &AssetSourceRef,
+        max_bytes: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        let AssetSourceRef::Slack { url, .. } = source;
+        let url = url.clone();
+        Box::pin(async move {
+            let mut response = self.get_file(&url).await?;
+            // One hop, and only to a Slack file host. Anything else is a redirect this transport
+            // will not carry a bot token to.
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or(TransportError::Response)?
+                    .to_owned();
+                if !is_slack_file_url(&location) {
+                    return Err(TransportError::Response);
+                }
+                response = self.get_file(&location).await?;
+            }
+            if !response.status().is_success() {
+                return Err(TransportError::Service {
+                    code: response.status().as_u16().to_string(),
+                });
+            }
+            // Streamed against the ceiling rather than buffered and measured afterwards. The
+            // reported size is sender-influenced metadata and a chunked response need not declare
+            // a length at all, so the only bound that holds is the one applied while reading.
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?
+            {
+                if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
+                    return Err(TransportError::Service {
+                        code: "asset-too-large".to_owned(),
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
+        })
     }
 }
 
-/// Describes the files on a message, because their existence is all the gateway knows about them.
-///
-/// Handed only the comment on an upload, a model answers as though nothing was attached — the
-/// sender watches their screenshot be denied rather than declined, which reads as the gateway
-/// having lost it. Saying what arrived and that it cannot be read is the honest version.
-///
-/// Contents are never fetched. Reading a Slack file needs the `files:read` scope, which the app
-/// manifest deliberately does not request, and a gateway that downloaded sender-supplied bytes on
-/// a model's behalf would be claiming an authority this process does not hold. Names and media
-/// types come from the event, so they are sender-controlled and untrusted exactly like the text
-/// they are appended to. A file the app cannot see at all arrives without a name; it still counts,
-/// because "one file you cannot read" is more accurate than silence.
-fn attachment_note(files: &Value) -> Option<String> {
-    let files = files.as_array()?;
-    let count = files.len();
-    if count == 0 {
-        return None;
+impl SlackReplier {
+    /// One authenticated GET against a Slack file URL, without following redirects.
+    async fn get_file(&self, url: &str) -> Result<reqwest::Response, TransportError> {
+        self.http
+            .get(url)
+            .header(
+                "authorization",
+                format!("Bearer {}", self.bot_token.expose()),
+            )
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))
     }
-    let named: Vec<String> = files
+}
+
+/// Whether a redirect target is a Slack file host this transport will re-authenticate to.
+///
+/// Compares the host itself rather than a prefix of the URL, so `https://files.slack.com.evil.test`
+/// is not mistaken for Slack.
+pub(crate) fn is_slack_file_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next_back()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    SLACK_FILE_HOSTS
         .iter()
-        .take(MAX_NAMED_ATTACHMENTS)
-        .filter_map(|file| {
-            let name = file["name"].as_str()?;
-            let name = &name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)];
-            match file["mimetype"].as_str() {
-                Some(mimetype) => Some(format!("{name} ({mimetype})")),
-                None => Some(name.to_owned()),
-            }
-        })
-        .collect();
-    let noun = if count == 1 { "file" } else { "files" };
-    let mut note = format!("[gateway: the sender attached {count} {noun} the gateway cannot read");
-    if !named.is_empty() {
-        note.push_str(": ");
-        note.push_str(&named.join(", "));
-        let unnamed = count - named.len();
-        if unnamed > 0 {
-            note.push_str(&format!(", and {unnamed} more"));
-        }
-    }
-    note.push(']');
-    Some(note)
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
 /// One HTTP client shared across a transport's calls, with redirects refused.

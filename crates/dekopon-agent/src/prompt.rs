@@ -5,11 +5,11 @@
 //! wants to do — inspect what it can reach, loop, branch, parse JSON, call capabilities — happens
 //! inside that script instead of across many small tool calls.
 
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
 use dekopon_model::model::{
-    ChatModel, CompletionOptions, ModelError, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
-    assistant_message,
+    ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool, ModelToolCall,
+    ModelUsage, assistant_message,
 };
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
@@ -27,6 +27,9 @@ pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, Histor
 /// tool called `bash`, and almost all of them transfer: pipelines, `&&`, `$( )`, exit codes. The
 /// description below spends its length on the places where those priors are wrong.
 pub const SCRIPT_TOOL_NAME: &str = "bash";
+
+/// The tool a model calls to look at something a person attached to their message.
+pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 
 /// Tool calls a single model turn may request.
 ///
@@ -62,6 +65,50 @@ pub trait ScriptRuntime {
     fn command_words(&self) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// One attachment, fetched.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FetchedAsset {
+    /// The name the sender gave it.
+    pub name: String,
+    /// IANA media type.
+    pub mime: String,
+    /// The bytes themselves.
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for FetchedAsset {
+    /// Summarised rather than printed, for the same reason [`ContentPart`] is.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FetchedAsset")
+            .field("name", &self.name)
+            .field("mime", &self.mime)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+/// The attachments one conversation can show a model.
+///
+/// Deliberately pull rather than push. A screenshot costs tokens on every turn it appears in, and
+/// most turns do not need to look at it — so the prompt carries a one-line reference and the model
+/// spends the bytes only when it decides the answer depends on them.
+///
+/// Every refusal is a `String` the model reads, never an error that ends the session: an asset that
+/// is too large, expired, or simply not there is something a model can work around by saying so,
+/// and killing a session over it would turn a recoverable answer into silence. The implementation
+/// owns its own budget for the same reason the shell runtime owns its capability budget.
+pub trait AssetSource {
+    /// Returns one asset's bytes, or a reason the model can read.
+    fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
+
+    /// Whether this conversation has any attachments at all.
+    ///
+    /// The tool is not offered when it answers `true`, because a tool that can only fail is a tool
+    /// a model will still try.
+    fn is_empty(&self) -> bool;
 }
 
 /// Bounds on one prompt session.
@@ -184,6 +231,87 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
+    run_prompt_session(
+        model,
+        runtime,
+        SessionInputs::new(prompt, limits)
+            .with_system(system)
+            .with_options(options),
+        history,
+    )
+}
+
+/// Everything one bounded session needs beyond the model and the script runtime.
+///
+/// A builder rather than more parameters: the entry point above already carries seven, and each
+/// capability a session gains would otherwise add both a parameter and a longer function name to
+/// every caller that does not want it. Fields are private so a later addition stays additive.
+pub struct SessionInputs<'a> {
+    prompt: &'a str,
+    system: Option<&'a str>,
+    limits: PromptLimits,
+    options: Option<&'a CompletionOptions>,
+    assets: Option<&'a dyn AssetSource>,
+}
+
+impl<'a> SessionInputs<'a> {
+    /// The two things every session has: what was asked, and what it may spend answering.
+    #[must_use]
+    pub const fn new(prompt: &'a str, limits: PromptLimits) -> Self {
+        Self {
+            prompt,
+            system: None,
+            limits,
+            options: None,
+            assets: None,
+        }
+    }
+
+    /// Standing instructions, supplied fresh per call and never remembered.
+    #[must_use]
+    pub const fn with_system(mut self, system: Option<&'a str>) -> Self {
+        self.system = system;
+        self
+    }
+
+    /// Per-request model options, such as a prompt cache key.
+    #[must_use]
+    pub const fn with_options(mut self, options: &'a CompletionOptions) -> Self {
+        self.options = Some(options);
+        self
+    }
+
+    /// The attachments this conversation can show the model.
+    #[must_use]
+    pub const fn with_assets(mut self, assets: &'a dyn AssetSource) -> Self {
+        self.assets = Some(assets);
+        self
+    }
+}
+
+/// Runs one bounded prompt/tool session from a [`SessionInputs`].
+///
+/// The general form of [`run_prompt_with_history_and_options`], which is this function with the
+/// defaults filled in.
+pub fn run_prompt_session<M, R>(
+    model: &M,
+    runtime: &R,
+    inputs: SessionInputs<'_>,
+    history: &mut History,
+) -> Result<PromptOutcome, PromptError>
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
+    let SessionInputs {
+        prompt,
+        system,
+        limits,
+        options,
+        assets,
+    } = inputs;
+    let fallback = CompletionOptions::default();
+    let options = options.unwrap_or(&fallback);
     if limits.max_steps == 0 {
         // Nothing is recorded here: a zero-step session builds no request, so the prompt never
         // reached a model and the conversation must not claim otherwise.
@@ -199,7 +327,7 @@ where
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
-    let result = run_session(model, runtime, messages, limits, options);
+    let result = run_session(model, runtime, messages, limits, options, assets);
     history.record(match &result {
         Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
         Err(_) => ConversationTurn::unanswered(prompt),
@@ -217,12 +345,19 @@ fn run_session<M, R>(
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
     options: &CompletionOptions,
+    assets: Option<&dyn AssetSource>,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
-    let model_tools = vec![script_tool(&runtime.command_words())];
+    // Offered only when this conversation actually carries something. A tool that can only fail is
+    // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
+    let assets = assets.filter(|source| !source.is_empty());
+    let mut model_tools = vec![script_tool(&runtime.command_words())];
+    if assets.is_some() {
+        model_tools.push(asset_tool());
+    }
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -356,6 +491,12 @@ where
             if call.id.trim().is_empty() {
                 reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
                 return Err(PromptError::EmptyToolCallId);
+            }
+            if call.function.name == ASSET_TOOL_NAME
+                && let Some(source) = assets
+            {
+                fetch_asset_into(&mut messages, source, &call, model_turns, tool_call_index)?;
+                continue;
             }
             // The model-selected name is deliberately not copied into telemetry: it is untrusted
             // model output, and an operator reads it from the error on stderr instead.
@@ -506,6 +647,148 @@ fn script_tool(command_words: &[String]) -> ModelTool {
     }
 }
 
+/// Media types whose bytes are readable as a tool result rather than as an attachment.
+///
+/// A model reads these as text, so routing them through an attachment part would encode a file it
+/// could simply have been handed. Everything else — an image, a PDF, an office document — has to
+/// arrive as a content part instead.
+fn is_textual(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || matches!(
+            mime,
+            "application/json" | "application/xml" | "application/x-yaml" | "application/yaml"
+        )
+}
+
+fn asset_tool() -> ModelTool {
+    ModelTool {
+        name: ASSET_TOOL_NAME.to_owned(),
+        description: "Look at a file someone attached to their chat message. The conversation \
+                      names each one as `Chat Asset #N`; pass that number. Call this when \
+                      answering depends on what the file actually contains."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "The number from the `Chat Asset #N` reference in the conversation."
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Answers one `fetch_chat_asset` call by appending the tool result and, when the asset is not
+/// text, the message that actually carries it.
+///
+/// Two messages rather than one because **a tool result cannot carry an attachment**. Chat
+/// Completions types a `tool` message's content as a string, and the Responses API types
+/// `function_call_output.output` the same way; neither accepts an image part where a tool result
+/// goes. So the tool result says what happened and a following `user` message carries the bytes.
+/// This shape is the only one both wire formats accept — do not "simplify" it by attaching to the
+/// tool result.
+fn fetch_asset_into(
+    messages: &mut Vec<ModelMessage>,
+    source: &dyn AssetSource,
+    call: &ModelToolCall,
+    model_turn: u32,
+    tool_call_index: usize,
+) -> Result<(), PromptError> {
+    let id = match asset_argument(&call.function.name, &call.function.arguments) {
+        Ok(id) => id,
+        Err(error) => {
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            return Err(error);
+        }
+    };
+    let span = tracing::info_span!(
+        "prompt.asset_fetch",
+        model.turn = model_turn,
+        tool_call.index = tool_call_index,
+        asset.id = id,
+    );
+    let _entered = span.enter();
+    // A refusal is an outcome the model reads, not a failed session. Its text is gateway-authored
+    // rather than sender-supplied, so it is safe to record.
+    let asset = match source.fetch(id) {
+        Ok(asset) => asset,
+        Err(reason) => {
+            tracing::info!(
+                target: "dekopon_agent::audit",
+                { audit.event = "agent.asset.refused", asset.id = id, reason = reason.as_str() },
+                "chat asset refused"
+            );
+            messages.push(ModelMessage::tool(call.id.clone(), reason));
+            return Ok(());
+        }
+    };
+    // Size and media type, never the bytes and never the sender's file name, which is untrusted.
+    tracing::info!(
+        target: "dekopon_agent::audit",
+        {
+            audit.event = "agent.asset.fetched",
+            asset.id = id,
+            asset.mime = asset.mime.as_str(),
+            asset.bytes = asset.data.len(),
+        },
+        "chat asset fetched"
+    );
+    if is_textual(&asset.mime) {
+        let text = String::from_utf8_lossy(&asset.data).into_owned();
+        messages.push(ModelMessage::tool(call.id.clone(), text));
+        return Ok(());
+    }
+    messages.push(ModelMessage::tool(
+        call.id.clone(),
+        format!("Chat Asset #{id} follows in the next message."),
+    ));
+    let part = if asset.mime.starts_with("image/") {
+        ContentPart::Image {
+            mime: asset.mime,
+            data: asset.data,
+        }
+    } else {
+        ContentPart::File {
+            name: asset.name,
+            mime: asset.mime,
+            data: asset.data,
+        }
+    };
+    messages.push(ModelMessage::user_with_parts(vec![
+        ContentPart::Text(format!("Chat Asset #{id}:")),
+        part,
+    ]));
+    Ok(())
+}
+
+/// Extracts the `id` argument from one `fetch_chat_asset` call.
+fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    // Models write `5` and `"5"` for the same intent, and refusing the second would spend a turn
+    // teaching one that the conversation already told it the number.
+    let id = arguments.get("id").and_then(|id| match id {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    });
+    id.ok_or_else(|| PromptError::MissingAssetId {
+        tool: tool.to_owned(),
+    })
+}
+
 /// Extracts the `script` argument from one model tool call.
 fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
@@ -626,6 +909,12 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// Tool arguments carried no asset to fetch.
+    #[error("model arguments for tool {tool:?} must include an integer \"id\" field")]
+    MissingAssetId {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
     /// The model ended without text or a tool call.
     #[error("model returned neither tool calls nor a final answer")]
     EmptyAnswer,
@@ -653,6 +942,7 @@ impl PromptError {
             Self::InvalidArguments { .. } => "invalid-json-arguments",
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
             Self::MissingScript { .. } => "missing-script",
+            Self::MissingAssetId { .. } => "missing-asset-id",
             Self::EmptyAnswer => "empty-answer",
             Self::MaxSteps { .. } => "max-steps",
         }

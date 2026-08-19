@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod asset;
 mod cache_key;
 mod config;
 mod conversation;
@@ -28,7 +29,13 @@ mod transport;
 
 pub mod cli;
 
-use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
@@ -45,13 +52,15 @@ pub use session::SessionError;
 pub use transport::TransportError;
 
 use crate::{
+    asset::AssetStore,
     config::TransportConfig,
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{ConfiguredModels, SessionGate, SessionRunner},
     transport::{
-        ChatReplier, ChatTransport, ConversationKind, InboundMessage, TransportIdentity,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
+        TransportIdentity, local::LocalTransport, slack::SlackTransport,
+        telegram::TelegramTransport,
     },
 };
 
@@ -61,6 +70,13 @@ use crate::{
 /// growing a queue the daemon can never work through. Admission control refuses the overflow with
 /// a sentence, which is a better answer than an unbounded backlog.
 const INBOUND_BUFFER: usize = 64;
+
+/// How long a conversation's attachments stay addressable after its last message.
+///
+/// Longer than a route's default conversation idle timeout, because the reference lines live in
+/// replayed history and a number that resolved a minute ago should not stop resolving while the
+/// text naming it is still in the prompt.
+const ASSET_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The effective UID this daemon runs as, used for every ownership check.
 #[must_use]
@@ -122,6 +138,7 @@ where
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut identities = BTreeMap::new();
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
+    let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -139,6 +156,11 @@ where
         );
         identities.insert(spec.name().to_owned(), identity);
         repliers.insert(spec.name().to_owned(), transport.replier());
+        // Absent for a transport that carries no attachments, which is what makes the tool
+        // unavailable on a route bound to one.
+        if let Some(fetcher) = transport.asset_fetcher() {
+            asset_fetchers.insert(spec.name().to_owned(), fetcher);
+        }
         transports.push(transport);
     }
 
@@ -148,6 +170,13 @@ where
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
+        // Sized and expired like the conversation store, because an attachment reference outliving
+        // the conversation that introduced it is a number no prompt can still name.
+        assets: Arc::new(AssetStore::new(
+            config.sessions.max_conversations,
+            ASSET_IDLE_TIMEOUT,
+        )),
+        asset_fetchers,
     });
 
     let (sender, receiver) = mpsc::channel::<InboundMessage>(INBOUND_BUFFER);

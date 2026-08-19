@@ -60,6 +60,8 @@ models:
                                               # must be in a writable directory: refreshing rewrites it
     timeoutMs: 120000
     classes: [reasoning]
+    modalities: [image]                       # optional; default none. Only a model that declares
+                                              # this is offered chat assets.
 
 routes:                                       # first match wins, so order these deliberately
   - transport: scientist-slack
@@ -130,11 +132,36 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 - `disconnect` envelopes are routine (Slack rotates sockets on its own schedule) and trigger a reconnect with jittered exponential backoff capped at 60 seconds.
 - Messages carrying `bot_id` and messages from the bot's own user identifier are dropped. Both checks matter: another app's post carries `bot_id`, and this app's own post arrives with the bot's user identifier and no `bot_id` at all.
 - A subtyped message is dropped unless its subtype is `file_share`, `me_message`, or `thread_broadcast`. Most subtypes are events *about* a message — an edit, a deletion, a channel join — and answering one would answer a question twice or answer nobody. Those three are a person making a new request. `file_share` is the one worth naming: Slack stamps it on any message carrying an upload, so while every subtype was dropped, asking a question with a screenshot attached produced no answer at all. The list is an allowlist, so a subtype Slack introduces later is dropped until someone decides it is a request.
-- A message's attachments are described to the model and never fetched. The gateway appends a note naming each file and its media type — `[gateway: the sender attached 1 file the gateway cannot read: image.png (image/png)]` — because a model handed only the sender's comment denies the screenshot exists, which reads as the gateway having lost it. Reading the file itself would need the `files:read` scope the [app manifest](../examples/slack/manifest.yaml) deliberately does not request, and a gateway that downloaded sender-supplied bytes on a model's behalf would be claiming authority this process does not hold. Names and media types come from the event, so they are sender-controlled and untrusted exactly like the message text they are appended to. An upload posted with no comment is still a request: the note is then the whole message. A message with neither text nor a file is not a request and is dropped.
+- A message's attachments become **chat assets**, described in the prompt and fetched only on demand. See [Chat assets](#chat-assets) below. The transport reports what arrived and nothing more: names and media types come from the event, so they are sender-controlled and untrusted exactly like the message text. An upload posted with no comment is still a request — the reference note is then the whole message. A message with neither text nor a file is not a request and is dropped.
 - `channel_type: im` is a direct message; anything else is a channel.
 - Subject: `slack.<team>.<user>`, lowercased.
 - A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A direct message has no thread to join and answering in one would hide the reply.
 - An answer is posted in a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), which carries the model's CommonMark unchanged and lets Slack render it. The `text` field is mrkdwn — a proprietary syntax where bold is `*one asterisk*` and a link is `<url|label>` — so an answer posted through it alone arrives with `**bold**` as four literal asterisks, and tables and task lists cannot be expressed in it at all. Translating in this process would be a second translation of what Slack is about to translate, so the gateway does none: the block gets the answer verbatim. `text` is still sent as the notification fallback, the one place blocks do not render. The block caps a payload at 12,000 characters, which the 8 KiB outbound bound already sits under.
+
+## Chat assets
+
+A screenshot is part of the message that carried it. Slack delivers it by reference rather than by value, so the gateway resolves that reference — with the `files:read` scope and the bot token it already holds — in order to hear the whole request. This grants no policy, no provider credential, and no way to write anything.
+
+What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is *named* in the prompt and fetched only if the model decides the answer depends on it:
+
+```text
+what does this say?
+
+[gateway: the sender attached
+  Chat Asset #1 — screenshot.png (image/png, 214 KB)
+  recording.mov (video/quicktime, 41.3 MB) — not a type the gateway can show you
+  Call fetch_chat_asset with the number to look at one.]
+```
+
+The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry an image — Chat Completions types a `tool` message's content as a string, and the Responses API types `function_call_output.output` the same way — the answer arrives as two messages: the tool result says the asset follows, and a `user` message carries the bytes. That shape is the only one both wire formats accept.
+
+- **Numbering is per conversation and monotonic.** `Chat Asset #5` means one file for as long as the reference line naming it is being replayed, which is what lets a follow-up three turns later resolve. Numbers are assigned by the gateway rather than by a transport, so two transports cannot collide inside one conversation.
+- **The reference line is what history remembers, not the bytes.** It is a few dozen bytes, so it replays inside the conversation byte budget instead of evicting real conversation the way a base64 screenshot would.
+- **A file that cannot be shown is still named.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so. Ignoring it is what made the gateway deny a screenshot that plainly existed.
+- **Only the media types a model can actually accept are offered:** `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Slack imposes no allowlist on uploads at all, so the narrow end of that intersection is the one worth enforcing. Documents are a separate content type and are not carried yet.
+- **A route's model has to opt in.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. The tool is not offered at all to a route whose model has not opted in.
+- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
+- **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. `url_private_download` genuinely redirects to Slack's own file host, so the transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
 
 ### Telegram long polling
 
