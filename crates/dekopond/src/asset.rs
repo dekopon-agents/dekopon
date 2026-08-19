@@ -181,6 +181,15 @@ impl AssetStore {
     }
 
     /// Registers what one message carried and reports what a model may be shown.
+    ///
+    /// The two halves answer different questions, and conflating them was a bug worth naming. The
+    /// returned refs are *this message's* attachments, because those are the ones a new reference
+    /// note describes. Whether the tool is offered depends on the whole **conversation**: a
+    /// follow-up carries no attachment of its own, and gating on that would withdraw the tool
+    /// exactly when someone asks a second question about the screenshot they already sent — the
+    /// reference line still sitting in replayed history, and nothing able to act on it. A model in
+    /// that position answers from the earlier description instead of looking, which reads as
+    /// confidently making things up.
     pub fn assets_for(
         &self,
         conversation: &str,
@@ -189,10 +198,28 @@ impl AssetStore {
         now: Instant,
     ) -> Registered {
         let refs = self.register(conversation, arriving, now);
-        let fetchable = refs
-            .iter()
-            .any(|asset| asset.is_fetchable(images_supported));
+        let fetchable = self.any_fetchable(conversation, images_supported, now);
         Registered { refs, fetchable }
+    }
+
+    /// Whether this conversation still holds anything a model could be shown.
+    ///
+    /// Touches the entry, so a conversation that keeps talking keeps its attachments addressable
+    /// for as long as the reference lines naming them are being replayed.
+    fn any_fetchable(&self, conversation: &str, images_supported: bool, now: Instant) -> bool {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::expire(&mut entries, self.idle_timeout, now);
+        let Some(entry) = entries.get_mut(conversation) else {
+            return false;
+        };
+        entry.touched = now;
+        entry
+            .assets
+            .iter()
+            .any(|asset| asset.is_fetchable(images_supported))
     }
 
     /// Looks one attachment up by the number a model named.
