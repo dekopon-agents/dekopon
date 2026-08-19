@@ -1,0 +1,169 @@
+# dekopon-brokerd — the only process in this example that holds any authority.
+#
+# It owns the socket, policy, constraint sets, GitHub credential, and audit chain. The gateway
+# holds none of those; it holds Slack credentials and access to a model endpoint.
+#
+# Hygiene, all checked at startup and all fatal:
+#   chmod 0600 broker.yaml policies.cedar
+#   chmod 0600 broker-credentials.yaml     # 0o077 — group/world *readable* is refused too
+#   chmod 0700 ~/.local/run/dekopon ~/.local/state/dekopon
+# Every relative path below resolves against this file's own directory, so the example runs from a
+# checkout without editing repository paths. The absolute `/home/xavier/...` paths are runtime
+# state and are the ones to change.
+apiVersion: dekopon.dev/brokerd/v1alpha1
+
+socketPath: /home/xavier/.local/run/dekopon/broker.sock
+auditPath: /home/xavier/.local/state/dekopon/audit.jsonl
+checkpointPath: /home/xavier/.local/state/dekopon/audit-checkpoint.json
+checkpointLockPath: /home/xavier/.local/state/dekopon/audit-checkpoint.lock
+
+brokerPrincipal: local-broker
+policyRevision: pr-summarizer-linter-2026-01
+
+# Copy broker-credentials.yaml.example, fill in the PAT, and `chmod 600` it. Startup fails closed
+# if it is missing, group-readable, or names no `github-pat`.
+credentialsPath: broker-credentials.yaml
+policiesPath: policies.cedar
+
+# This deployment's provider set is fixed and checked in. A capability typo is a mistake, not an
+# anticipation, so refuse startup instead of warning.
+strict: true
+
+providers:
+  # The checked-in gh component: 19 narrow GitHub capabilities and no `gh.api.*` passthrough.
+  # It must be a regular single-link file owned by this UID under owner-controlled directories.
+  - ../providers/gh-provider.wasm
+
+identities:
+  # 501 is the server's own UID, which is what the owner-only socket currently permits. Change it
+  # to your own (`id -u`). In this single-UID deployment the attestor grant buys attribution and
+  # deny-by-default scoping, not process isolation.
+  - uid: 501
+    principal: dekopond-gateway
+    actor:
+      type: service
+      principal: dekopond-gateway
+    attestor:
+      # Segment-boundary prefixes, service name first. This lets the gateway name Slack subjects
+      # in this workspace; it resolves none of them to a principal.
+      namespaces: [slack.t0123abcd]
+
+identityMappings:
+  # The only place a Slack user becomes a principal. An unmapped sender reaches nothing.
+  - subject: slack.t0123abcd.u0123abcd
+    principal: maintainer
+
+constraintSets:
+  # One entry per capability policy may reach. A capability with no entry is denied
+  # `unconstrained-capability` before Cedar is consulted.
+  #
+  # Every read also carries `credential: github-pat`: a private repository returns 404 without
+  # authentication. The credential is destination-bound to api.github.com and injected inside the
+  # broker's native HTTP engine; the model, shell session, and guest component never observe it.
+  gh.content.read:
+    provider: gh
+    effect: read-only
+    risk: Low
+    idempotency: idempotent
+    credential: github-pat
+    constraints:
+      timeoutMs: 10000
+      maxOutputBytes: 262144
+      http:
+        allowedHosts: [api.github.com]
+        allowedMethods: [GET]
+        maxRequests: 1
+        maxRequestBytes: 16384
+        maxResponseBytes: 2097152
+        allowPlaintextLoopback: false
+  gh.pull-request.read:
+    provider: gh
+    effect: read-only
+    risk: Low
+    idempotency: idempotent
+    credential: github-pat
+    constraints:
+      timeoutMs: 10000
+      maxOutputBytes: 32768
+      http:
+        allowedHosts: [api.github.com]
+        allowedMethods: [GET]
+        maxRequests: 1
+        maxRequestBytes: 16384
+        maxResponseBytes: 262144
+        allowPlaintextLoopback: false
+  gh.pull-request.files:
+    provider: gh
+    effect: read-only
+    risk: Low
+    idempotency: idempotent
+    credential: github-pat
+    constraints:
+      timeoutMs: 10000
+      maxOutputBytes: 131072
+      http:
+        allowedHosts: [api.github.com]
+        allowedMethods: [GET]
+        maxRequests: 1
+        maxRequestBytes: 16384
+        maxResponseBytes: 1048576
+        allowPlaintextLoopback: false
+  gh.pull-request.diff:
+    provider: gh
+    effect: read-only
+    risk: Low
+    idempotency: idempotent
+    credential: github-pat
+    constraints:
+      timeoutMs: 10000
+      maxOutputBytes: 262144
+      http:
+        allowedHosts: [api.github.com]
+        allowedMethods: [GET]
+        maxRequests: 1
+        maxRequestBytes: 16384
+        maxResponseBytes: 2097152
+        allowPlaintextLoopback: false
+  gh.pull-request.status:
+    provider: gh
+    effect: read-only
+    risk: Low
+    idempotency: idempotent
+    credential: github-pat
+    constraints:
+      timeoutMs: 10000
+      maxOutputBytes: 131072
+      http:
+        allowedHosts: [api.github.com]
+        # The provider first reads the pull request to discover its head SHA, then its check runs.
+        allowedMethods: [GET]
+        maxRequests: 2
+        maxRequestBytes: 16384
+        maxResponseBytes: 1048576
+        allowPlaintextLoopback: false
+  gh.pull-request.comment:
+    provider: gh
+    effect: external-write
+    risk: Medium
+    idempotency: conditional
+    credential: github-pat
+    constraints:
+      timeoutMs: 15000
+      maxOutputBytes: 8192
+      http:
+        allowedHosts: [api.github.com]
+        # The write pre-reads the pull request, then posts one COMMENT review pinned to that head.
+        allowedMethods: [GET, POST]
+        maxRequests: 2
+        maxRequestBytes: 16384
+        maxResponseBytes: 262144
+        allowPlaintextLoopback: false
+
+# Optional. Uncomment to export broker spans; the ingest token is read from
+# OTEL_EXPORTER_OTLP_HEADERS by the SDK and never appears in this file.
+# telemetry:
+#   endpoint: http://127.0.0.1:5080/api/default
+#   transport: http
+#   serviceName: dekopon-brokerd
+#   exportTimeoutMs: 5000
+#   telemetryPayloads: false

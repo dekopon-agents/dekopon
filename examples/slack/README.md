@@ -1,49 +1,44 @@
-# Slack app for the dekopond gateway
+# Slack setup
 
-[`manifest.yaml`](manifest.yaml) creates a Socket Mode Slack app with the minimum
-surface the gateway consumes: DM events, explicit @-mentions in channels, and reply
-authority. The manifest's own comments walk through creation and the two tokens.
+This directory contains the Slack app used by the
+[PR summarizer and linter](../pr-summarizer-linter/README.md). It receives direct messages and
+explicit channel mentions over Socket Mode, opens supported attachments on demand, and posts
+replies. No public endpoint is needed.
 
-This is step one of the [rubber-stamper walkthrough](../rubber-stamper/README.md), which
-carries it through to a boss DMing a bot and a pull request getting approved under a
-broker-held credential nothing in the session can see.
+## Create the app
 
-## From app to a running gateway
-
-1. Create the app from the manifest (https://api.slack.com/apps → From a manifest).
-2. Generate an app-level token with `connections:write` (`xapp-...`) and install the
-   app to the workspace for the bot token (`xoxb-...`).
-3. Export both under the names your dekopond config declares:
+1. Open [Your Apps](https://api.slack.com/apps), select **Create New App → From a manifest**, choose
+   a workspace, and paste [`manifest.yaml`](manifest.yaml).
+2. Under **Basic Information → App-Level Tokens**, create a token with `connections:write`. Save the
+   resulting `xapp-…` value.
+3. Under **Install App**, install the app to the workspace. Save the bot token (`xoxb-…`).
+4. Export both tokens using the names in `dekopond.yaml`:
 
    ```console
    export DEKOPOND_SLACK_APP_TOKEN=xapp-...
    export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
    ```
 
-   ```yaml
-   # dekopond.yaml
-   transports:
-     - name: workspace-slack
-       kind: slackSocketMode
-       appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
-       botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
-   ```
+The manifest already enables Socket Mode, the app Home messages tab, and the minimum bot scopes for
+DMs, mentions, replies, and attachment reads.
 
-4. Map the humans. The broker — not the gateway — decides who a Slack user is, from
-   canonical subjects in its owner-only configuration. The team ID is the `T...` value
-   in the workspace URL (or `auth.test`); member IDs are the `U...` values under a
-   profile's "Copy member ID". Both are lowercased into the canonical form:
+## Allow a sender
 
-   ```yaml
-   # broker.yaml
-   identityMappings:
-     - subject: slack.t0123abc.u9xyz
-       principal: cpetersen
-   ```
+Find the workspace team ID (`T…`) and the sender’s member ID (`U…`, available from **Copy member
+ID** in their profile). Lowercase both and add the canonical subject to `broker.yaml`:
 
-   An unmapped sender is refused before any model call, so the app can be installed
-   workspace-wide without widening who can actually reach an agent.
+```yaml
+identityMappings:
+  - subject: slack.t0123abc.u9xyz
+    principal: maintainer
+```
 
-A message the app cannot see (a channel it is not in, an unaddressed channel message)
-never reaches dekopond at all; a message it can see still has to pass the broker's
-attestor grant, identity mapping, and policy before an agent does anything.
+Also make sure the gateway identity’s attestor namespace covers that workspace:
+
+```yaml
+attestor:
+  namespaces: [slack.t0123abc]
+```
+
+An unmapped sender is refused before any model call. In channels, the app responds only when it is
+mentioned; direct messages route normally.

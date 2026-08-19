@@ -35,7 +35,7 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
 - Bounded per-sender conversation history on `mode: persistent` routes, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key.
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
-- A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/rubber-stamper` end-to-end walkthrough.
+- A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/pr-summarizer-linter` end-to-end walkthrough.
 
 Version 0.3.0 is published as provenance-attested CLI archives and a Git tag covering 20 public crates. Those crates were never uploaded: crates.io publication is a separate manual dispatch that has not been run, so crates.io still holds the 17 packages of `0.2.0`. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
 

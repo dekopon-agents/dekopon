@@ -235,7 +235,7 @@ fn agent_prompt_matches_the_named_agent_only() {
         @id("prompt-gate")
         permit(principal == Dekopon::Principal::"cpetersen",
                action == Dekopon::Action::"agent.prompt",
-               resource == Dekopon::Agent::"xaviers-rubber-stamper")
+               resource == Dekopon::Agent::"pr-summarizer-linter")
         when { context has via && context.via == "dekopond-gateway" };
         "#,
         &world(),
@@ -244,7 +244,7 @@ fn agent_prompt_matches_the_named_agent_only() {
 
     let allowed = engine.authorize(prompt_request(
         "cpetersen",
-        "xaviers-rubber-stamper",
+        "pr-summarizer-linter",
         via("dekopond-gateway"),
     ));
     assert!(allowed.allowed);
@@ -264,7 +264,7 @@ fn agent_prompt_matches_the_named_agent_only() {
         !engine
             .authorize(prompt_request(
                 "direct-caller",
-                "xaviers-rubber-stamper",
+                "pr-summarizer-linter",
                 via("dekopond-gateway"),
             ))
             .allowed

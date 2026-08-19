@@ -214,13 +214,13 @@ identities:
       namespaces: [slack.t0123abc]     # segment-boundary prefixes, service name first
 identityMappings:
   - subject: slack.t0123abc.u9xyz      # canonical: lowercase dotted segments
-    principal: cpetersen               # the only place a subject becomes a principal
+    principal: maintainer              # the only place a subject becomes a principal
 constraintSets:
   # One entry per capability the policy below may reach; the reads are elided here.
-  gh.pull-request.approve:
+  gh.pull-request.comment:
     provider: gh
     effect: external-write
-    risk: High
+    risk: Medium
     idempotency: conditional
     credential: github-pat
     constraints:
@@ -242,21 +242,22 @@ constraintSets:
 // person drive this agent at all, and through which gateway. The second is what that session may
 // then reach. Neither implies the other.
 
-@id("rubber-stamper-session")
-permit(principal == Dekopon::Principal::"cpetersen",
+@id("maintainer-may-prompt-pr-summarizer-linter")
+permit(principal == Dekopon::Principal::"maintainer",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"xaviers-rubber-stamper")
+       resource == Dekopon::Agent::"pr-summarizer-linter")
 when { context has via && context.via == "dekopond-gateway" };
 
-@id("rubber-stamper-github")
-permit(principal == Dekopon::Principal::"cpetersen",
+@id("pr-summarizer-linter-gh-surface")
+permit(principal == Dekopon::Principal::"maintainer",
        action in [Dekopon::Action::"gh.content.read",
                   Dekopon::Action::"gh.pull-request.read",
-                  Dekopon::Action::"gh.pull-request.list",
                   Dekopon::Action::"gh.pull-request.files",
-                  Dekopon::Action::"gh.pull-request.approve"],
+                  Dekopon::Action::"gh.pull-request.diff",
+                  Dekopon::Action::"gh.pull-request.status",
+                  Dekopon::Action::"gh.pull-request.comment"],
        resource == Dekopon::Provider::"gh")
-when { context has agent && context.agent == "xaviers-rubber-stamper"
+when { context has agent && context.agent == "pr-summarizer-linter"
     && context has via && context.via == "dekopond-gateway" };
 ```
 
