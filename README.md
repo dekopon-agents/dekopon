@@ -82,7 +82,18 @@ tar xzf dekopon-0.4.0-aarch64-apple-darwin.tar.gz
 
 ### crates.io
 
-**`0.4.0` is not on crates.io, and neither is `0.3.0`.** Both tags and both GitHub releases exist; crates.io publication is a deliberately separate manual workflow dispatch (see [Maintainer release process](#maintainer-release-process)) that has not been run for either version. `cargo install --locked dekopon` today installs `0.2.0`, and the three crates added in `0.3.0` — `dekopon-agent`, `dekopon-policy`, and `dekopond` — do not exist on crates.io under any version. Use Homebrew, the release archives, the container image, or a checkout to get `0.4.0`.
+All twenty public crates are on crates.io at `0.4.0`:
+
+```console
+cargo install --locked dekopon
+cargo install --locked dekopon-run
+cargo install --locked dekopon-brokerd
+cargo install --locked dekopond
+```
+
+`0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
+
+Publication is a separate manual workflow dispatch rather than a tag-push side effect (see [Maintainer release process](#maintainer-release-process)), so a tag can exist for a while before its crates do.
 
 ### From a checkout
 
