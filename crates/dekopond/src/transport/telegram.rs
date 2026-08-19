@@ -11,10 +11,16 @@ use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget, TransportError,
-    TransportIdentity, bound_inbound,
+use crate::{
+    asset::{AssetSourceRef, PendingAsset},
+    transport::{
+        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget,
+        TransportError, TransportIdentity, bound_inbound, floor_boundary,
+    },
 };
+
+/// Ceiling on one attachment's file name.
+const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 
 /// Server-side wait per poll, in seconds. Telegram's own ceiling is fifty.
 const POLL_SECONDS: u64 = 50;
@@ -100,14 +106,23 @@ impl TelegramTransport {
     }
 
     fn routable(&self, message: &Value) -> Result<Option<InboundMessage>, TransportError> {
-        let (Some(from), Some(chat), Some(text), Some(message_id)) = (
+        let (Some(from), Some(chat), Some(message_id)) = (
             message["from"].as_object(),
             message["chat"].as_object(),
-            message["text"].as_str(),
             message["message_id"].as_i64(),
         ) else {
             return Ok(None);
         };
+        // A message carrying a photo or a document puts its words in `caption`; only a plain
+        // message has `text`. Reading just `text` is what made an upload invisible here.
+        let text = message["text"]
+            .as_str()
+            .or_else(|| message["caption"].as_str())
+            .unwrap_or_default();
+        let assets = Self::pending_assets(message);
+        if text.trim().is_empty() && assets.is_empty() {
+            return Ok(None);
+        }
         // Loop prevention: a bot's own posts and every other bot's come back marked.
         if from.get("is_bot").and_then(Value::as_bool) == Some(true) {
             return Ok(None);
@@ -144,12 +159,52 @@ impl TelegramTransport {
             conversation_id,
             message_id: message_id.to_string(),
             text: bound_inbound(text),
-            // Telegram attachments are not carried yet: a photo arrives as a `file_id` needing a
-            // `getFile` round trip before it can be downloaded, which is its own fetch path.
-            assets: Vec::new(),
+            assets,
             conversation,
             reply: ReplyTarget::Telegram { chat_id, reply_to },
         }))
+    }
+
+    /// Describes the photo or document on one message so the session can number it.
+    ///
+    /// A photo arrives as an array of the same image at several sizes, smallest first. The largest is
+    /// the one worth showing a model — the small ones are thumbnails, and a model asked to read text in
+    /// a screenshot cannot read a 90-pixel-wide copy of it.
+    ///
+    /// Telegram reports no media type for a photo, so one is inferred: the Bot API re-encodes every
+    /// photo to JPEG, while a file sent as a *document* keeps its own bytes and its own declared type.
+    fn pending_assets(message: &Value) -> Vec<PendingAsset> {
+        if let Some(photo) = message["photo"].as_array()
+            && let Some(largest) = photo
+                .iter()
+                .max_by_key(|size| size["file_size"].as_u64().unwrap_or_default())
+            && let Some(file_id) = largest["file_id"].as_str()
+        {
+            return vec![PendingAsset {
+                name: "photo.jpg".to_owned(),
+                mime: "image/jpeg".to_owned(),
+                size: largest["file_size"].as_u64().unwrap_or_default(),
+                source: Some(AssetSourceRef::Telegram {
+                    file_id: file_id.to_owned(),
+                }),
+            }];
+        }
+        let document = &message["document"];
+        if let Some(file_id) = document["file_id"].as_str() {
+            let name = document["file_name"].as_str().unwrap_or("attachment");
+            return vec![PendingAsset {
+                name: name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)].to_owned(),
+                mime: document["mime_type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                size: document["file_size"].as_u64().unwrap_or_default(),
+                source: Some(AssetSourceRef::Telegram {
+                    file_id: file_id.to_owned(),
+                }),
+            }];
+        }
+        Vec::new()
     }
 
     fn backoff(&self) -> Duration {
@@ -206,6 +261,79 @@ impl ChatTransport for TelegramTransport {
 
     fn replier(&self) -> Arc<dyn ChatReplier> {
         Arc::clone(&self.replier) as Arc<dyn ChatReplier>
+    }
+
+    fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
+        Some(Arc::clone(&self.replier) as Arc<dyn AssetFetcher>)
+    }
+}
+
+/// Resolving a `file_id` and downloading the bytes, which the Bot API splits into two calls.
+///
+/// Telegram hands out a handle rather than a URL. `getFile` turns it into a path valid for roughly
+/// an hour, and the bytes live under a different prefix — `/file/bot<token>/<path>` rather than
+/// `/bot<token>/<method>`. Both carry the token in the URL, which is the Bot API's own design and
+/// the reason this transport never logs one.
+impl AssetFetcher for TelegramReplier {
+    fn fetch(
+        &self,
+        source: &AssetSourceRef,
+        max_bytes: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        let AssetSourceRef::Telegram { file_id } = source else {
+            // A reference belonging to another transport is a routing mistake, not a fetch failure.
+            return Box::pin(async { Err(TransportError::Response) });
+        };
+        let file_id = file_id.clone();
+        Box::pin(async move {
+            let described = decode(
+                self.http
+                    .get(format!(
+                        "{}/bot{}/getFile",
+                        self.endpoint,
+                        self.token.expose()
+                    ))
+                    .query(&[("file_id", file_id.as_str())])
+                    .send()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?,
+            )
+            .await?;
+            let path = described["result"]["file_path"]
+                .as_str()
+                .ok_or(TransportError::Response)?;
+            let mut response = self
+                .http
+                .get(format!(
+                    "{}/file/bot{}/{path}",
+                    self.endpoint,
+                    self.token.expose()
+                ))
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            if !response.status().is_success() {
+                return Err(TransportError::Service {
+                    code: response.status().as_u16().to_string(),
+                });
+            }
+            // Streamed against the ceiling rather than buffered and measured afterwards, for the
+            // same reason the Slack path is: a declared length is not a bound.
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?
+            {
+                if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
+                    return Err(TransportError::Service {
+                        code: "asset-too-large".to_owned(),
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
+        })
     }
 }
 

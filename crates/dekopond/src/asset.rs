@@ -75,6 +75,15 @@ pub(crate) enum AssetSourceRef {
         /// The private download URL, which is not.
         url: String,
     },
+    /// A Telegram file, which is a handle rather than a URL.
+    ///
+    /// The Bot API hands out a `file_id` and nothing else; resolving it to a path takes a `getFile`
+    /// call, and the path is only valid for about an hour. So unlike Slack there is no URL to carry
+    /// here — the round trip happens at fetch time, which is also when the path is freshest.
+    Telegram {
+        /// The opaque handle Telegram gave this file.
+        file_id: String,
+    },
 }
 
 impl fmt::Debug for AssetSourceRef {
@@ -84,6 +93,10 @@ impl fmt::Debug for AssetSourceRef {
                 .debug_struct("Slack")
                 .field("file_id", file_id)
                 .finish_non_exhaustive(),
+            Self::Telegram { file_id } => formatter
+                .debug_struct("Telegram")
+                .field("file_id", file_id)
+                .finish(),
         }
     }
 }
@@ -255,14 +268,39 @@ pub(crate) struct PendingAsset {
 
 /// Media types a model can be shown as an image.
 ///
-/// The intersection of what a chat service will deliver and what the model APIs accept. Slack
-/// imposes no allowlist on uploads at all — a 700 MB screen recording is a legal attachment — so
-/// the narrow end of that intersection is the one worth enforcing. Documents are a separate part
-/// type with their own ceilings and are not carried yet.
+/// The intersection of what a chat service will deliver and what the model APIs accept. A chat
+/// service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal
+/// attachment — so the narrow end of that intersection is the one worth enforcing.
 const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
-/// Whether an attachment is one a model can actually be shown.
+/// Media types a model can be handed as a document.
+///
+/// The API's own `input_file` list. Spreadsheets and presentations are parsed server-side rather
+/// than rendered, and a spreadsheet is read only to its first thousand rows per sheet — worth
+/// knowing before concluding a model ignored the bottom of one.
+const READABLE_DOCUMENT_TYPES: [&str; 13] = [
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/html",
+    "text/xml",
+    "application/json",
+    "application/xml",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/rtf",
+];
+
+/// Whether an attachment is one a model can be shown at all.
 pub(crate) fn is_readable(mime: &str) -> bool {
+    is_image(mime) || READABLE_DOCUMENT_TYPES.contains(&mime)
+}
+
+/// Whether an attachment is an image, which is the half a model needs a vision modality for.
+pub(crate) fn is_image(mime: &str) -> bool {
     READABLE_IMAGE_TYPES.contains(&mime)
 }
 
@@ -305,8 +343,14 @@ pub(crate) fn reference_note(assets: &[AssetRef], images_supported: bool) -> Opt
 
 impl AssetRef {
     /// Whether a model could actually be shown this one.
+    ///
+    /// Only an image needs the vision modality. A document is text or a parsed attachment to every
+    /// endpoint that accepts one at all, so gating it on the image modality would refuse a PDF to a
+    /// model perfectly able to read it.
     pub fn is_fetchable(&self, images_supported: bool) -> bool {
-        self.source.is_some() && is_readable(&self.mime) && images_supported
+        self.source.is_some()
+            && is_readable(&self.mime)
+            && (images_supported || !is_image(&self.mime))
     }
 
     /// Why this one cannot be shown, in words a model can repeat to the sender.
@@ -315,7 +359,7 @@ impl AssetRef {
             "the gateway cannot see this file at all"
         } else if !is_readable(&self.mime) {
             "not a type the gateway can show you"
-        } else if !images_supported {
+        } else if is_image(&self.mime) && !images_supported {
             "this agent's model cannot be shown images"
         } else {
             "unavailable"
