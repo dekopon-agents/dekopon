@@ -333,15 +333,20 @@ The chart and the application it deploys are versioned independently, and both n
 | **chart version** (`Chart.yaml: version`) | a `dekopon-chart-*` Git tag | the version of *this chart* — its templates, defaults, and documentation |
 | **appVersion** (`Chart.yaml: appVersion`) | the application release the chart deploys | what `image.tag` defaults to, and what the pod actually runs |
 
-They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1` and changes no
-`appVersion`; a new application release moves `appVersion` and, with it, the image the chart pulls.
+They move for different reasons, and neither moves merely because the other did. A templating fix
+ships as `dekopon-chart-0.1.1` and changes no `appVersion`. An application release does not move
+`appVersion` either: republishing the chart for a version its templates are identical across would
+make the chart version mean nothing, which is the one thing a version has to avoid. Point a
+deployment at a newer application with `image.tag` or `image.digest` instead — that is what those
+values are for, and it needs no chart release at all.
 `v*.*.*` tags publish crates, release archives, and the container image; `dekopon-chart-*` tags
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
 force an application release, and an application release should not republish an unchanged chart.
 
 `appVersion` is `0.4.0`, the **first release the container-image workflow runs for**. `v0.3.0`
 predates that workflow and no image was ever published for it, so setting `appVersion: 0.3.0` would
-ship a chart whose default pulls nothing.
+ship a chart whose default pulls nothing. It is a working default rather than a statement about the
+newest release: later application versions exist and are pulled by overriding the tag.
 
 The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
 therefore renders `v` + `appVersion`:
