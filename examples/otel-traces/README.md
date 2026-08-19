@@ -8,7 +8,14 @@ This example starts one local [OpenObserve](https://openobserve.ai/) container w
 - Rust 1.89 or newer
 - `curl`, `base64`, and `jq`
 
-The example pins the multi-architecture OpenObserve `v0.92.0` image by digest.
+The example pins the multi-architecture OpenObserve `v0.92.0` image by digest, and pulls it from
+upstream so that running this needs nothing but a container runtime.
+
+`OPENOBSERVE_IMAGE` overrides where that image comes from. CI sets it to a digest-identical copy in
+the project's own registry, because an anonymous pull from a public registry is rate-limited across
+every runner leaving the same address — a red build that says nothing about the change under test.
+[`.github/workflows/mirror-image.yml`](../../.github/workflows/mirror-image.yml) makes those copies
+and refuses any source that is not digest-pinned.
 
 ## 1. Start OpenObserve
 

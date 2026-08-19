@@ -99,6 +99,11 @@ jobs:
     name: OTLP OpenObserve smoke test
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Reads the mirrored OpenObserve image from this organization's registry. Narrower than the
+    # mirror workflow, which is the only thing allowed to write one.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,9 +115,16 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: otel-openobserve
+      - name: Sign in to the organization registry
+        # The example pulls upstream by default; CI pulls the mirror instead, because an anonymous
+        # pull from a public registry fails on other people's traffic rather than on this change.
+        run: |
+          printf '%s' '${{ secrets.GITHUB_TOKEN }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
       - name: Export runner traces to OpenObserve
         env:
           OPENOBSERVE_PORT: "15080"
+          OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
         run: examples/otel-traces/smoke-test.sh
 
   msrv:
