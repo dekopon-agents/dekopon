@@ -20,6 +20,7 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-telemetry",
     "crates/dekopon-testkit",
+    "crates/dekopon-webui",
     "crates/dekopond",
 ]
 exclude = ["examples/providers/echo"]
@@ -36,6 +37,7 @@ authors = ["Dekopon contributors"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
@@ -61,6 +63,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tower = "0.5.3"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-chrome = "0.7.2"
 tonic = { version = "0.14.1", default-features = false }
@@ -88,6 +91,7 @@ dekopon-protocol = { version = "0.5.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.5.0", path = "crates/dekopon-shell" }
 dekopon-telemetry = { version = "0.5.0", path = "crates/dekopon-telemetry" }
 dekopon-testkit = { version = "0.5.0", path = "crates/dekopon-testkit" }
+dekopon-webui = { version = "0.5.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.5.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]

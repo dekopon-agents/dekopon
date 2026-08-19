@@ -64,6 +64,10 @@ a missing field means "unreported", never "free".
 `accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
 URL path or query, no headers, no bodies.
 
+### The broker-hosted live token view
+
+The optional `dekopon-brokerd --http-bind <ADDRESS>` web UI mirrors provider-reported model usage into process-local counters. `dekopond` observes every successfully decoded model response — including one followed by a later tool/session failure and one whose provider omitted usage — coalesces bounded deltas, and reports them over the authenticated Unix protocol. Input, cached input, output, reasoning output, and total counts keep separate “unreported call” totals, so an omitted value never becomes zero. Reporting is best effort and cannot delay or fail an answer; a dropped report remains present in normal `accounting.model.turn` telemetry when that exporter received it. The UI therefore answers “what this broker process has heard since startup,” not billing reconciliation. It resets on broker restart, is self-reported by the gateway, and never replaces OTLP accounting or durable authorization audit.
+
 ## Enable OTLP export
 
 Export remains disabled unless an endpoint is configured:
@@ -96,6 +100,8 @@ Both read the standard `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_
 OpenTelemetry URL-encoded form; for example, `%20` represents the space in `Basic <token>`. There is
 intentionally no header CLI flag and no header configuration field, because credentials must not be
 exposed in process arguments, retained in a parsed CLI value, or written into a configuration file.
+Endpoint URL userinfo (`https://user:password@host`) is rejected for the same reason; use the
+standard header variables.
 
 The example header set works unchanged on both transports. On OpenObserve (observed on v0.92.0)
 `stream-name` selects the stream for traces and logs alike over HTTP and gRPC, so signals land
@@ -129,6 +135,8 @@ any span attribute — the same rule that keeps provider credentials out of prom
 With `transport: grpc` the endpoint is an authority that names no organization, so the header set
 must carry `organization=<org>` — the receiver otherwise rejects every export, invisibly, because
 the broker's log filter silences transport crates.
+
+The web UI renders the endpoint, transport, service name, timeout, and payload setting from this section. It reports only whether standard OTLP header/resource-attribute variables are present; their values are never retained or rendered.
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
 authorization and durable audit are the service's contract, and a missing dashboard must not cost a

@@ -1,6 +1,6 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, and executes only statically linked Dekopon host interfaces.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated GET-only `dekopon-webui` operational view.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
@@ -310,9 +310,29 @@ Host, broker, and server limits have conservative defaults (including a 2 MiB fr
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
 chmod 0600 /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml
+# Explicitly expose the unauthenticated informational UI on every interface:
+dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop acceptance, drain bounded in-flight connections, synchronize audit/checkpoint appends, log the verified chain head, and remove only the socket inode created by this process.
+SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
+
+## Read-only web UI
+
+`--http-bind <ADDRESS>` enables a second, TCP listener; without the flag the broker opens no HTTP port. `/` returns a permanent redirect to `/ui`. The HTTP router accepts only `GET`/`HEAD`, has no login and no mutation endpoint, sends `no-store`, `nosniff`, `no-referrer`, and a closed content-security policy, and escapes every authored or component-provided string.
+
+The overview includes:
+
+- the latest bounded catalog-agent inventory reported by `dekopond`, including declared providers, capabilities, and least-privilege provider permissions;
+- provider-reported input/output token totals and explicit counts of model calls that omitted each usage field;
+- a table of provider components loaded into this broker;
+- host-observed Wasmtime compilation, store, instantiation, invocation, fuel, memory/table limiter, HTTP count/byte statistics, plus every configured host ceiling; and
+- credential-free OTLP endpoint, transport, service name, timeout, and payload mode. Header and resource-attribute **values** are never retained or rendered.
+
+A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The current loader executes local WebAssembly component bytes. If an operator fetched those bytes from an OCI artifact first, it retains the local path and digest but not the remote OCI reference; the UI says so rather than inventing provenance it cannot prove.
+
+Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.turn` for retained accounting.
+
+“No login” makes the surrounding network the access boundary. Agent names, provider schemas, artifact paths/digests, OTLP endpoints, and runtime limits/activity are deployment information. `--http-bind=0.0.0.0:8080` deliberately exposes it on every interface; choose that address only when everyone who can reach it may read those facts.
 
 ## Audit checkpoint and recovery
 

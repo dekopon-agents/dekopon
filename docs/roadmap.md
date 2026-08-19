@@ -59,6 +59,11 @@ Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the sam
 
 Version 0.5.0 adds no crate and no process boundary, and it is the first release to move a documented authority line: the gateway now fetches the bytes of a file attached to a message it was already receiving. That is bounded by media type, per-attachment size enforced while streaming, per-session fetch count, and a per-conversation ceiling — never by policy, which the gateway still does not hold. [`security-model.md`](security-model.md) carries the argument.
 
+## Current development after 0.5
+
+- `dekopon-webui` is a meaningful new crate embedded only in `dekopon-brokerd`: an explicitly bound, unauthenticated GET-only operational view of loaded provider manifests/interfaces, host-observed Wasmtime counters/ceilings, credential-free OTLP settings, and bounded informational agent/token reports from `dekopond`.
+- Agent inventory and token reporting do not move orchestration into the broker. Reports omit content and authority, are accepted only from a mapped attestor, remain process-local, reset on restart, and never feed policy, constraints, credentials, execution, evidence, replay, or durable audit.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.
@@ -81,7 +86,7 @@ Each of these was raised, deliberately scoped out, and accepted as a follow-up r
 
 ## Intended package namespace
 
-`dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
+`dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-identity`
 - `dekopon-context`

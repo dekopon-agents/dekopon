@@ -114,6 +114,20 @@ impl ExporterSettings {
                 &endpoint[index..index + 1]
             )));
         }
+        // Ingest credentials belong in OTEL_EXPORTER_OTLP_HEADERS. Userinfo would put one in a
+        // parsed configuration value, exporter diagnostics, and the informational web UI.
+        let endpoint_authority = endpoint
+            .split_once("://")
+            .map_or(endpoint, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        if endpoint_authority.contains('@') {
+            return Err(TelemetryError::Configuration(
+                "OTLP endpoint must not contain username/password userinfo; use OTEL_EXPORTER_OTLP_HEADERS"
+                    .to_owned(),
+            ));
+        }
         let service_name = service_name.trim();
         if service_name.is_empty() {
             return Err(TelemetryError::Configuration(
@@ -132,6 +146,18 @@ impl ExporterSettings {
             executable_name: executable_name.to_owned(),
             timeout,
         })
+    }
+
+    /// Configured OTLP receiver base endpoint, validated to contain no URL userinfo.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// OpenTelemetry service name attached to exported resources.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
     }
 
     /// Export timeout applied to each batch and to the final shutdown flush.
@@ -424,6 +450,21 @@ mod tests {
                     "accepted {endpoint} on {transport}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn settings_reject_endpoint_userinfo_so_credentials_cannot_reach_status_views() {
+        let timeout = Duration::from_secs(5);
+        for endpoint in [
+            "https://operator:password@observe.example/api/default",
+            "http://token@127.0.0.1:4318",
+            "token@observe.example:4317",
+        ] {
+            assert!(
+                ExporterSettings::new(endpoint, Transport::Http, "svc", "exe", timeout).is_err(),
+                "accepted endpoint userinfo in {endpoint}"
+            );
         }
     }
 

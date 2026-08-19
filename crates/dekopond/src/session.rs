@@ -13,16 +13,16 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
-    prompt::{History, PromptError, SessionInputs, run_prompt_session},
+    prompt::{History, ModelUsageObserver, PromptError, SessionInputs, run_prompt_session},
 };
-use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
+use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED, ModelUsageReport};
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
-    model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
+    model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
 };
 use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::Instrument as _;
 
 use crate::{
@@ -161,6 +161,69 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
+    /// Best-effort informational usage deltas for the broker-hosted web UI.
+    pub usage_reports: Option<mpsc::Sender<ModelUsageReport>>,
+}
+
+#[derive(Default)]
+struct UsageAccumulator(Mutex<ModelUsageReport>);
+
+impl UsageAccumulator {
+    fn report(&self) -> ModelUsageReport {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ModelUsageObserver for UsageAccumulator {
+    fn observe(&self, usage: Option<ModelUsage>) {
+        let mut report = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        report.model_calls = report.model_calls.saturating_add(1);
+        let usage = usage.unwrap_or_default();
+        (report.input_tokens, report.input_unreported_calls) = accumulated(
+            report.input_tokens,
+            report.input_unreported_calls,
+            usage.input_tokens,
+        );
+        (
+            report.cached_input_tokens,
+            report.cached_input_unreported_calls,
+        ) = accumulated(
+            report.cached_input_tokens,
+            report.cached_input_unreported_calls,
+            usage.cached_input_tokens,
+        );
+        (report.output_tokens, report.output_unreported_calls) = accumulated(
+            report.output_tokens,
+            report.output_unreported_calls,
+            usage.output_tokens,
+        );
+        (
+            report.reasoning_output_tokens,
+            report.reasoning_unreported_calls,
+        ) = accumulated(
+            report.reasoning_output_tokens,
+            report.reasoning_unreported_calls,
+            usage.reasoning_output_tokens,
+        );
+        (report.total_tokens, report.total_unreported_calls) = accumulated(
+            report.total_tokens,
+            report.total_unreported_calls,
+            usage.total_tokens,
+        );
+    }
+}
+
+fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
+    match value {
+        Some(value) => (total.saturating_add(value), unreported),
+        None => (total, unreported.saturating_add(1)),
+    }
 }
 
 /// Runs one routed message end to end, answering in chat whatever happens.
@@ -363,6 +426,8 @@ async fn session(
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
+    let usage = Arc::new(UsageAccumulator::default());
+    let observed_usage = Arc::clone(&usage);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Built before the accumulator exists, so a model client that cannot be constructed
@@ -385,7 +450,8 @@ async fn session(
             SessionInputs::new(&text, limits)
                 .with_system(instructions.as_deref())
                 .with_options(&options)
-                .with_assets(&assets),
+                .with_assets(&assets)
+                .with_usage_observer(observed_usage.as_ref()),
             &mut history,
         )
         .map_err(SessionError::from);
@@ -401,6 +467,16 @@ async fn session(
         (outcome, turn)
     })
     .await;
+
+    let usage = usage.report();
+    if usage.model_calls > 0
+        && let Some(reports) = &runner.usage_reports
+        && reports.try_send(usage).is_err()
+    {
+        // Informational accounting must never delay or fail a paid-for answer. A bounded full or
+        // closed queue loses a live dashboard delta and leaves OTLP accounting unchanged.
+        tracing::warn!(event = "gateway_usage_report_dropped");
+    }
 
     let (outcome, turn) = match result {
         Ok(session) => session,

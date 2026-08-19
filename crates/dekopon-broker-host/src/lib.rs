@@ -12,7 +12,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
@@ -27,11 +27,17 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Store, StoreLimitsBuilder};
 
 mod http;
+mod metadata;
+mod metrics;
 pub use http::{BoundCredential, HttpCallEvidence};
 use http::{HttpCeilings, HttpState};
+pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
+use metadata::{component_interface, identify_artifact};
+use metrics::{ActiveStore, TrackingStoreLimits};
+pub use metrics::{BrokerHostMetrics, BrokerHostStats};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -181,17 +187,23 @@ pub struct BrokerInvocationOutput {
 struct Runtime {
     engine: Engine,
     limits: BrokerHostLimits,
+    metrics: BrokerHostMetrics,
 }
 
 impl Runtime {
     fn new(limits: BrokerHostLimits) -> Result<Self, BrokerHostError> {
         validate_limits(&limits)?;
+        let metrics = BrokerHostMetrics::new(limits.clone());
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|source| BrokerHostError::Engine { source })?;
-        Ok(Self { engine, limits })
+        Ok(Self {
+            engine,
+            limits,
+            metrics,
+        })
     }
 
     fn store(&self, http: HttpState) -> Result<Store<StoreState>, BrokerHostError> {
@@ -202,7 +214,17 @@ impl Runtime {
             .tables(self.limits.max_tables)
             .memories(self.limits.max_memories)
             .build();
-        let mut store = Store::new(&self.engine, StoreState { limits, http });
+        let active = self.metrics.enter_store();
+        let mut store = Store::new(
+            &self.engine,
+            StoreState {
+                limits: TrackingStoreLimits::new(limits, self.metrics.clone()),
+                http,
+                fuel_recorded: false,
+                provider_output_bytes: 0,
+                _active: active,
+            },
+        );
         store.limiter(|state| &mut state.limits);
         store
             .set_fuel(self.limits.fuel)
@@ -211,6 +233,17 @@ impl Runtime {
             .fuel_async_yield_interval(Some(self.limits.fuel.min(10_000)))
             .map_err(|source| BrokerHostError::Store { source })?;
         Ok(store)
+    }
+
+    fn record_fuel(&self, store: &mut Store<StoreState>) {
+        if store.data().fuel_recorded {
+            return;
+        }
+        let remaining = store.get_fuel();
+        store.data_mut().fuel_recorded = true;
+        if let Ok(remaining) = remaining {
+            self.metrics.record_fuel(self.limits.fuel, remaining);
+        }
     }
 
     fn linker(&self) -> Result<Linker<StoreState>, BrokerHostError> {
@@ -232,8 +265,11 @@ impl Runtime {
 }
 
 struct StoreState {
-    limits: StoreLimits,
+    limits: TrackingStoreLimits,
     http: HttpState,
+    fuel_recorded: bool,
+    provider_output_bytes: usize,
+    _active: ActiveStore,
 }
 
 impl bindings::dekopon::http::client::Host for StoreState {
@@ -255,6 +291,11 @@ pub struct BrokerWasmProvider {
     runtime: Arc<Runtime>,
     component: Component,
     source: PathBuf,
+    artifact_bytes: u64,
+    artifact_sha256: String,
+    imports: Vec<ComponentInterfaceItem>,
+    exports: Vec<ComponentInterfaceItem>,
+    interface_truncated: bool,
     manifest: ProviderManifest,
 }
 
@@ -270,15 +311,34 @@ impl fmt::Debug for BrokerWasmProvider {
 
 impl BrokerWasmProvider {
     async fn load(runtime: Arc<Runtime>, source: PathBuf) -> Result<Self, BrokerHostError> {
+        let artifact =
+            identify_artifact(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
+                path: source.clone(),
+                source: error,
+            })?;
         // Compilation happens once per provider at startup rather than per invocation, so this
         // span answers "why was the broker slow to become ready", not "why was that call slow".
         let compile = tracing::info_span!("provider.compile");
+        let started = Instant::now();
         let component = compile
             .in_scope(|| Component::from_file(&runtime.engine, &source))
             .map_err(|error| BrokerHostError::Compile {
                 path: source.clone(),
                 source: error,
             })?;
+        runtime
+            .metrics
+            .record_compilation(started.elapsed(), artifact.bytes);
+        let after_compile =
+            identify_artifact(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
+                path: source.clone(),
+                source: error,
+            })?;
+        if after_compile != artifact {
+            return Err(BrokerHostError::ArtifactChanged { path: source });
+        }
+        let (imports, exports, interface_truncated) =
+            component_interface(&runtime.engine, &component);
         let manifest_json = describe_component(&runtime, &component, &source).await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
             return Err(BrokerHostError::OutputTooLarge {
@@ -305,10 +365,16 @@ impl BrokerWasmProvider {
                 path: source.clone(),
             });
         }
+        runtime.metrics.record_provider_loaded();
         Ok(Self {
             runtime,
             component,
             source,
+            artifact_bytes: artifact.bytes,
+            artifact_sha256: artifact.sha256,
+            imports,
+            exports,
+            interface_truncated,
             manifest,
         })
     }
@@ -319,6 +385,7 @@ impl BrokerWasmProvider {
     /// runs *before* authorization, so a component that reaches for a host import here is refused
     /// rather than trusted.
     pub async fn resolve_command(&self, argv: &[String]) -> Result<String, BrokerHostError> {
+        self.runtime.metrics.record_command_resolution();
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
@@ -333,6 +400,7 @@ impl BrokerWasmProvider {
                     path: self.source.clone(),
                     source,
                 })?;
+            self.runtime.metrics.record_instantiation();
             let function = resolve_command_export(&mut store, &instance).ok_or_else(|| {
                 BrokerHostError::MissingResolveCommand {
                     provider: self.manifest.id.clone(),
@@ -355,12 +423,15 @@ impl BrokerWasmProvider {
                 })?;
             Ok::<_, BrokerHostError>(output)
         };
-        let output = timeout(operation_timeout, operation).await.map_err(|_| {
-            BrokerHostError::Timeout {
-                operation: format!("resolve-command {}", self.manifest.id),
-                timeout_ms: operation_timeout.as_millis() as u64,
-            }
-        })??;
+        let output =
+            timeout(operation_timeout, operation)
+                .await
+                .map_err(|_| BrokerHostError::Timeout {
+                    operation: format!("resolve-command {}", self.manifest.id),
+                    timeout_ms: operation_timeout.as_millis() as u64,
+                });
+        self.runtime.record_fuel(&mut store);
+        let output = output??;
         if store.data().http.attempted() {
             return Err(BrokerHostError::ResolveCommandUsedHostImport {
                 path: self.source.clone(),
@@ -413,15 +484,33 @@ impl BrokerWasmProvider {
             .into());
         }
 
+        self.runtime
+            .metrics
+            .record_invocation_started(input_json.len());
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
-        let http = HttpState::invoke(
+        let http = match HttpState::invoke(
             constraints.http.clone(),
             credential,
             self.runtime.http_ceilings(),
             operation_timeout,
-        )
-        .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-        let mut store = self.runtime.store(http)?;
+        ) {
+            Ok(http) => http,
+            Err(source) => {
+                self.runtime
+                    .metrics
+                    .record_invocation_finished(false, false, 0, &[]);
+                return Err(BrokerHostError::HttpConfiguration { source }.into());
+            }
+        };
+        let mut store = match self.runtime.store(http) {
+            Ok(store) => store,
+            Err(error) => {
+                self.runtime
+                    .metrics
+                    .record_invocation_finished(false, false, 0, &[]);
+                return Err(error.into());
+            }
+        };
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
@@ -434,7 +523,16 @@ impl BrokerWasmProvider {
                 operation_timeout,
             )
             .await;
+        self.runtime.record_fuel(&mut store);
+        let output_bytes = store.data().provider_output_bytes;
+        let timed_out = matches!(&executed, Err(BrokerHostError::Timeout { .. }));
         let http_calls = store.into_data().http.into_evidence();
+        self.runtime.metrics.record_invocation_finished(
+            executed.is_ok(),
+            timed_out,
+            output_bytes,
+            &http_calls,
+        );
         match executed {
             Ok(output) => Ok(BrokerInvocationOutput {
                 provider: self.manifest.id.clone(),
@@ -464,6 +562,7 @@ impl BrokerWasmProvider {
                         path: self.source.clone(),
                         source,
                     })?;
+            self.runtime.metrics.record_instantiation();
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
@@ -479,6 +578,7 @@ impl BrokerWasmProvider {
                 timeout_ms: constraints.timeout_ms,
             }
         })??;
+        store.data_mut().provider_output_bytes = output_json.len();
         if let Some(reason) = store.data().http.policy_violation() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
@@ -720,6 +820,34 @@ impl BrokerProviderRegistry {
         self.providers.iter().map(|provider| &provider.manifest)
     }
 
+    /// Returns owned documentation metadata for every component loaded into this registry.
+    pub fn loaded_provider_metadata(
+        &self,
+    ) -> impl ExactSizeIterator<Item = LoadedProviderMetadata> + '_ {
+        self.providers
+            .iter()
+            .map(|provider| LoadedProviderMetadata {
+                source: provider.source.clone(),
+                artifact_bytes: provider.artifact_bytes,
+                artifact_sha256: provider.artifact_sha256.clone(),
+                manifest: provider.manifest.clone(),
+                imports: provider.imports.clone(),
+                exports: provider.exports.clone(),
+                interface_truncated: provider.interface_truncated,
+            })
+    }
+
+    /// Returns a cloneable handle to live Wasmtime host counters.
+    #[must_use]
+    pub fn metrics(&self) -> BrokerHostMetrics {
+        self.providers
+            .first()
+            .expect("a registry is constructed with at least one provider")
+            .runtime
+            .metrics
+            .clone()
+    }
+
     /// Returns capabilities in deterministic identifier order.
     pub fn capabilities(&self) -> impl Iterator<Item = (&ProviderId, &ProviderCapability)> {
         self.routes.iter().map(|(capability_id, provider_index)| {
@@ -826,13 +954,16 @@ async fn exports_resolve_command(
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
     let mut store = runtime.store(http)?;
     let linker = runtime.linker()?;
-    let instance = linker
+    let instantiated = linker
         .instantiate_async(&mut store, component)
         .await
         .map_err(|error| BrokerHostError::Instantiate {
             path: source.to_path_buf(),
             source: error,
-        })?;
+        });
+    runtime.record_fuel(&mut store);
+    let instance = instantiated?;
+    runtime.metrics.record_instantiation();
     Ok(resolve_command_export(&mut store, &instance).is_some())
 }
 
@@ -853,6 +984,7 @@ async fn describe_component(
                 path: source.to_path_buf(),
                 source: error,
             })?;
+        runtime.metrics.record_instantiation();
         bindings
             .call_describe(&mut store)
             .await
@@ -867,7 +999,10 @@ async fn describe_component(
             .map_err(|_| BrokerHostError::Timeout {
                 operation: format!("describe {}", source.display()),
                 timeout_ms: operation_timeout.as_millis() as u64,
-            })??;
+            });
+    runtime.record_fuel(&mut store);
+    let manifest = manifest??;
+    runtime.metrics.record_description();
     if store.data().http.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
@@ -1044,6 +1179,21 @@ pub enum BrokerHostError {
         /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
+    },
+    /// Source artifact metadata could not be read for the informational provider view.
+    #[error("could not inspect broker provider artifact {}", path.display())]
+    ArtifactMetadata {
+        /// Component path.
+        path: PathBuf,
+        /// File read failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Provider source changed while startup was compiling it, so retained metadata would lie.
+    #[error("broker provider artifact changed while it was being compiled: {}", path.display())]
+    ArtifactChanged {
+        /// Component path.
+        path: PathBuf,
     },
     /// Component compilation failed.
     #[error("could not compile broker provider component {}", path.display())]

@@ -2,13 +2,13 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.5.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, and records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
 ## Design documentation
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md).
 
-## What works today in 0.5.0
+## What works in this tree
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -22,6 +22,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+
+Current development after 0.5.0:
+
+- **`dekopon-webui`**, embedded in `dekopon-brokerd` and enabled explicitly with `--http-bind`. `/` redirects to `/ui`; the GET-only unauthenticated view shows bounded gateway-reported agents and token counts, complete loaded-provider documentation, host-observed Wasmtime statistics/ceilings, and credential-free OTLP configuration. The network around the selected bind address is the access boundary.
 
 New in 0.5.0 — chat that can see what you sent it. One documented invariant was deliberately rewritten to get there, and it is the only thing in this release that moved:
 
@@ -109,6 +113,8 @@ A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopo
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
+# Optional unauthenticated informational UI:
+dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.

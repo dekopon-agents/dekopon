@@ -9,6 +9,7 @@ use dekopon_broker_protocol::{
 };
 use dekopon_core::InvocationId;
 use dekopon_telemetry::TraceContextParts;
+use dekopon_webui::ServiceStatus;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -47,6 +48,7 @@ where
 {
     broker: Arc<Broker<A>>,
     identities: Arc<BTreeMap<u32, MappedPeer>>,
+    status: ServiceStatus,
     limits: ServerLimits,
 }
 
@@ -58,6 +60,16 @@ where
         broker: Arc<Broker<A>>,
         identities: BTreeMap<u32, MappedPeer>,
         limits: ServerLimits,
+    ) -> Result<Self, ServerError> {
+        Self::new_with_status(broker, identities, limits, ServiceStatus::default())
+    }
+
+    /// Builds a server whose informational reports feed the supplied web-UI state.
+    pub fn new_with_status(
+        broker: Arc<Broker<A>>,
+        identities: BTreeMap<u32, MappedPeer>,
+        limits: ServerLimits,
+        status: ServiceStatus,
     ) -> Result<Self, ServerError> {
         limits
             .frame
@@ -72,6 +84,7 @@ where
         Ok(Self {
             broker,
             identities: Arc::new(identities),
+            status,
             limits,
         })
     }
@@ -99,10 +112,11 @@ where
                     };
                     let broker = Arc::clone(&self.broker);
                     let identities = Arc::clone(&self.identities);
+                    let status = self.status.clone();
                     let frame = self.limits.frame;
                     tasks.spawn(async move {
                         let _permit = permit;
-                        handle(stream, &broker, &identities, frame).await
+                        handle(stream, &broker, &identities, &status, frame).await
                     });
                 }
             }
@@ -168,6 +182,7 @@ async fn handle<A>(
     mut stream: UnixStream,
     broker: &Broker<A>,
     identities: &BTreeMap<u32, MappedPeer>,
+    status: &ServiceStatus,
     limits: FrameLimits,
 ) -> Result<(), ConnectionError>
 where
@@ -242,6 +257,41 @@ where
                     let _ = error;
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be rewritten")
                 }
+            }
+        }
+        BrokerRequest::PublishAgentInventory { inventory } => {
+            if peer.attestor.is_none() {
+                ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "informational reports require a mapped gateway attestor",
+                )
+            } else if !inventory.is_valid() {
+                ResponseEnvelope::error(ERROR_INVALID_REQUEST, "agent inventory is invalid")
+            } else {
+                let count = inventory.agents.len();
+                status.replace_agents(inventory);
+                tracing::debug!(
+                    event = "broker_agent_inventory_updated",
+                    agent.count = count
+                );
+                ResponseEnvelope::acknowledged()
+            }
+        }
+        BrokerRequest::PublishModelUsage { usage } => {
+            if peer.attestor.is_none() {
+                ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "informational reports require a mapped gateway attestor",
+                )
+            } else if !usage.is_valid() {
+                ResponseEnvelope::error(ERROR_INVALID_REQUEST, "model usage report is invalid")
+            } else {
+                status.record_usage(usage);
+                tracing::debug!(
+                    event = "broker_model_usage_updated",
+                    model.call.count = usage.model_calls
+                );
+                ResponseEnvelope::acknowledged()
             }
         }
         BrokerRequest::InvokeFor {

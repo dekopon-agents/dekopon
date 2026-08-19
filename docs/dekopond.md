@@ -333,6 +333,14 @@ dekopon-brokerd         attestor grant bounds the namespace
 
 The broker is the sole authority. `dekopond` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and an `invokeFor` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
 
+## Informational status reporting
+
+After its ordinary broker capability probe succeeds, the gateway best-effort publishes a bounded normalized inventory for `dekopon-webui`: agent identifier, description, enabled/model-class flags, capability/provider identifiers, and provider permission declarations. It refreshes that static snapshot once a minute so a restarted broker recovers its in-memory view; a truncated report says so explicitly. It deliberately omits standing instructions, labels, policy profile, chat content, subjects, principals, model endpoints, and every credential. The broker accepts it only from a mapped peer carrying an attestor grant.
+
+The shared prompt loop also calls an optional usage observer after every successfully decoded model response, including responses followed by a later tool/session failure and responses whose provider omitted usage. One session accumulates input, cached-input, output, reasoning-output, and total token counts plus an explicit missing count for each field. A bounded background reporter coalesces deltas and gives each send a short deadline. A full queue, broker restart, old protocol, or timeout logs a stable failure category and never delays or changes the answer; normal `accounting.model.turn` telemetry remains the retained accounting path.
+
+Both reports are self-reported informational state held only in broker memory. They reset on broker restart and never participate in identity, `capabilitiesFor`, Cedar, constraints, credential selection, provider execution, evidence, replay, or durable audit. A compromised gateway can lie to the dashboard and gains no effect authority by doing so.
+
 ## Telemetry
 
 Spans follow [`observability.md`](observability.md):

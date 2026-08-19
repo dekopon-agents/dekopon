@@ -30,14 +30,18 @@ mod transport;
 pub mod cli;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::Path,
     sync::Arc,
     time::Duration,
 };
 
-use dekopon_broker_protocol::BrokerClient;
+use dekopon_broker_protocol::{
+    AgentInventory, BrokerClient, MAX_REPORTED_AGENT_CAPABILITIES, MAX_REPORTED_AGENT_PROVIDERS,
+    MAX_REPORTED_AGENTS, MAX_REPORTED_PERMISSIONS, MAX_REPORTED_TEXT_BYTES, ModelUsageReport,
+    ReportedAgent, ReportedAgentCapability,
+};
 use dekopon_config::LocalCatalog;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
@@ -70,6 +74,12 @@ use crate::{
 /// growing a queue the daemon can never work through. Admission control refuses the overflow with
 /// a sentence, which is a better answer than an unbounded backlog.
 const INBOUND_BUFFER: usize = 64;
+/// Informational model-usage deltas waiting to be coalesced for the broker-hosted web UI.
+const USAGE_REPORT_BUFFER: usize = 64;
+/// Informational reporting must not delay gateway startup, an answer, or shutdown.
+const STATUS_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Re-publishes static inventory so a restarted broker recovers its in-memory view.
+const STATUS_INVENTORY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a conversation's attachments stay addressable after its last message.
 ///
@@ -118,22 +128,34 @@ where
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
+    let inventory = agent_inventory(&catalog);
+    let heartbeat_inventory = inventory.clone();
 
     // One probe before anything connects, so "the broker is not running" is a startup failure with
     // a clear message rather than every session failing identically an hour later.
-    let capabilities = BrokerClient::new(
+    let broker_client = BrokerClient::new(
         &config.broker.socket_path,
         config.broker.server_uid,
         config.broker.frame,
     )
-    .map_err(DekopondError::BrokerProbe)?
-    .capabilities()
-    .await
     .map_err(DekopondError::BrokerProbe)?;
+    let capabilities = broker_client
+        .capabilities()
+        .await
+        .map_err(DekopondError::BrokerProbe)?;
     tracing::info!(
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
     );
+    match timeout(
+        STATUS_REPORT_TIMEOUT,
+        broker_client.publish_agent_inventory(inventory),
+    )
+    .await
+    {
+        Ok(Ok(())) => tracing::info!(event = "gateway_agent_inventory_reported"),
+        Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_agent_inventory_report_failed"),
+    }
 
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut identities = BTreeMap::new();
@@ -164,6 +186,12 @@ where
         transports.push(transport);
     }
 
+    let (usage_sender, usage_receiver) = mpsc::channel(USAGE_REPORT_BUFFER);
+    let mut usage_reporter = tokio::spawn(report_status(
+        config.broker.clone(),
+        heartbeat_inventory,
+        usage_receiver,
+    ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
         models: Arc::new(ConfiguredModels),
@@ -177,6 +205,7 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
+        usage_reports: Some(usage_sender),
     });
 
     let (sender, receiver) = mpsc::channel::<InboundMessage>(INBOUND_BUFFER);
@@ -204,9 +233,227 @@ where
     .await;
     readers.abort_all();
     while readers.join_next().await.is_some() {}
+    if timeout(STATUS_REPORT_TIMEOUT, &mut usage_reporter)
+        .await
+        .is_err()
+    {
+        usage_reporter.abort();
+        let _ = usage_reporter.await;
+        tracing::warn!(event = "gateway_usage_reporter_abandoned");
+    }
 
     tracing::info!(event = "gateway_stopped");
     Ok(())
+}
+
+fn agent_inventory(catalog: &LocalCatalog) -> AgentInventory {
+    let mut truncated = catalog.agents().len() > MAX_REPORTED_AGENTS;
+    let agents = catalog
+        .agents()
+        .take(MAX_REPORTED_AGENTS)
+        .map(|agent| {
+            let mut providers = BTreeSet::new();
+            let mut capabilities = Vec::new();
+            if agent.spec.capabilities.len() > MAX_REPORTED_AGENT_CAPABILITIES {
+                truncated = true;
+            }
+            for capability_id in agent
+                .spec
+                .capabilities
+                .iter()
+                .take(MAX_REPORTED_AGENT_CAPABILITIES)
+            {
+                let Some(capability) = catalog.capability(capability_id) else {
+                    // Catalog validation already proved this reference. Keeping this defensive
+                    // branch makes reporting incapable of turning a future loader regression into
+                    // gateway authority or a panic.
+                    truncated = true;
+                    continue;
+                };
+                if !providers.contains(&capability.spec.provider)
+                    && providers.len() == MAX_REPORTED_AGENT_PROVIDERS
+                {
+                    truncated = true;
+                    continue;
+                }
+                providers.insert(capability.spec.provider.clone());
+                if capability.spec.permissions.len() > MAX_REPORTED_PERMISSIONS {
+                    truncated = true;
+                }
+                capabilities.push(ReportedAgentCapability {
+                    id: capability_id.clone(),
+                    provider: capability.spec.provider.clone(),
+                    permissions: capability
+                        .spec
+                        .permissions
+                        .iter()
+                        .take(MAX_REPORTED_PERMISSIONS)
+                        .cloned()
+                        .map(|mut permission| {
+                            permission.operation =
+                                bounded_report_text(&permission.operation, &mut truncated);
+                            permission.resource = permission
+                                .resource
+                                .as_deref()
+                                .map(|resource| bounded_report_text(resource, &mut truncated));
+                            permission
+                        })
+                        .collect(),
+                });
+            }
+            for provider in &agent.spec.providers {
+                if !providers.contains(provider) && providers.len() == MAX_REPORTED_AGENT_PROVIDERS
+                {
+                    truncated = true;
+                    continue;
+                }
+                providers.insert(provider.clone());
+            }
+            ReportedAgent {
+                id: agent
+                    .metadata
+                    .name
+                    .parse()
+                    .expect("catalog validation produces valid agent identifiers"),
+                description: bounded_report_text(&agent.spec.description, &mut truncated),
+                enabled: agent.spec.enabled,
+                model_class: agent
+                    .spec
+                    .model_class
+                    .as_deref()
+                    .map(|class| bounded_report_text(class, &mut truncated)),
+                providers: providers.into_iter().collect(),
+                capabilities,
+            }
+        })
+        .collect();
+    AgentInventory { agents, truncated }
+}
+
+fn bounded_report_text(value: &str, truncated: &mut bool) -> String {
+    if value.len() <= MAX_REPORTED_TEXT_BYTES {
+        return value.to_owned();
+    }
+    *truncated = true;
+    let mut end = MAX_REPORTED_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+async fn report_status(
+    broker: config::ResolvedBroker,
+    inventory: AgentInventory,
+    mut reports: mpsc::Receiver<ModelUsageReport>,
+) {
+    let mut heartbeat = tokio::time::interval(STATUS_INVENTORY_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately once. The synchronous startup report already did that job.
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            report = reports.recv() => {
+                let Some(mut report) = report else { break };
+                while let Ok(next) = reports.try_recv() {
+                    merge_usage(&mut report, next);
+                }
+                bound_usage_report(&mut report);
+                let client = match BrokerClient::new(
+                    &broker.socket_path,
+                    broker.server_uid,
+                    broker.frame,
+                ) {
+                    Ok(client) => client,
+                    Err(_) => {
+                        tracing::warn!(event = "gateway_usage_report_failed");
+                        continue;
+                    }
+                };
+                match timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_usage_report_failed"),
+                }
+            }
+            _ = heartbeat.tick() => {
+                let client = match BrokerClient::new(
+                    &broker.socket_path,
+                    broker.server_uid,
+                    broker.frame,
+                ) {
+                    Ok(client) => client,
+                    Err(_) => {
+                        tracing::warn!(event = "gateway_agent_inventory_report_failed");
+                        continue;
+                    }
+                };
+                match timeout(
+                    STATUS_REPORT_TIMEOUT,
+                    client.publish_agent_inventory(inventory.clone()),
+                ).await {
+                    Ok(Ok(())) => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(event = "gateway_agent_inventory_report_failed")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bound_usage_report(report: &mut ModelUsageReport) {
+    report.model_calls = report
+        .model_calls
+        .min(dekopon_broker_protocol::MAX_REPORTED_MODEL_CALLS);
+    report.input_unreported_calls = report.input_unreported_calls.min(report.model_calls);
+    report.cached_input_unreported_calls =
+        report.cached_input_unreported_calls.min(report.model_calls);
+    report.output_unreported_calls = report.output_unreported_calls.min(report.model_calls);
+    report.reasoning_unreported_calls = report.reasoning_unreported_calls.min(report.model_calls);
+    report.total_unreported_calls = report.total_unreported_calls.min(report.model_calls);
+    report.input_tokens = report
+        .input_tokens
+        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
+    report.cached_input_tokens = report
+        .cached_input_tokens
+        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
+    report.output_tokens = report
+        .output_tokens
+        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
+    report.reasoning_output_tokens = report
+        .reasoning_output_tokens
+        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
+    report.total_tokens = report
+        .total_tokens
+        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
+}
+
+fn merge_usage(total: &mut ModelUsageReport, next: ModelUsageReport) {
+    total.model_calls = total.model_calls.saturating_add(next.model_calls);
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.input_unreported_calls = total
+        .input_unreported_calls
+        .saturating_add(next.input_unreported_calls);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(next.cached_input_tokens);
+    total.cached_input_unreported_calls = total
+        .cached_input_unreported_calls
+        .saturating_add(next.cached_input_unreported_calls);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.output_unreported_calls = total
+        .output_unreported_calls
+        .saturating_add(next.output_unreported_calls);
+    total.reasoning_output_tokens = total
+        .reasoning_output_tokens
+        .saturating_add(next.reasoning_output_tokens);
+    total.reasoning_unreported_calls = total
+        .reasoning_unreported_calls
+        .saturating_add(next.reasoning_unreported_calls);
+    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
+    total.total_unreported_calls = total
+        .total_unreported_calls
+        .saturating_add(next.total_unreported_calls);
 }
 
 /// The routing loop: one message in, at most one session task out.

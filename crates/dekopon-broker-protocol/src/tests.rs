@@ -5,8 +5,10 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    BrokerRequest, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, TraceParent, TraceParentError, read_frame, write_frame,
+    AgentInventory, BrokerRequest, FrameLimits, InvocationRequest, MAX_REPORTED_MODEL_CALLS,
+    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, Permission, ProtocolError,
+    ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, TraceParent,
+    TraceParentError, read_frame, write_frame,
 };
 
 fn invocation() -> InvocationRequest {
@@ -213,6 +215,88 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
             }
         }))
         .is_err()
+    );
+}
+
+#[test]
+fn informational_reports_are_bounded_and_carry_no_authority_or_prompt_content() {
+    let inventory = AgentInventory {
+        agents: vec![ReportedAgent {
+            id: "reviewer".parse().expect("valid agent"),
+            description: "Reviews pull requests".to_owned(),
+            enabled: true,
+            model_class: Some("reasoning".to_owned()),
+            providers: vec!["gh".parse().expect("valid provider")],
+            capabilities: vec![ReportedAgentCapability {
+                id: "gh.pull-request.read".parse().expect("valid capability"),
+                provider: "gh".parse().expect("valid provider"),
+                permissions: vec![Permission {
+                    operation: "pull_requests:read".to_owned(),
+                    resource: Some("dekopon-agents/*".to_owned()),
+                }],
+            }],
+        }],
+        truncated: false,
+    };
+    assert!(inventory.is_valid());
+    let encoded =
+        serde_json::to_string(&RequestEnvelope::publish_agent_inventory(inventory.clone()))
+            .expect("inventory serializes");
+    for prohibited in [
+        "instructions",
+        "prompt",
+        "credential",
+        "principal",
+        "policy",
+    ] {
+        assert!(
+            !encoded.contains(prohibited),
+            "inventory leaked {prohibited}"
+        );
+    }
+
+    let mut duplicated = inventory.clone();
+    duplicated.agents.push(inventory.agents[0].clone());
+    assert!(!duplicated.is_valid());
+    let mut oversized = inventory;
+    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
+    assert!(!oversized.is_valid());
+
+    let usage = ModelUsageReport {
+        model_calls: 2,
+        input_tokens: 100,
+        input_unreported_calls: 1,
+        output_tokens: 12,
+        ..ModelUsageReport::default()
+    };
+    assert!(usage.is_valid());
+    assert!(matches!(
+        RequestEnvelope::publish_model_usage(usage).request,
+        BrokerRequest::PublishModelUsage { .. }
+    ));
+    assert!(!ModelUsageReport::default().is_valid());
+    assert!(
+        !ModelUsageReport {
+            model_calls: MAX_REPORTED_MODEL_CALLS + 1,
+            ..ModelUsageReport::default()
+        }
+        .is_valid()
+    );
+    assert!(
+        !ModelUsageReport {
+            model_calls: 1,
+            input_tokens: MAX_REPORTED_TOKENS + 1,
+            ..ModelUsageReport::default()
+        }
+        .is_valid()
+    );
+    assert!(
+        !ModelUsageReport {
+            model_calls: 1,
+            output_unreported_calls: 2,
+            ..ModelUsageReport::default()
+        }
+        .is_valid()
     );
 }
 

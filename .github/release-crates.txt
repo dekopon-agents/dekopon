@@ -10,6 +10,7 @@ dekopon-protocol
 dekopon-provider-sdk
 dekopon-broker-host
 dekopon-broker-protocol
+dekopon-webui
 dekopon-agent
 dekopon-config
 dekopon-provider-host
