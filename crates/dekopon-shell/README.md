@@ -56,6 +56,11 @@ the ordered list of commands a script actually executed — `jq`, then `curl`, t
 that drives several executions is shown as several: `xargs` mapping a command over ten items
 produces ten nested spans.
 
+A word that resolved to nothing is reported as `not-granted` when it names a capability in a
+namespace this session holds, and `not-found` otherwise. Only the namespace is exported, from the
+session's own granted set; the word stays `<withheld>` unless payloads are enabled. The script sees
+identical output either way — the distinction is in the span and nowhere a script can read it.
+
 Instrumentation lives at the single seam every command word passes through, so a builtin added
 later is traced without another edit, and none of the twenty builtin implementations carries
 telemetry code.
