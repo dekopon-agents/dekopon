@@ -197,29 +197,36 @@ impl AssetStore {
         images_supported: bool,
         now: Instant,
     ) -> Registered {
-        let refs = self.register(conversation, arriving, now);
-        let fetchable = self.any_fetchable(conversation, images_supported, now);
-        Registered { refs, fetchable }
+        let arrived = self
+            .register(conversation, arriving, now)
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect();
+        let inventory = self.inventory(conversation, now);
+        let fetchable = inventory
+            .iter()
+            .any(|asset| asset.is_fetchable(images_supported));
+        Registered {
+            inventory,
+            arrived,
+            fetchable,
+        }
     }
 
-    /// Whether this conversation still holds anything a model could be shown.
+    /// Every attachment this conversation can still offer, oldest first.
     ///
-    /// Touches the entry, so a conversation that keeps talking keeps its attachments addressable
-    /// for as long as the reference lines naming them are being replayed.
-    fn any_fetchable(&self, conversation: &str, images_supported: bool, now: Instant) -> bool {
+    /// Touches the entry, so a conversation that keeps talking keeps its attachments addressable.
+    fn inventory(&self, conversation: &str, now: Instant) -> Vec<AssetRef> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::expire(&mut entries, self.idle_timeout, now);
         let Some(entry) = entries.get_mut(conversation) else {
-            return false;
+            return Vec::new();
         };
         entry.touched = now;
-        entry
-            .assets
-            .iter()
-            .any(|asset| asset.is_fetchable(images_supported))
+        entry.assets.clone()
     }
 
     /// Looks one attachment up by the number a model named.
@@ -331,34 +338,42 @@ pub(crate) fn is_image(mime: &str) -> bool {
     READABLE_IMAGE_TYPES.contains(&mime)
 }
 
-/// The line appended to a prompt naming what the sender attached.
+/// The lines appended to a prompt naming what this conversation carries.
 ///
-/// One line per file, carrying the number the `fetch_chat_asset` tool takes. Short on purpose: it
-/// replays in conversation history on every later turn, so it has to stay inside the history byte
-/// budget while remaining specific enough for a follow-up three turns later to resolve.
+/// The **whole inventory**, not just what this message brought. A reference line is the only way a
+/// model learns a number exists, and it used to live solely in the turn that introduced it — so
+/// once ordinary chatter pushed that turn out of the replayed history window, the file became
+/// unreachable while the store still held it for another hour. The model would answer that it had
+/// never been sent a PDF, which was true of the prompt it could see and false of the conversation.
 ///
-/// A file the model could not be shown is still named, without a number. Saying "there is a screen
-/// recording here and I cannot watch it" is a better answer than ignoring it, which is what
-/// produced the flat denial this whole feature exists to fix.
-pub(crate) fn reference_note(assets: &[AssetRef], images_supported: bool) -> Option<String> {
-    if assets.is_empty() {
+/// Repeating the list costs one short line per attachment, bounded by the per-conversation
+/// ceiling, and it lands with the newest message rather than in the cached prefix.
+pub(crate) fn reference_note(registered: &Registered, images_supported: bool) -> Option<String> {
+    if registered.inventory.is_empty() {
         return None;
     }
-    let mut note = String::from("[gateway: the sender attached");
+    let mut note = String::from("[gateway: files in this conversation");
     let mut any_fetchable = false;
-    for asset in assets {
+    for asset in &registered.inventory {
         let size = kibibytes(asset.size);
         let name = &asset.name;
         let mime = &asset.mime;
+        // Marked so a model asking "is this a good recipe?" reaches for the file that arrived with
+        // the question rather than one from twenty messages ago.
+        let arrived = if registered.arrived.contains(&asset.id) {
+            " — attached to this message"
+        } else {
+            ""
+        };
         if asset.is_fetchable(images_supported) {
             any_fetchable = true;
             note.push_str(&format!(
-                "\n  Chat Asset #{} — {name} ({mime}, {size})",
+                "\n  Chat Asset #{} — {name} ({mime}, {size}){arrived}",
                 asset.id
             ));
         } else {
             let why = asset.unreadable_reason(images_supported);
-            note.push_str(&format!("\n  {name} ({mime}, {size}) — {why}"));
+            note.push_str(&format!("\n  {name} ({mime}, {size}) — {why}{arrived}"));
         }
     }
     if any_fetchable {
@@ -407,10 +422,12 @@ fn kibibytes(size: u64) -> String {
     }
 }
 
-/// What one message's attachments came to.
+/// What this conversation can offer a model, after one message's attachments joined it.
 pub(crate) struct Registered {
-    /// Every file that arrived, numbered, whether or not it can be shown.
-    pub refs: Vec<AssetRef>,
+    /// Every attachment the conversation still holds, oldest first.
+    pub inventory: Vec<AssetRef>,
+    /// The identifiers that arrived on *this* message, so the note can say which are new.
+    pub arrived: Vec<u64>,
     /// Whether at least one of them could actually be fetched, which is what decides if the tool
     /// is offered at all.
     pub fetchable: bool,

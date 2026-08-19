@@ -337,7 +337,7 @@ async fn session(
     );
     // Bounded again after the note is appended, because the invariant is on the whole prompt the
     // model reads rather than on the half of it the sender wrote.
-    let text = match asset::reference_note(&registered.refs, images_supported) {
+    let text = match asset::reference_note(&registered, images_supported) {
         Some(note) if message.text.trim().is_empty() => note,
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
