@@ -172,6 +172,10 @@ gh attestation verify oci://ghcr.io/dekopon-agents/dekopon:<VERSION> \
   --repo dekopon-agents/dekopon
 ```
 
+The publication job grants `artifact-metadata: write` so the attestation action can also link that
+OCI digest from the organization's **Linked Artifacts** view. This records the already-published
+subject; it does not grant another registry write path.
+
 Only the release tag is published. There is no `latest`: release tags are immutable here, a moving
 pointer would contradict that, and it would let a prerelease become the default pull.
 

@@ -1,0 +1,21 @@
+# Public workspace crates in package-dependency order.
+dekopon-core
+dekopon-provider-http
+dekopon-telemetry
+dekopon-capability
+dekopon-model
+dekopon-shell
+dekopon-http-host
+dekopon-protocol
+dekopon-provider-sdk
+dekopon-broker-host
+dekopon-broker-protocol
+dekopon-agent
+dekopon-config
+dekopon-provider-host
+dekopon
+dekopon-policy
+dekopon-broker
+dekopon-brokerd
+dekopon-run
+dekopond
