@@ -1,0 +1,28 @@
+[package]
+name = "dekopon-webui"
+description = "Unauthenticated read-only operational web UI for the Dekopon broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-webui"
+readme = "README.md"
+keywords = ["agents", "dashboard", "wasm", "observability", "web"]
+categories = ["web-programming::http-server", "visualization"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+axum.workspace = true
+dekopon-broker-host.workspace = true
+dekopon-broker-protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

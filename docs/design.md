@@ -98,9 +98,10 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-shell` | Sandboxed bash-flavored interpreter whose command words dispatch to capabilities through one abstract seam, with its own step, recursion, output, deadline, and capability-call bounds | **Current**; it links no Wasmtime, broker, HTTP, or filesystem code |
 | `dekopon-agent` | The shared agent session layer: the bounded one-tool prompt loop, the script runtime spending a session-wide capability budget, and a broker-leg facade over the protocol client | **Current**, holding no authority; consumed by `dekopon-run` and `dekopond` |
 | `dekopon-telemetry` | OTLP exporter settings and subscriber wiring, with ingest credentials read only from the environment | **Current** library shared by the executables |
+| `dekopon-webui` | GET-only, unauthenticated operational HTML for broker-loaded providers, Wasmtime counters, credential-free OTLP settings, and bounded gateway-reported agent/token status | **Current** library embedded only in `dekopon-brokerd`; listener enablement is explicit |
 | `dekopon-run` | One-shot direct invocation, a single model scripting tool, local/OTLP trace export, audit-safe lifecycle logs, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
 | `dekopond` | Chat-transport wakeups, attested routing, bounded agent sessions with no broker authority, and bounded per-sender conversation history | **Current** unprivileged daemon; a route is one independent session per message unless it opts into `mode: persistent`, and a dedicated gateway UID remains **committed direction** |
-| `dekopon-brokerd` | Owner-only Unix peer authentication, Cedar authorization, destination-bound credential resolution, replay restoration, provider execution, evidence, durable audit, and atomic local checkpoint verification | **Current** privileged process; independent remote/signed anchoring remains direction |
+| `dekopon-brokerd` | Owner-only Unix peer authentication, Cedar authorization, destination-bound credential resolution, replay restoration, provider execution, evidence, durable audit, atomic local checkpoint verification, and an explicitly enabled unauthenticated read-only web view | **Current** privileged process; independent remote/signed anchoring remains direction |
 | Cedar policy adapter | Declarative authorization with strict startup validation and per-decision explanations | **Current**; it replaced the exact-match evaluator outright |
 | Exact policy evaluator | Principal/actor/capability/provider rules with deny-by-default matching | **Removed.** Its authorization half is now Cedar; its execution half survives unchanged as owner-authored constraint sets, still validated against loaded manifests, host ceilings, and the credential store |
 | Deployable privileged provider path | Authenticated broker ownership of policy, credentials, component-host execution, durable evidence, and authorized effects | **Current** local Unix foundation; stronger deployment transport remains direction |
@@ -196,7 +197,8 @@ The current local broker protocol and service define:
 - timeout, output, exact network, and host-call constraints;
 - exact idempotency metadata matching (automatic retries remain future work);
 - evidence integrity and durable audit ordering;
-- denial and partial-failure semantics.
+- denial and partial-failure semantics; and
+- bounded informational agent-inventory and model-usage reports accepted only from a mapped gateway attestor. These reports feed process-local UI state and never enter policy, authorization, provider routing, credentials, evidence, or durable audit.
 
 ## Deployment and provider isolation
 
@@ -284,6 +286,7 @@ See [`cli.md`](cli.md) for the current command contract.
 | Owner-only Unix broker IPC | Local payloads cannot claim identity; private socket peer UID maps exactly to trusted context, with the whole UID as one trust domain. |
 | Gateway-held conversation history | The broker holds provider credentials and a metadata-only audit chain where provider output survives as a digest; conversation text there would put the most sensitive content in the most privileged process. Keeping a per-sender, compacted, window-bounded history in the unprivileged gateway's memory adds no authority, no durable copy, and no new reader — the gateway already read the message and wrote the answer. Authorization stays uncached, and the granted capability set travels with the history so a narrowed grant drops it. |
 | No empty future crates | A package boundary must be justified by meaningful, tested behavior. |
+| Explicit unauthenticated web listener | The web UI has no mutating route and receives no credential values, but provider schemas, artifact paths, agent names, receiver endpoints, and runtime capacity are deployment information. `dekopon-brokerd` opens no TCP listener unless the operator supplies `--http-bind`; the surrounding network is the access boundary. |
 
 ## How to evaluate a proposed change
 

@@ -22,6 +22,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 dekopon-telemetry.workspace = true
+dekopon-webui.workspace = true
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
 fs2.workspace = true

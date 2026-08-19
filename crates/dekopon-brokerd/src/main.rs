@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{io, path::PathBuf, process::ExitCode};
+use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
 use clap::Parser;
@@ -26,6 +26,9 @@ struct Cli {
     /// Strict owner-controlled broker YAML/JSON configuration.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
+    /// Bind the unauthenticated, read-only operational web UI.
+    #[arg(long, value_name = "ADDRESS")]
+    http_bind: Option<SocketAddr>,
 }
 
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
@@ -120,7 +123,7 @@ async fn execute(cli: Cli) -> Result<(), AppError> {
             _ = terminate.recv() => {}
         }
     };
-    dekopon_brokerd::run(cli.config, shutdown)
+    dekopon_brokerd::run_with_http(cli.config, cli.http_bind, shutdown)
         .await
         .map_err(AppError::Broker)?;
     Ok(())
@@ -137,13 +140,33 @@ enum AppError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use clap::CommandFactory as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use clap::{CommandFactory as _, Parser as _};
 
     use super::Cli;
 
     #[test]
     fn cli_definition_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn http_listener_is_explicit_and_accepts_the_documented_spelling() {
+        let disabled = Cli::try_parse_from(["dekopon-brokerd", "--config", "broker.yaml"])
+            .expect("HTTP is optional");
+        assert!(disabled.http_bind.is_none());
+
+        let enabled = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "--config=broker.yaml",
+            "--http-bind=0.0.0.0:8080",
+        ])
+        .expect("documented HTTP bind parses");
+        assert_eq!(
+            enabled.http_bind,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080))
+        );
     }
 }
 

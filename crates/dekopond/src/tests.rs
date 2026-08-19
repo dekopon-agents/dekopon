@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
+    agent_inventory,
     asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
@@ -458,6 +459,23 @@ fn catalog(enabled: bool, model_class: Option<&str>) -> LocalCatalog {
         &catalog_text(enabled, model_class),
     )
     .expect("catalog fixture parses")
+}
+
+#[test]
+fn informational_inventory_omits_agent_instructions() {
+    let inventory = agent_inventory(&catalog(true, Some("reasoning")));
+
+    assert!(!inventory.truncated);
+    assert_eq!(inventory.agents.len(), 1);
+    assert_eq!(inventory.agents[0].id.as_str(), "reviewer");
+    assert_eq!(inventory.agents[0].description, "Reviews things");
+    assert_eq!(
+        inventory.agents[0].model_class.as_deref(),
+        Some("reasoning")
+    );
+    let encoded = serde_json::to_string(&inventory).expect("inventory serializes");
+    assert!(!encoded.contains("Answer briefly"), "{encoded}");
+    assert!(!encoded.contains("instructions"), "{encoded}");
 }
 
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
@@ -1085,6 +1103,7 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
+        usage_reports: None,
     })
 }
 
@@ -1186,6 +1205,42 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     };
     assert_eq!(subject.canonical(), SUBJECT);
     assert_eq!(agent.as_str(), "reviewer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Done.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let (usage, mut reports) = mpsc::channel(1);
+    let mut session_runner = runner(broker, models, 1);
+    Arc::get_mut(&mut session_runner)
+        .expect("fixture has one runner owner")
+        .usage_reports = Some(usage);
+
+    run_session(
+        session_runner,
+        route(model_config()),
+        message("do it"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["Done."]);
+    let report = reports.recv().await.expect("session emits usage");
+    assert_eq!(report.model_calls, 1);
+    assert_eq!(report.input_tokens, 0);
+    assert_eq!(report.input_unreported_calls, 1);
+    assert_eq!(report.output_unreported_calls, 1);
+    assert_eq!(report.total_unreported_calls, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

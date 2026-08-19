@@ -12,7 +12,14 @@ mod credentials;
 mod server;
 mod socket;
 
-use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env,
+    future::{Future, pending},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+};
 
 use dekopon_broker::{
     AuditLog, Broker, ConstraintCatalog, CredentialStore, FileAuditLog, IdentityDirectory,
@@ -62,8 +69,24 @@ pub async fn telemetry_settings(
 }
 
 /// Loads trusted configuration, builds the privileged host, and serves until shutdown.
+///
+/// This compatibility entry point does not open the informational HTTP listener. Use
+/// [`run_with_http`] to enable the web UI explicitly.
 pub async fn run<F>(
     config_path: impl AsRef<Path>,
+    shutdown: F,
+) -> Result<AuditCheckpoint, BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_with_http(config_path, None, shutdown).await
+}
+
+/// Loads trusted configuration, builds the privileged host, and optionally serves the read-only
+/// web UI on `http_bind` until shutdown.
+pub async fn run_with_http<F>(
+    config_path: impl AsRef<Path>,
+    http_bind: Option<SocketAddr>,
     shutdown: F,
 ) -> Result<AuditCheckpoint, BrokerdError>
 where
@@ -132,6 +155,8 @@ where
     let registry = BrokerProviderRegistry::load(config.providers, config.host_limits)
         .await
         .map_err(BrokerdError::Host)?;
+    let host_metrics = registry.metrics();
+    let provider_metadata = registry.loaded_provider_metadata().collect::<Vec<_>>();
     validate_manifest_metadata(
         &registry,
         frame_limits
@@ -241,7 +266,30 @@ where
         max_connections: config.server_limits.max_connections,
         shutdown_grace: config.server_limits.shutdown_grace(),
     };
-    let server = BrokerServer::new(broker, identities, limits)?;
+    let service_status = dekopon_webui::ServiceStatus::default();
+    let web_shutdown_grace = limits.shutdown_grace;
+    let server = BrokerServer::new_with_status(broker, identities, limits, service_status.clone())?;
+    let dashboard = dekopon_webui::Dashboard::new(
+        env!("CARGO_PKG_VERSION"),
+        provider_metadata,
+        host_metrics,
+        service_status,
+        webui_otel_summary(config.telemetry.as_ref()),
+    );
+    let web_listener = match http_bind {
+        Some(address) => Some(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|source| BrokerdError::WebUiBind { address, source })?,
+        ),
+        None => None,
+    };
+    let web_address = web_listener
+        .as_ref()
+        .map(tokio::net::TcpListener::local_addr)
+        .transpose()
+        .map_err(|source| BrokerdError::WebUiAddress { source })?;
+    let web_enabled = web_listener.is_some();
     let (listener, mut socket_guard) = socket::bind(&config.socket_path, uid).await?;
     let (records, head) = audit.checkpoint().await;
     tracing::info!(
@@ -249,9 +297,58 @@ where
         audit_records = records,
         audit_head = head.as_deref().unwrap_or("none")
     );
-    let serve_result = server.serve(listener, shutdown).await;
+    if let Some(address) = web_address {
+        tracing::info!(
+            event = "broker_webui_started",
+            http.bind = %address,
+            http.path = "/ui",
+            authentication = "none"
+        );
+    }
+
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let broker_serve = server.serve(listener, wait_for_shutdown(shutdown_receiver.clone()));
+    let web_serve = async move {
+        match web_listener {
+            Some(listener) => {
+                dekopon_webui::serve(listener, dashboard, wait_for_shutdown(shutdown_receiver))
+                    .await
+            }
+            None => pending::<Result<(), dekopon_webui::WebUiError>>().await,
+        }
+    };
+    tokio::pin!(broker_serve);
+    tokio::pin!(web_serve);
+    tokio::pin!(shutdown);
+
+    let mut broker_result = None;
+    let mut web_result = None;
+    tokio::select! {
+        () = &mut shutdown => {}
+        result = &mut broker_serve => broker_result = Some(result),
+        result = &mut web_serve => web_result = Some(result),
+    }
+    let _ = shutdown_sender.send(true);
+    if broker_result.is_none() {
+        broker_result = Some(broker_serve.await);
+    }
+    let mut web_shutdown_timed_out = false;
+    if web_enabled && web_result.is_none() {
+        match tokio::time::timeout(web_shutdown_grace, &mut web_serve).await {
+            Ok(result) => web_result = Some(result),
+            Err(_) => web_shutdown_timed_out = true,
+        }
+    }
+
     socket_guard.cleanup()?;
-    serve_result?;
+    broker_result.ok_or(BrokerdError::Server(ServerError::ConnectionTask))??;
+    if web_shutdown_timed_out {
+        return Err(BrokerdError::WebUiShutdownTimeout);
+    }
+    if let Some(result) = web_result {
+        result.map_err(BrokerdError::WebUi)?;
+        tracing::info!(event = "broker_webui_stopped");
+    }
     let (records, head) = audit.checkpoint().await;
     tracing::info!(
         event = "broker_stopped",
@@ -259,6 +356,39 @@ where
         audit_head = head.as_deref().unwrap_or("none")
     );
     Ok(AuditCheckpoint { records, head })
+}
+
+async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+}
+
+fn webui_otel_summary(telemetry: Option<&ResolvedTelemetry>) -> Option<dekopon_webui::OtelSummary> {
+    let telemetry = telemetry?;
+    let headers_configured = [
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    ]
+    .into_iter()
+    .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()));
+    Some(dekopon_webui::OtelSummary {
+        endpoint: telemetry.settings.endpoint().to_owned(),
+        transport: telemetry.settings.transport().to_string(),
+        service_name: telemetry.settings.service_name().to_owned(),
+        export_timeout_ms: u64::try_from(telemetry.settings.timeout().as_millis())
+            .unwrap_or(u64::MAX),
+        telemetry_payloads: telemetry.telemetry_payloads,
+        headers_configured,
+        resource_attributes_configured: env::var_os("OTEL_RESOURCE_ATTRIBUTES")
+            .is_some_and(|value| !value.is_empty()),
+    })
 }
 
 fn validate_capability_responses<A: AuditLog>(
@@ -378,6 +508,28 @@ pub enum BrokerdError {
     /// Listener serving or bounded shutdown failed.
     #[error("broker server failed")]
     Server(#[from] ServerError),
+    /// The explicitly requested informational HTTP address could not be bound.
+    #[error("could not bind Dekopon web UI to {address}")]
+    WebUiBind {
+        /// Requested TCP address.
+        address: SocketAddr,
+        /// Bind failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The bound informational listener's local address could not be inspected.
+    #[error("could not inspect Dekopon web UI listener address")]
+    WebUiAddress {
+        /// Socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The informational HTTP server failed while the broker was running.
+    #[error("Dekopon web UI failed")]
+    WebUi(#[source] dekopon_webui::WebUiError),
+    /// Open informational HTTP connections did not close inside the broker shutdown grace.
+    #[error("Dekopon web UI did not stop inside the configured shutdown grace")]
+    WebUiShutdownTimeout,
 }
 
 #[cfg(test)]

@@ -196,6 +196,7 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     )
     .await
     .expect("HTTP provider loads without host calls during describe");
+    let metrics = registry.metrics();
     let (authority, request, server) = mock_http(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Value: one\r\nX-Value: two\r\nSet-Cookie: secret=session\r\nWWW-Authenticate: secret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
@@ -234,6 +235,16 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     assert_eq!(output.http_calls[0].method, "PATCH");
     assert_eq!(output.http_calls[0].authority, authority);
     assert_eq!(output.http_calls[0].status, Some(200));
+    let stats = metrics.snapshot();
+    assert_eq!(stats.providers_loaded, 1);
+    assert_eq!(stats.invocations_started, 1);
+    assert_eq!(stats.invocations_succeeded, 1);
+    assert_eq!(stats.invocations_failed, 0);
+    assert_eq!(stats.http_requests, 1);
+    assert!(stats.http_request_bytes > 0);
+    assert!(stats.http_response_bytes > 0);
+    assert_eq!(stats.active_stores, 0);
+    assert!(stats.fuel_consumed > 0);
     let request = request.recv().expect("fixture request recorded");
     assert!(request.starts_with(b"PATCH /resource?visible=no HTTP/1.1\r\n"));
     assert!(request.ends_with(b"\r\n\r\npayload"));

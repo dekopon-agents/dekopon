@@ -14,21 +14,24 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    BrokerClient, BrokerResponse, ClientError, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED,
-    FrameLimits, RequestEnvelope, ResponseEnvelope, SubjectAttestation, read_frame, write_frame,
+    AgentInventory, BrokerClient, BrokerResponse, ClientError, ERROR_INVALID_REQUEST,
+    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ReportedAgent, ReportedAgentCapability,
+    RequestEnvelope, ResponseEnvelope, SubjectAttestation, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
-    CheckpointError, MappedPeer, ServerLimits, current_uid, run,
+    CheckpointError, MappedPeer, ServerLimits, current_uid, run, run_with_http,
 };
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, TraceId,
 };
+use dekopon_webui::ServiceStatus;
 use serde_json::{Value, json};
 use tokio::{
-    net::{UnixListener, UnixStream},
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::{TcpStream, UnixListener, UnixStream},
     sync::oneshot,
 };
 
@@ -291,6 +294,75 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mapped_attestor_can_publish_informational_ui_state_without_touching_audit() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = attested_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let status = ServiceStatus::default();
+    let limits = server_limits();
+    let server = BrokerServer::new_with_status(broker, identities, limits, status.clone())
+        .expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        let _ = shutdown_receive.await;
+    }));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    client
+        .publish_agent_inventory(AgentInventory {
+            agents: vec![ReportedAgent {
+                id: agent("chat-agent"),
+                description: "Answers chat".to_owned(),
+                enabled: true,
+                model_class: Some("reasoning".to_owned()),
+                providers: vec!["echo".parse().expect("valid provider")],
+                capabilities: vec![ReportedAgentCapability {
+                    id: "echo.echo".parse().expect("valid capability"),
+                    provider: "echo".parse().expect("valid provider"),
+                    permissions: Vec::new(),
+                }],
+            }],
+            truncated: false,
+        })
+        .await
+        .expect("attestor inventory is accepted");
+    client
+        .publish_model_usage(ModelUsageReport {
+            model_calls: 2,
+            input_tokens: 30,
+            output_tokens: 7,
+            input_unreported_calls: 1,
+            ..ModelUsageReport::default()
+        })
+        .await
+        .expect("attestor usage is accepted");
+
+    let (inventory, reports) = status.agents();
+    assert_eq!(reports, 1);
+    assert_eq!(inventory.agents[0].id.as_str(), "chat-agent");
+    assert_eq!(status.tokens().input_tokens, 30);
+    assert_eq!(status.tokens().output_tokens, 7);
+    assert!(
+        audit.records().await.is_empty(),
+        "informational UI reports are not authorization audit"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unmapped_peer_receives_no_capability_information() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create server fixture");
@@ -414,6 +486,124 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         BrokerdError::Checkpoint(CheckpointError::AuditMismatch)
     ));
     assert!(!socket_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_service_serves_the_explicit_read_only_http_listener() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create web UI fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure fixture directory");
+    let config_path = directory.path().join("broker.json");
+    let socket_path = directory.path().join("broker.sock");
+    let policies_path = directory.path().join("policies.cedar");
+    let document = json!({
+        "apiVersion": CONFIG_API_VERSION,
+        "socketPath": &socket_path,
+        "auditPath": directory.path().join("audit.jsonl"),
+        "checkpointPath": directory.path().join("checkpoint.json"),
+        "checkpointLockPath": directory.path().join("checkpoint.lock"),
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "policiesPath": &policies_path,
+        "providers": [fixture("echo-provider.wasm")],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "constraintSets": {
+            "echo.echo": serde_json::to_value(echo_constraint_set())
+                .expect("constraint set serializes")
+        }
+    });
+    write_owner_only(&policies_path, DIRECT_POLICY.as_bytes());
+    write_owner_only(
+        &config_path,
+        &serde_json::to_vec(&document).expect("config serializes"),
+    );
+    let reservation =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral HTTP port");
+    let http_address = reservation.local_addr().expect("reserved address");
+    drop(reservation);
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let started_config = config_path.clone();
+    let mut service = tokio::spawn(async move {
+        run_with_http(started_config, Some(http_address), async move {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    wait_for_socket(&socket_path, &mut service).await;
+    wait_for_http(http_address, &mut service).await;
+
+    let root = http_get(http_address, "/").await;
+    assert!(
+        root.starts_with("HTTP/1.1 308 Permanent Redirect"),
+        "{root}"
+    );
+    assert!(
+        root.to_ascii_lowercase().contains("location: /ui"),
+        "{root}"
+    );
+    let ui = http_get(http_address, "/ui").await;
+    assert!(ui.starts_with("HTTP/1.1 200 OK"), "{ui}");
+    for expected in ["Dekopon service", "Providers", "Wasmtime", "echo"] {
+        assert!(ui.contains(expected), "missing {expected:?} in {ui}");
+    }
+    let provider = http_get(http_address, "/ui/providers/echo").await;
+    assert!(provider.starts_with("HTTP/1.1 200 OK"), "{provider}");
+    for expected in [
+        "pub capability",
+        "echo.echo",
+        "Complete manifest",
+        "SHA-256",
+    ] {
+        assert!(
+            provider.contains(expected),
+            "missing {expected:?} in provider page"
+        );
+    }
+
+    stop.send(()).expect("stop service");
+    service
+        .await
+        .expect("service task exits")
+        .expect("service stops cleanly");
+}
+
+async fn wait_for_http<T: std::fmt::Debug>(
+    address: std::net::SocketAddr,
+    task: &mut tokio::task::JoinHandle<T>,
+) {
+    for _ in 0..100 {
+        assert!(!task.is_finished(), "service exited before HTTP bind");
+        if TcpStream::connect(address).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("HTTP listener at {address} did not become ready");
+}
+
+async fn http_get(address: std::net::SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("connect to web UI");
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("write HTTP request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read HTTP response");
+    String::from_utf8(response).expect("HTTP response is UTF-8")
 }
 
 /// Waits until the fixture's socket exists *and* is owner-only.

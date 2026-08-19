@@ -18,6 +18,7 @@ authoritative copy of each:
   which is also what lets one conversation replay identically on either model backend
   rather than losing encrypted reasoning silently on the way across. The session's own
   exchange is recorded even when the session fails, so a failed turn is not silently lost.
+- `prompt::ModelUsageObserver` — an optional informational callback invoked for every decoded model response, including an explicit absence of provider usage; it cannot influence the session.
 - `prompt::run_prompt_with_history_and_options` — that same continuation carrying a
   `CompletionOptions` to every model call it makes. The options are request-scoped routing
   metadata such as a prompt cache key: they change how a provider routes the request, never

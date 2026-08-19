@@ -2501,6 +2501,8 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::Engine { .. }
         | BrokerHostError::Store { .. }
         | BrokerHostError::Linker { .. }
+        | BrokerHostError::ArtifactMetadata { .. }
+        | BrokerHostError::ArtifactChanged { .. }
         | BrokerHostError::Compile { .. }
         | BrokerHostError::Instantiate { .. }
         | BrokerHostError::DescribeUsedHostImport { .. }

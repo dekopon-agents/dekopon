@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{fmt, io, time::Duration};
+use std::{collections::BTreeSet, fmt, io, time::Duration};
 
 #[cfg(unix)]
 use std::{
@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use dekopon_capability::{InvocationOutcome, InvocationResult};
+pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
 use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId};
 use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -36,6 +36,20 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Default connection/read/write deadline.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum agents accepted in one informational gateway inventory.
+pub const MAX_REPORTED_AGENTS: usize = 1_024;
+/// Maximum capabilities accepted for one reported agent.
+pub const MAX_REPORTED_AGENT_CAPABILITIES: usize = 1_024;
+/// Maximum providers accepted for one reported agent.
+pub const MAX_REPORTED_AGENT_PROVIDERS: usize = 256;
+/// Maximum provider permissions accepted for one reported capability.
+pub const MAX_REPORTED_PERMISSIONS: usize = 256;
+/// Maximum bytes retained from one operator-authored informational string.
+pub const MAX_REPORTED_TEXT_BYTES: usize = 4 * 1024;
+/// Defensive ceiling on model calls represented by one accounting delta.
+pub const MAX_REPORTED_MODEL_CALLS: u64 = 1_000_000;
+/// Defensive ceiling on any one token-accounting delta.
+pub const MAX_REPORTED_TOKENS: u64 = 1_000_000_000_000_000;
 
 /// Stable failure code: the connected peer is not mapped by broker policy.
 pub const ERROR_UNAUTHENTICATED: &str = "unauthenticated";
@@ -257,6 +271,146 @@ pub struct AvailableCapability {
     pub capability: ProviderCapability,
 }
 
+/// Informational catalog capability reported by an unprivileged gateway.
+///
+/// This value is never policy input. It exists only so the broker-hosted read-only web UI can show
+/// what the gateway loaded from its catalog without moving catalog ownership into the broker.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReportedAgentCapability {
+    /// Catalog capability identifier.
+    pub id: CapabilityId,
+    /// Catalog provider declaration for this capability.
+    pub provider: ProviderId,
+    /// Catalog-declared least-privilege provider permissions.
+    pub permissions: Vec<Permission>,
+}
+
+/// One informational catalog agent reported by an unprivileged gateway.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReportedAgent {
+    /// Catalog agent identifier.
+    pub id: AgentId,
+    /// Operator-authored purpose, never standing instructions.
+    pub description: String,
+    /// Whether the catalog permits the gateway to route to this agent.
+    pub enabled: bool,
+    /// Optional model class, not a model credential or endpoint.
+    pub model_class: Option<String>,
+    /// Providers the agent's declared capabilities refer to.
+    pub providers: Vec<ProviderId>,
+    /// Capabilities the agent may propose; this inventory grants none of them.
+    pub capabilities: Vec<ReportedAgentCapability>,
+}
+
+/// Complete informational agent inventory loaded by one gateway.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentInventory {
+    /// Agents in deterministic identifier order.
+    pub agents: Vec<ReportedAgent>,
+    /// Whether defensive report bounds omitted or shortened any catalog metadata.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl AgentInventory {
+    /// Checks defensive cardinality, text, and duplicate bounds before retaining a report.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.agents.len() > MAX_REPORTED_AGENTS {
+            return false;
+        }
+        let mut agents = BTreeSet::new();
+        self.agents.iter().all(|agent| {
+            agents.insert(agent.id.clone())
+                && agent.description.len() <= MAX_REPORTED_TEXT_BYTES
+                && agent
+                    .model_class
+                    .as_ref()
+                    .is_none_or(|value| value.len() <= MAX_REPORTED_TEXT_BYTES)
+                && agent.providers.len() <= MAX_REPORTED_AGENT_PROVIDERS
+                && agent.capabilities.len() <= MAX_REPORTED_AGENT_CAPABILITIES
+                && unique(agent.providers.iter())
+                && unique(agent.capabilities.iter().map(|capability| &capability.id))
+                && agent.capabilities.iter().all(|capability| {
+                    agent.providers.contains(&capability.provider)
+                        && capability.permissions.len() <= MAX_REPORTED_PERMISSIONS
+                        && capability.permissions.iter().all(|permission| {
+                            permission.operation.len() <= MAX_REPORTED_TEXT_BYTES
+                                && permission.resource.as_ref().is_none_or(|resource| {
+                                    resource.len() <= MAX_REPORTED_TEXT_BYTES
+                                })
+                        })
+                })
+        })
+    }
+}
+
+fn unique<'a, T: 'a + Ord>(values: impl IntoIterator<Item = &'a T>) -> bool {
+    let mut seen = BTreeSet::new();
+    values.into_iter().all(|value| seen.insert(value))
+}
+
+/// Provider-reported token accounting accumulated by an unprivileged model process.
+///
+/// Counts are informational and process-local. They never enter policy, authorization, execution,
+/// evidence, or durable broker audit. Missing counts stay explicit rather than becoming zero.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ModelUsageReport {
+    /// Model calls represented by this delta.
+    pub model_calls: u64,
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Calls whose provider omitted input-token accounting.
+    pub input_unreported_calls: u64,
+    /// Provider-reported cached input tokens.
+    pub cached_input_tokens: u64,
+    /// Calls whose provider omitted cached-input accounting.
+    pub cached_input_unreported_calls: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+    /// Calls whose provider omitted output-token accounting.
+    pub output_unreported_calls: u64,
+    /// Provider-reported reasoning output tokens.
+    pub reasoning_output_tokens: u64,
+    /// Calls whose provider omitted reasoning-token accounting.
+    pub reasoning_unreported_calls: u64,
+    /// Provider-reported total tokens.
+    pub total_tokens: u64,
+    /// Calls whose provider omitted total-token accounting.
+    pub total_unreported_calls: u64,
+}
+
+impl ModelUsageReport {
+    /// Validates one bounded accounting delta before it reaches a live counter.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.model_calls > 0
+            && self.model_calls <= MAX_REPORTED_MODEL_CALLS
+            && [
+                self.input_unreported_calls,
+                self.cached_input_unreported_calls,
+                self.output_unreported_calls,
+                self.reasoning_unreported_calls,
+                self.total_unreported_calls,
+            ]
+            .into_iter()
+            .all(|missing| missing <= self.model_calls)
+            && [
+                self.input_tokens,
+                self.cached_input_tokens,
+                self.output_tokens,
+                self.reasoning_output_tokens,
+                self.total_tokens,
+            ]
+            .into_iter()
+            .all(|tokens| tokens <= MAX_REPORTED_TOKENS)
+    }
+}
+
 /// One attested on-behalf-of claim accompanying a gateway's proposal.
 ///
 /// This is deliberately a separate typed structure rather than fields on
@@ -341,6 +495,24 @@ impl RequestEnvelope {
             },
         }
     }
+
+    /// Creates an informational gateway catalog report.
+    #[must_use]
+    pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::PublishAgentInventory { inventory },
+        }
+    }
+
+    /// Creates an informational model-token accounting report.
+    #[must_use]
+    pub const fn publish_model_usage(usage: ModelUsageReport) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::PublishModelUsage { usage },
+        }
+    }
 }
 
 /// Operations accepted by the local broker.
@@ -385,6 +557,19 @@ pub enum BrokerRequest {
         word: String,
         /// Arguments as the script supplied them, `argv[0]` being the word itself.
         argv: Vec<String>,
+    },
+    /// Replaces the broker's in-memory informational view of the gateway catalog.
+    ///
+    /// The server accepts this only from a mapped attestor peer. It grants nothing and is never
+    /// consulted by authorization or provider execution.
+    PublishAgentInventory {
+        /// Bounded catalog metadata with no instructions, prompts, or credentials.
+        inventory: AgentInventory,
+    },
+    /// Adds one provider-reported model-token delta to process-local informational counters.
+    PublishModelUsage {
+        /// Bounded usage delta with explicit unreported-call counts.
+        usage: ModelUsageReport,
     },
 }
 
@@ -449,6 +634,15 @@ impl ResponseEnvelope {
         }
     }
 
+    /// Acknowledges an informational report that was retained in memory.
+    #[must_use]
+    pub const fn acknowledged() -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            response: BrokerResponse::Acknowledged,
+        }
+    }
+
     /// Creates a stable protocol/server failure response without internal details.
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -498,6 +692,8 @@ pub enum BrokerResponse {
         /// The provider's message when it declined to rewrite this argv.
         message: Option<String>,
     },
+    /// An informational status report was retained in process memory.
+    Acknowledged,
     /// Protocol or broker infrastructure failure.
     Error {
         /// Stable public machine code.
@@ -796,9 +992,9 @@ impl BrokerClient {
         match self.exchange(RequestEnvelope::capabilities()).await? {
             BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. } | BrokerResponse::CommandResolution { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -810,9 +1006,9 @@ impl BrokerClient {
         match self.exchange(RequestEnvelope::invoke(request)).await? {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandResolution { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -832,9 +1028,39 @@ impl BrokerClient {
         {
             BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. } | BrokerResponse::CommandResolution { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Publishes a bounded, informational gateway catalog inventory.
+    ///
+    /// A broker accepts this only from a mapped attestor peer. The inventory is never an
+    /// authorization input and a reporting failure must not be treated as loss of authority.
+    pub async fn publish_agent_inventory(
+        &self,
+        inventory: AgentInventory,
+    ) -> Result<(), ClientError> {
+        match self
+            .exchange(RequestEnvelope::publish_agent_inventory(inventory))
+            .await?
+        {
+            BrokerResponse::Acknowledged => Ok(()),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Publishes one bounded, informational model-token accounting delta.
+    pub async fn publish_model_usage(&self, usage: ModelUsageReport) -> Result<(), ClientError> {
+        match self
+            .exchange(RequestEnvelope::publish_model_usage(usage))
+            .await?
+        {
+            BrokerResponse::Acknowledged => Ok(()),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -859,9 +1085,9 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandResolution { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 

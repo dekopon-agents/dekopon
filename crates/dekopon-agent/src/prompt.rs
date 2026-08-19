@@ -111,6 +111,16 @@ pub trait AssetSource {
     fn is_empty(&self) -> bool;
 }
 
+/// Observes provider-reported token accounting without influencing a model session.
+///
+/// The observer receives one call after every successfully decoded model response, including a
+/// response whose provider omitted usage and a response followed by a later tool/session failure.
+/// It is operational accounting only and must never be used to authorize or alter the session.
+pub trait ModelUsageObserver: Send + Sync {
+    /// Records the provider's report, or `None` when it reported no token counts.
+    fn observe(&self, usage: Option<ModelUsage>);
+}
+
 /// Bounds on one prompt session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PromptLimits {
@@ -252,6 +262,7 @@ pub struct SessionInputs<'a> {
     limits: PromptLimits,
     options: Option<&'a CompletionOptions>,
     assets: Option<&'a dyn AssetSource>,
+    usage_observer: Option<&'a dyn ModelUsageObserver>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -264,6 +275,7 @@ impl<'a> SessionInputs<'a> {
             limits,
             options: None,
             assets: None,
+            usage_observer: None,
         }
     }
 
@@ -285,6 +297,13 @@ impl<'a> SessionInputs<'a> {
     #[must_use]
     pub const fn with_assets(mut self, assets: &'a dyn AssetSource) -> Self {
         self.assets = Some(assets);
+        self
+    }
+
+    /// Adds an informational observer for provider-reported token accounting.
+    #[must_use]
+    pub const fn with_usage_observer(mut self, observer: &'a dyn ModelUsageObserver) -> Self {
+        self.usage_observer = Some(observer);
         self
     }
 }
@@ -309,6 +328,7 @@ where
         limits,
         options,
         assets,
+        usage_observer,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -327,7 +347,15 @@ where
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
-    let result = run_session(model, runtime, messages, limits, options, assets);
+    let result = run_session(
+        model,
+        runtime,
+        messages,
+        limits,
+        options,
+        assets,
+        usage_observer,
+    );
     history.record(match &result {
         Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
         Err(_) => ConversationTurn::unanswered(prompt),
@@ -346,6 +374,7 @@ fn run_session<M, R>(
     limits: PromptLimits,
     options: &CompletionOptions,
     assets: Option<&dyn AssetSource>,
+    usage_observer: Option<&dyn ModelUsageObserver>,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
@@ -414,6 +443,9 @@ where
                 return Err(error.into());
             }
         };
+        if let Some(observer) = usage_observer {
+            observer.observe(turn.usage);
+        }
         if let Some(usage) = &turn.usage {
             record_usage(&model_span, usage);
         }
@@ -991,15 +1023,16 @@ mod tests {
 
     use dekopon_model::model::{
         AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall,
+        ModelTool, ModelToolCall, ModelUsage,
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
 
     use super::{
         ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits,
-        PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, format_script_outcome,
-        run_prompt, run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        ModelUsageObserver, PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime,
+        SessionInputs, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1156,6 +1189,15 @@ mod tests {
             .collect()
     }
 
+    #[derive(Default)]
+    struct UsageRecorder(Mutex<Vec<Option<ModelUsage>>>);
+
+    impl ModelUsageObserver for UsageRecorder {
+        fn observe(&self, usage: Option<ModelUsage>) {
+            self.0.lock().expect("usage observations lock").push(usage);
+        }
+    }
+
     /// Asserts a replayed window is a request both backends accept.
     ///
     /// The two 400s this feature could produce are a `tool` result whose call was trimmed away and
@@ -1209,6 +1251,34 @@ mod tests {
                 position += 1;
             }
         }
+    }
+
+    #[test]
+    fn token_observer_sees_reported_and_unreported_successful_model_responses() {
+        let mut first = script_call("call-1", "echo hello");
+        let expected = ModelUsage {
+            input_tokens: Some(41),
+            output_tokens: Some(5),
+            ..ModelUsage::default()
+        };
+        first.usage = Some(expected);
+        let model = ScriptedModel::new([first, answer("done")]);
+        let runtime = RecordingRuntime::new(0);
+        let observer = UsageRecorder::default();
+        let mut history = History::default();
+
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("run it", limits(3, 4)).with_usage_observer(&observer),
+            &mut history,
+        )
+        .expect("session succeeds");
+
+        assert_eq!(
+            *observer.0.lock().expect("usage observations lock"),
+            vec![Some(expected), None]
+        );
     }
 
     #[test]

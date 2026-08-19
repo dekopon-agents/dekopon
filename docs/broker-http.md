@@ -71,7 +71,10 @@ The protocol exposes only the operations needed by a broker client:
 - submit one invocation proposal;
 - inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
 - submit one proposal attested on behalf of an external subject (`invokeFor`);
+- let a mapped attestor publish a bounded informational catalog inventory and model-token delta for the process-local web UI; and
 - receive a denied, succeeded, or failed result with bounded public evidence metadata.
+
+The informational operations are deliberately outside the authority flow. Their payloads contain no prompt, subject, principal, instruction, credential, policy, constraint, or authorization; they grant nothing, produce no provider effect, and are absent from durable authorization audit. A gateway can misreport dashboard state and cannot use that state to influence a decision.
 
 `AuthorizedInvocation` is never accepted from or returned to the client. It is created and consumed inside the broker process.
 
@@ -99,6 +102,8 @@ A failure response carries a stable code and a bounded message. The code is the 
 `outcome-unaudited` is the durable-state signal that separates "nothing happened" from "something may have happened and nothing recorded it". It is emitted only for failures raised after execution began — a failed terminal audit append, or a failure to hash terminal evidence. A denied or failed *invocation* is not a failure response at all: it returns a normal result carrying its outcome and decision linkage.
 
 The server logs `broker_outcome_unaudited` with the invocation identifier for exactly this case, so the invocation needing manual reconciliation is identifiable without correlating client-side state.
+
+Successful informational reports return `acknowledged`; invalid bounds return `invalid-request`, and a mapped peer without an attestor grant receives `unauthenticated`. Reporting failures are non-authoritative and must never be interpreted as provider work or retried as an invocation.
 
 ## HTTP component contract
 
