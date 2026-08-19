@@ -5,8 +5,9 @@ drives one prompt session from a CLI; the `dekopond` daemon drives many from cha
 transports. Both consume the same pieces from this crate, so there is exactly one
 authoritative copy of each:
 
-- `prompt::run_prompt` — the bounded model tool loop that offers a single sandboxed
-  scripting tool (`bash`) instead of one tool per capability.
+- `prompt::run_prompt` — the bounded model tool loop that always offers one sandboxed
+  scripting tool (`bash`) instead of one tool per capability; embedders may additionally
+  supply bounded chat-asset and credential-free agent-configuration tools.
 - `prompt::run_prompt_with_history` — the same loop run as the continuation of a
   `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
   there is no tokenizer here and token counts only arrive after a call has been billed.
@@ -30,9 +31,16 @@ authoritative copy of each:
 - `BrokerLeg` — a synchronous `CapabilityInvoker` facade over the asynchronous
   `dekopon-broker-protocol` client, valid only on a blocking task; `connect_attested`
   additionally proposes on behalf of a transport-authenticated external subject, which
-  the broker honors only under an owner-configured attestor grant.
+  the broker honors only under an owner-configured attestor grant. Its fresh capability
+  snapshot also supplies trusted effect/risk/idempotency metadata for self-inspection,
+  never policy source, identity, constraints, or credentials.
 - `IdSequence` — collision-free trace and invocation identifiers under a caller-chosen
   session prefix.
+
+`meta::AgentConfigView` is the deliberately narrow introspection shape: exact standing
+instructions, session limits, and effective capability classifications. Its type has no
+field for policy source, policy IDs, identity, endpoints, paths, or credentials, and its
+serialized result is hard-bounded.
 
 Nothing in this crate holds authority. The broker leg submits identity-free proposals
 over an authenticated Unix socket and reports back whatever the broker decided; this

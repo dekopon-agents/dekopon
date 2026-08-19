@@ -51,8 +51,9 @@ use serde_json::Value;
 #[cfg(unix)]
 use thiserror::Error;
 
-use crate::prompt::ScriptRuntime;
+use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
+pub mod meta;
 pub mod prompt;
 
 /// Runs each model-authored script on the interpreter under this session's dispatch.
@@ -208,6 +209,8 @@ pub struct BrokerLeg {
     client: BrokerClient,
     runtime: tokio::runtime::Handle,
     capabilities: BTreeMap<String, CapabilityDescription>,
+    /// Trusted, credential-free classification for this exact effective capability set.
+    effective_capabilities: Vec<EffectiveCapabilityView>,
     /// Command words loaded providers contribute, snapshotted with the capability set.
     ///
     /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
@@ -233,13 +236,7 @@ impl BrokerLeg {
     /// session made is recoverable from the broker's audit log by prefix.
     pub async fn connect(client: BrokerClient, trace_prefix: &str) -> Result<Self, BrokerLegError> {
         let (capabilities, command_words) = client.session_surface().await?;
-        Self::build(
-            client,
-            trace_prefix,
-            snapshot(capabilities),
-            command_words,
-            None,
-        )
+        Self::build(client, trace_prefix, capabilities, command_words, None)
     }
 
     /// Connects a leg that proposes on behalf of one transport-authenticated external subject.
@@ -264,7 +261,7 @@ impl BrokerLeg {
         Self::build(
             client,
             trace_prefix,
-            snapshot(capabilities),
+            capabilities,
             command_words,
             Some(Attestation { subject, agent }),
         )
@@ -273,40 +270,64 @@ impl BrokerLeg {
     fn build(
         client: BrokerClient,
         trace_prefix: &str,
-        capabilities: BTreeMap<String, CapabilityDescription>,
+        available: Vec<dekopon_broker_protocol::AvailableCapability>,
         command_words: Vec<String>,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
+        let (capabilities, effective_capabilities) = snapshot(available);
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
+            effective_capabilities,
             command_words,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
         })
     }
+
+    /// Returns this session's trusted, subject-specific effective capability classification.
+    ///
+    /// This is the same fresh broker answer that backs `cap --list`. It contains no policy source,
+    /// policy identifier, subject, principal, constraint, or credential metadata.
+    #[must_use]
+    pub fn effective_capabilities(&self) -> Vec<EffectiveCapabilityView> {
+        self.effective_capabilities.clone()
+    }
 }
 
-/// Indexes a capability snapshot by identifier for the interpreter's lookups.
+/// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
 #[cfg(unix)]
 fn snapshot(
     capabilities: Vec<dekopon_broker_protocol::AvailableCapability>,
-) -> BTreeMap<String, CapabilityDescription> {
-    capabilities
-        .into_iter()
-        .map(|available| {
-            (
-                available.capability.id.to_string(),
-                CapabilityDescription {
-                    capability: available.capability.id.to_string(),
-                    description: available.capability.description,
-                    input_schema: available.capability.input_schema,
-                },
-            )
-        })
-        .collect()
+) -> (
+    BTreeMap<String, CapabilityDescription>,
+    Vec<EffectiveCapabilityView>,
+) {
+    let mut descriptions = BTreeMap::new();
+    let mut effective = Vec::with_capacity(capabilities.len());
+    for available in capabilities {
+        let id = available.capability.id.to_string();
+        effective.push(EffectiveCapabilityView {
+            id: id.clone(),
+            provider: available.provider.to_string(),
+            description: available.capability.description.clone(),
+            effect: available.capability.effect.to_string(),
+            risk: available.capability.risk.to_string(),
+            idempotency: available.capability.idempotency.to_string(),
+        });
+        descriptions.insert(
+            id.clone(),
+            CapabilityDescription {
+                capability: id,
+                description: available.capability.description,
+                input_schema: available.capability.input_schema,
+            },
+        );
+    }
+    effective.sort_by(|left, right| left.id.cmp(&right.id));
+    (descriptions, effective)
 }
 
 #[cfg(unix)]
@@ -612,7 +633,7 @@ mod tests {
         use serde_json::json;
         use tokio::{net::UnixListener, sync::mpsc};
 
-        use crate::{Attestation, BrokerLeg, IdSequence};
+        use crate::{Attestation, BrokerLeg, IdSequence, meta::EffectiveCapabilityView};
 
         const CAPABILITY: &str = "http-probe.fetch";
         const SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -709,6 +730,14 @@ mod tests {
                     .expect("stub broker client"),
                 runtime: tokio::runtime::Handle::current(),
                 capabilities,
+                effective_capabilities: vec![EffectiveCapabilityView {
+                    id: CAPABILITY.to_owned(),
+                    provider: "http-probe".to_owned(),
+                    description: "Fetches one broker-authorized URI".to_owned(),
+                    effect: "read-only".to_owned(),
+                    risk: "Low".to_owned(),
+                    idempotency: "idempotent".to_owned(),
+                }],
                 command_words: Vec::new(),
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,

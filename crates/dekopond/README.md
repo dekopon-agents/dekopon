@@ -5,8 +5,8 @@ persistent conversations are implemented and tested.
 
 The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services,
 waits for a wakeup, routes each authenticated message to a named agent from the catalog,
-runs one bounded model session whose only tool is the sandboxed shell, and replies with
-the answer.
+runs one bounded model session with the sandboxed shell plus safe on-demand meta tools,
+and replies with the answer.
 
 - **Transports** — Slack Socket Mode (outbound WebSocket, so no public HTTP endpoint),
   Telegram long polling, and an owner-only Unix development socket.
@@ -24,6 +24,9 @@ the answer.
   `mode: persistent`, which keeps a per-sender history in gateway memory, compacted to
   question-and-answer pairs inside a sliding window and dropped on an idle timeout, an LRU
   ceiling, or a changed capability grant. It caches no authorization.
+- **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
+  standing prompt, route limits, and fresh subject-specific effective Cedar grants. The fixed
+  shape omits raw policy, identity, endpoints, paths, and all credential names and values.
 - **Informational status** — after the broker probe, the gateway best-effort reports a bounded
   content-free catalog inventory; each session separately coalesces provider-reported model usage.
   These feed only the broker-hosted web UI, reset with the broker process, and never affect a
@@ -40,8 +43,10 @@ set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and
 `dekopon-brokerd`, and CI enforces that.
 
 Message text is untrusted end to end, and so are the agent's own standing orders from the
-catalog: neither can assert identity, name a principal, or widen a grant. Standing orders, chat
-content, subjects, and credentials are excluded from informational status reports.
+catalog: neither can assert identity, name a principal, or widen a grant. An authorized sender can
+ask the agent to quote those standing orders through self-inspection, so they are not confidential.
+Standing orders, chat content, subjects, and credentials remain excluded from informational status
+reports.
 
 The development transport is the one deliberate exception to "identity comes from
 authenticated transport": it trusts its local caller to declare a subject. It grants

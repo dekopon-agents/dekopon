@@ -783,6 +783,7 @@ dependencies = [
  "dekopon-shell",
  "dekopon-telemetry",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

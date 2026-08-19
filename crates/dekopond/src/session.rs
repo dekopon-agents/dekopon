@@ -13,6 +13,7 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
+    meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
     prompt::{History, ModelUsageObserver, PromptError, SessionInputs, run_prompt_session},
 };
 use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED, ModelUsageReport};
@@ -27,7 +28,7 @@ use tracing::Instrument as _;
 
 use crate::{
     asset::{self, AssetStore, SessionAssets},
-    config::{ModelConfig, ResolvedBroker},
+    config::{ConversationPolicy, ModelConfig, ResolvedBroker},
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{AssetFetcher, ChatReplier, InboundMessage, bound_inbound, bound_outbound},
@@ -345,6 +346,15 @@ async fn session(
         answer(replier, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
+    let agent_config = agent_config_view(
+        route.agent.as_str(),
+        &route.description,
+        route.model_class.as_deref(),
+        route.instructions.as_deref(),
+        route.limits,
+        route.conversation,
+        &leg,
+    );
 
     // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
@@ -451,7 +461,8 @@ async fn session(
                 .with_system(instructions.as_deref())
                 .with_options(&options)
                 .with_assets(&assets)
-                .with_usage_observer(observed_usage.as_ref()),
+                .with_usage_observer(observed_usage.as_ref())
+                .with_agent_config(&agent_config),
             &mut history,
         )
         .map_err(SessionError::from);
@@ -514,6 +525,43 @@ async fn session(
     } else {
         "reply-failed"
     }
+}
+
+/// Builds the credential-free meta view from gateway-owned catalog fields and the broker's fresh
+/// subject-specific capability snapshot.
+///
+/// Deliberately takes no [`ModelConfig`], broker configuration, transport message, subject, or
+/// principal. Those are exactly the places credentials, endpoints, paths, and identity live, and a
+/// constructor that cannot receive them is stronger than one expected to remember to redact them.
+fn agent_config_view(
+    agent: &str,
+    description: &str,
+    model_class: Option<&str>,
+    instructions: Option<&str>,
+    limits: dekopon_agent::prompt::PromptLimits,
+    conversation: ConversationPolicy,
+    leg: &BrokerLeg,
+) -> AgentConfigView {
+    let conversation = match conversation {
+        ConversationPolicy::OneShot => ConversationConfigView::OneShot,
+        ConversationPolicy::Persistent(window) => ConversationConfigView::Persistent {
+            idle_timeout_ms: u64::try_from(window.idle_timeout.as_millis()).unwrap_or(u64::MAX),
+            max_turns: window.limits.max_turns,
+            max_bytes: window.limits.max_bytes,
+        },
+    };
+    AgentConfigView::new(
+        agent.to_owned(),
+        description.to_owned(),
+        model_class.map(str::to_owned),
+        instructions.map(str::to_owned),
+        SessionConfigView {
+            max_steps: limits.max_steps,
+            max_capability_calls: limits.max_capability_calls,
+            conversation,
+        },
+        leg.effective_capabilities(),
+    )
 }
 
 /// Opens this session's attested broker leg.

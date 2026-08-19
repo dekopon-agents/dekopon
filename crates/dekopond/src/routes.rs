@@ -24,6 +24,10 @@ pub(crate) struct BoundRoute {
     pub transport: String,
     pub r#match: RouteMatch,
     pub agent: AgentId,
+    /// Operator-authored purpose safe to expose through credential-free introspection.
+    pub description: String,
+    /// Catalog model class; never the selected model endpoint or credential configuration.
+    pub model_class: Option<String>,
     /// The agent's standing orders, which are untrusted model text and grant nothing.
     pub instructions: Option<String>,
     pub model: Arc<ModelConfig>,
@@ -104,6 +108,8 @@ impl RoutingTable {
                 transport: route.transport.clone(),
                 r#match: route.r#match.clone(),
                 agent: route.agent.clone(),
+                description: agent.spec.description.clone(),
+                model_class: agent.spec.model_class.clone(),
                 instructions: agent.spec.instructions.clone(),
                 model: Arc::clone(model),
                 limits: PromptLimits {
