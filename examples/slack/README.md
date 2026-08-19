@@ -9,8 +9,15 @@ replies. No public endpoint is needed.
 
 1. Open [Your Apps](https://api.slack.com/apps), select **Create New App → From a manifest**, choose
    a workspace, and paste [`manifest.yaml`](manifest.yaml).
-2. Under **Basic Information → App-Level Tokens**, create a token with `connections:write`. Save the
-   resulting `xapp-…` value.
+2. Under **Basic Information → App-Level Tokens**, select **Generate Token and Scopes** and complete
+   the dialog:
+   - **Token Name:** enter `dekopon` (or any other descriptive label). The name only identifies the
+     credential in Slack.
+   - **Scopes to be accessed by this token:** add `connections:write`. This is the only app-level
+     scope Dekopon needs. If Slack leaves another empty permission selector in the dialog, leave it
+     empty; a second scope is not required.
+   - Select **Generate**, then copy the resulting `xapp-…` value. Treat it as a secret; do not put
+     it in the manifest or commit it to the repository.
 3. Under **Install App**, install the app to the workspace. Save the bot token (`xoxb-…`).
 4. Export both tokens using the names in `dekopond.yaml`:
 
