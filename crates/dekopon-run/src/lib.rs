@@ -146,10 +146,10 @@ fn command_name(command: &Command) -> &'static str {
 async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
     match &cli.command {
         Command::Inspect { limits, providers } => {
-            let span =
-                tracing::info_span!("runner.inspect", provider.count = providers.provider.len());
+            let components = providers.components()?;
+            let span = tracing::info_span!("runner.inspect", provider.count = components.len());
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
+            let registry = ProviderRegistry::load(components, host_limits(limits))?;
             let manifests = registry.manifests().collect::<Vec<&ProviderManifest>>();
             serde_json::to_string_pretty(&manifests)
                 .map(CommandOutput::success)
@@ -163,9 +163,10 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             input_file,
             repeat,
         } => {
+            let components = providers.components()?;
             let span = tracing::info_span!(
                 "runner.invoke",
-                provider.count = providers.provider.len(),
+                provider.count = components.len(),
                 capability.id = %capability,
                 invocation.count = repeat.get()
             );
@@ -175,7 +176,7 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 input_file.as_deref(),
                 limits.max_input_bytes,
             )?;
-            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
+            let registry = ProviderRegistry::load(components, host_limits(limits))?;
             let mut samples = TimingSamples::default();
             let mut last = None;
             let total_start = Instant::now();
@@ -242,14 +243,15 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             curl_capability,
             script,
         } => {
+            let components = providers.components()?;
             let span = tracing::info_span!(
                 "runner.shell",
-                provider.count = providers.provider.len(),
+                provider.count = components.len(),
                 shell.max_steps = shell.shell_max_steps,
                 shell.max_capability_calls = shell.shell_max_capability_calls
             );
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(providers.provider.clone(), host_limits(limits))?;
+            let registry = ProviderRegistry::load(components, host_limits(limits))?;
             let invoker = RegistryInvoker {
                 registry: &registry,
             };
@@ -284,11 +286,12 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             } else {
                 "openai-compatible"
             };
+            let components = providers.components()?;
             let settings = PromptSettings {
                 limits: host_limits(limits),
                 shell: shell_limits(shell),
                 curl_capability: curl_capability.as_ref().map(CapabilityId::to_string),
-                providers: providers.provider.clone(),
+                providers: components.clone(),
                 model: model.clone(),
                 chatgpt_subscription: *chatgpt_subscription,
                 chatgpt_auth_file: chatgpt_auth_file.clone(),
@@ -305,7 +308,7 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             evaluate_prompt(settings, *broker, connection)
                 .instrument(tracing::info_span!(
                     "runner.prompt",
-                    provider.count = providers.provider.len(),
+                    provider.count = components.len(),
                     model = %model,
                     model.backend = backend,
                     prompt.max_steps = max_steps.get(),
@@ -962,6 +965,8 @@ enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderHostError),
     #[error(transparent)]
+    ProviderArgs(#[from] cli::ProviderArgsError),
+    #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
     Prompt(#[from] PromptError),
@@ -1020,6 +1025,7 @@ impl AppError {
             Self::BrokerInputObject => "broker-input-object",
             Self::ChatGpt(_) => "chatgpt",
             Self::Provider(_) => "provider",
+            Self::ProviderArgs(_) => "provider-args",
             Self::Model(_) => "model",
             Self::Prompt(_) => "prompt",
             Self::ReadInput { .. } => "input-read",
