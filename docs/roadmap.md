@@ -59,10 +59,12 @@ Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the sam
 
 Version 0.5.0 adds no crate and no process boundary, and it is the first release to move a documented authority line: the gateway now fetches the bytes of a file attached to a message it was already receiving. That is bounded by media type, per-attachment size enforced while streaming, per-session fetch count, and a per-conversation ceiling — never by policy, which the gateway still does not hold. [`security-model.md`](security-model.md) carries the argument.
 
-## Current development after 0.5
+## 0.6 — read-only operational web UI (released)
 
 - `dekopon-webui` is a meaningful new crate embedded only in `dekopon-brokerd`: an explicitly bound, unauthenticated GET-only operational view of loaded provider manifests/interfaces, host-observed Wasmtime counters/ceilings, credential-free OTLP settings, and bounded informational agent/token reports from `dekopond`.
 - Agent inventory and token reporting do not move orchestration into the broker. Reports omit content and authority, are accepted only from a mapped attestor, remain process-local, reset on restart, and never feed policy, constraints, credentials, execution, evidence, replay, or durable audit.
+
+Version 0.6.0 adds the twenty-first public crate and an opt-in TCP listener, but no new effect authority. Omitting `--http-bind` leaves the listener absent; enabling it exposes deployment metadata to every client the selected network address can reach.
 
 ## Next milestones
 
