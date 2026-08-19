@@ -3266,6 +3266,43 @@ fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
 
+#[test]
+fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
+    // The bug this pins, observed in a real conversation: someone sends a screenshot, the model
+    // looks at it and answers, and then the *next* message withdraws the tool because that message
+    // carried no attachment of its own. The reference line is still in replayed history, so the
+    // model is left able to name `Chat Asset #1` and unable to open it — and answers from the
+    // description it produced a turn ago rather than saying it cannot see. That reads as lying.
+    let store = asset_store();
+    let now = Instant::now();
+    let first = store.assets_for(
+        "c1",
+        vec![pending("shot.png", "image/png", 2048)],
+        true,
+        now,
+    );
+    assert!(first.fetchable);
+
+    // The follow-up: no attachment, same conversation.
+    let second = store.assets_for("c1", Vec::new(), true, now);
+    assert!(
+        second.refs.is_empty(),
+        "a message that carried nothing describes nothing"
+    );
+    assert!(
+        second.fetchable,
+        "but the conversation's screenshot is still there to be looked at"
+    );
+    assert_eq!(
+        store.get("c1", 1, now).map(|asset| asset.name),
+        Some("shot.png".to_owned())
+    );
+
+    // A conversation that never had one still offers nothing.
+    let elsewhere = store.assets_for("c2", Vec::new(), true, now);
+    assert!(!elsewhere.fetchable);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
     // A model that asked for the wrong number can say so and carry on. Ending the session would
