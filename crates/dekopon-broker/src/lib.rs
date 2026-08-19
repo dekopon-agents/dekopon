@@ -41,7 +41,8 @@ use std::{
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use dekopon_broker_host::{
-    BoundCredential, BrokerHostError, BrokerProviderRegistry, HttpCallEvidence, ProviderCapability,
+    BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, HttpCallEvidence,
+    ProviderCapability,
 };
 pub use dekopon_broker_protocol::{AvailableCapability, InvocationRequest, SubjectAttestation};
 use dekopon_capability::{
@@ -1815,6 +1816,51 @@ where
     ///
     /// The listing and the invocation decision come from the same evaluation, so a capability can
     /// never appear here and then refuse — or be hidden here and then succeed.
+    /// Returns the command words this context may use.
+    ///
+    /// A word appears only when policy allows this context at least one capability of the provider
+    /// declaring it, so a session is never told a word exists that it could not use — and a
+    /// principal granted nothing sees an empty vocabulary rather than a map of the deployment.
+    #[must_use]
+    pub fn command_words(&self, context: &AuthenticatedContext) -> Vec<String> {
+        let reachable = self
+            .constraints
+            .iter()
+            .filter(|(capability, set)| self.authorize_capability(context, capability, set).allowed)
+            .map(|(_, set)| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        let mut words = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .filter(|(provider, _)| reachable.contains(*provider))
+            .flat_map(|(_, words)| words.iter().cloned())
+            .collect::<Vec<_>>();
+        words.sort();
+        words.dedup();
+        words
+    }
+
+    /// Rewrites one command word's arguments into a capability proposal.
+    ///
+    /// Ungated on purpose. This is a pure function inside the declaring component — no imports,
+    /// bounded by fuel and timeout — and what it returns is a *proposal*. Authorization happens
+    /// where it always happens, on the invocation that follows; a caller who rewrites a word they
+    /// may not use receives a denial one step later, having learned nothing they could not learn
+    /// by asking for the capability directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a host error when no loaded provider declares the word, when the guest traps, or
+    /// when the rewrite reaches for a host import.
+    pub async fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Result<CommandResolution, BrokerHostError> {
+        self.registry.resolve_command(word, argv).await
+    }
+
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
         let mut capabilities = self
             .constraints
@@ -1896,7 +1942,7 @@ where
         grant: Option<&AttestorGrant>,
         subject: &ExternalSubject,
         agent: &AgentId,
-    ) -> Option<Vec<AvailableCapability>> {
+    ) -> Option<(Vec<AvailableCapability>, Vec<String>)> {
         if !grant.is_some_and(|grant| grant.permits(subject)) {
             return None;
         }
@@ -1913,7 +1959,7 @@ where
         if !self.authorize_agent_prompt(&context, agent).allowed {
             return None;
         }
-        Some(self.capabilities(&context))
+        Some((self.capabilities(&context), self.command_words(&context)))
     }
 
     /// Derives the context an attested proposal is evaluated — or refused — under.
@@ -2444,7 +2490,8 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
             "invalid-provider-output"
         }
         BrokerHostError::ResolveCommand { .. }
-        | BrokerHostError::ResolveCommandUsedHostImport { .. } => "command-rewrite-failed",
+        | BrokerHostError::ResolveCommandUsedHostImport { .. }
+        | BrokerHostError::InvalidCommandResolution { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
         BrokerHostError::Invoke { .. } => "provider-trap",

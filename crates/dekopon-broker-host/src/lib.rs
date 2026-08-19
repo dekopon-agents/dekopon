@@ -18,7 +18,8 @@ use std::{
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
 pub use dekopon_provider_sdk::{
-    ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability, ProviderManifest,
+    CommandResolution, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
+    ProviderManifest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -651,6 +652,21 @@ impl BrokerProviderRegistry {
         Ok(Self { providers, routes })
     }
 
+    /// Returns each provider's command words, in load order.
+    #[must_use]
+    pub fn command_words_by_provider(&self) -> Vec<(&ProviderId, &[String])> {
+        self.providers
+            .iter()
+            .filter(|provider| !provider.manifest.command_words.is_empty())
+            .map(|provider| {
+                (
+                    &provider.manifest.id,
+                    provider.manifest.command_words.as_slice(),
+                )
+            })
+            .collect()
+    }
+
     /// Returns every command word the loaded providers contribute, in identifier order.
     #[must_use]
     pub fn command_words(&self) -> Vec<String> {
@@ -674,7 +690,7 @@ impl BrokerProviderRegistry {
         &self,
         word: &str,
         argv: &[String],
-    ) -> Result<String, BrokerHostError> {
+    ) -> Result<CommandResolution, BrokerHostError> {
         let provider = self
             .providers
             .iter()
@@ -688,7 +704,15 @@ impl BrokerProviderRegistry {
             .ok_or_else(|| BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             })?;
-        provider.resolve_command(argv).await
+        // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
+        // a daemon that never sees the raw string cannot accidentally forward it to a caller.
+        let json = provider.resolve_command(argv).await?;
+        serde_json::from_str::<CommandResolution>(&json).map_err(|source| {
+            BrokerHostError::InvalidCommandResolution {
+                provider: provider.manifest.id.clone(),
+                source,
+            }
+        })
     }
 
     /// Returns validated manifests in component load order.
@@ -1050,6 +1074,15 @@ pub enum BrokerHostError {
     ConflictingProviders {
         /// Every conflict found, boxed to keep this enum small.
         report: Box<ProviderConflicts>,
+    },
+    /// A provider returned something that is not a command resolution.
+    #[error("provider {provider} returned an unreadable command resolution")]
+    InvalidCommandResolution {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Decode failure.
+        #[source]
+        source: serde_json::Error,
     },
     /// No loaded provider declared the requested command word.
     #[error("no loaded provider declares the command word {word:?}")]
