@@ -8,9 +8,15 @@
 # cost a native build matrix to arrive somewhere less trustworthy than the artifacts users already
 # download.
 #
-# `release: published` rather than the `v*.*.*` tag push: the tag push is what starts `release.yml`,
-# so triggering on it would race the archives this workflow needs. It is the same signal
-# `homebrew-tap.yml` uses, for the same reason. `workflow_dispatch` re-runs an existing release.
+# `release.yml` calls this workflow with `needs: github-release` rather than this workflow
+# triggering on `release: published`. That event cannot fire in this repository: the release is
+# created by `softprops/action-gh-release` authenticated with `GITHUB_TOKEN`, and GitHub does not
+# start workflow runs from events raised by its own token. At v0.4.0 the release was published,
+# `release.yml` went green, and this workflow produced no run at all — not skipped, never created.
+# A `needs` edge states the ordering instead of inferring it from event plumbing, and it gives the
+# same guarantee the release event was meant to: the release exists with every archive and its
+# `.sha256` sidecar attached before this starts. Triggering on the `v*.*.*` tag push would instead
+# race the archives this workflow is made of. `workflow_dispatch` re-runs an existing release.
 #
 # Consequences of having nothing to compile, each one deliberate:
 #   * Every Dockerfile instruction is a COPY, so one runner assembles both platforms in a single
@@ -33,8 +39,12 @@
 name: Container image
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag to package (for example v0.4.0)
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -54,6 +64,10 @@ permissions:
   contents: read
 
 concurrency:
+  # Under `workflow_call` both expressions read the caller's context: the ref is the pushed tag
+  # and the event is `push`, so a called run never cancels itself. The group is also distinct
+  # from `release.yml`'s `release-<tag>`, which matters — a called workflow that queued behind
+  # its own caller's concurrency group would wait for a job that is waiting for it.
   group: container-image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -73,30 +87,25 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          DISPATCH_TAG: ${{ inputs.tag }}
-          PUBLISHED_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          case "$EVENT" in
-            release)
-              tag="$PUBLISHED_TAG"
-              push=true
-              ;;
-            workflow_dispatch)
-              tag="$DISPATCH_TAG"
-              push=true
-              ;;
-            *)
-              # A pull request has no release of its own. Building its Dockerfile and its
-              # checked-in components against the newest published release proves the part a
-              # pull request can break, before a release depends on it.
-              tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
-              push=false
-              ;;
-          esac
+          # The presence of the input, not `github.event_name`: under `workflow_call` the github
+          # context belongs to the caller, so the event name here would be `release.yml`'s `push`.
+          # The input is required by both entry points that publish and absent for a pull request,
+          # which is exactly the distinction this step needs.
+          if [ -n "$REQUESTED_TAG" ]; then
+            tag="$REQUESTED_TAG"
+            push=true
+          else
+            # A pull request has no release of its own. Building its Dockerfile and its
+            # checked-in components against the newest published release proves the part a
+            # pull request can break, before a release depends on it.
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+            push=false
+          fi
           if [ -z "$tag" ]; then
-            echo "::error::could not resolve a release tag for event $EVENT"
+            echo "::error::could not resolve a release tag to package"
             exit 1
           fi
           {

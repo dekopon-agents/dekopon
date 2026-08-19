@@ -212,15 +212,15 @@ The dependency-ordered crate list lives in [`.github/workflows/release.yml`](.gi
 
 ## Homebrew tap automation
 
-Publishing a release also updates [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap). [`.github/workflows/homebrew-tap.yml`](.github/workflows/homebrew-tap.yml) runs on `release: published`, and on manual dispatch against an existing tag. It renders `Formula/dekopon.rb` with [`.github/scripts/render-homebrew-formula.py`](.github/scripts/render-homebrew-formula.py) from the archives that release actually attached, taking each `sha256` from the published `.sha256` sidecar rather than recomputing it.
+Publishing a release also updates [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap). [`.github/workflows/homebrew-tap.yml`](.github/workflows/homebrew-tap.yml) is a reusable workflow that [`release.yml`](.github/workflows/release.yml) calls as a job needing the one that publishes the release, and it also runs on manual dispatch against an existing tag. It renders `Formula/dekopon.rb` with [`.github/scripts/render-homebrew-formula.py`](.github/scripts/render-homebrew-formula.py) from the archives that release actually attached, taking each `sha256` from the published `.sha256` sidecar rather than recomputing it.
 
 It derives platforms from the release rather than from a list held here, so adding a target needs no change to the tap. A target the generator cannot place in a Homebrew `on_macos`/`on_linux` block is a hard error rather than a silently dropped platform. The one hand-maintained entry is the generator's `RETIRED` set, holding targets a past release shipped that the tap must stop offering — currently `x86_64-apple-darwin`, dropped from the matrix in [#74](https://github.com/dekopon-agents/dekopon/pull/74). Re-running the same release renders identical bytes and commits nothing; re-running an *older* release is refused rather than rolling the tap backwards; a release marked prerelease is skipped, because the tap tracks stable releases.
 
-It is a separate workflow rather than a job in `release.yml` because a tap failure must not mark an already-published release red, because `release: published` cannot race the release the formula has to describe, and because re-running only the tap update avoids repeating the whole build matrix.
+It is called rather than triggered by `release: published`, because that event cannot fire here: the release is created by `GITHUB_TOKEN`, and GitHub does not start workflow runs from events raised by its own token. The `needs` edge is what keeps it from racing the release the formula has to describe. It stays a separate workflow file rather than steps inside the release job because re-running only the tap update avoids repeating the whole build matrix. The release object exists before it starts, so a genuine tap failure now reddens a run whose release was published — which is the accurate report, and is why the operator situations below skip instead of failing.
 
 ### The cross-repository credential
 
-`GITHUB_TOKEN` is scoped to the repository running the workflow, so it cannot push to the tap. The workflow mints a short-lived installation token from a GitHub App instead. **This is one-time manual setup by a maintainer.** Until `TAP_APP_ID` exists, the workflow logs a warning and skips; it never fails a release.
+`GITHUB_TOKEN` is scoped to the repository running the workflow, so it cannot push to the tap. The workflow mints a short-lived installation token from a GitHub App instead. **This is one-time manual setup by a maintainer.** Until both secrets exist *and* the App is installed on the tap, the workflow logs a warning naming the missing half and skips; an unfinished credential setup never fails a release.
 
 In the `dekopon-agents` organization, at **Settings → Developer settings → GitHub Apps → New GitHub App**:
 
@@ -229,7 +229,7 @@ In the `dekopon-agents` organization, at **Settings → Developer settings → G
 3. Under **Permissions → Repository permissions**, grant **Contents: Read and write**, and nothing else.
 4. Create the app and note the numeric **App ID**.
 5. **Generate a private key.** GitHub offers the `.pem` download exactly once; save it before leaving the page, and generate a replacement if it is lost.
-6. **Install the app** — creating it grants nothing. Choose **Install App → dekopon-agents → Only select repositories → `homebrew-tap`**. Skipping this produces a `404` on push that reads like a permissions bug.
+6. **Install the app** — creating it grants nothing, and the two secrets below prove only that it exists. Choose **Install App → dekopon-agents → Only select repositories → `homebrew-tap`**. Skipping this makes the token mint `404`; the workflow treats that as the same unfinished setup as a missing secret and skips with a warning naming this step, rather than failing with an action stack trace.
 
 Then add two repository secrets to `dekopon-agents/dekopon` under **Settings → Secrets and variables → Actions**: `TAP_APP_ID`, the numeric App ID, and `TAP_APP_PRIVATE_KEY`, the full `.pem` contents including the `-----BEGIN`/`-----END` lines.
 

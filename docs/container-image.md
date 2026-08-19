@@ -150,11 +150,15 @@ changes.
 
 ## Publication
 
-[`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) runs on
-`release: published`, not on the `v*.*.*` tag push. The tag push is what starts `release.yml`, so
-triggering on it would race the archives the image is made of. It is the same signal
-[`homebrew-tap.yml`](../.github/workflows/homebrew-tap.yml) uses. `workflow_dispatch` with a tag
-re-runs an existing release.
+[`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) is a
+reusable workflow. [`release.yml`](../.github/workflows/release.yml) calls it as a job that `needs`
+the job publishing the release, and passes that job's tag. It does not trigger on the `v*.*.*` tag
+push, which would race the archives the image is made of, and it no longer triggers on
+`release: published`, which cannot fire here at all: the release is created by `GITHUB_TOKEN`, and
+GitHub does not start workflow runs from events raised by its own token. The `needs` edge is the
+ordering guarantee — the release, its archives, its `.sha256` sidecars, and their attestations all
+exist before this workflow starts. [`homebrew-tap.yml`](../.github/workflows/homebrew-tap.yml) is
+called the same way. `workflow_dispatch` with a tag re-runs an existing release.
 
 Because every instruction is a `COPY`, one runner assembles both platforms in a single build and
 pushes a manifest list directly. There is no per-architecture matrix, no push-by-digest, no digest
