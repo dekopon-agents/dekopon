@@ -1,0 +1,77 @@
+name: Mirror image
+
+# Copies a third-party container image into this organization's own registry, so CI depends on a
+# registry we control rather than on an anonymous pull from someone else's.
+#
+# The OTLP smoke test began failing with `toomanyrequests: Rate exceeded` pulling OpenObserve from
+# AWS ECR Public, whose anonymous limits are strict and shared across every runner leaving the same
+# address. Nothing was wrong with the change under test — a green pull and a red pull differed only
+# in who else was pulling at that moment, which is the worst kind of CI failure because it teaches
+# people to re-run rather than to read.
+#
+# Deliberately manual. The image is digest-pinned, so it needs copying exactly when the pin moves,
+# and a schedule would spend pulls re-copying bytes that cannot have changed.
+#
+# No credential is added by any of this: `GITHUB_TOKEN` pushes to this organization's own packages,
+# and the smoke test reads them back with the same token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Fully qualified source image, digest-pinned
+        required: true
+        default: public.ecr.aws/zinclabs/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
+      target:
+        description: Package name and tag to publish under ghcr.io/<owner>
+        required: true
+        default: openobserve:v0.92.0
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: mirror to ghcr
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Sign in to the organization registry
+        # Plain `docker login` rather than an action, because this needs no third-party code and
+        # every action in this repository is pinned by commit — one fewer pin to keep current.
+        run: |
+          printf '%s' '${{ secrets.GITHUB_TOKEN }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Copy the image
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ghcr.io/${{ github.repository_owner }}/${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          # A digest-pinned source is the whole point: without one this job would copy whatever the
+          # upstream tag happened to mean today and call it a mirror.
+          case "$SOURCE" in
+            *@sha256:*) ;;
+            *) echo "source must be digest-pinned (…@sha256:…): $SOURCE" >&2; exit 1 ;;
+          esac
+          # `imagetools create` copies the manifest rather than re-pushing a pulled image, so a
+          # multi-architecture index survives and the digest is preserved.
+          docker buildx imagetools create --tag "$TARGET" "$SOURCE"
+
+      - name: Verify the copy is byte-identical
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ghcr.io/${{ github.repository_owner }}/${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          # The mirror is only useful if the digest the compose file pins still names it. Comparing
+          # is cheap; discovering months later that CI pins a digest nothing serves is not.
+          expected="${SOURCE##*@}"
+          actual="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$TARGET")"
+          if [ "$expected" != "$actual" ]; then
+            echo "mirrored digest $actual does not match source $expected" >&2
+            exit 1
+          fi
+          echo "mirrored $TARGET at $actual"
