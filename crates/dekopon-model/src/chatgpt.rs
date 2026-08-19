@@ -22,8 +22,8 @@ use thiserror::Error;
 use ureq::{Agent, http};
 
 use crate::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-    ModelTool, ModelToolCall, ModelUsage,
+    AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelError, ModelFunctionCall,
+    ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -606,6 +606,31 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .ok_or_else(|| ChatGptError::Protocol("access token omitted ChatGPT account ID".to_owned()))
 }
 
+/// The `content` array for one user message, text-only or multimodal.
+///
+/// The Responses API has taken an array here since before attachments existed, which is why this
+/// transport needs one function rather than the wire-message type the chat-completions path grew.
+fn responses_content(message: &ModelMessage) -> Vec<Value> {
+    let Some(parts) = message.parts() else {
+        return vec![json!({"type": "input_text", "text": message.content().unwrap_or_default()})];
+    };
+    parts
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => json!({"type": "input_text", "text": text}),
+            ContentPart::Image { mime, data } => json!({
+                "type": "input_image",
+                "image_url": data_url(mime, data),
+            }),
+            ContentPart::File { name, mime, data } => json!({
+                "type": "input_file",
+                "filename": name,
+                "file_data": data_url(mime, data),
+            }),
+        })
+        .collect()
+}
+
 fn build_request_body(
     model: &str,
     messages: &[ModelMessage],
@@ -631,7 +656,7 @@ fn build_request_body(
             "user" => input.push(json!({
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": message.content().unwrap_or_default()}],
+                "content": responses_content(message),
             })),
             "assistant" if !message.replay_items().is_empty() => {
                 input.extend(message.replay_items().iter().cloned());
@@ -1279,7 +1304,7 @@ mod tests {
         export_credentials, extract_account_id, load_credentials, login_with_endpoints, logout,
         parse_sse, save_credentials, status,
     };
-    use crate::model::{ChatModel as _, CompletionOptions, ModelMessage, ModelTool};
+    use crate::model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool};
 
     fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
@@ -1460,6 +1485,54 @@ mod tests {
                 }),
             ],
         }
+    }
+
+    #[test]
+    fn attachments_become_responses_input_parts() {
+        // The Responses path has emitted a `content` array since before attachments existed, so
+        // this is the one site that had to learn the new part types.
+        let body = build_request_body(
+            "gpt-5-codex",
+            &[ModelMessage::user_with_parts(vec![
+                ContentPart::Text("what does this say?".to_owned()),
+                ContentPart::Image {
+                    mime: "image/png".to_owned(),
+                    data: b"PNG".to_vec(),
+                },
+                ContentPart::File {
+                    name: "spec.pdf".to_owned(),
+                    mime: "application/pdf".to_owned(),
+                    data: b"PDF".to_vec(),
+                },
+            ])],
+            &[],
+            &CompletionOptions::default(),
+        );
+
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                {"type": "input_text", "text": "what does this say?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,UE5H"},
+                {"type": "input_file", "filename": "spec.pdf", "file_data": "data:application/pdf;base64,UERG"},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_text_only_user_message_keeps_its_single_input_text_part() {
+        // Unchanged shape for every request that carries no attachment.
+        let body = build_request_body(
+            "gpt-5-codex",
+            &[ModelMessage::user("how many files?")],
+            &[],
+            &CompletionOptions::default(),
+        );
+
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([{"type": "input_text", "text": "how many files?"}])
+        );
     }
 
     #[test]

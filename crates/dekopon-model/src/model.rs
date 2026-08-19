@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_core::Redacted;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 use ureq::{Agent, http};
@@ -18,12 +19,111 @@ pub struct ModelTool {
     pub parameters: Value,
 }
 
+/// One piece of a multimodal message.
+///
+/// `Debug` and `Serialize` render bytes as a summary and never as bytes. Every message this crate
+/// builds passes through the prompt transcript `dekopon-agent` writes to the audit log, and a
+/// base64 screenshot in that record would be enormous, sender-supplied, and permanent. The wire
+/// encoding lives in each transport's own request builder, which is the only place a data URL is
+/// produced.
+#[derive(Clone, PartialEq)]
+pub enum ContentPart {
+    /// Prose, the same thing a text-only message carries.
+    Text(String),
+    /// An image the model can look at.
+    Image {
+        /// IANA media type, such as `image/png`.
+        mime: String,
+        /// Raw bytes, encoded only when a request is built.
+        data: Vec<u8>,
+    },
+    /// A document the model can read.
+    File {
+        /// The name the sender gave it, which is how a model tells two attachments apart.
+        name: String,
+        /// IANA media type, such as `application/pdf`.
+        mime: String,
+        /// Raw bytes, encoded only when a request is built.
+        data: Vec<u8>,
+    },
+}
+
+impl fmt::Debug for ContentPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter.debug_tuple("Text").field(text).finish(),
+            Self::Image { mime, data } => formatter
+                .debug_struct("Image")
+                .field("mime", mime)
+                .field("bytes", &data.len())
+                .finish(),
+            Self::File { name, mime, data } => formatter
+                .debug_struct("File")
+                .field("name", name)
+                .field("mime", mime)
+                .field("bytes", &data.len())
+                .finish(),
+        }
+    }
+}
+
+impl Serialize for ContentPart {
+    /// The audit rendering, not the wire one. See the type's own documentation.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::Image { mime, data } => {
+                serializer.serialize_str(&format!("[{mime}, {} bytes]", data.len()))
+            }
+            Self::File { name, mime, data } => {
+                serializer.serialize_str(&format!("[{name} ({mime}), {} bytes]", data.len()))
+            }
+        }
+    }
+}
+
+/// What a message carries: prose, or prose interleaved with attachments.
+///
+/// Untagged so a text-only message still renders as a bare string, which keeps every existing
+/// request and every existing audit record byte-identical to what they were before parts existed.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// The text of a text-only message, or `None` when this message carries parts.
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Parts(_) => None,
+        }
+    }
+
+    fn as_parts(&self) -> Option<&[ContentPart]> {
+        match self {
+            Self::Text(_) => None,
+            Self::Parts(parts) => Some(parts),
+        }
+    }
+}
+
+/// Encodes one attachment as the `data:` URL both wire formats accept.
+///
+/// Built at request time and dropped with the request. Nothing retains the encoded copy, which is
+/// what keeps a screenshot from being held twice for the life of a conversation.
+pub(crate) fn data_url(mime: &str, data: &[u8]) -> String {
+    format!("data:{mime};base64,{}", STANDARD.encode(data))
+}
+
 /// One model-request conversation message.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ModelToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,12 +145,27 @@ impl ModelMessage {
         Self::plain("user", content)
     }
 
+    /// Creates a user message carrying attachments alongside its text.
+    ///
+    /// Separate from [`Self::user`] rather than replacing it: a text-only message must keep
+    /// serializing to a bare string on both wire formats, and most messages are text-only.
+    #[must_use]
+    pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: "user",
+            content: Some(MessageContent::Parts(parts)),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            replay_items: Vec::new(),
+        }
+    }
+
     /// Creates a tool result message.
     #[must_use]
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool",
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             replay_items: Vec::new(),
@@ -60,7 +175,7 @@ impl ModelMessage {
     fn assistant(turn: &AssistantTurn) -> Self {
         Self {
             role: "assistant",
-            content: turn.content.clone(),
+            content: turn.content.clone().map(MessageContent::Text),
             tool_calls: turn.tool_calls.clone(),
             tool_call_id: None,
             replay_items: turn.replay_items.clone(),
@@ -70,7 +185,7 @@ impl ModelMessage {
     fn plain(role: &'static str, content: impl Into<String>) -> Self {
         Self {
             role,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: Vec::new(),
             tool_call_id: None,
             replay_items: Vec::new(),
@@ -83,10 +198,20 @@ impl ModelMessage {
         self.role
     }
 
-    /// Returns message content when present.
+    /// Returns message text, or `None` when the message is absent or carries attachments.
+    ///
+    /// A message with parts answers `None` rather than its text run, because a caller that wanted
+    /// the whole content and silently received only part of it is the worse failure. Reach for
+    /// [`Self::parts`] when attachments matter.
     #[must_use]
     pub fn content(&self) -> Option<&str> {
-        self.content.as_deref()
+        self.content.as_ref().and_then(MessageContent::as_text)
+    }
+
+    /// Returns the attachments and text runs of a multimodal message, if it is one.
+    #[must_use]
+    pub fn parts(&self) -> Option<&[ContentPart]> {
+        self.content.as_ref().and_then(MessageContent::as_parts)
     }
 
     pub(crate) fn tool_calls(&self) -> &[ModelToolCall] {
@@ -321,9 +446,10 @@ impl ChatModel for OpenAiChatModel {
                 function: tool,
             })
             .collect::<Vec<_>>();
+        let wire = messages.iter().map(WireMessage::from).collect::<Vec<_>>();
         let request_body = ChatRequest {
             model: &self.model,
-            messages,
+            messages: &wire,
             tools: &tools,
             tool_choice: "auto",
             prompt_cache_key: options.prompt_cache_key(),
@@ -369,13 +495,101 @@ impl ChatModel for OpenAiChatModel {
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [ModelMessage],
+    messages: &'a [WireMessage<'a>],
     tools: &'a [OpenAiTool<'a>],
     tool_choice: &'static str,
     /// Skipped when absent so a request without a cache key serializes to the same bytes it did
     /// before the field existed. Compatible endpoints that have never heard of it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+}
+
+/// One message as the chat-completions wire wants it.
+///
+/// A separate type from [`ModelMessage`] because the two answer different questions. This is what
+/// an endpoint parses; `ModelMessage`'s own `Serialize` is the redacted rendering that reaches the
+/// audit transcript. While they were one type, the wire format *was* the log format, which put a
+/// base64 attachment one careless `to_string` away from being written to disk forever.
+///
+/// Field order and skip rules match what the derived implementation emitted before this type
+/// existed, so a text-only request serializes to the same bytes it always did.
+#[derive(Debug, Serialize)]
+struct WireMessage<'a> {
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<WireContent<'a>>,
+    #[serde(skip_serializing_if = "is_empty")]
+    tool_calls: &'a [ModelToolCall],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+/// Serde needs a named predicate to skip an empty borrowed slice.
+fn is_empty(calls: &&[ModelToolCall]) -> bool {
+    calls.is_empty()
+}
+
+/// Untagged, so text stays a bare string and only an attachment forces the array form.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+    Text(&'a str),
+    Parts(Vec<WirePart<'a>>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum WirePart<'a> {
+    #[serde(rename = "text")]
+    Text { text: &'a str },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: WireUrl },
+    #[serde(rename = "file")]
+    File { file: WireFile<'a> },
+}
+
+#[derive(Debug, Serialize)]
+struct WireUrl {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WireFile<'a> {
+    filename: &'a str,
+    file_data: String,
+}
+
+impl<'a> From<&'a ModelMessage> for WireMessage<'a> {
+    fn from(message: &'a ModelMessage) -> Self {
+        let content = message.content.as_ref().map(|content| match content {
+            MessageContent::Text(text) => WireContent::Text(text),
+            MessageContent::Parts(parts) => WireContent::Parts(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text(text) => WirePart::Text { text },
+                        ContentPart::Image { mime, data } => WirePart::ImageUrl {
+                            image_url: WireUrl {
+                                url: data_url(mime, data),
+                            },
+                        },
+                        ContentPart::File { name, mime, data } => WirePart::File {
+                            file: WireFile {
+                                filename: name,
+                                file_data: data_url(mime, data),
+                            },
+                        },
+                    })
+                    .collect(),
+            ),
+        });
+        Self {
+            role: message.role,
+            content,
+            tool_calls: &message.tool_calls,
+            tool_call_id: message.tool_call_id.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -566,9 +780,10 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AssistantTurn, ChatModel, ChatRequest, ChatResponse, CompletionOptions, ModelError,
-        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage, OpenAiChatModel,
-        OpenAiTool, WireFunctionCall, WireToolCall, assistant_message, completion_url,
+        AssistantTurn, ChatModel, ChatRequest, ChatResponse, CompletionOptions, ContentPart,
+        ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+        OpenAiChatModel, OpenAiTool, WireFunctionCall, WireMessage, WireToolCall,
+        assistant_message, completion_url,
     };
 
     #[test]
@@ -739,7 +954,7 @@ mod tests {
             bodies.push(
                 serde_json::to_value(ChatRequest {
                     model: "test-model",
-                    messages: &messages,
+                    messages: &messages.iter().map(WireMessage::from).collect::<Vec<_>>(),
                     tools: &tools,
                     tool_choice: "auto",
                     prompt_cache_key: None,
@@ -803,14 +1018,14 @@ mod tests {
             kind: "function",
             function: &tool,
         }];
-        let messages = vec![
+        let messages = [
             ModelMessage::system("Be concise."),
             ModelMessage::user("how many files are in the repository?"),
         ];
         let request = |prompt_cache_key| {
             serde_json::to_value(ChatRequest {
                 model: "test-model",
-                messages: &messages,
+                messages: &messages.iter().map(WireMessage::from).collect::<Vec<_>>(),
                 tools: &tools,
                 tool_choice: "auto",
                 prompt_cache_key,
@@ -913,5 +1128,103 @@ mod tests {
             error,
             ModelError::UnsupportedToolKind("computer".to_owned())
         );
+    }
+
+    /// One message through the chat-completions wire mapping.
+    fn wire(message: &ModelMessage) -> Value {
+        serde_json::to_value(WireMessage::from(message)).expect("serialize wire message")
+    }
+
+    #[test]
+    fn a_text_only_message_still_serializes_to_a_bare_string() {
+        // The compatibility promise of the whole change. `content` became an enum, and an untagged
+        // enum that guessed wrong here would silently reshape every request the daemon has ever
+        // sent to an endpoint that has never heard of content parts.
+        assert_eq!(
+            wire(&ModelMessage::user("how many files?")),
+            json!({"role": "user", "content": "how many files?"})
+        );
+        assert_eq!(
+            wire(&ModelMessage::tool("call-1", "42")),
+            json!({"role": "tool", "content": "42", "tool_call_id": "call-1"})
+        );
+    }
+
+    #[test]
+    fn attachments_become_chat_completions_content_parts() {
+        let message = ModelMessage::user_with_parts(vec![
+            ContentPart::Text("what does this say?".to_owned()),
+            ContentPart::Image {
+                mime: "image/png".to_owned(),
+                data: b"PNG".to_vec(),
+            },
+            ContentPart::File {
+                name: "spec.pdf".to_owned(),
+                mime: "application/pdf".to_owned(),
+                data: b"PDF".to_vec(),
+            },
+        ]);
+
+        assert_eq!(
+            wire(&message),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what does this say?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,UE5H"}},
+                    {"type": "file", "file": {
+                        "filename": "spec.pdf",
+                        "file_data": "data:application/pdf;base64,UERG"
+                    }},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn an_attachment_never_reaches_the_audit_transcript_as_bytes() {
+        // `dekopon-agent` logs every prompt by serializing the message slice, so `ModelMessage`'s
+        // own `Serialize` is the audit rendering rather than the wire one. A base64 screenshot in
+        // that record would be enormous, sender-supplied, and permanent. The wire mapping above is
+        // the only thing that ever encodes.
+        let message = ModelMessage::user_with_parts(vec![
+            ContentPart::Text("look".to_owned()),
+            ContentPart::Image {
+                mime: "image/png".to_owned(),
+                data: b"PNG".to_vec(),
+            },
+        ]);
+
+        let logged =
+            serde_json::to_string(std::slice::from_ref(&message)).expect("serialize transcript");
+        assert!(
+            logged.contains("[image/png, 3 bytes]"),
+            "the record should say what arrived: {logged}"
+        );
+        assert!(
+            !logged.contains("UE5H"),
+            "encoded bytes must never reach the log: {logged}"
+        );
+        // `Debug` is the other way a message reaches a log, and it has the same duty.
+        let debugged = format!("{message:?}");
+        assert!(debugged.contains("bytes: 3"), "{debugged}");
+        assert!(!debugged.contains("UE5H"), "{debugged}");
+        assert!(
+            !debugged.contains("80, 78, 71"),
+            "raw bytes leaked: {debugged}"
+        );
+    }
+
+    #[test]
+    fn a_multimodal_message_reports_parts_rather_than_partial_text() {
+        // `content()` answering `Some("look")` would hand a caller the text and drop the image
+        // without saying so, which is the failure this accessor split exists to prevent.
+        let message = ModelMessage::user_with_parts(vec![ContentPart::Text("look".to_owned())]);
+        assert_eq!(message.content(), None);
+        assert_eq!(message.parts().map(<[_]>::len), Some(1));
+
+        let text = ModelMessage::user("look");
+        assert_eq!(text.content(), Some("look"));
+        assert_eq!(text.parts(), None);
     }
 }
