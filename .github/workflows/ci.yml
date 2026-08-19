@@ -303,11 +303,11 @@ jobs:
           set -euo pipefail
           helm template dekopon charts/dekopon > "$RUNNER_TEMP/default.yaml"
           helm template dekopon charts/dekopon \
-            -f charts/dekopon/values-rubber-stamper.yaml > "$RUNNER_TEMP/realistic.yaml"
+            -f charts/dekopon/values-pr-summarizer-linter.yaml > "$RUNNER_TEMP/realistic.yaml"
           # The seed-once path adds a Secret, a projected source, an init block, and a subPath
           # mount, none of which the two renders above reach.
           helm template dekopon charts/dekopon \
-            -f charts/dekopon/values-rubber-stamper.yaml \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.chatgpt.enabled=true \
             --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth > "$RUNNER_TEMP/chatgpt.yaml"
       - name: Validate rendered manifests against Kubernetes schemas
@@ -336,7 +336,7 @@ jobs:
           helm package charts/dekopon --destination "$RUNNER_TEMP"
           tarball="$RUNNER_TEMP/dekopon-$version.tgz"
           helm lint "$tarball"
-          for args in "" "-f charts/dekopon/values-rubber-stamper.yaml"; do
+          for args in "" "-f charts/dekopon/values-pr-summarizer-linter.yaml"; do
             # shellcheck disable=SC2086
             helm template dekopon charts/dekopon $args > "$RUNNER_TEMP/from-source.yaml"
             # shellcheck disable=SC2086
@@ -346,7 +346,7 @@ jobs:
           # The README and the example values are documentation a consumer only has if they are
           # inside the archive.
           tar -tzf "$tarball" | grep -qx 'dekopon/README.md'
-          tar -tzf "$tarball" | grep -qx 'dekopon/values-rubber-stamper.yaml'
+          tar -tzf "$tarball" | grep -qx 'dekopon/values-pr-summarizer-linter.yaml'
       # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
       # and mode check. This runs the init container's real command in a real container and
       # asserts every permission tier dekopon-brokerd enforces, then seeds a ChatGPT credential,

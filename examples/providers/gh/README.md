@@ -53,8 +53,9 @@ credential injection is the only path a credential may take. A constraint set bi
 symbolic name; the native HTTP engine adds the header after the guest's own headers were
 validated, and audit records `credentialInjected: true` and never a value. A deployment that
 binds no credential reaches only public data.
-[`../../rubber-stamper/`](../../rubber-stamper/README.md) is the worked deployment: five of these
-capabilities, one GitHub token, and a Slack DM that ends in an approved pull request.
+[`../../pr-summarizer-linter/`](../../pr-summarizer-linter/README.md) is the worked deployment:
+six of these capabilities, one GitHub token, and a Slack DM that ends in one head-pinned review
+comment while approval, change-request, and merge remain ungranted.
 
 The endpoint defaults to `https://api.github.com` and otherwise accepts only a literal
 loopback `http://` socket address, for deterministic tests. Transport failures are

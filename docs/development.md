@@ -21,7 +21,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Domain identifiers and enums | `crates/dekopon-core/src/lib.rs` | Inline unit and compile-fail tests |
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
-| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/rubber-stamper/dekopon.yaml` |
+| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/pr-summarizer-linter/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, and environment-credential tests |
 | Operator CLI and model auth commands | `crates/dekopon/src/` | `crates/dekopon/tests/cli.rs` |
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE tests |
@@ -32,7 +32,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket/CLI tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/rubber-stamper/` against the loaded `gh` manifest and the Cedar grammar |
+| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket/CLI tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/pr-summarizer-linter/` against the loaded `gh` manifest and Cedar grammar |
 | Broker operational web UI | `crates/dekopon-webui/src/`; Wasmtime observations in `crates/dekopon-broker-host/src/{metrics,metadata}.rs` | Router/rendering, escaping/security-header, provider-detail, live-counter, artifact/interface, and GET-only tests in `crates/dekopon-webui/src/tests.rs`; real bind/redirect coverage in `crates/dekopon-brokerd/tests/server.rs` |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
@@ -41,7 +41,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Chat gateway configuration, transports, routing, bounded agent sessions, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, conversation replay and eviction, cache-key minting and rotation, and loopback Slack/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
-| End-to-end deployment example | `examples/rubber-stamper/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
+| End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 

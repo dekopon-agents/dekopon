@@ -8,9 +8,9 @@ It holds chat bot credentials and model credentials — the things it needs to h
 
 Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
 
-[`../examples/rubber-stamper/`](../examples/rubber-stamper/README.md) is the complete worked
-deployment: a Slack DM from an owner-mapped sender, five `gh` capabilities, a broker-injected
-GitHub token, and the audit record naming the person who asked. Read it alongside this document —
+[`../examples/pr-summarizer-linter/`](../examples/pr-summarizer-linter/README.md) is the complete
+worked deployment: a Slack DM from an owner-mapped sender, six narrow `gh` capabilities, a
+broker-injected GitHub token, and an audited PR review comment. Read it alongside this document —
 it is the configuration this one describes in the abstract.
 
 ## Run
@@ -69,10 +69,10 @@ routes:                                       # first match wins, so order these
     agent: incident-responder                 # one named channel, its own agent
   - transport: scientist-slack
     match: { kind: channel }                  # any other channel the bot is invited to
-    agent: xaviers-rubber-stamper
+    agent: pr-summarizer-linter
   - transport: scientist-slack
     match: { kind: directMessage }
-    agent: xaviers-rubber-stamper
+    agent: pr-summarizer-linter
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
     limits: { maxSteps: 8, maxCapabilityCalls: 16 }
     conversation:                             # optional; default { mode: oneShot }

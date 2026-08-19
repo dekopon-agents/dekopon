@@ -333,14 +333,17 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             };
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
+            // Every review capability accepts an expected head. Keeping the flag at this shared
+            // layer lets a comment or change request refuse instead of landing on commits the
+            // caller did not inspect, just as an approval does.
+            insert_optional_text(
+                &mut input,
+                "expectedHeadSha",
+                options.expected_head_sha.take(),
+            );
             let capability: &'static [&'static str] = match event {
                 ReviewEvent::Approve => {
                     insert_optional_text(&mut input, "body", options.body.take());
-                    insert_optional_text(
-                        &mut input,
-                        "expectedHeadSha",
-                        options.expected_head_sha.take(),
-                    );
                     &["gh.pull-request.approve"]
                 }
                 ReviewEvent::Comment => {
@@ -732,9 +735,26 @@ mod tests {
                 json!({"owner": "o", "repo": "r", "number": 7, "expectedHeadSha": "abc123"}),
             ),
             (
-                &["pr", "review", "7", "-R", "o/r", "--comment", "-b", "hm"],
+                &[
+                    "pr",
+                    "review",
+                    "7",
+                    "-R",
+                    "o/r",
+                    "--comment",
+                    "-b",
+                    "hm",
+                    "--expected-head-sha",
+                    "abc123",
+                ],
                 "gh.pull-request.comment",
-                json!({"owner": "o", "repo": "r", "number": 7, "body": "hm"}),
+                json!({
+                    "owner": "o",
+                    "repo": "r",
+                    "number": 7,
+                    "body": "hm",
+                    "expectedHeadSha": "abc123"
+                }),
             ),
             (
                 &[
@@ -746,9 +766,17 @@ mod tests {
                     "--request-changes",
                     "-b",
                     "no",
+                    "--expected-head-sha",
+                    "abc123",
                 ],
                 "gh.pull-request.request-changes",
-                json!({"owner": "o", "repo": "r", "number": 7, "body": "no"}),
+                json!({
+                    "owner": "o",
+                    "repo": "r",
+                    "number": 7,
+                    "body": "no",
+                    "expectedHeadSha": "abc123"
+                }),
             ),
             (
                 &["pr", "merge", "7", "-R", "o/r", "--squash"],

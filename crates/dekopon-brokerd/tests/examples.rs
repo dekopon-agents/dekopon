@@ -1,8 +1,9 @@
-//! The `examples/rubber-stamper/` walkthrough, held against the real machinery it documents.
+//! The `examples/pr-summarizer-linter/` walkthrough, held against the real machinery it documents.
 //!
-//! The example is a configuration a reader copies and runs, and its whole claim is that five
-//! narrow GitHub capabilities are reachable by one person, through one gateway, driving one agent
-//! — and that nothing else is. Prose cannot keep that true. These tests load the checked-in `gh`
+//! The example is a configuration a reader copies and runs, and its claim is that six narrow
+//! GitHub capabilities are reachable by one person, through one gateway, driving one agent — and
+//! that approval, change-request, merge, and everything else are not. Prose cannot keep that true.
+//! These tests load the checked-in `gh`
 //! component, build the same declared world `dekopon-brokerd` builds at startup, compile the
 //! example's Cedar file against it, and assert the decision table both directions.
 //!
@@ -26,26 +27,33 @@ use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
 use serde::Deserialize;
 
-/// The five Tier-1 capabilities the example grants, in the order its files list them.
-const GRANTED: [&str; 5] = [
+/// The six capabilities the example grants, in the order its files list them.
+const GRANTED: [&str; 6] = [
     "gh.content.read",
-    "gh.pull-request.list",
     "gh.pull-request.read",
     "gh.pull-request.files",
-    "gh.pull-request.approve",
+    "gh.pull-request.diff",
+    "gh.pull-request.status",
+    "gh.pull-request.comment",
 ];
-/// A capability the `gh` manifest exposes and the example deliberately does not grant.
-const UNGRANTED: &str = "gh.pull-request.merge";
-const PRINCIPAL: &str = "cpetersen";
+/// Verdict and merge capabilities the `gh` manifest exposes and this example omits.
+const UNGRANTED: [&str; 3] = [
+    "gh.pull-request.approve",
+    "gh.pull-request.request-changes",
+    "gh.pull-request.merge",
+];
+const PRINCIPAL: &str = "maintainer";
 const GATEWAY: &str = "dekopond-gateway";
-const AGENT: &str = "xaviers-rubber-stamper";
+const AGENT: &str = "pr-summarizer-linter";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn example(name: &str) -> PathBuf {
-    repository_root().join("examples/rubber-stamper").join(name)
+    repository_root()
+        .join("examples/pr-summarizer-linter")
+        .join(name)
 }
 
 fn read(name: &str) -> String {
@@ -165,7 +173,7 @@ async fn the_example_policy_compiles_against_the_checked_in_gh_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
+async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
     let config = config();
     let registry = gh_registry().await;
     let world = world(&config, &registry);
@@ -174,10 +182,10 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
 
     // Allowed: the whole workflow, under the attested context the gateway actually renders.
     let session = policy.authorize(prompt_request(AGENT, attested(Some(GATEWAY), Some(AGENT))));
-    assert!(session.allowed, "the boss may drive the agent");
+    assert!(session.allowed, "the maintainer may drive the agent");
     assert_eq!(
         session.determining_policy_ids,
-        vec!["boss-may-prompt-rubber-stamper".to_owned()],
+        vec!["maintainer-may-prompt-pr-summarizer-linter".to_owned()],
         "the audit record names the rule a reader can find in policies.cedar"
     );
 
@@ -190,7 +198,7 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
         assert!(decision.allowed, "{name} is granted");
         assert_eq!(
             decision.determining_policy_ids,
-            vec!["rubber-stamper-gh-surface".to_owned()],
+            vec!["pr-summarizer-linter-gh-surface".to_owned()],
             "{name}"
         );
         assert!(!decision.errors_present, "{name}");
@@ -234,26 +242,32 @@ async fn the_boss_may_review_through_the_gateway_and_nothing_else_may() {
         assert!(!decision.allowed, "agent.prompt must be denied with {case}");
     }
 
-    // A capability the manifest exposes, the example never grants, and no constraint set covers.
-    // Cedar denies it even with every context condition satisfied; the broker would have denied it
-    // `unconstrained-capability` before reaching Cedar at all.
-    let merge = capability(UNGRANTED);
-    assert!(
-        !config.constraint_sets.contains_key(&merge),
-        "{UNGRANTED} must stay unconstrained in the example"
-    );
-    let decision = policy.authorize(PolicyRequest {
-        principal: PRINCIPAL.parse::<PrincipalId>().expect("valid principal"),
-        target: PolicyTarget::Capability {
-            capability: merge,
-            provider: "gh".parse::<ProviderId>().expect("valid provider"),
-            effect: EffectKind::ExternalWrite,
-            risk: RiskLevel::High,
-            idempotency: Idempotency::Conditional,
-        },
-        context: attested(Some(GATEWAY), Some(AGENT)),
-    });
-    assert!(!decision.allowed, "{UNGRANTED} is not part of this example");
+    // The provider exposes these verdict and merge capabilities, but this workflow never grants
+    // or constrains them. Cedar denies each even with every context condition satisfied; the broker
+    // would deny it as `unconstrained-capability` before reaching Cedar at all.
+    for name in UNGRANTED {
+        let id = capability(name);
+        assert!(
+            !config.constraint_sets.contains_key(&id),
+            "{name} must stay unconstrained in the example"
+        );
+        let decision = policy.authorize(PolicyRequest {
+            principal: PRINCIPAL.parse::<PrincipalId>().expect("valid principal"),
+            target: PolicyTarget::Capability {
+                capability: id,
+                provider: "gh".parse::<ProviderId>().expect("valid provider"),
+                effect: EffectKind::ExternalWrite,
+                risk: if name == "gh.pull-request.approve" || name == "gh.pull-request.merge" {
+                    RiskLevel::High
+                } else {
+                    RiskLevel::Medium
+                },
+                idempotency: Idempotency::Conditional,
+            },
+            context: attested(Some(GATEWAY), Some(AGENT)),
+        });
+        assert!(!decision.allowed, "{name} is not part of this example");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,7 +291,7 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             expected.sort_unstable();
             expected
         },
-        "the example declares exactly the Tier-1 review slice"
+        "the example declares exactly the summarize-and-lint review slice"
     );
 
     for (id, set) in &config.constraint_sets {
@@ -307,11 +321,12 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             Some("github-pat"),
             "{id} presents the broker-held credential; private repositories need it even to read"
         );
-        // The write pre-reads its pull request, which is exactly one extra GET and the reason the
-        // capability is `conditional`. A read that could issue two requests would be a read that
-        // could paginate somewhere the example never inspected.
+        // The comment pre-reads its pull request before the POST. Status also performs two GETs:
+        // one for the pull request's head SHA and one for check runs. Every other read is one GET.
         let (methods, requests) = if capability.effect == EffectKind::ExternalWrite {
             (vec!["GET".to_owned(), "POST".to_owned()], 2)
+        } else if id.as_str() == "gh.pull-request.status" {
+            (vec!["GET".to_owned()], 2)
         } else {
             (vec!["GET".to_owned()], 1)
         };

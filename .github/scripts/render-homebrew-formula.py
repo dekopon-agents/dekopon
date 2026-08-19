@@ -103,8 +103,8 @@ class Dekopon < Formula
       refuses to instantiate it. The constraint set and Cedar policy it needs are
       in #{{pkgshare}}/providers/JSONPLACEHOLDER.md.
 
-      The end-to-end walkthrough is examples/rubber-stamper in the source tree:
-      https://github.com/{repository}/tree/{tag}/examples/rubber-stamper
+      The end-to-end walkthrough is examples/pr-summarizer-linter in the source tree:
+      https://github.com/{repository}/tree/{tag}/examples/pr-summarizer-linter
     EOS
   end
 

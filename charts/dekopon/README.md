@@ -501,15 +501,13 @@ From a checkout:
 ```console
 helm lint charts/dekopon
 helm template dekopon charts/dekopon
-helm template dekopon charts/dekopon -f charts/dekopon/values-rubber-stamper.yaml
+helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml
 helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
   -f my-values.yaml
 ```
 
-[`values-rubber-stamper.yaml`](values-rubber-stamper.yaml) is the
-[rubber-stamper](https://github.com/dekopon-agents/dekopon/blob/main/examples/rubber-stamper/README.md) deployment expressed as chart values:
-Slack in, one agent, two `gh` capabilities, a broker-injected token by reference, and the audit
-chain on its own volume.
+[`values-pr-summarizer-linter.yaml`](values-pr-summarizer-linter.yaml) is the
+[PR summarizer and linter](https://github.com/dekopon-agents/dekopon/blob/main/examples/pr-summarizer-linter/README.md) deployment expressed as chart values: Slack in, one agent, six narrow `gh` capabilities, a broker-injected token by reference, and the audit chain on its own volume. It may post one review comment and has no approval, request-changes, or merge capability.
 
 ## What is not proven
 
