@@ -38,6 +38,20 @@ startup refusal: Cedar's validator checks types, not instances, so
 `PolicyEngine::new` walks every entity literal in every policy and refuses any name the declared
 world does not contain.
 
+`PolicyEngine::new_lenient` walks the same literals but separates two kinds of absence. A
+**principal** comes from owner-authored identities, never from a loaded component, so an undeclared
+one is a typo and stays fatal. An **action** or **provider** is derived from a loaded provider
+manifest, so an undeclared one means that provider is not loaded — a legitimate state for a
+deployment whose policy anticipates it. Those are reported as `UnresolvedName` and registered as
+*phantoms*: names present in the generated schema and nowhere else.
+
+The phantom exists so the policy survives validation whole. Dropping it instead would be worse than
+it sounds — a grant reading `action in [a, b]` with only `a` loaded would lose *both*, turning "one
+provider is missing" into "this agent can do nothing". A phantom takes away exactly the missing
+capability and nothing else, and can never authorize an execution: it routes to no provider, the
+broker refuses any constraint set naming an unrouted capability, and an invocation naming one is
+denied `unconstrained-capability` before Cedar is consulted.
+
 ## Context
 
 Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`. `agent.prompt`

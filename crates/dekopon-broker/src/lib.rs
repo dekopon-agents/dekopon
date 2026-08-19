@@ -29,6 +29,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     future::Future,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
@@ -272,10 +273,83 @@ impl ConstraintSet {
     }
 }
 
+/// Whether startup refuses configuration that cannot apply, or reports it and continues.
+///
+/// This governs *startup* only. No decision the broker makes afterwards depends on it, and in
+/// particular the runtime `unconstrained-capability` denial is unconditional in both modes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Leniency {
+    /// Refuse to start. Every mismatch is a [`BrokerBuildError`].
+    #[default]
+    Strict,
+    /// Start anyway, reporting each mismatch as a [`StartupWarning`].
+    Tolerant,
+}
+
+/// Configuration that could not apply, reported instead of refusing startup.
+///
+/// Every variant describes something already inert: the broker behaves identically whether the
+/// offending configuration is present or absent. The warning exists so an operator learns their
+/// config says something the deployment cannot honor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartupWarning {
+    /// A constraint set named a capability no loaded provider routes, and was dropped.
+    UnroutedConstraintSet {
+        /// The unrouted capability.
+        capability: CapabilityId,
+    },
+    /// A capability a policy could permit has no constraint set bounding it.
+    ///
+    /// Every invocation of it is denied `unconstrained-capability` before Cedar is consulted, so
+    /// the grant is unreachable rather than unbounded.
+    UnconstrainedCapability {
+        /// The capability with no constraint set.
+        capability: CapabilityId,
+    },
+}
+
+impl StartupWarning {
+    /// Returns the stable machine-readable reason recorded alongside the message.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::UnroutedConstraintSet { .. } => "unrouted-constraint-set",
+            Self::UnconstrainedCapability { .. } => "unconstrained-capability",
+        }
+    }
+
+    /// Returns the capability the warning is about.
+    #[must_use]
+    pub const fn capability(&self) -> &CapabilityId {
+        match self {
+            Self::UnroutedConstraintSet { capability }
+            | Self::UnconstrainedCapability { capability } => capability,
+        }
+    }
+}
+
+impl fmt::Display for StartupWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnroutedConstraintSet { capability } => write!(
+                formatter,
+                "constraint set for {capability} names no loaded provider route; it was ignored"
+            ),
+            Self::UnconstrainedCapability { capability } => write!(
+                formatter,
+                "policy could permit {capability}, which has no constraint set; every invocation \
+                 of it will be denied unconstrained-capability"
+            ),
+        }
+    }
+}
+
 /// Every capability this broker knows how to execute, and how.
 ///
 /// A capability with no constraint set is not deployable: the broker refuses it before consulting
-/// policy at all, and refuses to start if any policy could ever permit it.
+/// policy at all. Under [`Leniency::Strict`] it also refuses to start if any policy could ever
+/// permit one; under [`Leniency::Tolerant`] that becomes a [`StartupWarning`] and the invocation-
+/// time refusal — which is the part that actually enforces anything — is unchanged.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConstraintCatalog {
     sets: BTreeMap<CapabilityId, ConstraintSet>,
@@ -305,6 +379,29 @@ impl ConstraintCatalog {
             }
         }
         Ok(Self { sets })
+    }
+
+    /// Drops every set naming a capability no loaded provider routes, returning what was dropped.
+    ///
+    /// Used only under [`Leniency::Tolerant`]. Such a set is inert either way — the broker cannot
+    /// execute a capability it has no route for — so removing it changes no decision. It exists so
+    /// an operator can keep constraint sets for a provider they have not dropped in yet without the
+    /// broker refusing to start.
+    pub fn retain_routed(&mut self, registry: &BrokerProviderRegistry) -> Vec<CapabilityId> {
+        let routed = registry
+            .capabilities()
+            .map(|(_, capability)| capability.id.clone())
+            .collect::<BTreeSet<_>>();
+        let dropped = self
+            .sets
+            .keys()
+            .filter(|capability| !routed.contains(*capability))
+            .cloned()
+            .collect::<Vec<_>>();
+        for capability in &dropped {
+            self.sets.remove(capability);
+        }
+        dropped
     }
 
     /// Returns the constraint set for one capability, if the deployment declared one.
@@ -1549,6 +1646,59 @@ where
         limits: BrokerLimits,
         replay_ids: impl IntoIterator<Item = InvocationId>,
     ) -> Result<Self, BrokerBuildError> {
+        Self::start(
+            registry,
+            broker_principal,
+            policy_revision,
+            policy,
+            constraints,
+            credentials,
+            identities,
+            audit,
+            limits,
+            Leniency::Strict,
+            replay_ids,
+        )
+        .map(|(broker, _)| broker)
+    }
+
+    /// Builds a broker, choosing whether configuration that cannot apply refuses startup.
+    ///
+    /// This is the full constructor [`Broker::new`] and [`Broker::new_with_replay_ids`] delegate
+    /// to; both pin [`Leniency::Strict`], which is exactly today's behavior.
+    ///
+    /// Under [`Leniency::Tolerant`] two startup refusals become [`StartupWarning`]s instead:
+    /// a constraint set naming a capability no loaded provider routes is dropped, and a capability
+    /// a policy could permit but no constraint set bounds is reported. Neither weakens a decision.
+    /// The runtime `unconstrained-capability` denial is untouched and remains unconditional, so a
+    /// tolerated capability is refused at invocation exactly as a strict deployment refuses it at
+    /// startup — deny-by-default is preserved, only the moment of complaint moves.
+    ///
+    /// # Errors
+    ///
+    /// Every [`BrokerBuildError`] the strict path returns, except the two named above when
+    /// tolerating.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each trusted input is a separate owner-controlled store; bundling them into one \
+                  struct would let a caller assemble policy, constraints, credentials, and identity \
+                  mapping from mismatched sources without the type system noticing"
+    )]
+    pub fn start(
+        registry: BrokerProviderRegistry,
+        broker_principal: PrincipalId,
+        policy_revision: String,
+        policy: PolicyEngine,
+        constraints: ConstraintCatalog,
+        credentials: CredentialStore,
+        identities: IdentityDirectory,
+        audit: Arc<A>,
+        limits: BrokerLimits,
+        leniency: Leniency,
+        replay_ids: impl IntoIterator<Item = InvocationId>,
+    ) -> Result<(Self, Vec<StartupWarning>), BrokerBuildError> {
+        let mut constraints = constraints;
+        let mut warnings = Vec::new();
         if limits.max_constraint_sets == 0 {
             return Err(BrokerBuildError::ZeroLimit {
                 field: "max_constraint_sets",
@@ -1560,15 +1710,31 @@ where
             });
         }
         validate_policy_revision(&policy_revision)?;
+        if leniency == Leniency::Tolerant {
+            // Drop before validating: a set naming a capability nothing routes has no manifest to
+            // be checked against, so it cannot be proven either way.
+            for capability in constraints.retain_routed(&registry) {
+                warnings.push(StartupWarning::UnroutedConstraintSet { capability });
+            }
+        }
         constraints.validate(&registry, &credentials, limits.max_constraint_sets)?;
         // Every capability a policy could permit must be executable. The decision path treats a
         // missing constraint set as a denial anyway, but a grant that can only ever be refused is
         // a configuration mistake worth refusing to start over.
         for capability in policy.referenced_capabilities() {
             if constraints.get(capability).is_none() {
-                return Err(BrokerBuildError::UnconstrainedCapability {
-                    capability: capability.clone(),
-                });
+                match leniency {
+                    Leniency::Strict => {
+                        return Err(BrokerBuildError::UnconstrainedCapability {
+                            capability: capability.clone(),
+                        });
+                    }
+                    Leniency::Tolerant => {
+                        warnings.push(StartupWarning::UnconstrainedCapability {
+                            capability: capability.clone(),
+                        });
+                    }
+                }
             }
         }
         let mut restored_replay_ids = BTreeSet::new();
@@ -1580,22 +1746,25 @@ where
                 });
             }
         }
-        Ok(Self {
-            registry,
-            policy_digest: policy.digest().to_owned(),
-            policy,
-            policy_revision,
-            constraints,
-            credentials,
-            identities,
-            broker_principal,
-            gate: AuthorizationGate::new(),
-            audit,
-            replay: ReplayLedger {
-                maximum: limits.max_replay_ids,
-                ids: Mutex::new(restored_replay_ids),
+        Ok((
+            Self {
+                registry,
+                policy_digest: policy.digest().to_owned(),
+                policy,
+                policy_revision,
+                constraints,
+                credentials,
+                identities,
+                broker_principal,
+                gate: AuthorizationGate::new(),
+                audit,
+                replay: ReplayLedger {
+                    maximum: limits.max_replay_ids,
+                    ids: Mutex::new(restored_replay_ids),
+                },
             },
-        })
+            warnings,
+        ))
     }
 
     /// The fingerprint of the policy set every decision by this broker is evaluated against.
@@ -1831,9 +2000,11 @@ where
                     .deny(context, &request, refusal.reason, refusal.policy_ids)
                     .await;
             }
-            // Defense in depth behind the startup check: policy can only permit a capability the
-            // deployment declared a constraint set for, so a missing set means there is nothing
-            // to execute regardless of what policy says.
+            // A missing constraint set means there is nothing to execute regardless of what policy
+            // says. Under `Leniency::Strict` this is defense in depth behind the startup check;
+            // under `Leniency::Tolerant` the startup check is only a warning, so this *is* the
+            // enforcement — a capability a policy anticipates but no provider routes dies here.
+            // Do not weaken it into an assertion or fold it into the policy decision.
             let Some(set) = self.constraints.get(&request.capability).cloned() else {
                 authorize.record("outcome", "unconstrained-capability");
                 return self

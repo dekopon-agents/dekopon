@@ -753,7 +753,7 @@ async fn capabilities_for_over_the_socket() {
 /// perfectly well typed and would simply never match. The declared world is what turns that into a
 /// startup refusal — the same protection the exact engine's reachability check used to provide.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_policy_naming_an_undeclared_principal_refuses_to_start() {
+async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create service fixture");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -769,6 +769,7 @@ async fn a_policy_naming_an_undeclared_principal_refuses_to_start() {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
+        "strict": true,
         "providers": [fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
@@ -820,4 +821,84 @@ async fn a_policy_naming_an_undeclared_principal_refuses_to_start() {
         );
     }
     assert!(!directory.path().join("broker.sock").exists());
+}
+
+/// The default posture is the mirror of `strict_startup_refuses_every_policy_that_names_something_absent`.
+///
+/// Everything that test proves refuses under `strict: true` must *start* without it, so an operator
+/// can ship policy and constraint sets that anticipate a provider they have not dropped in yet. The
+/// undeclared principal is the exception and stays fatal: principals come from this very file, not
+/// from a loaded component, so naming one that does not exist is always a typo.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_startup_tolerates_names_no_loaded_provider_declares() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create service fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure service directory");
+    let config_path = directory.path().join("broker.json");
+    let policies_path = directory.path().join("policies.cedar");
+    let document = json!({
+        "apiVersion": CONFIG_API_VERSION,
+        "socketPath": directory.path().join("broker.sock"),
+        "auditPath": directory.path().join("audit.jsonl"),
+        "checkpointPath": directory.path().join("checkpoint.json"),
+        "checkpointLockPath": directory.path().join("checkpoint.lock"),
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "policiesPath": &policies_path,
+        "providers": [fixture("echo-provider.wasm")],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "constraintSets": {
+            "echo.echo": serde_json::to_value(echo_constraint_set())
+                .expect("constraint set serializes")
+        }
+    });
+    write_owner_only(
+        &config_path,
+        &serde_json::to_vec(&document).expect("config serializes"),
+    );
+
+    for (policies, label) in [
+        (
+            r#"permit(principal == Dekopon::Principal::"caller",
+                      action == Dekopon::Action::"echo.nonexistent",
+                      resource == Dekopon::Provider::"echo");"#,
+            "an unloaded capability",
+        ),
+        (
+            r#"permit(principal == Dekopon::Principal::"caller",
+                      action == Dekopon::Action::"echo.reverse",
+                      resource == Dekopon::Provider::"echo");"#,
+            "a capability with no constraint set",
+        ),
+        (
+            r#"permit(principal == Dekopon::Principal::"caller",
+                      action in [Dekopon::Action::"echo.echo",
+                                 Dekopon::Action::"echo.nonexistent"],
+                      resource == Dekopon::Provider::"echo");"#,
+            "a grant mixing a loaded and an unloaded capability",
+        ),
+    ] {
+        write_owner_only(&policies_path, policies.as_bytes());
+        run(&config_path, async {})
+            .await
+            .unwrap_or_else(|error| panic!("{label} must start when tolerating: {error:?}"));
+    }
+
+    // Still fatal, in every mode: a principal comes from this configuration, not a component.
+    write_owner_only(
+        &policies_path,
+        r#"permit(principal == Dekopon::Principal::"nobody",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#
+            .as_bytes(),
+    );
+    let error = run(&config_path, async {})
+        .await
+        .expect_err("an undeclared principal refuses startup even when tolerating");
+    assert!(matches!(error, BrokerdError::Policy { .. }), "{error:?}");
 }
