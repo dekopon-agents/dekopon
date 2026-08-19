@@ -144,6 +144,9 @@ impl TelegramTransport {
             conversation_id,
             message_id: message_id.to_string(),
             text: bound_inbound(text),
+            // Telegram attachments are not carried yet: a photo arrives as a `file_id` needing a
+            // `getFile` round trip before it can be downloaded, which is its own fetch path.
+            assets: Vec::new(),
             conversation,
             reply: ReplyTarget::Telegram { chat_id, reply_to },
         }))

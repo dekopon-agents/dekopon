@@ -8,6 +8,8 @@
 use std::sync::Arc;
 
 use dekopon_core::ExternalSubject;
+
+use crate::asset::{AssetSourceRef, PendingAsset};
 use futures_util::future::BoxFuture;
 use thiserror::Error;
 
@@ -52,7 +54,13 @@ pub(crate) struct InboundMessage {
     /// Service-native message identifier, used only to reject redeliveries.
     pub message_id: String,
     /// Untrusted message text, already bounded to [`MAX_INBOUND_TEXT_BYTES`].
+    ///
+    /// The sender's own words only. The reference lines naming attachments are appended by the
+    /// session, because the numbers in them are assigned by [`crate::asset::AssetStore`] and a
+    /// transport that minted its own would collide with the one beside it.
     pub text: String,
+    /// What the sender attached, described but not yet numbered or fetched.
+    pub assets: Vec<PendingAsset>,
     /// Whether this is a one-to-one conversation or a shared channel.
     pub conversation: ConversationKind,
     /// Whatever the transport needs to answer this message.
@@ -142,12 +150,36 @@ pub(crate) trait ChatTransport: Send {
     /// message arrived, while `next` has long since gone back to waiting. Handing sessions a shared
     /// handle is what lets both happen at once without a lock across the wait.
     fn replier(&self) -> Arc<dyn ChatReplier>;
+
+    /// How this transport turns an attachment reference back into bytes, when it can.
+    ///
+    /// Defaulted to `None` so a transport that never carries attachments says nothing about them.
+    fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
+        None
+    }
 }
 
 /// The answering half of a transport, shared by every in-flight session on it.
 pub(crate) trait ChatReplier: Send + Sync {
     fn reply(&self, target: ReplyTarget, text: String)
     -> BoxFuture<'_, Result<(), TransportError>>;
+}
+
+/// Resolves an attachment reference back into the bytes a model can look at.
+///
+/// Separate from [`ChatReplier`] because the two are used at different moments by different code:
+/// a reply happens once at the end of a session, while a fetch happens mid-loop only if the model
+/// decides the answer depends on the file. A transport that carries no attachments implements
+/// neither and answers `None` from [`ChatTransport::asset_fetcher`].
+///
+/// `max_bytes` is enforced by the implementation rather than the caller, because the point is to
+/// stop reading a response that is too large rather than to discover afterwards that it was.
+pub(crate) trait AssetFetcher: Send + Sync {
+    fn fetch(
+        &self,
+        source: &AssetSourceRef,
+        max_bytes: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>>;
 }
 
 /// Transport-level failure.

@@ -151,6 +151,8 @@ impl LocalTransport {
                     conversation_id: request.channel,
                     message_id: format!("{connection}-{sequence}"),
                     text: bound_inbound(&request.text),
+                    // The development transport speaks line-delimited JSON and carries no files.
+                    assets: Vec::new(),
                     // Always a direct message: a local caller is talking to the daemon
                     // one-to-one, so there is no ambient traffic to filter and no mention to
                     // require. Channel routes are a chat-service concept.

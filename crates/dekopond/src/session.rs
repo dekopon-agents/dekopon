@@ -6,14 +6,14 @@
 //! cheapest possible refusal, and one that cannot be talked out of by the message text.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::Instant,
 };
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
-    prompt::{History, PromptError, run_prompt_with_history_and_options},
+    prompt::{History, PromptError, SessionInputs, run_prompt_session},
 };
 use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
 use dekopon_model::{
@@ -26,10 +26,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
 use crate::{
+    asset::{self, AssetStore, SessionAssets},
     config::{ModelConfig, ResolvedBroker},
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
-    transport::{ChatReplier, InboundMessage, bound_outbound},
+    transport::{AssetFetcher, ChatReplier, InboundMessage, bound_inbound, bound_outbound},
 };
 
 /// Trace-identifier prefix, so every broker record a gateway session made is recoverable by prefix.
@@ -156,6 +157,10 @@ pub(crate) struct SessionRunner {
     pub reply_on_busy: bool,
     /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
     pub conversations: ConversationStore,
+    /// The attachments live conversations carry, numbered so a model can ask for one.
+    pub assets: Arc<AssetStore>,
+    /// How each transport turns one of those references back into bytes, by transport name.
+    pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
 }
 
 /// Runs one routed message end to end, answering in chat whatever happens.
@@ -321,7 +326,30 @@ async fn session(
     let models = Arc::clone(&runner.models);
     let limits = route.limits;
     let instructions = route.instructions.clone();
-    let text = message.text.clone();
+    // Numbered here rather than in the transport: the identifier belongs to the store, and two
+    // transports minting their own would collide inside one conversation.
+    let images_supported = route.model.accepts_images();
+    let registered = runner.assets.assets_for(
+        &message.conversation_id,
+        message.assets.clone(),
+        images_supported,
+        Instant::now(),
+    );
+    // Bounded again after the note is appended, because the invariant is on the whole prompt the
+    // model reads rather than on the half of it the sender wrote.
+    let text = match asset::reference_note(&registered.refs, images_supported) {
+        Some(note) if message.text.trim().is_empty() => note,
+        Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
+        None => message.text.clone(),
+    };
+    let assets = SessionAssets::new(
+        Arc::clone(&runner.assets),
+        message.conversation_id.clone(),
+        runner.asset_fetchers.get(&message.transport).cloned(),
+        tokio::runtime::Handle::current(),
+        images_supported,
+        registered.fetchable,
+    );
     let shell = ShellLimits {
         max_capability_calls: limits.max_capability_calls,
         ..ShellLimits::default()
@@ -351,14 +379,14 @@ async fn session(
         // `history` is the accumulator rather than a return value, so this session's exchange is
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
-        let outcome = run_prompt_with_history_and_options(
+        let outcome = run_prompt_session(
             model.as_ref(),
             &runtime,
-            &text,
-            instructions.as_deref(),
-            limits,
+            SessionInputs::new(&text, limits)
+                .with_system(instructions.as_deref())
+                .with_options(&options)
+                .with_assets(&assets),
             &mut history,
-            &options,
         )
         .map_err(SessionError::from);
         // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision

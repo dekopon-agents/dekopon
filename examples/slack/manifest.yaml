@@ -28,11 +28,16 @@
 # the `channels:history` scope plus the `message.channels` event; private channels
 # need `groups:history` plus `message.groups`. Add them here and reinstall the app.
 #
-# `files:read` is deliberately absent. An upload still reaches its route — the gateway
-# tells the model which files arrived and that it cannot read them — but the contents
-# are never fetched, because a gateway that downloaded sender-supplied bytes on a
-# model's behalf would be claiming authority this process does not hold. Without the
-# scope Slack may also withhold a file's name; the gateway then reports the count alone.
+# `files:read` is what lets the gateway open an attachment. An attachment is part of
+# the message that carried it — Slack just delivers it by reference rather than by
+# value — and resolving that reference is how the gateway hears the whole request.
+# Without the scope Slack withholds the file's id and URL, and every upload is
+# reported to the model as something it cannot open.
+#
+# The gateway does not read a file just because one arrived. Each is named in the
+# prompt as `Chat Asset #N`, and the bytes are fetched only if the model calls
+# `fetch_chat_asset` with that number. Nothing else in Dekopon gains authority from
+# this scope: no policy, no provider credential, no way to write anything back.
 display_information:
   name: dekopond
   description: Dekopon agent gateway — routes messages to broker-authorized agents
@@ -51,6 +56,7 @@ oauth_config:
     bot:
       - app_mentions:read
       - chat:write
+      - files:read
       - im:history
 settings:
   event_subscriptions:
