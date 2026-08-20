@@ -235,6 +235,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     }
 }
 
@@ -273,6 +274,7 @@ fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) ->
 fn attestor_grant<'a>(namespaces: impl IntoIterator<Item = &'a str>) -> AttestorGrant {
     AttestorGrant {
         namespaces: namespaces.into_iter().map(str::to_owned).collect(),
+        chat_scopes: Vec::new(),
     }
 }
 
@@ -703,6 +705,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     };
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
@@ -792,6 +795,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     };
     let read_constraints = ExecutionConstraints {
         http: Some(HttpConstraints {
@@ -938,6 +942,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     };
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
@@ -1388,6 +1393,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: false,
         }),
+        storage: None,
     };
     let store = || {
         CredentialStore::new([
@@ -1712,12 +1718,12 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         else {
             panic!("a refusal records a decision event");
         };
-        assert_eq!(principal.as_str(), "gateway");
+        assert_eq!(principal.as_ref().map(PrincipalId::as_str), Some("gateway"));
         assert_eq!(
             actor,
-            &Actor::Service {
+            &Some(Actor::Service {
                 principal: crate::principal("gateway")
-            }
+            })
         );
         assert!(
             via.is_none(),
@@ -1760,7 +1766,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     else {
         panic!("a refusal records a decision event");
     };
-    assert_eq!(principal.as_str(), "gateway");
+    assert_eq!(principal.as_ref().map(PrincipalId::as_str), Some("gateway"));
     assert_eq!(
         attested_subject.as_ref().map(ExternalSubject::canonical),
         Some(SLACK_SUBJECT.to_owned())
@@ -1929,6 +1935,7 @@ fn attestor_scopes_match_on_segment_boundaries() {
     ] {
         let grant = AttestorGrant {
             namespaces: invalid.clone(),
+            chat_scopes: Vec::new(),
         };
         assert!(
             grant.validate().is_err(),

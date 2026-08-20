@@ -32,3 +32,13 @@ A denied destination or method cannot be hidden by provider code: the host marks
 ## Deliberate limitations
 
 This crate does not authenticate callers, evaluate policy, construct authorization, resolve credentials, or write audit records. Those responsibilities belong to the broker layer. A broker-resolved destination-bound credential may ride alongside an authorized invocation (never inside it); the native engine injects it after guest-header validation, and the guest never observes it. It supports buffered HTTP request/response exchanges, not CONNECT tunnels, upgrades, WebSockets, streaming guest handles, redirects, cookies, or ambient proxy configuration.
+
+## Provider storage
+
+The linker also implements `dekopon:storage@0.1.0`. A storage call succeeds only with a consumed
+`StorageGrant` matching host, invocation, capability, provider, interface, access, namespace, and
+limits. Description/command resolution get a disabled sticky context. Wrong-interface,
+permission/quota/budget/corruption/timeout errors stay terminal after a guest catches the WIT enum.
+A successful provider result is returned only after storage commit finalization. Storage spans and
+metrics omit identity/scope/provider/capability and exact provider byte totals; only content-free
+operation/sync/quota counts and coarse byte buckets are retained.

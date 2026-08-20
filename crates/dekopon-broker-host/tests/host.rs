@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    os::unix::fs::PermissionsExt as _,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
@@ -8,13 +9,15 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, HTTP_WIT, PROVIDER_WIT,
+    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, HTTP_WIT, PROVIDER_WIT, STORAGE_WIT,
 };
 use dekopon_capability::{
     AuthorizedInvocation, EffectKind, ExecutionConstraints, HttpConstraints, Idempotency,
-    ProposedInvocation, broker::AuthorizationGate,
+    ProposedInvocation, StorageAccess, StorageConstraints, StorageInterface, StorageNamespace,
+    broker::AuthorizationGate,
 };
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, TraceId};
+use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> PathBuf {
@@ -90,6 +93,7 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     }
 }
 
@@ -683,6 +687,10 @@ fn broker_bindings_mirror_the_immutable_packages() {
         include_str!("../../dekopon-provider-sdk/wit/provider.wit")
     );
     assert_eq!(HTTP_WIT, include_str!("../../../wit/http/http.wit"));
+    assert_eq!(
+        STORAGE_WIT,
+        include_str!("../../../wit/storage/storage.wit")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -874,6 +882,7 @@ fn gh_approve_constraints(
             max_response_bytes: 256 * 1024,
             allow_plaintext_loopback: true,
         }),
+        storage: None,
     }
 }
 
@@ -1072,4 +1081,146 @@ async fn conflicting_providers_are_all_reported_in_one_failure() {
     let rendered = report.to_string();
     assert!(rendered.contains("6 provider conflict(s)"), "{rendered}");
     assert!(rendered.contains("echo.ransom-case"), "{rendered}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace() {
+    let directory = tempfile::tempdir().expect("storage directory");
+    let directory = directory
+        .path()
+        .canonicalize()
+        .expect("canonical directory");
+    let root = directory.join("root");
+    let key = directory.join("key.yaml");
+    std::fs::write(
+        &key,
+        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .expect("write key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
+    let limits = StorageLimits {
+        lock_timeout_ms: 500,
+        ..StorageLimits::default()
+    };
+    let storage = StorageHost::open(&root, &key, limits).expect("storage host");
+    let held = storage
+        .grant(probe_storage_grant("lease-held", "slack.t0123abc.uone"))
+        .expect("held grant");
+
+    let competing_host = storage.clone();
+    let competing = tokio::task::spawn_blocking(move || {
+        competing_host.grant(probe_storage_grant(
+            "lease-competing",
+            "slack.t0123abc.uone",
+        ))
+    });
+    // This timer runs on the only runtime worker while the blocking lease wait continues elsewhere.
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::time::sleep(std::time::Duration::from_millis(20)),
+    )
+    .await
+    .expect("lease wait did not stall the runtime timer");
+
+    let distinct_host = storage.clone();
+    let distinct = tokio::task::spawn_blocking(move || {
+        distinct_host.grant(probe_storage_grant("lease-distinct", "slack.t0123abc.utwo"))
+    });
+    let distinct = tokio::time::timeout(std::time::Duration::from_millis(200), distinct)
+        .await
+        .expect("a distinct namespace was not serialized behind the blocked base")
+        .expect("blocking task")
+        .expect("distinct grant");
+    drop(distinct);
+
+    // Cancelling the waiter does not cancel a native syscall/job. The held grant is released only
+    // now; the blocking task then drains and drops whichever grant it obtained.
+    competing.abort();
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+}
+
+fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
+    StorageGrantRequest::new(
+        invocation.parse().expect("invocation"),
+        "storage-probe.run".parse().expect("capability"),
+        "storage-probe".parse().expect("provider"),
+        StorageInterface::DurableFiles,
+        StorageAccess::ReadWrite,
+        StorageNamespace::Chat,
+        "provider-test".parse().expect("agent"),
+        subject.parse().expect("subject"),
+        "slack",
+        "probe-transport",
+        "c0123abc",
+        "c0123abc:1712345678.000100",
+        ContinuityPolicy::Stable,
+        b"probe-authority".to_vec(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
+    let directory = tempfile::tempdir().expect("storage directory");
+    let directory = directory
+        .path()
+        .canonicalize()
+        .expect("canonical storage directory");
+    let root = directory.join("root");
+    let key = directory.join("key.yaml");
+    std::fs::write(
+        &key,
+        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .expect("write key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [fixture("storage-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage.clone()),
+    )
+    .await
+    .expect("probe loads");
+    let capability = "storage-probe.run"
+        .parse::<CapabilityId>()
+        .expect("capability");
+    let constraints = ExecutionConstraints {
+        timeout_ms: 10_000,
+        max_output_bytes: 64 * 1024,
+        http: None,
+        storage: Some(StorageConstraints {
+            interface: StorageInterface::DurableFiles,
+            access: StorageAccess::ReadWrite,
+            namespace: StorageNamespace::Chat,
+        }),
+    };
+    let grant = storage
+        .grant(StorageGrantRequest::new(
+            "invoke-test".parse().expect("invocation"),
+            capability.clone(),
+            "storage-probe".parse().expect("provider"),
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadWrite,
+            StorageNamespace::Chat,
+            "provider-test".parse().expect("agent"),
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "slack",
+            "probe-transport",
+            "c0123abc",
+            "c0123abc:1712345678.000100",
+            ContinuityPolicy::Stable,
+            b"probe-authority".to_vec(),
+        ))
+        .expect("grant");
+    let output = registry
+        .invoke_with_storage(
+            authorized_for("storage-probe", capability, json!({}), constraints),
+            None,
+            Some(grant),
+        )
+        .await
+        .expect("probe succeeds");
+    assert_eq!(output.output["clocksCalled"], true);
+    assert!(output.storage.is_some());
 }

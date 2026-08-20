@@ -60,3 +60,8 @@ when the embedding binary opts into payload telemetry.
 
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
 `docs/design.md` for the authority model this crate deliberately sits outside of.
+
+A gateway may use `BrokerLeg::connect_chat` to snapshot an invocation-bound chat surface. Only that
+leg can receive the broker-derived durable-memory prompt note or dispatch chat-scoped command/
+invocation operations. It still owns no storage grant or recording authority; the gateway performs
+the dedicated post-acceptance record request on a fresh client outside the model's capability seam.

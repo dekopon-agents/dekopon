@@ -15,7 +15,9 @@ use std::{
 };
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
-use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId};
+use dekopon_core::{
+    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId, TransportId,
+};
 use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -71,6 +73,13 @@ pub const ERROR_PROVIDER: &str = "provider-error";
 /// The external effect may have taken place. The request must **not** be resubmitted under any
 /// identifier; the durable audit is the only record of what happened.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
+/// Stable pre-execution storage failure codes. No provider work began, so a corrected request may
+/// use a fresh invocation identifier.
+pub const ERROR_STORAGE_QUOTA: &str = "storage-quota";
+pub const ERROR_STORAGE_BUSY: &str = "storage-busy";
+pub const ERROR_STORAGE_TIMEOUT: &str = "storage-timeout";
+pub const ERROR_STORAGE_CORRUPT: &str = "storage-corrupt";
+pub const ERROR_STORAGE_IO: &str = "storage-io";
 
 /// Exact protocol version carried by every envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -256,6 +265,361 @@ pub struct InvocationRequest {
     pub trace_parent: Option<TraceParent>,
     /// Capability-specific untrusted input.
     pub input: Value,
+}
+
+/// Transport family that authenticated one chat scope.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatTransportKind {
+    Slack,
+    Discord,
+    Telegram,
+    Local,
+}
+
+impl fmt::Display for ChatTransportKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Local => "local",
+        })
+    }
+}
+
+/// Bounded transport-derived channel and conversation scope.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatScopeClaim {
+    pub transport: TransportId,
+    pub kind: ChatTransportKind,
+    #[serde(deserialize_with = "deserialize_scope_part")]
+    pub channel: String,
+    #[serde(deserialize_with = "deserialize_scope_part")]
+    pub conversation: String,
+}
+
+impl fmt::Debug for ChatScopeClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatScopeClaim([REDACTED])")
+    }
+}
+
+impl ChatScopeClaim {
+    /// Defensive wire bounds common to every service-specific canonical form.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        bounded_scope_part(&self.channel) && bounded_scope_part(&self.conversation)
+    }
+}
+
+fn bounded_scope_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && !value.contains(['/', '\\'])
+}
+
+fn deserialize_scope_part<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    bounded_scope_part(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("chat scope part is not canonical"))
+}
+
+fn deserialize_bounded_string<'de, D, const MAXIMUM: usize>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor<const MAXIMUM: usize>;
+
+    impl<'de, const MAXIMUM: usize> serde::de::Visitor<'de> for Visitor<MAXIMUM> {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a string no longer than {MAXIMUM} bytes")
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAXIMUM {
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAXIMUM {
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_string(Visitor::<MAXIMUM>)
+}
+
+/// Subject, agent, and transport scope claimed for a chat session.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatSessionClaim {
+    pub subject: ExternalSubject,
+    pub agent: AgentId,
+    pub scope: ChatScopeClaim,
+}
+
+impl fmt::Debug for ChatSessionClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatSessionClaim([REDACTED])")
+    }
+}
+
+/// Invocation-bound chat attestation. The broker validates it against owner-authored scope grants.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatAttestation {
+    pub subject: ExternalSubject,
+    pub agent: AgentId,
+    pub scope: ChatScopeClaim,
+    pub invocation: InvocationId,
+}
+
+impl fmt::Debug for ChatAttestation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatAttestation([REDACTED])")
+    }
+}
+
+/// Service-specific identity of the inbound delivery whose answer was accepted.
+///
+/// The tagged shape prevents a Slack timestamp, Discord snowflake, Telegram message, or local
+/// nonce from being replayed under another transport kind. Channel/topic fields are checked
+/// against the separately attested chat scope before any namespace is derived.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DeliveryIdentity {
+    Slack {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        channel: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        timestamp: String,
+    },
+    Discord {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        channel: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        message: String,
+    },
+    Telegram {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        chat: String,
+        #[serde(default, deserialize_with = "deserialize_optional_scope_part")]
+        topic: Option<String>,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        message: String,
+    },
+    Local {
+        transport: TransportId,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        conversation: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        boot_nonce: String,
+        connection: u64,
+        sequence: u64,
+    },
+}
+
+impl fmt::Debug for DeliveryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeliveryIdentity([REDACTED])")
+    }
+}
+
+impl DeliveryIdentity {
+    #[must_use]
+    pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
+        match (self, scope.kind) {
+            (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
+                channel == &scope.channel && canonical_slack_timestamp(timestamp)
+            }
+            (Self::Discord { channel, message }, ChatTransportKind::Discord) => {
+                channel == &scope.channel
+                    && canonical_unsigned_decimal(channel)
+                    && canonical_unsigned_decimal(message)
+            }
+            (
+                Self::Telegram {
+                    chat,
+                    topic,
+                    message,
+                },
+                ChatTransportKind::Telegram,
+            ) => {
+                let expected_topic = scope
+                    .conversation
+                    .strip_prefix(&format!("{}:topic:", scope.channel));
+                chat == &scope.channel
+                    && canonical_signed_decimal(chat)
+                    && topic.as_deref() == expected_topic
+                    && topic.as_deref().is_none_or(canonical_unsigned_decimal)
+                    && canonical_unsigned_decimal(message)
+            }
+            (
+                Self::Local {
+                    transport,
+                    conversation,
+                    boot_nonce,
+                    connection,
+                    sequence,
+                },
+                ChatTransportKind::Local,
+            ) => {
+                transport == &scope.transport
+                    && conversation == &scope.conversation
+                    && boot_nonce.len() == 32
+                    && boot_nonce
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && *connection > 0
+                    && *sequence > 0
+            }
+            _ => false,
+        }
+    }
+}
+
+fn deserialize_optional_scope_part<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalScopePart;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalScopePart {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("null or a bounded canonical chat scope part")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<Inner>(self, deserializer: Inner) -> Result<Self::Value, Inner::Error>
+        where
+            Inner: serde::Deserializer<'de>,
+        {
+            let value = deserialize_bounded_string::<Inner, 256>(deserializer)?;
+            bounded_scope_part(&value)
+                .then_some(Some(value))
+                .ok_or_else(|| serde::de::Error::custom("optional chat scope part is not bounded"))
+        }
+    }
+
+    deserializer.deserialize_option(OptionalScopePart)
+}
+
+fn canonical_slack_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        seconds.len() == 10
+            && fraction.len() == 6
+            && !seconds.starts_with('0')
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn canonical_unsigned_decimal(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_signed_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+/// Exact turn accepted by a transport and proposed once for model-hidden recording.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DeliveredTurnRequest {
+    pub id: InvocationId,
+    pub trace: TraceId,
+    pub trace_parent: Option<TraceParent>,
+    pub delivery: DeliveryIdentity,
+    #[serde(deserialize_with = "deserialize_turn_text")]
+    pub user: String,
+    #[serde(deserialize_with = "deserialize_turn_text")]
+    pub assistant: String,
+}
+
+impl fmt::Debug for DeliveredTurnRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeliveredTurnRequest([REDACTED])")
+    }
+}
+
+impl DeliveredTurnRequest {
+    /// Validates the complete text bound. Delivery canonicalization additionally needs the
+    /// separately attested scope and is checked by the broker.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.user
+            .len()
+            .checked_add(self.assistant.len())
+            .is_some_and(|bytes| bytes <= 64 * 1024)
+    }
+}
+
+fn deserialize_turn_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, { 64 * 1024 }>(deserializer)
+}
+
+/// Broker-derived optional memory surface for one freshly authorized chat scope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatMemorySurface {
+    pub max_lookback_turns: u32,
+    pub prompt_note: String,
 }
 
 /// One capability visible to an authenticated broker client.
@@ -496,6 +860,55 @@ impl RequestEnvelope {
         }
     }
 
+    /// Creates a bounded chat-scoped capability request.
+    #[must_use]
+    pub const fn capabilities_for_chat(claim: ChatSessionClaim) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::CapabilitiesForChat { claim },
+        }
+    }
+
+    /// Creates a bounded chat-scoped command rewrite request.
+    #[must_use]
+    pub const fn resolve_command_for_chat(
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::ResolveCommandForChat { claim, word, argv },
+        }
+    }
+
+    /// Creates a bounded chat-scoped generic proposal.
+    #[must_use]
+    pub const fn invoke_for_chat(
+        invocation: InvocationRequest,
+        attestation: ChatAttestation,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::InvokeForChat {
+                invocation,
+                attestation,
+            },
+        }
+    }
+
+    /// Creates the dedicated model-hidden post-acceptance record proposal.
+    #[must_use]
+    pub const fn record_delivered_turn_for_chat(
+        turn: DeliveredTurnRequest,
+        attestation: ChatAttestation,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::RecordDeliveredTurnForChat { turn, attestation },
+        }
+    }
+
     /// Creates an informational gateway catalog report.
     #[must_use]
     pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
@@ -544,6 +957,24 @@ pub enum BrokerRequest {
         invocation: InvocationRequest,
         /// The gateway's on-behalf-of claim, honored only under an attestor grant.
         attestation: SubjectAttestation,
+    },
+    /// Lists the chat surface after invocation-bound scope authority is validated.
+    CapabilitiesForChat { claim: ChatSessionClaim },
+    /// Rewrites a command only inside a freshly authorized chat scope.
+    ResolveCommandForChat {
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    },
+    /// Submits a recent/search proposal under invocation-bound chat attestation.
+    InvokeForChat {
+        invocation: InvocationRequest,
+        attestation: ChatAttestation,
+    },
+    /// Dedicated model-hidden recording operation after transport acceptance.
+    RecordDeliveredTurnForChat {
+        turn: DeliveredTurnRequest,
+        attestation: ChatAttestation,
     },
     /// Rewrites one command word's arguments into a capability proposal.
     ///
@@ -595,6 +1026,24 @@ impl ResponseEnvelope {
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                chat_memory: None,
+            },
+        }
+    }
+
+    /// Creates a successful freshly authorized chat capability response.
+    #[must_use]
+    pub const fn chat_capabilities(
+        capabilities: Vec<AvailableCapability>,
+        command_words: Vec<String>,
+        chat_memory: Option<ChatMemorySurface>,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            response: BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+                chat_memory,
             },
         }
     }
@@ -674,6 +1123,9 @@ pub enum BrokerResponse {
         /// Defaulted so a client of this version reads a broker that predates it.
         #[serde(default)]
         command_words: Vec<String>,
+        /// Present only for an effective all-three chat-memory surface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_memory: Option<ChatMemorySurface>,
     },
     /// Terminal invocation result.
     Invocation {
@@ -962,6 +1414,7 @@ impl BrokerClient {
             BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                ..
             } => Ok((capabilities, command_words)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             _ => Err(ClientError::UnexpectedResponse),
@@ -981,7 +1434,60 @@ impl BrokerClient {
             BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                ..
             } => Ok((capabilities, command_words)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Returns the freshly authorized capability, command, and optional memory chat surface.
+    pub async fn session_surface_for_chat(
+        &self,
+        claim: ChatSessionClaim,
+    ) -> Result<
+        (
+            Vec<AvailableCapability>,
+            Vec<String>,
+            Option<ChatMemorySurface>,
+        ),
+        ClientError,
+    > {
+        match self
+            .exchange(RequestEnvelope::capabilities_for_chat(claim))
+            .await?
+        {
+            BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+                chat_memory,
+            } => Ok((capabilities, command_words, chat_memory)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Rewrites one command under the same bounded chat scope used for later invocation.
+    pub async fn resolve_command_for_chat(
+        &self,
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    ) -> Result<Result<(CapabilityId, serde_json::Value), String>, ClientError> {
+        match self
+            .exchange(RequestEnvelope::resolve_command_for_chat(claim, word, argv))
+            .await?
+        {
+            BrokerResponse::CommandResolution {
+                capability: Some(capability),
+                input: Some(input),
+                ..
+            } => Ok(Ok((capability, input))),
+            BrokerResponse::CommandResolution {
+                message: Some(message),
+                ..
+            } => Ok(Err(message)),
+            BrokerResponse::CommandResolution { .. } => Err(ClientError::UnexpectedResponse),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1031,6 +1537,53 @@ impl BrokerClient {
             BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Submits recent/search under invocation-bound chat attestation.
+    pub async fn invoke_for_chat(
+        &self,
+        request: InvocationRequest,
+        claim: ChatSessionClaim,
+    ) -> Result<InvocationResult, ClientError> {
+        let attestation = ChatAttestation {
+            subject: claim.subject,
+            agent: claim.agent,
+            scope: claim.scope,
+            invocation: request.id.clone(),
+        };
+        match self
+            .exchange(RequestEnvelope::invoke_for_chat(request, attestation))
+            .await?
+        {
+            BrokerResponse::Invocation { result } => Ok(result),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Submits exactly one model-hidden post-acceptance record request.
+    pub async fn record_delivered_turn_for_chat(
+        &self,
+        turn: DeliveredTurnRequest,
+        claim: ChatSessionClaim,
+    ) -> Result<InvocationResult, ClientError> {
+        let attestation = ChatAttestation {
+            subject: claim.subject,
+            agent: claim.agent,
+            scope: claim.scope,
+            invocation: turn.id.clone(),
+        };
+        match self
+            .exchange(RequestEnvelope::record_delivered_turn_for_chat(
+                turn,
+                attestation,
+            ))
+            .await?
+        {
+            BrokerResponse::Invocation { result } => Ok(result),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
         }
     }
 

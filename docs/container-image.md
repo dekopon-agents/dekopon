@@ -28,7 +28,8 @@ that one image with two `command`s does not.
 | `/usr/local/bin/dekopon-run` | Direct runner and broker client |
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
-| `/opt/dekopon/providers/*.wasm` | The four checked-in provider components, copied verbatim |
+| `/opt/dekopon/providers/*.wasm` | The four existing default components, copied verbatim |
+| `/opt/dekopon/optional-providers/memory-chat-provider.wasm` | Optional durable-memory component; never in the default scan |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
 The image runs as UID/GID `65532:65532` — numeric, because Kubernetes `runAsNonRoot` compares a UID
@@ -65,9 +66,9 @@ requires is 2.34.
 
 ## The build context is constructed, not filtered
 
-The image needs three things: the release executables, the checked-in provider components, and the
-two licences. The staging script copies exactly those into a scratch directory alongside the
-`Dockerfile`, asserts that the result is precisely that fifteen-file set, and builds from there.
+The image needs three things: the release executables, the checked-in default and optional provider
+components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
+`Dockerfile`, asserts that the result is precisely that sixteen-file set, and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
 `.dockerignore` — is correct only for as long as every file added later stays matched by it. That
@@ -98,10 +99,11 @@ The `COPY` that places them uses `--chown` and deliberately no `--chmod`, becaus
 components therefore keep the mode they carry in the staged context, which the staging script
 normalises to `0644`.
 
-Only `echo-provider.wasm` loads on the direct runner. The other three import
-`dekopon:http/client@1.0.0`, the immediate linker is empty by design, and `dekopon-run inspect`
-therefore refuses to instantiate them; they are broker-only components. That is the documented
-boundary in [`run.md`](run.md), not a packaging defect.
+Only `echo-provider.wasm` loads on the direct runner. The other default components import HTTP,
+and optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
+Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
+retention. An operator must name the exact optional file or explicitly scan its directory. The
+`storage-probe` fixture is not packaged anywhere in the image.
 
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.

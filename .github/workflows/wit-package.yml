@@ -10,6 +10,14 @@ on:
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
+      - "crates/dekopon-provider-storage/**"
+      - "crates/dekopon-broker-host/wit/**"
+      - "examples/providers/echo/**"
+      - "examples/providers/echo-provider.wasm"
+      - "examples/providers/memory-chat/**"
+      - "examples/providers/memory-chat-provider.wasm"
+      - "examples/providers/storage-probe/**"
+      - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/gh/**"
       - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
@@ -30,6 +38,14 @@ on:
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
       - "crates/dekopon-provider-sdk/wit/**"
+      - "crates/dekopon-provider-storage/**"
+      - "crates/dekopon-broker-host/wit/**"
+      - "examples/providers/echo/**"
+      - "examples/providers/echo-provider.wasm"
+      - "examples/providers/memory-chat/**"
+      - "examples/providers/memory-chat-provider.wasm"
+      - "examples/providers/storage-probe/**"
+      - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/gh/**"
       - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
@@ -59,6 +75,7 @@ env:
   WASM_TOOLS_SHA256: 2ea92231826976cb001c6c6d8708ff54e1ef1ea7229968a75a2119ff26c4cd6f
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.2.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
+  STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
 
 jobs:
   validate:
@@ -128,7 +145,9 @@ jobs:
             examples/providers/gh/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/jsonplaceholder/wit/deps/provider.wit \
-            examples/providers/skylight-private/wit/deps/provider.wit
+            examples/providers/skylight-private/wit/deps/provider.wit \
+            examples/providers/memory-chat/wit/deps/provider.wit \
+            examples/providers/storage-probe/wit/deps/provider.wit
           do
             cmp crates/dekopon-provider-sdk/wit/provider.wit "$mirror"
           done
@@ -143,6 +162,14 @@ jobs:
           do
             cmp wit/http/http.wit "$mirror"
           done
+          for mirror in \
+            crates/dekopon-provider-storage/wit/deps/storage.wit \
+            crates/dekopon-broker-host/wit/deps/storage.wit \
+            examples/providers/memory-chat/wit/deps/storage.wit \
+            examples/providers/storage-probe/wit/deps/storage.wit
+          do
+            cmp wit/storage/storage.wit "$mirror"
+          done
           wkg build \
             --wit-dir crates/dekopon-provider-sdk/wit \
             --output target/wit-package/dekopon-provider.wasm \
@@ -156,7 +183,15 @@ jobs:
               --config ../../wkg/config.toml \
               --cache "$RUNNER_TEMP/wkg-build-cache"
           )
-          git diff --exit-code -- wkg.lock wit/http/wkg.lock
+          (
+            cd wit/storage
+            wkg build \
+              --wit-dir . \
+              --output ../../target/wit-package/dekopon-storage.wasm \
+              --config ../../wkg/config.toml \
+              --cache "$RUNNER_TEMP/wkg-build-cache"
+          )
+          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock
 
       - name: Verify provider exports and import-free boundary
         shell: bash
@@ -238,6 +273,75 @@ jobs:
             (.worlds == [])
           ' target/wit-package/dekopon-http.json
 
+      - name: Verify namespace-bound storage interfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=target/wit-package/dekopon-storage.wasm
+          wasm-tools validate "$package"
+          wasm-tools component wit --json "$package" > target/wit-package/dekopon-storage.json
+          jq --exit-status --arg package "$STORAGE_WIT_PACKAGE" '
+            (.packages | length == 1) and
+            (.packages[0].name == $package) and
+            (.packages[0].interfaces == {"jsonl": 0, "durable-files": 1}) and
+            (.packages[0].worlds == {}) and
+            (.interfaces | map(.name) == ["jsonl", "durable-files"]) and
+            ((.interfaces[0].functions | keys) == ["append", "read-chunk", "replace", "size"]) and
+            ((.interfaces[1].functions | keys | contains([
+              "open", "stat", "remove", "rename-atomic", "random-bytes",
+              "monotonic-time-ns", "wall-time-ms", "[method]file.read-at",
+              "[method]file.write-at", "[method]file.lock"
+            ]))) and
+            (.worlds == [])
+          ' target/wit-package/dekopon-storage.json
+
+      - name: Verify the storage facade default feature set imports nothing
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/echo-provider.wasm
+          description=target/wit-package/echo-default-storage.json
+          grep -q 'name = "dekopon-provider-storage"' examples/providers/echo/Cargo.lock
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].name == "root") and
+            (.worlds[0].imports == {}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke"])
+          ' "$description"
+
+      - name: Verify storage-importing provider fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in memory-chat storage-probe; do
+            component="examples/providers/$name-provider.wasm"
+            description="target/wit-package/$name.json"
+            wasm-tools validate "$component"
+            wasm-tools component wit --json "$component" > "$description"
+            expected=jsonl
+            expected_exports='["describe", "invoke", "resolve-command"]'
+            if [ "$name" = storage-probe ]; then
+              expected=durable-files
+              expected_exports='["describe", "invoke"]'
+            fi
+            jq --exit-status --arg interface "$expected" --argjson exports "$expected_exports" '
+              (.packages | map(.name) == ["dekopon:storage@0.1.0", "root:component"]) and
+              (.worlds | length == 1) and
+              (.worlds[0].name == "root") and
+              (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
+              ((.worlds[0].exports | keys) == $exports) and
+              (.interfaces | length == 1) and
+              (.interfaces[0].name == $interface)
+            ' "$description"
+            if grep -Eqi 'wasi:|wasm-bindgen|js-sys' "$description"; then
+              echo "forbidden ambient import in $component" >&2
+              exit 1
+            fi
+          done
+
       - name: Verify HTTP-importing provider fixtures
         shell: bash
         run: |
@@ -272,7 +376,7 @@ jobs:
           [registry."local.test".local]
           root = "$registry/packages"
           EOF
-          for artifact in dekopon-provider dekopon-http; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage; do
             wkg publish \
               --config "$registry/config.toml" \
               --cache "$registry/publish-cache" \
@@ -288,8 +392,14 @@ jobs:
             --cache "$registry/fetch-cache" \
             --output "$registry/fetched-http.wasm" \
             "$HTTP_WIT_PACKAGE"
+          wkg get \
+            --config "$registry/config.toml" \
+            --cache "$registry/fetch-cache" \
+            --output "$registry/fetched-storage.wasm" \
+            "$STORAGE_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$registry/fetched-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$registry/fetched-http.wasm"
+          cmp target/wit-package/dekopon-storage.wasm "$registry/fetched-storage.wasm"
 
       - name: Upload the verified packages
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -299,6 +409,7 @@ jobs:
           path: |
             target/wit-package/dekopon-provider.wasm
             target/wit-package/dekopon-http.wasm
+            target/wit-package/dekopon-storage.wasm
           if-no-files-found: error
           retention-days: 1
 
@@ -343,7 +454,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in dekopon-provider dekopon-http; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage; do
             wkg publish \
               --skip-dupes \
               --config wkg/config.toml \
@@ -365,8 +476,14 @@ jobs:
             --cache "$RUNNER_TEMP/wkg-verify-cache" \
             --output "$RUNNER_TEMP/published-http.wasm" \
             "$HTTP_WIT_PACKAGE"
+          wkg get \
+            --config wkg/config.toml \
+            --cache "$RUNNER_TEMP/wkg-verify-cache" \
+            --output "$RUNNER_TEMP/published-storage.wasm" \
+            "$STORAGE_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$RUNNER_TEMP/published-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$RUNNER_TEMP/published-http.wasm"
+          cmp target/wit-package/dekopon-storage.wasm "$RUNNER_TEMP/published-storage.wasm"
 
       - name: Log out of GHCR
         if: always()

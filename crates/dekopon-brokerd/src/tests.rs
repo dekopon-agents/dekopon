@@ -631,3 +631,38 @@ async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
         "{error:?}"
     );
 }
+
+#[test]
+fn storage_section_is_optional_all_or_nothing_and_strict() {
+    let uid = current_uid();
+    let mut document = attested_document(uid);
+    assert!(serde_json::from_value::<config::BrokerdConfig>(document.clone()).is_ok());
+
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    let object = storage.as_object_mut().expect("limits object");
+    object.insert(
+        "rootPath".to_owned(),
+        json!("/var/lib/dekopon-provider-storage"),
+    );
+    object.insert(
+        "namespaceKeyPath".to_owned(),
+        json!("/etc/dekopon-storage-key/storage-key.yaml"),
+    );
+    document["storage"] = storage.clone();
+    let decoded = serde_json::from_value::<config::BrokerdConfig>(document.clone())
+        .expect("complete strict storage section decodes");
+    assert_eq!(
+        decoded.storage.expect("storage").limits.max_root_bytes,
+        2 * 1024 * 1024 * 1024
+    );
+
+    document["storage"]
+        .as_object_mut()
+        .expect("storage object")
+        .remove("maxRootBytes");
+    assert!(
+        serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
+        "presence requires every storage field"
+    );
+}

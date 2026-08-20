@@ -324,6 +324,21 @@ state:
   # Bring your own claim instead. The chart still chowns its root to 65532 and chmods it 0700.
   existingClaim: ""
 
+# Optional provider storage is physically and lifecycle-separate from audit state. The generated
+# claim is always retained. The namespace key is operator-managed and never chart-created, so an
+# uninstall cannot destroy the only key capable of reopening retained data.
+providerStorage:
+  enabled: false
+  storageClassName: local-path
+  accessModes: [ReadWriteOnce]
+  size: 2Gi
+  existingClaim: ""
+  existingKeySecret: ""
+  existingKeySecretKey: storage-key.yaml
+  rootPath: /var/lib/dekopon-provider-storage
+  keyDir: /etc/dekopon-storage-key
+  keyFileName: storage-key.yaml
+
 # tmpfs sizes. Both are memory-backed so the credentials file and the socket never touch the
 # node's disk; both count against the pod's memory limit, which is why they are small.
 volumeSizes:

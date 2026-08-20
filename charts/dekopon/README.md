@@ -475,8 +475,12 @@ Use `existingSecret` for credentials. An inline value is stored in the release, 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, or `constraintSets` with no corresponding value supplied;
-or `paths.catalogDir` is inside `paths.configDir`. Every one of those is a mistake whose only other
-symptom is a pod that starts and never becomes ready.
+or `paths.catalogDir` is inside `paths.configDir`. When provider storage is enabled, its root and
+key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with
+every chart-owned mount (`config`, runtime, audit state, catalog, `/tmp`, and both projected
+configuration/key sources); a nested mount would otherwise shadow or destructively replace those
+files. Every one of
+those is a mistake whose only other symptom is a pod that starts and never becomes ready.
 
 The chart's default `broker.config.inline` is the echo example from the broker's own README, moved
 onto these paths: a real deny-by-default configuration that starts, loads the baked
@@ -538,3 +542,24 @@ own volume. It may post one review comment and has no approval, request-changes,
   a live refresh against OpenAI.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
+
+## Optional provider-storage claim and namespace key
+
+`providerStorage.enabled` creates (or mounts) a claim physically separate from `state`, mounted only
+into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
+`helm.sh/resource-policy: keep`; an existing claim remains operator-owned. Rendering fails when the
+resolved audit and provider-storage claim names are equal.
+
+The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
+operator-managed, so uninstall cannot delete the key for retained data. The init container alone
+mounts its projected symlink farm, copies the selected key into a separate broker-only tmpfs
+`0700` directory as one `0600`, UID-65532, single-link regular file, and verifies it. The gateway
+mounts neither key tmpfs nor provider-storage PVC. `storage-probe` is not present in the image;
+`memory-chat-provider.wasm` is baked only under `/opt/dekopon/optional-providers`, outside the
+default scan.
+
+The key is HMAC namespace/recovery authority, not encryption-at-rest. Losing or rotating it with
+retained data makes startup fail. The provider-storage filesystem must support retained
+directory-descriptor-relative no-follow opens, advisory locks, same-directory rename, and
+file/directory sync. A stuck native syscall may exceed
+the configured shutdown grace, and malicious same-UID filesystem mutation is outside the claim.

@@ -13,3 +13,14 @@ Authorization and execution are separate by construction. Cedar decides *who may
 Invocation IDs are reserved in a bounded replay ledger before policy evaluation, so repeated denied requests cannot later be reused for execution. Exhaustion fails closed; transport-level quotas must prevent an authenticated peer from consuming the ledger. A broker restart can seed the ledger from decision IDs reconstructed from a verified durable audit chain. Authorization is non-cloneable and consumed by provider execution. Public results carry an inert decision ID/broker/policy reference plus digest evidence. Audit records contain identities, routing and policy metadata — including `policy_ids`, the identifiers of the policies that determined the decision, and `policy_digest`, a fingerprint of the evaluated policy set — stable outcomes, timings, output digests, and sanitized HTTP call metadata. They never contain invocation input, provider output, paths, queries, headers, bodies, cookies, authorization values, or credentials.
 
 The in-memory audit implementation is deterministic and bounded for tests. `FileAuditLog` creates or opens an exclusively writer-locked, single-link owner-only JSONL file without following symlinks, bounds every line and record count, verifies the complete chain before appending, flushes and synchronizes each record, poisons a handle after a failed write, rejects partial final records, and exposes a chain checkpoint, exact-prefix comparison, and verified replay IDs. `dekopon-brokerd` composes it with an atomic separately locked checkpoint file to detect valid-prefix rollback relative to retained local state. Authenticated transport and checkpoint persistence remain service layers; independent remote/signed anchoring is not implemented. A constraint set may bind a symbolic `credential:` resolved from a caller-supplied `CredentialStore`; construction fails closed on unknown names, missing HTTP authority, or allowed hosts outside the credential's destination binding.
+
+## Optional durable chat memory
+
+New chat operations add canonical transport/channel/conversation authority to the existing subject
+mapping and `agent.prompt` gate. Owner configuration must grant both the subject namespace and an
+explicit `chatScopes` breadth; Cedar receives those scope fields. Legacy list/resolve/invoke paths
+reserve and omit the memory provider, word, and capabilities. Recent/search are visible only as an
+all-three surface; record is reachable only through the dedicated typed post-acceptance operation.
+Storage audit records replace raw identities/provider/policy metadata with a domain-separated keyed
+scope commitment and content-free evidence. `authority-bound` continuity uses persisted random
+epochs, so semantic A→B→A creates three generations; explicit `stable` preserves the namespace.

@@ -15,14 +15,19 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, ShellRuntime,
+    BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
     meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
     prompt::{
         CancellationProbe, History, ModelUsageObserver, PromptError, SessionInputs,
         run_prompt_session,
     },
 };
-use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED, ModelUsageReport};
+use dekopon_broker_protocol::{
+    BrokerClient, ChatScopeClaim, ChatSessionClaim, ClientError, DeliveredTurnRequest,
+    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
+    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
+    ModelUsageReport,
+};
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
     model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
@@ -39,8 +44,8 @@ use crate::{
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, ChatActivity, ChatReplier, InboundMessage, ReplyTarget, SessionStop,
-        bound_inbound, bound_outbound,
+        AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, ReplyTarget,
+        SessionStop, bound_inbound, bound_outbound,
     },
 };
 
@@ -59,6 +64,8 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
 /// Confirmation sent when Slack's authenticated Agent-session Stop event wins the completion race.
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
+/// One transport-independent normalization for a successful empty model answer.
+pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const SESSION_RUNNING: u8 = 0;
 const SESSION_CANCELLED: u8 = 1;
@@ -611,10 +618,19 @@ async fn session(
         );
     }
 
+    let memory_surface = leg.chat_memory_surface().cloned();
+    let chat_claim = chat_claim(route, message).ok();
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
     let limits = route.limits;
-    let instructions = route.instructions.clone();
+    let instructions = match (route.instructions.as_deref(), memory_surface.as_ref()) {
+        (Some(instructions), Some(memory)) => {
+            Some(format!("{instructions}\n\n{}", memory.prompt_note))
+        }
+        (None, Some(memory)) => Some(memory.prompt_note.clone()),
+        (Some(instructions), None) => Some(instructions.to_owned()),
+        (None, None) => None,
+    };
     // Numbered here rather than in the transport: the identifier belongs to the store, and two
     // transports minting their own would collide inside one conversation.
     let images_supported = route.model.accepts_images();
@@ -772,22 +788,31 @@ async fn session(
             .commit(&key, &granted, window, turn, &cache_key, Instant::now());
     }
 
-    let (answer_text, completed_outcome) = match outcome {
-        Ok(outcome) => (outcome.answer, "answered"),
+    let (answer_text, completed_outcome, recordable) = match outcome {
+        Ok(outcome) if outcome.answer.is_empty() => (EMPTY_REPLY.to_owned(), "answered", true),
+        Ok(outcome) => (outcome.answer, "answered", true),
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category()
             );
-            (FAILURE_REPLY.to_owned(), "failed")
+            (FAILURE_REPLY.to_owned(), "failed", false)
         }
     };
-    let replied = answer(replier, message, &answer_text).await;
+    let delivered_answer = bound_outbound(&answer_text);
+    let delivery = deliver(replier, message, delivered_answer.clone()).await;
     activity.finish_in_background();
-    if replied {
-        completed_outcome
-    } else {
-        "reply-failed"
+    match delivery {
+        Some(receipt) if receipt.accepted() => {
+            if recordable
+                && memory_surface.is_some()
+                && let Some(claim) = chat_claim
+            {
+                record_delivered_turn(runner, message, claim, delivered_answer).await;
+            }
+            completed_outcome
+        }
+        Some(_) | None => "reply-failed",
     }
 }
 
@@ -843,14 +868,178 @@ async fn connect(
         runner.broker.server_uid,
         runner.broker.frame,
     )?;
-    BrokerLeg::connect_attested(
-        client,
-        TRACE_PREFIX,
-        message.subject.clone(),
-        route.agent.clone(),
-    )
-    .await
-    .map_err(SessionError::from)
+    BrokerLeg::connect_chat(client, TRACE_PREFIX, chat_claim(route, message)?)
+        .await
+        .map_err(SessionError::from)
+}
+
+fn chat_claim(
+    route: &BoundRoute,
+    message: &InboundMessage,
+) -> Result<ChatSessionClaim, SessionError> {
+    let transport = message
+        .transport
+        .parse()
+        .map_err(SessionError::TransportId)?;
+    let (channel, conversation) = match message.transport_kind {
+        dekopon_broker_protocol::ChatTransportKind::Slack => (
+            message.channel.to_ascii_lowercase(),
+            message.conversation_id.to_ascii_lowercase(),
+        ),
+        _ => (message.channel.clone(), message.conversation_id.clone()),
+    };
+    Ok(ChatSessionClaim {
+        subject: message.subject.clone(),
+        agent: route.agent.clone(),
+        scope: ChatScopeClaim {
+            transport,
+            kind: message.transport_kind,
+            channel,
+            conversation,
+        },
+    })
+}
+
+async fn record_delivered_turn(
+    runner: &SessionRunner,
+    message: &InboundMessage,
+    claim: ChatSessionClaim,
+    assistant: String,
+) {
+    let Some(delivery) = delivery_identity(message, &claim) else {
+        tracing::warn!(
+            event = "gateway_memory_record_failed",
+            category = "delivery-identity",
+        );
+        return;
+    };
+    let result: Result<(), MemoryRecordFailure> = async {
+        let identifiers = IdSequence::new("dekopond-memory-record").map_err(|error| {
+            MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(error))
+        })?;
+        let id = identifiers.next_invocation().map_err(|error| {
+            MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(error))
+        })?;
+        let client = BrokerClient::new(
+            &runner.broker.socket_path,
+            runner.broker.server_uid,
+            runner.broker.frame,
+        )
+        .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
+        let result = client
+            .record_delivered_turn_for_chat(
+                DeliveredTurnRequest {
+                    id,
+                    trace: identifiers.trace().clone(),
+                    trace_parent: current_trace_parent(),
+                    delivery,
+                    user: message.text.clone(),
+                    assistant,
+                },
+                claim,
+            )
+            .await
+            .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
+        match result.outcome {
+            InvocationOutcome::Succeeded => Ok(()),
+            InvocationOutcome::Denied => Err(MemoryRecordFailure::Outcome("denied")),
+            InvocationOutcome::Failed => Err(MemoryRecordFailure::Outcome(
+                match result.error.as_deref() {
+                    Some("dedup-capacity") => "dedup-capacity",
+                    Some("dedup-conflict") => "dedup-conflict",
+                    Some("memory-corrupt") => "memory-corrupt",
+                    Some("result-too-large") => "result-too-large",
+                    Some("storage-quota") => "storage-quota",
+                    Some("storage-busy") => "storage-busy",
+                    Some("storage-timeout") => "storage-timeout",
+                    Some("storage-corrupt") => "storage-corrupt",
+                    _ => "storage",
+                },
+            )),
+        }
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            event = "gateway_memory_record_failed",
+            category = memory_record_category(&error),
+        );
+    }
+}
+
+fn delivery_identity(
+    message: &InboundMessage,
+    claim: &ChatSessionClaim,
+) -> Option<DeliveryIdentity> {
+    match message.transport_kind {
+        dekopon_broker_protocol::ChatTransportKind::Slack => Some(DeliveryIdentity::Slack {
+            channel: claim.scope.channel.clone(),
+            timestamp: message.message_id.clone(),
+        }),
+        dekopon_broker_protocol::ChatTransportKind::Discord => Some(DeliveryIdentity::Discord {
+            channel: claim.scope.channel.clone(),
+            message: message.message_id.clone(),
+        }),
+        dekopon_broker_protocol::ChatTransportKind::Telegram => {
+            let topic = claim
+                .scope
+                .conversation
+                .strip_prefix(&format!("{}:topic:", claim.scope.channel))
+                .map(str::to_owned);
+            Some(DeliveryIdentity::Telegram {
+                chat: claim.scope.channel.clone(),
+                topic,
+                message: message.message_id.clone(),
+            })
+        }
+        dekopon_broker_protocol::ChatTransportKind::Local => {
+            let mut fields = message.message_id.rsplitn(3, '-');
+            let sequence = fields.next()?.parse().ok()?;
+            let connection = fields.next()?.parse().ok()?;
+            let boot_nonce = fields.next()?.to_owned();
+            Some(DeliveryIdentity::Local {
+                transport: claim.scope.transport.clone(),
+                conversation: claim.scope.conversation.clone(),
+                boot_nonce,
+                connection,
+                sequence,
+            })
+        }
+    }
+}
+
+enum MemoryRecordFailure {
+    Broker(BrokerLegError),
+    Outcome(&'static str),
+}
+
+fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
+    match error {
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == "outcome-unaudited" => "outcome-unaudited",
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_UNAUTHENTICATED => "denied",
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_STORAGE_QUOTA => ERROR_STORAGE_QUOTA,
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_STORAGE_BUSY => ERROR_STORAGE_BUSY,
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_STORAGE_TIMEOUT => ERROR_STORAGE_TIMEOUT,
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_STORAGE_CORRUPT => ERROR_STORAGE_CORRUPT,
+        MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
+            code, ..
+        })) if code == ERROR_STORAGE_IO => ERROR_STORAGE_IO,
+        MemoryRecordFailure::Broker(BrokerLegError::Client(_)) => "broker",
+        MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(_)) => "identifier",
+        MemoryRecordFailure::Outcome(category) => category,
+    }
 }
 
 /// Sends one answer, reporting whether it arrived.
@@ -859,14 +1048,21 @@ async fn connect(
 /// text, every chat service rejects or mangles an oversized post, and one bound at the session
 /// boundary is one place to read rather than three places to keep in agreement.
 async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: &str) -> bool {
-    match replier
-        .reply(message.reply.clone(), bound_outbound(text))
+    deliver(replier, message, bound_outbound(text))
         .await
-    {
-        Ok(()) => true,
+        .is_some()
+}
+
+async fn deliver(
+    replier: &Arc<dyn ChatReplier>,
+    message: &InboundMessage,
+    text: String,
+) -> Option<DeliveryReceipt> {
+    match replier.reply(message.reply.clone(), text).await {
+        Ok(receipt) => Some(receipt),
         Err(error) => {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
-            false
+            None
         }
     }
 }
@@ -878,6 +1074,8 @@ pub enum SessionError {
     BrokerClient(#[from] ClientError),
     #[error("broker leg could not be opened")]
     BrokerLeg(#[from] BrokerLegError),
+    #[error("configured chat transport identifier is invalid")]
+    TransportId(#[source] dekopon_core::IdentifierError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
@@ -895,6 +1093,7 @@ impl SessionError {
         match self {
             Self::BrokerClient(_) => "broker-client",
             Self::BrokerLeg(_) => "broker-leg",
+            Self::TransportId(_) => "transport-id",
             Self::Model(_) => "model",
             Self::ChatGpt(_) => "chatgpt",
             Self::Prompt(error) => error.telemetry_kind(),

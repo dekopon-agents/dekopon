@@ -5,10 +5,11 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    AgentInventory, BrokerRequest, FrameLimits, InvocationRequest, MAX_REPORTED_MODEL_CALLS,
-    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, Permission, ProtocolError,
-    ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, TraceParent,
-    TraceParentError, read_frame, write_frame,
+    AgentInventory, BrokerRequest, ChatAttestation, ChatScopeClaim, ChatSessionClaim,
+    ChatTransportKind, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InvocationRequest,
+    MAX_REPORTED_MODEL_CALLS, MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport,
+    Permission, ProtocolError, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
+    ResponseEnvelope, TraceParent, TraceParentError, read_frame, write_frame,
 };
 
 fn invocation() -> InvocationRequest {
@@ -347,4 +348,149 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
     let wrong_uid = uid.wrapping_add(1);
     let client = BrokerClient::new(&socket, wrong_uid, limits).expect("valid client limits");
     assert!(client.capabilities().await.is_err());
+}
+
+#[test]
+fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
+    let scope = ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("transport"),
+        kind: ChatTransportKind::Slack,
+        channel: "c0123abc".to_owned(),
+        conversation: "c0123abc:1712345678.000100".to_owned(),
+    };
+    let session = ChatSessionClaim {
+        subject: "slack.t0123abc.u9xyz".parse().expect("subject"),
+        agent: "reviewer".parse().expect("agent"),
+        scope: scope.clone(),
+    };
+    let attestation = ChatAttestation {
+        subject: session.subject.clone(),
+        agent: session.agent.clone(),
+        scope: scope.clone(),
+        invocation: "invoke-chat".parse().expect("invocation"),
+    };
+    let turn = DeliveredTurnRequest {
+        id: "invoke-chat".parse().expect("invocation"),
+        trace: "trace-chat".parse().expect("trace"),
+        trace_parent: None,
+        delivery: DeliveryIdentity::Slack {
+            channel: "c0123abc".to_owned(),
+            timestamp: "1712345678.000100".to_owned(),
+        },
+        user: "private user sentinel".to_owned(),
+        assistant: "private assistant sentinel".to_owned(),
+    };
+    assert!(scope.is_bounded() && turn.is_bounded());
+    for rendered in [
+        format!("{scope:?}"),
+        format!("{session:?}"),
+        format!("{attestation:?}"),
+        format!("{turn:?}"),
+    ] {
+        assert_eq!(rendered.matches("[REDACTED]").count(), 1);
+        for sentinel in ["c0123abc", "u9xyz", "reviewer", "private"] {
+            assert!(!rendered.contains(sentinel));
+        }
+    }
+
+    let oversized = ChatScopeClaim {
+        channel: "x".repeat(257),
+        ..scope
+    };
+    assert!(!oversized.is_bounded());
+    let oversized_turn = DeliveredTurnRequest {
+        user: "x".repeat(64 * 1024),
+        assistant: "y".to_owned(),
+        ..turn
+    };
+    assert!(!oversized_turn.is_bounded());
+}
+
+#[test]
+fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
+    let slack = ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("transport"),
+        kind: ChatTransportKind::Slack,
+        channel: "c0123abc".to_owned(),
+        conversation: "c0123abc:1712345678.000100".to_owned(),
+    };
+    assert!(
+        DeliveryIdentity::Slack {
+            channel: "c0123abc".to_owned(),
+            timestamp: "1712345678.000101".to_owned(),
+        }
+        .is_canonical_for(&slack)
+    );
+    for timestamp in ["01712345678.000101", "1712345678.1", "171234567.000101"] {
+        assert!(
+            !DeliveryIdentity::Slack {
+                channel: "c0123abc".to_owned(),
+                timestamp: timestamp.to_owned(),
+            }
+            .is_canonical_for(&slack)
+        );
+    }
+    assert!(
+        !DeliveryIdentity::Discord {
+            channel: "123".to_owned(),
+            message: "456".to_owned(),
+        }
+        .is_canonical_for(&slack)
+    );
+
+    let telegram = ChatScopeClaim {
+        transport: "tg".parse().expect("transport"),
+        kind: ChatTransportKind::Telegram,
+        channel: "-1001".to_owned(),
+        conversation: "-1001:topic:42".to_owned(),
+    };
+    assert!(
+        DeliveryIdentity::Telegram {
+            chat: "-1001".to_owned(),
+            topic: Some("42".to_owned()),
+            message: "7".to_owned(),
+        }
+        .is_canonical_for(&telegram)
+    );
+    assert!(
+        !DeliveryIdentity::Telegram {
+            chat: "-1001".to_owned(),
+            topic: None,
+            message: "7".to_owned(),
+        }
+        .is_canonical_for(&telegram)
+    );
+}
+
+#[test]
+fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bound() {
+    let document = serde_json::json!({
+        "id": "turn-bound",
+        "trace": "trace-bound",
+        "traceParent": null,
+        "delivery": {
+            "kind": "slack",
+            "channel": "c0123abc",
+            "timestamp": "1712345678.000100"
+        },
+        "user": "x".repeat(64 * 1024 + 1),
+        "assistant": "answer"
+    });
+    assert!(serde_json::from_value::<DeliveredTurnRequest>(document).is_err());
+
+    let scope = serde_json::json!({
+        "transport": "scientist-slack",
+        "kind": "slack",
+        "channel": "c0123abc",
+        "conversation": "x".repeat(257)
+    });
+    assert!(serde_json::from_value::<ChatScopeClaim>(scope).is_err());
+
+    let delivery = serde_json::json!({
+        "kind": "telegram",
+        "chat": "-1001",
+        "topic": "7".repeat(257),
+        "message": "9"
+    });
+    assert!(serde_json::from_value::<DeliveryIdentity>(delivery).is_err());
 }

@@ -78,6 +78,14 @@ Object names.
 {{- end -}}
 {{- end -}}
 
+{{- define "dekopon.providerStorageClaimName" -}}
+{{- if .Values.providerStorage.existingClaim -}}
+{{- .Values.providerStorage.existingClaim -}}
+{{- else -}}
+{{- printf "%s-provider-storage" (include "dekopon.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Whether each optional file has a source at all.
 */}}
@@ -221,6 +229,35 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
 {{- end -}}
 
+{{- if .Values.providerStorage.enabled -}}
+{{- if not .Values.providerStorage.existingKeySecret -}}
+{{- fail "providerStorage.enabled requires operator-managed providerStorage.existingKeySecret; the chart never owns or deletes the namespace key" -}}
+{{- end -}}
+{{- if eq (include "dekopon.providerStorageClaimName" .) (include "dekopon.stateClaimName" .) -}}
+{{- fail "provider storage and audit state must use distinct PersistentVolumeClaims" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.providerStorage.keyFileName) -}}
+{{- fail "providerStorage.keyFileName must be one path segment" -}}
+{{- end -}}
+{{- range $name, $path := dict "providerStorage.rootPath" .Values.providerStorage.rootPath "providerStorage.keyDir" .Values.providerStorage.keyDir -}}
+{{- if not (regexMatch "^/[^/].*[^/]$|^/[^/]$" $path) -}}
+{{- fail (printf "%s must be an absolute path with at least one segment and no trailing slash, got %q" $name $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $storageMounts := dict "providerStorage.rootPath" .Values.providerStorage.rootPath "providerStorage.keyDir" .Values.providerStorage.keyDir -}}
+{{- $ownedMounts := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "projected storage-key source" "/dekopon-storage-key-source" -}}
+{{- range $storageName, $storagePath := $storageMounts -}}
+{{- range $ownedName, $ownedPath := $ownedMounts -}}
+{{- if or (eq $storagePath $ownedPath) (hasPrefix (printf "%s/" $storagePath) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) $storagePath) -}}
+{{- fail (printf "%s (%s) must not equal, contain, or be contained by chart-owned %s (%s); overlapping volume mounts shadow files" $storageName $storagePath $ownedName $ownedPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq .Values.providerStorage.rootPath .Values.providerStorage.keyDir) (hasPrefix (printf "%s/" .Values.providerStorage.rootPath) .Values.providerStorage.keyDir) (hasPrefix (printf "%s/" .Values.providerStorage.keyDir) .Values.providerStorage.rootPath) -}}
+{{- fail "providerStorage.rootPath and providerStorage.keyDir must not overlap" -}}
+{{- end -}}
+{{- end -}}
+
 {{- range $key, $path := .Values.paths -}}
 {{- if not (regexMatch "^/[^/].*[^/]$|^/[^/]$" $path) -}}
 {{- fail (printf "paths.%s must be an absolute path with at least one segment and no trailing slash, got %q" $key $path) -}}
@@ -283,6 +320,13 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ $.Values.paths.runtimeDir }}
     - name: state
       mountPath: {{ $.Values.paths.stateDir }}
+{{- if $.Values.providerStorage.enabled }}
+    - name: provider-storage
+      mountPath: {{ $.Values.providerStorage.rootPath }}
+    - name: provider-storage-key
+      mountPath: {{ $.Values.providerStorage.keyDir }}
+      readOnly: true
+{{- end }}
     - name: tmp
       mountPath: /tmp
 {{- end -}}

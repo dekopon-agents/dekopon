@@ -7,9 +7,10 @@ use dekopon_capability::ExecutionConstraints;
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
 
 use super::{
-    AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog, AuditRecord,
-    AuthenticatedContext, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
-    verify_audit_chain,
+    AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
+    AuditRecord, AuthenticatedContext, ChatMemoryConfig, ChatScopeGrant, ChatTransportKind,
+    ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
+    is_reserved_memory_route, verify_audit_chain,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -20,28 +21,176 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         trace: "trace-test"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
-        principal: "caller"
-            .parse::<PrincipalId>()
-            .expect("valid principal fixture"),
-        actor: Actor::Agent {
+        principal: Some(
+            "caller"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        actor: Some(Actor::Agent {
             agent: "reviewer".parse::<AgentId>().expect("valid agent fixture"),
-        },
+        }),
         via: None,
         attested_subject: None,
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
         provider: None,
-        authorized_by: "broker"
-            .parse::<PrincipalId>()
-            .expect("valid principal fixture"),
+        authorized_by: Some(
+            "broker"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
         decision_id: format!("decision-{invocation}"),
-        policy_revision: "policy-test".to_owned(),
+        policy_revision: Some("policy-test".to_owned()),
         policy_ids: Vec::new(),
         policy_digest: None,
         allowed,
         reason: (!allowed).then(|| "policy-denied".to_owned()),
         decision_digest: format!("sha256:{}", "a".repeat(64)),
+        storage_scope_commitment: None,
+        storage: None,
+    }
+}
+
+#[test]
+fn the_complete_memory_prefix_and_provider_are_reserved() {
+    let provider_route = ConstraintSet {
+        provider: "memory-chat".parse().expect("provider"),
+        effect: dekopon_capability::EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        idempotency: dekopon_capability::Idempotency::Idempotent,
+        credential: None,
+        credential_by_agent: Default::default(),
+        constraints: ExecutionConstraints::default(),
+    };
+    assert!(is_reserved_memory_route(
+        &"memory.chat.export".parse().expect("capability"),
+        None,
+    ));
+    assert!(is_reserved_memory_route(
+        &"unrelated.extra".parse().expect("capability"),
+        Some(&provider_route),
+    ));
+    assert!(!is_reserved_memory_route(
+        &"ordinary.read".parse().expect("capability"),
+        None,
+    ));
+}
+
+#[test]
+fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
+    let memory = ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        enabled_agents: vec!["reviewer".parse().expect("agent")],
+        max_lookback_turns: 200,
+        max_recent_turns: 20,
+        max_search_results: 20,
+        max_query_bytes: 256,
+        max_result_bytes: 65_536,
+        max_turn_bytes: 32_768,
+        max_dedup_records: 16_000,
+        max_dedup_bytes: 4_194_304,
+        compaction_target_bytes: 8_388_608,
+        compaction_threshold_bytes: 12_582_912,
+    };
+
+    let mut minimal = memory.clone();
+    minimal.max_lookback_turns = 1;
+    minimal.max_recent_turns = 1;
+    minimal.max_search_results = 1;
+    minimal.max_turn_bytes = 251;
+    minimal.max_dedup_records = 1;
+    minimal.max_dedup_bytes = 256;
+    minimal.compaction_target_bytes = 251;
+    minimal.compaction_threshold_bytes = 252;
+    let too_small_call = dekopon_storage_host::StorageLimits {
+        max_write_bytes_per_call: 255,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(minimal.validate(&too_small_call).is_err());
+
+    let unaligned_read_budget = dekopon_storage_host::StorageLimits {
+        max_read_bytes_per_invocation: 300_000,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(
+        minimal.validate(&unaligned_read_budget).is_err(),
+        "two final partial chunks are charged at their requested 256 KiB bounds"
+    );
+
+    // The old threshold + target estimate fit in 30 MiB; the real old+staged peak can hold two
+    // near-threshold turn files plus both permanent-dedup copies and transaction metadata.
+    let too_small_namespace = dekopon_storage_host::StorageLimits {
+        max_namespace_bytes: 30 * 1024 * 1024,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&too_small_namespace).is_err());
+}
+
+#[test]
+fn pre_execution_storage_failures_keep_their_public_category() {
+    for (source, expected) in [
+        (
+            dekopon_storage_host::StorageHostError::QuotaExceeded,
+            "storage-quota",
+        ),
+        (dekopon_storage_host::StorageHostError::Busy, "storage-busy"),
+        (
+            dekopon_storage_host::StorageHostError::Timeout,
+            "storage-timeout",
+        ),
+        (
+            dekopon_storage_host::StorageHostError::Corrupt { scope: "test" },
+            "storage-corrupt",
+        ),
+        (dekopon_storage_host::StorageHostError::Io, "storage-io"),
+    ] {
+        assert_eq!(
+            super::BrokerError::Storage { source }.storage_failure_code(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn exact_chat_scope_configuration_requires_service_canonical_forms() {
+    for scope in [
+        ChatScopeGrant::ExactChannel {
+            kind: ChatTransportKind::Discord,
+            transport: "discord".parse().expect("transport"),
+            channel: "00123".to_owned(),
+            local_subject_service: None,
+        },
+        ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Discord,
+            transport: "discord".parse().expect("transport"),
+            channel: "123".to_owned(),
+            conversation: "456".to_owned(),
+            local_subject_service: None,
+        },
+        ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Slack,
+            transport: "slack".parse().expect("transport"),
+            channel: "c0123abc".to_owned(),
+            conversation: "c0123abc:01712345678.1".to_owned(),
+            local_subject_service: None,
+        },
+        ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Telegram,
+            transport: "telegram".parse().expect("transport"),
+            channel: "-1001".to_owned(),
+            conversation: "-1001:topic:00".to_owned(),
+            local_subject_service: None,
+        },
+    ] {
+        assert!(
+            AttestorGrant {
+                namespaces: vec!["slack".to_owned()],
+                chat_scopes: vec![scope],
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
 
@@ -267,7 +416,16 @@ fn policy_http_scope_values_are_bounded() {
         }),
         ..ExecutionConstraints::default()
     };
-    assert!(super::validate_set_constraints(&constraints).is_err());
+    let set = ConstraintSet {
+        provider: "echo".parse().expect("provider"),
+        effect: dekopon_capability::EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        idempotency: dekopon_capability::Idempotency::Idempotent,
+        credential: None,
+        credential_by_agent: Default::default(),
+        constraints,
+    };
+    assert!(super::validate_set_constraints(&set).is_err());
 }
 
 /// The authored spelling of a per-agent credential, and what selection does with it.

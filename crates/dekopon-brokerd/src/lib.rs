@@ -19,6 +19,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use dekopon_broker::{
@@ -33,7 +34,7 @@ pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOIN
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
     IdentityMapping, PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig,
-    TelemetryConfig,
+    StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
@@ -152,9 +153,30 @@ where
         file_audit,
         checkpoint_store,
     ));
-    let registry = BrokerProviderRegistry::load(config.providers, config.host_limits)
-        .await
-        .map_err(BrokerdError::Host)?;
+    let storage_host = config
+        .storage
+        .as_ref()
+        .map(|storage| {
+            dekopon_storage_host::StorageHost::open(
+                &storage.root_path,
+                &storage.namespace_key_path,
+                storage.limits.clone(),
+            )
+        })
+        .transpose()
+        .map_err(BrokerdError::Storage)?;
+    let storage_gc = storage_host.clone();
+    let storage_gc_interval = config
+        .storage
+        .as_ref()
+        .map(|storage| Duration::from_millis(storage.limits.gc_interval_ms));
+    let registry = BrokerProviderRegistry::load_with_storage(
+        config.providers,
+        config.host_limits,
+        storage_host,
+    )
+    .await
+    .map_err(BrokerdError::Host)?;
     let host_metrics = registry.metrics();
     let provider_metadata = registry.loaded_provider_metadata().collect::<Vec<_>>();
     validate_manifest_metadata(
@@ -238,6 +260,12 @@ where
         replay_ids,
     )
     .map_err(BrokerdError::Broker)?;
+    let broker = match config.chat_memory {
+        Some(memory) => broker
+            .with_chat_memory(memory)
+            .map_err(BrokerdError::Broker)?,
+        None => broker,
+    };
     for warning in &warnings {
         tracing::warn!(
             target: "dekopon_brokerd::audit",
@@ -308,6 +336,8 @@ where
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let broker_serve = server.serve(listener, wait_for_shutdown(shutdown_receiver.clone()));
+    let storage_gc_serve =
+        storage_gc_loop(storage_gc, storage_gc_interval, shutdown_receiver.clone());
     let web_serve = async move {
         match web_listener {
             Some(listener) => {
@@ -318,6 +348,7 @@ where
         }
     };
     tokio::pin!(broker_serve);
+    tokio::pin!(storage_gc_serve);
     tokio::pin!(web_serve);
     tokio::pin!(shutdown);
 
@@ -331,6 +362,12 @@ where
     let _ = shutdown_sender.send(true);
     if broker_result.is_none() {
         broker_result = Some(broker_serve.await);
+    }
+    if tokio::time::timeout(web_shutdown_grace, &mut storage_gc_serve)
+        .await
+        .is_err()
+    {
+        return Err(BrokerdError::StorageGcShutdownTimeout);
     }
     let mut web_shutdown_timed_out = false;
     if web_enabled && web_result.is_none() {
@@ -356,6 +393,38 @@ where
         audit_head = head.as_deref().unwrap_or("none")
     );
     Ok(AuditCheckpoint { records, head })
+}
+
+async fn storage_gc_loop(
+    host: Option<dekopon_storage_host::StorageHost>,
+    interval: Option<Duration>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let (Some(host), Some(interval)) = (host, interval) else {
+        wait_for_shutdown(shutdown).await;
+        return;
+    };
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {
+                let host = host.clone();
+                match tokio::task::spawn_blocking(move || host.gc_once()).await {
+                    Ok(Ok(report)) => tracing::debug!(
+                        event = "broker_storage_gc_completed",
+                        namespace.count = report.namespaces_removed,
+                        storage.byte_bucket = if report.bytes_removed == 0 { 0 } else { 64 - report.bytes_removed.leading_zeros() },
+                    ),
+                    Ok(Err(_)) | Err(_) => tracing::warn!(
+                        event = "broker_storage_gc_failed",
+                        category = "storage",
+                    ),
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
@@ -454,6 +523,12 @@ pub enum BrokerdError {
     /// Durable checkpoint could not be locked, verified, reconciled, or synchronized.
     #[error("broker audit checkpoint is unavailable")]
     Checkpoint(#[source] CheckpointError),
+    /// Provider storage root/key/recovery could not start.
+    #[error("broker provider storage could not start")]
+    Storage(#[source] dekopon_storage_host::StorageHostError),
+    /// A blocking provider-storage GC pass did not drain inside shutdown grace.
+    #[error("broker provider storage GC did not stop inside shutdown grace")]
+    StorageGcShutdownTimeout,
     /// Provider components could not be validated and compiled.
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),

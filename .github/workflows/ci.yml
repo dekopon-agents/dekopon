@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|policy) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -86,8 +86,12 @@ jobs:
           do
             cargo check --locked --manifest-path "$manifest" --target wasm32-unknown-unknown
           done
-      - name: Check HTTP guest bindings for Wasm
-        run: cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
+      - name: Check guest host-interface bindings for Wasm
+        run: |
+          cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
+          cargo check --locked -p dekopon-provider-storage --no-default-features --target wasm32-unknown-unknown
+          cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown
+          cargo check --locked -p dekopon-provider-storage --no-default-features --features durable-files --target wasm32-unknown-unknown
       - name: Check observability smoke-test script
         run: shellcheck examples/otel-traces/smoke-test.sh
       - name: Build documentation
@@ -321,6 +325,9 @@ jobs:
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.chatgpt.enabled=true \
             --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth > "$RUNNER_TEMP/chatgpt.yaml"
+          helm template dekopon charts/dekopon \
+            --set providerStorage.enabled=true \
+            --set providerStorage.existingKeySecret=dekopon-storage-key > "$RUNNER_TEMP/provider-storage.yaml"
       - name: Validate rendered manifests against Kubernetes schemas
         run: |
           docker run --rm -i \
@@ -335,6 +342,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/chatgpt.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/provider-storage.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a

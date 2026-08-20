@@ -335,6 +335,16 @@ fn render_wasmtime(output: &mut String, stats: &BrokerHostStats) {
                 bytes(stats.http_response_bytes)
             ),
         ),
+        (
+            "Storage operations",
+            stats.storage_operations,
+            format!(
+                "{} invocations · {} syncs · {} quota denials",
+                number(stats.storage_invocations),
+                number(stats.storage_syncs),
+                number(stats.storage_quota_denials)
+            ),
+        ),
     ] {
         output.push_str(&metric_card(label, value, detail));
     }
@@ -350,8 +360,22 @@ fn render_wasmtime(output: &mut String, stats: &BrokerHostStats) {
         ("Invocations succeeded", stats.invocations_succeeded),
         ("Invocations failed", stats.invocations_failed),
         ("Invocations timed out", stats.invocations_timed_out),
-        ("Provider input bytes", stats.provider_input_bytes),
-        ("Provider output bytes", stats.provider_output_bytes),
+        (
+            "Provider input bytes (non-storage)",
+            stats.provider_input_bytes,
+        ),
+        (
+            "Provider output bytes (non-storage)",
+            stats.provider_output_bytes,
+        ),
+        (
+            "Storage read byte bucket max",
+            stats.storage_read_bucket_max,
+        ),
+        (
+            "Storage write byte bucket max",
+            stats.storage_write_bucket_max,
+        ),
         ("Memory growth requests", stats.memory_growth_requests),
         ("Memory growth denied", stats.memory_growth_denied),
         ("Memory growth failed", stats.memory_growth_failed),

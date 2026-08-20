@@ -24,6 +24,7 @@ dekopon-protocol.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 libc.workspace = true
 opentelemetry.workspace = true
 reqwest.workspace = true
@@ -40,6 +41,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 dekopon-brokerd.workspace = true
+dekopon-storage-host.workspace = true
 tempfile.workspace = true
 
 [lints]

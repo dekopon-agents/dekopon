@@ -90,12 +90,31 @@ Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or e
 
 Version 0.9.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds only the transport credentials it already needed, derives every activity target from authenticated envelopes, and treats every status failure as cosmetic.
 
+## Unreleased — broker-owned provider storage and durable on-demand chat memory
+
+- Independent `dekopon:storage@0.1.0` JSONL and durable-files interfaces, feature-gated guest
+  bindings, and a Wasmtime-independent secure native storage host.
+- Exact storage interface/access authority, opaque keyed namespaces, non-reusing authority-bound
+  generations, logical quotas, namespace leases, transactional commit/recovery, and bounded GC.
+- Optional generated JSONL `memory-chat` provider: hidden post-acceptance record, visible on-demand
+  recent/literal search, finite permanent dedup, and compaction hysteresis.
+- Invocation-bound chat attestation plus owner-authored `chatScopes` and Cedar scope context; legacy
+  operations reserve and omit all memory entry points.
+- Complete transport-acceptance receipts and exactly one no-retry record request after acceptance.
+- Separate retained broker-only provider-storage PVC and operator-managed key; optional memory
+  component path outside the default scan.
+- Pinned Turso 0.7.2 gate failed on forbidden JS/C/build paths and wasm compilation, so SQLite did
+  not ship. Durable-files remains engine-neutral and makes no WAL/SHM claim.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.
 2. ~~Add broker-owned credential resolution only after destination binding and redaction are independently tested.~~ Done: destination binding and redaction ship with independent engine-, broker-, and service-level tests.
 3. ~~Introduce Cedar only after authorization inputs and explainability requirements are proven by the broker prototype.~~ Done: the exact-match evaluator proved which inputs a decision needs, and Cedar replaced it. `dekopon-policy` generates a schema from the deployment's declared world, validates the policy set in strict mode at startup, denies on any evaluation error, and reports the determining policy identifiers plus a policy-set digest in every audit record. Execution constraints stayed outside the policy language as owner-authored constraint sets, so a policy edit can broaden who may act and can never widen how far an action reaches.
-4. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior. Broker-side identity is now current: canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped rules that keep attested and direct authority disjoint. The unprivileged agent daemon is now current too: `dekopond` connects to chat services, routes each authenticated message to a catalog agent, and submits attested proposals with no authority of its own ([`dekopond.md`](dekopond.md)). Conversation context is current too: a route set to `mode: persistent` keeps a bounded per-sender history in gateway memory, compacted to question-and-answer pairs, dropped on an idle timeout, an LRU ceiling, or a changed capability grant, with the contract in [`dekopond.md`](dekopond.md#conversations) and the trust surface it accepts in [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface). `oneShot` is the default, so a message on a route that did not ask for memory is still an independent session. Agent memory that outlives a conversation, a dedicated gateway UID — the deployment in which `via` scoping is real isolation rather than attribution — and the rest of this item remain future.
+4. Add identity, context, memory, observability, MCP interoperability, and multi-agent review only when each has tested user-facing behavior. Optional durable on-demand chat turns are now current; automatic replay, deletion/export UX, semantic/vector memory, shared namespaces, and task memory remain future. Broker-side identity is now current: canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped rules that keep attested and direct authority disjoint. The unprivileged agent daemon is now current too: `dekopond` connects to chat services, routes each authenticated message to a catalog agent, and submits attested proposals with no authority of its own ([`dekopond.md`](dekopond.md)). Conversation context is current too: a route set to `mode: persistent` keeps a bounded per-sender history in gateway memory, compacted to question-and-answer pairs, dropped on an idle timeout, an LRU ceiling, or a changed capability grant, with the contract in [`dekopond.md`](dekopond.md#conversations) and the trust surface it accepts in [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface). `oneShot` is the default, so a message on a route that did not ask for memory is still an independent session. Broader memory that automatically replays, shares across agents, stores tasks/facts, or provides
+deletion/export remains future. The current durable store is explicit per-conversation retrieval
+only. A dedicated gateway UID — the deployment in which `via` scoping is real isolation rather
+than attribution — also remains future.
 
 ## Follow-ups accepted during the gateway/identity/Cedar work
 

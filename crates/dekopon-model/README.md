@@ -17,4 +17,4 @@ them as `[image/png, 214 KB]`, because those are what reach the prompt transcrip
 The `dekopon` CLI owns account lifecycle through `dekopon auth`; execution clients such as
 `dekopon-run` consume the resulting credentials. Model credentials are never passed to Wasm
 provider components. [`docs/inference.md`](../../docs/inference.md) traces these types into literal
-ChatGPT wire JSON and distinguishes cache affinity, conversation history, and agent memory.
+ChatGPT wire JSON and distinguishes cache affinity, gateway conversation history, optional broker-provider durable chat-turn retrieval, and broader agent memory.

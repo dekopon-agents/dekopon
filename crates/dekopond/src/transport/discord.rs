@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
@@ -24,8 +25,8 @@ use crate::{
     config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        InboundMessage, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, floor_boundary,
+        DeliveryReceipt, InboundMessage, ReplyTarget, TransportError, TransportEvent,
+        TransportIdentity, bound_inbound, floor_boundary,
     },
 };
 
@@ -511,6 +512,7 @@ impl DiscordTransport {
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
+            transport_kind: ChatTransportKind::Discord,
             subject: ExternalSubject::discord(user_id).map_err(TransportError::Subject)?,
             channel: channel_id.to_owned(),
             thread: None,
@@ -635,7 +637,7 @@ impl ChatReplier for DiscordReplier {
         &self,
         target: ReplyTarget,
         text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Discord {
                 channel_id,
@@ -649,6 +651,8 @@ impl ChatReplier for DiscordReplier {
                 return Err(TransportError::Response);
             }
             let _guard = self.rest_lock.lock().await;
+            let mut accepted = 0_usize;
+            let mut last_id = None;
             for (index, chunk) in split_message(&text).into_iter().enumerate() {
                 let mut body = json!({
                     "content": chunk,
@@ -667,9 +671,18 @@ impl ChatReplier for DiscordReplier {
                         "fail_if_not_exists": false,
                     });
                 }
-                self.create_message(&channel_id, &body).await?;
+                match self.create_message(&channel_id, &body).await {
+                    Ok(id) => {
+                        accepted += 1;
+                        last_id = Some(id);
+                    }
+                    Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                    Err(error) => return Err(error),
+                }
             }
-            Ok(())
+            Ok(DeliveryReceipt::new(
+                last_id.ok_or(TransportError::Response)?,
+            ))
         })
     }
 }
@@ -754,7 +767,11 @@ impl ChatActivity for DiscordReplier {
 }
 
 impl DiscordReplier {
-    async fn create_message(&self, channel_id: &str, body: &Value) -> Result<(), TransportError> {
+    async fn create_message(
+        &self,
+        channel_id: &str,
+        body: &Value,
+    ) -> Result<String, TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
@@ -795,8 +812,15 @@ impl DiscordReplier {
                 retried = true;
                 continue;
             }
-            decode(response).await.map(|_| ())?;
-            return Ok(());
+            let response = decode(response).await?;
+            let response_id = response["id"].as_str().ok_or(TransportError::Response)?;
+            let response_channel = response["channel_id"]
+                .as_str()
+                .ok_or(TransportError::Response)?;
+            if !is_snowflake(response_id) || response_channel != channel_id {
+                return Err(TransportError::Response);
+            }
+            return Ok(response_id.to_owned());
         }
     }
 
@@ -957,7 +981,7 @@ fn pending_assets(
 
 fn split_message(text: &str) -> Vec<String> {
     if text.is_empty() {
-        return vec!["[empty response]".to_owned()];
+        return vec![String::new()];
     }
     let mut chunks = Vec::new();
     let mut start = 0;

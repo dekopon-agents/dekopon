@@ -125,12 +125,14 @@ fn reports_unknown_capabilities_without_entering_wasm() {
 }
 
 #[test]
-fn immediate_host_rejects_components_requiring_http() {
+fn immediate_host_rejects_components_requiring_privileged_imports() {
     for fixture in [
         "http-probe-provider.wasm",
         "jsonplaceholder-provider.wasm",
         "gh-provider.wasm",
         "skylight-private-provider.wasm",
+        "memory-chat-provider.wasm",
+        "storage-probe-provider.wasm",
     ] {
         let error =
             ProviderRegistry::load([imported_provider_path(fixture)], HostLimits::default())

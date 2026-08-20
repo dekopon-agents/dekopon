@@ -12,15 +12,15 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld, SubjectAttestation,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatScopeClaim, ChatSessionClaim,
+    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
+    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, SubjectAttestation,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TraceId,
+    RiskLevel, TraceId, TransportId,
 };
 use serde_json::json;
 
@@ -258,6 +258,7 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                         &peer,
                         Some(&AttestorGrant {
                             namespaces: vec!["slack.t0123abc".to_owned()],
+                            chat_scopes: Vec::new(),
                         }),
                         &attestation,
                         request,
@@ -289,6 +290,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
     .expect("gateway context binds");
     let grant = AttestorGrant {
         namespaces: vec!["slack.t0123abc".to_owned()],
+        chat_scopes: Vec::new(),
     };
 
     assert!(
@@ -296,6 +298,27 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
             .capabilities_for(&gateway, Some(&grant), &subject(), &agent("some-agent"))
             .is_some(),
         "the permitted agent may be driven"
+    );
+    let (capabilities, _words, memory) = broker
+        .capabilities_for_chat(
+            &gateway,
+            Some(&grant),
+            &ChatSessionClaim {
+                subject: subject(),
+                agent: agent("some-agent"),
+                scope: ChatScopeClaim {
+                    transport: "scientist-slack".parse::<TransportId>().expect("transport"),
+                    kind: ChatTransportKind::Slack,
+                    channel: "c0123abc".to_owned(),
+                    conversation: "c0123abc:1712345678.000100".to_owned(),
+                },
+            },
+        )
+        .expect("legacy subject-only attestor remains compatible with chat operations");
+    assert!(!capabilities.is_empty());
+    assert!(
+        memory.is_none(),
+        "subject-only attestation grants no storage scope"
     );
     assert!(
         broker

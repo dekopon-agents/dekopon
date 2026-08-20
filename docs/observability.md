@@ -276,6 +276,27 @@ acting agent, and a trace that named none of them would make two writes to two d
 organizations look identical — the same reason the terminal audit record carries it. A `Redacted`
 value renders its marker in either payload mode, so the value cannot arrive by another route.
 
+## Storage telemetry and audit privacy
+
+Storage-backed invocations deliberately do not follow the ordinary provider span shape. The
+`broker.execute` and `provider.invoke` storage spans omit provider, capability, agent, subject,
+transport scope, logical names, offsets, search terms, and exact bytes even when payload telemetry
+is enabled. Provider input/output byte totals receive zero for storage calls. The live UI may show
+only storage invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket,
+plus public ceilings; it never receives root/key paths or opaque tokens.
+
+Storage audit decisions and outcomes omit principal, actor/agent, via/subject, provider, broker
+principal/policy revision, policy IDs/digest, and credential. A separate keyed audit-scope
+commitment is never equal to a physical namespace token. Storage decision/output/evidence values use
+separate `hmac-sha256:` domains, preventing the ordinary unkeyed low-entropy dictionary oracle.
+Historical and current non-storage records retain their previous `sha256:` encoding and bytes.
+
+Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native
+filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded
+finalization step from starting after its deadline, while the base/generation leases and quota
+reservation remain held until an already-started blocking job drains. Duration is therefore
+observation rather than a hard native-operation deadline.
+
 ## Span payloads
 
 Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope
@@ -389,8 +410,8 @@ Telemetry includes operation names, model/provider/capability identifiers, bound
 - user and system prompts;
 - model response text and reasoning replay data;
 - model tool-call IDs and the script text a model authors, along with that script's output;
-- provider input and output;
-- inbound chat message text and the canonical subject identifiers of the people who sent it;
+- provider input and output (including every durable-memory query and turn);
+- inbound chat message text, durable memory content/query/scope, and canonical subject identifiers of the people who sent it;
 - activity channel/thread/message targets, native status text, reaction names, and raw service errors;
 - chat bot tokens and the environment variable values behind every configured credential;
 - command arguments, in every form and at every level;
