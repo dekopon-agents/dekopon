@@ -137,9 +137,10 @@ That last section is an **effective Cedar view**, not Cedar source. Raw policy, 
 digests, denied or merely declared capabilities, execution constraints, credential bindings,
 principal/subject/channel/transport identifiers, model endpoints and auth paths, broker paths, and
 all credential names and values are absent. The gateway never receives provider credentials or raw
-policy, and the typed view has no field for the chat/model credentials it does hold. The serialized
-result has a 128 KiB hard ceiling and can be materialized once per model session; an oversized or
-repeated request produces one fixed content-free diagnostic instead of another configuration copy.
+policy, and the typed view has no field for the chat/model credentials it does hold. Each serialized
+result has a 128 KiB hard ceiling. Calls are repeatable under the prompt loop's shared per-turn tool
+call and model-step bounds; there is no inspection-specific call limit. An oversized view produces
+one fixed content-free diagnostic instead of a partial configuration.
 
 Inspection happens only after the ordinary authorization gate, makes no broker invocation, spends
 no capability-call budget, grants nothing, and creates no durable broker audit record. It does make
