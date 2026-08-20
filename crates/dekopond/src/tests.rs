@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits};
+use dekopon_agent::prompt::{
+    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits,
+};
 use dekopon_broker_protocol::{
     AvailableCapability, BrokerRequest, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame,
     write_frame,
@@ -18,7 +20,8 @@ use dekopon_broker_protocol::{
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
 use dekopon_model::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelMessage, ModelTool,
+    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+    ModelTool, ModelToolCall,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -496,6 +499,8 @@ async fn routes_bind_to_a_catalog_agent_and_a_class_matched_model() {
         .route("dev", &ConversationKind::DirectMessage)
         .expect("the direct-message route matches");
     assert_eq!(route.agent.as_str(), "reviewer");
+    assert_eq!(route.description, "Reviews things");
+    assert_eq!(route.model_class.as_deref(), Some("reasoning"));
     assert_eq!(route.model.name(), "local-qwen");
     // Standing orders travel from the catalog into the session as the system prompt.
     assert_eq!(
@@ -791,6 +796,8 @@ struct ModelScript {
     /// Recorded rather than counted because a conversation is an assertion about *what* a later
     /// session replayed and in which order, which a request count cannot express.
     prompts: Mutex<Vec<Vec<ModelMessage>>>,
+    /// The model tools offered on each request, in order.
+    tools: Mutex<Vec<Vec<ModelTool>>>,
     /// The prompt cache key each request declared, in the same order.
     ///
     /// Recorded from the options the loop actually passed rather than from a serialized body:
@@ -811,6 +818,7 @@ impl ModelScript {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
             prompts: Mutex::new(Vec::new()),
+            tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: false,
@@ -823,6 +831,7 @@ impl ModelScript {
         Arc::new(Self {
             turns: Mutex::new(VecDeque::new()),
             prompts: Mutex::new(Vec::new()),
+            tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             forbidden: true,
@@ -831,6 +840,17 @@ impl ModelScript {
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    fn tool_names(&self, index: usize) -> Vec<String> {
+        self.tools
+            .lock()
+            .expect("recorded tools")
+            .get(index)
+            .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1))
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
     }
 
     /// The cache key one request declared, failing the test when it declared none.
@@ -889,7 +909,7 @@ impl ChatModel for ScriptedModel {
     fn complete_with(
         &self,
         messages: &[ModelMessage],
-        _tools: &[ModelTool],
+        tools: &[ModelTool],
         options: &CompletionOptions,
     ) -> Result<AssistantTurn, ModelError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
@@ -898,6 +918,11 @@ impl ChatModel for ScriptedModel {
             .lock()
             .expect("recorded prompts")
             .push(messages.to_vec());
+        self.0
+            .tools
+            .lock()
+            .expect("recorded tools")
+            .push(tools.to_vec());
         self.0
             .cache_keys
             .lock()
@@ -918,6 +943,22 @@ fn answer(text: &str) -> AssistantTurn {
     AssistantTurn {
         content: Some(text.to_owned()),
         tool_calls: Vec::new(),
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+fn inspect_agent_config() -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "config-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: AGENT_CONFIG_TOOL_NAME.to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        }],
         usage: None,
         replay_items: Vec::new(),
     }
@@ -1006,6 +1047,8 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         transport: "dev".to_owned(),
         r#match: RouteMatch::DirectMessage {},
         agent: "reviewer".parse().expect("valid agent fixture"),
+        description: "Reviews things".to_owned(),
+        model_class: Some("reasoning".to_owned()),
         instructions: Some("Answer briefly.".to_owned()),
         model: Arc::new(model),
         limits: PromptLimits {
@@ -1205,6 +1248,87 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     };
     assert_eq!(subject.canonical(), SUBJECT);
     assert_eq!(agent.as_str(), "reviewer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([
+        inspect_agent_config(),
+        answer("I have prepared the configuration table."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("what is this agent's configuration?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(
+        replier.replies(),
+        vec!["I have prepared the configuration table.".to_owned()]
+    );
+    assert_eq!(models.requests(), 2);
+    assert_eq!(
+        models.tool_names(0),
+        vec!["bash".to_owned(), AGENT_CONFIG_TOOL_NAME.to_owned()]
+    );
+
+    let result = models
+        .prompt(1)
+        .into_iter()
+        .find_map(|(role, content)| (role == "tool").then_some(content))
+        .expect("second request carries the meta result");
+    let encoded = result;
+    let result: Value = serde_json::from_str(&encoded).expect("meta result is JSON");
+    assert_eq!(result["agent"]["id"], "reviewer");
+    assert_eq!(result["agent"]["description"], "Reviews things");
+    assert_eq!(result["agent"]["modelClass"], "reasoning");
+    assert_eq!(result["prompt"]["instructions"], "Answer briefly.");
+    assert_eq!(result["session"]["maxSteps"], 4);
+    assert_eq!(result["session"]["maxCapabilityCalls"], 8);
+    assert_eq!(result["session"]["conversation"]["mode"], "oneShot");
+    assert_eq!(result["effectiveAuthorization"]["engine"], "Cedar");
+    assert_eq!(
+        result["effectiveAuthorization"]["capabilities"][0]["id"],
+        "echo.echo"
+    );
+    assert_eq!(
+        result["effectiveAuthorization"]["capabilities"][0]["effect"],
+        "read-only"
+    );
+    assert_eq!(result["security"]["credentialsIncluded"], false);
+    assert_eq!(result["security"]["rawCedarIncluded"], false);
+    assert_eq!(result["security"]["identityIncluded"], false);
+    assert!(result.get("principal").is_none());
+    assert!(result.get("subject").is_none());
+    // These values exist on the live route/session objects handed to the constructor's caller.
+    // None is an allowed input to the credential-free view itself.
+    assert!(!encoded.contains("http://127.0.0.1:1/v1"));
+    assert!(!encoded.contains("qwen3"));
+    assert!(!encoded.contains(SUBJECT));
+    assert!(!encoded.contains(&directory.path().display().to_string()));
+
+    let request = observed.recv().await.expect("one capability listing");
+    assert!(matches!(
+        request.request,
+        BrokerRequest::CapabilitiesFor { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "meta inspection makes no broker call"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

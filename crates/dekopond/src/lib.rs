@@ -1,8 +1,8 @@
 //! The unprivileged Dekopon chat gateway and agent daemon.
 //!
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
-//! message to a named agent from the catalog, runs one bounded model session whose only tool is the
-//! sandboxed shell, and replies with the answer.
+//! message to a named agent from the catalog, runs one bounded model session with the sandboxed
+//! shell and safe on-demand meta tools, and replies with the answer.
 //!
 //! # Authority
 //!

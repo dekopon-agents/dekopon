@@ -1,9 +1,9 @@
 //! The model tool loop, exposing one sandboxed scripting tool rather than one tool per capability.
 //!
-//! `dekopon-shell` is the interpreter; this module is the model-facing half. A session offers
-//! exactly one tool, [`SCRIPT_TOOL_NAME`], whose single argument is a script. Everything a model
-//! wants to do — inspect what it can reach, loop, branch, parse JSON, call capabilities — happens
-//! inside that script instead of across many small tool calls.
+//! `dekopon-shell` is the interpreter; this module is the model-facing half. Every session offers
+//! [`SCRIPT_TOOL_NAME`], whose single argument is a script. An embedding gateway may additionally
+//! offer credential-free agent configuration and chat-asset tools. Provider work still happens
+//! only inside the script instead of across many small capability-shaped model tools.
 
 use std::{fmt, time::Instant};
 
@@ -15,7 +15,7 @@ use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::milliseconds;
+use crate::{meta::AgentConfigView, milliseconds};
 
 mod history;
 
@@ -27,6 +27,9 @@ pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, Histor
 /// tool called `bash`, and almost all of them transfer: pipelines, `&&`, `$( )`, exit codes. The
 /// description below spends its length on the places where those priors are wrong.
 pub const SCRIPT_TOOL_NAME: &str = "bash";
+
+/// The tool a model calls to inspect this session's credential-free agent configuration.
+pub const AGENT_CONFIG_TOOL_NAME: &str = "inspect_agent_config";
 
 /// The tool a model calls to look at something a person attached to their message.
 pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
@@ -42,7 +45,7 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 /// What is left is a well-formedness bound. A scripting tool expresses a multi-step plan *inside*
 /// one script, so a correct turn calls it once; a handful of calls is tolerated for models that
 /// split work across parallel calls, and anything beyond that is a runaway rather than a plan.
-const MAX_SCRIPT_CALLS_PER_TURN: usize = 4;
+const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 
 /// Script execution boundary consumed by the prompt loop.
 ///
@@ -263,6 +266,7 @@ pub struct SessionInputs<'a> {
     options: Option<&'a CompletionOptions>,
     assets: Option<&'a dyn AssetSource>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
+    agent_config: Option<&'a AgentConfigView>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -276,6 +280,7 @@ impl<'a> SessionInputs<'a> {
             options: None,
             assets: None,
             usage_observer: None,
+            agent_config: None,
         }
     }
 
@@ -306,6 +311,22 @@ impl<'a> SessionInputs<'a> {
         self.usage_observer = Some(observer);
         self
     }
+
+    /// Adds the credential-free, subject-specific agent configuration meta tool.
+    #[must_use]
+    pub const fn with_agent_config(mut self, config: &'a AgentConfigView) -> Self {
+        self.agent_config = Some(config);
+        self
+    }
+}
+
+/// Optional, request-scoped surfaces handed to the inner model loop.
+#[derive(Clone, Copy)]
+struct SessionExtensions<'a> {
+    options: &'a CompletionOptions,
+    assets: Option<&'a dyn AssetSource>,
+    usage_observer: Option<&'a dyn ModelUsageObserver>,
+    agent_config: Option<&'a AgentConfigView>,
 }
 
 /// Runs one bounded prompt/tool session from a [`SessionInputs`].
@@ -329,6 +350,7 @@ where
         options,
         assets,
         usage_observer,
+        agent_config,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -352,9 +374,12 @@ where
         runtime,
         messages,
         limits,
-        options,
-        assets,
-        usage_observer,
+        SessionExtensions {
+            options,
+            assets,
+            usage_observer,
+            agent_config,
+        },
     );
     history.record(match &result {
         Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
@@ -372,18 +397,25 @@ fn run_session<M, R>(
     runtime: &R,
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
-    options: &CompletionOptions,
-    assets: Option<&dyn AssetSource>,
-    usage_observer: Option<&dyn ModelUsageObserver>,
+    extensions: SessionExtensions<'_>,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
+    let SessionExtensions {
+        options,
+        assets,
+        usage_observer,
+        agent_config,
+    } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
     let assets = assets.filter(|source| !source.is_empty());
     let mut model_tools = vec![script_tool(&runtime.command_words())];
+    if agent_config.is_some() {
+        model_tools.push(agent_config_tool());
+    }
     if assets.is_some() {
         model_tools.push(asset_tool());
     }
@@ -396,6 +428,7 @@ where
     let _session = session_span.enter();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
+    let mut agent_config_inspected = false;
 
     for model_turns in 1..=limits.max_steps {
         // Usage fields are declared empty and recorded once the provider answers: token counts
@@ -501,7 +534,7 @@ where
                 capability_invocations,
             });
         }
-        if turn.tool_calls.len() > MAX_SCRIPT_CALLS_PER_TURN {
+        if turn.tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
             tracing::error!(
                 target: "dekopon_agent::audit",
                 {
@@ -514,7 +547,7 @@ where
             );
             return Err(PromptError::TooManyToolCalls {
                 actual: turn.tool_calls.len(),
-                maximum: MAX_SCRIPT_CALLS_PER_TURN,
+                maximum: MAX_TOOL_CALLS_PER_TURN,
             });
         }
 
@@ -523,6 +556,26 @@ where
             if call.id.trim().is_empty() {
                 reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
                 return Err(PromptError::EmptyToolCallId);
+            }
+            if call.function.name == AGENT_CONFIG_TOOL_NAME
+                && let Some(config) = agent_config
+            {
+                if agent_config_inspected {
+                    messages.push(ModelMessage::tool(
+                        call.id.clone(),
+                        r#"{"error":"agent configuration was already inspected in this session"}"#,
+                    ));
+                    continue;
+                }
+                inspect_agent_config_into(
+                    &mut messages,
+                    config,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                )?;
+                agent_config_inspected = true;
+                continue;
             }
             if call.function.name == ASSET_TOOL_NAME
                 && let Some(source) = assets
@@ -649,7 +702,7 @@ fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'stati
     );
 }
 
-/// Builds the one tool a prompt session offers.
+/// Builds the scripting tool every prompt session offers.
 ///
 /// `command_words` are the words loaded providers contribute on top of the fixed builtins. They are
 /// appended rather than interpolated into the prose so the description stays one constant plus a
@@ -677,6 +730,76 @@ fn script_tool(command_words: &[String]) -> ModelTool {
             "additionalProperties": false
         }),
     }
+}
+
+fn agent_config_tool() -> ModelTool {
+    ModelTool {
+        name: AGENT_CONFIG_TOOL_NAME.to_owned(),
+        description: "Inspect this session's credential-free agent configuration. Call this when \
+                      asked about the agent's prompt, configuration, Cedar policy, permissions, \
+                      tools, limits, or memory. The result contains the exact standing \
+                      instructions, route/session bounds, and only the capabilities Cedar \
+                      currently grants this sender through this agent. The snapshot can be \
+                      materialized once in this session. Present it as concise Markdown tables \
+                      unless raw JSON was requested. Raw Cedar source, policy \
+                      identifiers, principals, subjects, endpoints, paths, credential names, and \
+                      all credential values are intentionally omitted."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Answers one `inspect_agent_config` call without touching the capability budget or broker.
+fn inspect_agent_config_into(
+    messages: &mut Vec<ModelMessage>,
+    config: &AgentConfigView,
+    call: &ModelToolCall,
+    model_turn: u32,
+    tool_call_index: usize,
+) -> Result<(), PromptError> {
+    if let Err(error) = agent_config_argument(&call.function.name, &call.function.arguments) {
+        reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+        return Err(error);
+    }
+    let result = config.tool_result();
+    tracing::info!(
+        target: "dekopon_agent::audit",
+        {
+            audit.event = "agent.config.inspected",
+            model.turn = model_turn,
+            tool_call.index = tool_call_index,
+            config.bytes = result.len(),
+        },
+        "agent configuration inspected"
+    );
+    messages.push(ModelMessage::tool(call.id.clone(), result));
+    Ok(())
+}
+
+/// Requires the meta tool's argument object to be exactly empty.
+fn agent_config_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    if !arguments.is_empty() {
+        return Err(PromptError::AgentConfigArgumentsNotEmpty {
+            tool: tool.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Media types whose bytes are readable as a tool result rather than as an attachment.
@@ -907,9 +1030,9 @@ pub enum PromptError {
     #[error(transparent)]
     Model(#[from] ModelError),
     /// The model selected a tool that was not offered.
-    #[error("model requested unknown tool {0:?}; this session offers only {SCRIPT_TOOL_NAME:?}")]
+    #[error("model requested unknown or unavailable tool {0:?}")]
     UnknownTool(String),
-    /// A model requested more scripts in one turn than a plan ever needs.
+    /// A model requested more tool calls in one turn than a plan ever needs.
     #[error("model returned {actual} tool calls in one turn; the maximum is {maximum}")]
     TooManyToolCalls {
         /// Model-requested call count.
@@ -932,6 +1055,12 @@ pub enum PromptError {
     /// Tool arguments were valid JSON but not an object.
     #[error("model arguments for tool {tool:?} must be a JSON object")]
     ArgumentsNotObject {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// The agent-configuration tool received fields despite having no arguments.
+    #[error("model arguments for tool {tool:?} must be an empty object")]
+    AgentConfigArgumentsNotEmpty {
         /// Prompt-visible tool name.
         tool: String,
     },
@@ -973,6 +1102,7 @@ impl PromptError {
             Self::EmptyToolCallId => "empty-tool-call-id",
             Self::InvalidArguments { .. } => "invalid-json-arguments",
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
+            Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
             Self::MissingScript { .. } => "missing-script",
             Self::MissingAssetId { .. } => "missing-asset-id",
             Self::EmptyAnswer => "empty-answer",
@@ -1028,11 +1158,16 @@ mod tests {
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
 
+    use crate::meta::{
+        AgentConfigView, ConversationConfigView, EffectiveCapabilityView, SessionConfigView,
+    };
+
     use super::{
-        ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits,
-        ModelUsageObserver, PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime,
-        SessionInputs, format_script_outcome, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        AGENT_CONFIG_TOOL_NAME, ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History,
+        HistoryLimits, ModelUsageObserver, PromptError, PromptLimits, SCRIPT_TOOL_NAME,
+        ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
+        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
+        script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1177,6 +1312,44 @@ mod tests {
         PromptLimits {
             max_steps,
             max_capability_calls,
+        }
+    }
+
+    fn agent_config() -> AgentConfigView {
+        AgentConfigView::new(
+            "reviewer".to_owned(),
+            "Reviews pull requests".to_owned(),
+            Some("reasoning".to_owned()),
+            Some("Be concise and skeptical.".to_owned()),
+            SessionConfigView {
+                max_steps: 8,
+                max_capability_calls: 16,
+                conversation: ConversationConfigView::OneShot,
+            },
+            vec![EffectiveCapabilityView {
+                id: "gh.pull-request.read".to_owned(),
+                provider: "gh".to_owned(),
+                description: "Reads one pull request".to_owned(),
+                effect: "read-only".to_owned(),
+                risk: "Low".to_owned(),
+                idempotency: "idempotent".to_owned(),
+            }],
+        )
+    }
+
+    fn agent_config_call(arguments: Value) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                id: "config-call".to_owned(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: AGENT_CONFIG_TOOL_NAME.to_owned(),
+                    arguments: arguments.to_string(),
+                },
+            }],
+            usage: None,
+            replay_items: Vec::new(),
         }
     }
 
@@ -1789,6 +1962,122 @@ mod tests {
         // ...and it must not invent a discovery command the interpreter does not implement. There
         // is no `help` builtin, so advertising one would spend a tool call on "command not found".
         assert!(tool.description.contains("There is no `help`"));
+    }
+
+    #[test]
+    fn agent_config_tool_promises_a_credential_free_effective_view() {
+        let tool = agent_config_tool();
+
+        assert_eq!(tool.name, AGENT_CONFIG_TOOL_NAME);
+        assert_eq!(tool.parameters["properties"], json!({}));
+        assert_eq!(tool.parameters["required"], json!([]));
+        assert_eq!(tool.parameters["additionalProperties"], false);
+        assert!(tool.description.contains("Markdown tables"));
+        assert!(tool.description.contains("currently grants this sender"));
+        assert!(
+            tool.description
+                .contains("credential values are intentionally omitted")
+        );
+    }
+
+    #[test]
+    fn agent_config_tool_returns_the_prompt_and_effective_grants_without_spending_authority() {
+        let model = ScriptedModel::new([
+            agent_config_call(json!({})),
+            answer("Here is the configuration table."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let config = agent_config();
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("what is your configuration?", limits(4, 32))
+                .with_agent_config(&config),
+            &mut history,
+        )
+        .expect("meta inspection succeeds");
+
+        assert_eq!(outcome.answer, "Here is the configuration table.");
+        assert_eq!(outcome.script_calls, 0);
+        assert_eq!(outcome.capability_invocations, 0);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+
+        let observed = model.observed_tools.lock().expect("tool observations lock");
+        assert_eq!(observed[0].len(), 2);
+        assert_eq!(observed[0][0].name, SCRIPT_TOOL_NAME);
+        assert_eq!(observed[0][1].name, AGENT_CONFIG_TOOL_NAME);
+        drop(observed);
+
+        let messages = model.tool_messages();
+        assert_eq!(messages.len(), 1);
+        let value: Value = serde_json::from_str(&messages[0]).expect("meta result is JSON");
+        assert_eq!(value["agent"]["id"], "reviewer");
+        assert_eq!(value["prompt"]["instructions"], "Be concise and skeptical.");
+        assert_eq!(
+            value["effectiveAuthorization"]["capabilities"][0]["id"],
+            "gh.pull-request.read"
+        );
+        assert_eq!(value["security"]["credentialsIncluded"], false);
+    }
+
+    #[test]
+    fn agent_config_can_be_materialized_only_once_per_session() {
+        let model = ScriptedModel::new([
+            agent_config_call(json!({})),
+            agent_config_call(json!({})),
+            answer("done"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let config = agent_config();
+        let mut history = History::default();
+
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("inspect twice", limits(4, 32)).with_agent_config(&config),
+            &mut history,
+        )
+        .expect("repeat is a bounded tool result, not a broken session");
+
+        let messages = model.tool_messages();
+        assert_eq!(
+            messages.len(),
+            3,
+            "later requests replay earlier tool results"
+        );
+        let repeated: Value = serde_json::from_str(messages.last().expect("repeat result"))
+            .expect("repeat diagnostic is JSON");
+        assert_eq!(
+            repeated["error"],
+            "agent configuration was already inspected in this session"
+        );
+        assert!(repeated.get("agent").is_none());
+    }
+
+    #[test]
+    fn agent_config_tool_rejects_model_supplied_fields() {
+        let model = ScriptedModel::new([agent_config_call(json!({
+            "credential": "please"
+        }))]);
+        let runtime = RecordingRuntime::new(0);
+        let config = agent_config();
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("inspect", limits(1, 32)).with_agent_config(&config),
+            &mut history,
+        )
+        .expect_err("meta tool has no arguments");
+
+        assert!(matches!(
+            error,
+            PromptError::AgentConfigArgumentsNotEmpty { .. }
+        ));
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
     }
 
     #[test]

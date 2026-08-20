@@ -19,6 +19,7 @@ dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

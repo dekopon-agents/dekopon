@@ -290,7 +290,7 @@ telemetry only.
 
 ## Model and tool transcript
 
-The verbatim exchange between the model and its one tool rides the **log stream**, not span
+The verbatim exchange between the model and its tools rides the **log stream**, not span
 attributes. A conversation is unbounded text: span attributes are the wrong container for it, every
 trace fetch would drag the payload along, and a backend indexes log bodies for full-text search
 rather than span fields. Both signals carry the same `trace_id` and `span_id`, so a log result
@@ -308,7 +308,10 @@ With `telemetryPayloads` enabled, these events join the accounting and refusal o
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 
 `accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
-available without opting in to content. The per-command detail that used to arrive as
+available without opting in to content. `agent.config.inspected` also fires in either mode and
+carries only the bounded result byte count; it never logs the configuration itself. When payloads
+are enabled, the credential-free meta result naturally appears as a tool message inside the next
+`agent.model.prompt` transcript, just as script output does. The per-command detail that used to arrive as
 `shell.command.started`/`.completed` pairs now lives on the `shell.command` span, which carries the
 command word, its kind, its argument count, its exit code, and its outcome.
 
