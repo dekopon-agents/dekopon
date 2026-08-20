@@ -26,7 +26,7 @@ use dekopon_broker_protocol::{
     BrokerClient, ChatScopeClaim, ChatSessionClaim, ClientError, DeliveredTurnRequest,
     DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
     ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
-    ModelUsageReport,
+    InvocationResult, ModelUsageReport,
 };
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
@@ -940,23 +940,9 @@ async fn record_delivered_turn(
             )
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
-        match result.outcome {
-            InvocationOutcome::Succeeded => Ok(()),
-            InvocationOutcome::Denied => Err(MemoryRecordFailure::Outcome("denied")),
-            InvocationOutcome::Failed => Err(MemoryRecordFailure::Outcome(
-                match result.error.as_deref() {
-                    Some("dedup-capacity") => "dedup-capacity",
-                    Some("dedup-conflict") => "dedup-conflict",
-                    Some("memory-corrupt") => "memory-corrupt",
-                    Some("result-too-large") => "result-too-large",
-                    Some("storage-quota") => "storage-quota",
-                    Some("storage-busy") => "storage-busy",
-                    Some("storage-timeout") => "storage-timeout",
-                    Some("storage-corrupt") => "storage-corrupt",
-                    _ => "storage",
-                },
-            )),
-        }
+        memory_record_outcome_category(&result).map_or(Ok(()), |category| {
+            Err(MemoryRecordFailure::Outcome(category))
+        })
     }
     .await;
     if let Err(error) = result {
@@ -1005,6 +991,27 @@ fn delivery_identity(
                 sequence,
             })
         }
+    }
+}
+
+pub(crate) fn memory_record_outcome_category(result: &InvocationResult) -> Option<&'static str> {
+    match result.outcome {
+        InvocationOutcome::Succeeded => None,
+        InvocationOutcome::Denied => Some("denied"),
+        InvocationOutcome::Failed => Some(match result.error.as_deref() {
+            Some("dedup-capacity") => "dedup-capacity",
+            Some("dedup-conflict") => "dedup-conflict",
+            Some("memory-corrupt") => "memory-corrupt",
+            Some("result-too-large") => "result-too-large",
+            Some("storage-quota") => "storage-quota",
+            Some("storage-busy") => "storage-busy",
+            Some("storage-timeout") => "storage-timeout",
+            Some("storage-corrupt") => "storage-corrupt",
+            Some("storage-io") => "storage-io",
+            // Never copy a future provider/public error into telemetry. The broker result is
+            // bounded, but an allowlist keeps this category stable and content-free by proof.
+            _ => "failed",
+        }),
     }
 }
 

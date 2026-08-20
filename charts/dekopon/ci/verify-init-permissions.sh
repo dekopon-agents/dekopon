@@ -361,5 +361,41 @@ if helm template overlap-source "$chart_dir" \
 fi
 echo "PASS provider storage paths cannot shadow projected init sources"
 
+if helm template normalized-collision "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set-string 'paths.configDir=/etc//dekopon-storage-key' >/dev/null 2>&1; then
+  echo "FAIL a non-canonical chart path bypassed provider-storage mount collision checks" >&2
+  exit 1
+fi
+echo "PASS all chart paths reject repeated-slash aliases before collision comparison"
+
+if helm template packaged-provider-collision "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.rootPath=/opt/dekopon/optional-providers >/dev/null 2>&1; then
+  echo "FAIL provider storage shadowed the packaged optional memory provider" >&2
+  exit 1
+fi
+echo "PASS provider storage cannot shadow image-owned provider directories"
+
+if helm template dot-key "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.keyFileName=.. >/dev/null 2>&1; then
+  echo "FAIL provider namespace-key destination accepted a parent segment" >&2
+  exit 1
+fi
+echo "PASS provider storage key names reject dot segments"
+
+if helm template unsafe-storage-path "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set-string 'providerStorage.rootPath=/var/lib/bad;touch-bad' >/dev/null 2>&1; then
+  echo "FAIL provider storage root accepted shell-active path text" >&2
+  exit 1
+fi
+echo "PASS provider storage paths are safe shell and mount segments"
+
 echo
 echo "OK: every tier satisfied; ChatGPT is seed-once; provider storage/key are retained, separate, and broker-only."

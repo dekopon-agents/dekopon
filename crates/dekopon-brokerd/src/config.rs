@@ -29,9 +29,6 @@ pub const HARD_MAX_POLICY_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_CONNECTIONS: usize = 1_024;
 pub const HARD_MAX_PROVIDERS: usize = 64;
 pub const MINIMUM_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
-/// Curated record-operation fields beyond the complete canonical turn line.
-const MEMORY_RECORD_INPUT_OVERHEAD_BYTES: usize = 4 * 1024;
-const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: usize = 1_024;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 
@@ -528,18 +525,16 @@ fn resolve(
     let storage = config
         .storage
         .map(|mut storage| {
-            storage.root_path = resolve_future_path(resolve_path(storage.root_path))?;
-            let key = resolve_path(storage.namespace_key_path);
-            let key_parent = key.parent().ok_or(ConfigError::MissingParent)?;
-            let key_name = key.file_name().ok_or(ConfigError::MissingParent)?;
-            // Canonicalize only the parent. Canonicalizing the complete key path would follow a
-            // final symlink before `StorageKey::load` can enforce `O_NOFOLLOW` on that leaf.
-            storage.namespace_key_path = std::fs::canonicalize(key_parent)
-                .map_err(|source| ConfigError::ResolvePath {
-                    path: key_parent.to_path_buf(),
-                    source,
-                })?
-                .join(key_name);
+            // Storage paths preserve their configured spelling until every original ancestor has
+            // been walked through retained `openat(...NOFOLLOW...)` descriptors. Canonicalizing a
+            // parent here would erase precisely the symlink the storage boundary must reject.
+            storage.root_path =
+                dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
+                    .map_err(|_| ConfigError::InvalidStorage)?;
+            storage.namespace_key_path = dekopon_storage_host::resolve_namespace_key_path(
+                &resolve_path(storage.namespace_key_path),
+            )
+            .map_err(|_| ConfigError::InvalidStorage)?;
             if storage.namespace_key_path.starts_with(&storage.root_path)
                 || storage.namespace_key_path == storage.root_path
             {
@@ -610,6 +605,19 @@ fn resolve(
             return Err(ConfigError::StorageStateCollision);
         }
     }
+    if let Some(storage) = &storage
+        && (reserved
+            .iter()
+            .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path))
+            || providers
+                .iter()
+                .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path)))
+    {
+        // Initialization owns every entry under the root and rejects unknown ones. Refuse this at
+        // config resolution rather than letting a future socket or audit file poison the storage
+        // layout after the first successful start.
+        return Err(ConfigError::StorageStateCollision);
+    }
     if reserved.iter().collect::<BTreeSet<_>>().len() != reserved.len()
         || providers
             .iter()
@@ -671,20 +679,14 @@ fn resolve(
         });
     }
     if let Some(memory) = &chat_memory {
-        let turn =
-            usize::try_from(memory.max_turn_bytes).map_err(|_| ConfigError::InvalidChatMemory)?;
+        memory
+            .validate_host_limits(&host_limits)
+            .map_err(|_| ConfigError::InvalidChatMemory)?;
         let result =
             usize::try_from(memory.max_result_bytes).map_err(|_| ConfigError::InvalidChatMemory)?;
-        if turn
-            .checked_add(MEMORY_RECORD_INPUT_OVERHEAD_BYTES)
-            .is_none_or(|bytes| bytes > host_limits.max_input_bytes)
-            || result
-                .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
-                .is_none_or(|bytes| bytes > host_limits.max_output_bytes)
-            || result
-                .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
-                .is_none_or(|bytes| bytes > frame_limits.max_frame_bytes)
-            || memory.max_turn_bytes > host_limits.max_memory_bytes as u64
+        if result
+            .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
+            .is_none_or(|bytes| bytes > frame_limits.max_frame_bytes)
         {
             return Err(ConfigError::InvalidChatMemory);
         }
@@ -836,7 +838,7 @@ pub enum ConfigError {
     ChatMemoryWithoutStorage,
     #[error("chat-memory bounds do not compose with frame, Wasm, host, and storage limits")]
     InvalidChatMemory,
-    #[error("provider storage root/key and audit state must be distinct")]
+    #[error("provider storage root/key and broker-owned files must be disjoint")]
     StorageStateCollision,
     #[error("response frame maximum must be at least {minimum} bytes for configured host output")]
     SmallResponseFrame { minimum: usize },

@@ -12,6 +12,10 @@
 - [`skylight-private-provider.wasm`](skylight-private-provider.wasm) is its generated component. The immediate host rejects its HTTP import, and broker-host integration exercises only a pre-network grant denial—no test contacts Skylight.
 - [`memory-chat/`](memory-chat/) is the generated optional JSONL-only durable chat-memory provider.
   It exposes recent/search to an authorized model and never resolves hidden record.
+- [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free malicious fixture that
+  occupies both the reserved provider ID and capability prefix. It is test-only and never packaged.
+- [`provider-v0-1-compat/`](provider-v0-1-compat/) is an import-free component generated against
+  the immutable two-export `dekopon:provider@0.1.0` world for real host compatibility coverage.
 - [`storage-probe/`](storage-probe/) is the durable-files conformance fixture. Its generated artifact
   is deliberately not packaged in any scanned image directory.
 

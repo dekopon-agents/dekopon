@@ -1,6 +1,6 @@
 use dekopon_provider_sdk::{
-    CapabilityId, EffectKind, Idempotency, Provider, ProviderApiVersion, ProviderCapability,
-    ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandInvocation, EffectKind, Idempotency, Provider, ProviderApiVersion,
+    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
 };
 use dekopon_provider_storage::durable_files::{
     self as storage, Durability, LockLevel, OpenOptions, StorageError,
@@ -24,25 +24,61 @@ impl Provider for StorageProbe {
             api_version: ProviderApiVersion::V1Alpha1,
             id: "storage-probe".parse().expect("static provider"),
             description: "Exercises every durable-files contract family".to_owned(),
-            command_words: Vec::new(),
+            command_words: vec!["storageprobe".to_owned()],
             capabilities: vec![ProviderCapability {
                 id: "storage-probe.run".parse().expect("static capability"),
                 description: "Runs the durable-file conformance sequence".to_owned(),
                 effect: EffectKind::LocalWrite,
                 risk: RiskLevel::Medium,
                 idempotency: Idempotency::Conditional,
-                input_schema: json!({"type":"object","additionalProperties":false}),
+                input_schema: json!({
+                    "type":"object",
+                    "properties": {
+                        "mode": {
+                            "type":"string",
+                            "enum":[
+                                "success", "read-only-denial", "wrong-interface-denial",
+                                "quota-denial", "budget-denial", "drop-after-denial"
+                            ]
+                        }
+                    },
+                    "additionalProperties":false
+                }),
             }],
         }
     }
 
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError> {
-        if capability.as_str() != "storage-probe.run"
-            || input.as_object().is_none_or(|value| !value.is_empty())
-        {
+        if capability.as_str() != "storage-probe.run" {
             return Err(failure("invalid-input"));
         }
-        run()
+        let object = input.as_object().ok_or_else(|| failure("invalid-input"))?;
+        if object.len() > 1 || object.keys().any(|key| key != "mode") {
+            return Err(failure("invalid-input"));
+        }
+        match object
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("success")
+        {
+            "success" => run(),
+            "read-only-denial" => catch_read_only_denial(),
+            "wrong-interface-denial" => catch_wrong_interface_denial(),
+            "quota-denial" => catch_quota_denial(),
+            "budget-denial" => catch_budget_denial(),
+            "drop-after-denial" => drop_after_denial(),
+            _ => Err(failure("invalid-input")),
+        }
+    }
+
+    fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
+        if !argv.is_empty() {
+            return Err(failure("invalid-command"));
+        }
+        Ok(CommandInvocation {
+            capability: "storage-probe.run".parse().expect("static capability"),
+            input: json!({}),
+        })
     }
 }
 
@@ -166,6 +202,55 @@ fn run() -> Result<Value, ProviderError> {
     }))
 }
 
+fn catch_read_only_denial() -> Result<Value, ProviderError> {
+    expect(
+        storage::open("denied.db", OpenOptions::new().write(true).create_new(true)),
+        StorageError::PermissionDenied,
+    )?;
+    Ok(json!({"caught": "read-only"}))
+}
+
+fn catch_wrong_interface_denial() -> Result<Value, ProviderError> {
+    expect(
+        storage::stat("wrong-interface.db"),
+        StorageError::PermissionDenied,
+    )?;
+    Ok(json!({"caught": "wrong-interface"}))
+}
+
+fn catch_quota_denial() -> Result<Value, ProviderError> {
+    // One byte above the storage host's default entropy-per-call ceiling.
+    expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
+    Ok(json!({"caught": "quota"}))
+}
+
+fn catch_budget_denial() -> Result<Value, ProviderError> {
+    // The integration host gives this mode a one-call budget. Not-found remains non-terminal;
+    // the second call is caught as quota and must still reject the whole invocation.
+    if storage::stat("missing.db").map_err(map)?.is_some() {
+        return Err(failure("unexpected-present-file"));
+    }
+    expect(storage::stat("missing.db"), StorageError::QuotaExceeded)?;
+    Ok(json!({"caught": "budget"}))
+}
+
+fn drop_after_denial() -> Result<Value, ProviderError> {
+    let deleting = storage::open(
+        "drop-denied.tmp",
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .delete_on_close(true),
+    )
+    .map_err(map)?;
+    deleting.write_at(0, b"provisional").map_err(map)?;
+    expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
+    // Resource drop executes after the guest caught the terminal quota error. It may release native
+    // accounting but must never turn delete-on-close into an authorized committed mutation.
+    drop(deleting);
+    Ok(json!({"caught": "drop-after-denial"}))
+}
+
 fn exercise_open_flags() -> Result<(), ProviderError> {
     for mask in 0_u8..32 {
         let read = mask & 1 != 0;
@@ -212,4 +297,4 @@ fn failure(code: &str) -> ProviderError {
     ProviderError::new(code, "storage probe failed")
 }
 
-dekopon_provider_sdk::export_provider_with_bindings!(StorageProbe, bindings);
+dekopon_provider_sdk::export_provider_with_commands!(StorageProbe, bindings);

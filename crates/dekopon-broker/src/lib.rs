@@ -61,7 +61,8 @@ use dekopon_core::{
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
 use dekopon_storage_host::{
-    ContinuityPolicy, StorageEvidence, StorageGrant, StorageGrantRequest, StorageScopeCommitment,
+    ContinuityPolicy, StorageEvidence, StorageGrantPreparation, StorageGrantRequest,
+    StorageScopeCommitment,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,20 @@ const MEMORY_DEDUP_LINE_BYTES: u64 = 256;
 const MEMORY_MIN_TURN_LINE_BYTES: u64 = 251;
 /// SDK success/failure envelope around the provider's already-bounded result value.
 const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
+/// Curated record/query fields and worst-case JSON string escaping at the component boundary.
+const MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES: u64 = 4 * 1024;
+const MEMORY_QUERY_JSON_EXPANSION: u64 = 6;
+/// Raw/decoded collections, canonical-ABI copies, allocator metadata, and component static state.
+const MEMORY_WORKING_SET_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+/// Smallest serialized `{"turns":[],"truncated":false}` result.
+const MEMORY_MIN_RESULT_BYTES: u64 = 30;
+/// The provider owns exactly the turn and permanent-dedup logical files.
+const MEMORY_LOGICAL_FILES: u64 = 2;
+/// Size/read calls for both files plus two appends and the worst-case replacement.
+const MEMORY_RECORD_FIXED_HOST_CALLS: u64 = 5;
+/// Fixed setup/serde headroom plus a conservative instruction allowance per processed byte.
+const MEMORY_FUEL_BASE: u64 = 10_000_000;
+const MEMORY_FUEL_PER_WORK_BYTE: u64 = 256;
 /// Fixed JSONL chunk requested by the generated memory provider.
 const MEMORY_READ_CHUNK_BYTES: u64 = 256 * 1024;
 
@@ -149,6 +164,7 @@ impl ChatMemoryConfig {
             || self.compaction_target_bytes >= self.compaction_threshold_bytes
             || self.compaction_threshold_bytes > storage.max_file_bytes
             || self.max_turn_bytes < MEMORY_MIN_TURN_LINE_BYTES
+            || self.max_result_bytes < MEMORY_MIN_RESULT_BYTES
             || self.max_dedup_bytes < MEMORY_DEDUP_LINE_BYTES
         {
             return Err(BrokerBuildError::InvalidChatMemory);
@@ -159,11 +175,17 @@ impl ChatMemoryConfig {
         // `read-file` asks for a full CHUNK even on its final partial call, and the host
         // intentionally charges the requested bound. Round both files independently so a valid
         // near-threshold store cannot become unreadable only because its length is not aligned.
-        let read_budget = round_up(self.max_dedup_bytes, MEMORY_READ_CHUNK_BYTES)?
-            .checked_add(round_up(
-                self.compaction_threshold_bytes,
-                MEMORY_READ_CHUNK_BYTES,
-            )?)
+        let dedup_read_budget = round_up(self.max_dedup_bytes, MEMORY_READ_CHUNK_BYTES)?;
+        let turns_read_budget = round_up(self.compaction_threshold_bytes, MEMORY_READ_CHUNK_BYTES)?;
+        let read_budget = dedup_read_budget
+            .checked_add(turns_read_budget)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let host_calls = dedup_read_budget
+            .checked_div(MEMORY_READ_CHUNK_BYTES)
+            .and_then(|value| {
+                value.checked_add(turns_read_budget.checked_div(MEMORY_READ_CHUNK_BYTES)?)
+            })
+            .and_then(|value| value.checked_add(MEMORY_RECORD_FIXED_HOST_CALLS))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let write_budget = self
             .compaction_target_bytes
@@ -178,10 +200,13 @@ impl ChatMemoryConfig {
             .checked_add(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let namespace_headroom = self
-            // Immediately before compaction, old turns and their staged replacement can each be
-            // just below the high threshold. The lower target is not a valid peak bound.
+            // Immediately before compaction, the old turn file may sit just below the high
+            // threshold and then receive one maximum turn. Its staged replacement can approach
+            // the target. Using two thresholds is conservative for the replacement, but the
+            // post-append maximum turn is independent and must not disappear into entry overhead.
             .compaction_threshold_bytes
             .checked_mul(2)
+            .and_then(|value| value.checked_add(self.max_turn_bytes))
             .and_then(|value| value.checked_add(self.max_dedup_bytes.checked_mul(2)?))
             // Generation/transaction directories, files, markers, manifest, and replacement
             // temporaries. The fixed memory transaction has only two logical files; 32 logical
@@ -197,9 +222,77 @@ impl ChatMemoryConfig {
             || threshold_with_append > storage.max_file_bytes
             || read_budget > storage.max_read_bytes_per_invocation
             || write_budget > storage.max_write_bytes_per_invocation
+            || host_calls > storage.max_host_calls_per_invocation
+            || storage.max_files_per_namespace < MEMORY_LOGICAL_FILES
             || namespace_headroom > storage.max_namespace_bytes
             || self.max_query_bytes > 256 * 1024
             || self.max_result_bytes > 1024 * 1024
+        {
+            return Err(BrokerBuildError::InvalidChatMemory);
+        }
+        Ok(())
+    }
+
+    fn maximum_provider_input_bytes(&self) -> Result<u64, BrokerBuildError> {
+        let record = self
+            .max_turn_bytes
+            .checked_add(MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let search = self
+            .max_query_bytes
+            .checked_mul(MEMORY_QUERY_JSON_EXPANSION)
+            .and_then(|value| value.checked_add(MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        Ok(record.max(search))
+    }
+
+    fn maximum_provider_working_set_bytes(&self) -> Result<u64, BrokerBuildError> {
+        self.compaction_threshold_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(self.max_dedup_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(self.compaction_target_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(self.max_turn_bytes))
+            .and_then(|bytes| bytes.checked_add(self.max_result_bytes))
+            .and_then(|bytes| bytes.checked_add(MEMORY_WORKING_SET_OVERHEAD_BYTES))
+            .ok_or(BrokerBuildError::InvalidChatMemory)
+    }
+
+    fn minimum_provider_fuel(&self) -> Result<u64, BrokerBuildError> {
+        let record_work = self
+            .max_dedup_bytes
+            .checked_add(self.compaction_threshold_bytes)
+            .and_then(|value| value.checked_add(self.compaction_target_bytes))
+            .and_then(|value| value.checked_add(self.max_turn_bytes))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let search_work = self
+            .compaction_threshold_bytes
+            .checked_add(self.max_query_bytes)
+            .and_then(|value| value.checked_add(self.max_result_bytes))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        record_work
+            .max(search_work)
+            .checked_mul(MEMORY_FUEL_PER_WORK_BYTE)
+            .and_then(|value| value.checked_add(MEMORY_FUEL_BASE))
+            .ok_or(BrokerBuildError::InvalidChatMemory)
+    }
+
+    /// Validates the memory algorithm's serialized-input, result, working-set, and fuel needs
+    /// against the independent component-host ceilings.
+    pub fn validate_host_limits(
+        &self,
+        host: &dekopon_broker_host::BrokerHostLimits,
+    ) -> Result<(), BrokerBuildError> {
+        let max_input = u64::try_from(host.max_input_bytes).unwrap_or(u64::MAX);
+        let max_output = u64::try_from(host.max_output_bytes).unwrap_or(u64::MAX);
+        let max_memory = u64::try_from(host.max_memory_bytes).unwrap_or(u64::MAX);
+        let provider_output = self
+            .max_result_bytes
+            .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        if self.maximum_provider_input_bytes()? > max_input
+            || provider_output > max_output
+            || self.maximum_provider_working_set_bytes()? > max_memory
+            || self.minimum_provider_fuel()? > host.fuel
         {
             return Err(BrokerBuildError::InvalidChatMemory);
         }
@@ -1119,7 +1212,7 @@ fn canonical_chat_scope_shape(scope: &ChatScopeClaim) -> bool {
                     || scope
                         .conversation
                         .strip_prefix(&format!("{}:topic:", scope.channel))
-                        .is_some_and(canonical_unsigned_decimal))
+                        .is_some_and(canonical_positive_service_decimal))
         }
         ChatTransportKind::Local => {
             lowercase_scope_value(&scope.channel) && lowercase_scope_value(&scope.conversation)
@@ -1157,6 +1250,12 @@ fn canonical_unsigned_decimal(value: &str) -> bool {
     value
         .parse::<u64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_positive_service_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number > 0 && number.to_string() == value)
 }
 
 fn canonical_signed_decimal(value: &str) -> bool {
@@ -2246,6 +2345,7 @@ where
             .storage_host()
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         config.validate(storage_host.limits())?;
+        config.validate_host_limits(self.registry.host_limits())?;
         let expected = [
             (
                 MEMORY_RECORD,
@@ -2398,16 +2498,35 @@ where
             .iter()
             .filter(|(capability, set)| {
                 !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
                     && self.authorize_capability(context, capability, set).allowed
             })
             .map(|(_, set)| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        let storage_providers = self
+            .constraints
+            .iter()
+            .map(|(_, set)| set)
+            .filter(|set| set.constraints.storage.is_some())
+            .map(|set| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        let reserved_providers = self
+            .registry
+            .capabilities()
+            .filter(|(provider, capability)| {
+                provider.as_str() == MEMORY_PROVIDER
+                    || capability.id.as_str().starts_with("memory.chat.")
+            })
+            .map(|(provider, _)| provider.clone())
             .collect::<BTreeSet<_>>();
         let mut words = self
             .registry
             .command_words_by_provider()
             .into_iter()
             .filter(|(provider, _)| {
-                provider.as_str() != MEMORY_PROVIDER && reachable.contains(*provider)
+                !reserved_providers.contains(*provider)
+                    && reachable.contains(*provider)
+                    && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
             })
             .flat_map(|(_, words)| {
                 words
@@ -2438,19 +2557,34 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        let memory_provider_word =
+        let reserved_provider_word =
             self.registry
                 .command_words_by_provider()
                 .into_iter()
                 .any(|(provider, words)| {
-                    provider.as_str() == MEMORY_PROVIDER && words.iter().any(|value| value == word)
+                    words.iter().any(|value| value == word)
+                        && self.registry.capabilities().any(|(candidate, capability)| {
+                            candidate == provider
+                                && (candidate.as_str() == MEMORY_PROVIDER
+                                    || capability.id.as_str().starts_with("memory.chat."))
+                        })
                 });
-        if word == MEMORY_WORD || memory_provider_word {
+        if word == MEMORY_WORD || reserved_provider_word {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
         }
-        self.registry.resolve_command(word, argv).await
+        let resolution = self.registry.resolve_command(word, argv).await?;
+        if matches!(
+            &resolution,
+            CommandResolution::Resolved { capability, .. }
+                if is_reserved_memory_route(capability, self.constraints.get(capability))
+        ) {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        Ok(resolution)
     }
 
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
@@ -2459,6 +2593,7 @@ where
             .iter()
             .filter(|(capability, set)| {
                 !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
                     && self.authorize_capability(context, capability, set).allowed
             })
             .map(|(capability_id, set)| {
@@ -2625,14 +2760,39 @@ where
                 .any(|(provider, words)| {
                     provider.as_str() == MEMORY_PROVIDER && words.iter().any(|value| value == word)
                 });
+        let reserved_nonmemory_provider_word = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .any(|(provider, words)| {
+                provider.as_str() != MEMORY_PROVIDER
+                    && words.iter().any(|value| value == word)
+                    && self.registry.capabilities().any(|(candidate, capability)| {
+                        candidate == provider && capability.id.as_str().starts_with("memory.chat.")
+                    })
+            });
         if (word == MEMORY_WORD && self.memory_surface(&context, &claim.agent).is_none())
             || (memory_provider_word && word != MEMORY_WORD)
+            || reserved_nonmemory_provider_word
         {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
         }
-        self.registry.resolve_command(word, argv).await
+        let resolution = self.registry.resolve_command(word, argv).await?;
+        if matches!(
+            &resolution,
+            CommandResolution::Resolved { capability, .. }
+                if (word != MEMORY_WORD
+                    && is_reserved_memory_route(capability, self.constraints.get(capability)))
+                    || (word == MEMORY_WORD
+                        && !matches!(capability.as_str(), MEMORY_RECENT | MEMORY_SEARCH))
+        ) {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        Ok(resolution)
     }
 
     /// Executes one generic proposal under invocation-bound chat authority.
@@ -2846,7 +3006,9 @@ where
                 }
             },
         );
-        encoded.text("principal", context.principal().as_str());
+        // Principal mapping is not part of continuity. The canonical external subject is already
+        // in the base namespace, while this generation commits only the resulting effective
+        // authority. Remapping the same subject without changing that surface must not rotate.
 
         let artifacts = self
             .registry
@@ -2858,12 +3020,17 @@ where
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let effective_memory_surface = memory_route
+            && match context.actor() {
+                Actor::Agent { agent } => self.memory_surface(context, agent).is_some(),
+                Actor::Human { .. } | Actor::Service { .. } => false,
+            };
         let effective = self
             .constraints
             .iter()
             .filter(|(capability, set)| {
-                (!is_reserved_memory_route(capability, Some(set))
-                    || is_memory_capability(capability))
+                let reserved = is_reserved_memory_route(capability, Some(set));
+                (!reserved || (effective_memory_surface && is_memory_capability(capability)))
                     && self.authorize_capability(context, capability, set).allowed
             })
             .collect::<Vec<_>>();
@@ -2882,30 +3049,7 @@ where
             encoded.text("providerArtifactSha256", digest);
         }
 
-        let host = self.registry.host_limits();
-        encoded.number("host.maxMemoryBytes", host.max_memory_bytes as u128);
-        encoded.number("host.maxTableElements", host.max_table_elements as u128);
-        encoded.number("host.maxInstances", host.max_instances as u128);
-        encoded.number("host.maxTables", host.max_tables as u128);
-        encoded.number("host.maxMemories", host.max_memories as u128);
-        encoded.number("host.maxInputBytes", host.max_input_bytes as u128);
-        encoded.number("host.maxOutputBytes", host.max_output_bytes as u128);
-        encoded.number("host.maxHttpRequests", u128::from(host.max_http_requests));
-        encoded.number(
-            "host.maxHttpRequestBytes",
-            u128::from(host.max_http_request_bytes),
-        );
-        encoded.number(
-            "host.maxHttpResponseBytes",
-            u128::from(host.max_http_response_bytes),
-        );
-        encoded.number("host.maxHttpHeaders", host.max_http_headers as u128);
-        encoded.number(
-            "host.maxHttpHeaderBytes",
-            host.max_http_header_bytes as u128,
-        );
-        encoded.number("host.fuel", u128::from(host.fuel));
-        encoded.number("host.maxTimeoutNanos", host.max_timeout.as_nanos());
+        encode_host_limits(&mut encoded, self.registry.host_limits());
 
         let storage = self
             .registry
@@ -2913,48 +3057,17 @@ where
             .ok_or(BrokerError::MemoryUnavailable)?;
         encode_storage_limits(&mut encoded, storage.limits());
         if let Some(memory) = self.chat_memory.as_ref().filter(|_| memory_route) {
-            encoded.byte(
-                "memory.continuityPolicy",
-                match memory.continuity_policy {
-                    ContinuityPolicy::Stable => 0,
-                    ContinuityPolicy::AuthorityBound => 1,
-                },
-            );
-            encoded.number(
-                "memory.maxLookbackTurns",
-                u128::from(memory.max_lookback_turns),
-            );
-            encoded.number("memory.maxRecentTurns", u128::from(memory.max_recent_turns));
-            encoded.number(
-                "memory.maxSearchResults",
-                u128::from(memory.max_search_results),
-            );
-            encoded.number("memory.maxQueryBytes", u128::from(memory.max_query_bytes));
-            encoded.number("memory.maxResultBytes", u128::from(memory.max_result_bytes));
-            encoded.number("memory.maxTurnBytes", u128::from(memory.max_turn_bytes));
-            encoded.number(
-                "memory.maxDedupRecords",
-                u128::from(memory.max_dedup_records),
-            );
-            encoded.number("memory.maxDedupBytes", u128::from(memory.max_dedup_bytes));
-            encoded.number(
-                "memory.compactionTargetBytes",
-                u128::from(memory.compaction_target_bytes),
-            );
-            encoded.number(
-                "memory.compactionThresholdBytes",
-                u128::from(memory.compaction_threshold_bytes),
-            );
+            encode_memory_config(&mut encoded, memory);
         }
         Ok(encoded.finish())
     }
 
-    async fn storage_grant(
+    fn prepare_storage_grant(
         &self,
         context: &AuthenticatedContext,
         request: &InvocationRequest,
         set: &ConstraintSet,
-    ) -> Result<Option<StorageGrant>, BrokerError> {
+    ) -> Result<Option<StorageGrantPreparation>, BrokerError> {
         let Some(storage) = &set.constraints.storage else {
             return Ok(None);
         };
@@ -3000,11 +3113,7 @@ where
             },
             authority,
         );
-        tokio::task::spawn_blocking(move || host.grant(grant_request))
-            .await
-            .map_err(|_| BrokerError::Storage {
-                source: dekopon_storage_host::StorageHostError::Io,
-            })?
+        host.prepare_grant(grant_request)
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
     }
@@ -3097,10 +3206,7 @@ where
         // Identifiers and the decision only. Request input never reaches a span field, exactly as
         // it never reaches an audit field — a refusal must be visible without the payload that
         // was refused being visible with it.
-        let storage_candidate = self
-            .constraints
-            .get(&request.capability)
-            .is_some_and(|set| set.constraints.storage.is_some());
+        let storage_candidate = self.capability_uses_storage(&request.capability);
         let authorize = if storage_candidate {
             tracing::info_span!(
                 "broker.authorize",
@@ -3227,12 +3333,8 @@ where
             reason: Some(reason),
         };
         let storage_host = self.registry.storage_host();
-        let storage_backed = storage_host.is_some()
-            && (is_memory_capability(&request.capability)
-                || self
-                    .constraints
-                    .get(&request.capability)
-                    .is_some_and(|set| set.constraints.storage.is_some()));
+        let storage_backed =
+            storage_host.is_some() && self.capability_uses_storage(&request.capability);
         let digest = if storage_backed {
             let bytes = serde_json::to_vec(&material)
                 .map_err(|source| BrokerError::DecisionEvidence { source })?;
@@ -3294,8 +3396,13 @@ where
         set: ConstraintSet,
         policy_ids: Vec<String>,
     ) -> Result<InvocationResult, BrokerError> {
-        let mut storage_grant = self.storage_grant(context, &request, &set).await?;
-        let storage_scope_commitment = storage_grant.as_ref().map(StorageGrant::scope_commitment);
+        // Keyed scope/evidence preparation is deliberately non-mutating. The authorization
+        // decision is durably appended before `materialize` may create a namespace, rotate a
+        // generation pointer, or update lifecycle state.
+        let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
+        let storage_scope_commitment = storage_preparation
+            .as_ref()
+            .map(StorageGrantPreparation::scope_commitment);
         if request.capability.as_str() == MEMORY_RECORD {
             let config = self
                 .chat_memory
@@ -3323,13 +3430,13 @@ where
                 .get("assistant")
                 .and_then(serde_json::Value::as_str)
                 .ok_or(BrokerError::InvalidMemoryInput)?;
-            let grant = storage_grant
+            let preparation = storage_preparation
                 .as_ref()
                 .ok_or(BrokerError::MemoryUnavailable)?;
             request.input = serde_json::json!({
                 "operation": "record",
-                "id": grant.record_id(&delivery),
-                "commitment": grant.content_commitment(user, assistant),
+                "id": preparation.record_id(&delivery),
+                "commitment": preparation.content_commitment(user, assistant),
                 "user": user,
                 "assistant": assistant,
                 "maxTurnBytes": config.max_turn_bytes,
@@ -3363,10 +3470,10 @@ where
                 set.constraints.clone(),
             )
             .map_err(|source| BrokerError::Authorization { source })?;
-        let decision_digest = if let Some(grant) = storage_grant.as_ref() {
+        let decision_digest = if let Some(preparation) = storage_preparation.as_ref() {
             let bytes = serde_json::to_vec(&authorized)
                 .map_err(|source| BrokerError::DecisionEvidence { source })?;
-            grant.evidence_commitment("authorized-invocation", &bytes)
+            preparation.evidence_commitment("authorized-invocation", &bytes)
         } else {
             decision_evidence_digest("authorized-invocation", &authorized)?
         };
@@ -3423,6 +3530,18 @@ where
             .await
             .map_err(|source| BrokerError::DecisionAudit { source })?;
 
+        let storage_grant = match storage_preparation.take() {
+            None => None,
+            Some(preparation) => Some(
+                tokio::task::spawn_blocking(move || preparation.materialize())
+                    .await
+                    .map_err(|_| BrokerError::Storage {
+                        source: dekopon_storage_host::StorageHostError::Io,
+                    })?
+                    .map_err(|source| BrokerError::Storage { source })?,
+            ),
+        };
+
         // Selected by the acting agent, falling back to the set's default; construction proved
         // every name the set can select exists and that every allowed host sits inside that
         // credential's destination binding. The agent comes from the trusted context the broker
@@ -3437,7 +3556,7 @@ where
         let started = Instant::now();
         let execution = self
             .registry
-            .invoke_with_storage(authorized, credential, storage_grant.take())
+            .invoke_with_storage(authorized, credential, storage_grant)
             .await;
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
@@ -3738,6 +3857,70 @@ fn encode_execution_constraints(
     } else {
         encoded.byte("execution.storage.present", 0);
     }
+}
+
+fn encode_host_limits(
+    encoded: &mut AuthorityEncoder,
+    limits: &dekopon_broker_host::BrokerHostLimits,
+) {
+    encoded.number("host.maxMemoryBytes", limits.max_memory_bytes as u128);
+    encoded.number("host.maxTableElements", limits.max_table_elements as u128);
+    encoded.number("host.maxInstances", limits.max_instances as u128);
+    encoded.number("host.maxTables", limits.max_tables as u128);
+    encoded.number("host.maxMemories", limits.max_memories as u128);
+    encoded.number("host.maxInputBytes", limits.max_input_bytes as u128);
+    encoded.number("host.maxOutputBytes", limits.max_output_bytes as u128);
+    encoded.number("host.maxHttpRequests", u128::from(limits.max_http_requests));
+    encoded.number(
+        "host.maxHttpRequestBytes",
+        u128::from(limits.max_http_request_bytes),
+    );
+    encoded.number(
+        "host.maxHttpResponseBytes",
+        u128::from(limits.max_http_response_bytes),
+    );
+    encoded.number("host.maxHttpHeaders", limits.max_http_headers as u128);
+    encoded.number(
+        "host.maxHttpHeaderBytes",
+        limits.max_http_header_bytes as u128,
+    );
+    encoded.number("host.fuel", u128::from(limits.fuel));
+    encoded.number("host.maxTimeoutNanos", limits.max_timeout.as_nanos());
+}
+
+fn encode_memory_config(encoded: &mut AuthorityEncoder, memory: &ChatMemoryConfig) {
+    encoded.byte(
+        "memory.continuityPolicy",
+        match memory.continuity_policy {
+            ContinuityPolicy::Stable => 0,
+            ContinuityPolicy::AuthorityBound => 1,
+        },
+    );
+    encoded.number(
+        "memory.maxLookbackTurns",
+        u128::from(memory.max_lookback_turns),
+    );
+    encoded.number("memory.maxRecentTurns", u128::from(memory.max_recent_turns));
+    encoded.number(
+        "memory.maxSearchResults",
+        u128::from(memory.max_search_results),
+    );
+    encoded.number("memory.maxQueryBytes", u128::from(memory.max_query_bytes));
+    encoded.number("memory.maxResultBytes", u128::from(memory.max_result_bytes));
+    encoded.number("memory.maxTurnBytes", u128::from(memory.max_turn_bytes));
+    encoded.number(
+        "memory.maxDedupRecords",
+        u128::from(memory.max_dedup_records),
+    );
+    encoded.number("memory.maxDedupBytes", u128::from(memory.max_dedup_bytes));
+    encoded.number(
+        "memory.compactionTargetBytes",
+        u128::from(memory.compaction_target_bytes),
+    );
+    encoded.number(
+        "memory.compactionThresholdBytes",
+        u128::from(memory.compaction_threshold_bytes),
+    );
 }
 
 fn encode_storage_limits(

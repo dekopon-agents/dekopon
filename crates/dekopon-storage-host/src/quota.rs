@@ -40,19 +40,6 @@ impl QuotaLedger {
         })
     }
 
-    pub(crate) fn refresh_root(&self, usage: Usage) {
-        let mut state = self.state.lock().expect("storage quota ledger");
-        if state.root_reserved == 0 && state.pending_transactions == 0 {
-            state.root_used = usage.bytes;
-            state.root_entries = usage.entries;
-        } else {
-            // Physical staging may overlap a logical reservation. Keeping the larger observation is
-            // conservative; the next idle refresh reconciles exact accounting.
-            state.root_used = state.root_used.max(usage.bytes);
-            state.root_entries = state.root_entries.max(usage.entries);
-        }
-    }
-
     pub(crate) fn reserve_root(
         self: &Arc<Self>,
         bytes: u64,
@@ -88,6 +75,11 @@ impl QuotaLedger {
             entries,
             finalized: false,
         })
+    }
+
+    pub(crate) fn observe_namespaces(&self, observed: impl IntoIterator<Item = String>) {
+        let mut state = self.state.lock().expect("storage quota ledger");
+        state.namespace_slots.extend(observed);
     }
 
     pub(crate) fn reserve_namespace(
@@ -150,6 +142,7 @@ impl QuotaLedger {
             namespace,
             reserved: 0,
             entries_reserved: 0,
+            reconciled: false,
             finalized: false,
         })
     }
@@ -246,29 +239,47 @@ impl RootReservation {
         let byte_growth = after.bytes.saturating_sub(before.bytes);
         let entry_growth = after.entries.saturating_sub(before.entries);
         if byte_growth > self.bytes || entry_growth > self.entries {
+            // Physical housekeeping already happened. Retaining the complete reservation is safer
+            // than releasing headroom that an unaccounted entry may now occupy; restart rebuilds
+            // the exact ledger from descriptor-relative scans.
+            self.finalized = true;
             return Err(StorageHostError::Arithmetic);
         }
-        state.root_used = if after.bytes >= before.bytes {
+        let root_used = if after.bytes >= before.bytes {
             state
                 .root_used
                 .checked_add(byte_growth)
-                .ok_or(StorageHostError::Arithmetic)?
+                .ok_or(StorageHostError::Arithmetic)
         } else {
-            state.root_used.saturating_sub(before.bytes - after.bytes)
+            Ok(state.root_used.saturating_sub(before.bytes - after.bytes))
         };
-        state.root_entries = if after.entries >= before.entries {
+        let root_entries = if after.entries >= before.entries {
             state
                 .root_entries
                 .checked_add(entry_growth)
-                .ok_or(StorageHostError::Arithmetic)?
+                .ok_or(StorageHostError::Arithmetic)
         } else {
-            state
+            Ok(state
                 .root_entries
-                .saturating_sub(before.entries - after.entries)
+                .saturating_sub(before.entries - after.entries))
         };
+        let (root_used, root_entries) = match (root_used, root_entries) {
+            (Ok(root_used), Ok(root_entries)) => (root_used, root_entries),
+            _ => {
+                self.finalized = true;
+                return Err(StorageHostError::Arithmetic);
+            }
+        };
+        state.root_used = root_used;
+        state.root_entries = root_entries;
         release_root_locked(&mut state, self.bytes, self.entries);
         self.finalized = true;
         Ok(())
+    }
+
+    /// Conservatively keeps housekeeping headroom after physical mutation may have started.
+    pub(crate) fn retain(mut self) {
+        self.finalized = true;
     }
 }
 
@@ -289,6 +300,7 @@ pub(crate) struct Reservation {
     namespace: String,
     reserved: u64,
     entries_reserved: u64,
+    reconciled: bool,
     finalized: bool,
 }
 
@@ -356,6 +368,11 @@ impl Reservation {
         final_usage: Usage,
         retired_transaction: Usage,
     ) -> Result<(), StorageHostError> {
+        if self.reconciled {
+            return Err(StorageHostError::Corrupt {
+                scope: "reservation-reconciled-twice",
+            });
+        }
         let mut state = self.ledger.state.lock().expect("storage quota ledger");
         let old = *state.namespace_used.get(&self.namespace).unwrap_or(&0);
         let old_entries = *state.namespace_entries.get(&self.namespace).unwrap_or(&0);
@@ -391,6 +408,15 @@ impl Reservation {
         state
             .namespace_entries
             .insert(self.namespace.clone(), final_usage.entries);
+        // Keep the complete staging/failure reservation until the caller has durably published its
+        // final marker. If that publication fails, poison and any ambiguous marker entry remain
+        // covered without trying to reconstruct accounting on the error path.
+        self.reconciled = true;
+        Ok(())
+    }
+
+    pub(crate) fn finish_commit(mut self) {
+        let mut state = self.ledger.state.lock().expect("storage quota ledger");
         release_locked(
             &mut state,
             &self.namespace,
@@ -398,7 +424,6 @@ impl Reservation {
             self.entries_reserved,
         );
         self.finalized = true;
-        Ok(())
     }
 
     pub(crate) fn abort(mut self) {

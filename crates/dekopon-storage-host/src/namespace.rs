@@ -27,7 +27,6 @@ pub(crate) struct Namespace {
     pub(crate) directory: Directory,
     pub(crate) data_directory: Directory,
     pub(crate) scope_commitment: String,
-    pub(crate) record_key: [u8; 32],
     /// Held before the generation lease is acquired and retained through transaction finalization.
     pub(crate) _base_lease: File,
 }
@@ -45,6 +44,7 @@ pub(crate) struct NamespacePlan {
     remove_authority_pointer: bool,
     previous_generation: Option<String>,
     retired_marker: Option<Vec<u8>>,
+    clear_selected_retired: bool,
     last_access_marker: Vec<u8>,
     existing_base: Option<Directory>,
     existing_base_lease: Option<File>,
@@ -221,6 +221,7 @@ impl NamespacePlan {
             });
         }
         let maximum_generation_peak_bytes;
+        let selected_retired_length;
         if let Some(generation) = &generation {
             require_directory(generation, "data")?;
             require_private_file(generation, "lease.lock")?;
@@ -230,6 +231,7 @@ impl NamespacePlan {
                 file_length(generation, "last-access")?,
                 last_access_marker.len() as u64,
             )?;
+            selected_retired_length = file_length(generation, "retired")?;
         } else {
             simulation.create_entry(0)?; // generation directory
             simulation.create_entry(0)?; // data directory
@@ -238,6 +240,22 @@ impl NamespacePlan {
                 .checked_mul(ENTRY_CHARGE)
                 .and_then(|bytes| bytes.checked_add(last_access_marker.len() as u64))
                 .ok_or(StorageHostError::Arithmetic)?;
+            selected_retired_length = None;
+        }
+
+        // Fully prepare the selected generation before publishing a pointer to it. If pointer
+        // publication later fails, the inaccessible generation remains valid and TTL-collectable
+        // rather than becoming a current generation with no authenticated lifecycle marker.
+        simulation.replace(
+            generation
+                .as_ref()
+                .map(|generation| file_length(generation, "last-access"))
+                .transpose()?
+                .flatten(),
+            last_access_marker.len() as u64,
+        )?;
+        if let Some(length) = selected_retired_length {
+            simulation.remove(length)?;
         }
 
         let old_pointer_length = base
@@ -259,14 +277,6 @@ impl NamespacePlan {
             // generation rather than being blocked by historical bytes it is trying to leave.
             simulation.replace(file_length(&previous, "retired")?, marker.len() as u64)?;
         }
-        simulation.replace(
-            generation
-                .as_ref()
-                .map(|generation| file_length(generation, "last-access"))
-                .transpose()?
-                .flatten(),
-            last_access_marker.len() as u64,
-        )?;
 
         Ok(Self {
             base_token,
@@ -276,6 +286,7 @@ impl NamespacePlan {
             remove_authority_pointer,
             previous_generation,
             retired_marker,
+            clear_selected_retired: selected_retired_length.is_some(),
             last_access_marker,
             existing_base,
             existing_base_lease,
@@ -305,7 +316,6 @@ impl NamespacePlan {
     pub(crate) fn apply(
         mut self,
         namespaces_root: &Directory,
-        key: &StorageKey,
         lock_timeout_ms: u64,
     ) -> Result<Namespace, StorageHostError> {
         let (base, base_lease) = match (self.existing_base.take(), self.existing_base_lease.take())
@@ -325,6 +335,14 @@ impl NamespacePlan {
         };
 
         let (directory, data_directory) = ensure_generation(&base, &self.generation_token)?;
+        directory.replace_private("last-access", &self.last_access_marker)?;
+        if self.clear_selected_retired {
+            // Reactivating stable continuity must make the selected generation non-retired before
+            // removing the authority pointer publishes it. A stale marker would otherwise let GC
+            // delete freshly accessed stable data after the transition back from authority-bound.
+            directory.remove_file("retired")?;
+            directory.sync()?;
+        }
         if let Some(pointer) = &self.authority_pointer {
             base.replace_private("current", pointer)?;
         } else if self.remove_authority_pointer {
@@ -342,11 +360,6 @@ impl NamespacePlan {
             let old = base.open_directory(previous)?;
             old.replace_private("retired", marker)?;
         }
-        directory.replace_private("last-access", &self.last_access_marker)?;
-        let record_key = key.bytes(
-            crate::key::DOMAIN_RECORD_ID,
-            &[self.base_token.as_bytes(), self.generation_token.as_bytes()],
-        );
         Ok(Namespace {
             base_token: self.base_token,
             generation_token: self.generation_token,
@@ -354,7 +367,6 @@ impl NamespacePlan {
             directory,
             data_directory,
             scope_commitment: self.scope_commitment,
-            record_key,
             _base_lease: base_lease,
         })
     }
@@ -599,14 +611,15 @@ pub(crate) fn current_generation(
     key: &StorageKey,
     base_token: &str,
 ) -> Result<Option<String>, StorageHostError> {
-    Ok(
-        read_pointer(base_directory, key, base_token)?.map(|document| {
-            key.token(
-                DOMAIN_GENERATION,
-                &[base_token.as_bytes(), document.epoch.as_bytes()],
-            )
-        }),
-    )
+    Ok(Some(match read_pointer(base_directory, key, base_token)? {
+        Some(document) => key.token(
+            DOMAIN_GENERATION,
+            &[base_token.as_bytes(), document.epoch.as_bytes()],
+        ),
+        // Absence of an authority pointer is the explicit stable publication state. Treat the
+        // deterministic stable generation as current everywhere, including bounded GC.
+        None => key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]),
+    }))
 }
 
 /// Validates one complete isolated namespace without following or trusting any path entry.
@@ -674,13 +687,6 @@ pub(crate) fn validate_namespace_base(
             scope: "missing-current-generation",
         });
     }
-    let stable = key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
-    if current.is_none() && !generations.contains(&stable) {
-        return Err(StorageHostError::Corrupt {
-            scope: "missing-stable-generation",
-        });
-    }
-
     for generation_token in generations {
         let generation = base_directory.open_directory(&generation_token)?;
         validate_generation(&generation, key, base_token, &generation_token)?;

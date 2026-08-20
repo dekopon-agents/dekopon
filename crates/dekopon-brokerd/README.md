@@ -364,9 +364,9 @@ The backing filesystem must honor Unix no-follow opens, advisory exclusive locks
 ## Optional provider storage and chat memory
 
 Presence of `storage` requires every field; absence links storage imports only to a disabled sticky
-context. `rootPath` is separate from audit state and `namespaceKeyPath` is one no-follow,
-server-owned `0600`, single-link, ≤4 KiB document. A deployment with retained data and a missing or
-changed key fails closed.
+context. `rootPath` is disjoint from every broker-owned file/provider path and
+`namespaceKeyPath` is one no-follow, server-owned `0600`, single-link, ≤4 KiB document under safe
+ancestors. A deployment with retained data and a missing or changed key fails closed.
 
 ```yaml
 storage:
@@ -417,7 +417,11 @@ chatMemory:
 Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
 headroom. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
-invocation budget and reserves both the old near-threshold file and its staged replacement.
+invocation and host-call budgets, requires both logical files, and reserves the post-append old file,
+staged replacement, permanent dedup copies, and transaction metadata. Startup accounts the
+worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files
+plus canonical-ABI compaction copies and fixed allocator headroom fit the independent Wasm
+linear-memory ceiling.
 
 The gateway peer's attestor additionally needs `chatScopes`. Breadth is an explicit tagged value:
 `transportWide`, `exactChannel`, or `exactConversation`; each names transport kind and configured

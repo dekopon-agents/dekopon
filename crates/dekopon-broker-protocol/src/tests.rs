@@ -438,6 +438,22 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         .is_canonical_for(&slack)
     );
 
+    let discord = ChatScopeClaim {
+        transport: "discord".parse().expect("transport"),
+        kind: ChatTransportKind::Discord,
+        channel: "123".to_owned(),
+        conversation: "123".to_owned(),
+    };
+    for (channel, message) in [("0123", "456"), ("123", "0"), ("123", "0456")] {
+        assert!(
+            !DeliveryIdentity::Discord {
+                channel: channel.to_owned(),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&discord)
+        );
+    }
+
     let telegram = ChatScopeClaim {
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
@@ -460,6 +476,60 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         }
         .is_canonical_for(&telegram)
     );
+    for (chat, topic, message) in [
+        ("-01001", Some("42"), "7"),
+        ("-1001", Some("042"), "7"),
+        ("-1001", Some("42"), "07"),
+        ("-1001", Some("9223372036854775808"), "7"),
+        ("-1001", Some("42"), "9223372036854775808"),
+    ] {
+        assert!(
+            !DeliveryIdentity::Telegram {
+                chat: chat.to_owned(),
+                topic: topic.map(str::to_owned),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&telegram)
+        );
+    }
+
+    let telegram_max = ChatScopeClaim {
+        transport: "tg".parse().expect("transport"),
+        kind: ChatTransportKind::Telegram,
+        channel: i64::MIN.to_string(),
+        conversation: format!("{}:topic:{}", i64::MIN, i64::MAX),
+    };
+    assert!(
+        DeliveryIdentity::Telegram {
+            chat: i64::MIN.to_string(),
+            topic: Some(i64::MAX.to_string()),
+            message: i64::MAX.to_string(),
+        }
+        .is_canonical_for(&telegram_max),
+        "every Telegram identifier representable by the gateway remains canonical"
+    );
+
+    let local = ChatScopeClaim {
+        transport: "dev".parse().expect("transport"),
+        kind: ChatTransportKind::Local,
+        channel: "conversation".to_owned(),
+        conversation: "conversation".to_owned(),
+    };
+    let local_identity = |boot_nonce: &str, connection, sequence| DeliveryIdentity::Local {
+        transport: "dev".parse().expect("transport"),
+        conversation: "conversation".to_owned(),
+        boot_nonce: boot_nonce.to_owned(),
+        connection,
+        sequence,
+    };
+    assert!(local_identity("0123456789abcdef0123456789abcdef", 1, 1).is_canonical_for(&local));
+    for identity in [
+        local_identity("0123456789abcdef0123456789abcdeg", 1, 1),
+        local_identity("0123456789abcdef0123456789abcdef", 0, 1),
+        local_identity("0123456789abcdef0123456789abcdef", 1, 0),
+    ] {
+        assert!(!identity.is_canonical_for(&local));
+    }
 }
 
 #[test]
@@ -493,4 +563,16 @@ fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bou
         "message": "9"
     });
     assert!(serde_json::from_value::<DeliveryIdentity>(delivery).is_err());
+    for (topic, message) in [("9223372036854775808", "9"), ("7", "9223372036854775808")] {
+        assert!(
+            serde_json::from_value::<DeliveryIdentity>(serde_json::json!({
+                "kind": "telegram",
+                "chat": "-1001",
+                "topic": topic,
+                "message": message
+            }))
+            .is_err(),
+            "Telegram max+1 must fail during wire decoding"
+        );
+    }
 }

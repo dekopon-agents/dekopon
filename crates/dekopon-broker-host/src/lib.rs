@@ -2,8 +2,8 @@
 //!
 //! The current immediate host intentionally has an empty linker. This crate is the privileged
 //! counterpart intended only for a separately deployed broker: it accepts an
-//! [`AuthorizedInvocation`], links the project-owned buffered HTTP interface, and applies the
-//! invocation's exact host-call constraints in a fresh store.
+//! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
+//! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 
 #![forbid(unsafe_code)]
 
@@ -85,7 +85,12 @@ pub const DEFAULT_MAX_HTTP_HEADERS: usize = 128;
 /// Default maximum aggregate HTTP header bytes in either direction (64 KiB).
 pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 /// Default Wasm instruction fuel supplied to each store.
-pub const DEFAULT_FUEL: u64 = 10_000_000;
+///
+/// Durable-memory compaction parses the bounded near-threshold turn and dedup files and emits one
+/// multi-megabyte replacement inside the guest. The independent wall-clock deadline still bounds
+/// execution; this ceiling keeps the default valid memory limits from deterministically trapping
+/// on their first full compaction.
+pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 /// Host ceiling for one provider description or invocation.
 pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -626,13 +631,16 @@ impl BrokerWasmProvider {
                     source,
                 })
         };
-        let output_json = timeout(operation_timeout, operation).await.map_err(|_| {
-            BrokerHostError::Timeout {
-                operation: format!("invoke {capability}"),
-                timeout_ms: constraints.timeout_ms,
-            }
-        })??;
-        store.data_mut().provider_output_bytes = output_json.len();
+        let operation_result =
+            timeout(operation_timeout, operation)
+                .await
+                .map_err(|_| BrokerHostError::Timeout {
+                    operation: format!("invoke {capability}"),
+                    timeout_ms: constraints.timeout_ms,
+                })?;
+        // Sticky host authority wins even when the guest catches the typed error or a failing
+        // resource destructor turns it into a component trap. Inspect policy state before
+        // propagating the guest call result.
         if let Some(reason) = store.data().http.policy_violation() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
@@ -647,6 +655,8 @@ impl BrokerWasmProvider {
                 reason,
             });
         }
+        let output_json = operation_result?;
+        store.data_mut().provider_output_bytes = output_json.len();
 
         let maximum_output = usize::try_from(constraints.max_output_bytes)
             .unwrap_or(usize::MAX)

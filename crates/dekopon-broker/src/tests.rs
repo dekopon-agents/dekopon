@@ -3,13 +3,18 @@ use std::{fs, sync::Arc};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-use dekopon_capability::ExecutionConstraints;
+use dekopon_broker_host::BrokerHostLimits;
+use dekopon_capability::{
+    ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
+    StorageNamespace,
+};
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, ChatMemoryConfig, ChatScopeGrant, ChatTransportKind,
-    ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeGrant,
+    ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
+    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
     is_reserved_memory_route, verify_audit_chain,
 };
 
@@ -125,6 +130,384 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(memory.validate(&too_small_namespace).is_err());
+
+    let exact_write_call = dekopon_storage_host::StorageLimits {
+        max_write_bytes_per_call: memory.compaction_target_bytes,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&exact_write_call).is_ok());
+    let one_below_write_call = dekopon_storage_host::StorageLimits {
+        max_write_bytes_per_call: memory.compaction_target_bytes - 1,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&one_below_write_call).is_err());
+
+    let exact_file = memory.compaction_threshold_bytes + memory.max_turn_bytes;
+    let exact_file_limit = dekopon_storage_host::StorageLimits {
+        max_file_bytes: exact_file,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&exact_file_limit).is_ok());
+    let one_below_file_limit = dekopon_storage_host::StorageLimits {
+        max_file_bytes: exact_file - 1,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&one_below_file_limit).is_err());
+
+    let exact_namespace = memory.compaction_threshold_bytes * 2
+        + memory.max_turn_bytes
+        + memory.max_dedup_bytes * 2
+        + 32 * 4_096;
+    let exact_namespace_limit = dekopon_storage_host::StorageLimits {
+        max_namespace_bytes: exact_namespace,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&exact_namespace_limit).is_ok());
+    let one_below_namespace_limit = dekopon_storage_host::StorageLimits {
+        max_namespace_bytes: exact_namespace - 1,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&one_below_namespace_limit).is_err());
+
+    // The minimum fixture reads one chunk from each file, makes both size calls, appends both
+    // records, and may replace turns: seven host calls exactly.
+    let exact_host_calls = dekopon_storage_host::StorageLimits {
+        max_host_calls_per_invocation: 7,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(minimal.validate(&exact_host_calls).is_ok());
+    let one_below_host_calls = dekopon_storage_host::StorageLimits {
+        max_host_calls_per_invocation: 6,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(minimal.validate(&one_below_host_calls).is_err());
+
+    let exact_file_count = dekopon_storage_host::StorageLimits {
+        max_files_per_namespace: 2,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(minimal.validate(&exact_file_count).is_ok());
+    let one_below_file_count = dekopon_storage_host::StorageLimits {
+        max_files_per_namespace: 1,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(minimal.validate(&one_below_file_count).is_err());
+
+    let mut result_too_small_for_empty_history = minimal;
+    result_too_small_for_empty_history.max_result_bytes = 29;
+    assert!(
+        result_too_small_for_empty_history
+            .validate(&dekopon_storage_host::StorageLimits::default())
+            .is_err()
+    );
+
+    assert_eq!(
+        memory
+            .maximum_provider_input_bytes()
+            .expect("default input arithmetic"),
+        memory.max_turn_bytes + 4 * 1024
+    );
+    let mut query_dominates = memory.clone();
+    query_dominates.max_query_bytes = 10_000;
+    assert_eq!(
+        query_dominates
+            .maximum_provider_input_bytes()
+            .expect("query input arithmetic"),
+        10_000 * 6 + 4 * 1024
+    );
+    assert_eq!(
+        memory
+            .maximum_provider_working_set_bytes()
+            .expect("working-set arithmetic"),
+        memory.compaction_threshold_bytes * 2
+            + memory.max_dedup_bytes * 2
+            + memory.compaction_target_bytes * 2
+            + memory.max_turn_bytes
+            + memory.max_result_bytes
+            + 4 * 1024 * 1024
+    );
+
+    let minimum_fuel = memory
+        .minimum_provider_fuel()
+        .expect("default memory fuel arithmetic");
+    assert!(minimum_fuel <= BrokerHostLimits::default().fuel);
+    assert_eq!(
+        minimum_fuel,
+        (memory.max_dedup_bytes
+            + memory.compaction_threshold_bytes
+            + memory.compaction_target_bytes
+            + memory.max_turn_bytes)
+            * 256
+            + 10_000_000
+    );
+    memory
+        .validate_host_limits(&BrokerHostLimits::default())
+        .expect("default host and memory limits compose");
+    for host in [
+        BrokerHostLimits {
+            max_input_bytes: usize::try_from(
+                memory.maximum_provider_input_bytes().expect("input") - 1,
+            )
+            .expect("input fits usize"),
+            ..BrokerHostLimits::default()
+        },
+        BrokerHostLimits {
+            max_output_bytes: usize::try_from(
+                memory.max_result_bytes + super::MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES - 1,
+            )
+            .expect("output fits usize"),
+            ..BrokerHostLimits::default()
+        },
+        BrokerHostLimits {
+            max_memory_bytes: usize::try_from(
+                memory
+                    .maximum_provider_working_set_bytes()
+                    .expect("working set")
+                    - 1,
+            )
+            .expect("working set fits usize"),
+            ..BrokerHostLimits::default()
+        },
+        BrokerHostLimits {
+            fuel: minimum_fuel - 1,
+            ..BrokerHostLimits::default()
+        },
+    ] {
+        assert!(memory.validate_host_limits(&host).is_err());
+    }
+
+    query_dominates.max_query_bytes = u64::MAX;
+    assert!(query_dominates.maximum_provider_input_bytes().is_err());
+}
+
+#[test]
+fn every_authority_ceiling_is_canonical_and_semantic() {
+    type Mutation<T> = (&'static str, fn(&mut T));
+
+    fn encoded_host(limits: &BrokerHostLimits) -> Vec<u8> {
+        let mut encoded = AuthorityEncoder::new();
+        encode_host_limits(&mut encoded, limits);
+        encoded.finish()
+    }
+    fn encoded_storage(limits: &dekopon_storage_host::StorageLimits) -> Vec<u8> {
+        let mut encoded = AuthorityEncoder::new();
+        encode_storage_limits(&mut encoded, limits);
+        encoded.finish()
+    }
+    fn encoded_memory(config: &ChatMemoryConfig) -> Vec<u8> {
+        let mut encoded = AuthorityEncoder::new();
+        encode_memory_config(&mut encoded, config);
+        encoded.finish()
+    }
+    fn assert_rotations<T: Clone>(
+        baseline: &T,
+        mutations: &[Mutation<T>],
+        encode: impl Fn(&T) -> Vec<u8>,
+    ) {
+        let baseline_bytes = encode(baseline);
+        for (field, mutate) in mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed);
+            assert_ne!(baseline_bytes, encode(&changed), "{field} did not rotate");
+        }
+    }
+
+    let host = BrokerHostLimits::default();
+    let host_mutations: &[Mutation<BrokerHostLimits>] = &[
+        ("maxMemoryBytes", |v| v.max_memory_bytes += 1),
+        ("maxTableElements", |v| v.max_table_elements += 1),
+        ("maxInstances", |v| v.max_instances += 1),
+        ("maxTables", |v| v.max_tables += 1),
+        ("maxMemories", |v| v.max_memories += 1),
+        ("maxInputBytes", |v| v.max_input_bytes += 1),
+        ("maxOutputBytes", |v| v.max_output_bytes += 1),
+        ("maxHttpRequests", |v| v.max_http_requests += 1),
+        ("maxHttpRequestBytes", |v| v.max_http_request_bytes += 1),
+        ("maxHttpResponseBytes", |v| v.max_http_response_bytes += 1),
+        ("maxHttpHeaders", |v| v.max_http_headers += 1),
+        ("maxHttpHeaderBytes", |v| v.max_http_header_bytes += 1),
+        ("fuel", |v| v.fuel += 1),
+        ("maxTimeout", |v| {
+            v.max_timeout += std::time::Duration::from_nanos(1);
+        }),
+    ];
+    assert_rotations(&host, host_mutations, encoded_host);
+
+    let storage = dekopon_storage_host::StorageLimits::default();
+    let storage_mutations: &[Mutation<dekopon_storage_host::StorageLimits>] = &[
+        ("maxRootBytes", |v| v.max_root_bytes += 1),
+        ("maxNamespaces", |v| v.max_namespaces += 1),
+        ("maxNamespaceBytes", |v| v.max_namespace_bytes += 1),
+        ("maxFilesPerNamespace", |v| v.max_files_per_namespace += 1),
+        ("maxFileBytes", |v| v.max_file_bytes += 1),
+        ("maxOpenHandles", |v| v.max_open_handles += 1),
+        ("maxHandlesPerInvocation", |v| {
+            v.max_handles_per_invocation += 1
+        }),
+        ("maxHostCallsPerInvocation", |v| {
+            v.max_host_calls_per_invocation += 1
+        }),
+        ("maxReadBytesPerCall", |v| v.max_read_bytes_per_call += 1),
+        ("maxReadBytesPerInvocation", |v| {
+            v.max_read_bytes_per_invocation += 1
+        }),
+        ("maxWriteBytesPerCall", |v| v.max_write_bytes_per_call += 1),
+        ("maxWriteBytesPerInvocation", |v| {
+            v.max_write_bytes_per_invocation += 1
+        }),
+        ("maxEntropyBytesPerCall", |v| {
+            v.max_entropy_bytes_per_call += 1
+        }),
+        ("maxEntropyBytesPerInvocation", |v| {
+            v.max_entropy_bytes_per_invocation += 1
+        }),
+        ("lockTimeoutMs", |v| v.lock_timeout_ms += 1),
+        ("finalizationBudgetMs", |v| v.finalization_budget_ms += 1),
+        ("maxPendingTransactions", |v| {
+            v.max_pending_transactions += 1
+        }),
+        ("startupMaxEntries", |v| v.startup_max_entries += 1),
+        ("startupMaxTransactions", |v| {
+            v.startup_max_transactions += 1
+        }),
+        ("maxQuarantinedNamespaces", |v| {
+            v.max_quarantined_namespaces += 1
+        }),
+        ("retiredGenerationGraceMs", |v| {
+            v.retired_generation_grace_ms += 1
+        }),
+        ("retiredGenerationTtlMs", |v| {
+            v.retired_generation_ttl_ms += 1
+        }),
+        ("inactiveNamespaceTtlMs", |v| {
+            v.inactive_namespace_ttl_ms += 1
+        }),
+        ("gcIntervalMs", |v| v.gc_interval_ms += 1),
+        ("gcMaxNamespacesPerPass", |v| {
+            v.gc_max_namespaces_per_pass += 1
+        }),
+        ("gcMaxBytesPerPass", |v| v.gc_max_bytes_per_pass += 1),
+    ];
+    assert_rotations(&storage, storage_mutations, encoded_storage);
+
+    let memory = ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        enabled_agents: vec![
+            "reviewer".parse().expect("agent"),
+            "other".parse().expect("agent"),
+        ],
+        max_lookback_turns: 200,
+        max_recent_turns: 20,
+        max_search_results: 20,
+        max_query_bytes: 256,
+        max_result_bytes: 65_536,
+        max_turn_bytes: 32_768,
+        max_dedup_records: 16_000,
+        max_dedup_bytes: 4_194_304,
+        compaction_target_bytes: 8_388_608,
+        compaction_threshold_bytes: 12_582_912,
+    };
+    let memory_mutations: &[Mutation<ChatMemoryConfig>] = &[
+        ("continuityPolicy", |v| {
+            v.continuity_policy = dekopon_storage_host::ContinuityPolicy::Stable;
+        }),
+        ("maxLookbackTurns", |v| v.max_lookback_turns += 1),
+        ("maxRecentTurns", |v| v.max_recent_turns += 1),
+        ("maxSearchResults", |v| v.max_search_results += 1),
+        ("maxQueryBytes", |v| v.max_query_bytes += 1),
+        ("maxResultBytes", |v| v.max_result_bytes += 1),
+        ("maxTurnBytes", |v| v.max_turn_bytes += 1),
+        ("maxDedupRecords", |v| v.max_dedup_records += 1),
+        ("maxDedupBytes", |v| v.max_dedup_bytes += 1),
+        ("compactionTargetBytes", |v| v.compaction_target_bytes += 1),
+        ("compactionThresholdBytes", |v| {
+            v.compaction_threshold_bytes += 1
+        }),
+    ];
+    assert_rotations(&memory, memory_mutations, encoded_memory);
+
+    let mut reordered_agents = memory.clone();
+    reordered_agents.enabled_agents.reverse();
+    assert_eq!(encoded_memory(&memory), encoded_memory(&reordered_agents));
+    let mut unrelated_agent = memory.clone();
+    unrelated_agent
+        .enabled_agents
+        .push("unrelated".parse().expect("agent"));
+    assert_eq!(encoded_memory(&memory), encoded_memory(&unrelated_agent));
+}
+
+#[test]
+fn execution_authority_normalizes_sets_but_commits_every_constraint() {
+    fn bytes(constraints: &ExecutionConstraints) -> Vec<u8> {
+        let mut encoded = AuthorityEncoder::new();
+        encode_execution_constraints(&mut encoded, constraints);
+        encoded.finish()
+    }
+    let baseline = ExecutionConstraints {
+        timeout_ms: 30_000,
+        max_output_bytes: 1_048_576,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec!["b.example:443".to_owned(), "a.example:443".to_owned()],
+            allowed_methods: vec!["POST".to_owned(), "GET".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 3,
+            max_response_bytes: 4,
+            allow_plaintext_loopback: false,
+        }),
+        storage: None,
+    };
+    let mut reordered = baseline.clone();
+    let http = reordered.http.as_mut().expect("HTTP");
+    http.allowed_hosts.reverse();
+    http.allowed_methods.reverse();
+    http.allowed_hosts.push("a.example:443".to_owned());
+    assert_eq!(bytes(&baseline), bytes(&reordered));
+
+    macro_rules! changes {
+        ($mutation:expr) => {{
+            let mut changed = baseline.clone();
+            ($mutation)(&mut changed);
+            assert_ne!(bytes(&baseline), bytes(&changed));
+        }};
+    }
+    changes!(|v: &mut ExecutionConstraints| v.timeout_ms += 1);
+    changes!(|v: &mut ExecutionConstraints| v.max_output_bytes += 1);
+    changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_requests += 1);
+    changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_request_bytes += 1);
+    changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_response_bytes += 1);
+    changes!(|v: &mut ExecutionConstraints| v
+        .http
+        .as_mut()
+        .expect("HTTP")
+        .allow_plaintext_loopback = true);
+    changes!(|v: &mut ExecutionConstraints| v
+        .http
+        .as_mut()
+        .expect("HTTP")
+        .allowed_hosts
+        .push("c.example:443".to_owned()));
+    changes!(|v: &mut ExecutionConstraints| v
+        .http
+        .as_mut()
+        .expect("HTTP")
+        .allowed_methods
+        .push("PATCH".to_owned()));
+
+    let storage = ExecutionConstraints {
+        http: None,
+        storage: Some(StorageConstraints {
+            interface: StorageInterface::Jsonl,
+            access: StorageAccess::ReadOnly,
+            namespace: StorageNamespace::Chat,
+        }),
+        ..ExecutionConstraints::default()
+    };
+    let mut durable = storage.clone();
+    durable.storage.as_mut().expect("storage").interface = StorageInterface::DurableFiles;
+    assert_ne!(bytes(&storage), bytes(&durable));
+    let mut writable = storage.clone();
+    writable.storage.as_mut().expect("storage").access = StorageAccess::ReadWrite;
+    assert_ne!(bytes(&storage), bytes(&writable));
 }
 
 #[test]
@@ -182,6 +565,19 @@ fn exact_chat_scope_configuration_requires_service_canonical_forms() {
             conversation: "-1001:topic:00".to_owned(),
             local_subject_service: None,
         },
+        ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Telegram,
+            transport: "telegram".parse().expect("transport"),
+            channel: "-1001".to_owned(),
+            conversation: "-1001:topic:9223372036854775808".to_owned(),
+            local_subject_service: None,
+        },
+        ChatScopeGrant::ExactChannel {
+            kind: ChatTransportKind::Slack,
+            transport: "slack".parse().expect("transport"),
+            channel: format!("c{}", "x".repeat(256)),
+            local_subject_service: None,
+        },
     ] {
         assert!(
             AttestorGrant {
@@ -192,6 +588,19 @@ fn exact_chat_scope_configuration_requires_service_canonical_forms() {
             .is_err()
         );
     }
+
+    AttestorGrant {
+        namespaces: vec!["telegram".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Telegram,
+            transport: "telegram".parse().expect("transport"),
+            channel: i64::MIN.to_string(),
+            conversation: format!("{}:topic:{}", i64::MIN, i64::MAX),
+            local_subject_service: None,
+        }],
+    }
+    .validate()
+    .expect("signed Telegram service limits are accepted exactly");
 }
 
 #[test]

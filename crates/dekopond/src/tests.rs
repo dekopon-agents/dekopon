@@ -14,8 +14,8 @@ use dekopon_agent::prompt::{
     AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits,
 };
 use dekopon_broker_protocol::{
-    AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, RequestEnvelope,
-    ResponseEnvelope, read_frame, write_frame,
+    AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
+    InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
@@ -40,7 +40,7 @@ use crate::{
     routes::{RouteError, RoutingTable},
     session::{
         BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
-        UNAUTHORIZED_REPLY, run_session,
+        UNAUTHORIZED_REPLY, memory_record_outcome_category, run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
@@ -1242,6 +1242,18 @@ impl ChatReplier for DelayedSurface {
     }
 }
 
+struct PartialDeliveryReplier;
+
+impl ChatReplier for PartialDeliveryReplier {
+    fn reply(
+        &self,
+        _target: ReplyTarget,
+        _text: String,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+        Box::pin(async { Err(TransportError::PartialDelivery) })
+    }
+}
+
 /// Built through the wire shape rather than the guest type, so this crate keeps its dependency
 /// set free of provider-SDK machinery it never links in production.
 fn capability(id: &str) -> AvailableCapability {
@@ -1257,6 +1269,35 @@ fn capability(id: &str) -> AvailableCapability {
         }
     }))
     .expect("capability fixture decodes")
+}
+
+fn memory_surface_response() -> ResponseEnvelope {
+    ResponseEnvelope::chat_capabilities(
+        vec![
+            capability("memory.chat.recent"),
+            capability("memory.chat.search"),
+        ],
+        vec!["memory".to_owned()],
+        Some(ChatMemorySurface {
+            max_lookback_turns: 200,
+            prompt_note: "Durable memory is available only on demand.".to_owned(),
+        }),
+    )
+}
+
+fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationResult {
+    serde_json::from_value(json!({
+        "invocation": "record-result-fixture",
+        "decision": {
+            "decisionId": "record-result-decision",
+            "authorizedBy": "broker",
+            "policyRevision": "record-result-policy"
+        },
+        "outcome": outcome,
+        "error": error,
+        "evidence": []
+    }))
+    .expect("record result fixture decodes")
 }
 
 /// Serves a fixed script of broker responses over a private Unix socket.
@@ -1521,18 +1562,12 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::chat_capabilities(
-                vec![
-                    capability("memory.chat.recent"),
-                    capability("memory.chat.search"),
-                ],
-                vec!["memory".to_owned()],
-                Some(ChatMemorySurface {
-                    max_lookback_turns: 200,
-                    prompt_note: "Durable memory is available only on demand.".to_owned(),
-                }),
-            ),
+            memory_surface_response(),
             ResponseEnvelope::error("outcome-unaudited", "do not retry"),
+            // Keep the listener alive for a third exchange. If recording retries, the request is
+            // observed and receives this response instead of merely failing to reconnect after
+            // the fixture exits.
+            ResponseEnvelope::error("outcome-unaudited", "still do not retry"),
         ],
     )
     .await;
@@ -1573,6 +1608,178 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     assert!(
         observed.try_recv().is_err(),
         "outcome-unknown must never trigger a retry"
+    );
+}
+
+#[test]
+fn record_outcomes_have_a_stable_content_free_failure_vocabulary() {
+    for (outcome, error, expected) in [
+        (InvocationOutcome::Succeeded, None, None),
+        (
+            InvocationOutcome::Denied,
+            Some("policy detail sentinel"),
+            Some("denied"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-capacity"),
+            Some("dedup-capacity"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-conflict"),
+            Some("dedup-conflict"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("memory-corrupt"),
+            Some("memory-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("result-too-large"),
+            Some("result-too-large"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-quota"),
+            Some("storage-quota"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-busy"),
+            Some("storage-busy"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-timeout"),
+            Some("storage-timeout"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-corrupt"),
+            Some("storage-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-io"),
+            Some("storage-io"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("untrusted future detail sentinel"),
+            Some("failed"),
+        ),
+    ] {
+        assert_eq!(
+            memory_record_outcome_category(&record_result(outcome, error)),
+            expected
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_retry() {
+    for (outcome, error) in [
+        (InvocationOutcome::Denied, Some("policy-denied")),
+        (InvocationOutcome::Failed, Some("provider-failure")),
+        (InvocationOutcome::Failed, Some("dedup-capacity")),
+        (InvocationOutcome::Failed, Some("dedup-conflict")),
+        (InvocationOutcome::Failed, Some("storage-quota")),
+        (InvocationOutcome::Failed, Some("storage-busy")),
+        (InvocationOutcome::Failed, Some("storage-timeout")),
+        (InvocationOutcome::Failed, Some("storage-corrupt")),
+        (InvocationOutcome::Failed, Some("storage-io")),
+    ] {
+        let directory = temporary();
+        let result = record_result(outcome, error);
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![
+                memory_surface_response(),
+                ResponseEnvelope::invocation(result.clone()),
+                ResponseEnvelope::invocation(result),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([answer("The delivered answer remains delivered.")]);
+        let replier = Arc::new(RecordingReplier::default());
+
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route(model_config()),
+            message("record this once"),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+
+        assert_eq!(
+            replier.replies(),
+            ["The delivered answer remains delivered."]
+        );
+        assert!(matches!(
+            observed.recv().await.expect("surface request").request,
+            BrokerRequest::CapabilitiesForChat { .. }
+        ));
+        assert!(matches!(
+            observed.recv().await.expect("record request").request,
+            BrokerRequest::RecordDeliveredTurnForChat { .. }
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "{outcome:?}/{error:?} unexpectedly retried"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_text() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::scripted([None]);
+    let replier = Arc::new(RecordingReplier::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("the model will fail"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert_eq!(replier.replies(), [FAILURE_REPLY]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "the fixed gateway failure reply must not be recorded"
+    );
+
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::new([answer("one chunk lands and another fails")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("partial delivery"),
+        Arc::new(PartialDeliveryReplier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "partial transport delivery must not be recorded"
     );
 }
 
@@ -5850,4 +6057,30 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
     assert_eq!(named.conversation_id, "session-7");
+
+    // The receipt resolves only after the transport writer has completed both `write_all` and
+    // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
+    let reply = tokio::spawn({
+        let replier = transport.replier();
+        let target = first.reply.clone();
+        async move { replier.reply(target, "accepted locally".to_owned()).await }
+    });
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut client = BufReader::new(client);
+    let mut line = String::new();
+    client
+        .read_line(&mut line)
+        .await
+        .expect("the flushed reply reaches the local caller");
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).expect("local reply is JSON")["reply"],
+        "accepted locally"
+    );
+    assert!(
+        reply
+            .await
+            .expect("reply task completes")
+            .expect("local write and flush are accepted")
+            .accepted()
+    );
 }

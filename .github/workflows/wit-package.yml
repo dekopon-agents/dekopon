@@ -16,6 +16,10 @@ on:
       - "examples/providers/echo-provider.wasm"
       - "examples/providers/memory-chat/**"
       - "examples/providers/memory-chat-provider.wasm"
+      - "examples/providers/memory-reservation-probe/**"
+      - "examples/providers/memory-reservation-probe-provider.wasm"
+      - "examples/providers/provider-v0-1-compat/**"
+      - "examples/providers/provider-v0-1-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/gh/**"
@@ -44,6 +48,10 @@ on:
       - "examples/providers/echo-provider.wasm"
       - "examples/providers/memory-chat/**"
       - "examples/providers/memory-chat-provider.wasm"
+      - "examples/providers/memory-reservation-probe/**"
+      - "examples/providers/memory-reservation-probe-provider.wasm"
+      - "examples/providers/provider-v0-1-compat/**"
+      - "examples/providers/provider-v0-1-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/gh/**"
@@ -73,6 +81,7 @@ env:
   WKG_SHA256: 8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a
   WASM_TOOLS_VERSION: 1.236.1
   WASM_TOOLS_SHA256: 2ea92231826976cb001c6c6d8708ff54e1ef1ea7229968a75a2119ff26c4cd6f
+  PROVIDER_RUST_TOOLCHAIN: 1.97.0
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.2.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
@@ -115,23 +124,63 @@ jobs:
 
           echo "$tools/bin" >> "$GITHUB_PATH"
 
-      - name: Verify Skylight provider source matches the checked component
+      - name: Deterministically rebuild and inspect every generated provider component
         shell: bash
         run: |
           set -euo pipefail
-          manifest=examples/providers/skylight-private/Cargo.toml
-          component=examples/providers/skylight-private-provider.wasm
+          rustup toolchain install "$PROVIDER_RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$PROVIDER_RUST_TOOLCHAIN"
+          mkdir -p "$RUNNER_TEMP/checked-components" target/wit-package/provider-inspection
+          providers=(
+            echo gh http-probe jsonplaceholder skylight-private memory-chat
+            memory-reservation-probe provider-v0-1-compat storage-probe
+          )
+          for provider in "${providers[@]}"; do
+            artifact="examples/providers/$provider-provider.wasm"
+            cp "$artifact" "$RUNNER_TEMP/checked-components/$provider.wasm"
+            "examples/providers/$provider/build.sh"
+            cmp "$RUNNER_TEMP/checked-components/$provider.wasm" "$artifact"
 
-          cargo "+${RUST_VERSION}" fmt --manifest-path "$manifest" -- --check
-          cargo "+${RUST_VERSION}" clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
-          cargo "+${RUST_VERSION}" test --locked --manifest-path "$manifest"
-          cargo "+${RUST_VERSION}" check --locked --manifest-path "$manifest" --target wasm32-unknown-unknown
+            manifest="examples/providers/$provider/Cargo.toml"
+            cargo tree --locked --manifest-path "$manifest" \
+              --target wasm32-unknown-unknown --edges normal,build \
+              > "target/wit-package/provider-inspection/$provider.tree"
+            if grep -Eqi '(^|[[:space:]])(wasm-bindgen|js-sys|wasi)([[:space:]]|$)' \
+              "target/wit-package/provider-inspection/$provider.tree"; then
+              echo "forbidden ambient dependency in $provider" >&2
+              exit 1
+            fi
 
-          expected_component=$(mktemp)
-          trap 'rm -f "$expected_component"' EXIT
-          cp "$component" "$expected_component"
-          examples/providers/skylight-private/build.sh
-          cmp "$expected_component" "$component"
+            core=$(find "examples/providers/$provider/target/wasm32-unknown-unknown/release" \
+              -maxdepth 1 -type f -name '*.wasm' -print -quit)
+            test -n "$core"
+            wasm-tools metadata show "$core" \
+              > "target/wit-package/provider-inspection/$provider.core-producers.txt"
+            wasm-tools metadata show "$artifact" \
+              > "target/wit-package/provider-inspection/$provider.component-producers.txt"
+            grep -q 'Rust' "target/wit-package/provider-inspection/$provider.core-producers.txt"
+            grep -q 'wit-bindgen-rust' \
+              "target/wit-package/provider-inspection/$provider.component-producers.txt"
+            wasm-tools print "$core" | grep '(import ' \
+              > "target/wit-package/provider-inspection/$provider.core-imports.txt" || true
+
+            expected=''
+            case "$provider" in
+              gh|http-probe|jsonplaceholder|skylight-private) expected='dekopon:http/client@1.0.0' ;;
+              memory-chat) expected='dekopon:storage/jsonl@0.1.0' ;;
+              storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
+            esac
+            imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
+            if [ -z "$expected" ]; then
+              test ! -s "$imports"
+            else
+              test -s "$imports"
+              if grep -Fv "$expected" "$imports"; then
+                echo "unexpected core import in $provider" >&2
+                exit 1
+              fi
+            fi
+          done
 
       - name: Build the WIT packages
         shell: bash
@@ -147,6 +196,7 @@ jobs:
             examples/providers/jsonplaceholder/wit/deps/provider.wit \
             examples/providers/skylight-private/wit/deps/provider.wit \
             examples/providers/memory-chat/wit/deps/provider.wit \
+            examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
           do
             cmp crates/dekopon-provider-sdk/wit/provider.wit "$mirror"
@@ -281,18 +331,77 @@ jobs:
           wasm-tools validate "$package"
           wasm-tools component wit --json "$package" > target/wit-package/dekopon-storage.json
           jq --exit-status --arg package "$STORAGE_WIT_PACKAGE" '
-            (.packages | length == 1) and
-            (.packages[0].name == $package) and
-            (.packages[0].interfaces == {"jsonl": 0, "durable-files": 1}) and
-            (.packages[0].worlds == {}) and
-            (.interfaces | map(.name) == ["jsonl", "durable-files"]) and
-            ((.interfaces[0].functions | keys) == ["append", "read-chunk", "replace", "size"]) and
-            ((.interfaces[1].functions | keys | contains([
-              "open", "stat", "remove", "rename-atomic", "random-bytes",
-              "monotonic-time-ns", "wall-time-ms", "[method]file.read-at",
-              "[method]file.write-at", "[method]file.lock"
-            ]))) and
-            (.worlds == [])
+            def sigs: with_entries(.value |= {kind, params, result});
+            def errors: [
+              {"name":"not-found"}, {"name":"already-exists"},
+              {"name":"invalid-name"}, {"name":"invalid-argument"},
+              {"name":"permission-denied"}, {"name":"quota-exceeded"},
+              {"name":"busy"}, {"name":"timeout"}, {"name":"unsupported"},
+              {"name":"corrupt"}, {"name":"io"}
+            ];
+            (.packages == [{
+              "name": $package,
+              "interfaces": {"jsonl": 0, "durable-files": 1},
+              "worlds": {}
+            }]) and
+            (.worlds == []) and
+            (.interfaces | map({name, types, functions: (.functions | sigs), package}) == [
+              {
+                "name":"jsonl", "types":{"storage-error":0,"chunk":2}, "package":0,
+                "functions": {
+                  "size":{"kind":"freestanding","params":[{"name":"name","type":"string"}],"result":3},
+                  "read-chunk":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"offset","type":"u64"},{"name":"max-bytes","type":"u32"}],"result":4},
+                  "append":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"expected-size","type":"u64"},{"name":"record","type":1}],"result":3},
+                  "replace":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"expected-size","type":"u64"},{"name":"contents","type":1}],"result":5}
+                }
+              },
+              {
+                "name":"durable-files",
+                "types":{"open-flags":6,"durability":7,"lock-level":8,"storage-error":9,"file-stat":10,"file":11},
+                "package":0,
+                "functions": {
+                  "[method]file.read-at":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"offset","type":"u64"},{"name":"max-bytes","type":"u32"}],"result":14},
+                  "[method]file.write-at":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"offset","type":"u64"},{"name":"bytes","type":13}],"result":15},
+                  "[method]file.size":{"kind":{"method":11},"params":[{"name":"self","type":12}],"result":16},
+                  "[method]file.truncate":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"size","type":"u64"}],"result":15},
+                  "[method]file.sync":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"mode","type":7}],"result":15},
+                  "[method]file.lock":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"level","type":8}],"result":15},
+                  "[method]file.unlock":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"to","type":8}],"result":15},
+                  "[method]file.check-reserved-lock":{"kind":{"method":11},"params":[{"name":"self","type":12}],"result":17},
+                  "open":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"flags","type":6}],"result":19},
+                  "stat":{"kind":"freestanding","params":[{"name":"name","type":"string"}],"result":21},
+                  "remove":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"mode","type":7}],"result":15},
+                  "rename-atomic":{"kind":"freestanding","params":[{"name":"from","type":"string"},{"name":"to","type":"string"},{"name":"replace","type":"bool"},{"name":"mode","type":7}],"result":15},
+                  "random-bytes":{"kind":"freestanding","params":[{"name":"length","type":"u32"}],"result":14},
+                  "monotonic-time-ns":{"kind":"freestanding","params":[],"result":16},
+                  "wall-time-ms":{"kind":"freestanding","params":[],"result":16}
+                }
+              }
+            ]) and
+            (.types | map({name, kind, owner}) == [
+              {"name":"storage-error","kind":{"enum":{"cases":errors}},"owner":{"interface":0}},
+              {"name":null,"kind":{"list":"u8"},"owner":null},
+              {"name":"chunk","kind":{"record":{"fields":[{"name":"bytes","type":1},{"name":"next-offset","type":"u64"},{"name":"eof","type":"bool"}]}},"owner":{"interface":0}},
+              {"name":null,"kind":{"result":{"ok":"u64","err":0}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":2,"err":0}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":null,"err":0}},"owner":null},
+              {"name":"open-flags","kind":{"flags":{"flags":[{"name":"read"},{"name":"write"},{"name":"create"},{"name":"create-new"},{"name":"delete-on-close"}]}},"owner":{"interface":1}},
+              {"name":"durability","kind":{"enum":{"cases":[{"name":"data"},{"name":"data-and-metadata"},{"name":"full"}]}},"owner":{"interface":1}},
+              {"name":"lock-level","kind":{"enum":{"cases":[{"name":"none"},{"name":"shared"},{"name":"reserved"},{"name":"pending"},{"name":"exclusive"}]}},"owner":{"interface":1}},
+              {"name":"storage-error","kind":{"enum":{"cases":errors}},"owner":{"interface":1}},
+              {"name":"file-stat","kind":{"record":{"fields":[{"name":"size","type":"u64"},{"name":"identity","type":"u64"}]}},"owner":{"interface":1}},
+              {"name":"file","kind":"resource","owner":{"interface":1}},
+              {"name":null,"kind":{"handle":{"borrow":11}},"owner":null},
+              {"name":null,"kind":{"list":"u8"},"owner":null},
+              {"name":null,"kind":{"result":{"ok":13,"err":9}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":null,"err":9}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":"u64","err":9}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":"bool","err":9}},"owner":null},
+              {"name":null,"kind":{"handle":{"own":11}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":18,"err":9}},"owner":null},
+              {"name":null,"kind":{"option":10},"owner":null},
+              {"name":null,"kind":{"result":{"ok":20,"err":9}},"owner":null}
+            ])
           ' target/wit-package/dekopon-storage.json
 
       - name: Verify the storage facade default feature set imports nothing
@@ -312,6 +421,45 @@ jobs:
             ((.worlds[0].exports | keys) == ["describe", "invoke"])
           ' "$description"
 
+      - name: Verify the historical provider 0.1 compatibility component
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/provider-v0-1-compat-provider.wasm
+          description=target/wit-package/provider-v0-1-compat.json
+          grep -Fxq 'package dekopon:provider@0.1.0;' \
+            examples/providers/provider-v0-1-compat/wit/deps/provider.wit
+          grep -Fq 'include dekopon:provider/provider@0.1.0;' \
+            examples/providers/provider-v0-1-compat/wit/provider.wit
+          if grep -Rq 'dekopon:provider@0.2.0' \
+            examples/providers/provider-v0-1-compat/wit; then
+            echo "historical fixture was regenerated against the current provider package" >&2
+            exit 1
+          fi
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].imports == {}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke"])
+          ' "$description"
+
+      - name: Verify the malicious memory reservation fixture is import-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/memory-reservation-probe-provider.wasm
+          description=target/wit-package/memory-reservation-probe.json
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].imports == {}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "resolve-command"])
+          ' "$description"
+
       - name: Verify storage-importing provider fixtures
         shell: bash
         run: |
@@ -325,7 +473,6 @@ jobs:
             expected_exports='["describe", "invoke", "resolve-command"]'
             if [ "$name" = storage-probe ]; then
               expected=durable-files
-              expected_exports='["describe", "invoke"]'
             fi
             jq --exit-status --arg interface "$expected" --argjson exports "$expected_exports" '
               (.packages | map(.name) == ["dekopon:storage@0.1.0", "root:component"]) and

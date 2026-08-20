@@ -14,6 +14,6 @@ owner-authored storage constraint and commits mutations only after a valid succe
 response.
 
 ```toml
-# JSONL-only provider: exactly one storage interface import.
-dekopon-provider-storage = { version = "0.8.0", default-features = false, features = ["jsonl"] }
+# Unreleased repository fixture: JSONL-only means exactly one storage interface import.
+dekopon-provider-storage = { path = "../../../crates/dekopon-provider-storage", default-features = false, features = ["jsonl"] }
 ```

@@ -5,7 +5,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dekopon_storage_host::{
@@ -68,6 +68,7 @@ impl Drop for JobGuard {
 pub(crate) struct ActiveStorage {
     transaction: Arc<Mutex<Option<StorageTransaction>>>,
     jobs: Arc<ActiveJobs>,
+    finalization_budget: Duration,
 }
 
 /// Per-store storage context. A disabled context is still linked so imports can be diagnosed.
@@ -88,10 +89,12 @@ impl StorageState {
         Self::Disabled { attempted: false }
     }
     pub(crate) fn active(transaction: StorageTransaction) -> Self {
+        let finalization_budget = transaction.finalization_budget();
         Self::Active {
             active: ActiveStorage {
                 transaction: Arc::new(Mutex::new(Some(transaction))),
                 jobs: Arc::new(ActiveJobs::new()),
+                finalization_budget,
             },
             violation: None,
             evidence: None,
@@ -166,6 +169,9 @@ impl StorageState {
         let active_jobs = Arc::clone(&active.jobs);
         let transaction = Arc::clone(&active.transaction);
         let rejected = violation.is_some();
+        let deadline = Instant::now()
+            .checked_add(active.finalization_budget)
+            .ok_or(StorageHostError::Arithmetic)?;
         let finished = tokio::task::spawn_blocking(move || {
             active_jobs.wait();
             let transaction = transaction
@@ -175,15 +181,23 @@ impl StorageState {
                 .ok_or(StorageHostError::Corrupt {
                     scope: "finalized-transaction",
                 })?;
+            if commit && !rejected && Instant::now() >= deadline {
+                transaction.abort();
+                return Err(StorageHostError::Timeout);
+            }
             let output_commitment = output
                 .as_deref()
                 .map(|bytes| transaction.output_commitment(bytes));
+            if commit && !rejected && Instant::now() >= deadline {
+                transaction.abort();
+                return Err(StorageHostError::Timeout);
+            }
             let mut result = if !commit || rejected {
                 transaction.abort()
             } else if transaction.access() == dekopon_capability::StorageAccess::ReadOnly {
                 transaction.finish_read()?
             } else {
-                transaction.commit()?
+                transaction.commit_before(deadline)?
             };
             result.output_commitment = output_commitment;
             Ok::<StorageEvidence, StorageHostError>(result)
@@ -552,5 +566,186 @@ fn public_reason(error: &StorageHostError) -> &'static str {
         | StorageHostError::KeyMismatch => "corrupt",
         StorageHostError::PermissionDenied | StorageHostError::GrantHostMismatch => "denied",
         _ => "io",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        time::{Duration, Instant},
+    };
+
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+    use dekopon_storage_host::{
+        ContinuityPolicy, StorageGrantRequest, StorageHost, StorageHostError, StorageLimits,
+    };
+
+    use super::StorageState;
+
+    fn request(invocation: &str) -> StorageGrantRequest {
+        StorageGrantRequest::new(
+            invocation.parse().expect("invocation"),
+            "storage-probe.run".parse().expect("capability"),
+            "storage-probe".parse().expect("provider"),
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadWrite,
+            StorageNamespace::Chat,
+            "provider-test".parse().expect("agent"),
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "slack",
+            "probe-transport",
+            "c0123abc",
+            "c0123abc:1712345678.000100",
+            ContinuityPolicy::Stable,
+            b"probe-authority".to_vec(),
+        )
+    }
+
+    fn jsonl_request(invocation: &str, access: StorageAccess) -> StorageGrantRequest {
+        StorageGrantRequest::new(
+            invocation.parse().expect("invocation"),
+            "memory.chat.record".parse().expect("capability"),
+            "memory-chat".parse().expect("provider"),
+            StorageInterface::Jsonl,
+            access,
+            StorageNamespace::Chat,
+            "provider-test".parse().expect("agent"),
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "slack",
+            "probe-transport",
+            "c0123abc",
+            "c0123abc:1712345678.000100",
+            ContinuityPolicy::Stable,
+            b"probe-authority".to_vec(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalization_budget_includes_draining_an_already_started_host_job() {
+        let directory = tempfile::tempdir().expect("storage directory");
+        let directory = directory
+            .path()
+            .canonicalize()
+            .expect("canonical directory");
+        let root = directory.join("root");
+        let key = directory.join("key.yaml");
+        fs::write(
+            &key,
+            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        let host = StorageHost::open(
+            &root,
+            &key,
+            StorageLimits {
+                finalization_budget_ms: 30,
+                ..StorageLimits::default()
+            },
+        )
+        .expect("host");
+        let mut transaction = host
+            .begin(
+                host.grant(jsonl_request("drain-budget", StorageAccess::ReadWrite))
+                    .expect("grant"),
+            )
+            .expect("transaction");
+        transaction
+            .jsonl_append("turns.jsonl", 0, br#"{"provisional":true}"#)
+            .expect("provisional append");
+        let mut state = StorageState::active(transaction);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                state.call(|_transaction| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                }),
+            )
+            .await
+            .is_err(),
+            "the host-call future should be cancelled while its blocking job drains"
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            state.finish(true, None).await,
+            Err(StorageHostError::Timeout)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(70));
+
+        let mut reader = host
+            .begin(
+                host.grant(jsonl_request("drain-budget-read", StorageAccess::ReadOnly))
+                    .expect("read grant"),
+            )
+            .expect("reader");
+        assert!(matches!(
+            reader.jsonl_size("turns.jsonl"),
+            Err(StorageHostError::NotFound)
+        ));
+        reader.finish_read().expect("finish reader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_host_call_drains_its_blocking_job_before_releasing_the_lease() {
+        let directory = tempfile::tempdir().expect("storage directory");
+        let directory = directory
+            .path()
+            .canonicalize()
+            .expect("canonical directory");
+        let root = directory.join("root");
+        let key = directory.join("key.yaml");
+        fs::write(
+            &key,
+            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        let host = StorageHost::open(
+            &root,
+            &key,
+            StorageLimits {
+                lock_timeout_ms: 1_000,
+                ..StorageLimits::default()
+            },
+        )
+        .expect("host");
+        let transaction = host
+            .begin(host.grant(request("cancel-held")).expect("grant"))
+            .expect("transaction");
+        let (started_send, started_receive) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let mut state = StorageState::active(transaction);
+            state
+                .call(move |_transaction| {
+                    let _ = started_send.send(());
+                    std::thread::sleep(Duration::from_millis(150));
+                    Ok(())
+                })
+                .await
+        });
+        started_receive.await.expect("blocking operation started");
+        operation.abort();
+
+        let competing_host = host.clone();
+        let competing =
+            tokio::task::spawn_blocking(move || competing_host.grant(request("cancel-competing")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), competing)
+                .await
+                .is_err(),
+            "cancellation released a lease while its native job was still running"
+        );
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let followup_host = host.clone();
+        let followup =
+            tokio::task::spawn_blocking(move || followup_host.grant(request("cancel-followup")));
+        tokio::time::timeout(Duration::from_secs(2), followup)
+            .await
+            .expect("drained job retained the lease forever")
+            .expect("blocking task")
+            .expect("followup grant");
     }
 }

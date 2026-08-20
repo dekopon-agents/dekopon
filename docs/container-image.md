@@ -14,7 +14,7 @@ no image.
 
 One image, `ghcr.io/dekopon-agents/dekopon`, carrying all four binaries for `linux/amd64` and
 `linux/arm64`. It is a separate GHCR package from the published WIT interface packages
-`dekopon/provider` and `dekopon/http`, which are OCI artifacts rather than images.
+`dekopon/provider`, `dekopon/http`, and `dekopon/storage`, which are OCI artifacts rather than images.
 
 One image rather than four is a deployment fact, not a convenience. `dekopon-brokerd` binds a
 `0600` Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
@@ -103,7 +103,8 @@ Only `echo-provider.wasm` loads on the direct runner. The other default componen
 and optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
 Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
 retention. An operator must name the exact optional file or explicitly scan its directory. The
-`storage-probe` fixture is not packaged anywhere in the image.
+`storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
+the image.
 
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.

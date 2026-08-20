@@ -70,32 +70,36 @@ impl StorageTransaction {
         if !exists && !options.create && !options.create_new {
             return Err(StorageHostError::NotFound);
         }
-        if !exists {
-            self.charge_write(0)?;
-            self.reserve_candidate(&[(&token, Some(&[]))])?;
-            let identity = self.allocate_file_identity()?;
-            let entry = self.entries.get_mut(&token).expect("loaded entry");
-            entry.data = Some(Vec::new());
-            entry.identity = identity;
-            entry.dirty = true;
-        }
-        self.ledger.acquire_handle()?;
         let handle = self.next_handle;
-        self.next_handle = self
-            .next_handle
-            .checked_add(1)
-            .ok_or(StorageHostError::Arithmetic)?;
-        self.handles.insert(
-            handle,
-            crate::transaction::HandleState {
-                token,
-                read: options.read,
-                write: options.write,
-                delete_on_close: options.delete_on_close,
-                lock: LockLevel::None,
-            },
-        );
-        Ok(handle)
+        let next_handle = handle.checked_add(1).ok_or(StorageHostError::Arithmetic)?;
+        self.ledger.acquire_handle()?;
+        let opened = (|| {
+            if !exists {
+                self.charge_write(0)?;
+                let identity = self.allocate_file_identity()?;
+                self.reserve_candidate(&[(&token, Some(&[]))])?;
+                let entry = self.entries.get_mut(&token).expect("loaded entry");
+                entry.data = Some(Vec::new());
+                entry.identity = identity;
+                entry.dirty = true;
+            }
+            self.handles.insert(
+                handle,
+                crate::transaction::HandleState {
+                    token,
+                    read: options.read,
+                    write: options.write,
+                    delete_on_close: options.delete_on_close,
+                    lock: LockLevel::None,
+                },
+            );
+            self.next_handle = next_handle;
+            Ok(handle)
+        })();
+        if opened.is_err() {
+            self.ledger.release_handle();
+        }
+        opened
     }
 
     pub fn vfs_close(&mut self, handle: u64) -> Result<(), StorageHostError> {
@@ -201,24 +205,40 @@ impl StorageTransaction {
             return Err(StorageHostError::PermissionDenied);
         }
         self.load_token(&state.token)?;
-        let current = self
+        let current_length = self
             .entries
             .get(&state.token)
             .and_then(|entry| entry.data.as_ref())
-            .cloned()
+            .map(Vec::len)
             .ok_or(StorageHostError::NotFound)?;
         let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
         let end = start
             .checked_add(bytes.len())
             .ok_or(StorageHostError::Arithmetic)?;
-        let logical_write = end.saturating_sub(current.len()).max(bytes.len()) as u64;
+        let logical_write = end.saturating_sub(current_length).max(bytes.len()) as u64;
         self.charge_write(logical_write)?;
-        let mut replacement = current;
+        let mut replacement = self
+            .entries
+            .get_mut(&state.token)
+            .expect("open entry")
+            .data
+            .take()
+            .expect("loaded existing file");
+        let overlap_end = end.min(current_length);
+        let overwritten = (start < overlap_end).then(|| replacement[start..overlap_end].to_vec());
         if replacement.len() < end {
             replacement.resize(end, 0);
         }
         replacement[start..end].copy_from_slice(bytes);
-        self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])?;
+        if let Err(error) = self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])
+        {
+            if let Some(overwritten) = overwritten {
+                replacement[start..overlap_end].copy_from_slice(&overwritten);
+            }
+            replacement.truncate(current_length);
+            self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
+            return Err(error);
+        }
         let entry = self.entries.get_mut(&state.token).expect("open entry");
         entry.data = Some(replacement);
         entry.dirty = true;
@@ -251,17 +271,36 @@ impl StorageTransaction {
         }
         let target = usize::try_from(size).map_err(|_| StorageHostError::QuotaExceeded)?;
         self.load_token(&state.token)?;
-        let current = self
+        let current_length = self
             .entries
             .get(&state.token)
             .and_then(|entry| entry.data.as_ref())
-            .cloned()
+            .map(Vec::len)
             .ok_or(StorageHostError::NotFound)?;
-        let growth = target.saturating_sub(current.len()) as u64;
+        let growth = target.saturating_sub(current_length) as u64;
         self.charge_write(growth)?;
-        let mut replacement = current;
+        let mut replacement = self
+            .entries
+            .get_mut(&state.token)
+            .expect("open entry")
+            .data
+            .take()
+            .expect("loaded existing file");
+        if target > current_length {
+            replacement.resize(target, 0);
+        }
+        let candidate = &replacement[..target.min(current_length)];
+        let result = if target > current_length {
+            self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])
+        } else {
+            self.reserve_candidate(&[(&state.token, Some(candidate))])
+        };
+        if let Err(error) = result {
+            replacement.truncate(current_length);
+            self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
+            return Err(error);
+        }
         replacement.resize(target, 0);
-        self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])?;
         let entry = self.entries.get_mut(&state.token).expect("open entry");
         entry.data = Some(replacement);
         entry.dirty = true;
@@ -325,18 +364,31 @@ impl StorageTransaction {
         {
             return Err(StorageHostError::Busy);
         }
-        let source = self.entries[&from_token]
-            .data
-            .clone()
-            .ok_or(StorageHostError::NotFound)?;
+        if self.entries[&from_token].data.is_none() {
+            return Err(StorageHostError::NotFound);
+        }
         if !replace && self.entries[&to_token].data.is_some() {
             return Err(StorageHostError::AlreadyExists);
         }
-        self.reserve_candidate(&[(&from_token, None), (&to_token, Some(source.as_slice()))])?;
         let identity = self.entries[&from_token].identity;
+        let source = self
+            .entries
+            .get_mut(&from_token)
+            .expect("loaded source")
+            .data
+            .take()
+            .expect("source existence checked");
+        if let Err(error) =
+            self.reserve_candidate(&[(&from_token, None), (&to_token, Some(source.as_slice()))])
+        {
+            self.entries
+                .get_mut(&from_token)
+                .expect("loaded source")
+                .data = Some(source);
+            return Err(error);
+        }
         {
             let entry = self.entries.get_mut(&from_token).expect("loaded source");
-            entry.data = None;
             entry.identity = 0;
             entry.dirty = true;
         }

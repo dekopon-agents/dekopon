@@ -115,7 +115,8 @@ jobs:
             echo "push=$push"
             # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
             # cannot push to the wrong package. The published WIT packages are separate GHCR
-            # packages under the same owner (dekopon/provider, dekopon/http) and are unaffected.
+            # packages under the same owner (dekopon/provider, dekopon/http, dekopon/storage) and
+            # are unaffected.
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
             # Publishing checks out the tag so the baked components and the Dockerfile match the
             # release; a pull request checks out itself, which is the point.

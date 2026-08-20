@@ -27,7 +27,7 @@ use crate::{
 const MANIFEST_VERSION: &str = "dekopon.dev/storage-transaction/v1alpha1";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PostMarkerFault {
     MarkerFileSync,
     MarkerDirectorySync,
@@ -37,6 +37,12 @@ pub(crate) enum PostMarkerFault {
     Evidence,
     Cleanup,
     TransactionSync,
+    FinalizedCreate,
+    FinalizedFileSync,
+    FinalizedDirectorySync,
+    PoisonCreate,
+    PoisonFileSync,
+    PoisonDirectorySync,
 }
 
 #[derive(Clone, Debug)]
@@ -115,11 +121,15 @@ pub struct StorageTransaction {
     pub(crate) namespaces_root: Directory,
     pub(crate) transactions_root: Directory,
     pub(crate) trash_root: Directory,
+    poisoned_bases: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    retired_transaction: Option<String>,
     reservation: Option<Reservation>,
     lease: Option<File>,
     finalized: bool,
     #[cfg(test)]
-    post_marker_fault: Option<PostMarkerFault>,
+    post_marker_faults: BTreeSet<PostMarkerFault>,
+    #[cfg(test)]
+    post_marker_delay: Option<Duration>,
 }
 
 impl std::fmt::Debug for StorageTransaction {
@@ -135,6 +145,7 @@ impl StorageTransaction {
         namespaces_root: Directory,
         transactions_root: Directory,
         trash_root: Directory,
+        poisoned_bases: Arc<std::sync::Mutex<BTreeSet<String>>>,
     ) -> Result<Self, StorageHostError> {
         if grant.namespace.base_directory.exists("poisoned")?
             || grant.namespace.directory.exists("poisoned")?
@@ -161,7 +172,11 @@ impl StorageTransaction {
             .checked_add(ENTRY_CHARGE)
             .ok_or(StorageHostError::Arithmetic)?;
         let mut baseline_files = BTreeSet::new();
-        for token in grant.namespace.data_directory.entries()? {
+        for token in grant
+            .namespace
+            .data_directory
+            .entries_bounded(grant.limits.max_files_per_namespace)?
+        {
             if !is_token(&token) {
                 return Err(StorageHostError::Corrupt {
                     scope: "logical-token",
@@ -218,11 +233,15 @@ impl StorageTransaction {
             namespaces_root,
             transactions_root,
             trash_root,
+            poisoned_bases,
+            retired_transaction: None,
             reservation: Some(reservation),
             lease: Some(lease),
             finalized: false,
             #[cfg(test)]
-            post_marker_fault: None,
+            post_marker_faults: BTreeSet::new(),
+            #[cfg(test)]
+            post_marker_delay: None,
         })
     }
 
@@ -473,9 +492,10 @@ impl StorageTransaction {
             .iter()
             .filter(|change| change.new.is_some())
             .count() as u64;
-        // Transaction directory + manifest + commit + applied, plus one base poison marker whose
-        // headroom must already exist if any post-marker step becomes outcome-unknown.
-        let mut desired = 5_u64
+        // Transaction directory + manifest + commit + applied/finalized marker, plus a base poison
+        // marker. Failure-state headroom is reserved before staging: a base marker can fail while
+        // the already-retired transaction remains the durable unknown-by-default evidence.
+        let mut desired = 6_u64
             .checked_add(staged)
             .and_then(|entries| entries.checked_mul(ENTRY_CHARGE))
             .and_then(|bytes| bytes.checked_add(manifest_bytes.encoded.len() as u64))
@@ -487,7 +507,7 @@ impl StorageTransaction {
                     .ok_or(StorageHostError::Arithmetic)?;
             }
         }
-        let staged_entries = staged.checked_add(5).ok_or(StorageHostError::Arithmetic)?;
+        let staged_entries = staged.checked_add(6).ok_or(StorageHostError::Arithmetic)?;
         let result = self
             .reservation
             .as_mut()
@@ -566,13 +586,17 @@ impl StorageTransaction {
 
     #[cfg(test)]
     pub(crate) fn inject_post_marker_fault(&mut self, fault: PostMarkerFault) {
-        self.post_marker_fault = Some(fault);
+        self.post_marker_faults.insert(fault);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_post_marker_delay(&mut self, delay: Duration) {
+        self.post_marker_delay = Some(delay);
     }
 
     #[cfg(test)]
     fn fail_post_marker(&mut self, fault: PostMarkerFault) -> Result<(), StorageHostError> {
-        if self.post_marker_fault == Some(fault) {
-            self.post_marker_fault = None;
+        if self.post_marker_faults.remove(&fault) {
             Err(StorageHostError::Io)
         } else {
             Ok(())
@@ -584,8 +608,23 @@ impl StorageTransaction {
         Ok(())
     }
 
+    /// Returns the complete budget shared by job draining and not-yet-started finalization steps.
+    #[must_use]
+    pub fn finalization_budget(&self) -> Duration {
+        Duration::from_millis(self.limits.finalization_budget_ms)
+    }
+
     /// Makes all provisional files durable. The synchronized `commit` marker is the durable point.
-    pub fn commit(mut self) -> Result<StorageEvidence, StorageHostError> {
+    pub fn commit(self) -> Result<StorageEvidence, StorageHostError> {
+        let deadline = Instant::now()
+            .checked_add(self.finalization_budget())
+            .ok_or(StorageHostError::Arithmetic)?;
+        self.commit_before(deadline)
+    }
+
+    /// Finalizes against a deadline started by the async adapter before draining active jobs.
+    #[doc(hidden)]
+    pub fn commit_before(mut self, deadline: Instant) -> Result<StorageEvidence, StorageHostError> {
         if !self.handles.is_empty() {
             return Err(StorageHostError::Busy);
         }
@@ -606,9 +645,6 @@ impl StorageTransaction {
         // first staging mutation.
         self.reserve_candidate(&[])?;
         let manifest = encode_manifest(&self.key, &self.namespace, changes)?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(self.limits.finalization_budget_ms))
-            .ok_or(StorageHostError::Arithmetic)?;
         check_budget(deadline)?;
         let (transaction_token, transaction_directory) =
             self.create_transaction_directory(deadline)?;
@@ -680,15 +716,30 @@ impl StorageTransaction {
             // Move a partial manifest/stage set atomically out of the recovery directory before
             // deleting it. A failed recursive unlink can then leave only bounded trash, never an
             // unknown transaction state that blocks the next startup.
-            let _ = discard_transaction(
+            let fully_removed = discard_transaction(
                 &self.transactions_root,
                 &self.trash_root,
                 &transaction_token,
-            );
+                Some(deadline),
+            )
+            .unwrap_or(false);
+            if !fully_removed && let Some(reservation) = self.reservation.take() {
+                // The outcome is known to be uncommitted, but partial staging/trash still occupies
+                // quota. Retain its exact pre-reserved peak until restart reconstructs accounting.
+                reservation.retain_after_unknown();
+            }
             return Err(error);
         }
 
+        #[cfg(test)]
+        if let Some(delay) = self.post_marker_delay.take() {
+            std::thread::sleep(delay);
+        }
         let after_marker = (|| -> Result<(StorageEvidence, String, Usage), StorageHostError> {
+            // A marker sync is one already-started native syscall and may drain after the deadline.
+            // Recheck before beginning the first apply step rather than treating the pre-sync check
+            // as permission for the rest of finalization.
+            check_budget(deadline)?;
             self.fail_post_marker(PostMarkerFault::Apply)?;
             apply_manifest_data(
                 &self.namespaces_root,
@@ -722,6 +773,16 @@ impl StorageTransaction {
             self.transactions_root.sync()?;
             check_budget(deadline)?;
             self.fail_post_marker(PostMarkerFault::Cleanup)?;
+            let retired_candidate = format!("transaction-{transaction_token}");
+            if self.trash_root.exists(&retired_candidate)? {
+                return Err(StorageHostError::Corrupt {
+                    scope: "trash-collision",
+                });
+            }
+            // Record the deterministic destination before rename. If a parent sync or follow-up
+            // scan fails after the rename itself, absence of `finalized` keeps the retired
+            // directory outcome-unknown on the next startup without requiring another write.
+            self.retired_transaction = Some(retired_candidate);
             let (retired_name, retired_usage) = retire_transaction(
                 &self.transactions_root,
                 &self.trash_root,
@@ -730,16 +791,37 @@ impl StorageTransaction {
                 Some(deadline),
             )?;
 
+            let finalized_usage = Usage {
+                bytes: retired_usage
+                    .bytes
+                    .checked_add(ENTRY_CHARGE)
+                    .ok_or(StorageHostError::Arithmetic)?,
+                entries: retired_usage
+                    .entries
+                    .checked_add(1)
+                    .ok_or(StorageHostError::Arithmetic)?,
+                files: retired_usage
+                    .files
+                    .checked_add(1)
+                    .ok_or(StorageHostError::Arithmetic)?,
+            };
             check_budget(deadline)?;
             self.fail_post_marker(PostMarkerFault::Accounting)?;
             if let Some(reservation) = self.reservation.as_mut() {
-                reservation.commit(final_usage, retired_usage)?;
+                reservation.commit(final_usage, finalized_usage)?;
             }
-            // A finalized reservation drops without changing the reconciled ledger. Keeping it in
-            // the option until commit succeeds lets post-marker error handling retain conservative
-            // headroom even if reconciliation itself ever fails.
-            self.reservation.take();
-            Ok((evidence, retired_name, retired_usage))
+
+            // `finalized` is written only after scan, evidence, retirement, and ledger
+            // reconciliation finish. On restart every committed retired transaction lacking this
+            // synchronized marker is outcome-unknown by default, even if both live poison and
+            // diagnostic marker writes failed.
+            self.write_finalized_marker(&retired_name, deadline)?;
+            // Release staging/failure headroom only after the marker is durable. Any marker error
+            // keeps that reservation (including poison headroom) for the rest of this process.
+            if let Some(reservation) = self.reservation.take() {
+                reservation.finish_commit();
+            }
+            Ok((evidence, retired_name, finalized_usage))
         })();
         match after_marker {
             Ok((evidence, retired_name, retired_usage)) => {
@@ -757,7 +839,7 @@ impl StorageTransaction {
     }
 
     fn create_transaction_directory(
-        &self,
+        &mut self,
         deadline: Instant,
     ) -> Result<(String, Directory), StorageHostError> {
         for _ in 0..16 {
@@ -775,7 +857,27 @@ impl StorageTransaction {
             match self.transactions_root.create_directory(&token) {
                 Ok(directory) => return Ok((token, directory)),
                 Err(StorageHostError::AlreadyExists) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // `mkdirat` may have succeeded before opening/validating the retained child
+                    // failed. Retire that exact token when possible; otherwise keep its complete
+                    // reservation charged instead of turning a failed create into free trash.
+                    let remains = self.transactions_root.exists(&token).unwrap_or(true);
+                    let fully_removed = remains
+                        && discard_transaction(
+                            &self.transactions_root,
+                            &self.trash_root,
+                            &token,
+                            Some(deadline),
+                        )
+                        .unwrap_or(false);
+                    if remains
+                        && !fully_removed
+                        && let Some(reservation) = self.reservation.take()
+                    {
+                        reservation.retain_after_unknown();
+                    }
+                    return Err(error);
+                }
             }
         }
         Err(StorageHostError::Busy)
@@ -785,16 +887,90 @@ impl StorageTransaction {
         if check_budget(deadline).is_err() {
             return;
         }
-        if self.trash_root.remove_tree(name).is_err() || check_budget(deadline).is_err() {
+        if self.trash_root.remove_tree(name).is_err() {
             return;
         }
-        if self.trash_root.sync().is_ok() {
-            self.ledger.release_root_usage(usage);
+        // The entry is absent in this process now. Release its charge even if a later deadline or
+        // parent sync fails; restart reconstructs whichever directory state survived a crash.
+        self.ledger.release_root_usage(usage);
+        if check_budget(deadline).is_err() {
+            return;
+        }
+        let _ = self.trash_root.sync();
+    }
+
+    fn write_finalized_marker(
+        &mut self,
+        retired: &str,
+        deadline: Instant,
+    ) -> Result<(), StorageHostError> {
+        let directory = self.trash_root.open_directory(retired)?;
+        check_budget(deadline)?;
+        self.fail_post_marker(PostMarkerFault::FinalizedCreate)?;
+        let marker = directory.create_private("finalized.pending")?;
+        check_budget(deadline)?;
+        self.fail_post_marker(PostMarkerFault::FinalizedFileSync)?;
+        marker
+            .sync_all()
+            .map_err(|source| directory.io_error(source))?;
+        drop(marker);
+        check_budget(deadline)?;
+        directory.rename_to("finalized.pending", &directory, "finalized")?;
+        check_budget(deadline)?;
+        self.fail_post_marker(PostMarkerFault::FinalizedDirectorySync)?;
+        directory.sync()
+    }
+
+    fn persist_poison_best_effort(&mut self) {
+        let directory = self.namespace.base_directory.clone();
+        if directory.exists("poisoned").unwrap_or(true) {
+            return;
+        }
+        if self
+            .fail_post_marker(PostMarkerFault::PoisonCreate)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(marker) = directory.create_private("poisoned") else {
+            return;
+        };
+        if self
+            .fail_post_marker(PostMarkerFault::PoisonFileSync)
+            .is_err()
+            || marker.sync_all().is_err()
+        {
+            drop(marker);
+            let _ = directory.remove_file("poisoned");
+            let _ = directory.sync();
+            return;
+        }
+        drop(marker);
+        if self
+            .fail_post_marker(PostMarkerFault::PoisonDirectorySync)
+            .is_err()
+            || directory.sync().is_err()
+        {
+            let _ = directory.remove_file("poisoned");
+            let _ = directory.sync();
         }
     }
 
     fn post_marker_failure(mut self) -> Result<StorageEvidence, StorageHostError> {
-        let _ = poison(&self.namespace.base_directory);
+        if let Some(retired) = &self.retired_transaction
+            && let Ok(directory) = self.trash_root.open_directory(retired)
+        {
+            // A failed final-marker publish must remain unknown even if rename completed before a
+            // later synchronization failure. Removal is best effort; recovery also gives an
+            // explicit `finalized.pending` precedence of unknown over `finalized`.
+            let _ = directory.remove_file("finalized");
+            let _ = directory.sync();
+        }
+        self.poisoned_bases
+            .lock()
+            .expect("storage poison registry")
+            .insert(self.namespace.base_token.clone());
+        self.persist_poison_best_effort();
         self.close_all_handles();
         // Every started filesystem step has drained before this point. Keep its conservative
         // quota headroom for the rest of this host process: another namespace may already hold a
@@ -964,24 +1140,34 @@ fn retire_transaction(
     Ok((destination, usage))
 }
 
+/// Atomically retires a pre-marker transaction and reports whether recursive cleanup was fully
+/// synchronized. `false` is safe recognized trash, but its reservation must remain charged live.
 fn discard_transaction(
     transactions: &Directory,
     trash: &Directory,
     transaction_token: &str,
-) -> Result<(), StorageHostError> {
+    deadline: Option<Instant>,
+) -> Result<bool, StorageHostError> {
     let destination = format!("transaction-{transaction_token}");
+    maybe_check_budget(deadline)?;
     if trash.exists(&destination)? {
         return Err(StorageHostError::Corrupt {
             scope: "trash-collision",
         });
     }
+    maybe_check_budget(deadline)?;
     transactions.rename_to(transaction_token, trash, &destination)?;
+    maybe_check_budget(deadline)?;
     transactions.sync()?;
+    maybe_check_budget(deadline)?;
     trash.sync()?;
-    if trash.remove_tree(&destination).is_ok() {
-        let _ = trash.sync();
+    maybe_check_budget(deadline)?;
+    if trash.remove_tree(&destination).is_err() {
+        return Ok(false);
     }
-    Ok(())
+    maybe_check_budget(deadline)?;
+    trash.sync()?;
+    Ok(true)
 }
 
 pub(crate) fn recover_transactions(
@@ -989,7 +1175,9 @@ pub(crate) fn recover_transactions(
     key: &StorageKey,
     limits: &crate::StorageLimits,
 ) -> Result<(), StorageHostError> {
-    let entries = layout.transactions().entries()?;
+    let entries = layout
+        .transactions()
+        .entries_prefix(limits.startup_max_transactions.saturating_add(1))?;
     if entries.len() as u64 > limits.startup_max_transactions {
         return Err(StorageHostError::StartupTransactionLimit);
     }
@@ -1017,6 +1205,118 @@ pub(crate) fn recover_transactions(
     Ok(())
 }
 
+pub(crate) fn recover_retired_transactions(
+    layout: &Layout,
+    key: &StorageKey,
+    limits: &crate::StorageLimits,
+) -> Result<(), StorageHostError> {
+    let trash_entries = layout
+        .trash()
+        .entries_prefix(limits.startup_max_entries.saturating_add(1))?;
+    if trash_entries.len() as u64 > limits.startup_max_entries {
+        return Err(StorageHostError::StartupEntryLimit {
+            count: trash_entries.len() as u64,
+            maximum: limits.startup_max_entries,
+        });
+    }
+    for name in trash_entries {
+        let Some(token) = name.strip_prefix("transaction-") else {
+            continue;
+        };
+        if !is_token(token) {
+            return Err(StorageHostError::Corrupt {
+                scope: "trash-transaction-token",
+            });
+        }
+        let metadata = layout
+            .trash()
+            .metadata(&name)?
+            .ok_or(StorageHostError::Corrupt {
+                scope: "trash-transaction",
+            })?;
+        if metadata.kind != EntryKind::Directory {
+            return Err(StorageHostError::Corrupt {
+                scope: "trash-transaction",
+            });
+        }
+        let transaction = layout.trash().open_directory(&name)?;
+        let maximum = limits.max_files_per_namespace.saturating_add(5);
+        let entries = transaction.entries_prefix(maximum.saturating_add(1))?;
+        if entries.len() as u64 > maximum {
+            return Err(StorageHostError::Corrupt {
+                scope: "transaction-entry-count",
+            });
+        }
+        for entry in &entries {
+            let metadata = transaction
+                .metadata(entry)?
+                .ok_or(StorageHostError::Corrupt {
+                    scope: "trash-transaction-entry",
+                })?;
+            if metadata.kind != EntryKind::File || metadata.nlink != 1 {
+                return Err(StorageHostError::Corrupt {
+                    scope: "trash-transaction-entry",
+                });
+            }
+            let _ = transaction.open_private(entry, false)?;
+        }
+        let has_commit = entries.iter().any(|entry| entry == "commit");
+        if !has_commit {
+            // A failed best-effort pre-marker discard is recognized quota-accounted trash and has
+            // no uncertain durable outcome to poison.
+            continue;
+        }
+        let has_manifest = entries.iter().any(|entry| entry == "manifest");
+        let has_applied = entries.iter().any(|entry| entry == "applied");
+        let outcome_unknown = entries.iter().any(|entry| entry == "outcome-unknown");
+        let finalized = entries.iter().any(|entry| entry == "finalized");
+        let finalized_pending = entries.iter().any(|entry| entry == "finalized.pending");
+        if !has_manifest
+            || !has_applied
+            || (finalized && finalized_pending)
+            || entries.iter().any(|entry| {
+                !matches!(
+                    entry.as_str(),
+                    "manifest"
+                        | "commit"
+                        | "applied"
+                        | "outcome-unknown"
+                        | "finalized"
+                        | "finalized.pending"
+                )
+            })
+        {
+            return Err(StorageHostError::Corrupt {
+                scope: "trash-transaction-state",
+            });
+        }
+        validate_empty_marker(&transaction, "commit", true)?;
+        validate_empty_marker(&transaction, "applied", true)?;
+        validate_empty_marker(&transaction, "outcome-unknown", outcome_unknown)?;
+        validate_empty_marker(&transaction, "finalized", finalized)?;
+        validate_empty_marker(&transaction, "finalized.pending", finalized_pending)?;
+        let manifest: ManifestDocument =
+            serde_json::from_slice(&transaction.read_bounded("manifest", MAX_MANIFEST_BYTES)?)
+                .map_err(|_| StorageHostError::Corrupt { scope: "manifest" })?;
+        verify_manifest(&manifest, key, limits)?;
+        // Unknown wins over every optimistic hint. Most importantly, absence of the one durable
+        // final marker is itself unknown; live reconciliation must not depend on successfully
+        // creating a second marker on a failing filesystem.
+        let unknown = outcome_unknown || finalized_pending || !finalized;
+        if !unknown || layout.quarantine().exists(&manifest.base)? {
+            continue;
+        }
+        if !layout.namespaces().exists(&manifest.base)? {
+            return Err(StorageHostError::Corrupt {
+                scope: "missing-transaction-base",
+            });
+        }
+        let base = layout.namespaces().open_directory(&manifest.base)?;
+        poison(&base)?;
+    }
+    Ok(())
+}
+
 fn recover_transaction(
     layout: &Layout,
     transaction_token: &str,
@@ -1024,8 +1324,9 @@ fn recover_transaction(
     key: &StorageKey,
     limits: &crate::StorageLimits,
 ) -> Result<(), StorageHostError> {
-    let entries = transaction.entries()?;
-    if entries.len() as u64 > limits.max_files_per_namespace.saturating_add(3) {
+    let maximum = limits.max_files_per_namespace.saturating_add(3);
+    let entries = transaction.entries_prefix(maximum.saturating_add(1))?;
+    if entries.len() as u64 > maximum {
         return Err(StorageHostError::Corrupt {
             scope: "transaction-entry-count",
         });
@@ -1073,7 +1374,12 @@ fn recover_transaction(
         }
         // The only non-token pre-marker file is the complete-or-partial manifest staging name.
         // Its target was never atomically published, so rollback is unambiguous.
-        discard_transaction(layout.transactions(), layout.trash(), transaction_token)?;
+        let _fully_removed = discard_transaction(
+            layout.transactions(),
+            layout.trash(),
+            transaction_token,
+            None,
+        )?;
         return Ok(());
     }
     if !has_manifest {
@@ -1084,7 +1390,12 @@ fn recover_transaction(
         }
         // A token-named directory containing only bounded token-named stages is the other
         // recognized pre-manifest crash state.
-        discard_transaction(layout.transactions(), layout.trash(), transaction_token)?;
+        let _fully_removed = discard_transaction(
+            layout.transactions(),
+            layout.trash(),
+            transaction_token,
+            None,
+        )?;
         return Ok(());
     }
 
@@ -1119,19 +1430,124 @@ fn recover_transaction(
                 scope: "missing-stage",
             });
         }
-        discard_transaction(layout.transactions(), layout.trash(), transaction_token)?;
+        let _fully_removed = discard_transaction(
+            layout.transactions(),
+            layout.trash(),
+            transaction_token,
+            None,
+        )?;
         return Ok(());
     }
 
-    apply_manifest_data(
-        layout.namespaces(),
-        transaction,
-        &manifest,
-        key,
-        limits,
+    // Namespace validation runs before recovery so one corrupt base cannot block healthy peers.
+    // If that base was quarantined, retain its committed roll-forward state beside it rather than
+    // turning isolated corruption into a root-wide startup failure or deleting outcome evidence.
+    if layout.quarantine().exists(&manifest.base)? {
+        let destination = format!("transaction-{transaction_token}");
+        if layout.quarantine().exists(&destination)? {
+            return Err(StorageHostError::Corrupt {
+                scope: "quarantine-collision",
+            });
+        }
+        layout
+            .transactions()
+            .rename_to(transaction_token, layout.quarantine(), &destination)?;
+        layout.transactions().sync()?;
+        layout.quarantine().sync()?;
+        return Ok(());
+    }
+
+    // Finding a durable marker at startup means the previous process could not return a known,
+    // audited outcome. Persist poison even if that process failed before it could write its live
+    // marker; recovery without poison would make uncertain data silently usable after restart.
+    let recovery = (|| {
+        let base = layout.namespaces().open_directory(&manifest.base)?;
+        poison(&base)?;
+        apply_manifest_data(
+            layout.namespaces(),
+            transaction,
+            &manifest,
+            key,
+            limits,
+            None,
+        )
+    })();
+    if let Err(error) = recovery {
+        if isolated_recovery_error(&error) {
+            quarantine_recovery(layout, &manifest.base, transaction_token, limits)?;
+            return Ok(());
+        }
+        return Err(error);
+    }
+    // Keep the recovered committed transaction as reconciliation evidence. It intentionally has
+    // no `finalized` marker, so retired-state recovery and every GC pass classify it as unknown.
+    let _ = retire_transaction(
+        layout.transactions(),
+        layout.trash(),
+        transaction_token,
+        limits.startup_max_entries,
         None,
     )?;
-    discard_transaction(layout.transactions(), layout.trash(), transaction_token)
+    Ok(())
+}
+
+fn isolated_recovery_error(error: &StorageHostError) -> bool {
+    matches!(
+        error,
+        StorageHostError::Corrupt { .. } | StorageHostError::UnsafeRoot { .. }
+    ) || matches!(
+        error,
+        StorageHostError::RootIo { source, .. }
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
+            )
+    )
+}
+
+fn quarantine_recovery(
+    layout: &Layout,
+    base: &str,
+    transaction_token: &str,
+    limits: &crate::StorageLimits,
+) -> Result<(), StorageHostError> {
+    if !layout.namespaces().exists(base)? {
+        return Err(StorageHostError::Corrupt {
+            scope: "missing-transaction-base",
+        });
+    }
+    let base_count = layout
+        .quarantine()
+        .entries_prefix(limits.max_quarantined_namespaces.saturating_add(1))?
+        .into_iter()
+        .filter(|name| !name.starts_with("transaction-"))
+        .count() as u64;
+    if base_count >= limits.max_quarantined_namespaces {
+        return Err(StorageHostError::Corrupt {
+            scope: "quarantine-capacity",
+        });
+    }
+    if layout.quarantine().exists(base)? {
+        return Err(StorageHostError::Corrupt {
+            scope: "quarantine-collision",
+        });
+    }
+    let transaction = format!("transaction-{transaction_token}");
+    if layout.quarantine().exists(&transaction)? {
+        return Err(StorageHostError::Corrupt {
+            scope: "quarantine-collision",
+        });
+    }
+    layout
+        .namespaces()
+        .rename_to(base, layout.quarantine(), base)?;
+    layout.namespaces().sync()?;
+    layout.quarantine().sync()?;
+    layout
+        .transactions()
+        .rename_to(transaction_token, layout.quarantine(), &transaction)?;
+    layout.transactions().sync()?;
+    layout.quarantine().sync()
 }
 
 fn validate_empty_marker(
@@ -1220,7 +1636,7 @@ fn apply_manifest_data(
     let data = generation.open_directory("data")?;
     for change in &manifest.changes {
         maybe_check_budget(deadline)?;
-        let current = match data.metadata(&change.token)? {
+        let current_commitment = match data.metadata(&change.token)? {
             Some(metadata) if metadata.kind == EntryKind::File => {
                 if metadata.len > limits.max_file_bytes || metadata.nlink != 1 {
                     return Err(StorageHostError::Corrupt {
@@ -1228,7 +1644,12 @@ fn apply_manifest_data(
                     });
                 }
                 maybe_check_budget(deadline)?;
-                Some(data.read_bounded(&change.token, limits.max_file_bytes)?)
+                Some(streamed_file_commitment(
+                    &data,
+                    &change.token,
+                    metadata.len,
+                    key,
+                )?)
             }
             Some(_) => {
                 return Err(StorageHostError::Corrupt {
@@ -1237,7 +1658,6 @@ fn apply_manifest_data(
             }
             None => None,
         };
-        let current_commitment = current.as_deref().map(|bytes| file_commitment(key, bytes));
         if current_commitment == change.new {
             maybe_check_budget(deadline)?;
             if transaction.exists(&change.token)? {
@@ -1260,9 +1680,17 @@ fn apply_manifest_data(
                     });
                 }
                 maybe_check_budget(deadline)?;
-                let staged = transaction.read_bounded(&change.token, change.new_size)?;
-                if staged.len() as u64 != change.new_size
-                    || file_commitment(key, &staged) != *expected
+                let staged =
+                    transaction
+                        .metadata(&change.token)?
+                        .ok_or(StorageHostError::Corrupt {
+                            scope: "missing-stage",
+                        })?;
+                if staged.kind != EntryKind::File
+                    || staged.nlink != 1
+                    || staged.len != change.new_size
+                    || streamed_file_commitment(transaction, &change.token, staged.len, key)?
+                        != *expected
                 {
                     return Err(StorageHostError::Corrupt {
                         scope: "staging-identity",
@@ -1315,6 +1743,17 @@ fn file_commitment(key: &StorageKey, bytes: &[u8]) -> String {
     key.commitment(DOMAIN_CONTENT, &[b"file", bytes])
 }
 
+fn streamed_file_commitment(
+    directory: &Directory,
+    name: &str,
+    length: u64,
+    key: &StorageKey,
+) -> Result<String, StorageHostError> {
+    let file = directory.open_private(name, false)?;
+    key.commitment_reader(DOMAIN_CONTENT, &[b"file"], length, file)
+        .map_err(|source| directory.io_error(source))
+}
+
 fn is_commitment(value: &str) -> bool {
     value.strip_prefix("hmac-sha256:").is_some_and(is_token)
 }
@@ -1350,7 +1789,7 @@ pub(crate) fn wall_ms() -> Result<u64, StorageHostError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _, path::Path};
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
 
     use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
 
@@ -1361,15 +1800,27 @@ mod tests {
 
     #[test]
     fn every_post_marker_failure_is_outcome_unaudited_poisoned_and_recoverable() {
-        for (index, fault) in [
-            PostMarkerFault::MarkerFileSync,
-            PostMarkerFault::MarkerDirectorySync,
-            PostMarkerFault::Apply,
-            PostMarkerFault::Scan,
-            PostMarkerFault::Accounting,
-            PostMarkerFault::Evidence,
-            PostMarkerFault::TransactionSync,
-            PostMarkerFault::Cleanup,
+        for (index, (fault, reconciliation_fault)) in [
+            (PostMarkerFault::MarkerFileSync, None),
+            (PostMarkerFault::MarkerDirectorySync, None),
+            (PostMarkerFault::Apply, None),
+            (PostMarkerFault::Scan, None),
+            (PostMarkerFault::Accounting, None),
+            (PostMarkerFault::Evidence, None),
+            (PostMarkerFault::TransactionSync, None),
+            (PostMarkerFault::Cleanup, None),
+            (PostMarkerFault::FinalizedCreate, None),
+            (PostMarkerFault::FinalizedFileSync, None),
+            (PostMarkerFault::FinalizedDirectorySync, None),
+            (PostMarkerFault::Apply, Some(PostMarkerFault::PoisonCreate)),
+            (
+                PostMarkerFault::Apply,
+                Some(PostMarkerFault::PoisonFileSync),
+            ),
+            (
+                PostMarkerFault::Apply,
+                Some(PostMarkerFault::PoisonDirectorySync),
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -1408,11 +1859,18 @@ mod tests {
                 .jsonl_append("turns.jsonl", 0, br#"{"durable":true}"#)
                 .expect("append");
             transaction.inject_post_marker_fault(fault);
+            if let Some(reconciliation_fault) = reconciliation_fault {
+                transaction.inject_post_marker_fault(reconciliation_fault);
+            }
             assert!(matches!(
                 transaction.commit(),
                 Err(StorageHostError::OutcomeUnaudited)
             ));
-            assert!(walk(&root).iter().any(|path| path.ends_with("poisoned")));
+            assert_eq!(
+                walk(&root).iter().any(|path| path.ends_with("poisoned")),
+                reconciliation_fault.is_none(),
+                "injected poison-marker refusal was not honored"
+            );
             assert!(matches!(
                 host.grant(StorageGrantRequest::new(
                     format!("fault-followup-{index}")
@@ -1434,6 +1892,41 @@ mod tests {
                 )),
                 Err(StorageHostError::Corrupt { .. })
             ));
+            if matches!(
+                fault,
+                PostMarkerFault::Accounting
+                    | PostMarkerFault::FinalizedCreate
+                    | PostMarkerFault::FinalizedFileSync
+                    | PostMarkerFault::FinalizedDirectorySync
+            ) {
+                host.gc_once()
+                    .expect("GC skips committed state without finalized");
+                let paths = walk(&root);
+                assert!(
+                    paths.iter().any(|path| {
+                        path.parent()
+                            .is_some_and(|parent| parent.ends_with("trash"))
+                            && path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with("transaction-"))
+                    }),
+                    "GC deleted unknown-by-default reconciliation state"
+                );
+                assert!(
+                    !paths.iter().any(|path| path.ends_with("finalized")),
+                    "failed finalization left an optimistic marker"
+                );
+            }
+            if reconciliation_fault.is_none()
+                && (index == 0 || fault == PostMarkerFault::Accounting)
+            {
+                let marker = walk(&root)
+                    .into_iter()
+                    .find(|path| path.ends_with("poisoned"))
+                    .expect("poison marker");
+                fs::remove_file(marker).expect("simulate a failed live poison write");
+            }
             drop(host);
 
             // Startup rolls every durable marker forward, including a fault injected before the
@@ -1441,6 +1934,10 @@ mod tests {
             let reopened = StorageHost::open(&root, &key, StorageLimits::default())
                 .expect("recognized recovery succeeds");
             drop(reopened);
+            assert!(
+                walk(&root).iter().any(|path| path.ends_with("poisoned")),
+                "startup must restore poison for every recovered durable marker"
+            );
             let contents = walk(&root)
                 .into_iter()
                 .filter(|path| path.parent().is_some_and(|parent| parent.ends_with("data")))
@@ -1453,6 +1950,176 @@ mod tests {
                 "fault {fault:?} lost the durable transaction"
             );
         }
+    }
+
+    #[test]
+    fn missing_committed_stage_quarantines_attributable_base_and_transaction() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let directory = temporary.path().canonicalize().expect("canonical tempdir");
+        let root = directory.join("storage");
+        let key = directory.join("key.yaml");
+        fs::write(
+            &key,
+            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+
+        let healthy = host
+            .grant(StorageGrantRequest::new(
+                "healthy-before-quarantine".parse().expect("invocation"),
+                "memory.chat.recent".parse().expect("capability"),
+                "memory-chat".parse().expect("provider"),
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageNamespace::Chat,
+                "reviewer".parse().expect("agent"),
+                "slack.t0123abc.uhealthy".parse().expect("subject"),
+                "slack",
+                "scientist-slack",
+                "c0123abc",
+                "c0123abc:1712345678.000100",
+                ContinuityPolicy::AuthorityBound,
+                b"authority".to_vec(),
+            ))
+            .expect("healthy grant");
+        host.begin(healthy)
+            .expect("healthy transaction")
+            .finish_read()
+            .expect("healthy finish");
+
+        let damaged = host
+            .grant(StorageGrantRequest::new(
+                "damaged-commit".parse().expect("invocation"),
+                "memory.chat.record".parse().expect("capability"),
+                "memory-chat".parse().expect("provider"),
+                StorageInterface::Jsonl,
+                StorageAccess::ReadWrite,
+                StorageNamespace::Chat,
+                "reviewer".parse().expect("agent"),
+                "slack.t0123abc.udamaged".parse().expect("subject"),
+                "slack",
+                "scientist-slack",
+                "c0123abc",
+                "c0123abc:1712345678.000100",
+                ContinuityPolicy::AuthorityBound,
+                b"authority".to_vec(),
+            ))
+            .expect("damaged grant");
+        let mut transaction = host.begin(damaged).expect("damaged transaction");
+        transaction
+            .jsonl_append("turns.jsonl", 0, br#"{"retained":true}"#)
+            .expect("append");
+        transaction.inject_post_marker_fault(PostMarkerFault::Apply);
+        assert!(matches!(
+            transaction.commit(),
+            Err(StorageHostError::OutcomeUnaudited)
+        ));
+
+        let transaction = fs::read_dir(root.join("transactions"))
+            .expect("transactions")
+            .next()
+            .expect("committed transaction")
+            .expect("transaction entry")
+            .path();
+        let stage = fs::read_dir(&transaction)
+            .expect("transaction entries")
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_str().is_some_and(super::is_token))
+            .expect("staged file")
+            .path();
+        fs::remove_file(stage).expect("simulate corrupt committed stage");
+        drop(host);
+
+        let reopened = StorageHost::open(&root, &key, StorageLimits::default())
+            .expect("healthy namespaces survive attributable recovery corruption");
+        assert_eq!(
+            fs::read_dir(root.join("quarantine"))
+                .expect("quarantine")
+                .count(),
+            2,
+            "the base and its committed transaction are retained together"
+        );
+        let healthy = reopened
+            .grant(StorageGrantRequest::new(
+                "healthy-after-quarantine".parse().expect("invocation"),
+                "memory.chat.recent".parse().expect("capability"),
+                "memory-chat".parse().expect("provider"),
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageNamespace::Chat,
+                "reviewer".parse().expect("agent"),
+                "slack.t0123abc.uhealthy".parse().expect("subject"),
+                "slack",
+                "scientist-slack",
+                "c0123abc",
+                "c0123abc:1712345678.000100",
+                ContinuityPolicy::AuthorityBound,
+                b"authority".to_vec(),
+            ))
+            .expect("healthy grant after quarantine");
+        reopened
+            .begin(healthy)
+            .expect("healthy transaction")
+            .finish_read()
+            .expect("healthy finish");
+    }
+
+    #[test]
+    fn finalization_budget_stops_the_next_step_after_a_marker_syscall_drains() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let directory = temporary.path().canonicalize().expect("canonical tempdir");
+        let root = directory.join("storage");
+        let key = directory.join("key.yaml");
+        fs::write(
+            &key,
+            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        let limits = StorageLimits {
+            finalization_budget_ms: 200,
+            ..StorageLimits::default()
+        };
+        let host = StorageHost::open(&root, &key, limits.clone()).expect("host");
+        let grant = host
+            .grant(StorageGrantRequest::new(
+                "budget-delay".parse().expect("invocation"),
+                "memory.chat.record".parse().expect("capability"),
+                "memory-chat".parse().expect("provider"),
+                StorageInterface::Jsonl,
+                StorageAccess::ReadWrite,
+                StorageNamespace::Chat,
+                "reviewer".parse().expect("agent"),
+                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "slack",
+                "scientist-slack",
+                "c0123abc",
+                "c0123abc:1712345678.000100",
+                ContinuityPolicy::Stable,
+                b"authority".to_vec(),
+            ))
+            .expect("grant");
+        let mut transaction = host.begin(grant).expect("transaction");
+        transaction
+            .jsonl_append("turns.jsonl", 0, br#"{"budget":true}"#)
+            .expect("append");
+        transaction.inject_post_marker_delay(Duration::from_millis(300));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StorageHostError::OutcomeUnaudited)
+        ));
+        drop(host);
+
+        let reopened = StorageHost::open(&root, &key, limits).expect("recovery");
+        drop(reopened);
+        assert!(
+            walk(&root)
+                .into_iter()
+                .filter_map(|path| fs::read(path).ok())
+                .any(|bytes| bytes == b"{\"budget\":true}\n")
+        );
     }
 
     fn walk(path: &Path) -> Vec<std::path::PathBuf> {

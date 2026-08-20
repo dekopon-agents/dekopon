@@ -40,7 +40,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Path, PathBuf},
+    fs::File,
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -66,7 +67,10 @@ pub use jsonl::JsonlChunk;
 pub use transaction::StorageTransaction;
 pub use vfs::{Durability, FileStat, LockLevel, OpenOptions};
 
-use key::{DOMAIN_CONTENT, DOMAIN_NAMESPACE_PATH, DOMAIN_RECORD_ID, StorageKey, random_bytes};
+use key::{
+    DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_NAMESPACE_PATH,
+    DOMAIN_RECORD_ID, StorageKey, random_bytes,
+};
 use layout::{ENTRY_CHARGE, Layout, scan_root_usage, scan_usage};
 use namespace::{Namespace, NamespacePlan};
 use quota::QuotaLedger;
@@ -198,6 +202,65 @@ impl StorageGrantRequest {
     }
 }
 
+/// Non-mutating, single-use preparation for one invocation-bound storage grant.
+///
+/// Preparation derives only keyed opaque values. It performs no filesystem operation and reserves
+/// no quota, so dropping it after an authorization-audit failure leaves the storage tree exactly
+/// unchanged. [`materialize`](Self::materialize) is the explicit mutation boundary.
+pub struct StorageGrantPreparation {
+    host: StorageHost,
+    request: StorageGrantRequest,
+    base_token: String,
+    scope_commitment: StorageScopeCommitment,
+    record_key: [u8; 32],
+}
+
+impl fmt::Debug for StorageGrantPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StorageGrantPreparation([REDACTED])")
+    }
+}
+
+impl StorageGrantPreparation {
+    #[must_use]
+    pub fn scope_commitment(&self) -> StorageScopeCommitment {
+        self.scope_commitment.clone()
+    }
+
+    /// Derives one stable namespace-keyed record identifier without touching the namespace tree.
+    #[must_use]
+    pub fn record_id(&self, delivery: &[u8]) -> String {
+        StorageKey::from_bytes(self.record_key).commitment(DOMAIN_RECORD_ID, &[delivery])
+    }
+
+    /// Derives keyed low-entropy decision evidence without materializing storage authority.
+    #[must_use]
+    pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
+        self.host.inner.key.commitment(
+            DOMAIN_DECISION_EVIDENCE,
+            &[self.base_token.as_bytes(), label.as_bytes(), bytes],
+        )
+    }
+
+    /// Derives the provider's content/dedup commitment before filesystem mutation.
+    #[must_use]
+    pub fn content_commitment(&self, user: &str, assistant: &str) -> String {
+        self.host.inner.key.commitment(
+            DOMAIN_CONTENT,
+            &[
+                self.base_token.as_bytes(),
+                user.as_bytes(),
+                assistant.as_bytes(),
+            ],
+        )
+    }
+
+    /// Crosses the explicit filesystem mutation boundary after durable authorization audit.
+    pub fn materialize(self) -> Result<StorageGrant, StorageHostError> {
+        self.host.materialize_grant(self.request, self.base_token)
+    }
+}
+
 /// Single-use invocation-bound storage authority.
 pub struct StorageGrant {
     host_id: [u8; 32],
@@ -250,8 +313,11 @@ impl StorageGrant {
     /// Derives one stable namespace-keyed record identifier from a bounded delivery identity.
     #[must_use]
     pub fn record_id(&self, delivery: &[u8]) -> String {
-        let key = StorageKey::from_bytes(self.namespace.record_key);
-        key.commitment(DOMAIN_RECORD_ID, &[delivery])
+        let record_key = self.key.bytes(
+            DOMAIN_RECORD_ID,
+            &[self.namespace.base_token.as_bytes(), b"record-key-v1"],
+        );
+        StorageKey::from_bytes(record_key).commitment(DOMAIN_RECORD_ID, &[delivery])
     }
     /// Derives keyed low-entropy evidence distinct from every path and content domain.
     #[must_use]
@@ -260,7 +326,6 @@ impl StorageGrant {
             key::DOMAIN_DECISION_EVIDENCE,
             &[
                 self.namespace.base_token.as_bytes(),
-                self.namespace.generation_token.as_bytes(),
                 label.as_bytes(),
                 bytes,
             ],
@@ -274,7 +339,6 @@ impl StorageGrant {
             DOMAIN_CONTENT,
             &[
                 self.namespace.base_token.as_bytes(),
-                self.namespace.generation_token.as_bytes(),
                 user.as_bytes(),
                 assistant.as_bytes(),
             ],
@@ -290,9 +354,11 @@ struct HostInner {
     ledger: Arc<QuotaLedger>,
     limits: StorageLimits,
     namespace_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// In-process poison is authoritative even when a failing filesystem cannot persist the marker.
+    poisoned_bases: Arc<Mutex<BTreeSet<String>>>,
     /// Serializes physical namespace-slot observations with base removal, but never lease waits.
     namespace_observation_lock: Mutex<()>,
-    gc_lock: Mutex<()>,
+    gc_lock: Mutex<gc::GcState>,
 }
 
 /// Wasmtime-independent secure native storage engine.
@@ -315,18 +381,28 @@ impl StorageHost {
         limits: StorageLimits,
     ) -> Result<Self, StorageHostError> {
         limits.validate()?;
-        let root = canonical_parent_leaf(root.as_ref(), false)?;
-        let namespace_key_path = canonical_parent_leaf(namespace_key_path.as_ref(), true)?;
+        let root = resolve_storage_root_path(root.as_ref())?;
+        let namespace_key_path = resolve_namespace_key_path(namespace_key_path.as_ref())?;
         if namespace_key_path == root || namespace_key_path.starts_with(&root) {
             return Err(StorageHostError::UnsafeKeyFile {
                 path: namespace_key_path,
             });
         }
         let key = Arc::new(StorageKey::load(&namespace_key_path)?);
+        let minimum = Layout::minimum_usage(&key)?;
+        if minimum.bytes > limits.max_root_bytes || minimum.entries > limits.startup_max_entries {
+            return Err(StorageHostError::QuotaExceeded);
+        }
         let layout = Layout::open(&root, &key)?;
         quarantine_isolated_namespaces(&layout, &key, &limits)?;
         transaction::recover_transactions(&layout, &key, &limits)?;
-        let quarantined = layout.quarantine().entries()?.len() as u64;
+        transaction::recover_retired_transactions(&layout, &key, &limits)?;
+        let quarantined = layout
+            .quarantine()
+            .entries_prefix(limits.startup_max_entries.saturating_add(1))?
+            .into_iter()
+            .filter(|name| !name.starts_with("transaction-"))
+            .count() as u64;
         if quarantined > limits.max_quarantined_namespaces {
             return Err(StorageHostError::Corrupt {
                 scope: "quarantine-capacity",
@@ -348,8 +424,9 @@ impl StorageHost {
                 ledger,
                 limits,
                 namespace_locks: Mutex::new(BTreeMap::new()),
+                poisoned_bases: Arc::new(Mutex::new(BTreeSet::new())),
                 namespace_observation_lock: Mutex::new(()),
-                gc_lock: Mutex::new(()),
+                gc_lock: Mutex::new(gc::GcState::default()),
             }),
         })
     }
@@ -366,24 +443,73 @@ impl StorageHost {
         )
     }
 
-    /// Mints one non-cloneable grant after the broker has authorized a validated chat operation.
-    pub fn grant(&self, request: StorageGrantRequest) -> Result<StorageGrant, StorageHostError> {
+    /// Prepares one grant without reading or mutating the filesystem or reserving quota.
+    pub fn prepare_grant(
+        &self,
+        request: StorageGrantRequest,
+    ) -> Result<StorageGrantPreparation, StorageHostError> {
         if request.namespace != StorageNamespace::Chat {
             return Err(StorageHostError::PermissionDenied);
         }
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
-        let base = self.inner.key.token(DOMAIN_NAMESPACE_PATH, &fields);
+        let base_token = self.inner.key.token(DOMAIN_NAMESPACE_PATH, &fields);
+        Ok(StorageGrantPreparation {
+            host: self.clone(),
+            request,
+            scope_commitment: StorageScopeCommitment(
+                self.inner.key.commitment(DOMAIN_AUDIT_SCOPE, &fields),
+            ),
+            record_key: self
+                .inner
+                .key
+                .bytes(DOMAIN_RECORD_ID, &[base_token.as_bytes(), b"record-key-v1"]),
+            base_token,
+        })
+    }
+
+    /// Convenience path for trusted callers that have already durably audited authorization.
+    pub fn grant(&self, request: StorageGrantRequest) -> Result<StorageGrant, StorageHostError> {
+        self.prepare_grant(request)?.materialize()
+    }
+
+    fn materialize_grant(
+        &self,
+        request: StorageGrantRequest,
+        base: String,
+    ) -> Result<StorageGrant, StorageHostError> {
+        debug_assert_eq!(
+            base,
+            self.inner.key.token(
+                DOMAIN_NAMESPACE_PATH,
+                &request
+                    .scope_values()
+                    .iter()
+                    .map(String::as_bytes)
+                    .collect::<Vec<_>>()
+            )
+        );
         let namespace_lock = namespace_lock(&self.inner.namespace_locks, &base);
         let _namespace = namespace_lock
             .lock()
             .expect("storage namespace housekeeping lock");
+        if self
+            .inner
+            .poisoned_bases
+            .lock()
+            .expect("storage poison registry")
+            .contains(&base)
+        {
+            return Err(StorageHostError::Corrupt {
+                scope: "poisoned-namespace",
+            });
+        }
         if self.inner.layout.quarantine().exists(&base)? {
             return Err(StorageHostError::Corrupt {
                 scope: "quarantined-namespace",
             });
         }
-        let namespace_reservation = {
+        let mut namespace_reservation = Some({
             // A GC base removal takes the same short lock around rename + slot release. The lock
             // is deliberately dropped before any base lease wait, preserving concurrency between
             // distinct namespaces.
@@ -396,17 +522,33 @@ impl StorageHost {
                 .inner
                 .layout
                 .namespaces()
-                .entries()?
+                .entries_bounded(self.inner.limits.startup_max_entries)?
                 .into_iter()
-                .chain(self.inner.layout.quarantine().entries()?)
+                .chain(
+                    self.inner
+                        .layout
+                        .quarantine()
+                        .entries_bounded(self.inner.limits.startup_max_entries)?
+                        .into_iter()
+                        .filter(|name| !name.starts_with("transaction-")),
+                )
+                .chain(
+                    self.inner
+                        .layout
+                        .trash()
+                        .entries_bounded(self.inner.limits.startup_max_entries)?
+                        .into_iter()
+                        .filter_map(|name| name.strip_prefix("base-").map(str::to_owned))
+                        .filter(|name| namespace::is_token(name)),
+                )
                 .collect::<BTreeSet<_>>();
             self.inner
                 .ledger
                 .reserve_namespace(base.clone(), observed_namespaces)?
-        };
-        let root_before =
-            scan_root_usage(&self.inner.layout, self.inner.limits.startup_max_entries)?;
-        self.inner.ledger.refresh_root(root_before);
+        });
+        // The ledger is rebuilt once at startup and every host mutation reconciles or retains its
+        // reservation. Rescanning here would be unsafe: a scan can start before another namespace
+        // commits and publish its stale lower total after that commit releases its reservation.
         let plan = NamespacePlan::prepare(
             self.inner.layout.namespaces(),
             &self.inner.key,
@@ -422,18 +564,109 @@ impl StorageHost {
             .inner
             .ledger
             .reserve_root(plan.reserved_bytes(), plan.reserved_entries())?;
-        let namespace = plan.apply(
+        // Reconcile physical existence and keep slot publication under the same observation lock
+        // as the first namespace mutation. `prepare` has already completed every lease wait, so
+        // this short critical section never serializes an unrelated namespace behind a blocked
+        // base lease.
+        let _observation = self
+            .inner
+            .namespace_observation_lock
+            .lock()
+            .expect("storage namespace observation lock");
+        self.inner.ledger.observe_namespaces(
+            self.inner
+                .layout
+                .namespaces()
+                .entries_bounded(self.inner.limits.startup_max_entries)?
+                .into_iter()
+                .chain(
+                    self.inner
+                        .layout
+                        .quarantine()
+                        .entries_bounded(self.inner.limits.startup_max_entries)?
+                        .into_iter()
+                        .filter(|name| !name.starts_with("transaction-")),
+                )
+                .chain(
+                    self.inner
+                        .layout
+                        .trash()
+                        .entries_bounded(self.inner.limits.startup_max_entries)?
+                        .into_iter()
+                        .filter_map(|name| name.strip_prefix("base-").map(str::to_owned))
+                        .filter(|name| namespace::is_token(name)),
+                ),
+        );
+        let namespace = match plan.apply(
             self.inner.layout.namespaces(),
-            &self.inner.key,
             self.inner.limits.lock_timeout_ms,
-        )?;
-        let base_directory = self.inner.layout.namespaces().open_directory(&base)?;
+        ) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                // `apply` may have completed mkdir/rename before a later open or sync failed. A
+                // physically present base owns the slot permanently until GC removes its trash.
+                if self.inner.layout.namespaces().exists(&base).unwrap_or(true) {
+                    namespace_reservation
+                        .take()
+                        .expect("namespace reservation")
+                        .commit();
+                }
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
+        };
+        let base_directory = match self.inner.layout.namespaces().open_directory(&base) {
+            Ok(directory) => directory,
+            Err(error) => {
+                namespace_reservation
+                    .take()
+                    .expect("namespace reservation")
+                    .commit();
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
+        };
         let mut after_namespace =
-            scan_usage(&base_directory, self.inner.limits.startup_max_entries)?;
-        after_namespace.entries = after_namespace.entries.saturating_add(1);
-        after_namespace.bytes = after_namespace.bytes.saturating_add(ENTRY_CHARGE);
-        housekeeping_reservation.commit(before_namespace, after_namespace)?;
-        namespace_reservation.commit();
+            match scan_usage(&base_directory, self.inner.limits.startup_max_entries) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    namespace_reservation
+                        .take()
+                        .expect("namespace reservation")
+                        .commit();
+                    housekeeping_reservation.retain();
+                    return Err(error);
+                }
+            };
+        let Some(entries) = after_namespace.entries.checked_add(1) else {
+            namespace_reservation
+                .take()
+                .expect("namespace reservation")
+                .commit();
+            housekeeping_reservation.retain();
+            return Err(StorageHostError::Arithmetic);
+        };
+        let Some(bytes) = after_namespace.bytes.checked_add(ENTRY_CHARGE) else {
+            namespace_reservation
+                .take()
+                .expect("namespace reservation")
+                .commit();
+            housekeeping_reservation.retain();
+            return Err(StorageHostError::Arithmetic);
+        };
+        after_namespace.entries = entries;
+        after_namespace.bytes = bytes;
+        if let Err(error) = housekeeping_reservation.commit(before_namespace, after_namespace) {
+            namespace_reservation
+                .take()
+                .expect("namespace reservation")
+                .commit();
+            return Err(error);
+        }
+        namespace_reservation
+            .take()
+            .expect("namespace reservation")
+            .commit();
         Ok(StorageGrant {
             host_id: self.inner.id,
             invocation: request.invocation,
@@ -459,12 +692,13 @@ impl StorageHost {
             self.inner.layout.namespaces().clone(),
             self.inner.layout.transactions().clone(),
             self.inner.layout.trash().clone(),
+            Arc::clone(&self.inner.poisoned_bases),
         )
     }
 
     /// Runs one bounded lifecycle pass. Active namespace leases are skipped.
     pub fn gc_once(&self) -> Result<GcReport, StorageHostError> {
-        let _gc = self.inner.gc_lock.lock().expect("storage GC lock");
+        let mut gc = self.inner.gc_lock.lock().expect("storage GC lock");
         gc::run(
             &self.inner.layout,
             &self.inner.key,
@@ -472,6 +706,7 @@ impl StorageHost {
             &self.inner.namespace_locks,
             &self.inner.namespace_observation_lock,
             &self.inner.ledger,
+            &mut gc,
         )
     }
 
@@ -494,41 +729,89 @@ fn namespace_lock(
     )
 }
 
-fn canonical_parent_leaf(path: &Path, key: bool) -> Result<PathBuf, StorageHostError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|source| StorageHostError::RootIo {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .join(path)
-    };
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| StorageHostError::UnsafeRoot {
-            path: absolute.clone(),
-        })?;
-    let name = absolute
-        .file_name()
-        .ok_or_else(|| StorageHostError::UnsafeRoot {
-            path: absolute.clone(),
-        })?;
-    let parent = std::fs::canonicalize(parent).map_err(|source| {
+/// Resolves a configured storage root without following any original ancestor symlink.
+pub fn resolve_storage_root_path(path: &Path) -> Result<PathBuf, StorageHostError> {
+    resolve_parent_leaf(path, false)
+}
+
+/// Resolves a configured namespace-key path without following any original ancestor symlink.
+pub fn resolve_namespace_key_path(path: &Path) -> Result<PathBuf, StorageHostError> {
+    resolve_parent_leaf(path, true)
+}
+
+fn resolve_parent_leaf(path: &Path, key: bool) -> Result<PathBuf, StorageHostError> {
+    let io_error = |path: &Path, source: std::io::Error| {
         if key {
             StorageHostError::KeyIo {
-                path: parent.to_path_buf(),
+                path: path.to_path_buf(),
                 source,
             }
         } else {
             StorageHostError::RootIo {
-                path: parent.to_path_buf(),
+                path: path.to_path_buf(),
                 source,
             }
         }
-    })?;
-    Ok(parent.join(name))
+    };
+    let unsafe_path = |path: &Path| {
+        if key {
+            StorageHostError::UnsafeKeyFile {
+                path: path.to_path_buf(),
+            }
+        } else {
+            StorageHostError::UnsafeRoot {
+                path: path.to_path_buf(),
+            }
+        }
+    };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| io_error(path, source))?
+            .join(path)
+    };
+    let mut components = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => components.push(component.to_os_string()),
+            // Do not normalize a parent component away: every component in the configured spelling
+            // must be traversed under a retained no-follow directory descriptor.
+            Component::ParentDir | Component::Prefix(_) => return Err(unsafe_path(&absolute)),
+        }
+    }
+    if components.is_empty() {
+        return Err(unsafe_path(&absolute));
+    }
+
+    let root_fd = rustix::fs::open(
+        "/",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|source| io_error(Path::new("/"), std::io::Error::from(source)))?;
+    let mut directory = File::from(root_fd);
+    let mut traversed = PathBuf::from("/");
+    for component in &components[..components.len() - 1] {
+        traversed.push(component);
+        let fd = rustix::fs::openat(
+            &directory,
+            component,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|source| io_error(&traversed, std::io::Error::from(source)))?;
+        directory = File::from(fd);
+    }
+    traversed.push(components.last().expect("non-empty path components"));
+    Ok(traversed)
 }
 
 fn quarantine_isolated_namespaces(
@@ -536,8 +819,16 @@ fn quarantine_isolated_namespaces(
     key: &StorageKey,
     limits: &StorageLimits,
 ) -> Result<(), StorageHostError> {
-    let mut quarantined = layout.quarantine().entries()?.len() as u64;
-    for base in layout.namespaces().entries()? {
+    let mut quarantined = layout
+        .quarantine()
+        .entries_prefix(limits.startup_max_entries.saturating_add(1))?
+        .into_iter()
+        .filter(|name| !name.starts_with("transaction-"))
+        .count() as u64;
+    for base in layout
+        .namespaces()
+        .entries_bounded(limits.startup_max_entries)?
+    {
         let validation = (|| {
             let metadata =
                 layout
@@ -557,7 +848,7 @@ fn quarantine_isolated_namespaces(
         })();
         match validation {
             Ok(()) => {}
-            Err(StorageHostError::Corrupt { .. }) | Err(StorageHostError::UnsafeRoot { .. }) => {
+            Err(error) if isolated_namespace_corruption(&error) => {
                 if quarantined >= limits.max_quarantined_namespaces {
                     return Err(StorageHostError::Corrupt {
                         scope: "quarantine-capacity",
@@ -567,6 +858,17 @@ fn quarantine_isolated_namespaces(
                     return Err(StorageHostError::Corrupt {
                         scope: "quarantine-collision",
                     });
+                }
+                if matches!(error, StorageHostError::UnsafeRoot { .. })
+                    || matches!(
+                        error,
+                        StorageHostError::RootIo { ref source, .. }
+                            if source.kind() == std::io::ErrorKind::PermissionDenied
+                    )
+                {
+                    layout
+                        .namespaces()
+                        .make_owned_directory_traversable(&base)?;
                 }
                 layout
                     .namespaces()
@@ -579,6 +881,20 @@ fn quarantine_isolated_namespaces(
         }
     }
     Ok(())
+}
+
+fn isolated_namespace_corruption(error: &StorageHostError) -> bool {
+    matches!(
+        error,
+        StorageHostError::Corrupt { .. } | StorageHostError::UnsafeRoot { .. }
+    ) || matches!(
+        error,
+        StorageHostError::RootIo { source, .. }
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
+            )
+    )
 }
 
 /// Stable native storage failure classes. No variant contains guest names, paths, or content.

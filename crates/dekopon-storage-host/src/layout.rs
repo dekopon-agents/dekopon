@@ -31,6 +31,40 @@ pub(crate) struct Directory {
     diagnostic_path: Arc<PathBuf>,
 }
 
+pub(crate) struct EntryStream {
+    directory: Directory,
+    inner: rustix::fs::Dir,
+}
+
+impl std::fmt::Debug for EntryStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EntryStream([RETAINED])")
+    }
+}
+
+impl EntryStream {
+    pub(crate) fn next_name(&mut self) -> Result<Option<String>, StorageHostError> {
+        loop {
+            let Some(entry) = self.inner.read() else {
+                return Ok(None);
+            };
+            let entry =
+                entry.map_err(|source| self.directory.io_error(std::io::Error::from(source)))?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map_err(|_| StorageHostError::Corrupt {
+                    scope: "non-utf8-entry",
+                })?;
+            if name == "." || name == ".." {
+                continue;
+            }
+            validate_component(name)?;
+            return Ok(Some(name.to_owned()));
+        }
+    }
+}
+
 impl std::fmt::Debug for Directory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Directory([RETAINED])")
@@ -77,11 +111,37 @@ pub(crate) struct Usage {
 }
 
 impl Layout {
+    pub(crate) fn minimum_usage(key: &StorageKey) -> Result<Usage, StorageHostError> {
+        let document = LayoutDocument {
+            api_version: LAYOUT_VERSION.to_owned(),
+            key_commitment: key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]),
+        };
+        let encoded = u64::try_from(
+            serde_json::to_vec(&document)
+                .map_err(|_| StorageHostError::CorruptLayout)?
+                .len(),
+        )
+        .map_err(|_| StorageHostError::Arithmetic)?
+        .checked_add(1)
+        .ok_or(StorageHostError::Arithmetic)?;
+        Ok(Usage {
+            bytes: 6_u64
+                .checked_mul(ENTRY_CHARGE)
+                .and_then(|bytes| bytes.checked_add(encoded))
+                .ok_or(StorageHostError::Arithmetic)?,
+            entries: 6,
+            files: 2,
+        })
+    }
+
     pub(crate) fn open(root: &Path, key: &StorageKey) -> Result<Self, StorageHostError> {
         validate_ancestors(root)?;
         ensure_root_directory(root)?;
         let root = Directory::open_path(root, true)?;
-        let initial_entries = root.entries()?;
+        let initial_entries = root.entries_prefix(7)?;
+        if initial_entries.len() > 6 {
+            return Err(StorageHostError::CorruptLayout);
+        }
         let has_layout = initial_entries.iter().any(|name| name == "layout");
         let has_writer = initial_entries.iter().any(|name| name == "writer.lock");
 
@@ -128,7 +188,9 @@ impl Layout {
                 "trash",
                 "writer.lock",
             ];
-            if root.entries()?.iter().map(String::as_str).ne(expected) {
+            let retained = root.entries_prefix(expected.len() as u64 + 1)?;
+            if retained.len() != expected.len() || retained.iter().map(String::as_str).ne(expected)
+            {
                 return Err(StorageHostError::CorruptLayout);
             }
             (
@@ -239,6 +301,30 @@ impl Directory {
         Ok(())
     }
 
+    /// Restores owner-only traversal before moving an owner-owned corrupt directory to quarantine.
+    pub(crate) fn make_owned_directory_traversable(
+        &self,
+        name: &str,
+    ) -> Result<(), StorageHostError> {
+        validate_component(name)?;
+        let stat = rustix::fs::statat(self.file.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| self.io_error(std::io::Error::from(source)))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(StorageHostError::Corrupt {
+                scope: "quarantine-directory",
+            });
+        }
+        rustix::fs::chmodat(
+            self.file.as_ref(),
+            name,
+            Mode::from_raw_mode(0o700),
+            AtFlags::empty(),
+        )
+        .map_err(|source| self.io_error(std::io::Error::from(source)))
+    }
+
     pub(crate) fn ensure_directory(&self, name: &str) -> Result<Self, StorageHostError> {
         validate_component(name)?;
         match rustix::fs::mkdirat(self.file.as_ref(), name, Mode::from_raw_mode(0o700)) {
@@ -263,6 +349,23 @@ impl Directory {
     }
 
     pub(crate) fn open_directory(&self, name: &str) -> Result<Self, StorageHostError> {
+        self.open_directory_impl(name, true)
+    }
+
+    /// Opens quarantined corruption without accepting it back into the trusted layout.
+    ///
+    /// Owner/mode failures are exactly why an entry may have been quarantined, but its complete
+    /// apparent size must still be charged. Type, no-follow, and before/after identity checks stay
+    /// mandatory; an unreadable directory fails startup rather than disappearing from quota.
+    fn open_quarantined_directory(&self, name: &str) -> Result<Self, StorageHostError> {
+        self.open_directory_impl(name, false)
+    }
+
+    fn open_directory_impl(
+        &self,
+        name: &str,
+        validate_private: bool,
+    ) -> Result<Self, StorageHostError> {
         validate_component(name)?;
         let before = rustix::fs::statat(self.file.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|source| self.io_error(std::io::Error::from(source)))?;
@@ -271,23 +374,44 @@ impl Directory {
                 scope: "directory-type",
             });
         }
-        let fd = rustix::fs::openat(
-            self.file.as_ref(),
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|source| self.io_error(std::io::Error::from(source)))?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = match rustix::fs::openat(self.file.as_ref(), name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(source)
+                if !validate_private
+                    && matches!(source, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
+                    && before.st_uid == rustix::process::geteuid().as_raw() =>
+            {
+                // Permission corruption is quarantinable only if this process owns the directory.
+                // Restore traverse permission inside quarantine so exact quota accounting can walk
+                // the preserved contents; no symlink is followed and type/identity are rechecked.
+                rustix::fs::chmodat(
+                    self.file.as_ref(),
+                    name,
+                    Mode::from_raw_mode(0o700),
+                    AtFlags::empty(),
+                )
+                .map_err(|source| self.io_error(std::io::Error::from(source)))?;
+                rustix::fs::openat(self.file.as_ref(), name, flags, Mode::empty())
+                    .map_err(|source| self.io_error(std::io::Error::from(source)))?
+            }
+            Err(source) => return Err(self.io_error(std::io::Error::from(source))),
+        };
         let child = Self {
             file: Arc::new(File::from(fd)),
             diagnostic_path: Arc::new(self.diagnostic_child(name)),
         };
-        child.validate_self(true)?;
+        if validate_private {
+            child.validate_self(true)?;
+        }
         let opened = child
             .file
             .metadata()
             .map_err(|source| child.io_error(source))?;
-        if opened.dev() != before.st_dev as u64 || opened.ino() != before.st_ino as u64 {
+        if !opened.is_dir()
+            || opened.dev() != before.st_dev as u64
+            || opened.ino() != before.st_ino as u64
+        {
             return Err(StorageHostError::Corrupt {
                 scope: "directory-identity",
             });
@@ -341,6 +465,32 @@ impl Directory {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<String>, StorageHostError> {
+        self.read_entries(HARD_MAX_DIRECTORY_ENTRIES, true)
+    }
+
+    pub(crate) fn entry_stream(&self) -> Result<EntryStream, StorageHostError> {
+        Ok(EntryStream {
+            directory: self.clone(),
+            inner: rustix::fs::Dir::read_from(self.file.as_ref())
+                .map_err(|source| self.io_error(std::io::Error::from(source)))?,
+        })
+    }
+
+    /// Reads at most one bounded prefix without first materializing the complete directory.
+    pub(crate) fn entries_prefix(&self, maximum: u64) -> Result<Vec<String>, StorageHostError> {
+        self.read_entries(maximum.min(HARD_MAX_DIRECTORY_ENTRIES), false)
+    }
+
+    /// Reads a configured bounded directory and fails on the first excess entry.
+    pub(crate) fn entries_bounded(&self, maximum: u64) -> Result<Vec<String>, StorageHostError> {
+        self.read_entries(maximum.min(HARD_MAX_DIRECTORY_ENTRIES), true)
+    }
+
+    fn read_entries(
+        &self,
+        maximum: u64,
+        fail_on_excess: bool,
+    ) -> Result<Vec<String>, StorageHostError> {
         let mut directory = rustix::fs::Dir::read_from(self.file.as_ref())
             .map_err(|source| self.io_error(std::io::Error::from(source)))?;
         let mut entries = Vec::new();
@@ -356,11 +506,14 @@ impl Directory {
                 continue;
             }
             validate_component(name)?;
-            if entries.len() as u64 >= HARD_MAX_DIRECTORY_ENTRIES {
-                return Err(StorageHostError::StartupEntryLimit {
-                    count: entries.len() as u64 + 1,
-                    maximum: HARD_MAX_DIRECTORY_ENTRIES,
-                });
+            if entries.len() as u64 >= maximum {
+                if fail_on_excess {
+                    return Err(StorageHostError::StartupEntryLimit {
+                        count: entries.len() as u64 + 1,
+                        maximum,
+                    });
+                }
+                break;
             }
             entries.push(name.to_owned());
         }
@@ -633,6 +786,90 @@ pub(crate) fn scan_usage(
     scan_usage_checked(directory, maximum_entries, || Ok(()))
 }
 
+/// Scans no more than the configured entry/byte budget.
+///
+/// `None` means the subtree cannot fit this GC pass. Traversal stops as soon as that is known,
+/// rather than walking a large trash tree before applying the byte limit.
+pub(crate) fn scan_usage_capped(
+    directory: &Directory,
+    maximum_entries: u64,
+    maximum_bytes: u64,
+) -> Result<Option<Usage>, StorageHostError> {
+    let mut usage = Usage::default();
+    if scan_capped(directory, maximum_entries, maximum_bytes, &mut usage)? {
+        Ok(Some(usage))
+    } else {
+        Ok(None)
+    }
+}
+
+fn scan_capped(
+    directory: &Directory,
+    maximum_entries: u64,
+    maximum_bytes: u64,
+    usage: &mut Usage,
+) -> Result<bool, StorageHostError> {
+    let remaining = maximum_entries.saturating_sub(usage.entries);
+    let byte_slots = maximum_bytes
+        .saturating_sub(usage.bytes)
+        .checked_div(ENTRY_CHARGE)
+        .unwrap_or(0);
+    let bounded = remaining.min(byte_slots);
+    let entries = directory.entries_prefix(bounded.saturating_add(1))?;
+    if entries.len() as u64 > bounded {
+        return Ok(false);
+    }
+    for name in entries {
+        let metadata = directory
+            .metadata(&name)?
+            .ok_or(StorageHostError::Corrupt {
+                scope: "vanished-entry",
+            })?;
+        usage.entries = usage
+            .entries
+            .checked_add(1)
+            .ok_or(StorageHostError::Arithmetic)?;
+        usage.bytes = usage
+            .bytes
+            .checked_add(ENTRY_CHARGE)
+            .ok_or(StorageHostError::Arithmetic)?;
+        if usage.bytes > maximum_bytes {
+            return Ok(false);
+        }
+        match metadata.kind {
+            EntryKind::File => {
+                let next = usage
+                    .bytes
+                    .checked_add(metadata.len)
+                    .ok_or(StorageHostError::Arithmetic)?;
+                if next > maximum_bytes {
+                    return Ok(false);
+                }
+                let file = directory.open_private(&name, false)?;
+                directory.validate_private_file(&name, &file)?;
+                usage.bytes = next;
+                usage.files = usage
+                    .files
+                    .checked_add(1)
+                    .ok_or(StorageHostError::Arithmetic)?;
+            }
+            EntryKind::Directory => {
+                let child = directory.open_directory(&name)?;
+                if !scan_capped(&child, maximum_entries, maximum_bytes, usage)? {
+                    return Ok(false);
+                }
+            }
+            EntryKind::Symlink => {
+                return Err(StorageHostError::Corrupt { scope: "symlink" });
+            }
+            EntryKind::Other => {
+                return Err(StorageHostError::Corrupt { scope: "file-type" });
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Scans exact logical usage while checking a caller-owned deadline before each filesystem step.
 ///
 /// One native operation may still block past the deadline. The callback prevents beginning the
@@ -654,7 +891,15 @@ fn scan(
     check: &mut impl FnMut() -> Result<(), StorageHostError>,
 ) -> Result<(), StorageHostError> {
     check()?;
-    for name in directory.entries()? {
+    let remaining = maximum_entries.saturating_sub(usage.entries);
+    let entries = directory.entries_prefix(remaining.saturating_add(1))?;
+    if entries.len() as u64 > remaining {
+        return Err(StorageHostError::StartupEntryLimit {
+            count: usage.entries.saturating_add(entries.len() as u64),
+            maximum: maximum_entries,
+        });
+    }
+    for name in entries {
         check()?;
         let metadata = directory
             .metadata(&name)?
@@ -723,7 +968,15 @@ fn scan_quarantine(
     maximum_entries: u64,
     usage: &mut Usage,
 ) -> Result<(), StorageHostError> {
-    for name in directory.entries()? {
+    let remaining = maximum_entries.saturating_sub(usage.entries);
+    let entries = directory.entries_prefix(remaining.saturating_add(1))?;
+    if entries.len() as u64 > remaining {
+        return Err(StorageHostError::StartupEntryLimit {
+            count: usage.entries.saturating_add(entries.len() as u64),
+            maximum: maximum_entries,
+        });
+    }
+    for name in entries {
         let metadata = directory
             .metadata(&name)?
             .ok_or(StorageHostError::Corrupt {
@@ -755,11 +1008,17 @@ fn scan_quarantine(
                     .ok_or(StorageHostError::Arithmetic)?;
             }
             EntryKind::Directory => {
-                if let Ok(child) = directory.open_directory(&name) {
-                    scan_quarantine(&child, maximum_entries, usage)?;
-                }
+                let child = directory.open_quarantined_directory(&name)?;
+                scan_quarantine(&child, maximum_entries, usage)?;
             }
-            EntryKind::Symlink | EntryKind::Other => {}
+            EntryKind::Symlink | EntryKind::Other => {
+                // Never follow the entry, but do charge its own apparent bytes in addition to the
+                // universal entry charge. Corruption cannot become free space by changing type.
+                usage.bytes = usage
+                    .bytes
+                    .checked_add(metadata.len)
+                    .ok_or(StorageHostError::Arithmetic)?;
+            }
         }
     }
     Ok(())
@@ -787,7 +1046,7 @@ pub(crate) fn scan_root_usage(
     maximum_entries: u64,
 ) -> Result<Usage, StorageHostError> {
     let mut usage = Usage::default();
-    for name in layout.root.entries()? {
+    for name in layout.root.entries_bounded(maximum_entries)? {
         let metadata = layout
             .root
             .metadata(&name)?

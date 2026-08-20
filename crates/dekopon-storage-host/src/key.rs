@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    fs::File,
+    fs::{self, File},
     io::Read as _,
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::Path,
@@ -62,6 +62,7 @@ impl StorageKey {
             .ok_or_else(|| StorageHostError::UnsafeKeyFile {
                 path: path.to_path_buf(),
             })?;
+        validate_key_ancestors(parent, path)?;
         let parent_fd = rustix::fs::open(
             parent,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
@@ -159,6 +160,69 @@ impl StorageKey {
     pub(crate) fn commitment(&self, domain: &str, fields: &[&[u8]]) -> String {
         format!("hmac-sha256:{}", self.token(domain, fields))
     }
+
+    /// Computes one final length-prefixed field from a bounded reader without retaining it.
+    pub(crate) fn commitment_reader(
+        &self,
+        domain: &str,
+        prefix_fields: &[&[u8]],
+        final_length: u64,
+        mut reader: impl std::io::Read,
+    ) -> Result<String, std::io::Error> {
+        let domain_key = hmac_sha256(
+            &self.0,
+            &encoded_fields(&[b"dekopon-storage-domain-v1".as_slice(), domain.as_bytes()]),
+        );
+        let mut hmac = HmacSha256::new(&domain_key);
+        for field in prefix_fields {
+            hmac.update(&(field.len() as u64).to_be_bytes());
+            hmac.update(field);
+        }
+        hmac.update(&final_length.to_be_bytes());
+        let mut remaining = final_length;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining != 0 {
+            let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("a buffer-bounded length always fits usize");
+            let read = reader.read(&mut buffer[..maximum])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "bounded commitment input ended early",
+                ));
+            }
+            hmac.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        let mut extra = [0_u8; 1];
+        if reader.read(&mut extra)? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bounded commitment input grew while reading",
+            ));
+        }
+        Ok(format!("hmac-sha256:{}", hex(&hmac.finalize())))
+    }
+}
+
+fn validate_key_ancestors(parent: &Path, key: &Path) -> Result<(), StorageHostError> {
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|source| StorageHostError::KeyIo {
+                path: ancestor.to_path_buf(),
+                source,
+            })?;
+        let mode = metadata.permissions().mode();
+        let sticky = mode & 0o1000 != 0;
+        if !metadata.is_dir() || (mode & 0o022 != 0 && !sticky) {
+            return Err(StorageHostError::UnsafeKeyFile {
+                path: key.to_path_buf(),
+            });
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
 }
 
 pub(crate) fn encoded_fields(fields: &[&[u8]]) -> Vec<u8> {
@@ -173,28 +237,48 @@ pub(crate) fn encoded_fields(fields: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
+struct HmacSha256 {
+    inner: Sha256,
+    outer_pad: [u8; 64],
+}
+
+impl HmacSha256 {
+    fn new(key: &[u8]) -> Self {
+        const BLOCK: usize = 64;
+        let mut normalized = [0_u8; BLOCK];
+        if key.len() > BLOCK {
+            normalized[..32].copy_from_slice(&Sha256::digest(key));
+        } else {
+            normalized[..key.len()].copy_from_slice(key);
+        }
+        let mut inner_pad = [0x36_u8; BLOCK];
+        let mut outer_pad = [0x5c_u8; BLOCK];
+        for index in 0..BLOCK {
+            inner_pad[index] ^= normalized[index];
+            outer_pad[index] ^= normalized[index];
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        Self { inner, outer_pad }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        let inner = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(self.outer_pad);
+        outer.update(inner);
+        outer.finalize().into()
+    }
+}
+
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut normalized = [0_u8; BLOCK];
-    if key.len() > BLOCK {
-        normalized[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        normalized[..key.len()].copy_from_slice(key);
-    }
-    let mut inner_pad = [0x36_u8; BLOCK];
-    let mut outer_pad = [0x5c_u8; BLOCK];
-    for index in 0..BLOCK {
-        inner_pad[index] ^= normalized[index];
-        outer_pad[index] ^= normalized[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner);
-    outer.finalize().into()
+    let mut hmac = HmacSha256::new(key);
+    hmac.update(message);
+    hmac.finalize()
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -217,7 +301,7 @@ pub(crate) fn random_bytes(length: usize) -> Result<Vec<u8>, StorageHostError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, io::Cursor};
 
     use super::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_GENERATION,
@@ -250,5 +334,21 @@ mod tests {
             commitments.iter().collect::<BTreeSet<_>>().len(),
             commitments.len()
         );
+    }
+
+    #[test]
+    fn streaming_commitments_match_the_canonical_in_memory_encoding() {
+        let key = StorageKey([9; 32]);
+        let bytes = vec![0x5a; 256 * 1024 + 17];
+        let expected = key.commitment(DOMAIN_CONTENT, &[b"file", &bytes]);
+        let streamed = key
+            .commitment_reader(
+                DOMAIN_CONTENT,
+                &[b"file"],
+                bytes.len() as u64,
+                Cursor::new(&bytes),
+            )
+            .expect("streamed commitment");
+        assert_eq!(streamed, expected);
     }
 }

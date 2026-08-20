@@ -7,7 +7,7 @@ use dekopon_broker_protocol::{
     ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope,
     ResponseEnvelope, read_frame, write_frame,
 };
-use dekopon_core::InvocationId;
+use dekopon_core::{InvocationId, TraceId};
 use dekopon_telemetry::TraceContextParts;
 use dekopon_webui::ServiceStatus;
 use thiserror::Error;
@@ -21,6 +21,10 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
+
+pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: &TraceId) -> tracing::Span {
+    tracing::info_span!("broker.invocation", invocation = %invocation, trace = %trace)
+}
 
 /// One mapped peer: its trusted transport context and optional attestor authority.
 ///
@@ -339,7 +343,7 @@ where
             } else {
                 let storage = broker.capability_uses_storage(&invocation.capability);
                 let span = if storage {
-                    tracing::info_span!("broker.invocation", invocation = %invocation.id, trace = %invocation.trace)
+                    storage_invocation_span(&invocation.id, &invocation.trace)
                 } else {
                     tracing::info_span!(
                         "broker.invocation", invocation = %invocation.id,
@@ -378,7 +382,7 @@ where
                     "delivered turn attestation is invalid",
                 )
             } else {
-                let span = tracing::info_span!("broker.invocation", invocation = %turn.id, trace = %turn.trace);
+                let span = storage_invocation_span(&turn.id, &turn.trace);
                 if let Some(parent) = turn.trace_parent
                     && let Err(error) =
                         span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
@@ -424,11 +428,7 @@ where
                 return Err(ConnectionError::InvalidRequest);
             }
             let span = if broker.capability_uses_storage(&invocation.capability) {
-                tracing::info_span!(
-                    "broker.invocation",
-                    invocation = %invocation.id,
-                    trace = %invocation.trace,
-                )
+                storage_invocation_span(&invocation.id, &invocation.trace)
             } else {
                 tracing::info_span!(
                     "broker.invocation",
@@ -465,11 +465,7 @@ where
             // out of this span for the same reason they stay out of audit records: telemetry is a
             // second egress path and must not carry what the audit chain deliberately redacts.
             let span = if broker.capability_uses_storage(&invocation.capability) {
-                tracing::info_span!(
-                    "broker.invocation",
-                    invocation = %invocation.id,
-                    trace = %invocation.trace,
-                )
+                storage_invocation_span(&invocation.id, &invocation.trace)
             } else {
                 tracing::info_span!(
                     "broker.invocation",

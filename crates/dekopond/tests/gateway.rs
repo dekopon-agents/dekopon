@@ -47,7 +47,12 @@ fn echo_provider() -> PathBuf {
 }
 
 fn temporary() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("temporary directory");
+    let parent = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary parent");
+    let directory = tempfile::Builder::new()
+        .tempdir_in(parent)
+        .expect("temporary directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .expect("private temporary directory");
     directory

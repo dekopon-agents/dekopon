@@ -12,9 +12,10 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatScopeClaim, ChatSessionClaim,
-    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, SubjectAttestation,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation, ChatScopeClaim,
+    ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
+    SubjectAttestation,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -320,6 +321,29 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         memory.is_none(),
         "subject-only attestation grants no storage scope"
     );
+
+    let ordinary = request(98, "echo.reverse");
+    let ordinary_result = broker
+        .invoke_for_chat(
+            &gateway,
+            Some(&grant),
+            &ChatAttestation {
+                subject: subject(),
+                agent: agent("some-agent"),
+                scope: ChatScopeClaim {
+                    transport: "scientist-slack".parse::<TransportId>().expect("transport"),
+                    kind: ChatTransportKind::Slack,
+                    channel: "c0123abc".to_owned(),
+                    conversation: "c0123abc:1712345678.000100".to_owned(),
+                },
+                invocation: ordinary.id.clone(),
+            },
+            ordinary,
+        )
+        .await
+        .expect("ordinary subject-only chat executes through the upgraded chat operation");
+    assert_eq!(ordinary_result.outcome, InvocationOutcome::Succeeded);
+
     assert!(
         broker
             .capabilities_for(&gateway, Some(&grant), &subject(), &agent("other-agent"))

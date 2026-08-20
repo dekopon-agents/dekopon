@@ -554,9 +554,15 @@ The chart never creates the namespace key. `providerStorage.existingKeySecret` i
 operator-managed, so uninstall cannot delete the key for retained data. The init container alone
 mounts its projected symlink farm, copies the selected key into a separate broker-only tmpfs
 `0700` directory as one `0600`, UID-65532, single-link regular file, and verifies it. The gateway
-mounts neither key tmpfs nor provider-storage PVC. `storage-probe` is not present in the image;
-`memory-chat-provider.wasm` is baked only under `/opt/dekopon/optional-providers`, outside the
-default scan.
+mounts neither key tmpfs nor provider-storage PVC. Every chart mount path must be a canonical
+absolute sequence of safe non-dot segments (no repeated slash). Storage root/key paths must not
+overlap each other, another chart mount, projected init sources, or baked image paths including
+`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`; key source/destination names must be
+non-dot path segments. Invalid combinations fail during `helm template` before a volume can shadow
+configuration, packaged providers, or init-script text. The `storage-probe` and malicious
+`memory-reservation-probe` fixtures are not present in the image; `memory-chat-provider.wasm` is
+baked only under `/opt/dekopon/optional-providers`, outside
+the default scan.
 
 The key is HMAC namespace/recovery authority, not encryption-at-rest. Losing or rotating it with
 retained data makes startup fail. The provider-storage filesystem must support retained

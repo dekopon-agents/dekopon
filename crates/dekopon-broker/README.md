@@ -22,5 +22,9 @@ explicit `chatScopes` breadth; Cedar receives those scope fields. Legacy list/re
 reserve and omit the memory provider, word, and capabilities. Recent/search are visible only as an
 all-three surface; record is reachable only through the dedicated typed post-acceptance operation.
 Storage audit records replace raw identities/provider/policy metadata with a domain-separated keyed
-scope commitment and content-free evidence. `authority-bound` continuity uses persisted random
-epochs, so semantic A→B→A creates three generations; explicit `stable` preserves the namespace.
+scope commitment and content-free evidence. `authority-bound` continuity uses only the sorted
+effective capability/artifact/constraint/selected-credential/host/storage/memory surface and
+persisted random epochs, so semantic A→B→A creates three generations. Provider/config ordering,
+unrelated denied providers, enabled-agent ordering, policy formatting, and a principal remap that
+leaves the canonical subject's effective surface unchanged do not rotate. Explicit `stable`
+preserves the namespace across semantic changes.

@@ -20,7 +20,7 @@ mod bindings {
     });
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Turn {
     format: String,
@@ -31,7 +31,7 @@ struct Turn {
     assistant: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Dedup {
     format: String,
@@ -379,7 +379,14 @@ fn bounded_refs(turns: &[&Turn], maximum: usize, max_bytes: u64) -> Result<Value
     }
     kept.reverse();
     let truncated = kept.len() < turns.len().min(maximum) || turns.len() > maximum;
-    Ok(json!({"turns": kept, "truncated": truncated}))
+    let result = json!({"turns": kept, "truncated": truncated});
+    if serde_json::to_vec(&result).map_err(|_| corrupt())?.len() as u64 > max_bytes {
+        return Err(ProviderError::new(
+            "result-too-large",
+            "memory result envelope cannot fit configured bound",
+        ));
+    }
+    Ok(result)
 }
 
 fn read_turns_tail(maximum: usize) -> Result<Vec<Turn>, ProviderError> {
@@ -495,7 +502,20 @@ dekopon_provider_sdk::export_provider_with_commands!(MemoryChat, bindings);
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryChat, Provider, USAGE};
+    use super::{
+        MemoryChat, Provider, Turn, USAGE, bounded_refs, compact, join_lines, parse_lines,
+    };
+
+    fn turn(id: &str, text: &str) -> Turn {
+        Turn {
+            format: "dekopon.chat-memory.turn".to_owned(),
+            version: 1,
+            id: id.to_owned(),
+            commitment: format!("commitment-{id}"),
+            user: text.to_owned(),
+            assistant: format!("answer-{text}"),
+        }
+    }
 
     #[test]
     fn manifest_is_exact_and_record_is_not_a_command() {
@@ -509,5 +529,80 @@ mod tests {
                 .message()
                 .contains(USAGE)
         );
+    }
+
+    #[test]
+    fn compaction_accepts_its_exact_target_and_rejects_one_byte_less() {
+        let newest = turn("newest", "payload");
+        let encoded = serde_json::to_vec(&newest).expect("turn JSON");
+        let exact = encoded.len() as u64 + 1;
+        assert_eq!(
+            compact(std::slice::from_ref(&newest), 1, exact).expect("exact target"),
+            join_lines(&[encoded])
+        );
+        assert_eq!(
+            compact(std::slice::from_ref(&newest), 1, exact - 1)
+                .expect_err("one byte below newest line")
+                .code(),
+            "result-too-large"
+        );
+    }
+
+    #[test]
+    fn result_envelopes_enforce_empty_exact_and_one_byte_bounds() {
+        let empty = serde_json::json!({"turns": Vec::<Turn>::new(), "truncated": false});
+        let empty_bytes = serde_json::to_vec(&empty).expect("empty envelope").len() as u64;
+        assert_eq!(
+            bounded_refs(&[], 1, empty_bytes).expect("exact empty envelope"),
+            empty
+        );
+        assert_eq!(
+            bounded_refs(&[], 1, empty_bytes - 1)
+                .expect_err("empty envelope still has a bound")
+                .code(),
+            "result-too-large"
+        );
+
+        let older = turn("older", "first");
+        let newer = turn("newer", "second");
+        let result = bounded_refs(&[&older, &newer], 2, 64 * 1024).expect("two turns");
+        assert_eq!(result["turns"][0]["id"], "older");
+        assert_eq!(result["turns"][1]["id"], "newer");
+
+        let one = bounded_refs(&[&newer], 1, 64 * 1024).expect("one turn");
+        let exact = serde_json::to_vec(&one).expect("one-turn envelope").len() as u64;
+        assert_eq!(
+            bounded_refs(&[&newer], 1, exact).expect("exact one-turn result"),
+            one
+        );
+        assert_eq!(
+            bounded_refs(&[&newer], 1, exact - 1)
+                .expect_err("one byte below the complete newest turn")
+                .code(),
+            "result-too-large"
+        );
+    }
+
+    #[test]
+    fn only_complete_versioned_lines_survive_parsing() {
+        let valid = serde_json::to_vec(&turn("one", "text")).expect("turn JSON");
+        assert_eq!(
+            parse_lines::<Turn>(&join_lines(&[valid]), "dekopon.chat-memory.turn")
+                .expect("valid line")
+                .len(),
+            1
+        );
+        for corrupt in [
+            b"{}\n".as_slice(),
+            b"{\"format\":\"dekopon.chat-memory.turn\",\"version\":1}".as_slice(),
+            b"not-json\n".as_slice(),
+        ] {
+            assert_eq!(
+                parse_lines::<Turn>(corrupt, "dekopon.chat-memory.turn")
+                    .expect_err("corrupt line")
+                    .code(),
+                "memory-corrupt"
+            );
+        }
     }
 }

@@ -29,6 +29,8 @@ All notable changes to Dekopon are documented here. The format is based on
   canonical effective-authority generations independent of configuration ordering.
 - Chat recording now uses service-typed scope-bound delivery identities and requires successful
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
+- Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
+  memory and fuel headroom, so every accepted default store can advance and query at its bounds.
 
 ### Security
 

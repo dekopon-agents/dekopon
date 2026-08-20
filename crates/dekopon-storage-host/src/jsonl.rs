@@ -85,15 +85,27 @@ impl StorageTransaction {
             .ok_or(StorageHostError::Arithmetic)?;
         self.charge_write(write)?;
         let token = self.ensure_loaded(name)?;
-        let current = self.entries[&token].data.as_deref().unwrap_or_default();
-        if current.len() as u64 != expected_size {
+        let current_size = self.entries[&token].data.as_ref().map_or(0, Vec::len);
+        if current_size as u64 != expected_size {
             return Err(StorageHostError::Busy);
         }
-        let mut replacement = Vec::with_capacity(current.len().saturating_add(record.len() + 1));
-        replacement.extend_from_slice(current);
+        let was_present = self.entries[&token].data.is_some();
+        let mut replacement = self
+            .entries
+            .get_mut(&token)
+            .expect("loaded entry")
+            .data
+            .take()
+            .unwrap_or_default();
+        replacement.reserve(record.len().saturating_add(1));
         replacement.extend_from_slice(record);
         replacement.push(b'\n');
-        self.reserve_candidate(&[(&token, Some(replacement.as_slice()))])?;
+        if let Err(error) = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]) {
+            replacement.truncate(current_size);
+            self.entries.get_mut(&token).expect("loaded entry").data =
+                was_present.then_some(replacement);
+            return Err(error);
+        }
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = Some(replacement);
         entry.dirty = true;

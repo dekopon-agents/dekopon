@@ -435,11 +435,14 @@ pub enum DeliveryIdentity {
         message: String,
     },
     Telegram {
-        #[serde(deserialize_with = "deserialize_scope_part")]
+        #[serde(deserialize_with = "deserialize_signed_service_decimal")]
         chat: String,
-        #[serde(default, deserialize_with = "deserialize_optional_scope_part")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_positive_service_decimal"
+        )]
         topic: Option<String>,
-        #[serde(deserialize_with = "deserialize_scope_part")]
+        #[serde(deserialize_with = "deserialize_positive_service_decimal")]
         message: String,
     },
     Local {
@@ -485,8 +488,10 @@ impl DeliveryIdentity {
                 chat == &scope.channel
                     && canonical_signed_decimal(chat)
                     && topic.as_deref() == expected_topic
-                    && topic.as_deref().is_none_or(canonical_unsigned_decimal)
-                    && canonical_unsigned_decimal(message)
+                    && topic
+                        .as_deref()
+                        .is_none_or(canonical_positive_service_decimal)
+                    && canonical_positive_service_decimal(message)
             }
             (
                 Self::Local {
@@ -512,17 +517,39 @@ impl DeliveryIdentity {
     }
 }
 
-fn deserialize_optional_scope_part<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_positive_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct OptionalScopePart;
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_positive_service_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is outside the positive service range"))
+}
 
-    impl<'de> serde::de::Visitor<'de> for OptionalScopePart {
+fn deserialize_signed_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_signed_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is outside the signed service range"))
+}
+
+fn deserialize_optional_positive_service_decimal<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalServiceDecimal;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalServiceDecimal {
         type Value = Option<String>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("null or a bounded canonical chat scope part")
+            formatter.write_str("null or a canonical positive signed-service identifier")
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -543,14 +570,11 @@ where
         where
             Inner: serde::Deserializer<'de>,
         {
-            let value = deserialize_bounded_string::<Inner, 256>(deserializer)?;
-            bounded_scope_part(&value)
-                .then_some(Some(value))
-                .ok_or_else(|| serde::de::Error::custom("optional chat scope part is not bounded"))
+            deserialize_positive_service_decimal(deserializer).map(Some)
         }
     }
 
-    deserializer.deserialize_option(OptionalScopePart)
+    deserializer.deserialize_option(OptionalServiceDecimal)
 }
 
 fn canonical_slack_timestamp(value: &str) -> bool {
@@ -567,6 +591,12 @@ fn canonical_unsigned_decimal(value: &str) -> bool {
     value
         .parse::<u64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_positive_service_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number > 0 && number.to_string() == value)
 }
 
 fn canonical_signed_decimal(value: &str) -> bool {
