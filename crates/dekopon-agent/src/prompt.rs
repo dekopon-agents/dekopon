@@ -428,7 +428,6 @@ where
     let _session = session_span.enter();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
-    let mut agent_config_inspected = false;
 
     for model_turns in 1..=limits.max_steps {
         // Usage fields are declared empty and recorded once the provider answers: token counts
@@ -560,13 +559,6 @@ where
             if call.function.name == AGENT_CONFIG_TOOL_NAME
                 && let Some(config) = agent_config
             {
-                if agent_config_inspected {
-                    messages.push(ModelMessage::tool(
-                        call.id.clone(),
-                        r#"{"error":"agent configuration was already inspected in this session"}"#,
-                    ));
-                    continue;
-                }
                 inspect_agent_config_into(
                     &mut messages,
                     config,
@@ -574,7 +566,6 @@ where
                     model_turns,
                     tool_call_index,
                 )?;
-                agent_config_inspected = true;
                 continue;
             }
             if call.function.name == ASSET_TOOL_NAME
@@ -739,9 +730,8 @@ fn agent_config_tool() -> ModelTool {
                       asked about the agent's prompt, configuration, Cedar policy, permissions, \
                       tools, limits, or memory. The result contains the exact standing \
                       instructions, route/session bounds, and only the capabilities Cedar \
-                      currently grants this sender through this agent. The snapshot can be \
-                      materialized once in this session. Present it as concise Markdown tables \
-                      unless raw JSON was requested. Raw Cedar source, policy \
+                      currently grants this sender through this agent. Present it as concise \
+                      Markdown tables unless raw JSON was requested. Raw Cedar source, policy \
                       identifiers, principals, subjects, endpoints, paths, credential names, and \
                       all credential values are intentionally omitted."
             .to_owned(),
@@ -1337,17 +1327,21 @@ mod tests {
         )
     }
 
+    fn agent_config_tool_call(id: &str, arguments: Value) -> ModelToolCall {
+        ModelToolCall {
+            id: id.to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: AGENT_CONFIG_TOOL_NAME.to_owned(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
     fn agent_config_call(arguments: Value) -> AssistantTurn {
         AssistantTurn {
             content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "config-call".to_owned(),
-                kind: "function".to_owned(),
-                function: ModelFunctionCall {
-                    name: AGENT_CONFIG_TOOL_NAME.to_owned(),
-                    arguments: arguments.to_string(),
-                },
-            }],
+            tool_calls: vec![agent_config_tool_call("config-call", arguments)],
             usage: None,
             replay_items: Vec::new(),
         }
@@ -2023,37 +2017,42 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_can_be_materialized_only_once_per_session() {
+    fn agent_config_can_be_inspected_repeatedly_within_a_turn() {
         let model = ScriptedModel::new([
-            agent_config_call(json!({})),
-            agent_config_call(json!({})),
+            AssistantTurn {
+                content: None,
+                tool_calls: vec![
+                    agent_config_tool_call("config-call-1", json!({})),
+                    agent_config_tool_call("config-call-2", json!({})),
+                ],
+                usage: None,
+                replay_items: Vec::new(),
+            },
             answer("done"),
         ]);
         let runtime = RecordingRuntime::new(0);
         let config = agent_config();
         let mut history = History::default();
 
-        run_prompt_session(
+        let outcome = run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("inspect twice", limits(4, 32)).with_agent_config(&config),
+            SessionInputs::new("inspect twice", limits(3, 32)).with_agent_config(&config),
             &mut history,
         )
-        .expect("repeat is a bounded tool result, not a broken session");
+        .expect("repeated inspection succeeds");
+
+        assert_eq!(outcome.script_calls, 0);
+        assert_eq!(outcome.capability_invocations, 0);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
 
         let messages = model.tool_messages();
-        assert_eq!(
-            messages.len(),
-            3,
-            "later requests replay earlier tool results"
-        );
-        let repeated: Value = serde_json::from_str(messages.last().expect("repeat result"))
-            .expect("repeat diagnostic is JSON");
-        assert_eq!(
-            repeated["error"],
-            "agent configuration was already inspected in this session"
-        );
-        assert!(repeated.get("agent").is_none());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], messages[1]);
+        let repeated: Value =
+            serde_json::from_str(&messages[1]).expect("repeated configuration is JSON");
+        assert_eq!(repeated["agent"]["id"], "reviewer");
+        assert!(repeated.get("error").is_none());
     }
 
     #[test]
