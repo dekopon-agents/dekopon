@@ -80,7 +80,7 @@ Version 0.7.0 adds no crate, process boundary, network path, credential access, 
 - Gateway lifecycle handling covers heartbeat acknowledgements, dispatch sequence and Resume, Invalid Session, fatal close codes, session-start limits, deduplication, jittered reconnect backoff, and bounded REST rate-limit retry.
 - Discord photos and files reuse the lazy chat-asset path. Signed CDN URLs are host-validated and fetched without the bot token; expired URLs refresh through the exact source message and attachment ID. Discord users map to canonical global `discord.<user id>` subjects.
 
-Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds the Discord bot token needed to hear and answer messages, while the broker remains the only component that maps identity and authorizes effects.
+Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds the Discord bot token needed to hear and answer messages, while the broker remains the only component that maps identity and authorizes effects. Version 0.8.1 raises the shared prompt loop's per-turn tool-call guard from four to ten so bounded multi-attachment turns can degrade through the existing four-fetch session limit instead of failing before any attachment opens.
 
 ## Next milestones
 

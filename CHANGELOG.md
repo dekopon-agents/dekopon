@@ -7,10 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-20
+
 ### Fixed
 
 - Raised the per-model-turn tool-call ceiling from four to ten so bounded multi-attachment requests
-  reach the attachment-specific limit instead of failing the entire session as runaway fan-out.
+  reach the attachment-specific limit instead of failing the entire session as runaway fan-out
+  (#118).
 
 ## [0.8.0] - 2026-08-20
 
@@ -245,7 +248,8 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dekopon-agents/dekopon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dekopon-agents/dekopon/compare/v0.5.0...v0.6.0
