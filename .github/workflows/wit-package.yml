@@ -16,6 +16,8 @@ on:
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
       - "examples/providers/jsonplaceholder-provider.wasm"
+      - "examples/providers/skylight-private/**"
+      - "examples/providers/skylight-private-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -34,6 +36,8 @@ on:
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
       - "examples/providers/jsonplaceholder-provider.wasm"
+      - "examples/providers/skylight-private/**"
+      - "examples/providers/skylight-private-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -48,6 +52,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  RUST_VERSION: 1.89.0
   WKG_VERSION: 0.16.0
   WKG_SHA256: 8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a
   WASM_TOOLS_VERSION: 1.236.1
@@ -62,6 +67,13 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust for provider regeneration
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Install pinned component tools
         shell: bash
@@ -86,6 +98,24 @@ jobs:
 
           echo "$tools/bin" >> "$GITHUB_PATH"
 
+      - name: Verify Skylight provider source matches the checked component
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=examples/providers/skylight-private/Cargo.toml
+          component=examples/providers/skylight-private-provider.wasm
+
+          cargo "+${RUST_VERSION}" fmt --manifest-path "$manifest" -- --check
+          cargo "+${RUST_VERSION}" clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
+          cargo "+${RUST_VERSION}" test --locked --manifest-path "$manifest"
+          cargo "+${RUST_VERSION}" check --locked --manifest-path "$manifest" --target wasm32-unknown-unknown
+
+          expected_component=$(mktemp)
+          trap 'rm -f "$expected_component"' EXIT
+          cp "$component" "$expected_component"
+          examples/providers/skylight-private/build.sh
+          cmp "$expected_component" "$component"
+
       - name: Build the WIT packages
         shell: bash
         run: |
@@ -97,7 +127,8 @@ jobs:
           for mirror in \
             examples/providers/gh/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
-            examples/providers/jsonplaceholder/wit/deps/provider.wit
+            examples/providers/jsonplaceholder/wit/deps/provider.wit \
+            examples/providers/skylight-private/wit/deps/provider.wit
           do
             cmp crates/dekopon-provider-sdk/wit/provider.wit "$mirror"
           done
@@ -107,7 +138,8 @@ jobs:
           for mirror in \
             examples/providers/gh/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit \
-            examples/providers/jsonplaceholder/wit/deps/http.wit
+            examples/providers/jsonplaceholder/wit/deps/http.wit \
+            examples/providers/skylight-private/wit/deps/http.wit
           do
             cmp wit/http/http.wit "$mirror"
           done
@@ -210,7 +242,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in http-probe jsonplaceholder; do
+          for name in http-probe jsonplaceholder skylight-private; do
             component="examples/providers/$name-provider.wasm"
             description="target/wit-package/$name.json"
             wasm-tools validate "$component"
