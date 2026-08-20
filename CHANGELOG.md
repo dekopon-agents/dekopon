@@ -7,28 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-20
+
 ### Added
 
 - Added the opt-in Exploration-only `skylight-private` broker provider proof of concept with two
   unofficial, private, unsupported, mock-only account/frame reads. It is absent from default
-  catalogs, images, policies, and deployments.
+  catalogs, images, policies, and deployments (#120).
 - Added opt-in native in-flight activity for Slack, Discord, and Telegram chat sessions: Slack Agent
   `processing`/Stop lifecycle with classic/free `:tangerine:` reaction fallback, Discord typing,
-  Telegram topic-aware chat actions, and separate classic/Agent Slack manifests.
+  Telegram topic-aware chat actions, separate classic/Agent Slack manifests, and Slack's required
+  Agent View App Home event subscription (#122, #124).
 
 ### Changed
 
 - Application release tags now publish all crates.io packages automatically through trusted
-  publishing; manual workflow dispatch remains an idempotent recovery path.
+  publishing; manual workflow dispatch remains an idempotent recovery path (#121).
 
 ### Security
 
 - Bound each Skylight read to one fixed HTTPS GET and a static short-lived destination-bound broker
   bearer, while keeping authorization and OAuth out of the guest and projecting only bounded IDs
-  and optional frame names. The pinned pyskylight MIT notice is adjacent to source and artifact.
+  and optional frame names. The pinned pyskylight MIT notice is adjacent to source and artifact
+  (#120).
 - Derive activity and Stop targets only from authenticated chat envelopes, start activity only after
   fresh broker authorization, prevent model-controlled status content, and cooperatively suppress
-  later model/tool work, stale answers, and history commits after a Slack Agent Stop event.
+  later model/tool work, stale answers, and history commits after a Slack Agent Stop event (#122).
 
 ## [0.8.1] - 2026-08-20
 
@@ -271,7 +275,8 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/dekopon-agents/dekopon/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dekopon-agents/dekopon/compare/v0.6.0...v0.7.0
