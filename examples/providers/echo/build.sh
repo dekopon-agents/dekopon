@@ -6,21 +6,7 @@ manifest="$root/examples/providers/echo/Cargo.toml"
 core="$root/examples/providers/echo/target/wasm32-unknown-unknown/release/dekopon_echo_provider.wasm"
 component="$root/examples/providers/echo-provider.wasm"
 
-required_wasm_tools_version="1.236.1"
-command -v wasm-tools >/dev/null 2>&1 || {
-  echo "error: wasm-tools $required_wasm_tools_version is required (cargo install wasm-tools --version $required_wasm_tools_version --locked)" >&2
-  exit 1
-}
-actual_wasm_tools=$(wasm-tools --version)
-actual_wasm_tools_version=${actual_wasm_tools#wasm-tools }
-actual_wasm_tools_version=${actual_wasm_tools_version%% *}
-if [[ "$actual_wasm_tools_version" != "$required_wasm_tools_version" ]]; then
-  echo "error: expected wasm-tools $required_wasm_tools_version, found $actual_wasm_tools" >&2
-  echo "install it with: cargo install wasm-tools --version $required_wasm_tools_version --locked --force" >&2
-  exit 1
-fi
-
-rustup target add wasm32-unknown-unknown
-cargo build --locked --manifest-path "$manifest" --target wasm32-unknown-unknown --release
-wasm-tools component new "$core" -o "$component"
-printf 'generated %s\n' "$component"
+"$root/examples/providers/build-component.sh" \
+  "$manifest" "$core" "$component" \
+  "1.97.0" "rustc 1.97.0 (2d8144b78 2026-07-07)" \
+  "dekopon-provider-repro-v1"

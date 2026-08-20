@@ -92,8 +92,13 @@ jobs:
           cargo check --locked -p dekopon-provider-storage --no-default-features --target wasm32-unknown-unknown
           cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown
           cargo check --locked -p dekopon-provider-storage --no-default-features --features durable-files --target wasm32-unknown-unknown
-      - name: Check observability smoke-test script
-        run: shellcheck examples/otel-traces/smoke-test.sh
+      - name: Check repository shell scripts
+        run: |
+          shellcheck \
+            examples/otel-traces/smoke-test.sh \
+            charts/dekopon/ci/verify-init-permissions.sh \
+            examples/providers/build-component.sh \
+            examples/providers/*/build.sh
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
