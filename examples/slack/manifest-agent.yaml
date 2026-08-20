@@ -4,6 +4,8 @@
 # Agent messaging experience. The same Socket Mode and bot credentials are used, but Agent DMs are
 # thread-scoped and `agents.sessions.setStatus(processing)` creates Slack's native Working/Stop UI.
 # Dekopon handles `agent_session_stopped` cooperatively and queues a best-effort return to `active`.
+# Slack also requires the `app_home_opened` bot event whenever `agent_view` is enabled; opening App
+# Home is not itself a prompt, so dekopond safely acknowledges and ignores that event.
 #
 # If Agent status returns `feature_disabled` or another permanent installation error, dekopond
 # degrades to the fixed `:tangerine:` reaction requested by `classicFallback: reaction`, and then
@@ -50,6 +52,7 @@ settings:
   event_subscriptions:
     bot_events:
       - agent_session_stopped
+      - app_home_opened
       - app_mention
       - message.im
   interactivity:

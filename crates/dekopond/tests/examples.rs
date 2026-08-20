@@ -137,12 +137,18 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
     );
     assert!(agent_scopes.iter().any(|scope| scope == "assistant:write"));
     assert!(agent_scopes.iter().any(|scope| scope == "reactions:write"));
+    let agent_events = agent["settings"]["event_subscriptions"]["bot_events"]
+        .as_sequence()
+        .expect("Agent events are a sequence");
     assert!(
-        agent["settings"]["event_subscriptions"]["bot_events"]
-            .as_sequence()
-            .expect("Agent events are a sequence")
+        agent_events
             .iter()
             .any(|event| event.as_str() == Some("agent_session_stopped"))
+    );
+    assert!(
+        agent_events
+            .iter()
+            .any(|event| event.as_str() == Some("app_home_opened"))
     );
     assert_eq!(
         classic["display_information"]["background_color"],
