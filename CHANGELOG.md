@@ -7,16 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-20
+
 ### Added
 
 - Added Discord Gateway v10 transport support for direct messages, explicit guild mentions,
   resumable sessions, no-ping replies, and bounded lazy photo/file attachments with signed-URL
-  refresh.
+  refresh (#114).
 
 ### Changed
 
 - Backfilled release history and made pull-request and tag validation require a dated, non-empty
-  changelog entry for future application and Helm chart releases.
+  changelog entry for future application and Helm chart releases (#113).
 
 ### Security
 
@@ -238,7 +240,8 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dekopon-agents/dekopon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dekopon-agents/dekopon/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dekopon-agents/dekopon/compare/v0.4.0...v0.5.0

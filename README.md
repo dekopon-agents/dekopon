@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.7.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.8.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
-## What works today in 0.7.0
+## What works today in 0.8.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -24,6 +24,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+
+New in 0.8.0 — Discord support without moving authority:
+
+- **Outbound Gateway transport.** `dekopond` connects to Discord Gateway v10 without an inbound HTTP endpoint, accepts DMs and explicit structured guild mentions, treats native threads as channel identities, and filters bot, webhook, self-authored, and system messages before admission.
+- **Resilient, quiet replies.** Heartbeat ACKs, dispatch sequence tracking, Resume, Invalid Session handling, session-start limits, fatal close-code handling, bounded 429 retry, and deduplication keep reconnects controlled. Replies split at Discord's 2,000-unit boundary and disable every user, role, `@everyone`, and reply mention.
+- **Bounded photos and files.** Discord attachments reuse the lazy `Chat Asset #N` flow. Signed CDN URLs are host-validated and fetched without the bot token; expired URLs refresh through the exact source message and attachment ID. The existing media, byte, attempt, and conversation limits remain in force.
 
 New in 0.7.0 — credential-free self-inspection without moving authority:
 
@@ -73,26 +79,26 @@ From there, [`examples/pr-summarizer-linter`](examples/pr-summarizer-linter/READ
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.7.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.7.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.8.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.8.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.7.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.7.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.7.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.8.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.8.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.8.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.7.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.7.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.8.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.8.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-The workspace contains twenty-one public crates at `0.7.0`. After the separate crates.io publication dispatch completes:
+The workspace contains twenty-one public crates at `0.8.0`. After the separate crates.io publication dispatch completes:
 
 ```console
-cargo install --locked --version 0.7.0 dekopon
-cargo install --locked --version 0.7.0 dekopon-run
-cargo install --locked --version 0.7.0 dekopon-brokerd
-cargo install --locked --version 0.7.0 dekopond
+cargo install --locked --version 0.8.0 dekopon
+cargo install --locked --version 0.8.0 dekopon-run
+cargo install --locked --version 0.8.0 dekopon-brokerd
+cargo install --locked --version 0.8.0 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
@@ -130,7 +136,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.7.0` through the chart's `image.tag` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.8.0` through the chart's `image.tag` value.
 
 ## Run the flagship example
 
