@@ -13,6 +13,11 @@ All notable changes to Dekopon are documented here. The format is based on
   unofficial, private, unsupported, mock-only account/frame reads. It is absent from default
   catalogs, images, policies, and deployments.
 
+### Changed
+
+- Application release tags now publish all crates.io packages automatically through trusted
+  publishing; manual workflow dispatch remains an idempotent recovery path.
+
 ### Security
 
 - Bound each Skylight read to one fixed HTTPS GET and a static short-lived destination-bound broker

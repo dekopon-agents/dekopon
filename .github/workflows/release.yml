@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       publish_to_crates:
-        description: Publish crates in dependency order (requires environment approval)
+        description: Recover crates.io publication for an existing release tag
         required: true
         default: false
         type: boolean
@@ -220,9 +220,12 @@ jobs:
     with:
       tag: ${{ needs.github-release.outputs.tag }}
 
+  # An authorized release tag is the publication gate. Routine tag pushes publish every configured
+  # artifact, including crates.io packages; workflow_dispatch remains idempotent recovery for an
+  # existing tag because the loop skips versions crates.io already holds.
   crates-io:
     name: publish crates.io packages
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_crates }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_to_crates) }}
     needs: validate
     runs-on: ubuntu-24.04
     environment: crates-io
@@ -256,8 +259,8 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
-      # Manual publication runs from main, so this cache can accelerate later releases instead of
-      # being isolated under a one-off tag ref. It shares its shape with the PR packaging gate.
+      # Share the package-cache shape with the pull-request gate and manual recovery runs. GitHub
+      # still applies its normal ref-scoping rules to caches created by a release tag.
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:

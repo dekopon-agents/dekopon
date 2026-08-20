@@ -92,7 +92,7 @@ tar xzf dekopon-0.8.1-aarch64-apple-darwin.tar.gz
 
 ### crates.io
 
-The workspace contains twenty-one public crates at `0.8.1`. After the separate crates.io publication dispatch completes:
+The workspace contains twenty-one public crates at `0.8.1`. Each application release tag publishes them in checked dependency order through crates.io trusted publishing:
 
 ```console
 cargo install --locked --version 0.8.1 dekopon
@@ -103,7 +103,7 @@ cargo install --locked --version 0.8.1 dekopond
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
 
-Publication is a separate manual workflow dispatch rather than a tag-push side effect (see [Maintainer release process](#maintainer-release-process)), so a tag can exist for a while before its crates do.
+Crates.io publication is part of the release-tag workflow (see [Maintainer release process](#maintainer-release-process)). A manual dispatch remains available only to recover an interrupted tag publication; already-published immutable versions are skipped.
 
 ### From a checkout
 
@@ -212,12 +212,12 @@ The next architectural milestones are independent checkpoint retention or signin
 
 ## Maintainer release process
 
-Releases deliberately separate preparation, GitHub artifacts, and crates.io publication:
+Releases deliberately separate reviewed preparation from automated publication:
 
 1. Start from a clean, current `main`. Update release-facing status/install text in the root and crate READMEs before tagging—the packaged README is immutable on crates.io. Move the completed [`CHANGELOG.md`](CHANGELOG.md) entries from `[Unreleased]` into a dated `[VERSION]` section and leave an `[Unreleased]` heading for later work; CI and the tag workflow reject a missing or empty release section. Run the full validation matrix in [`docs/development.md`](docs/development.md), including `cargo package --workspace --exclude dekopon-testkit --locked`.
 2. Use `cargo release <VERSION>` to preview the shared-version commit and tag, then `cargo release <VERSION> --execute` after review. [`release.toml`](release.toml) creates the commit and tag but intentionally does not push or publish anything.
-3. Let pull-request CI verify formatting, clippy, tests, rustdoc, package contents, dependency policy, the changelog, and the runner privilege boundary before landing the version commit. CI does not repeat those expensive jobs on the resulting `main` commit. Push the matching `v<VERSION>` tag; the `Release` workflow checks the immutable tag against the shared workspace version, changelog, and publication plan, then builds three CLI archives, attests them, and creates the GitHub release.
-4. A tag push **does not publish crates**. Ensure every public package has the crates.io GitHub trusted publisher `dekopon-agents/dekopon`, workflow `release.yml`, environment `crates-io`; a brand-new crate name must be bootstrapped with an explicitly authorized scoped credential, then registered immediately. Dispatch the same `Release` workflow with the existing tag and `publish_to_crates=true`, then approve the protected environment. The dispatch packages and publishes crates without rebuilding platform archives or replacing the existing GitHub release. It obtains a short-lived OIDC token and publishes every public crate in checked dependency order. It skips an immutable version already present, making a partially completed publication recoverable; an explicit crates.io new-package `429` waits until the server's retry time, while every other publication failure stops the job.
+3. Let pull-request CI verify formatting, clippy, tests, rustdoc, package contents, dependency policy, the changelog, and the runner privilege boundary before landing the version commit. CI does not repeat those expensive jobs on the resulting `main` commit. Push the matching `v<VERSION>` tag; that explicitly authorized tag is the single publication gate. The `Release` workflow checks the immutable tag against the shared workspace version, changelog, and publication plan, builds and attests three CLI archives, creates the GitHub release, publishes the container image, updates the Homebrew tap, and publishes every public crate in checked dependency order through a short-lived OIDC credential.
+4. Ensure every public package has the crates.io GitHub trusted publisher `dekopon-agents/dekopon`, workflow `release.yml`, environment `crates-io`. The environment name is part of that OIDC identity but has no required-reviewer rule; approving the release tag is sufficient. A brand-new crate name must still be bootstrapped with an explicitly authorized scoped credential, then registered immediately. If tag publication is interrupted, dispatch the same `Release` workflow with the existing tag and `publish_to_crates=true`; the recovery packages only the immutable tag, does not rebuild its other artifacts, and skips crate versions already present. An explicit crates.io new-package `429` waits until the server's retry time, while every other publication failure stops the job.
 5. Verify the GitHub release, every crates.io package version, and fresh `cargo install --locked ... --version <VERSION>` commands before announcing the release.
 
 The dependency-ordered crate list lives in [`.github/release-crates.txt`](.github/release-crates.txt). Pull-request CI and release validation fail if that list omits a publishable workspace crate, includes a private/unknown crate, contains duplicates, or places a dependent before its dependency. Never move an existing tag or attempt to overwrite a published crate version; fix release automation on `main` and cut a new patch version when published bytes must change.
