@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""Validate shared workspace versions and the crates.io publication plan."""
+"""Validate shared workspace versions, changelog, and crates.io publication plan."""
 
 import argparse
 import json
 from pathlib import Path
+
+from verify_changelog import verify_changelog
+
+
+# These immutable tags predate CHANGELOG.md. Current automation is intentionally staged before a
+# manual recovery checks out an older tag, so only this exact historical set may omit the file.
+LEGACY_CHANGELOGLESS_TAGS = frozenset(
+    {"v0.2.0", "v0.3.0", "v0.4.0", "v0.5.0", "v0.6.0", "v0.7.0"}
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", required=True, type=Path)
     parser.add_argument("--plan", required=True, type=Path)
+    parser.add_argument("--changelog", required=True, type=Path)
     parser.add_argument("--tag")
     return parser.parse_args()
 
@@ -53,6 +63,13 @@ def main() -> None:
 
     if args.tag is not None and args.tag != f"v{version}":
         raise SystemExit(f"release tag {args.tag!r} does not match workspace version v{version}")
+
+    verify_changelog(
+        args.changelog,
+        version,
+        tag=args.tag,
+        allow_missing_tags=LEGACY_CHANGELOGLESS_TAGS,
+    )
 
     publishable = {
         name: package
