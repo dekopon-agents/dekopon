@@ -43,9 +43,10 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 /// enforces across the session.
 ///
 /// What is left is a well-formedness bound. A scripting tool expresses a multi-step plan *inside*
-/// one script, so a correct turn calls it once; a handful of calls is tolerated for models that
-/// split work across parallel calls, and anything beyond that is a runaway rather than a plan.
-const MAX_TOOL_CALLS_PER_TURN: usize = 4;
+/// one script, while embedder-owned meta tools can legitimately fan out over a bounded attachment
+/// set. Ten calls leave room for that parallel work; anything beyond ten is a runaway rather than
+/// a plan.
+const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
 /// Script execution boundary consumed by the prompt loop.
 ///
@@ -1154,10 +1155,10 @@ mod tests {
 
     use super::{
         AGENT_CONFIG_TOOL_NAME, ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History,
-        HistoryLimits, ModelUsageObserver, PromptError, PromptLimits, SCRIPT_TOOL_NAME,
-        ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_tool,
+        HistoryLimits, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits,
+        SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -2220,8 +2221,45 @@ mod tests {
     }
 
     #[test]
-    fn bounds_script_fan_out_per_model_turn() {
-        let tool_calls = (0..5)
+    fn accepts_ten_tool_calls_in_one_model_turn() {
+        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 10);
+        let tool_calls = (0..MAX_TOOL_CALLS_PER_TURN)
+            .map(|index| ModelToolCall {
+                id: format!("call-{index}"),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: SCRIPT_TOOL_NAME.to_owned(),
+                    arguments: json!({ "script": "echo hi" }).to_string(),
+                },
+            })
+            .collect();
+        let model = ScriptedModel::new([
+            AssistantTurn {
+                content: None,
+                tool_calls,
+                usage: None,
+                replay_items: Vec::new(),
+            },
+            answer("done"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+
+        let outcome = run_prompt(&model, &runtime, "fan out", None, limits(2, 32))
+            .expect("ten calls remain inside the per-turn bound");
+
+        assert_eq!(
+            outcome.script_calls,
+            u32::try_from(MAX_TOOL_CALLS_PER_TURN).expect("tool-call bound fits u32")
+        );
+        assert_eq!(
+            runtime.scripts.lock().expect("script lock").len(),
+            MAX_TOOL_CALLS_PER_TURN
+        );
+    }
+
+    #[test]
+    fn rejects_eleven_tool_calls_in_one_model_turn() {
+        let tool_calls = (0..=MAX_TOOL_CALLS_PER_TURN)
             .map(|index| ModelToolCall {
                 id: format!("call-{index}"),
                 kind: "function".to_owned(),
@@ -2240,9 +2278,15 @@ mod tests {
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "fan out", None, limits(1, 32))
-            .expect_err("script fan-out must be bounded");
+            .expect_err("eleven calls must exceed the per-turn bound");
 
-        assert!(matches!(error, PromptError::TooManyToolCalls { .. }));
+        assert!(matches!(
+            error,
+            PromptError::TooManyToolCalls {
+                actual: 11,
+                maximum: 10
+            }
+        ));
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
     }
 

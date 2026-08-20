@@ -7,6 +7,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Raised the per-model-turn tool-call ceiling from four to ten so bounded multi-attachment requests
+  reach the attachment-specific limit instead of failing the entire session as runaway fan-out.
+
 ## [0.8.0] - 2026-08-20
 
 ### Added
