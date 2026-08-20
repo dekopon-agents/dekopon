@@ -150,6 +150,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test changelog validation
+        run: python3 .github/scripts/test_verify_changelog.py
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -166,7 +168,8 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
           .github/scripts/verify-release-metadata.py \
             --metadata "$RUNNER_TEMP/metadata.json" \
-            --plan .github/release-crates.txt
+            --plan .github/release-crates.txt \
+            --changelog CHANGELOG.md
       - name: Package every publishable crate
         run: cargo package --workspace --exclude dekopon-testkit --locked
       - name: Prepare package cache for saving
@@ -295,6 +298,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Show Helm version
         run: helm version
+      - name: Verify chart changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(helm show chart charts/dekopon | awk '$1 == "version:" { print $2; exit }')
+          python3 .github/scripts/verify_changelog.py \
+            --changelog CHANGELOG.md \
+            --entry "dekopon-chart-$version"
       - name: Lint the chart
         run: helm lint charts/dekopon
       - name: Render with default and realistic values

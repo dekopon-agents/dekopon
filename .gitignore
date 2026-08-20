@@ -7,6 +7,7 @@
 .env.*
 !.env.example
 coverage/
+__pycache__/
 
 # The end-to-end walkthrough tells a reader to copy the .example beside this path and paste a
 # GitHub token into it. Ignoring it here means following the walkthrough cannot commit a secret.

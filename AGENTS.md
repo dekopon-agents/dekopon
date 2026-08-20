@@ -52,6 +52,7 @@ Read the maintainer procedure in [`README.md`](README.md#maintainer-release-proc
 
 - Explicit authorization applies only to the release the human named; it is not standing permission for later versions.
 - Prepare from a clean, current `main`. Every public workspace package must share the release version, and the tag must be exactly `v<VERSION>`.
+- Every release must update [`CHANGELOG.md`](CHANGELOG.md): application tag `v<VERSION>` requires a dated, non-empty `[VERSION]` section, and chart tag `dekopon-chart-<VERSION>` requires `[dekopon-chart-<VERSION>]`. Keep pending work under `[Unreleased]`. Pull-request CI checks both current versions, and each tag workflow rechecks its own entry before publishing.
 - `cargo release` prepares the shared-version commit and tag. Repository configuration intentionally disables its publish and push phases; GitHub Actions owns release artifacts and crates.io trusted publication.
 - A tag push validates and publishes provenance-attested GitHub archives but does **not** publish crates.io packages. Crates publication requires a manual `Release` workflow dispatch with `publish_to_crates=true` and approval of the protected `crates-io` environment.
 - Keep [`.github/release-crates.txt`](.github/release-crates.txt) in package-dependency order, including internal build and dev dependencies that `cargo package` resolves. Pull-request and release-metadata validation check exact coverage, uniqueness, and ordering so a newly public crate cannot be silently omitted or published before a dependency needed for verification.

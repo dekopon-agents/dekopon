@@ -30,7 +30,7 @@ env:
 jobs:
   # Branch protection makes the pull-request CI run the expensive formatting, lint, test,
   # documentation, package, and dependency-policy checks. A release only needs to prove that the
-  # immutable tag agrees with the already-reviewed workspace and publication plan.
+  # immutable tag agrees with the already-reviewed workspace, changelog, and publication plan.
   validate:
     name: validate release
     runs-on: ubuntu-24.04
@@ -51,6 +51,7 @@ jobs:
           mkdir -p "$automation"
           cp .github/release-crates.txt \
             .github/scripts/prepare-package-cache.sh \
+            .github/scripts/verify_changelog.py \
             .github/scripts/verify-release-metadata.py \
             "$automation/"
       - name: Check out release tag
@@ -74,6 +75,7 @@ jobs:
           "$RUNNER_TEMP/release-automation/verify-release-metadata.py" \
             --metadata "$RUNNER_TEMP/metadata.json" \
             --plan "$plan" \
+            --changelog CHANGELOG.md \
             --tag "$RELEASE_TAG"
 
   artifacts:
@@ -242,6 +244,7 @@ jobs:
           mkdir -p "$automation"
           cp .github/release-crates.txt \
             .github/scripts/prepare-package-cache.sh \
+            .github/scripts/verify_changelog.py \
             .github/scripts/verify-release-metadata.py \
             "$automation/"
       - name: Check out release tag

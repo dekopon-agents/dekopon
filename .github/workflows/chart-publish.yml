@@ -75,6 +75,16 @@ jobs:
             echo "registry=$registry"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Verify chart changelog
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_changelog.py \
+            --changelog CHANGELOG.md \
+            --entry "dekopon-chart-$VERSION"
+
       - name: Package the chart
         shell: bash
         env:
