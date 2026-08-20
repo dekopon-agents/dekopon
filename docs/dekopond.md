@@ -4,7 +4,11 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** Chat-transport wakeups, attested routing, bounded sessions, and persistent conversations are implemented and tested. A route is `oneShot` unless its configuration says otherwise, so a deployment that never writes a `conversation:` block behaves exactly as it did before this existed. A dedicated gateway UID remains **committed direction**, and agent memory that outlives a conversation is not designed at all.
+**Status: Current.** Chat-transport wakeups, chat-scoped attested routing, bounded sessions,
+persistent conversations, truthful transport-acceptance receipts, and optional broker-owned durable
+chat memory are implemented and tested. A route is `oneShot` unless configured otherwise; durable
+memory is a separate broker/agent opt-in and never changes that default into automatic replay. A
+dedicated gateway UID remains **committed direction**.
 
 Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
 
@@ -145,7 +149,7 @@ render as concise Markdown tables:
 - agent identifier, description, and catalog `modelClass`;
 - the exact catalog `instructions` supplied as this session's system prompt;
 - route step/capability limits and one-shot or persistent conversation bounds; and
-- the capability metadata in this sender's fresh `capabilitiesFor(subject, agent)` result:
+- the capability metadata in this sender's fresh `capabilitiesForChat(subject, agent, scope)` result:
   identifier, selected provider, description, effect, risk, and idempotency.
 
 That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and
@@ -246,7 +250,7 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 
 `getUpdates?timeout=50&offset=N` blocks server-side and returns as soon as anything arrives, so waiting costs one idle connection. **The poll is the wakeup and advancing `offset` is the acknowledgment** — there is no separate ack call and therefore no ack-before-work problem. The offset advances past every update, including ones the daemon chose not to route, or a filtered bot message would return forever.
 
-Messages from bots are dropped. A private chat is a direct message; a group is a channel. Subject: `telegram.<user id>`.
+Messages from bots are dropped. A private chat is a direct message; a group is a channel. Subject: `telegram.<user id>`. A forum `message_thread_id` creates the distinct canonical conversation `<chat>:topic:<id>`, and the reply carries that same thread ID; plain messages retain the chat itself as their conversation.
 
 Telegram's optional `message_thread_id` is preserved consistently in admission, conversation
 identity, replies, and activity, so a forum-topic pulse cannot appear in another topic. With
@@ -265,7 +269,7 @@ $ nc -U /path/to/dekopond-dev.sock
 {"reply": "Nothing external. Two read-only capability calls."}
 ```
 
-**This transport trusts its local caller to declare a subject.** That is the whole point of it — it exists so a developer can drive a routed session without a Slack workspace — and it is why it is a development tool rather than a production transport. It grants nothing by doing so: the declared subject is still only a claim carried into the broker's `invokeFor`, and the broker still needs an attestor grant covering that namespace plus an owner-controlled mapping before it resolves to a principal. Its `0600` mode keeps it reachable only by the owner's UID, which is the trust domain the broker socket already lives in.
+**This transport trusts its local caller to declare a subject.** That is the whole point of it — it exists so a developer can drive a routed session without a Slack workspace — and it is why it is a development tool rather than a production transport. It grants nothing by doing so: the declared subject is still only a claim carried into the broker's `invokeForChat`, and the broker still needs an attestor grant covering that namespace plus an owner-controlled mapping before it resolves to a principal. Its `0600` mode keeps it reachable only by the owner's UID, which is the trust domain the broker socket already lives in.
 
 A declared subject also selects a *history*. A local caller can therefore name a subject some Slack sender created and have that person's compacted exchange replayed into its own prompt. No authority moves — the broker still decides every invocation for itself — but text does, which is a second reason this socket is `0600` and a development tool.
 
@@ -292,10 +296,10 @@ Nor do two people in one channel share a conversation. History is keyed on `(tra
 Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `conversation:` block — that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, channel, thread)` in-flight set stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
-2. **Authorization.** The session opens an attested broker leg with `capabilitiesFor(subject, agent)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or activity write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
+2. **Authorization.** The session opens an attested broker leg with `capabilitiesForChat(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or activity write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
 3. **Activity.** When the transport opted in, one session-owned generation starts immediately after the fresh grant. The service renders it; the model supplies no target, status text, frame, emoji, or timing. The coordinator permits one request at a time, refreshes expiring signals, seals synchronously before terminal delivery, and queues cleanup afterwards so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop renewal for that generation; permanent Slack installation failures additionally trip a transport-wide fallback breaker.
 4. **Execution.** On a `persistent` route the session first looks up its conversation, keyed on `(transport, the conversation identity, the sender's canonical subject)`. An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then, as before: the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
-5. **Answer.** The session's final text goes back to chat. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route then writes the exchange back as one more remembered turn, trims the window, and restarts the idle clock. **The fixed failure line is never stored.** A session that reached the model and failed records its question with nothing in the answer's place, which is truthful and is what makes the retry after it answerable; a session refused at step 2 records nothing at all, because it never asked. What must never be remembered is this daemon's own failure sentence, since replaying it would teach the model to keep producing it.
+5. **Answer and optional durable recording.** The session's final bounded text goes back to chat. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes the exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. **The fixed failure line is never stored.** A session that reached the model and failed records its question with nothing in the in-process answer's place, which is truthful and is what makes the retry after it answerable; a session refused at step 2 records nothing at all. When optional durable memory is authorized, only a successful model answer that received a complete transport acceptance receipt is recorded, exactly once and without automatic retry. Failure replies, partial delivery, reply errors, and sessions won by an authenticated Stop event are never durably recorded.
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -309,7 +313,7 @@ A `persistent` route keeps a bounded history per sender and replays it into the 
 
 ### The history lives in the gateway
 
-In the daemon's memory, and nowhere else. It is never written to disk, never sent to the broker, and lost on restart: `dekopond` comes back with every conversation forgotten, and a person who asks a follow-up across a restart gets a first-message answer.
+This subsection describes the automatic replay window, not the separate on-demand durable provider. The replay window lives in the daemon's memory and nowhere else. It is never written to disk, never sent to the broker, and is lost on restart: `dekopond` comes back with every conversation forgotten, and a person who asks a follow-up across a restart gets a first-message answer.
 
 That placement is the whole point rather than an implementation shortcut. The broker holds provider credentials and a deliberately metadata-only audit chain in which a provider's output survives only as a digest. Conversation text there would put the most sensitive content in the system inside the most privileged process, sitting beside a record built specifically not to contain it. The gateway already handles this text — it read the message and it wrote the answer — so keeping the history there adds no new reader.
 
@@ -351,7 +355,7 @@ Neither eviction runs on a timer. There is no sweeper task and no shutdown hook:
 
 ### Authorization is never cached
 
-Every message opens a fresh attested broker leg and gets a fresh `capabilitiesFor` answer, exactly as step 2 already describes. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
+Every message opens a fresh attested broker leg and gets a fresh `capabilitiesForChat` answer, exactly as step 2 already describes. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
 
 The granted capability set is additionally **stored with the conversation** and compared on every message. Any difference drops the history and starts a fresh conversation; an empty grant removes the entry outright. The reason is narrow and specific: output a session fetched under a broad grant is sitting in the history, and if the owner then narrows what that subject may reach, an unchecked entry would keep replaying it after the capability that produced it was taken away. Invalidation costs a cache miss on the first message after any policy change, which is the right price — a narrowed grant is precisely when replaying old output is wrong.
 
@@ -396,6 +400,41 @@ Less than it sounds like, and worth having anyway. Set expectations from the pro
 
 On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking. On the default that is fifteen minutes of a person's question, and the agent's answer, resident in a process that previously kept neither past the reply. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of it to disk; the operating system's own paging and core-dump behavior are outside what the daemon controls. Under the single-UID deployment described below, any process under the owner's UID can read that memory — "in memory only" is a durability property, not an isolation one.
 
+## Durable memory after transport acceptance
+
+The gateway receives an optional `ChatMemorySurface` only when the agent is enabled and the broker
+freshly permits all three exact memory capabilities under a matching subject namespace,
+owner-authored `chatScopes` grant, canonical transport/channel/conversation claim, storage
+constraint, and Cedar context. Otherwise recent/search, the `memory` word, the prompt note, durable
+recording, and namespace creation are all absent.
+
+When present, the model may retrieve on demand:
+
+```text
+memory recent --last N
+memory search --query TEXT
+```
+
+It cannot resolve or invoke record. After model success, the gateway bounds the final answer once
+(empty output uses the fixed normal answer), asks the transport to accept those exact bytes, and
+only then opens one fresh broker client for one `RecordDeliveredTurnForChat`. The recorded user text
+is the original bounded sender text, excluding generated attachment reference notes; assistant text
+is exactly what the transport accepted. No response, denial, timeout, EOF, partial Discord delivery,
+or outcome-unaudited is retried, and none changes the already delivered `answered` outcome.
+
+Receipts mean complete **transport acceptance**, never human receipt: Slack and Telegram require an
+HTTP success status before accepting `ok: true`; Slack also validates channel and strict canonical
+timestamp, Telegram validates message/chat/topic and replies inside the topic, Discord validates
+every split message and treats a later failure as partial, and local acknowledges only after
+`write_all` and `flush`. The hidden request carries a tagged service-specific inbound delivery
+identity, and the broker checks its channel/topic/transport fields against the attested scope before
+namespace creation, preventing cross-transport aliases. Local identities include a 128-bit
+OS-random boot nonce, connection, and sequence, so restarts do not collide.
+
+Durable retrieval is not conversation replay. It is never automatically inserted into a later
+prompt. JSONL deduplication is permanent but finite; at capacity recording stops while reads
+continue. There is no deletion/export UX or encryption-at-rest claim.
+
 ## Authorization flow
 
 ```text
@@ -405,8 +444,8 @@ chat service            authenticates the sender
 dekopond                subject = ExternalSubject::{slack,discord,telegram}(...) (routing metadata, not authority)
       |                 agent   = the route's catalog agent
       |
-      | capabilitiesFor(subject, agent)  ── empty ⇒ refuse, no model call
-      | invokeFor(proposal, subject, agent)
+      | capabilitiesForChat(subject, agent, scope)  ── empty ⇒ refuse, no model call
+      | invokeForChat(proposal, subject, agent, scope)
       v
 dekopon-brokerd         attestor grant bounds the namespace
                         identityMappings turn the subject into a principal
@@ -415,7 +454,7 @@ dekopon-brokerd         attestor grant bounds the namespace
                         credentials resolve, the provider executes, audit records it
 ```
 
-The broker is the sole authority. `dekopond` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and an `invokeFor` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
+The broker is the sole authority. `dekopond` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and an `invokeForChat` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
 
 ## Informational status reporting
 
@@ -423,7 +462,7 @@ After its ordinary broker capability probe succeeds, the gateway best-effort pub
 
 The shared prompt loop also calls an optional usage observer after every successfully decoded model response, including responses followed by a later tool/session failure and responses whose provider omitted usage. One session accumulates input, cached-input, output, reasoning-output, and total token counts plus an explicit missing count for each field. A bounded background reporter coalesces deltas and gives each send a short deadline. A full queue, broker restart, old protocol, or timeout logs a stable failure category and never delays or changes the answer; normal `accounting.model.turn` telemetry remains the retained accounting path.
 
-Both reports are self-reported informational state held only in broker memory. They reset on broker restart and never participate in identity, `capabilitiesFor`, Cedar, constraints, credential selection, provider execution, evidence, replay, or durable audit. A compromised gateway can lie to the dashboard and gains no effect authority by doing so.
+Both reports are self-reported informational state held only in broker memory. They reset on broker restart and never participate in identity, `capabilitiesForChat`, Cedar, constraints, credential selection, provider execution, evidence, replay, or durable audit. A compromised gateway can lie to the dashboard and gains no effect authority by doing so.
 
 ## Telemetry
 

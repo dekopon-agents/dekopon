@@ -137,8 +137,13 @@ fn inspects_the_checked_in_provider_component() {
 }
 
 #[test]
-fn direct_mode_rejects_the_http_importing_provider() {
-    for fixture in ["http-probe-provider.wasm", "jsonplaceholder-provider.wasm"] {
+fn direct_mode_rejects_every_privileged_importing_provider() {
+    for fixture in [
+        "http-probe-provider.wasm",
+        "jsonplaceholder-provider.wasm",
+        "memory-chat-provider.wasm",
+        "storage-probe-provider.wasm",
+    ] {
         let provider = imported_provider_path(fixture);
         let output = run(&[
             "inspect",
@@ -429,6 +434,7 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
                         max_response_bytes: 64 * 1024,
                         allow_plaintext_loopback: true,
                     }),
+                    storage: None,
                 },
             )]),
             CredentialStore::empty(),

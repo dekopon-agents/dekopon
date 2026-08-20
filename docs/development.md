@@ -27,6 +27,8 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
+| Provider storage WIT and guest facade | `wit/storage/`, `crates/dekopon-provider-storage/` | Feature/import inspection, mirror comparisons, package workflow |
+| Native provider storage | `crates/dekopon-storage-host/src/{config,key,layout,namespace,quota,transaction,jsonl,vfs,gc,metrics}.rs` | Path/key/quota/transaction/restart/continuity tests plus broker-host component integration |
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, and loopback tests |
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
@@ -40,7 +42,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Chat gateway configuration, transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting and rotation, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
-| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/`, `examples/providers/skylight-private/` | Inline tests plus host/runner tests against checked-in components and injected or loopback mocks |
+| Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `gh/`, `skylight-private/`, `memory-chat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
 | End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
@@ -82,19 +84,30 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `examples/providers/gh/wit/deps/http.wit`
 - `examples/providers/skylight-private/wit/deps/http.wit`
 
-The HTTP-importing guests also mirror the provider package:
+The storage package is mirrored byte-for-byte at:
+
+- `wit/storage/storage.wit`
+- `crates/dekopon-provider-storage/wit/deps/storage.wit`
+- `crates/dekopon-broker-host/wit/deps/storage.wit`
+- `examples/providers/memory-chat/wit/deps/storage.wit`
+- `examples/providers/storage-probe/wit/deps/storage.wit`
+
+The broker host and imported guests also mirror the provider package:
 
 - `crates/dekopon-broker-host/wit/deps/provider.wit`
 - `examples/providers/http-probe/wit/deps/provider.wit`
 - `examples/providers/jsonplaceholder/wit/deps/provider.wit`
 - `examples/providers/gh/wit/deps/provider.wit`
 - `examples/providers/skylight-private/wit/deps/provider.wit`
+- `examples/providers/memory-chat/wit/deps/provider.wit`
+- `examples/providers/memory-reservation-probe/wit/deps/provider.wit`
+- `examples/providers/storage-probe/wit/deps/provider.wit`
 
 Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.2.0` worlds and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), and [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), independently define the HTTP and storage packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.2.0` worlds and the interface-only `dekopon:http@1.0.0` and `dekopon:storage@0.1.0` packages independently. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
-Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. `dekopon-broker-host` is the separate privileged adapter: it links only the project-owned HTTP interface, consumes `AuthorizedInvocation`, and maps WIT values to `dekopon-http-host`. The native engine consumes one exact HTTP grant beneath independent host ceilings, disables redirects, ambient proxies, and automatic decompression, validates and pins DNS results, and returns sanitized HTTP evidence metadata. Neither host authenticates callers, evaluates policy, constructs authorization, injects credentials, or writes audit records.
+Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. The generated echo provider deliberately compiles `dekopon-provider-storage` with its empty default feature set and still decodes to zero imports, proving that merely depending on the facade grants and imports nothing. `dekopon-broker-host` is the separate privileged adapter: it links only the project-owned HTTP and storage interfaces, consumes `AuthorizedInvocation` plus an exact optional storage grant, and maps WIT values to `dekopon-http-host` or `dekopon-storage-host`. The native engines consume exact grants beneath independent host ceilings. Neither host authenticates callers, evaluates policy, constructs authorization, injects credentials, or writes audit records.
 
 The checked-in components are generated:
 
@@ -105,8 +118,12 @@ The checked-in components are generated:
 | `examples/providers/jsonplaceholder/src/lib.rs` | `examples/providers/jsonplaceholder/build.sh` | `examples/providers/jsonplaceholder-provider.wasm` |
 | `examples/providers/gh/src/` | `examples/providers/gh/build.sh` | `examples/providers/gh-provider.wasm` |
 | `examples/providers/skylight-private/src/lib.rs` | `examples/providers/skylight-private/build.sh` | `examples/providers/skylight-private-provider.wasm` |
+| `examples/providers/memory-chat/src/lib.rs` | `examples/providers/memory-chat/build.sh` | `examples/providers/memory-chat-provider.wasm` |
+| `examples/providers/memory-reservation-probe/src/lib.rs` | `examples/providers/memory-reservation-probe/build.sh` | `examples/providers/memory-reservation-probe-provider.wasm` |
+| `examples/providers/provider-v0-1-compat/src/lib.rs` | `examples/providers/provider-v0-1-compat/build.sh` | `examples/providers/provider-v0-1-compat-provider.wasm` |
+| `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. All HTTP-importing components must decode to the two provider exports, exactly one `dekopon:http/client@1.0.0` import, and no WASI imports; direct-host tests prove that the empty linker rejects them. `skylight-private` is an opt-in, unsupported Exploration with injected mocks only; it is not part of a default catalog, image, policy, or deployment.
+Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Publication CI rebuilds every checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection. HTTP-importing components, including the opt-in unsupported `skylight-private` Exploration, decode to exactly one HTTP import. `memory-chat` decodes to JSONL only and three provider exports; `memory-reservation-probe` and the provider-v0.1 compatibility fixture are import-free; `storage-probe` decodes to durable-files only and three provider exports. None may import WASI. Direct-host and `dekopon-run inspect` tests reject every imported component.
 
 ### Dependencies, crates, CI, or releases
 
@@ -185,7 +202,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --exclude dekopon-testkit --locked
 ```
 
-The immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only component integration fixtures, so Cargo may warn that `tests/host.rs`, `tests/broker.rs`, `tests/policy_decisions.rs`, or `tests/server.rs` is not included in the published package. After verification, CI runs `.github/scripts/prepare-package-cache.sh` to remove unpacked test-source directories from `target/package`: they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations while saving the cache.
+The storage host, immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only integration fixtures, so Cargo may warn that `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, or `tests/server.rs` is not included in the published package. After verification, CI runs `.github/scripts/prepare-package-cache.sh` to remove unpacked test-source directories from `target/package`: they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations while saving the cache.
 
 ### OpenObserve OTLP end-to-end test
 
@@ -206,7 +223,7 @@ OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
 
 ### Provider example workspaces
 
-Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `gh`, and `skylight-private`):
+Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `gh`, `skylight-private`, `memory-chat`, `memory-reservation-probe`, `provider-v0-1-compat`, and `storage-probe`):
 
 ```console
 cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
@@ -214,6 +231,10 @@ cargo clippy --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml -
 cargo test --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml
 cargo check --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml --target wasm32-unknown-unknown
 ```
+
+For `memory-chat`, `memory-reservation-probe`, and `storage-probe`, additionally run their
+`build.sh`, `wasm-tools validate`, and `wasm-tools component wit --json`; assert exactly JSONL,
+zero imports, or durable-files respectively and no WASI.
 
 If provider source, SDK exports, WIT, or tool manifests change, install the pinned component tool, regenerate, validate, and exercise each affected checked-in artifact:
 
@@ -264,11 +285,18 @@ wkg build \
 )
 wasm-tools validate target/wit-package/dekopon-provider.wasm
 wasm-tools validate target/wit-package/dekopon-http.wasm
+(
+  cd wit/storage
+  wkg build --wit-dir . --output ../../target/wit-package/dekopon-storage.wasm \
+    --config ../../wkg/config.toml
+)
+wasm-tools validate target/wit-package/dekopon-storage.wasm
 wasm-tools component wit target/wit-package/dekopon-provider.wasm
 wasm-tools component wit target/wit-package/dekopon-http.wasm
+wasm-tools component wit target/wit-package/dekopon-storage.wasm
 ```
 
-The builds must leave both `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.2.0`, a `provider` world with two exports and zero imports, and a `provider-commands` world with three exports and zero imports. The HTTP package must identify `dekopon:http@1.0.0`, one `client` interface with a single buffered `send` function, and no worlds. Exercise the configured fetch path with:
+The builds must leave all three `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.2.0`, a `provider` world with two exports and zero imports, and a `provider-commands` world with three exports and zero imports. The HTTP package must identify `dekopon:http@1.0.0`, one `client` interface with a single buffered `send` function, and no worlds. The storage package must identify `dekopon:storage@0.1.0`, the complete pinned JSONL and durable-files signatures/types, and no worlds. Exercise the configured fetch path with:
 
 ```console
 wkg get \
@@ -279,9 +307,13 @@ wkg get \
   --config wkg/config.toml \
   --output target/wit-package/fetched-http.wasm \
   dekopon:http@1.0.0
+wkg get \
+  --config wkg/config.toml \
+  --output target/wit-package/fetched-storage.wasm \
+  dekopon:storage@0.1.0
 ```
 
-`.github/workflows/wit-package.yml` performs local publish/fetch round trips for both packages on pull requests. When the relevant files reach `main`, it publishes the immutable packages to GHCR and verifies that fetching each package returns identical bytes.
+`.github/workflows/wit-package.yml` performs local publish/fetch round trips for all three packages on pull requests. When the relevant files reach `main`, it publishes the immutable packages to GHCR and verifies that fetching each package returns identical bytes.
 
 ### Container image
 
@@ -302,7 +334,7 @@ docker run --rm dekopon:local dekopon-run invoke \
 docker export "$(docker create dekopon:local unused)" | tar -tvf - opt/dekopon/providers
 ```
 
-The script prints the fifteen files it staged and the digest of each executable, then the build
+The script prints the sixteen files it staged and the digest of each executable, then the build
 context is exactly those files: there is no `.dockerignore` denylist to keep correct as the
 repository grows. The repository root cannot be used as a context and fails in about a second if
 someone tries.
@@ -316,11 +348,11 @@ release's binaries, verifiable with `sha256sum` against the published archive. T
 exactly that for all eight before it pushes anything, and the staging script refuses to stage a
 binary that needs a glibc newer than the runtime base provides.
 
-`echo` is the only baked component the direct runner can load — the other three import
-`dekopon:http/client@1.0.0` and the immediate linker is empty — and loading one matters because
-components compile lazily through Cranelift, so a clean startup proves nothing. The `docker
-export` listing is how ownership and mode are read: the image has no shell. The four components
-must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
+`echo` is the only baked component the direct runner can load — the other default components
+import HTTP and optional memory imports JSONL, while the immediate linker is empty — and loading
+one matters because components compile lazily through Cranelift, so a clean startup proves nothing.
+The `docker export` listing is how ownership and mode are read: the image has no shell. The four
+default components and optional memory component must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 
 ## Before opening a pull request

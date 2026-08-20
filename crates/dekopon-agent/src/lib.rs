@@ -37,7 +37,8 @@ use std::{
 use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
-    BrokerClient, ClientError, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
+    BrokerClient, ChatMemorySurface, ChatScopeClaim, ChatSessionClaim, ClientError,
+    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
 };
 #[cfg(unix)]
 use dekopon_core::{
@@ -196,6 +197,7 @@ pub enum BrokerLegError {
 struct Attestation {
     subject: ExternalSubject,
     agent: AgentId,
+    scope: Option<ChatScopeClaim>,
 }
 
 /// The broker half of a session's capability dispatch.
@@ -221,6 +223,8 @@ pub struct BrokerLeg {
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
+    /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
+    chat_memory: Option<ChatMemorySurface>,
 }
 
 #[cfg(unix)]
@@ -237,7 +241,14 @@ impl BrokerLeg {
     /// session made is recoverable from the broker's audit log by prefix.
     pub async fn connect(client: BrokerClient, trace_prefix: &str) -> Result<Self, BrokerLegError> {
         let (capabilities, command_words) = client.session_surface().await?;
-        Self::build(client, trace_prefix, capabilities, command_words, None)
+        Self::build(
+            client,
+            trace_prefix,
+            capabilities,
+            command_words,
+            None,
+            None,
+        )
     }
 
     /// Connects a leg that proposes on behalf of one transport-authenticated external subject.
@@ -264,7 +275,34 @@ impl BrokerLeg {
             trace_prefix,
             capabilities,
             command_words,
-            Some(Attestation { subject, agent }),
+            Some(Attestation {
+                subject,
+                agent,
+                scope: None,
+            }),
+            None,
+        )
+    }
+
+    /// Connects a bounded chat-scoped leg. This is the only leg that can see durable memory.
+    pub async fn connect_chat(
+        client: BrokerClient,
+        trace_prefix: &str,
+        claim: ChatSessionClaim,
+    ) -> Result<Self, BrokerLegError> {
+        let (capabilities, command_words, chat_memory) =
+            client.session_surface_for_chat(claim.clone()).await?;
+        Self::build(
+            client,
+            trace_prefix,
+            capabilities,
+            command_words,
+            Some(Attestation {
+                subject: claim.subject,
+                agent: claim.agent,
+                scope: Some(claim.scope),
+            }),
+            chat_memory,
         )
     }
 
@@ -274,6 +312,7 @@ impl BrokerLeg {
         available: Vec<dekopon_broker_protocol::AvailableCapability>,
         command_words: Vec<String>,
         attestation: Option<Attestation>,
+        chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, effective_capabilities) = snapshot(available);
         Ok(Self {
@@ -285,6 +324,7 @@ impl BrokerLeg {
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
+            chat_memory,
         })
     }
 
@@ -295,6 +335,12 @@ impl BrokerLeg {
     #[must_use]
     pub fn effective_capabilities(&self) -> Vec<EffectiveCapabilityView> {
         self.effective_capabilities.clone()
+    }
+
+    /// Returns the broker-derived memory note and lookback only when all three grants are effective.
+    #[must_use]
+    pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
+        self.chat_memory.as_ref()
     }
 }
 
@@ -360,9 +406,32 @@ impl CapabilityInvoker for BrokerLeg {
             return None;
         }
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
-        let resolved = self
-            .runtime
-            .block_on(self.client.resolve_command(word.to_owned(), argv.to_vec()));
+        let resolved = self.runtime.block_on(async {
+            match &self.attestation {
+                Some(Attestation {
+                    subject,
+                    agent,
+                    scope: Some(scope),
+                }) => {
+                    self.client
+                        .resolve_command_for_chat(
+                            ChatSessionClaim {
+                                subject: subject.clone(),
+                                agent: agent.clone(),
+                                scope: scope.clone(),
+                            },
+                            word.to_owned(),
+                            argv.to_vec(),
+                        )
+                        .await
+                }
+                _ => {
+                    self.client
+                        .resolve_command(word.to_owned(), argv.to_vec())
+                        .await
+                }
+            }
+        });
         match resolved {
             Ok(Ok((capability, input))) => Some(Ok((capability.to_string(), input))),
             Ok(Err(message)) => Some(Err(message)),
@@ -404,6 +473,22 @@ impl CapabilityInvoker for BrokerLeg {
         // blocking pool it is the ordinary bridge back into async code.
         let submitted = self.runtime.block_on(async {
             match &self.attestation {
+                Some(Attestation {
+                    subject,
+                    agent,
+                    scope: Some(scope),
+                }) => {
+                    self.client
+                        .invoke_for_chat(
+                            request,
+                            ChatSessionClaim {
+                                subject: subject.clone(),
+                                agent: agent.clone(),
+                                scope: scope.clone(),
+                            },
+                        )
+                        .await
+                }
                 Some(attestation) => {
                     self.client
                         .invoke_for(
@@ -713,6 +798,7 @@ mod tests {
                 agent: "chat-agent"
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
+                scope: None,
             }
         }
 
@@ -742,6 +828,7 @@ mod tests {
                 command_words: Vec::new(),
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
+                chat_memory: None,
             }
         }
 

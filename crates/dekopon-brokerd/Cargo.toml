@@ -21,6 +21,7 @@ dekopon-http-host.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
+dekopon-storage-host.workspace = true
 dekopon-telemetry.workspace = true
 dekopon-webui.workspace = true
 opentelemetry.workspace = true

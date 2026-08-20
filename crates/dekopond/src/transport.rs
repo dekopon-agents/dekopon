@@ -7,6 +7,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
 
 use crate::asset::{AssetSourceRef, PendingAsset};
@@ -30,6 +31,8 @@ pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 pub(crate) struct InboundMessage {
     /// The configured transport name this arrived on.
     pub transport: String,
+    /// Transport family that authenticated this message.
+    pub transport_kind: ChatTransportKind,
     /// The sender, taken from the authenticated transport payload and nowhere else.
     pub subject: ExternalSubject,
     /// Service-native conversation identifier.
@@ -241,8 +244,37 @@ pub(crate) trait ChatActivity: Send + Sync {
 
 /// The answering half of a transport, shared by every in-flight session on it.
 pub(crate) trait ChatReplier: Send + Sync {
-    fn reply(&self, target: ReplyTarget, text: String)
-    -> BoxFuture<'_, Result<(), TransportError>>;
+    fn reply(
+        &self,
+        target: ReplyTarget,
+        text: String,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>>;
+}
+
+/// Opaque proof that one complete bounded answer reached service/kernel transport acceptance.
+///
+/// It is intentionally non-serializable and fully redacted. It does not claim human receipt.
+pub(crate) struct DeliveryReceipt {
+    acceptance: String,
+}
+
+impl DeliveryReceipt {
+    pub(crate) fn new(acceptance: impl Into<String>) -> Self {
+        Self {
+            acceptance: acceptance.into(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn accepted(&self) -> bool {
+        !self.acceptance.is_empty()
+    }
+}
+
+impl std::fmt::Debug for DeliveryReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeliveryReceipt([REDACTED])")
+    }
 }
 
 /// Resolves an attachment reference back into the bytes a model can look at.
@@ -278,6 +310,8 @@ pub enum TransportError {
     Service { code: String },
     #[error("chat service response was not the expected shape")]
     Response,
+    #[error("chat service accepted only part of a split answer")]
+    PartialDelivery,
     #[error("chat socket closed")]
     Closed,
     #[error("transport input/output failed")]
@@ -297,6 +331,7 @@ impl TransportError {
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::Response => "response",
+            Self::PartialDelivery => "partial-delivery",
             Self::Closed => "closed",
             Self::Io(_) => "io",
             Self::InsecureSocket { .. } => "insecure-socket",

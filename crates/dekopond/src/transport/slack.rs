@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
@@ -26,7 +27,7 @@ use crate::{
     config::{ActivityMode, SlackActivityConfig, SlackActivityFallback, SlackExperience},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        InboundMessage, ReplyTarget, SessionStop, TransportError, TransportEvent,
+        DeliveryReceipt, InboundMessage, ReplyTarget, SessionStop, TransportError, TransportEvent,
         TransportIdentity, bound_inbound, floor_boundary,
     },
 };
@@ -294,6 +295,7 @@ impl SlackTransport {
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
+            transport_kind: ChatTransportKind::Slack,
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
             channel: channel.to_owned(),
             thread: match self.experience {
@@ -446,7 +448,7 @@ impl ChatReplier for SlackReplier {
         &self,
         target: ReplyTarget,
         text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
@@ -459,6 +461,7 @@ impl ChatReplier for SlackReplier {
             //
             // `text` stays as the notification fallback, which is the one place blocks do not
             // render. It carries the answer unchanged rather than a second translation of it.
+            let expected_channel = channel.clone();
             let mut body = json!({
                 "channel": channel,
                 "text": text,
@@ -479,7 +482,16 @@ impl ChatReplier for SlackReplier {
                 .send()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
-            check_ok(response).await.map(|_| ())
+            let body = check_ok(response).await?;
+            let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
+            let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
+            if response_channel != expected_channel || !canonical_timestamp(timestamp) {
+                return Err(TransportError::Response);
+            }
+            Ok(DeliveryReceipt::new(format!(
+                "{}:{timestamp}",
+                response_channel.to_ascii_lowercase()
+            )))
         })
     }
 }
@@ -901,21 +913,36 @@ async fn post_form(
 ///
 /// The code is Slack's own stable vocabulary (`invalid_auth`, `channel_not_found`), never a token
 /// or a message body, so it is safe to log and to carry in an error.
+fn canonical_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        seconds.len() == 10
+            && fraction.len() == 6
+            && !seconds.starts_with('0')
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 async fn check_ok(response: reqwest::Response) -> Result<Value, TransportError> {
+    let status = response.status();
     let bytes = response
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
     let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
-    if body["ok"] == Value::Bool(true) {
+    if status.is_success() && body["ok"] == Value::Bool(true) {
         return Ok(body);
     }
     Err(TransportError::Service {
-        code: body["error"]
-            .as_str()
-            .unwrap_or("unknown")
-            .chars()
-            .take(64)
-            .collect(),
+        code: if status.is_success() {
+            body["error"]
+                .as_str()
+                .unwrap_or("unknown")
+                .chars()
+                .take(64)
+                .collect()
+        } else {
+            format!("http-{}", status.as_u16())
+        },
     })
 }

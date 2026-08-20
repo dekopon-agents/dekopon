@@ -234,6 +234,10 @@ impl PolicyWorld {
                 "via": { "type": "String", "required": false },
                 "subject": { "type": "String", "required": false },
                 "agent": { "type": "String", "required": false },
+                "transportKind": { "type": "String", "required": false },
+                "transport": { "type": "String", "required": false },
+                "channel": { "type": "String", "required": false },
+                "conversation": { "type": "String", "required": false },
                 "effect": { "type": "String" },
                 "risk": { "type": "String" },
                 "idempotency": { "type": "String" },
@@ -245,6 +249,10 @@ impl PolicyWorld {
                 "via": { "type": "String", "required": false },
                 "subject": { "type": "String", "required": false },
                 "agent": { "type": "String", "required": false },
+                "transportKind": { "type": "String", "required": false },
+                "transport": { "type": "String", "required": false },
+                "channel": { "type": "String", "required": false },
+                "conversation": { "type": "String", "required": false },
             }
         });
 
@@ -343,6 +351,14 @@ pub struct PolicyContext {
     pub subject: Option<String>,
     /// The agent identity of an agent actor.
     pub agent: Option<String>,
+    /// Chat transport family, absent for legacy operations.
+    pub transport_kind: Option<String>,
+    /// Owner-configured transport identifier, absent for legacy operations.
+    pub transport: Option<String>,
+    /// Canonical service channel, absent for legacy operations.
+    pub channel: Option<String>,
+    /// Canonical service conversation, absent for legacy operations.
+    pub conversation: Option<String>,
 }
 
 /// One authorization question.
@@ -651,6 +667,10 @@ impl PolicyEngine {
             ("via", request.context.via.as_ref()),
             ("subject", request.context.subject.as_ref()),
             ("agent", request.context.agent.as_ref()),
+            ("transportKind", request.context.transport_kind.as_ref()),
+            ("transport", request.context.transport.as_ref()),
+            ("channel", request.context.channel.as_ref()),
+            ("conversation", request.context.conversation.as_ref()),
         ] {
             if let Some(value) = value {
                 pairs.push((

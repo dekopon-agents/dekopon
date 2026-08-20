@@ -139,7 +139,11 @@ printf 'what changed today?\nand what did it cost?\n' \
 
 Exit codes follow the rest of the runner: `0` when standard input ends normally, `2` for a usage failure, and `1` for every session failure — the gateway closing the connection, a line from the socket that is not a reply, an over-long message, or a socket that will not connect. Replies already printed are kept; only the unanswered request fails the session. A consumer that stops reading (`| head -1`) ends the session cleanly rather than failing it.
 
-**This does not yet give the gateway a memory.** Every message is still an independent gateway session, so `chat` is useful immediately but not stateful: the daemon does not carry earlier turns into a later one. `--conversation` is the value a later change will key gateway-side history on, which is why it is the conversation's identity now rather than a label; when that arrives, the same command becomes a real conversation with no change here.
+`--conversation` now participates in both optional memory mechanisms. A `persistent` route replays
+its bounded process-memory window immediately. Separately, an agent with the complete broker-owned
+memory surface may run `memory recent --last N` or `memory search --query TEXT` to retrieve durable
+turns across restarts. Durable text is never replayed automatically, and `memory.chat.record` is
+absent from shell listing, description, command resolution, and generic invocation.
 
 Today the identifier's only visible effect is on the gateway's admission check, which keys an in-flight set on `(transport, channel, thread)`. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
 
@@ -257,7 +261,10 @@ Direct-operation bounds are configurable on `inspect`, `invoke`, and `prompt` wi
 - `--fuel`
 - `--timeout-ms`
 
-The host supplies no WASI, filesystem, network, environment, clock, random, or credential imports. It accepts only capabilities declaring `read-only`. Consequently this path exercises pure provider computation; it does not grant read access to an external system despite the effect label.
+The host supplies no WASI, filesystem, network, environment, clock, random, credential, JSONL, or
+durable-file imports. It accepts only capabilities declaring `read-only`. Consequently this path
+exercises pure provider computation; both generated storage components are intentionally rejected
+by `inspect`, just like HTTP-importing components.
 
 ## Authority limitation
 

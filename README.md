@@ -27,6 +27,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+- Unreleased: generic broker-owned JSONL and durable-file provider storage plus optional on-demand
+  durable chat memory. Memory is model-queryable only under an effective all-three grant and is
+  recorded once after gateway-attested complete transport acceptance; it is never automatically
+  replayed into a prompt.
 
 New in 0.9.0 — native chat activity without moving authority:
 
@@ -64,7 +68,13 @@ New in 0.5.0 — chat that can see what you sent it. One documented invariant wa
 
 ## What does not work yet
 
-Agent memory that outlives a conversation. A gateway session replays a bounded per-sender window of earlier turns; nothing carries across conversations, and there is no task store. `dekopond` also runs under the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping rather than isolation; a dedicated gateway UID, where `via` becomes real separation, remains committed direction. See [`docs/dekopond.md`](docs/dekopond.md) for the current contract and [`docs/inference.md`](docs/inference.md#what-a-memory-framework-could-buy) for the explicitly exploratory memory-framework tradeoffs.
+Automatic memory replay, semantic/vector memory, cross-agent sharing, task memory, deletion/export UX,
+SQLite, and encryption-at-rest claims do not exist. Optional durable chat turns carry across broker
+and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope and
+are retrieved on demand with `memory recent` or `memory search`. JSONL deduplication is permanent
+but finite; recording stops with `dedup-capacity` while reads continue. `dekopond` also runs under
+the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping
+rather than isolation; a dedicated gateway UID remains committed direction.
 
 There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Catalog provider and status resources remain declarations only. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
@@ -101,7 +111,7 @@ tar xzf dekopon-0.9.0-aarch64-apple-darwin.tar.gz
 
 ### crates.io
 
-The workspace contains twenty-one public crates at `0.9.0`. Each application release tag publishes them in checked dependency order through crates.io trusted publishing:
+The unreleased workspace contains twenty-three public crates; the published `0.9.0` release contains twenty-one. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
 cargo install --locked --version 0.9.0 dekopon
@@ -217,7 +227,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

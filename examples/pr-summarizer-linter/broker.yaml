@@ -47,6 +47,12 @@ identities:
       # Segment-boundary prefixes, service name first. This lets the gateway name Slack subjects
       # in this workspace; it resolves none of them to a principal.
       namespaces: [slack.t0123abcd]
+      # Chat operations additionally bind the configured transport/channel/conversation. This
+      # route is DM-only; transport-wide breadth avoids owner config depending on Slack's DM ID.
+      chatScopes:
+        - breadth: transportWide
+          kind: slack
+          transport: workspace-slack
 
 identityMappings:
   # The only place a Slack user becomes a principal. An unmapped sender reaches nothing.

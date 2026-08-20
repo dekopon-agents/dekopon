@@ -1,0 +1,7 @@
+package dekopon:provider@0.1.0;
+
+/// Historical immutable provider world: exactly two exports and no imports.
+world provider {
+    export describe: func() -> string;
+    export invoke: func(capability: string, input-json: string) -> string;
+}

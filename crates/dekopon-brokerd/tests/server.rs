@@ -199,6 +199,7 @@ fn agent(name: &str) -> AgentId {
 fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
         namespaces: vec!["slack.t0123abc".to_owned()],
+        chat_scopes: Vec::new(),
     }
 }
 

@@ -51,9 +51,13 @@ Crate boundaries are:
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
 - `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and adapters for its default or a caller-generated provider world.
 - `dekopon-provider-http`: guest-only Rust facade for the published buffered HTTP interface.
+- `dekopon-provider-storage`: feature-gated guest-only JSONL and durable-files bindings with no
+  namespace/path/authority API.
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry for immediate import-free execution.
 - `dekopon-http-host`: statically linked native buffered HTTP engine that consumes HTTP constraints beneath independent ceilings.
-- `dekopon-broker-host`: privileged asynchronous Wasmtime component host that adapts `dekopon:http@1.0.0` to the native engine and accepts only authorized invocations.
+- `dekopon-storage-host`: privileged Wasmtime-independent namespace/key/layout/quota/lease/
+  transaction/recovery/JSONL/durable-file engine. It is absent from `dekopon-run` and `dekopond`.
+- `dekopon-broker-host`: privileged asynchronous Wasmtime component host adapting project-owned HTTP and storage imports, accepting only authorized invocations and exact single-use storage grants.
 - `dekopon-policy`: the bounded, deterministic Cedar adapter — a schema generated from the deployment's declared principals, providers, and capabilities; strict startup validation; entity literals proved against that world; deny on any evaluation error; determining policy identifiers and a policy-set digest per decision. It is consumed only by `dekopon-broker` and `dekopon-brokerd`, and it holds no execution authority: constraint sets stay outside the policy language.
 - `dekopon-broker`: deny-by-default Cedar authorization over owner-authored execution constraint sets, trusted context binding, single-use authorization, replay rejection/recovery, public evidence, and bounded in-memory or durable owner-only single-writer hash-linked audit coordination around the component host.
 - `dekopon-broker-protocol`: lightweight strict versioned messages and an unprivileged Unix client carrying proposals/results but no identity or authorization fields; it has no broker-host or native-HTTP dependency.
@@ -75,8 +79,8 @@ The deployment is three operator-visible roles, two of which are now separate ru
 ```text
 dekopond
     chat transports, routing, model interaction, bounded sessions,
-    bounded per-conversation history
-    (agent memory outliving a conversation remains committed direction)
+    bounded per-conversation history; optional post-acceptance durable recording
+    (durable retrieval remains explicit/on demand, never automatic prompt replay)
 
 dekopon-brokerd
     authorization, credentials, provider execution, external effects,
@@ -103,6 +107,22 @@ Model authentication terminates in the model client, separately from provider au
 The privileged component-linking library and Unix provider **process** are now present. The checked-in JSONPlaceholder component demonstrates the boundary with a read-only GET capability and a distinct external-write POST capability; injected and loopback mocks exercise both without public network access. `dekopon-http-host` consumes exact destinations, methods, call counts, byte limits, and deadlines beneath independent ceilings. It checks and pins DNS results, disables redirects and ambient proxies, and emits sanitized metadata. `dekopon-broker-host` adds a shared async Wasmtime engine, compiled components, fresh fuel/memory-bounded stores, wall-clock cancellation, typed WIT adaptation, and rejection tracking that guest code cannot mask. It consumes one non-cloneable `AuthorizedInvocation` at its public execution boundary; an optional destination-bound credential rides alongside that authorization (never inside it) and is injected by the native engine strictly after guest-header validation.
 
 `dekopon-broker` supplies the next in-process boundary: a transport-independent `AuthenticatedContext`, a Cedar decision from `dekopon-policy`, the capability's owner-authored constraint set, replay rejection with durable restoration, authorization construction, provider execution, redacted public evidence, and bounded in-memory plus durable JSONL hash-chain implementations. The two halves are separate on purpose: a policy edit can broaden who may act and can never widen a timeout, a destination, or a credential binding. The durable log verifies existing records, synchronizes each append, exposes exact prefix comparison, and restores replay IDs. `dekopon-brokerd` maintains a separate atomic count/head checkpoint and requires it to identify a verified prefix before listening, detecting valid-prefix truncation relative to retained local state. Constructing a context alone does not authenticate it. `dekopon-broker-protocol` owns the shared untrusted request/capability wire types without depending on privileged broker/host machinery and adds strict one-request-per-connection framing with hard byte/deadline ceilings and a client that verifies private socket metadata plus the server peer UID. Its invocation payload deliberately omits principal, actor, policy, constraints, credentials, and authorization. `dekopon-brokerd` accepts that socket, derives peer UID from the connected stream, applies an exact owner-controlled UID-to-context mapping, and invokes the core. Owner-only socket mode currently creates one UID trust domain; it is not process-level attestation. Coordinated rollback of both local audit/checkpoint files still requires independent retention to detect. Provider credentials resolve from a separate owner-only `credentialsPath` file into per-capability destination-bound values, selectable per acting agent; evidence records their presence (`credentialInjected`) and audit their symbolic name, never their value. Direct `dekopon-run` execution does not grow those privileges in-process; explicit broker-backed runner operations load no component and remain unprivileged clients. The complete boundary is described in [`broker-http.md`](broker-http.md).
+
+## Unreleased storage execution boundary
+
+A storage-enabled operation follows the ordinary authorization transition and additionally consumes
+one non-cloneable `StorageGrant`. The grant binds the exact component interface and access mode;
+wrong-interface and denied/quota/budget calls become sticky even when guest code catches the WIT
+error. A base-then-generation lease order serializes one scope's pointer, lifecycle, invocation, and
+GC work while distinct opaque namespaces can overlap; grant/begin run as tracked blocking work so a
+lease wait cannot stall Tokio workers. Guest writes land only in an invocation overlay. A valid successful component response triggers the
+MACed manifest → synchronized commit marker → idempotent apply sequence; every earlier failure
+aborts. A live post-marker failure is structurally outcome-unaudited.
+
+The generated memory component is under `/opt/dekopon/optional-providers`, not the default provider
+scan. The chart mounts its retained provider-storage claim and copied operator-managed namespace key
+only into the broker container. The gateway receives neither mount and only sends one typed record
+proposal after an opaque transport-acceptance receipt.
 
 ## Resource evolution
 

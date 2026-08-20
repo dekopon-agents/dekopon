@@ -7,6 +7,38 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
+  engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
+- Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
+  search` commands, with stable or non-reusing authority-bound continuity across restarts.
+- Added chat-scope grants, invocation-bound chat attestations, and dedicated post-transport
+  `RecordDeliveredTurnForChat` recording.
+- Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
+  memory provider.
+
+### Changed
+
+- Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
+  durable recording uses the exact bounded answer once and is never retried automatically.
+- Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
+  totals, using domain-separated keyed commitments and coarse counters instead.
+- Storage now uses retained descriptor-relative tree operations, base→generation lease ordering,
+  exact manifest/entry reservations, bounded finalization, strict recovery/quarantine, and
+  canonical effective-authority generations independent of configuration ordering.
+- Chat recording now uses service-typed scope-bound delivery identities and requires successful
+  Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
+- Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
+  memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+
+### Security
+
+- Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
+  execute hidden memory recording. Storage imports receive only an exact interface/access grant.
+- Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
+  claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+
 ## [0.9.0] - 2026-08-20
 
 ### Added

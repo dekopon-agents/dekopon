@@ -250,6 +250,11 @@ identifier!(
 );
 identifier!(TraceId, "trace", "A validated end-to-end trace identifier.");
 identifier!(
+    TransportId,
+    "transport",
+    "A validated owner-configured chat transport identifier."
+);
+identifier!(
     PrincipalId,
     "principal",
     "A validated authenticated principal identifier."

@@ -4,6 +4,10 @@ use dekopon_provider_sdk::{
 };
 use serde_json::{Value, json};
 
+// Compile the storage facade with its empty default feature set into a generated provider. The
+// resulting component must remain import-free; CI decodes its WIT after every rebuild.
+const _: [(); 1] = [(); (!dekopon_provider_storage::STORAGE_WIT.is_empty()) as usize];
+
 struct EchoProvider;
 
 impl Provider for EchoProvider {

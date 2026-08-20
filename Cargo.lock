@@ -800,6 +800,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-policy",
+ "dekopon-storage-host",
  "fs2",
  "libc",
  "serde",
@@ -819,9 +820,11 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
+ "dekopon-storage-host",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -854,6 +857,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-policy",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-webui",
  "fs2",
@@ -994,6 +998,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-provider-storage"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.44.0",
+]
+
+[[package]]
 name = "dekopon-run"
 version = "0.9.0"
 dependencies = [
@@ -1041,6 +1052,23 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dekopon-storage-host"
+version = "0.9.0"
+dependencies = [
+ "dekopon-capability",
+ "dekopon-core",
+ "fs2",
+ "getrandom 0.4.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -1100,8 +1128,10 @@ dependencies = [
  "dekopon-model",
  "dekopon-protocol",
  "dekopon-shell",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "futures-util",
+ "getrandom 0.4.3",
  "libc",
  "opentelemetry",
  "reqwest",

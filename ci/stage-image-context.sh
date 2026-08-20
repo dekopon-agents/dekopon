@@ -24,7 +24,7 @@
 # Produces:
 #   <work>/archives/        the release archives and their published .sha256 sidecars
 #   <work>/context/         the build context: Dockerfile, dist/<arch>/<binary>, providers/,
-#                           LICENSE-APACHE, LICENSE-MIT — and nothing else
+#                           optional-providers/, LICENSE-APACHE, LICENSE-MIT — and nothing else
 #   <work>/binaries.sha256  the eight staged executables, for the byte-identity check after the
 #                           image is built
 set -euo pipefail
@@ -81,7 +81,7 @@ glibc_exceeds() {
 }
 
 rm -rf "$archives" "$context"
-mkdir -p "$archives" "$context/dist" "$context/providers"
+mkdir -p "$archives" "$context/dist" "$context/providers" "$context/optional-providers"
 
 # Derive the Linux targets from the release rather than assuming a fixed set: a target added or
 # dropped upstream changes the release, and this follows it.
@@ -131,6 +131,11 @@ done
 # Normalised rather than inherited: the Dockerfile deliberately copies the components without
 # --chmod, so whatever mode they have here is the mode dekopon-brokerd will check in the image.
 chmod 0644 "$context/providers"/*.wasm
+# Durable memory is shipped but never joins the default scan directory. An operator must name this
+# exact file or explicitly scan the optional directory.
+cp "$source_dir/examples/providers/memory-chat-provider.wasm" \
+  "$context/optional-providers/memory-chat-provider.wasm"
+chmod 0644 "$context/optional-providers/memory-chat-provider.wasm"
 
 cp "$source_dir/Dockerfile" "$context/Dockerfile"
 cp "$source_dir/LICENSE-APACHE" "$source_dir/LICENSE-MIT" "$context/"
@@ -148,6 +153,7 @@ expected=$(
       for binary in $binaries; do echo "dist/$arch/$binary"; done
     done
     for provider in $providers; do echo "providers/$provider-provider.wasm"; done
+    echo "optional-providers/memory-chat-provider.wasm"
   } | sort
 )
 staged=$(cd "$context" && find . -type f | sed 's|^\./||' | sort)

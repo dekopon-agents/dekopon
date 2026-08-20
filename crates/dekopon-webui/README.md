@@ -22,3 +22,8 @@ Agent and token data remain owned by the unprivileged gateway. `dekopond` sends 
 informational reports over the authenticated Unix broker protocol; the broker retains them only in
 memory and never consults them for Cedar policy, constraints, credentials, routing, evidence, or
 durable audit. Counters and the latest inventory reset when `dekopon-brokerd` restarts.
+
+Storage-backed invocations add only content-free operation/sync/quota counts and coarse
+powers-of-two byte buckets. Exact storage provider input/output totals, provider/capability,
+agent/subject/scope, logical names, offsets, queries, root/key paths, and opaque tokens never enter
+UI state.

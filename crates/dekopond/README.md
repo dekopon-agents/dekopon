@@ -76,3 +76,11 @@ dekopond --config /path/to/dekopond.yaml
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
 `docs/design.md` for the authority model and `docs/security-model.md` for the trust
 boundaries this daemon sits outside of.
+
+## Durable memory receipts
+
+When the broker returns an effective all-three memory surface, the prompt notes only the on-demand
+`memory recent` and `memory search` forms. After model success, the gateway bounds the answer once,
+requires complete service/kernel transport acceptance, and sends exactly one fresh hidden record
+request containing the original bounded sender text and exact accepted answer. It never retries;
+record failure cannot change an already delivered answer. Receipts do not prove human receipt.

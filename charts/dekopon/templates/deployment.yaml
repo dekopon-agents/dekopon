@@ -8,6 +8,8 @@
 {{- $cfg := .Values.paths.configDir -}}
 {{- $run := .Values.paths.runtimeDir -}}
 {{- $state := .Values.paths.stateDir -}}
+{{- $storageRoot := .Values.providerStorage.rootPath -}}
+{{- $storageKeyDir := .Values.providerStorage.keyDir -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -98,7 +100,7 @@ spec:
               # in-place pod restart, and after a previous run these are 0700 and owned by $uid,
               # which root without CAP_DAC_OVERRIDE can neither enter nor write. Reclaiming them
               # keeps the capability set at CHOWN plus FOWNER instead of adding DAC_OVERRIDE.
-              for d in {{ $cfg }} {{ $run }} {{ $state }}; do
+              for d in {{ $cfg }} {{ $run }} {{ $state }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }} {{ $storageKeyDir }}{{ end }}; do
                 chown 0:0 "$d"
                 chmod 0700 "$d"
               done
@@ -113,6 +115,19 @@ spec:
               {{- range $files }}
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
               {{- end }}
+{{- if .Values.providerStorage.enabled }}
+              # The namespace key comes from an external operator-managed Secret, is copied into a
+              # separate broker-only tmpfs, and is never mounted into the gateway.
+              rm -f "{{ $storageKeyDir }}"/*
+              install -m 0600 -o "$uid" -g "$gid" \
+                "/dekopon-storage-key-source/{{ .Values.providerStorage.existingKeySecretKey }}" \
+                "{{ $storageKeyDir }}/{{ .Values.providerStorage.keyFileName }}"
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $storageKeyDir }}/{{ .Values.providerStorage.keyFileName }}")
+              if [ "$got" != "$uid:$gid:600:1:regular file" ]; then
+                echo "provider storage key: got $got, want $uid:$gid:600:1:regular file" >&2
+                rc=1
+              fi
+{{- end }}
 
               # Assert what the daemons assert, so a wrong file is an init failure naming the file
               # rather than a broker that starts and then refuses to serve. `stat` does not follow
@@ -184,7 +199,7 @@ spec:
               # the runtime UID, and every ancestor up to / must be a directory that is not
               # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
               # 0777 and a local-path volume arrives root-owned and 0777, so both need this.
-              for d in {{ $cfg }} {{ $run }} {{ $state }}; do
+              for d in {{ $cfg }} {{ $run }} {{ $state }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }} {{ $storageKeyDir }}{{ end }}; do
                 chmod 0700 "$d"
                 chown "$uid:$gid" "$d"
                 got=$(stat -c '%u:%a:%F' "$d")
@@ -211,6 +226,15 @@ spec:
               mountPath: {{ $run }}
             - name: state
               mountPath: {{ $state }}
+{{- if .Values.providerStorage.enabled }}
+            - name: provider-storage
+              mountPath: {{ $storageRoot }}
+            - name: provider-storage-key
+              mountPath: {{ $storageKeyDir }}
+            - name: provider-storage-key-source
+              mountPath: /dekopon-storage-key-source
+              readOnly: true
+{{- end }}
         {{- if .Values.gateway.enabled }}
         {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" true) | nindent 8 }}
         {{- end }}
@@ -312,6 +336,24 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: {{ include "dekopon.stateClaimName" . }}
+{{- if .Values.providerStorage.enabled }}
+        # Broker-only provider data and broker-only copied namespace key. The gateway has neither
+        # mount, even though it shares the pod and UID for the Unix socket.
+        - name: provider-storage
+          persistentVolumeClaim:
+            claimName: {{ include "dekopon.providerStorageClaimName" . }}
+        - name: provider-storage-key
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: provider-storage-key-source
+          secret:
+            secretName: {{ .Values.providerStorage.existingKeySecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.providerStorage.existingKeySecretKey }}
+                path: {{ .Values.providerStorage.existingKeySecretKey }}
+{{- end }}
         {{- if .Values.gateway.enabled }}
         - name: catalog
           {{- if .Values.gateway.catalog.existingConfigMap }}

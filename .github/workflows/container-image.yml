@@ -115,7 +115,8 @@ jobs:
             echo "push=$push"
             # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
             # cannot push to the wrong package. The published WIT packages are separate GHCR
-            # packages under the same owner (dekopon/provider, dekopon/http) and are unaffected.
+            # packages under the same owner (dekopon/provider, dekopon/http, dekopon/storage) and
+            # are unaffected.
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
             # Publishing checks out the tag so the baked components and the Dockerfile match the
             # release; a pull request checks out itself, which is the point.
@@ -209,6 +210,17 @@ jobs:
                 if (bad) { exit 1 }
                 print "provider components are 65532-owned and not group- or world-writable"
               }'
+            tar -tvf "$rootfs" | awk '
+              $NF ~ /^opt\/dekopon\/optional-providers\// {
+                seen++
+                if ($1 != "-rw-r--r--" && $1 != "drwxr-xr-x") { print "unexpected mode " $1 " on " $NF; bad++ }
+                if ($2 != "65532/65532") { print "unexpected owner " $2 " on " $NF; bad++ }
+              }
+              END {
+                if (seen != 2) { print "expected optional directory plus memory component, found " seen; exit 1 }
+                if (bad) { exit 1 }
+                print "memory is packaged only in the optional provider directory"
+              }'
           done
 
           # The runner is amd64, so that image runs here for real.
@@ -218,8 +230,8 @@ jobs:
           docker run --rm dekopon-proof:amd64 dekopond --version
           # Components compile lazily through Cranelift, so only an actual component load proves
           # Wasmtime works under the runtime image's constraints. `echo` is the one baked component
-          # the direct runner can load: the other three import dekopon:http/client and the
-          # immediate linker is empty by design, so they are broker-only.
+          # the direct runner can load: other default components import HTTP and optional memory
+          # imports JSONL; the immediate linker is empty by design.
           docker run --rm dekopon-proof:amd64 dekopon-run inspect \
             --provider /opt/dekopon/providers/echo-provider.wasm > /dev/null
           docker run --rm dekopon-proof:amd64 dekopon-run invoke \

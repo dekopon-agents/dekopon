@@ -14,8 +14,8 @@ use dekopon_agent::prompt::{
     AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits,
 };
 use dekopon_broker_protocol::{
-    AvailableCapability, BrokerRequest, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame,
-    write_frame,
+    AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
+    InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
@@ -40,12 +40,13 @@ use crate::{
     routes::{RouteError, RoutingTable},
     session::{
         BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
-        UNAUTHORIZED_REPLY, run_session,
+        UNAUTHORIZED_REPLY, memory_record_outcome_category, run_session,
     },
     transport::{
-        ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES, ReplyTarget, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
+        ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
+        DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
+        ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
+        bound_outbound,
     },
 };
 
@@ -1107,10 +1108,10 @@ impl ChatReplier for RecordingReplier {
         &self,
         _target: ReplyTarget,
         text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.replies.lock().expect("reply lock").push(text);
-            Ok(())
+            Ok(DeliveryReceipt::new("test-acceptance"))
         })
     }
 }
@@ -1173,13 +1174,13 @@ impl ChatReplier for RecordingSurface {
         &self,
         _target: ReplyTarget,
         text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.events
                 .lock()
                 .expect("surface event lock")
                 .push(format!("reply:{text}"));
-            Ok(())
+            Ok(DeliveryReceipt::new("recording-surface"))
         })
     }
 }
@@ -1230,14 +1231,26 @@ impl ChatReplier for DelayedSurface {
         &self,
         _target: ReplyTarget,
         _text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.events
                 .lock()
                 .expect("delayed surface events")
                 .push("reply");
-            Ok(())
+            Ok(DeliveryReceipt::new("delayed-surface"))
         })
+    }
+}
+
+struct PartialDeliveryReplier;
+
+impl ChatReplier for PartialDeliveryReplier {
+    fn reply(
+        &self,
+        _target: ReplyTarget,
+        _text: String,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+        Box::pin(async { Err(TransportError::PartialDelivery) })
     }
 }
 
@@ -1256,6 +1269,35 @@ fn capability(id: &str) -> AvailableCapability {
         }
     }))
     .expect("capability fixture decodes")
+}
+
+fn memory_surface_response() -> ResponseEnvelope {
+    ResponseEnvelope::chat_capabilities(
+        vec![
+            capability("memory.chat.recent"),
+            capability("memory.chat.search"),
+        ],
+        vec!["memory".to_owned()],
+        Some(ChatMemorySurface {
+            max_lookback_turns: 200,
+            prompt_note: "Durable memory is available only on demand.".to_owned(),
+        }),
+    )
+}
+
+fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationResult {
+    serde_json::from_value(json!({
+        "invocation": "record-result-fixture",
+        "decision": {
+            "decisionId": "record-result-decision",
+            "authorizedBy": "broker",
+            "policyRevision": "record-result-policy"
+        },
+        "outcome": outcome,
+        "error": error,
+        "evidence": []
+    }))
+    .expect("record result fixture decodes")
 }
 
 /// Serves a fixed script of broker responses over a private Unix socket.
@@ -1349,11 +1391,12 @@ fn model_config() -> ModelConfig {
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
         transport: "dev".to_owned(),
+        transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
         subject: subject(),
         channel: "dev".to_owned(),
         thread: None,
         conversation_id: "dev".to_owned(),
-        message_id: "1".to_owned(),
+        message_id: "0123456789abcdef0123456789abcdef-1-1".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
         conversation: ConversationKind::DirectMessage,
@@ -1505,11 +1548,239 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     // The gateway asked on the sender's behalf, not its own: the broker sees a subject and an
     // agent, and maps the subject to a principal itself.
     let request = observed.recv().await.expect("stub broker saw one request");
-    let BrokerRequest::CapabilitiesFor { subject, agent } = request.request else {
-        panic!("a session must open an attested leg: {request:?}");
+    let BrokerRequest::CapabilitiesForChat { claim } = request.request else {
+        panic!("a session must open a chat-scoped attested leg: {request:?}");
     };
-    assert_eq!(subject.canonical(), SUBJECT);
-    assert_eq!(agent.as_str(), "reviewer");
+    assert_eq!(claim.subject.canonical(), SUBJECT);
+    assert_eq!(claim.agent.as_str(), "reviewer");
+    assert_eq!(claim.scope.transport.as_str(), "dev");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_retried() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::error("outcome-unaudited", "do not retry"),
+            // Keep the listener alive for a third exchange. If recording retries, the request is
+            // observed and receives this response instead of merely failing to reconnect after
+            // the fixture exits.
+            ResponseEnvelope::error("outcome-unaudited", "still do not retry"),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("The exact accepted answer.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("the exact sender text"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["The exact accepted answer."]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    let record = observed.recv().await.expect("one record request");
+    let BrokerRequest::RecordDeliveredTurnForChat { turn, attestation } = record.request else {
+        panic!("expected hidden record operation: {record:?}");
+    };
+    assert_eq!(turn.user, "the exact sender text");
+    assert_eq!(turn.assistant, "The exact accepted answer.");
+    assert_eq!(
+        turn.delivery,
+        dekopon_broker_protocol::DeliveryIdentity::Local {
+            transport: "dev".parse().expect("transport"),
+            conversation: "dev".to_owned(),
+            boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            connection: 1,
+            sequence: 1,
+        }
+    );
+    assert_eq!(turn.id, attestation.invocation);
+    assert!(
+        observed.try_recv().is_err(),
+        "outcome-unknown must never trigger a retry"
+    );
+}
+
+#[test]
+fn record_outcomes_have_a_stable_content_free_failure_vocabulary() {
+    for (outcome, error, expected) in [
+        (InvocationOutcome::Succeeded, None, None),
+        (
+            InvocationOutcome::Denied,
+            Some("policy detail sentinel"),
+            Some("denied"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-capacity"),
+            Some("dedup-capacity"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-conflict"),
+            Some("dedup-conflict"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("memory-corrupt"),
+            Some("memory-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("result-too-large"),
+            Some("result-too-large"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-quota"),
+            Some("storage-quota"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-busy"),
+            Some("storage-busy"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-timeout"),
+            Some("storage-timeout"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-corrupt"),
+            Some("storage-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-io"),
+            Some("storage-io"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("untrusted future detail sentinel"),
+            Some("failed"),
+        ),
+    ] {
+        assert_eq!(
+            memory_record_outcome_category(&record_result(outcome, error)),
+            expected
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_retry() {
+    for (outcome, error) in [
+        (InvocationOutcome::Denied, Some("policy-denied")),
+        (InvocationOutcome::Failed, Some("provider-failure")),
+        (InvocationOutcome::Failed, Some("dedup-capacity")),
+        (InvocationOutcome::Failed, Some("dedup-conflict")),
+        (InvocationOutcome::Failed, Some("storage-quota")),
+        (InvocationOutcome::Failed, Some("storage-busy")),
+        (InvocationOutcome::Failed, Some("storage-timeout")),
+        (InvocationOutcome::Failed, Some("storage-corrupt")),
+        (InvocationOutcome::Failed, Some("storage-io")),
+    ] {
+        let directory = temporary();
+        let result = record_result(outcome, error);
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![
+                memory_surface_response(),
+                ResponseEnvelope::invocation(result.clone()),
+                ResponseEnvelope::invocation(result),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([answer("The delivered answer remains delivered.")]);
+        let replier = Arc::new(RecordingReplier::default());
+
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route(model_config()),
+            message("record this once"),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+
+        assert_eq!(
+            replier.replies(),
+            ["The delivered answer remains delivered."]
+        );
+        assert!(matches!(
+            observed.recv().await.expect("surface request").request,
+            BrokerRequest::CapabilitiesForChat { .. }
+        ));
+        assert!(matches!(
+            observed.recv().await.expect("record request").request,
+            BrokerRequest::RecordDeliveredTurnForChat { .. }
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "{outcome:?}/{error:?} unexpectedly retried"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_text() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::scripted([None]);
+    let replier = Arc::new(RecordingReplier::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("the model will fail"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert_eq!(replier.replies(), [FAILURE_REPLY]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "the fixed gateway failure reply must not be recorded"
+    );
+
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::new([answer("one chunk lands and another fails")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("partial delivery"),
+        Arc::new(PartialDeliveryReplier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "partial transport delivery must not be recorded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1663,16 +1934,10 @@ async fn unauthorized_work_never_publishes_activity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_native_stop_wins_the_race_and_suppresses_answer_and_history() {
+async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_recording() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
-            Vec::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), vec![memory_surface_response()]).await;
     let model = BlockedModel::new("stale answer");
     let surface = Arc::new(RecordingSurface::default());
     let mut runner = runner_with(
@@ -1744,6 +2009,14 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_and_history() {
         0,
         "a cancelled turn is never committed to persistent history"
     );
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "a cancelled turn is never durably recorded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1791,7 +2064,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         .expect("authorization request was sent");
     assert!(matches!(
         first.request,
-        BrokerRequest::CapabilitiesFor { .. }
+        BrokerRequest::CapabilitiesForChat { .. }
     ));
 
     session.abort();
@@ -1886,7 +2159,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     let request = observed.recv().await.expect("one capability listing");
     assert!(matches!(
         request.request,
-        BrokerRequest::CapabilitiesFor { .. }
+        BrokerRequest::CapabilitiesForChat { .. }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -2171,8 +2444,8 @@ fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) 
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
         assert!(
-            matches!(request.request, BrokerRequest::CapabilitiesFor { .. }),
-            "every session opens an attested leg: {request:?}"
+            matches!(request.request, BrokerRequest::CapabilitiesForChat { .. }),
+            "every session opens a chat-scoped attested leg: {request:?}"
         );
         count += 1;
     }
@@ -4342,6 +4615,59 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     assert_eq!(body["channel"], "d0123abc");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses() {
+    let slack_http = spawn_raw_http_mock(|_| {
+        (
+            500,
+            "application/json",
+            br#"{"ok":true,"channel":"d0123abc","ts":"1712345678.000100"}"#.to_vec(),
+        )
+    });
+    let slack = slack(&slack_http.base).replier();
+    assert!(
+        slack
+            .reply(
+                ReplyTarget::Slack {
+                    channel: "d0123abc".to_owned(),
+                    thread_ts: None,
+                },
+                "answer".to_owned(),
+            )
+            .await
+            .is_err()
+    );
+
+    let telegram_http = spawn_raw_http_mock(|_| {
+        (
+            500,
+            "application/json",
+            br#"{"ok":true,"result":{"message_id":7,"chat":{"id":42}}}"#.to_vec(),
+        )
+    });
+    let telegram = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        telegram_http.base,
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport")
+    .replier();
+    assert!(
+        telegram
+            .reply(
+                ReplyTarget::Telegram {
+                    chat_id: 42,
+                    reply_to: None,
+                    message_thread_id: None,
+                },
+                "answer".to_owned(),
+            )
+            .await
+            .is_err()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Chat assets
 // ---------------------------------------------------------------------------
@@ -4760,7 +5086,10 @@ fn discord_handler(gateway_url: String) -> impl Fn(&str, &str) -> Value + Send +
                 "max_concurrency": 1
             }
         }),
-        path if path.starts_with("/api/v10/channels/") => json!({"id": "444444444444444444"}),
+        path if path.starts_with("/api/v10/channels/") => json!({
+            "id": "444444444444444444",
+            "channel_id": DISCORD_CHANNEL,
+        }),
         _ => json!({"code": 10002, "message": "Unknown Application"}),
     }
 }
@@ -4962,7 +5291,15 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
                     br#"{"retry_after":0.001,"global":false}"#.to_vec(),
                 )
             } else {
-                (200, "application/json", b"{}".to_vec())
+                (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "id": "444444444444444444",
+                        "channel_id": DISCORD_CHANNEL,
+                    }))
+                    .expect("Discord response serializes"),
+                )
             }
         }
         _ => (404, "application/json", b"{}".to_vec()),
@@ -4981,6 +5318,43 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
         )
         .await
         .expect("the bounded retry succeeds");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_failure_after_one_accepted_chunk_is_partial_delivery() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let http = spawn_raw_http_mock(move |path| {
+        if path == "/api/v10/channels/222222222222222222/messages" {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                return (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "id": "444444444444444444",
+                        "channel_id": DISCORD_CHANNEL,
+                    }))
+                    .expect("response serializes"),
+                );
+            }
+            return (500, "application/json", br#"{"code":500}"#.to_vec());
+        }
+        (404, "application/json", br#"{"code":404}"#.to_vec())
+    });
+    let transport = discord(&http.base);
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: None,
+            },
+            "x".repeat(3_000),
+        )
+        .await
+        .expect_err("the second chunk fails after the first was accepted");
+    assert!(matches!(error, TransportError::PartialDelivery));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -5473,8 +5847,18 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
                 }
             }]});
         }
-        if path.contains("sendChatAction") || path.contains("sendMessage") {
+        if path.contains("sendChatAction") {
             return json!({"ok": true, "result": true});
+        }
+        if path.contains("sendMessage") {
+            return json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "message_thread_id": 99,
+                    "chat": {"id": -1001}
+                }
+            });
         }
         json!({"ok": true, "result": []})
     });
@@ -5489,7 +5873,7 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
     let message = next_message(&mut transport).await;
 
     assert_eq!(message.thread.as_deref(), Some("99"));
-    assert_eq!(message.conversation_id, "-1001:99");
+    assert_eq!(message.conversation_id, "-1001:topic:99");
     assert_eq!(
         message.reply.clone(),
         ReplyTarget::Telegram {
@@ -5572,6 +5956,63 @@ async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     assert_ne!(first.conversation_id, group.conversation_id);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("getUpdates") && path.contains("offset=0") {
+            let mut message = telegram_chat_message(
+                -1001,
+                "supergroup",
+                16034700182_i64,
+                false,
+                3,
+                "topic question",
+            );
+            message["message_thread_id"] = json!(77);
+            return json!({"ok": true, "result": [{"update_id": 500, "message": message}]});
+        }
+        if path.contains("sendMessage") {
+            return json!({
+                "ok": true,
+                "result": {
+                    "message_id": 4,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "type": "supergroup"}
+                }
+            });
+        }
+        json!({"ok": true, "result": []})
+    });
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("telegram connects");
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.conversation_id, "-1001:topic:77");
+    assert_eq!(message.thread.as_deref(), Some("77"));
+    transport
+        .replier()
+        .reply(message.reply, "inside topic".to_owned())
+        .await
+        .expect("topic reply is accepted");
+    let body = http
+        .calls()
+        .into_iter()
+        .find_map(|(path, body)| path.contains("sendMessage").then_some(body))
+        .expect("sendMessage request");
+    let body: Value = serde_json::from_str(&body).expect("request JSON");
+    assert_eq!(body["chat_id"], -1001);
+    assert_eq!(body["message_thread_id"], 77);
+    assert_eq!(body["reply_to_message_id"], 3);
+}
+
 // ---------------------------------------------------------------------------
 // The development transport
 // ---------------------------------------------------------------------------
@@ -5619,5 +6060,39 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         first.message_id, second.message_id,
         "each request is still its own message"
     );
+    let parts = first.message_id.split('-').collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].len(), 32, "a 128-bit boot nonce prefixes every ID");
+    assert!(
+        parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert_eq!(named.conversation_id, "session-7");
+
+    // The receipt resolves only after the transport writer has completed both `write_all` and
+    // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
+    let reply = tokio::spawn({
+        let replier = transport.replier();
+        let target = first.reply.clone();
+        async move { replier.reply(target, "accepted locally".to_owned()).await }
+    });
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut client = BufReader::new(client);
+    let mut line = String::new();
+    client
+        .read_line(&mut line)
+        .await
+        .expect("the flushed reply reaches the local caller");
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).expect("local reply is JSON")["reply"],
+        "accepted locally"
+    );
+    assert!(
+        reply
+            .await
+            .expect("reply task completes")
+            .expect("local write and flush are accepted")
+            .accepted()
+    );
 }
