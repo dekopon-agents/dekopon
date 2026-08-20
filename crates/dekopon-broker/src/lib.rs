@@ -3562,10 +3562,12 @@ where
         let (result, audit_event) = match execution {
             Err(failure)
                 if matches!(
-                    failure.error,
-                    BrokerHostError::Storage {
-                        source: dekopon_storage_host::StorageHostError::OutcomeUnaudited,
-                    }
+                    failure.error.as_ref(),
+                    BrokerHostError::Storage { source }
+                        if matches!(
+                            source,
+                            dekopon_storage_host::StorageHostError::OutcomeUnaudited
+                        )
                 ) =>
             {
                 return Err(BrokerError::StorageOutcome {
@@ -4188,22 +4190,15 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
             reason: "denied", ..
         } => "storage-io",
         BrokerHostError::StorageCallRejected { .. } => "storage-io",
-        BrokerHostError::Storage {
-            source: dekopon_storage_host::StorageHostError::QuotaExceeded,
-        } => "storage-quota",
-        BrokerHostError::Storage {
-            source: dekopon_storage_host::StorageHostError::Busy,
-        } => "storage-busy",
-        BrokerHostError::Storage {
-            source: dekopon_storage_host::StorageHostError::Timeout,
-        } => "storage-timeout",
-        BrokerHostError::Storage {
-            source:
-                dekopon_storage_host::StorageHostError::Corrupt { .. }
-                | dekopon_storage_host::StorageHostError::CorruptLayout
-                | dekopon_storage_host::StorageHostError::KeyMismatch,
-        } => "storage-corrupt",
-        BrokerHostError::Storage { .. } => "storage-io",
+        BrokerHostError::Storage { source } => match source {
+            dekopon_storage_host::StorageHostError::QuotaExceeded => "storage-quota",
+            dekopon_storage_host::StorageHostError::Busy => "storage-busy",
+            dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
+            dekopon_storage_host::StorageHostError::Corrupt { .. }
+            | dekopon_storage_host::StorageHostError::CorruptLayout
+            | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
+            _ => "storage-io",
+        },
         BrokerHostError::Invoke { .. } => "provider-trap",
         BrokerHostError::ProviderFailure {
             provider,

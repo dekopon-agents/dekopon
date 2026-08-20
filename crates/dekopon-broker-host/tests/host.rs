@@ -403,7 +403,7 @@ async fn skylight_private_manifest_is_exact_and_a_nonmatching_grant_denies_befor
         .await
         .expect_err("a nonmatching HTTP authority grant must fail");
     assert!(matches!(
-        failure.error,
+        failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "denied",
             ..
@@ -440,7 +440,7 @@ async fn denies_http_when_authorization_has_no_http_grant() {
         .error;
 
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "denied",
             ..
@@ -473,7 +473,7 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
         .error;
 
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "denied",
             ..
@@ -509,7 +509,7 @@ async fn rejects_guest_control_of_authorization_headers() {
         .error;
 
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "invalid-http-request",
             ..
@@ -545,7 +545,7 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
         .error;
 
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "denied",
             ..
@@ -591,7 +591,7 @@ async fn enforces_response_bytes_while_streaming() {
         .error;
 
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "byte-limit",
             ..
@@ -675,7 +675,7 @@ async fn rejects_authorization_bound_to_a_different_provider() {
         .expect_err("authorization cannot be retargeted to the routed provider")
         .error;
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::AuthorizedProviderMismatch { .. }
     ));
 }
@@ -736,7 +736,7 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
         .expect_err("authorization cannot widen host timeout")
         .error;
     assert!(matches!(
-        error,
+        error.as_ref(),
         BrokerHostError::AuthorizationExceedsHostLimit {
             field: "timeout_ms"
         }
@@ -979,7 +979,7 @@ async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
     // The denial is terminal even though the guest catches the HTTP error internally, and the
     // evidence still shows exactly what ran: the pre-read happened, the write never did.
     assert!(matches!(
-        failure.error,
+        failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "denied",
             ..
@@ -1018,7 +1018,7 @@ async fn gh_approve_over_its_call_budget_trips_the_host_call_limit() {
         .expect_err("a second call over a one-call grant must fail");
 
     assert!(matches!(
-        failure.error,
+        failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: "host-call-limit",
             ..
@@ -1360,11 +1360,11 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
             .expect_err("a caught storage denial remains terminal");
         assert!(
             matches!(
-                failure.error,
+                failure.error.as_ref(),
                 BrokerHostError::StorageCallRejected {
                     reason: actual,
                     ..
-                } if actual == reason
+                } if *actual == reason
             ),
             "mode {mode} returned {:?}",
             failure.error

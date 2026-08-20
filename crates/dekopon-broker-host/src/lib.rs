@@ -156,7 +156,7 @@ impl Default for BrokerHostLimits {
 #[derive(Debug)]
 pub struct BrokerInvocationFailure {
     /// Host failure that ended the invocation.
-    pub error: BrokerHostError,
+    pub error: Box<BrokerHostError>,
     /// Sanitized metadata for every HTTP call dispatched before the failure.
     pub http_calls: Vec<HttpCallEvidence>,
     /// Content-free storage evidence when a storage transaction began.
@@ -166,7 +166,7 @@ pub struct BrokerInvocationFailure {
 impl From<BrokerHostError> for BrokerInvocationFailure {
     fn from(error: BrokerHostError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             http_calls: Vec::new(),
             storage: None,
         }
@@ -181,7 +181,7 @@ impl fmt::Display for BrokerInvocationFailure {
 
 impl std::error::Error for BrokerInvocationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+        Some(self.error.as_ref())
     }
 }
 
@@ -596,7 +596,7 @@ impl BrokerWasmProvider {
                 storage,
             }),
             Err(error) => Err(BrokerInvocationFailure {
-                error,
+                error: Box::new(error),
                 http_calls,
                 storage,
             }),
