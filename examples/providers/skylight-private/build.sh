@@ -54,9 +54,31 @@ if [[ "$manifest_dir" == "$source_root" || "$manifest_dir" == "$source_root/"* ]
   repository_crate=true
 fi
 
+target=host
+expect_target=false
+for argument in "$@"; do
+  if [[ "$expect_target" == true ]]; then
+    target=$argument
+    expect_target=false
+    continue
+  fi
+  case $argument in
+    --target)
+      expect_target=true
+      ;;
+    --target=*)
+      target=${argument#--target=}
+      ;;
+  esac
+done
+
+normalize_metadata=$repository_crate
+if [[ "$target" == wasm32-unknown-unknown ]]; then
+  normalize_metadata=true
+fi
+
 args=()
 crate_name=
-target=host
 while (($#)); do
   case $1 in
     --crate-name)
@@ -75,7 +97,7 @@ while (($#)); do
       shift
       ;;
     -C)
-      if (($# >= 2)) && [[ $2 == metadata=* ]] && [[ "$repository_crate" == true ]]; then
+      if (($# >= 2)) && [[ $2 == metadata=* ]] && [[ "$normalize_metadata" == true ]]; then
         shift 2
       else
         args+=("$1")
@@ -83,7 +105,7 @@ while (($#)); do
       fi
       ;;
     -Cmetadata=*)
-      if [[ "$repository_crate" == true ]]; then
+      if [[ "$normalize_metadata" == true ]]; then
         shift
       else
         args+=("$1")
@@ -97,25 +119,26 @@ while (($#)); do
   esac
 done
 
-if [[ "$repository_crate" == true && -n "$crate_name" ]]; then
+if [[ "$normalize_metadata" == true && -n "$crate_name" && -n "${CARGO_PKG_NAME-}" && -n "${CARGO_PKG_VERSION-}" ]]; then
   args+=(
     -C
-    "metadata=dekopon-skylight-repro-v1-${CARGO_PKG_NAME}-${CARGO_PKG_VERSION}-$crate_name-$target"
+    "metadata=dekopon-skylight-repro-v2-${CARGO_PKG_NAME}-${CARGO_PKG_VERSION}-$crate_name-$target"
   )
 fi
 exec "$actual_rustc" "${args[@]}"
 EOF
 chmod 0700 "$rustc_proxy"
 
-# Cargo includes checkout-dependent path-package IDs in its rustc metadata arguments. The proxy
-# preserves the configured RUSTC_WRAPPER (including sccache), delegates to the pinned compiler, and
-# replaces only that local metadata. Bump the v1 salt in both places if the normalization changes.
+# Cargo includes checkout-dependent path-package IDs and host-dependent target dependency hashes in
+# its rustc metadata arguments. The proxy preserves the configured RUSTC_WRAPPER (including
+# sccache), delegates to the pinned compiler, and replaces metadata for repository crates plus every
+# crate compiled for the Wasm target. Bump the v2 salt in both places if the normalization changes.
 printf -v encoded_rustflags '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
   "--remap-path-prefix=$root=/dekopon/source" \
   "--remap-path-prefix=$cargo_home=/dekopon/cargo" \
   "--remap-path-prefix=$sysroot=/dekopon/rust/$rust_toolchain" \
-  '--cfg=dekopon_skylight_repro_v1' \
-  '--check-cfg=cfg(dekopon_skylight_repro_v1)' \
+  '--cfg=dekopon_skylight_repro_v2' \
+  '--check-cfg=cfg(dekopon_skylight_repro_v2)' \
   '-Ccodegen-units=1'
 
 rustup target add --toolchain "$rust_toolchain" wasm32-unknown-unknown
