@@ -11,7 +11,9 @@
 use std::path::PathBuf;
 
 use dekopon_config::LocalCatalog;
-use dekopond::DekopondConfig;
+use dekopond::{
+    ActivityMode, DekopondConfig, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+};
 
 fn example(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,6 +51,17 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
 
     let transport = config.transports.first().expect("one transport");
     assert_eq!(transport.kind(), "slackSocketMode");
+    assert!(matches!(
+        transport,
+        dekopond::TransportConfig::SlackSocketMode {
+            experience: SlackExperience::Agent,
+            activity: SlackActivityConfig {
+                mode: ActivityMode::Native,
+                classic_fallback: SlackActivityFallback::Reaction,
+            },
+            ..
+        }
+    ));
     let route = config.routes.first().expect("one route");
     assert_eq!(route.transport, transport.name());
     assert_eq!(route.limits.max_steps, 8);
@@ -84,4 +97,56 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             .any(|model| model.classes().iter().any(|offered| offered == class)),
         "no configured model offers the {class} class the agent asks for"
     );
+}
+
+#[test]
+fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let load = |name: &str| {
+        let path = root.join("examples/slack").join(name);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("{} reads: {error}", path.display()));
+        serde_yaml::from_slice::<serde_yaml::Value>(&bytes)
+            .unwrap_or_else(|error| panic!("{} decodes: {error}", path.display()))
+    };
+    let classic = load("manifest.yaml");
+    let agent = load("manifest-agent.yaml");
+
+    assert!(classic["features"].get("agent_view").is_none());
+    assert!(agent["features"].get("agent_view").is_some());
+    let scopes = |manifest: &serde_yaml::Value| {
+        manifest["oauth_config"]["scopes"]["bot"]
+            .as_sequence()
+            .expect("bot scopes are a sequence")
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let classic_scopes = scopes(&classic);
+    let agent_scopes = scopes(&agent);
+    assert!(
+        classic_scopes
+            .iter()
+            .any(|scope| scope == "reactions:write")
+    );
+    assert!(
+        !classic_scopes
+            .iter()
+            .any(|scope| scope == "assistant:write")
+    );
+    assert!(agent_scopes.iter().any(|scope| scope == "assistant:write"));
+    assert!(agent_scopes.iter().any(|scope| scope == "reactions:write"));
+    assert!(
+        agent["settings"]["event_subscriptions"]["bot_events"]
+            .as_sequence()
+            .expect("Agent events are a sequence")
+            .iter()
+            .any(|event| event.as_str() == Some("agent_session_stopped"))
+    );
+    assert_eq!(
+        classic["display_information"]["background_color"],
+        "#ff6a3d"
+    );
+    assert_eq!(agent["display_information"]["background_color"], "#ff6a3d");
 }

@@ -1,7 +1,8 @@
 # dekopond
 
-**Status: current.** Chat-transport wakeups, attested routing, bounded sessions, and
-persistent conversations are implemented and tested.
+**Status: current.** Chat-transport wakeups, attested routing, opt-in native in-flight activity,
+cooperatively cancellable bounded sessions, and persistent conversations are implemented and
+tested.
 
 The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services,
 waits for a wakeup, routes each authenticated message to a named agent from the catalog,
@@ -19,8 +20,13 @@ and replies with the answer.
 - **Chat assets** — Slack, Discord, and Telegram photos/files become numbered, bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
+- **Activity** — after fresh authorization, Discord typing and Telegram chat actions renew under
+  their native leases; Slack Agent sessions use `processing`/`active` and an authenticated Stop
+  event, with an opt-in fixed `:tangerine:` reaction fallback for classic/free workspaces. Cosmetic
+  failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
-  bounded model turns, bounded capability calls, and one fixed line on failure.
+  bounded model turns, bounded capability calls, cooperative Stop checks, and one fixed line on
+  failure.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
 - **Conversations** — one independent session per message unless a route sets

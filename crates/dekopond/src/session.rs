@@ -6,32 +6,42 @@
 //! cheapest possible refusal, and one that cannot be talked out of by the message text.
 
 use std::{
-    collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex},
+    collections::{BTreeSet, HashMap, hash_map::Entry},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Instant,
 };
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, ShellRuntime,
     meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
-    prompt::{History, ModelUsageObserver, PromptError, SessionInputs, run_prompt_session},
+    prompt::{
+        CancellationProbe, History, ModelUsageObserver, PromptError, SessionInputs,
+        run_prompt_session,
+    },
 };
 use dekopon_broker_protocol::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED, ModelUsageReport};
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
     model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
 };
-use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::Instrument as _;
 
 use crate::{
+    activity::{ActivityControl, ActivityLease},
     asset::{self, AssetStore, SessionAssets},
     config::{ConversationPolicy, ModelConfig, ResolvedBroker},
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
-    transport::{AssetFetcher, ChatReplier, InboundMessage, bound_inbound, bound_outbound},
+    transport::{
+        AssetFetcher, ChatActivity, ChatReplier, InboundMessage, ReplyTarget, SessionStop,
+        bound_inbound, bound_outbound,
+    },
 };
 
 /// Trace-identifier prefix, so every broker record a gateway session made is recoverable by prefix.
@@ -47,6 +57,12 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 /// or a transport diagnostic, and chat is the last place any of those belong: the operator reads
 /// the category from telemetry, and the sender reads a sentence.
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
+/// Confirmation sent when Slack's authenticated Agent-session Stop event wins the completion race.
+pub(crate) const STOPPED_REPLY: &str = "Stopped.";
+
+const SESSION_RUNNING: u8 = 0;
+const SESSION_CANCELLED: u8 = 1;
+const SESSION_ANSWERING: u8 = 2;
 
 /// One conversation, for in-flight serialization only.
 ///
@@ -150,6 +166,202 @@ impl Drop for SessionAdmission {
     }
 }
 
+#[derive(Clone)]
+struct SessionCancellation(Arc<AtomicU8>);
+
+impl SessionCancellation {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(SESSION_RUNNING)))
+    }
+
+    fn claim_answer(&self) -> bool {
+        self.0
+            .compare_exchange(
+                SESSION_RUNNING,
+                SESSION_ANSWERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                SESSION_RUNNING,
+                SESSION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl CancellationProbe for SessionCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == SESSION_CANCELLED
+    }
+}
+
+/// Cancels synchronous work when its owning async session is aborted during shutdown.
+struct CancellationOnDrop(SessionCancellation);
+
+impl Drop for CancellationOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.cancel();
+    }
+}
+
+/// Prevents a script from starting another capability call after a native Stop was observed.
+///
+/// A call already inside the delegate is not rollbackable; this check is the cooperative boundary
+/// immediately before the broker proposal.
+struct CancelAwareInvoker<I> {
+    inner: I,
+    cancellation: SessionCancellation,
+}
+
+impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
+    fn granted(&self) -> Vec<String> {
+        self.inner.granted()
+    }
+
+    fn is_granted(&self, capability: &str) -> bool {
+        self.inner.is_granted(capability)
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        self.inner.command_words()
+    }
+
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, serde_json::Value), String>> {
+        self.inner.resolve_command(word, argv)
+    }
+
+    fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
+        self.inner.describe(capability)
+    }
+
+    fn invoke(&self, capability: &str, input: serde_json::Value) -> CapabilityCallResult {
+        if self.cancellation.is_cancelled() {
+            CapabilityCallResult::Denied {
+                reason: "session-cancelled".to_owned(),
+            }
+        } else {
+            self.inner.invoke(capability, input)
+        }
+    }
+}
+
+type ActiveSessionKey = (String, String);
+
+#[derive(Clone)]
+struct ActiveSession {
+    subject: dekopon_core::ExternalSubject,
+    cancellation: SessionCancellation,
+    activity: ActivityControl,
+    replier: Arc<dyn ChatReplier>,
+    reply: ReplyTarget,
+}
+
+/// A durable response to one native Stop event, sent outside the transport-reader task.
+pub(crate) struct StopReply {
+    pub replier: Arc<dyn ChatReplier>,
+    pub target: ReplyTarget,
+}
+
+/// Active Agent sessions keyed only by authenticated transport-native conversation identity.
+#[derive(Clone, Default)]
+pub(crate) struct ActiveSessions {
+    entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
+}
+
+impl ActiveSessions {
+    fn register(
+        &self,
+        message: &InboundMessage,
+        cancellation: SessionCancellation,
+        activity: ActivityControl,
+        replier: Arc<dyn ChatReplier>,
+    ) -> ActiveRegistration {
+        let key = (message.transport.clone(), message.conversation_id.clone());
+        let session = ActiveSession {
+            subject: message.subject.clone(),
+            cancellation: cancellation.clone(),
+            activity,
+            replier,
+            reply: message.reply.clone(),
+        };
+        let registered = match self
+            .entries
+            .lock()
+            .expect("active session registry")
+            .entry(key.clone())
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(session);
+                true
+            }
+            Entry::Occupied(_) => {
+                // Admission should make this unreachable. Refusing to replace the owner keeps a
+                // stale or malformed control event from cancelling a different generation.
+                tracing::error!(event = "gateway_session_registry_conflict");
+                false
+            }
+        };
+        ActiveRegistration {
+            entries: Arc::clone(&self.entries),
+            key,
+            cancellation,
+            registered,
+        }
+    }
+
+    pub(crate) fn stop(&self, request: &SessionStop) -> Option<StopReply> {
+        let key = (request.transport.clone(), request.conversation_id.clone());
+        let session = self
+            .entries
+            .lock()
+            .expect("active session registry")
+            .get(&key)
+            .cloned()?;
+        if session.subject != request.subject || !session.cancellation.cancel() {
+            return None;
+        }
+        session.activity.finish();
+        Some(StopReply {
+            replier: session.replier,
+            target: session.reply,
+        })
+    }
+}
+
+struct ActiveRegistration {
+    entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
+    key: ActiveSessionKey,
+    cancellation: SessionCancellation,
+    registered: bool,
+}
+
+impl Drop for ActiveRegistration {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut entries = self.entries.lock().expect("active session registry");
+        if entries
+            .get(&self.key)
+            .is_some_and(|session| Arc::ptr_eq(&session.cancellation.0, &self.cancellation.0))
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+
 /// Everything shared by every session this daemon runs.
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
@@ -162,6 +374,10 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
+    /// Optional service-native in-flight activity, by transport name.
+    pub activities: HashMap<String, Arc<dyn ChatActivity>>,
+    /// Native Agent sessions that can receive authenticated Stop events.
+    pub active_sessions: ActiveSessions,
     /// Best-effort informational usage deltas for the broker-hosted web UI.
     pub usage_reports: Option<mpsc::Sender<ModelUsageReport>>,
 }
@@ -432,12 +648,33 @@ async fn session(
     // which point a key captured in a constructor would describe the first conversation forever
     // while quietly mislabeling every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
+
+    // Activity is armed only after the fresh authorization gate and immediately before the costly
+    // model/tool work. The registry and cancellation probe share one generation, so a native Slack
+    // Stop event can win exactly once against the terminal answer.
+    let driver = runner.activities.get(&message.transport).cloned();
+    let activity_enabled = driver.is_some() && message.activity.is_some();
+    let cancellation = SessionCancellation::new();
+    let mut activity = ActivityLease::start(driver, message.activity.clone());
+    let _active_registration = activity_enabled.then(|| {
+        runner.active_sessions.register(
+            message,
+            cancellation.clone(),
+            activity.control(),
+            Arc::clone(replier),
+        )
+    });
+    // Declared last so task abortion drops this guard first, marking the blocking loop cancelled
+    // before activity/registry cleanup releases the rest of the async session state.
+    let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
+
     // The prompt loop and the interpreter are both synchronous and both can block for a long time
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
     let usage = Arc::new(UsageAccumulator::default());
     let observed_usage = Arc::clone(&usage);
+    let prompt_cancellation = cancellation.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Built before the accumulator exists, so a model client that cannot be constructed
@@ -447,7 +684,10 @@ async fn session(
             Err(error) => return (Err(error), None),
         };
         let runtime = ShellRuntime {
-            invoker: leg,
+            invoker: CancelAwareInvoker {
+                inner: leg,
+                cancellation: prompt_cancellation.clone(),
+            },
             limits: shell,
             curl_capability: None,
         };
@@ -462,7 +702,8 @@ async fn session(
                 .with_options(&options)
                 .with_assets(&assets)
                 .with_usage_observer(observed_usage.as_ref())
-                .with_agent_config(&agent_config),
+                .with_agent_config(&agent_config)
+                .with_cancellation(&prompt_cancellation),
             &mut history,
         )
         .map_err(SessionError::from);
@@ -472,7 +713,7 @@ async fn session(
         // the newest *seeded* turn look like this session's — which strict configuration already
         // rejects at startup, and which must not silently duplicate an exchange if it ever did not.
         let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::ZeroSteps)) => None,
+            Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
             _ => history.turns().last().cloned(),
         };
         (outcome, turn)
@@ -492,15 +733,37 @@ async fn session(
     let (outcome, turn) = match result {
         Ok(session) => session,
         Err(_) => {
+            if !cancellation.claim_answer() {
+                tracing::info!(event = "gateway_session_cancelled");
+                activity.finish_in_background();
+                return "cancelled";
+            }
             // The task itself died, so there is no history to trust and nothing to record.
+            activity.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
-            answer(replier, message, FAILURE_REPLY).await;
-            return "failed";
+            let replied = answer(replier, message, FAILURE_REPLY).await;
+            activity.finish_in_background();
+            return if replied { "failed" } else { "reply-failed" };
         }
     };
+
+    if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
+        || cancellation.is_cancelled()
+        || !cancellation.claim_answer()
+    {
+        tracing::info!(event = "gateway_session_cancelled");
+        activity.finish_in_background();
+        return "cancelled";
+    }
+
+    // Seal renewal before terminal delivery, but do no remote cleanup on this latency-sensitive
+    // path. Slack's explicit `active` and reaction removal run only after the durable answer.
+    activity.seal();
+
     // The exchange when the session answered, and the bare question when it did not. The fixed
     // failure line is never stored: it is this daemon's sentence rather than the agent's, and
-    // replaying it would teach the model to keep producing it.
+    // replaying it would teach the model to keep producing it. Cancellation claimed the state
+    // above and therefore never reaches this commit.
     if let Some(window) = window
         && let Some(turn) = turn
     {
@@ -509,19 +772,20 @@ async fn session(
             .commit(&key, &granted, window, turn, &cache_key, Instant::now());
     }
 
-    let answer_text = match outcome {
-        Ok(outcome) => outcome.answer,
+    let (answer_text, completed_outcome) = match outcome {
+        Ok(outcome) => (outcome.answer, "answered"),
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category()
             );
-            answer(replier, message, FAILURE_REPLY).await;
-            return "failed";
+            (FAILURE_REPLY.to_owned(), "failed")
         }
     };
-    if answer(replier, message, &answer_text).await {
-        "answered"
+    let replied = answer(replier, message, &answer_text).await;
+    activity.finish_in_background();
+    if replied {
+        completed_outcome
     } else {
         "reply-failed"
     }

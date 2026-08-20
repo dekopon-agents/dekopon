@@ -125,6 +125,16 @@ pub trait ModelUsageObserver: Send + Sync {
     fn observe(&self, usage: Option<ModelUsage>);
 }
 
+/// Request-scoped cooperative cancellation visible from the synchronous prompt loop.
+///
+/// Cancellation is not rollback: a model request or provider effect already accepted elsewhere may
+/// still finish. The probe prevents the next model turn or tool invocation from starting and lets
+/// an embedding gateway suppress a stale terminal answer.
+pub trait CancellationProbe: Send + Sync {
+    /// Whether the session should stop at its next cooperative boundary.
+    fn is_cancelled(&self) -> bool;
+}
+
 /// Bounds on one prompt session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PromptLimits {
@@ -268,6 +278,7 @@ pub struct SessionInputs<'a> {
     assets: Option<&'a dyn AssetSource>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
+    cancellation: Option<&'a dyn CancellationProbe>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -282,6 +293,7 @@ impl<'a> SessionInputs<'a> {
             assets: None,
             usage_observer: None,
             agent_config: None,
+            cancellation: None,
         }
     }
 
@@ -319,6 +331,13 @@ impl<'a> SessionInputs<'a> {
         self.agent_config = Some(config);
         self
     }
+
+    /// Adds a request-scoped cooperative cancellation probe.
+    #[must_use]
+    pub const fn with_cancellation(mut self, cancellation: &'a dyn CancellationProbe) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
 }
 
 /// Optional, request-scoped surfaces handed to the inner model loop.
@@ -328,6 +347,7 @@ struct SessionExtensions<'a> {
     assets: Option<&'a dyn AssetSource>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
+    cancellation: Option<&'a dyn CancellationProbe>,
 }
 
 /// Runs one bounded prompt/tool session from a [`SessionInputs`].
@@ -352,6 +372,7 @@ where
         assets,
         usage_observer,
         agent_config,
+        cancellation,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -380,6 +401,7 @@ where
             assets,
             usage_observer,
             agent_config,
+            cancellation,
         },
     );
     history.record(match &result {
@@ -409,6 +431,7 @@ where
         assets,
         usage_observer,
         agent_config,
+        cancellation,
     } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
@@ -431,6 +454,7 @@ where
     let mut capability_invocations = 0_u32;
 
     for model_turns in 1..=limits.max_steps {
+        check_cancelled(cancellation)?;
         // Usage fields are declared empty and recorded once the provider answers: token counts
         // are response data, and they belong on the turn span so a trace query can price a
         // session without leaving the trace.
@@ -520,9 +544,11 @@ where
             );
         }
         drop(model_entered);
+        check_cancelled(cancellation)?;
         messages.push(assistant_message(&turn));
 
         if turn.tool_calls.is_empty() {
+            check_cancelled(cancellation)?;
             let answer = turn
                 .content
                 .filter(|content| !content.trim().is_empty())
@@ -552,6 +578,7 @@ where
         }
 
         for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
+            check_cancelled(cancellation)?;
             let tool_call_index = tool_call_index + 1;
             if call.id.trim().is_empty() {
                 reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
@@ -621,7 +648,9 @@ where
                 // `run_script` returns no `Result`: a failed script is an outcome the model reads
                 // and recovers from, so the `prompt.script` span always closes normally and
                 // reports the script's own exit code rather than a host error.
+                check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script, remaining);
+                check_cancelled(cancellation)?;
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
                         target: "dekopon_agent::audit",
@@ -646,6 +675,14 @@ where
     Err(PromptError::MaxSteps {
         maximum: limits.max_steps,
     })
+}
+
+fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), PromptError> {
+    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+        Err(PromptError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Renders one script outcome the way a terminal would: output, then an exit-code trailer.
@@ -1014,6 +1051,9 @@ the entire point of this tool.";
 /// [`format_script_outcome`] so it can recover.
 #[derive(Debug, Error)]
 pub enum PromptError {
+    /// The embedding caller stopped the session at a cooperative boundary.
+    #[error("prompt session was cancelled")]
+    Cancelled,
     /// A zero-length loop was requested.
     #[error("prompt max steps must be greater than zero")]
     ZeroSteps,
@@ -1086,6 +1126,7 @@ impl PromptError {
     #[must_use]
     pub fn telemetry_kind(&self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::ZeroSteps => "zero-steps",
             Self::Model(_) => "model",
             Self::UnknownTool(_) => "unknown-tool",
@@ -1154,11 +1195,11 @@ mod tests {
     };
 
     use super::{
-        AGENT_CONFIG_TOOL_NAME, ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History,
-        HistoryLimits, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits,
-        SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome,
-        run_prompt, run_prompt_session, run_prompt_with_history,
-        run_prompt_with_history_and_options, script_tool,
+        AGENT_CONFIG_TOOL_NAME, CancellationProbe, ConversationTurn, DEFAULT_MAX_BYTES,
+        DEFAULT_MAX_TURNS, History, HistoryLimits, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver,
+        PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs,
+        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1304,6 +1345,43 @@ mod tests {
             max_steps,
             max_capability_calls,
         }
+    }
+
+    struct Cancelled;
+
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_pre_cancelled_session_never_reaches_the_model_or_history() {
+        let model = ScriptedModel::new([answer("too late")]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("stop", limits(2, 2)).with_cancellation(&Cancelled),
+            &mut history,
+        )
+        .expect_err("cancellation is a terminal session outcome");
+
+        assert!(matches!(error, PromptError::Cancelled));
+        assert!(
+            model
+                .observed_messages
+                .lock()
+                .expect("message observations lock")
+                .is_empty(),
+            "no model request starts after cancellation"
+        );
+        assert_eq!(
+            history.len(),
+            1,
+            "the prompt loop records an unanswered turn"
+        );
     }
 
     fn agent_config() -> AgentConfigView {

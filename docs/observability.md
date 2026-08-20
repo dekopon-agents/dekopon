@@ -180,12 +180,18 @@ attested context was derived.
 
 | Span | Fields |
 |---|---|
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
 
-Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model was called, `busy` means admission control refused the message, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
+Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
+
+In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
+only `operation` plus the stable transport-error category. A permanent Slack installation fallback
+emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or
+`reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
+thread, message, subject, status text, emoji, raw service response, or credential.
 
 ### What conversation history changes
 
@@ -385,6 +391,7 @@ Telemetry includes operation names, model/provider/capability identifiers, bound
 - model tool-call IDs and the script text a model authors, along with that script's output;
 - provider input and output;
 - inbound chat message text and the canonical subject identifiers of the people who sent it;
+- activity channel/thread/message targets, native status text, reaction names, and raw service errors;
 - chat bot tokens and the environment variable values behind every configured credential;
 - command arguments, in every form and at every level;
 - bearer tokens, OTLP authorization headers, and provider credentials; and

@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod activity;
 mod asset;
 mod cache_key;
 mod config;
@@ -47,9 +48,10 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
-    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig, ConversationPolicy,
-    ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES, ResolvedConfig, ResolvedRoute,
-    ResolvedTelemetry, SocketDiscovery, TelemetryConfig,
+    ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
+    ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
+    NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry, SlackActivityConfig,
+    SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig, TransportConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;
@@ -57,14 +59,13 @@ pub use transport::TransportError;
 
 use crate::{
     asset::AssetStore,
-    config::TransportConfig,
     conversation::ConversationStore,
     routes::RoutingTable,
-    session::{ConfiguredModels, SessionGate, SessionRunner},
+    session::{ConfiguredModels, STOPPED_REPLY, SessionGate, SessionRunner},
     transport::{
-        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        TransportIdentity, discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
-        telegram::TelegramTransport,
+        AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
+        SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
+        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
     },
 };
 
@@ -161,6 +162,7 @@ where
     let mut identities = BTreeMap::new();
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
+    let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -182,6 +184,9 @@ where
         // unavailable on a route bound to one.
         if let Some(fetcher) = transport.asset_fetcher() {
             asset_fetchers.insert(spec.name().to_owned(), fetcher);
+        }
+        if let Some(activity) = transport.activity() {
+            activities.insert(spec.name().to_owned(), activity);
         }
         transports.push(transport);
     }
@@ -205,10 +210,12 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
+        activities,
+        active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
     });
 
-    let (sender, receiver) = mpsc::channel::<InboundMessage>(INBOUND_BUFFER);
+    let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
     let mut readers = JoinSet::new();
     for transport in transports {
         readers.spawn(read_transport(transport, sender.clone()));
@@ -463,7 +470,7 @@ async fn serve<F>(
     routes: Arc<RoutingTable>,
     identities: Arc<BTreeMap<String, TransportIdentity>>,
     repliers: Arc<BTreeMap<String, Arc<dyn ChatReplier>>>,
-    mut receiver: mpsc::Receiver<InboundMessage>,
+    mut receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
 ) where
@@ -480,9 +487,16 @@ async fn serve<F>(
         }
         tokio::select! {
             () = &mut shutdown => break,
-            message = receiver.recv() => {
-                let Some(message) = message else { break };
-                dispatch(&runner, &routes, &identities, &repliers, &mut sessions, message);
+            event = receiver.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    TransportEvent::Message(message) => {
+                        dispatch(&runner, &routes, &identities, &repliers, &mut sessions, *message);
+                    }
+                    TransportEvent::SessionStopped(request) => {
+                        stop_session(&runner, &mut sessions, request);
+                    }
+                }
             }
         }
     }
@@ -565,15 +579,38 @@ fn dispatch(
     ));
 }
 
+fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request: SessionStop) {
+    let Some(reply) = runner.active_sessions.stop(&request) else {
+        tracing::debug!(
+            event = "gateway_session_stop_ignored",
+            transport = %request.transport
+        );
+        return;
+    };
+    tracing::info!(
+        event = "gateway_session_stop_requested",
+        transport = %request.transport
+    );
+    sessions.spawn(async move {
+        if let Err(error) = reply
+            .replier
+            .reply(reply.target, STOPPED_REPLY.to_owned())
+            .await
+        {
+            tracing::error!(event = "gateway_reply_failed", category = error.category());
+        }
+    });
+}
+
 /// One reader task per transport, feeding the routing loop.
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
-    sender: mpsc::Sender<InboundMessage>,
+    sender: mpsc::Sender<TransportEvent>,
 ) {
     loop {
         match transport.next().await {
-            Ok(message) => {
-                if sender.send(message).await.is_err() {
+            Ok(event) => {
+                if sender.send(event).await.is_err() {
                     return;
                 }
             }
@@ -599,6 +636,8 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                 name,
                 app_token_env,
                 bot_token_env,
+                experience,
+                activity,
                 endpoint,
             } => Box::new(SlackTransport::new(
                 name.clone(),
@@ -607,10 +646,13 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
                 transport::read_credential(app_token_env)?,
                 transport::read_credential(bot_token_env)?,
+                *experience,
+                *activity,
             )?),
             TransportConfig::DiscordGateway {
                 name,
                 bot_token_env,
+                activity,
                 endpoint,
             } => Box::new(DiscordTransport::new(
                 name.clone(),
@@ -618,10 +660,12 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .clone()
                     .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
                 transport::read_credential(bot_token_env)?,
+                activity.mode,
             )?),
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
+                activity,
                 endpoint,
             } => Box::new(TelegramTransport::new(
                 name.clone(),
@@ -629,6 +673,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .clone()
                     .unwrap_or_else(|| config::TELEGRAM_ENDPOINT.to_owned()),
                 transport::read_credential(bot_token_env)?,
+                activity.mode,
             )?),
             TransportConfig::Local { name, socket_path } => {
                 Box::new(LocalTransport::new(name.clone(), socket_path.clone()))
