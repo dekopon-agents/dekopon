@@ -63,7 +63,7 @@ use crate::{
     session::{ConfiguredModels, SessionGate, SessionRunner},
     transport::{
         AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        TransportIdentity, local::LocalTransport, slack::SlackTransport,
+        TransportIdentity, discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
         telegram::TelegramTransport,
     },
 };
@@ -536,11 +536,12 @@ fn dispatch(
     };
     // A channel route that fired on every message would be noise and cost, so a shared
     // conversation requires the bot to be addressed. A direct message is addressed by definition.
-    if matches!(message.conversation, ConversationKind::Channel(_))
-        && !identities
+    let addressed = message.addressed.unwrap_or_else(|| {
+        identities
             .get(&message.transport)
             .is_some_and(|identity| identity.is_addressed(&message.text))
-    {
+    });
+    if matches!(message.conversation, ConversationKind::Channel(_)) && !addressed {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -605,6 +606,17 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .clone()
                     .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
                 transport::read_credential(app_token_env)?,
+                transport::read_credential(bot_token_env)?,
+            )?),
+            TransportConfig::DiscordGateway {
+                name,
+                bot_token_env,
+                endpoint,
+            } => Box::new(DiscordTransport::new(
+                name.clone(),
+                endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
                 transport::read_credential(bot_token_env)?,
             )?),
             TransportConfig::TelegramLongPoll {

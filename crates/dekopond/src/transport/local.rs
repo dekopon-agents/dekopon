@@ -157,6 +157,7 @@ impl LocalTransport {
                     // one-to-one, so there is no ambient traffic to filter and no mention to
                     // require. Channel routes are a chat-service concept.
                     conversation: ConversationKind::DirectMessage,
+                    addressed: Some(true),
                     reply: ReplyTarget::Local { connection },
                 };
                 if inbound.send(message).is_err() {

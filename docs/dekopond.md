@@ -38,6 +38,9 @@ transports:
     kind: slackSocketMode
     appTokenEnv: DEKOPOND_SLACK_APP_TOKEN     # environment variable NAMES only
     botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+  - name: community-discord
+    kind: discordGateway
+    botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
   - name: tg
     kind: telegramLongPoll
     botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
@@ -69,6 +72,9 @@ routes:                                       # first match wins, so order these
     agent: incident-responder                 # one named channel, its own agent
   - transport: scientist-slack
     match: { kind: channel }                  # any other channel the bot is invited to
+    agent: pr-summarizer-linter
+  - transport: community-discord
+    match: { kind: channel }                  # Discord channels and native thread channels
     agent: pr-summarizer-linter
   - transport: scientist-slack
     match: { kind: directMessage }
@@ -110,7 +116,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
-- a transport endpoint override that is neither the one production origin nor a literal loopback `http://` URL;
+- a transport endpoint override that is neither its pinned production origin (Slack, Discord, or Telegram) nor a literal loopback `http://` URL;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
 - a missing credential environment variable;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`.
@@ -165,9 +171,20 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 - A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A direct message has no thread to join and answering in one would hide the reply.
 - An answer is posted in a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), which carries the model's CommonMark unchanged and lets Slack render it. The `text` field is mrkdwn — a proprietary syntax where bold is `*one asterisk*` and a link is `<url|label>` — so an answer posted through it alone arrives with `**bold**` as four literal asterisks, and tables and task lists cannot be expressed in it at all. Translating in this process would be a second translation of what Slack is about to translate, so the gateway does none: the block gets the answer verbatim. `text` is still sent as the notification fallback, the one place blocks do not render. The block caps a payload at 12,000 characters, which the 8 KiB outbound bound already sits under.
 
+### Discord Gateway
+
+Discord Gateway v10 is another outbound WebSocket transport. The daemon discovers the service URL through authenticated `GET /api/v10/gateway/bot`, requests only the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents, and identifies after Hello. It jitters the first heartbeat, requires each heartbeat ACK, tracks dispatch sequence, resumes a live session after reconnect, honors Invalid Session and identify/session-start limits, and treats Discord's fatal close codes as terminal transport failures. No public endpoint or privileged Message Content intent is required: Discord exposes content and attachments in DMs and in guild messages whose structured `mentions` array names the bot, and those are the only messages that may wake a session.
+
+- Bots, webhooks, the bot's own posts, and message types other than ordinary messages and replies are dropped.
+- Absence of `guild_id` is a direct message. A guild message is a channel message and must name the bot in its structured mentions. Subject: `discord.<user id>`; Discord user snowflakes are global, so a guild is not part of the canonical subject.
+- A Discord thread is itself a channel. Its channel ID is the route key, conversation identity, and reply destination. A catch-all channel route covers transient threads; a route naming only a parent channel does not automatically claim its thread IDs.
+- Replies use `POST /api/v10/channels/{channel}/messages`. The first guild post references the incoming message with `fail_if_not_exists: false`; every post disables parsed/reply mentions, so model-authored text cannot ping a user, role, or `@everyone`. Discord's 2,000-character ceiling is handled by lossless multi-message splitting, with Markdown left unchanged.
+
+[`../examples/discord/`](../examples/discord/README.md) is the bot installation, permission, token, route, and identity-mapping walkthrough.
+
 ## Chat assets
 
-A screenshot is part of the message that carried it. Both Slack and Telegram deliver it by reference rather than by value, so the gateway resolves that reference — with the bot token it already holds — in order to hear the whole request. This grants no policy, no provider credential, and no way to write anything.
+A screenshot is part of the message that carried it. Slack, Discord, and Telegram deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack and Telegram require the bot token they already terminate here; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
 
 What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is *named* in the prompt and fetched only if the model decides the answer depends on it:
 
@@ -190,7 +207,8 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **A route's model has to opt in to images.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. Documents need no modality: a PDF is a parsed attachment to every endpoint that accepts one at all, so gating it on vision would refuse it to a model perfectly able to read it.
 - **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
-- **Resolving a reference differs by transport.** Slack carries a private download URL on the event itself. Telegram carries only a `file_id`, so a fetch is two calls: `getFile` turns the handle into a path valid for about an hour, and the bytes live under `/file/bot<token>/<path>` rather than the method prefix. The round trip happens at fetch time, which is also when that path is freshest.
+- **Resolving a reference differs by transport.** Slack carries a private download URL on the event itself. Discord carries a signed CDN URL plus the source channel/message/attachment IDs; the CDN request carries no token, and an expired 401/403/404 URL is refreshed by re-reading that exact message through pinned Discord REST before retrying the same attachment ID. Telegram carries only a `file_id`, so a fetch is two calls: `getFile` turns the handle into a path valid for about an hour, and the bytes live under `/file/bot<token>/<path>` rather than the method prefix. The round trip happens at fetch time, which is also when that path is freshest.
+- **Discord specifics.** Photos and arbitrary files share the attachment object, retaining their sender-controlled filename, optional media type, and reported size. Production downloads accept only HTTPS `cdn.discordapp.com` or `media.discordapp.net` URLs, reject credentials and redirects, and enforce the byte ceiling while streaming.
 - **Telegram specifics.** A photo arrives as the same image at several sizes and the largest is the one used — a model asked to read text in a screenshot cannot read a 90-pixel-wide copy. Telegram reports no media type for a photo, so `image/jpeg` is inferred, which is what the Bot API re-encodes every photo to; a file sent as a *document* keeps its own bytes, name, and declared type. Words on an upload arrive in `caption` rather than `text`.
 
 ### Telegram long polling
@@ -223,7 +241,7 @@ Leaving `channel` out exists because naming them does not scale. One route per c
 
 **Declaration order is the whole precedence rule.** Routes are consulted top to bottom, so a named-channel route written above a catch-all keeps that channel for itself while the catch-all takes everything else — special handling in `#incidents`, the default everywhere else. Nothing sorts by specificity, deliberately: a hidden ranking is how an operator ends up unable to say which route answered.
 
-In a channel the bot must additionally be addressed: `<@BOT_USER_ID>` on Slack, `@botname` on Telegram. **A route decides which agent answers; the mention decides whether anything answers at all**, and widening the first leaves the second exactly where it stood. A channel route that fired on every message would be noise and cost. On Slack the app is not even offered the traffic — the manifest in [`../examples/slack/`](../examples/slack/README.md) subscribes to `app_mention` and not to channel history.
+In a channel the bot must additionally be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; the mention decides whether anything answers at all**, and widening the first leaves the second exactly where it stood. A channel route that fired on every message would be noise and cost. On Slack the app is not even offered the traffic — the manifest in [`../examples/slack/`](../examples/slack/README.md) subscribes to `app_mention` and not to channel history. Discord intentionally receives the non-privileged message event surface and drops ambient guild traffic before admission.
 
 ### Being available in a channel is not authority
 
@@ -345,7 +363,7 @@ On a `persistent` route, chat text sits in `dekopond`'s memory for at least the 
 chat service            authenticates the sender
       |
       v
-dekopond                subject = ExternalSubject::slack(team, user)   (routing metadata, not authority)
+dekopond                subject = ExternalSubject::{slack,discord,telegram}(...) (routing metadata, not authority)
       |                 agent   = the route's catalog agent
       |
       | capabilitiesFor(subject, agent)  ── empty ⇒ refuse, no model call

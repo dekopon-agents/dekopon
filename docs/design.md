@@ -229,8 +229,8 @@ because the deployment shape they compose into is not visible from any of them a
 - **Agents are the unit of surface.** A catalog agent has its own capability list and its own
   instructions. Two agents can name overlapping capabilities and remain separate surfaces.
 - **Routes are the unit of reach.** A route binds a transport and a match — a direct message, one
-  named channel, or any channel the bot is summoned in — to one agent. So a Slack workspace, or a
-  single channel inside it, selects which agent answers.
+  named channel, or any channel the bot is summoned in — to one agent. So a Slack workspace, a
+  Discord server/channel, or a single channel inside either selects which agent answers.
 - **Principals are the unit of trust.** Each canonical subject maps to its own principal through
   owner-controlled configuration, so one human in two workspaces is two principals with two
   surfaces, revocable independently. The gateway names a subject and never a principal.

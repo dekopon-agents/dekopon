@@ -8,14 +8,17 @@ waits for a wakeup, routes each authenticated message to a named agent from the 
 runs one bounded model session with the sandboxed shell plus safe on-demand meta tools,
 and replies with the answer.
 
-- **Transports** — Slack Socket Mode (outbound WebSocket, so no public HTTP endpoint),
-  Telegram long polling, and an owner-only Unix development socket.
+- **Transports** — Slack Socket Mode and Discord Gateway (outbound WebSockets, so no public HTTP
+  endpoint), Telegram long polling, and an owner-only Unix development socket.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
   its own traffic. Unmatched traffic is ignored, and a channel additionally requires the bot
   to be @-mentioned — a route decides which agent answers, the mention decides whether
   anything answers at all, and neither widens a grant.
+- **Chat assets** — Slack, Discord, and Telegram photos/files become numbered, bounded references
+  that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
+  8 MiB ceiling, and refreshed from the exact source message after expiry.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
   bounded model turns, bounded capability calls, and one fixed line on failure.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's

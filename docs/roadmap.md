@@ -32,7 +32,7 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - Cedar authorization in `dekopon-policy`: a schema generated from the deployment's declared world, strict startup validation, deny on any evaluation error, and the determining `policy_ids` plus a `policy_digest` in every audit record. It replaced the exact-match evaluator outright.
 - Broker-owned destination-bound credentials in a separate stricter owner-only file, bound per capability constraint set with optional per-agent overrides, injected inside the native HTTP engine after guest headers were validated.
 - Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped rules that keep attested and direct authority disjoint.
-- `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
+- `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Discord Gateway, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
 - Bounded per-sender conversation history on `mode: persistent` routes, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key.
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
 - A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/pr-summarizer-linter` end-to-end walkthrough.
@@ -51,7 +51,7 @@ Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the sam
 
 ## 0.5 — files in chat (released)
 
-- Chat assets: an image or a document attached to a message becomes a numbered reference in the prompt, which a model opens on demand through a `fetch_chat_asset` tool rather than carrying on every turn. Slack and Telegram, images and the document types a model API accepts.
+- Chat assets: an image or a document attached to a message becomes a numbered reference in the prompt, which a model opens on demand through a `fetch_chat_asset` tool rather than carrying on every turn. Slack, Discord, and Telegram, images and the document types a model API accepts.
 - Slack answers post in a Block Kit `markdown` block, so a model's CommonMark renders instead of arriving as literal punctuation.
 - `dekopon-model` messages can carry content parts. A text message still serializes to exactly the bytes it did before, and the public `Serialize` became the redacted audit rendering rather than the wire shape.
 - Providers declare their own command words, and those words cross the local broker protocol.

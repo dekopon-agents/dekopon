@@ -181,7 +181,7 @@ broker:
       cpu: "2"
       memory: 1Gi
 
-  # Plain env entries. Slack and model tokens are NOT here — they belong to the gateway. What the
+  # Plain env entries. Chat-service and model tokens are NOT here — they belong to the gateway. What the
   # broker wants is RUST_LOG and, if broker.yaml has a telemetry section, OTEL_EXPORTER_OTLP_HEADERS
   # (the OpenTelemetry SDK reads ingest auth from there so a token never enters the config file).
   #
@@ -292,6 +292,8 @@ gateway:
   #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: appToken } }
   #     - name: DEKOPOND_SLACK_BOT_TOKEN
   #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: botToken } }
+  #     - name: DEKOPOND_DISCORD_BOT_TOKEN
+  #       valueFrom: { secretKeyRef: { name: dekopon-discord, key: botToken } }
   #     - name: OPENAI_API_KEY
   #       valueFrom: { secretKeyRef: { name: dekopon-model, key: apiKey } }
   env:

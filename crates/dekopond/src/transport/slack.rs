@@ -272,6 +272,8 @@ impl SlackTransport {
             text,
             assets,
             conversation,
+            // Slack's event text carries its mention syntax, so the shared fallback checks it.
+            addressed: None,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
                 thread_ts: reply_thread,

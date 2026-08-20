@@ -1,8 +1,9 @@
 //! The attachments a conversation carries, and the numbers a model refers to them by.
 //!
-//! An attachment is part of the message that carried it. Slack delivers it by reference rather
-//! than by value, so hearing the whole request means being able to resolve that reference — which
-//! is why this lives in the gateway beside the bot token rather than behind the broker. Nothing
+//! An attachment is part of the message that carried it. Chat services deliver it by reference
+//! rather than by value, so hearing the whole request means being able to resolve that reference —
+//! which is why this lives in the gateway beside transport credentials rather than behind the
+//! broker. Nothing
 //! here decides *whether* an effect may happen; it reads what a sender already handed the bot on a
 //! transport the bot is already authenticated to.
 //!
@@ -34,8 +35,8 @@ const MAX_ASSETS_PER_CONVERSATION: usize = 32;
 
 /// One attachment, as the gateway knows it before anyone asks for the bytes.
 ///
-/// `Debug` prints no source, because a Slack private URL is a capability: anyone holding it plus
-/// the bot token can read the file. It is metadata in the payload sense, not the span sense.
+/// `Debug` prints no source, because Slack private URLs and Discord signed CDN URLs are
+/// capabilities. They are metadata in the payload sense, not the span sense.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AssetRef {
     /// The number the conversation refers to this by.
@@ -75,6 +76,17 @@ pub(crate) enum AssetSourceRef {
         /// The private download URL, which is not.
         url: String,
     },
+    /// A Discord attachment, fetched from its signed CDN URL without the bot token.
+    Discord {
+        /// Discord's snowflake attachment identifier, which is safe to log.
+        attachment_id: String,
+        /// Channel containing the source message, used to refresh an expired signed URL.
+        channel_id: String,
+        /// Source message containing the attachment, also used only for URL refresh.
+        message_id: String,
+        /// The signed CDN URL, which is not logged and is fetched only from an allowed host.
+        url: String,
+    },
     /// A Telegram file, which is a handle rather than a URL.
     ///
     /// The Bot API hands out a `file_id` and nothing else; resolving it to a path takes a `getFile`
@@ -92,6 +104,10 @@ impl fmt::Debug for AssetSourceRef {
             Self::Slack { file_id, .. } => formatter
                 .debug_struct("Slack")
                 .field("file_id", file_id)
+                .finish_non_exhaustive(),
+            Self::Discord { attachment_id, .. } => formatter
+                .debug_struct("Discord")
+                .field("attachment_id", attachment_id)
                 .finish_non_exhaustive(),
             Self::Telegram { file_id } => formatter
                 .debug_struct("Telegram")
