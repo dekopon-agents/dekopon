@@ -11,10 +11,10 @@ use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, HTTP_WIT, PROVIDER_WIT,
 };
 use dekopon_capability::{
-    AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation,
-    broker::AuthorizationGate,
+    AuthorizedInvocation, EffectKind, ExecutionConstraints, HttpConstraints, Idempotency,
+    ProposedInvocation, broker::AuthorizationGate,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, TraceId};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> PathBuf {
@@ -344,6 +344,71 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
         json!({"userId": 3, "title": "created title", "body": "created body"})
     );
     create_server.join().expect("POST fixture server exits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skylight_private_manifest_is_exact_and_a_nonmatching_grant_denies_before_network() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("skylight-private-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("Skylight private provider loads without description-time HTTP");
+
+    let manifest = registry.manifests().next().expect("one manifest is loaded");
+    assert_eq!(manifest.id.as_str(), "skylight-private");
+    assert!(manifest.command_words.is_empty());
+    assert_eq!(manifest.capabilities.len(), 2);
+    assert_eq!(
+        manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "skylight.private.account.read",
+            "skylight.private.frames.list",
+        ]
+    );
+    let empty_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    for capability in &manifest.capabilities {
+        assert_eq!(capability.effect, EffectKind::ReadOnly);
+        assert_eq!(capability.risk, RiskLevel::Medium);
+        assert_eq!(capability.idempotency, Idempotency::Idempotent);
+        assert_eq!(capability.input_schema, empty_schema);
+    }
+
+    // The guest has no endpoint override. A grant for any authority other than the one fixed in the
+    // component is rejected during host validation, before DNS or a connection can be attempted.
+    let failure = registry
+        .invoke(
+            authorized_for(
+                "skylight-private",
+                "skylight.private.account.read"
+                    .parse()
+                    .expect("valid Skylight capability"),
+                json!({}),
+                http_constraints("not-skylight.invalid".to_owned(), "GET"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a nonmatching HTTP authority grant must fail");
+    assert!(matches!(
+        failure.error,
+        BrokerHostError::HostCallRejected {
+            reason: "denied",
+            ..
+        }
+    ));
+    assert!(
+        failure.http_calls.is_empty(),
+        "a pre-dispatch denial must leave no HTTP call evidence"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

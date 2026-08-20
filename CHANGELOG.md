@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added the opt-in Exploration-only `skylight-private` broker provider proof of concept with two
+  unofficial, private, unsupported, mock-only account/frame reads. It is absent from default
+  catalogs, images, policies, and deployments.
+
+### Security
+
+- Bound each Skylight read to one fixed HTTPS GET and a static short-lived destination-bound broker
+  bearer, while keeping authorization and OAuth out of the guest and projecting only bounded IDs
+  and optional frame names. The pinned pyskylight MIT notice is adjacent to source and artifact.
+
 ## [0.8.1] - 2026-08-20
 
 ### Fixed

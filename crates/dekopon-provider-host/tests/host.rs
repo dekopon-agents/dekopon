@@ -130,6 +130,7 @@ fn immediate_host_rejects_components_requiring_http() {
         "http-probe-provider.wasm",
         "jsonplaceholder-provider.wasm",
         "gh-provider.wasm",
+        "skylight-private-provider.wasm",
     ] {
         let error =
             ProviderRegistry::load([imported_provider_path(fixture)], HostLimits::default())

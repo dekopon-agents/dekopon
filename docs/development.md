@@ -40,7 +40,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Chat gateway configuration, transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting and rotation, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
-| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/` | Inline tests plus host/runner tests against the checked-in components and loopback mocks |
+| Rust provider examples | `examples/providers/echo/`, `examples/providers/http-probe/`, `examples/providers/jsonplaceholder/`, `examples/providers/gh/`, `examples/providers/skylight-private/` | Inline tests plus host/runner tests against checked-in components and injected or loopback mocks |
 | End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
@@ -80,8 +80,17 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `examples/providers/http-probe/wit/deps/http.wit`
 - `examples/providers/jsonplaceholder/wit/deps/http.wit`
 - `examples/providers/gh/wit/deps/http.wit`
+- `examples/providers/skylight-private/wit/deps/http.wit`
 
-The HTTP probe, JSONPlaceholder provider, gh provider, and broker host also mirror the provider package under `examples/providers/http-probe/wit/deps/provider.wit`, `examples/providers/jsonplaceholder/wit/deps/provider.wit`, `examples/providers/gh/wit/deps/provider.wit`, and `crates/dekopon-broker-host/wit/deps/provider.wit`. Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+The HTTP-importing guests also mirror the provider package:
+
+- `crates/dekopon-broker-host/wit/deps/provider.wit`
+- `examples/providers/http-probe/wit/deps/provider.wit`
+- `examples/providers/jsonplaceholder/wit/deps/provider.wit`
+- `examples/providers/gh/wit/deps/provider.wit`
+- `examples/providers/skylight-private/wit/deps/provider.wit`
+
+Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.2.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.2.0`. The `0.1.0` package remains published and its components remain loadable: `resolve-command` is looked up by name at instantiation rather than required by the bound world. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) and [`../wit/http/wkg.lock`](../wit/http/wkg.lock) independently define the HTTP package. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.2.0` worlds and the interface-only `dekopon:http@1.0.0` package independently. Published package versions are immutable. Change both mirrored WIT files and increment the WIT package version before publishing a changed contract; the publication workflow fetches an existing version and rejects different bytes.
 
@@ -95,8 +104,9 @@ The checked-in components are generated:
 | `examples/providers/http-probe/src/lib.rs` | `examples/providers/http-probe/build.sh` | `examples/providers/http-probe-provider.wasm` |
 | `examples/providers/jsonplaceholder/src/lib.rs` | `examples/providers/jsonplaceholder/build.sh` | `examples/providers/jsonplaceholder-provider.wasm` |
 | `examples/providers/gh/src/` | `examples/providers/gh/build.sh` | `examples/providers/gh-provider.wasm` |
+| `examples/providers/skylight-private/src/lib.rs` | `examples/providers/skylight-private/build.sh` | `examples/providers/skylight-private-provider.wasm` |
 
-Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Both HTTP-importing components must decode to the two provider exports, exactly one `dekopon:http/client@1.0.0` import, and no WASI imports; direct-host tests prove that the empty linker rejects them.
+Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. All HTTP-importing components must decode to the two provider exports, exactly one `dekopon:http/client@1.0.0` import, and no WASI imports; direct-host tests prove that the empty linker rejects them. `skylight-private` is an opt-in, unsupported Exploration with injected mocks only; it is not part of a default catalog, image, policy, or deployment.
 
 ### Dependencies, crates, CI, or releases
 
@@ -196,7 +206,7 @@ OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
 
 ### Provider example workspaces
 
-Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, and `gh`):
+Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `gh`, and `skylight-private`):
 
 ```console
 cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
@@ -213,13 +223,16 @@ examples/providers/echo/build.sh
 examples/providers/http-probe/build.sh
 examples/providers/jsonplaceholder/build.sh
 examples/providers/gh/build.sh
+examples/providers/skylight-private/build.sh
 wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools validate examples/providers/jsonplaceholder-provider.wasm
 wasm-tools validate examples/providers/gh-provider.wasm
+wasm-tools validate examples/providers/skylight-private-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/jsonplaceholder-provider.wasm
 wasm-tools component wit examples/providers/gh-provider.wasm
+wasm-tools component wit examples/providers/skylight-private-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked
