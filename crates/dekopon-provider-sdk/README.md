@@ -1,6 +1,10 @@
 # dekopon-provider-sdk
 
-Rust guest SDK for read-only Dekopon WebAssembly component providers.
+Rust guest SDK for Dekopon WebAssembly component providers.
+
+**Start here:** [Build and run an import-free Wasm provider with Rust](https://dekopon-agents.github.io/guides/provider-sdk/) is a reproducible walkthrough pinned to v0.7.0. This v0.8.0 tree keeps the same provider contract; follow the guide's exact pins rather than mixing release versions.
+
+Providers bundled with Dekopon consume this same public SDK and runtime contract; they are ordinary components, not privileged plugins.
 
 Implement the `Provider` trait and call `export_provider!` once. The generated adapter exports the WIT world in [`wit/provider.wit`](wit/provider.wit), decodes JSON at the component boundary, and turns provider errors into a typed wire response. The host requires object-shaped inputs but does not generally enforce each capability's JSON Schema; provider implementations validate their own required fields, types, and constraints.
 
