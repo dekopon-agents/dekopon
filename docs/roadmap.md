@@ -82,6 +82,14 @@ Version 0.7.0 adds no crate, process boundary, network path, credential access, 
 
 Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds the Discord bot token needed to hear and answer messages, while the broker remains the only component that maps identity and authorizes effects. Version 0.8.1 raises the shared prompt loop's per-turn tool-call guard from four to ten so bounded multi-attachment turns can degrade through the existing four-fetch session limit instead of failing before any attachment opens.
 
+## 0.9 — native chat activity and Slack Agent sessions (released)
+
+- Authorized sessions can opt into transport-native activity: Slack Agent `processing`/`active`, Discord typing leases, and Telegram topic-aware chat actions. Activity begins only after the fresh broker session gate succeeds and never decides reply delivery.
+- Slack's Agent experience is explicit rather than inferred from billing or API success. Permanent capability failures degrade to an opt-in fixed `:tangerine:` reaction and then no-op; a reaction is removed only after its add was confirmed.
+- Slack Stop is authenticated and cooperative. It suppresses subsequent model turns, capability calls, stale answers, and history commits, but cannot roll back an already-running model request or provider effect.
+
+Version 0.9.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds only the transport credentials it already needed, derives every activity target from authenticated envelopes, and treats every status failure as cosmetic.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.
