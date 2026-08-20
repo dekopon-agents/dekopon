@@ -161,6 +161,8 @@ impl TelegramTransport {
             text: bound_inbound(text),
             assets,
             conversation,
+            // Telegram's message text carries `@handle`, so the shared fallback checks it.
+            addressed: None,
             reply: ReplyTarget::Telegram { chat_id, reply_to },
         }))
     }

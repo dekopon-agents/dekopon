@@ -13,6 +13,7 @@ use crate::asset::{AssetSourceRef, PendingAsset};
 use futures_util::future::BoxFuture;
 use thiserror::Error;
 
+pub(crate) mod discord;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
@@ -63,6 +64,13 @@ pub(crate) struct InboundMessage {
     pub assets: Vec<PendingAsset>,
     /// Whether this is a one-to-one conversation or a shared channel.
     pub conversation: ConversationKind,
+    /// Whether authenticated structured transport metadata says the bot was addressed.
+    ///
+    /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
+    /// text cannot override the authenticated structure. Other transports use `None` and the
+    /// routing loop applies their identifier/handle syntax through
+    /// [`TransportIdentity::is_addressed`]. Direct messages ignore this field.
+    pub addressed: Option<bool>,
     /// Whatever the transport needs to answer this message.
     pub reply: ReplyTarget,
 }
@@ -82,6 +90,10 @@ pub(crate) enum ReplyTarget {
     Slack {
         channel: String,
         thread_ts: Option<String>,
+    },
+    Discord {
+        channel_id: String,
+        reply_to: Option<String>,
     },
     Telegram {
         chat_id: i64,
@@ -105,13 +117,14 @@ pub(crate) struct TransportIdentity {
 impl TransportIdentity {
     /// Whether a message addresses the bot by identifier or handle.
     ///
-    /// Deliberately one implementation for every service. Slack renders a mention as
-    /// `<@U0123ABC>`, Telegram as `@botname`; both are a literal substring test, and keeping the
-    /// two in one place is what stops a channel route from firing on ambient traffic on only one
-    /// of them.
+    /// Deliberately one fallback implementation for every service. Slack renders a mention as
+    /// `<@U0123ABC>`, Discord can render `<@123>` or the legacy nickname form `<@!123>`, and
+    /// Telegram uses `@botname`. Keeping those forms in one place stops a channel route from firing
+    /// on ambient traffic on only one transport. Discord normally uses its structured mention bit
+    /// instead.
     pub fn is_addressed(&self, text: &str) -> bool {
         if let Some(user_id) = &self.user_id
-            && text.contains(&format!("<@{user_id}>"))
+            && (text.contains(&format!("<@{user_id}>")) || text.contains(&format!("<@!{user_id}>")))
         {
             return true;
         }

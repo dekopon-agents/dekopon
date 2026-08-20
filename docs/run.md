@@ -125,7 +125,7 @@ dekopon-run chat \
 ```
 
 - `--gateway <SOCKET>` is the path the gateway's `local` transport binds. There is no default and no discovery order: the path comes from the daemon's own configuration, and guessing one would connect to whatever happened to be there.
-- `--subject <SUBJECT>` is the canonical external subject the session claims, such as `tel.16034700182` or `slack.t0123abc.u9xyz`. It is parsed here, so a non-canonical value is a usage error exiting `2` rather than a line the gateway discards without answering — which would look like an unresponsive daemon.
+- `--subject <SUBJECT>` is the canonical external subject the session claims, such as `tel.16034700182`, `discord.123456789012345678`, or `slack.t0123abc.u9xyz`. It is parsed here, so a non-canonical value is a usage error exiting `2` rather than a line the gateway discards without answering — which would look like an unresponsive daemon.
 - `--conversation <ID>` is sent as the `channel` of **every** request in the session, and is the conversation's identity. Omitted, one is minted and announced on standard error as `conversation: chat-<hex>`, so the session can be resumed by passing that value back. It is announced on standard error rather than standard output because standard output is the reply stream and nothing else. The identifier is caller-chosen by design: a process identifier would be the wrong choice, because PIDs recycle and every invocation is a new process, so nothing derived from one survives to be resumed.
 
 Piped standard input is the same loop, so non-interactive use needs no separate mode:

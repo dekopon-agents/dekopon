@@ -335,6 +335,17 @@ async fn invalid_configurations_fail_closed_at_startup() {
             }),
         ),
         (
+            "a Discord endpoint that is neither production nor loopback",
+            mutate(|document| {
+                document["transports"][0] = json!({
+                    "name": "dev",
+                    "kind": "discordGateway",
+                    "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN",
+                    "endpoint": "https://discord.evil.test"
+                });
+            }),
+        ),
+        (
             // Userinfo makes the authority read as loopback while the socket connects elsewhere.
             "a loopback-looking endpoint that resolves elsewhere",
             mutate(|document| {
@@ -355,6 +366,27 @@ async fn invalid_configurations_fail_closed_at_startup() {
             "{name} must fail closed"
         );
     }
+}
+
+#[tokio::test]
+async fn a_discord_transport_resolves_its_pinned_rest_endpoint() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({
+        "name": "community-discord",
+        "kind": "discordGateway",
+        "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN"
+    });
+    document["routes"][0]["transport"] = json!("community-discord");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("a Discord transport resolves");
+    assert!(matches!(
+        &resolved.transports[0],
+        config::TransportConfig::DiscordGateway { endpoint: Some(endpoint), .. }
+            if endpoint == config::DISCORD_ENDPOINT
+    ));
 }
 
 #[tokio::test]
@@ -740,6 +772,14 @@ fn a_shared_channel_message_counts_as_addressed_only_when_it_names_the_bot() {
     assert!(slack.is_addressed("hey <@U0BOTBOT> please look at this"));
     assert!(!slack.is_addressed("hey everyone, U0BOTBOT is the bot"));
 
+    let discord = TransportIdentity {
+        user_id: Some("123456789012345678".to_owned()),
+        handle: None,
+    };
+    assert!(discord.is_addressed("hey <@123456789012345678>"));
+    assert!(discord.is_addressed("hey <@!123456789012345678>"));
+    assert!(!discord.is_addressed("123456789012345678 is the bot"));
+
     let telegram = TransportIdentity {
         user_id: None,
         handle: Some("dekopon_bot".to_owned()),
@@ -1105,6 +1145,9 @@ fn message(text: &str) -> InboundMessage {
         text: text.to_owned(),
         assets: Vec::new(),
         conversation: ConversationKind::DirectMessage,
+        // Direct messages ignore addressing. Channel tests opt into structured addressing where
+        // that is the behavior under test.
+        addressed: None,
         reply: ReplyTarget::Local { connection: 1 },
     }
 }
@@ -2517,6 +2560,21 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         "ambient traffic must not start a session"
     );
 
+    // Discord's structured mentions are authoritative. Presentation text cannot turn an explicit
+    // `mentions` miss into a wakeup.
+    let mut structurally_unaddressed = message("<@U0BOTBOT> presentation text");
+    structurally_unaddressed.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    structurally_unaddressed.addressed = Some(false);
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        &mut sessions,
+        structurally_unaddressed,
+    );
+    assert_eq!(sessions.len(), 0, "structured addressing must win");
+
     // A message on a channel with no route is ignored just as quietly.
     let mut elsewhere = message("<@U0BOTBOT> hello");
     elsewhere.conversation = ConversationKind::Channel("c9999zzz".to_owned());
@@ -2596,8 +2654,10 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         "a matched channel is not a wakeup on its own"
     );
 
-    let mut addressed = message("<@U0BOTBOT> what is the status?");
+    let mut addressed = message("what is the status?");
     addressed.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    // Discord supplies this from its authenticated `mentions` array rather than presentation text.
+    addressed.addressed = Some(true);
     crate::dispatch(
         &runner,
         &routes,
@@ -2689,8 +2749,80 @@ where
     }
 }
 
+/// A raw-body loopback mock for attachment downloads and non-200 responses.
+///
+/// Its call records retain request headers rather than bodies so CDN credential boundaries can be
+/// asserted directly.
+struct RawHttpMock {
+    base: String,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl RawHttpMock {
+    fn calls(&self) -> Vec<(String, String)> {
+        self.calls.lock().expect("raw mock call log").clone()
+    }
+}
+
+fn spawn_raw_http_mock<H>(handler: H) -> RawHttpMock
+where
+    H: Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("raw mock endpoint binds");
+    let address = listener.local_addr().expect("raw mock endpoint address");
+    listener
+        .set_nonblocking(true)
+        .expect("raw mock endpoint is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("raw mock endpoint adopts");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&calls);
+    tokio::spawn(async move {
+        let handler = Arc::new(handler);
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = Arc::clone(&handler);
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let Some((path, headers, _body)) = read_http_request_parts(&mut stream).await
+                else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .expect("raw mock call log")
+                    .push((path.clone(), headers));
+                let (status, content_type, response) = handler(&path);
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let headers = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                use tokio::io::AsyncWriteExt as _;
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    RawHttpMock {
+        base: format!("http://{address}"),
+        calls,
+    }
+}
+
 /// Reads one complete HTTP request, returning its path (with query) and body.
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
+    let (path, _headers, body) = read_http_request_parts(stream).await?;
+    Some((path, body))
+}
+
+/// The same request with raw headers retained for credential-boundary assertions.
+async fn read_http_request_parts(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, String, String)> {
     use tokio::io::AsyncReadExt as _;
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
@@ -2728,7 +2860,7 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String
         bytes.extend_from_slice(&buffer[..count]);
     }
     let body = String::from_utf8(bytes[header_end..].to_vec()).ok()?;
-    Some((path, body))
+    Some((path, headers, body))
 }
 
 /// Everything one mock Socket Mode connection recorded and can be told to send.
@@ -3614,6 +3746,580 @@ fn a_redirect_away_from_slack_is_not_followed() {
     assert!(!crate::transport::slack::is_slack_file_url(
         "http://files.slack.com/f/F0123"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Discord Gateway
+// ---------------------------------------------------------------------------
+
+const DISCORD_BOT: &str = "111111111111111111";
+const DISCORD_USER: &str = "999999999999999999";
+const DISCORD_CHANNEL: &str = "222222222222222222";
+const DISCORD_MESSAGE: &str = "333333333333333333";
+
+/// One loopback Discord Gateway, including the control payload the bot sent after Hello.
+struct DiscordSocketMock {
+    url: String,
+    sent: mpsc::UnboundedReceiver<Value>,
+}
+
+/// Serves one Discord Gateway connection and performs the Hello → Identify/Resume handshake.
+fn spawn_discord_socket_mock(
+    frames: Vec<Value>,
+    resume_gateway_url: Option<String>,
+) -> DiscordSocketMock {
+    spawn_discord_socket_mock_with_heartbeat(frames, resume_gateway_url, 60_000, true)
+}
+
+fn spawn_discord_socket_mock_with_heartbeat(
+    frames: Vec<Value>,
+    resume_gateway_url: Option<String>,
+    heartbeat_interval_ms: u64,
+    acknowledge_heartbeats: bool,
+) -> DiscordSocketMock {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Discord socket mock binds");
+    let address = listener.local_addr().expect("Discord socket mock address");
+    listener
+        .set_nonblocking(true)
+        .expect("Discord socket mock is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("Discord socket mock adopts");
+    let url = format!("ws://{address}");
+    let ready_resume_url = resume_gateway_url.unwrap_or_else(|| url.clone());
+    let (sent, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        if socket
+            .send(Message::text(
+                json!({"op": 10, "d": {"heartbeat_interval": heartbeat_interval_ms}}).to_string(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Some(Ok(Message::Text(handshake))) = socket.next().await else {
+            return;
+        };
+        let Ok(handshake) = serde_json::from_str::<Value>(&handshake) else {
+            return;
+        };
+        let _ = sent.send(handshake.clone());
+        let established = if handshake["op"] == 6 {
+            json!({"op": 0, "s": 2, "t": "RESUMED", "d": {}})
+        } else {
+            json!({
+                "op": 0,
+                "s": 1,
+                "t": "READY",
+                "d": {
+                    "session_id": "discord-session-1",
+                    "resume_gateway_url": ready_resume_url,
+                    "user": {"id": DISCORD_BOT, "username": "dekopon"}
+                }
+            })
+        };
+        if socket
+            .send(Message::text(established.to_string()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        for frame in frames {
+            if socket.send(Message::text(frame.to_string())).await.is_err() {
+                return;
+            }
+        }
+        while let Some(Ok(message)) = socket.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let _ = sent.send(payload.clone());
+            if acknowledge_heartbeats && payload["op"] == 1 {
+                let _ = socket
+                    .send(Message::text(json!({"op": 11, "d": null}).to_string()))
+                    .await;
+            }
+        }
+    });
+    DiscordSocketMock {
+        url,
+        sent: receiver,
+    }
+}
+
+fn discord_dispatch(sequence: u64, event: &str, data: Value) -> Value {
+    json!({"op": 0, "s": sequence, "t": event, "d": data})
+}
+
+fn discord_message(
+    id: &str,
+    channel: &str,
+    guild: Option<&str>,
+    author: &str,
+    bot: bool,
+    content: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "channel_id": channel,
+        "guild_id": guild,
+        "author": {"id": author, "bot": bot},
+        "content": content,
+        "mentions": [],
+        "attachments": [],
+        "type": 0
+    })
+}
+
+fn discord_handler(gateway_url: String) -> impl Fn(&str, &str) -> Value + Send + Sync + 'static {
+    move |path, _body| match path {
+        "/api/v10/gateway/bot" => json!({
+            "url": gateway_url,
+            "shards": 1,
+            "session_start_limit": {
+                "total": 1000,
+                "remaining": 999,
+                "reset_after": 60_000,
+                "max_concurrency": 1
+            }
+        }),
+        path if path.starts_with("/api/v10/channels/") => json!({"id": "444444444444444444"}),
+        _ => json!({"code": 10002, "message": "Unknown Application"}),
+    }
+}
+
+fn discord(endpoint: &str) -> crate::transport::discord::DiscordTransport {
+    crate::transport::discord::DiscordTransport::new(
+        "community-discord".to_owned(),
+        endpoint.to_owned(),
+        "discord-test-bot-token".to_owned(),
+    )
+    .expect("Discord transport builds")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
+    let assets = spawn_raw_http_mock(|_path| {
+        (
+            200,
+            "application/octet-stream",
+            b"attachment bytes".to_vec(),
+        )
+    });
+    let mut event = discord_message(
+        DISCORD_MESSAGE,
+        DISCORD_CHANNEL,
+        Some("777777777777777777"),
+        DISCORD_USER,
+        false,
+        "please inspect both attachments",
+    );
+    event["mentions"] = json!([{"id": DISCORD_BOT, "username": "dekopon"}]);
+    event["attachments"] = json!([
+        {
+            "id": "444444444444444444",
+            "filename": "screenshot.png",
+            "content_type": "image/png",
+            "size": 2048,
+            "url": format!("{}/attachments/photo", assets.base)
+        },
+        {
+            "id": "555555555555555555",
+            "filename": "spec.pdf",
+            "content_type": "Application/PDF; charset=binary",
+            "size": 4096,
+            "url": format!("{}/attachments/document", assets.base)
+        }
+    ]);
+    let mut socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = discord(&http.base);
+    let identity = transport
+        .connect()
+        .await
+        .expect("Discord transport connects");
+    assert_eq!(identity.user_id.as_deref(), Some(DISCORD_BOT));
+
+    let identify = tokio::time::timeout(Duration::from_secs(5), socket.sent.recv())
+        .await
+        .expect("Identify arrives")
+        .expect("Gateway recorded Identify");
+    assert_eq!(identify["op"], 2);
+    assert_eq!(identify["d"]["intents"], 4_608);
+    assert_eq!(
+        identify["d"]["intents"].as_u64().unwrap_or_default() & (1 << 15),
+        0
+    );
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(
+        message.subject.canonical(),
+        format!("discord.{DISCORD_USER}")
+    );
+    assert_eq!(
+        message.addressed,
+        Some(true),
+        "the structured mention is the wakeup"
+    );
+    assert_eq!(message.assets.len(), 2);
+    assert_eq!(message.assets[0].name, "screenshot.png");
+    assert_eq!(message.assets[0].mime, "image/png");
+    assert_eq!(message.assets[1].name, "spec.pdf");
+    assert_eq!(message.assets[1].mime, "application/pdf");
+
+    // Both an image and a document follow the same bounded lazy fetch path Slack uses. Discord CDN
+    // downloads carry no bot Authorization header; only an expired URL refresh returns to REST.
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Discord messages can carry assets");
+    for asset in &message.assets {
+        let bytes = fetcher
+            .fetch(
+                asset.source.as_ref().expect("attachment has a source"),
+                8 * 1024,
+            )
+            .await
+            .expect("attachment downloads within the bound");
+        assert!(!bytes.is_empty());
+    }
+    assert_eq!(
+        assets.calls().len(),
+        2,
+        "the image and file were both fetched"
+    );
+    assert!(
+        assets
+            .calls()
+            .iter()
+            .all(|(_, headers)| !headers.to_ascii_lowercase().contains("authorization:")),
+        "Discord CDN requests must never carry the bot token"
+    );
+
+    transport
+        .replier()
+        .reply(message.reply, "@everyone **done**".to_owned())
+        .await
+        .expect("Discord answer posts");
+    let posted = http
+        .calls()
+        .into_iter()
+        .find(|(path, _)| path == "/api/v10/channels/222222222222222222/messages")
+        .expect("Create Message was called");
+    let body = serde_json::from_str::<Value>(&posted.1).expect("reply body is JSON");
+    assert_eq!(body["content"], "@everyone **done**");
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(body["allowed_mentions"]["replied_user"], false);
+    assert_eq!(body["message_reference"]["message_id"], DISCORD_MESSAGE);
+    assert_eq!(body["message_reference"]["fail_if_not_exists"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
+    let socket = spawn_discord_socket_mock(Vec::new(), None);
+    let gateway_url = socket.url.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let http = spawn_raw_http_mock(move |path| match path {
+        "/api/v10/gateway/bot" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "url": gateway_url,
+                "shards": 1,
+                "session_start_limit": {
+                    "total": 1000,
+                    "remaining": 999,
+                    "reset_after": 60_000,
+                    "max_concurrency": 1
+                }
+            }))
+            .expect("Gateway response serializes"),
+        ),
+        "/api/v10/channels/222222222222222222/messages" => {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                (
+                    429,
+                    "application/json",
+                    br#"{"retry_after":0.001,"global":false}"#.to_vec(),
+                )
+            } else {
+                (200, "application/json", b"{}".to_vec())
+            }
+        }
+        _ => (404, "application/json", b"{}".to_vec()),
+    });
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: None,
+            },
+            "after a short rate limit".to_owned(),
+        )
+        .await
+        .expect("the bounded retry succeeds");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_refreshes_an_expired_signed_attachment_url_before_fetching_the_file() {
+    let cdn = spawn_raw_http_mock(|path| match path {
+        "/fresh/document" => (200, "application/pdf", b"fresh pdf bytes".to_vec()),
+        _ => (404, "application/json", br#"{"code":404}"#.to_vec()),
+    });
+    let channel_id = "200000000000000006";
+    let message_id = "300000000000000006";
+    let attachment_id = "400000000000000006";
+    let mut event = discord_message(
+        message_id,
+        channel_id,
+        None,
+        DISCORD_USER,
+        false,
+        "read this later",
+    );
+    event["attachments"] = json!([{
+        "id": attachment_id,
+        "filename": "retained.pdf",
+        "content_type": "application/pdf",
+        "size": 15,
+        "url": format!("{}/expired/document", cdn.base)
+    }]);
+    let socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let gateway_url = socket.url.clone();
+    let fresh_url = format!("{}/fresh/document", cdn.base);
+    let http = spawn_http_mock(move |path, _body| match path {
+        "/api/v10/gateway/bot" => json!({
+            "url": gateway_url,
+            "shards": 1,
+            "session_start_limit": {
+                "total": 1000,
+                "remaining": 999,
+                "reset_after": 60_000,
+                "max_concurrency": 1
+            }
+        }),
+        "/api/v10/channels/200000000000000006/messages/300000000000000006" => json!({
+            "id": message_id,
+            "attachments": [{"id": attachment_id, "url": fresh_url}]
+        }),
+        _ => json!({"code": 10008, "message": "Unknown Message"}),
+    });
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+    let message = next_message(&mut transport).await;
+    let source = message.assets[0]
+        .source
+        .as_ref()
+        .expect("attachment has a source");
+
+    let bytes = transport
+        .asset_fetcher()
+        .expect("Discord has an asset fetcher")
+        .fetch(source, 1024)
+        .await
+        .expect("an expired URL is refreshed from the source message");
+    assert_eq!(bytes, b"fresh pdf bytes");
+    assert_eq!(
+        cdn.calls()
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/expired/document", "/fresh/document"]
+    );
+    assert!(http.calls().iter().any(|(path, _)| {
+        path == "/api/v10/channels/200000000000000006/messages/300000000000000006"
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_drops_bots_webhooks_and_system_messages_before_routing_a_dm() {
+    let bot = discord_message(
+        "300000000000000001",
+        DISCORD_CHANNEL,
+        Some("777777777777777777"),
+        "888888888888888888",
+        true,
+        "another bot",
+    );
+    let mut webhook = discord_message(
+        "300000000000000002",
+        DISCORD_CHANNEL,
+        Some("777777777777777777"),
+        DISCORD_USER,
+        false,
+        "a webhook",
+    );
+    webhook["webhook_id"] = json!("666666666666666666");
+    let mut system = discord_message(
+        "300000000000000003",
+        DISCORD_CHANNEL,
+        Some("777777777777777777"),
+        DISCORD_USER,
+        false,
+        "joined",
+    );
+    system["type"] = json!(7);
+    let direct = discord_message(
+        "300000000000000004",
+        "200000000000000004",
+        None,
+        DISCORD_USER,
+        false,
+        "a private question",
+    );
+    let socket = spawn_discord_socket_mock(
+        vec![
+            discord_dispatch(2, "MESSAGE_CREATE", bot),
+            discord_dispatch(3, "MESSAGE_CREATE", webhook),
+            discord_dispatch(4, "MESSAGE_CREATE", system),
+            discord_dispatch(5, "MESSAGE_CREATE", direct),
+        ],
+        None,
+    );
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.text, "a private question");
+    assert_eq!(message.conversation, ConversationKind::DirectMessage);
+    assert_eq!(
+        message.addressed,
+        Some(true),
+        "a direct message is addressed by definition"
+    );
+    assert_eq!(message.conversation_id, "200000000000000004");
+    assert_eq!(
+        message.reply,
+        ReplyTarget::Discord {
+            channel_id: "200000000000000004".to_owned(),
+            reply_to: None,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_reconnects_when_a_heartbeat_is_not_acknowledged() {
+    let after_reconnect = discord_message(
+        "300000000000000008",
+        "200000000000000008",
+        None,
+        DISCORD_USER,
+        false,
+        "the heartbeat watchdog recovered",
+    );
+    let mut second = spawn_discord_socket_mock(
+        vec![discord_dispatch(3, "MESSAGE_CREATE", after_reconnect)],
+        None,
+    );
+    let mut first =
+        spawn_discord_socket_mock_with_heartbeat(Vec::new(), Some(second.url.clone()), 20, false);
+    let http = spawn_http_mock(discord_handler(first.url.clone()));
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+
+    let message = tokio::time::timeout(Duration::from_secs(10), transport.next())
+        .await
+        .expect("the heartbeat watchdog reconnects")
+        .expect("a message arrives on the resumed socket");
+    assert_eq!(message.text, "the heartbeat watchdog recovered");
+
+    let mut first_ops = Vec::new();
+    while let Ok(payload) = first.sent.try_recv() {
+        first_ops.push(payload["op"].as_u64());
+    }
+    assert!(
+        first_ops.contains(&Some(1)),
+        "a heartbeat was sent: {first_ops:?}"
+    );
+    let resume = tokio::time::timeout(Duration::from_secs(5), second.sent.recv())
+        .await
+        .expect("Resume arrives")
+        .expect("the second Gateway recorded Resume");
+    assert_eq!(resume["op"], 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_routes_a_redelivered_message_only_once() {
+    let event = discord_message(
+        "300000000000000007",
+        "200000000000000007",
+        None,
+        DISCORD_USER,
+        false,
+        "only once",
+    );
+    let socket = spawn_discord_socket_mock(
+        vec![
+            discord_dispatch(2, "MESSAGE_CREATE", event.clone()),
+            discord_dispatch(3, "MESSAGE_CREATE", event),
+        ],
+        None,
+    );
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+
+    assert_eq!(next_message(&mut transport).await.text, "only once");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), transport.next())
+            .await
+            .is_err(),
+        "a resume redelivery must not create a second session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_reconnects_with_resume_before_delivering_more_messages() {
+    let resumed_message = discord_message(
+        "300000000000000005",
+        "200000000000000005",
+        None,
+        DISCORD_USER,
+        false,
+        "after resume",
+    );
+    let mut second = spawn_discord_socket_mock(
+        vec![discord_dispatch(3, "MESSAGE_CREATE", resumed_message)],
+        None,
+    );
+    let first =
+        spawn_discord_socket_mock(vec![json!({"op": 7, "d": null})], Some(second.url.clone()));
+    let http = spawn_http_mock(discord_handler(first.url.clone()));
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+
+    let message = tokio::time::timeout(Duration::from_secs(10), transport.next())
+        .await
+        .expect("the transport resumes before the test gives up")
+        .expect("a message arrives after resume");
+    assert_eq!(message.text, "after resume");
+
+    let resume = tokio::time::timeout(Duration::from_secs(5), second.sent.recv())
+        .await
+        .expect("Resume arrives")
+        .expect("Gateway recorded Resume");
+    assert_eq!(resume["op"], 6);
+    assert_eq!(resume["d"]["session_id"], "discord-session-1");
+    assert_eq!(resume["d"]["seq"], 1);
 }
 
 // ---------------------------------------------------------------------------

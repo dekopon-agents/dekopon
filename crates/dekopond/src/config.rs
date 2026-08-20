@@ -51,6 +51,8 @@ pub const DEFAULT_CONVERSATION_MAX_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_CONVERSATIONS: usize = 1024;
 /// The only non-loopback Slack origin this daemon will talk to.
 pub const SLACK_ENDPOINT: &str = "https://slack.com";
+/// The only non-loopback Discord REST origin this daemon will talk to.
+pub const DISCORD_ENDPOINT: &str = "https://discord.com";
 /// The only non-loopback Telegram origin this daemon will talk to.
 pub const TELEGRAM_ENDPOINT: &str = "https://api.telegram.org";
 
@@ -116,6 +118,14 @@ pub enum TransportConfig {
         #[serde(default)]
         endpoint: Option<String>,
     },
+    /// Discord Gateway: an outbound WebSocket carries messages and REST posts answers.
+    DiscordGateway {
+        name: String,
+        bot_token_env: String,
+        /// Overridable only to `https://discord.com` or a literal loopback HTTP URL.
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
     /// Telegram long polling: the poll is the wakeup and advancing the offset is the ack.
     TelegramLongPoll {
         name: String,
@@ -134,6 +144,7 @@ impl TransportConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::SlackSocketMode { name, .. }
+            | Self::DiscordGateway { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
         }
@@ -144,6 +155,7 @@ impl TransportConfig {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::SlackSocketMode { .. } => "slackSocketMode",
+            Self::DiscordGateway { .. } => "discordGateway",
             Self::TelegramLongPoll { .. } => "telegramLongPoll",
             Self::Local { .. } => "local",
         }
@@ -676,6 +688,19 @@ pub(crate) fn resolve(
                 TransportConfig::SlackSocketMode {
                     name,
                     app_token_env,
+                    bot_token_env,
+                    endpoint: Some(endpoint),
+                }
+            }
+            TransportConfig::DiscordGateway {
+                name,
+                bot_token_env,
+                endpoint,
+            } => {
+                validate_env_name(&bot_token_env)?;
+                let endpoint = validate_endpoint(endpoint, DISCORD_ENDPOINT)?;
+                TransportConfig::DiscordGateway {
+                    name,
                     bot_token_env,
                     endpoint: Some(endpoint),
                 }
