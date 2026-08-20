@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-storage"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "wit-bindgen 0.44.0",
 ]
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-storage-host"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
