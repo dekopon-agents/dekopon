@@ -66,6 +66,14 @@ Version 0.5.0 adds no crate and no process boundary, and it is the first release
 
 Version 0.6.0 adds the twenty-first public crate and an opt-in TCP listener, but no new effect authority. Omitting `--http-bind` leaves the listener absent; enabling it exposes deployment metadata to every client the selected network address can reach.
 
+## 0.7 — credential-free agent self-inspection (released)
+
+- Every authorized gateway session offers `inspect_agent_config`: a bounded model-facing view of its catalog identity, exact standing instructions, route/session and conversation limits, and the fresh sender-specific capabilities Cedar currently grants through that agent.
+- The view structurally omits raw Cedar and policy identifiers, identity, execution constraints, endpoints, paths, credential references, credential names, and credential values. Denied and merely declared capabilities are absent.
+- Calls are repeatable under the prompt loop's shared per-turn tool and model-step bounds. Inspection spends no capability budget, makes no broker invocation, grants nothing, and creates no durable broker audit record.
+
+Version 0.7.0 adds no crate, process boundary, network path, credential access, or effect authority. It makes the prompt and effective grants deliberately visible to a sender already authorized to drive that agent.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.
