@@ -39,8 +39,9 @@ authoritative copy of each:
 
 `meta::AgentConfigView` is the deliberately narrow introspection shape: exact standing
 instructions, session limits, and effective capability classifications. Its type has no
-field for policy source, policy IDs, identity, endpoints, paths, or credentials, and its
-serialized result is hard-bounded.
+field for policy source, policy IDs, identity, endpoints, paths, or credentials, and each
+serialized result is hard-bounded. Inspection is repeatable under the prompt loop's shared
+per-turn tool-call and model-step bounds; it has no tool-specific call counter.
 
 Nothing in this crate holds authority. The broker leg submits identity-free proposals
 over an authenticated Unix socket and reports back whatever the broker decided; this

@@ -27,7 +27,7 @@ exclude = ["examples/providers/echo"]
 resolver = "3"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.89.0"
 license = "MIT OR Apache-2.0"
@@ -73,26 +73,26 @@ ureq = { version = "3.3.0", default-features = false, features = ["json", "rustl
 wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
-dekopon-agent = { version = "0.6.0", path = "crates/dekopon-agent" }
-dekopon-broker = { version = "0.6.0", path = "crates/dekopon-broker" }
-dekopon-broker-host = { version = "0.6.0", path = "crates/dekopon-broker-host" }
-dekopon-broker-protocol = { version = "0.6.0", path = "crates/dekopon-broker-protocol" }
-dekopon-brokerd = { version = "0.6.0", path = "crates/dekopon-brokerd" }
-dekopon-capability = { version = "0.6.0", path = "crates/dekopon-capability" }
-dekopon-config = { version = "0.6.0", path = "crates/dekopon-config" }
-dekopon-core = { version = "0.6.0", path = "crates/dekopon-core" }
-dekopon-http-host = { version = "0.6.0", path = "crates/dekopon-http-host" }
-dekopon-model = { version = "0.6.0", path = "crates/dekopon-model" }
-dekopon-policy = { version = "0.6.0", path = "crates/dekopon-policy" }
-dekopon-provider-host = { version = "0.6.0", path = "crates/dekopon-provider-host" }
-dekopon-provider-http = { version = "0.6.0", path = "crates/dekopon-provider-http" }
-dekopon-provider-sdk = { version = "0.6.0", path = "crates/dekopon-provider-sdk" }
-dekopon-protocol = { version = "0.6.0", path = "crates/dekopon-protocol" }
-dekopon-shell = { version = "0.6.0", path = "crates/dekopon-shell" }
-dekopon-telemetry = { version = "0.6.0", path = "crates/dekopon-telemetry" }
-dekopon-testkit = { version = "0.6.0", path = "crates/dekopon-testkit" }
-dekopon-webui = { version = "0.6.0", path = "crates/dekopon-webui" }
-dekopond = { version = "0.6.0", path = "crates/dekopond" }
+dekopon-agent = { version = "0.7.0", path = "crates/dekopon-agent" }
+dekopon-broker = { version = "0.7.0", path = "crates/dekopon-broker" }
+dekopon-broker-host = { version = "0.7.0", path = "crates/dekopon-broker-host" }
+dekopon-broker-protocol = { version = "0.7.0", path = "crates/dekopon-broker-protocol" }
+dekopon-brokerd = { version = "0.7.0", path = "crates/dekopon-brokerd" }
+dekopon-capability = { version = "0.7.0", path = "crates/dekopon-capability" }
+dekopon-config = { version = "0.7.0", path = "crates/dekopon-config" }
+dekopon-core = { version = "0.7.0", path = "crates/dekopon-core" }
+dekopon-http-host = { version = "0.7.0", path = "crates/dekopon-http-host" }
+dekopon-model = { version = "0.7.0", path = "crates/dekopon-model" }
+dekopon-policy = { version = "0.7.0", path = "crates/dekopon-policy" }
+dekopon-provider-host = { version = "0.7.0", path = "crates/dekopon-provider-host" }
+dekopon-provider-http = { version = "0.7.0", path = "crates/dekopon-provider-http" }
+dekopon-provider-sdk = { version = "0.7.0", path = "crates/dekopon-provider-sdk" }
+dekopon-protocol = { version = "0.7.0", path = "crates/dekopon-protocol" }
+dekopon-shell = { version = "0.7.0", path = "crates/dekopon-shell" }
+dekopon-telemetry = { version = "0.7.0", path = "crates/dekopon-telemetry" }
+dekopon-testkit = { version = "0.7.0", path = "crates/dekopon-testkit" }
+dekopon-webui = { version = "0.7.0", path = "crates/dekopon-webui" }
+dekopond = { version = "0.7.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
