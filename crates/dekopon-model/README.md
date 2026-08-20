@@ -5,6 +5,7 @@
 - the generic `ChatModel` request/response contract;
 - an OpenAI-compatible Chat Completions client;
 - native ChatGPT/Codex subscription device authentication, token refresh, and Responses streaming;
+- request-scoped prompt-cache routing hints plus normalized provider-reported cached-token usage; and
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
 
@@ -15,4 +16,5 @@ them as `[image/png, 214 KB]`, because those are what reach the prompt transcrip
 
 The `dekopon` CLI owns account lifecycle through `dekopon auth`; execution clients such as
 `dekopon-run` consume the resulting credentials. Model credentials are never passed to Wasm
-provider components.
+provider components. [`docs/inference.md`](../../docs/inference.md) traces these types into literal
+ChatGPT wire JSON and distinguishes cache affinity, conversation history, and agent memory.

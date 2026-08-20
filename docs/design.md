@@ -311,6 +311,7 @@ If authority ownership is unclear, stop and update the design before adding code
 - [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
 - [`cli.md`](cli.md) — current catalog and model-auth operator contract, discovery, output, and exit codes.
 - [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
+- [`inference.md`](inference.md) — model request types and wire shape, cache optimization and retention caveats, current conversation memory, and exploratory long-term memory.
 - [`dekopond.md`](dekopond.md) — the unprivileged chat gateway's configuration, transports, session bounds, authorization flow, and committed conversation contract.
 - [`broker-http.md`](broker-http.md) — committed broker-mediated HTTP contract and authority boundary.
 - [`roadmap.md`](roadmap.md) — implementation sequence and deliberately deferred scope.
