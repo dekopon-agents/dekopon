@@ -11,16 +11,35 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
    application and add a bot.
 2. On the bot page, reset/copy the bot token and store it as a secret. Do not put it in
    `dekopond.yaml`.
-3. Install the app in the intended server with the OAuth2 `bot` scope and only the permissions the
-   gateway uses:
-   - **View Channels**
-   - **Send Messages**
-   - **Read Message History**
-   - **Send Messages in Threads** (when thread replies are wanted)
-4. The transport identifies with the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents.
-   Do **not** enable the privileged Message Content intent for Dekopon. Discord exposes content and
-   attachments in DMs and in guild messages that explicitly mention the bot, which is the exact
-   wakeup surface the gateway accepts.
+3. Open the application's **OAuth2** page. Its address has this shape (the application ID below is
+   illustrative; use the ID Discord assigned to your application):
+
+   ```text
+   https://discord.com/developers/applications/123456789012345678/oauth2
+   ```
+
+4. Scroll down to **OAuth2 URL Generator**. Under **Scopes**, select only **bot**. Selecting that
+   checkbox expands the **Bot Permissions** section below it.
+5. In the expanded permissions, select exactly these four entries and leave **Administrator** and
+   every other permission unchecked:
+   - **View Channels** under General Permissions
+   - **Send Messages** under Text Permissions
+   - **Send Messages in Threads** under Text Permissions
+   - **Read Message History** under Text Permissions
+6. Copy the **Generated URL** at the bottom of the form. The URL used for the one-time server
+   installation step will look like this; again, the application ID is illustrative:
+
+   ```text
+   https://discord.com/oauth2/authorize?client_id=123456789012345678&permissions=274877975552&integration_type=0&scope=bot
+   ```
+
+   Open that URL, choose the intended server, and authorize the app. The installing account needs
+   permission to manage that server. This does not require a redirect URI, client secret,
+   `applications.commands` scope, or OAuth2 code grant.
+7. The transport identifies with the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents.
+   Leave Presence, Server Members, and Message Content under **Privileged Gateway Intents** disabled.
+   Discord exposes content and attachments in DMs and in guild messages that explicitly mention the
+   bot, which is the exact wakeup surface the gateway accepts.
 
 The transport implements heartbeat ACK detection, Resume after reconnect, Invalid Session handling,
 fatal close-code handling, identify/session-start limits, and jittered reconnect backoff. Slash
