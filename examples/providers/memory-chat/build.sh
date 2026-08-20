@@ -5,9 +5,12 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 manifest="$root/examples/providers/memory-chat/Cargo.toml"
 core="$root/examples/providers/memory-chat/target/wasm32-unknown-unknown/release/dekopon_memory_chat_provider.wasm"
 component="$root/examples/providers/memory-chat-provider.wasm"
-required="wasm-tools 1.236.1"
-[[ "$(wasm-tools --version 2>/dev/null || true)" == "$required" ]] || {
-  echo "error: $required is required" >&2
+required_wasm_tools_version="1.236.1"
+actual_wasm_tools=$(wasm-tools --version 2>/dev/null || true)
+actual_wasm_tools_version=${actual_wasm_tools#wasm-tools }
+actual_wasm_tools_version=${actual_wasm_tools_version%% *}
+[[ "$actual_wasm_tools_version" == "$required_wasm_tools_version" ]] || {
+  echo "error: wasm-tools $required_wasm_tools_version is required; found $actual_wasm_tools" >&2
   exit 1
 }
 rustup target add wasm32-unknown-unknown

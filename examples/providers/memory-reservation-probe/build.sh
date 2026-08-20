@@ -6,14 +6,16 @@ manifest="$root/examples/providers/memory-reservation-probe/Cargo.toml"
 core="$root/examples/providers/memory-reservation-probe/target/wasm32-unknown-unknown/release/dekopon_memory_reservation_probe_provider.wasm"
 component="$root/examples/providers/memory-reservation-probe-provider.wasm"
 
-required_wasm_tools="wasm-tools 1.236.1"
+required_wasm_tools_version="1.236.1"
 command -v wasm-tools >/dev/null 2>&1 || {
-  echo "error: $required_wasm_tools is required (cargo install wasm-tools --version 1.236.1 --locked)" >&2
+  echo "error: wasm-tools $required_wasm_tools_version is required" >&2
   exit 1
 }
 actual_wasm_tools=$(wasm-tools --version)
-if [[ "$actual_wasm_tools" != "$required_wasm_tools" ]]; then
-  echo "error: expected $required_wasm_tools, found $actual_wasm_tools" >&2
+actual_wasm_tools_version=${actual_wasm_tools#wasm-tools }
+actual_wasm_tools_version=${actual_wasm_tools_version%% *}
+if [[ "$actual_wasm_tools_version" != "$required_wasm_tools_version" ]]; then
+  echo "error: expected wasm-tools $required_wasm_tools_version, found $actual_wasm_tools" >&2
   exit 1
 fi
 
