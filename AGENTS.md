@@ -17,6 +17,7 @@ Finally, read the documents selected by the work:
 | Crate boundaries, dependencies, protocols, daemon/broker separation, async, Wasmtime, or Cedar | [`docs/architecture.md`](docs/architecture.md) | It maps design responsibilities to current and future implementation boundaries. |
 | Operator auth, catalog CLI parsing, config discovery, resource reads, output, or exit codes | [`docs/cli.md`](docs/cli.md) | It is the current operator contract. |
 | Exporting, storing, or deploying a ChatGPT subscription credential | [`docs/chatgpt-credential.md`](docs/chatgpt-credential.md) | It records the rotating-refresh-token constraints that decide how a credential may reach a pod. |
+| Model requests, prompt caching, cache retention, conversation memory, or long-lived agent memory | [`docs/inference.md`](docs/inference.md) | It distinguishes current wire behavior and bounded chat history from provider guarantees and future memory design. |
 | Immediate providers, Wasm components, prompt tools, model endpoints, or limits | [`docs/run.md`](docs/run.md) | It defines the experimental current runner and the privileges it must not gain. |
 | Runner traces, OTLP logs, telemetry redaction, or OpenObserve | [`docs/observability.md`](docs/observability.md) | It defines signal contents, configuration, audit limitations, and end-to-end coverage. |
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md) | It records repository mechanics and validation traps that root workspace commands do not cover. |

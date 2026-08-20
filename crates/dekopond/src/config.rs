@@ -39,9 +39,9 @@ pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 /// Default life of an untouched persistent conversation.
 ///
-/// Fifteen minutes resolves toward the person rather than toward a provider's prompt cache, which
-/// clears within a few minutes. A bot that forgot four minutes ago is the failure people report;
-/// the cost control is the window below, not the cache.
+/// Fifteen minutes resolves toward the person rather than an undocumented provider-cache lifetime.
+/// A bot that forgot after a brief lull is the failure people report; the cost control is the
+/// window below, not a best-effort cache. See `docs/inference.md`.
 pub const DEFAULT_CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 /// Default exchanges a persistent route replays into the next prompt.
 pub const DEFAULT_CONVERSATION_MAX_TURNS: usize = 12;

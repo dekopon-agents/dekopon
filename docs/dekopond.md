@@ -304,9 +304,9 @@ Its reach is exactly the granted capability *identifiers*, which is less than it
 
 The idle-timeout default is pulled in two directions and deliberately loses one of them.
 
-A provider's prompt cache clears within minutes of the last request. An entry that outlives the cache pays full price to re-read its own history on the next message, so a timeout chosen for cache hits would be a few minutes at most. Human conversational memory runs on a much longer clock: someone who asks a follow-up after a meeting expects the bot to still know what they were talking about, and a bot that forgot four minutes ago is the failure people actually report.
+The ChatGPT subscription endpoint publishes no prompt-cache lifetime. Public OpenAI API policies vary by model and retention mode, so tuning a user-visible memory timeout to one guessed provider TTL would couple two mechanisms that do not share a contract. Human conversational memory runs on a longer clock: someone who asks a follow-up after a meeting expects the bot to know what they were discussing, and a bot that forgot after a brief lull is the failure people report.
 
-The default is 15 minutes, which resolves toward the person, because the user-visible point of this feature is memory and not cache hits. An operator who wants the cache-aligned behavior sets `idleTimeoutMs` down to it and gets a bot with a shorter attention span in exchange. **The cost control is the window, not the cache:** `maxTurns` and `maxBytes` bound what any one message pays no matter how long its conversation has been alive, and they are the settings to reach for when the bill is the problem.
+The default is 15 minutes, which resolves toward the person because the user-visible point of this feature is memory, not a cache hit. **The cost control is the window, not the cache:** `maxTurns` and `maxBytes` bound what any one message pays no matter how long its conversation has been alive. [`inference.md`](inference.md#provider-retention-what-can-be-said) records the public API comparison, the undocumented subscription boundary, and why keeping a process alive does not pin a provider cache.
 
 ### The prompt cache key
 
@@ -329,7 +329,7 @@ A `oneShot` route's key is shared by **every sender that route answers**, which 
 
 Less than it sounds like, and worth having anyway. Set expectations from the provider's own behavior rather than from the key:
 
-- **Provider prompt caches clear after minutes of inactivity.** A gateway that receives a message every few hours misses on the first turn of every conversation no matter what key it sends. The win is a cheaper *burst* — the tool-calling turns inside one live session, and a follow-up sent while the conversation is still warm — not a standing discount on the bill.
+- **Retention belongs to the provider, and the subscription lifetime is undocumented.** The key can improve a burst — especially append-only tool-loop turns and a follow-up whose prefix still matches — but it promises no standing discount. Read the reported token counts instead of inferring a hit from elapsed time or a live process.
 - **A window trim costs a miss by construction.** When `maxTurns` or `maxBytes` drops the oldest exchange, the front of the request is rewritten and the cached prefix ends at the first changed token. That is an argument for a *generous* window that trims rarely rather than a tight one that trims constantly, which is the opposite of how a size bound is usually tuned. The bound is still the cost control; it is just not free to hit.
 - **Changing an agent's `instructions` invalidates everything.** They sit ahead of every message, and on the ChatGPT path they are hoisted into a separate top-level field, so an edit — including switching between having them and not — rewrites the front of every request on that route.
 
@@ -401,4 +401,5 @@ The caveat covers conversation history too. Holding it in gateway memory keeps i
 - [`security-model.md`](security-model.md) — attestation, trust boundaries, the single-UID limitation, and the trust surface conversation memory accepts.
 - [`broker-http.md`](broker-http.md) — the broker contract the gateway proposes into.
 - [`run.md`](run.md) — the one-shot runner that shares the same session layer.
+- [`inference.md`](inference.md) — request types and wire JSON, cache retention caveats, current chat memory, and the unexplored long-term-memory boundary.
 - [`observability.md`](observability.md) — span semantics, payload gating, and data minimization.

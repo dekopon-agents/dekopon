@@ -224,6 +224,8 @@ The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on 
 
 The subscription transport receives the prompt, system instruction, the single scripting tool schema, the scripts the model writes, and their output. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
 
+[`inference.md`](inference.md) shows the exact Rust request types and pre-wire Responses JSON, then separates Dekopon's cache-friendly request shape from the public OpenAI API's caching documentation. OpenAI publishes no cache-retention contract for the private ChatGPT subscription endpoint, so only provider-reported cached-token usage establishes an observed hit.
+
 ## Rust provider interface
 
 Provider source implements `dekopon_provider_sdk::Provider` and uses `export_provider!`. See [`../examples/providers/echo/src/lib.rs`](../examples/providers/echo/src/lib.rs).
