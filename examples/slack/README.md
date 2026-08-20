@@ -41,8 +41,9 @@ Neither token belongs in the app manifest or a Dekopon configuration file.
 
 Both manifests enable Socket Mode and the App Home messages tab. The classic profile adds
 `reactions:write` for the explicitly configured fallback; remove that scope and leave activity off
-if the classic deployment wants final replies only. The Agent profile additionally
-adds `agent_view`, `assistant:write`, and `agent_session_stopped`.
+if the classic deployment wants final replies only. The Agent profile additionally adds
+`agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
+requires for Agent View. Opening App Home is not itself routed as a prompt.
 
 ### Generate the app-level token (`xapp-…`)
 
