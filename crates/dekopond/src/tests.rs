@@ -1934,16 +1934,10 @@ async fn unauthorized_work_never_publishes_activity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_native_stop_wins_the_race_and_suppresses_answer_and_history() {
+async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_recording() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
-            Vec::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), vec![memory_surface_response()]).await;
     let model = BlockedModel::new("stale answer");
     let surface = Arc::new(RecordingSurface::default());
     let mut runner = runner_with(
@@ -2015,6 +2009,14 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_and_history() {
         0,
         "a cancelled turn is never committed to persistent history"
     );
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "a cancelled turn is never durably recorded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2062,7 +2064,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         .expect("authorization request was sent");
     assert!(matches!(
         first.request,
-        BrokerRequest::CapabilitiesFor { .. }
+        BrokerRequest::CapabilitiesForChat { .. }
     ));
 
     session.abort();
@@ -5845,8 +5847,18 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
                 }
             }]});
         }
-        if path.contains("sendChatAction") || path.contains("sendMessage") {
+        if path.contains("sendChatAction") {
             return json!({"ok": true, "result": true});
+        }
+        if path.contains("sendMessage") {
+            return json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "message_thread_id": 99,
+                    "chat": {"id": -1001}
+                }
+            });
         }
         json!({"ok": true, "result": []})
     });
@@ -5861,7 +5873,7 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
     let message = next_message(&mut transport).await;
 
     assert_eq!(message.thread.as_deref(), Some("99"));
-    assert_eq!(message.conversation_id, "-1001:99");
+    assert_eq!(message.conversation_id, "-1001:topic:99");
     assert_eq!(
         message.reply.clone(),
         ReplyTarget::Telegram {
