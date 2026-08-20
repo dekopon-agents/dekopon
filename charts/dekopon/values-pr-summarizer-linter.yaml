@@ -194,6 +194,10 @@ gateway:
           kind: slackSocketMode
           appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
           botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+          experience: agent
+          activity:
+            mode: native
+            classicFallback: reaction
       models:
         - name: hosted-reasoning
           kind: openaiCompatible

@@ -12,6 +12,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - Added the opt-in Exploration-only `skylight-private` broker provider proof of concept with two
   unofficial, private, unsupported, mock-only account/frame reads. It is absent from default
   catalogs, images, policies, and deployments.
+- Added opt-in native in-flight activity for Slack, Discord, and Telegram chat sessions: Slack Agent
+  `processing`/Stop lifecycle with classic/free `:tangerine:` reaction fallback, Discord typing,
+  Telegram topic-aware chat actions, and separate classic/Agent Slack manifests.
 
 ### Changed
 
@@ -23,6 +26,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - Bound each Skylight read to one fixed HTTPS GET and a static short-lived destination-bound broker
   bearer, while keeping authorization and OAuth out of the guest and projecting only bounded IDs
   and optional frame names. The pinned pyskylight MIT notice is adjacent to source and artifact.
+- Derive activity and Stop targets only from authenticated chat envelopes, start activity only after
+  fresh broker authorization, prevent model-controlled status content, and cooperatively suppress
+  later model/tool work, stale answers, and history commits after a Slack Agent Stop event.
 
 ## [0.8.1] - 2026-08-20
 

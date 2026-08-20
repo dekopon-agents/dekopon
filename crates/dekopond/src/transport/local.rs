@@ -36,7 +36,7 @@ use tokio::{
 
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget, TransportError,
-    TransportIdentity, bound_inbound,
+    TransportEvent, TransportIdentity, bound_inbound,
 };
 
 /// Longest line the development transport accepts, matching the inbound text bound plus envelope.
@@ -159,6 +159,7 @@ impl LocalTransport {
                     conversation: ConversationKind::DirectMessage,
                     addressed: Some(true),
                     reply: ReplyTarget::Local { connection },
+                    activity: None,
                 };
                 if inbound.send(message).is_err() {
                     break;
@@ -184,7 +185,7 @@ impl ChatTransport for LocalTransport {
         })
     }
 
-    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>> {
+    fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
             loop {
                 let listener = self.listener.as_ref().ok_or(TransportError::Closed)?;
@@ -195,7 +196,10 @@ impl ChatTransport for LocalTransport {
                         self.serve(stream);
                     }
                     message = receiver.recv() => {
-                        return message.ok_or(TransportError::Closed);
+                        return message
+                            .map(Box::new)
+                            .map(TransportEvent::Message)
+                            .ok_or(TransportError::Closed);
                     }
                 }
             }

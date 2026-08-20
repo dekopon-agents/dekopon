@@ -62,6 +62,61 @@ pub enum ConfigApiVersion {
     V1Alpha1,
 }
 
+/// Whether a transport publishes native in-flight activity while an authorized session runs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityMode {
+    /// Preserve the transport's current reply-only behavior.
+    #[default]
+    Off,
+    /// Use the service's native activity surface, with transport-specific fallback where configured.
+    Native,
+}
+
+/// Which Slack conversation model the installed app exposes.
+///
+/// This is explicit because Agent mode changes DM threading and conversation identity. A failed
+/// cosmetic status call must never switch those semantics underneath a live conversation.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum SlackExperience {
+    /// Conventional App Home messages and channel mentions.
+    #[default]
+    Classic,
+    /// Slack's paid/admin-gated Agent messaging experience and thread-scoped sessions.
+    Agent,
+}
+
+/// Visible fallback when Slack's Agent session status is unavailable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum SlackActivityFallback {
+    /// Degrade to the final reply only.
+    #[default]
+    None,
+    /// Add and later remove Dekopon's fixed `:tangerine:` reaction.
+    Reaction,
+}
+
+/// In-flight activity settings for Discord and Telegram.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NativeActivityConfig {
+    #[serde(default)]
+    pub mode: ActivityMode,
+}
+
+/// Slack-specific activity settings.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SlackActivityConfig {
+    #[serde(default)]
+    pub mode: ActivityMode,
+    /// Used by classic apps and when Agent status is unavailable for this installation.
+    #[serde(default)]
+    pub classic_fallback: SlackActivityFallback,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DekopondConfig {
@@ -114,6 +169,12 @@ pub enum TransportConfig {
         name: String,
         app_token_env: String,
         bot_token_env: String,
+        /// Conversation and lifecycle model configured on the installed Slack app.
+        #[serde(default)]
+        experience: SlackExperience,
+        /// Best-effort native activity and its explicit classic/free-workspace fallback.
+        #[serde(default)]
+        activity: SlackActivityConfig,
         /// Overridable only to `https://slack.com` or a literal loopback HTTP URL, for tests.
         #[serde(default)]
         endpoint: Option<String>,
@@ -122,6 +183,9 @@ pub enum TransportConfig {
     DiscordGateway {
         name: String,
         bot_token_env: String,
+        /// Best-effort renewable native typing while an authorized session runs.
+        #[serde(default)]
+        activity: NativeActivityConfig,
         /// Overridable only to `https://discord.com` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
@@ -130,6 +194,9 @@ pub enum TransportConfig {
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
+        /// Best-effort renewable native `typing` action while an authorized session runs.
+        #[serde(default)]
+        activity: NativeActivityConfig,
         /// Overridable only to `https://api.telegram.org` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
@@ -680,21 +747,38 @@ pub(crate) fn resolve(
                 name,
                 app_token_env,
                 bot_token_env,
+                experience,
+                activity,
                 endpoint,
             } => {
                 validate_env_name(&app_token_env)?;
                 validate_env_name(&bot_token_env)?;
+                let activity_is_meaningful = match (experience, activity.mode) {
+                    (_, ActivityMode::Off) => {
+                        activity.classic_fallback == SlackActivityFallback::None
+                    }
+                    (SlackExperience::Classic, ActivityMode::Native) => {
+                        activity.classic_fallback == SlackActivityFallback::Reaction
+                    }
+                    (SlackExperience::Agent, ActivityMode::Native) => true,
+                };
+                if !activity_is_meaningful {
+                    return Err(ConfigError::InvalidSlackActivity { name });
+                }
                 let endpoint = validate_endpoint(endpoint, SLACK_ENDPOINT)?;
                 TransportConfig::SlackSocketMode {
                     name,
                     app_token_env,
                     bot_token_env,
+                    experience,
+                    activity,
                     endpoint: Some(endpoint),
                 }
             }
             TransportConfig::DiscordGateway {
                 name,
                 bot_token_env,
+                activity,
                 endpoint,
             } => {
                 validate_env_name(&bot_token_env)?;
@@ -702,12 +786,14 @@ pub(crate) fn resolve(
                 TransportConfig::DiscordGateway {
                     name,
                     bot_token_env,
+                    activity,
                     endpoint: Some(endpoint),
                 }
             }
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
+                activity,
                 endpoint,
             } => {
                 validate_env_name(&bot_token_env)?;
@@ -715,6 +801,7 @@ pub(crate) fn resolve(
                 TransportConfig::TelegramLongPoll {
                     name,
                     bot_token_env,
+                    activity,
                     endpoint: Some(endpoint),
                 }
             }
@@ -976,6 +1063,10 @@ pub enum ConfigError {
     DuplicateModel { name: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
+    #[error(
+        "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
+    )]
+    InvalidSlackActivity { name: String },
     #[error("route names unknown transport {transport:?}")]
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]

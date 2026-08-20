@@ -3,7 +3,8 @@
 # Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest",
 # pick the workspace, and paste this file.
 #
-# The manifest deliberately requests the minimum surface the gateway consumes:
+# This classic/free-workspace profile requests the reply surface plus the explicitly configured
+# tangerine-reaction activity fallback:
 #
 # - Socket Mode, so events arrive over an outbound WebSocket wakeup and the gateway
 #   needs no public HTTP endpoint.
@@ -12,6 +13,9 @@
 #   when the bot is explicitly addressed — dekopond ignores unaddressed channel
 #   traffic by design.
 # - `chat:write`, so the gateway can reply.
+# - `reactions:write`, so `activity.mode: native` with `classicFallback: reaction`
+#   can add and later remove the fixed `:tangerine:` in-flight marker. Remove this scope and leave
+#   activity off when even that cosmetic message mutation is unwanted.
 #
 # Two tokens exist after creation, and neither lives in any Dekopon config file —
 # dekopond reads both from environment variables named in its `transports` entry:
@@ -21,7 +25,7 @@
 #    declare app-level tokens; this step is always manual. This token opens the
 #    Socket Mode connection.
 # 2. Bot token (`xoxb-...`): "Install App" → install to the workspace. This token
-#    sends replies.
+#    sends the configured reaction activity and replies.
 #
 # To extend later: seeing every message in a public channel (not just mentions) needs
 # the `channels:history` scope plus the `message.channels` event; private channels
@@ -40,7 +44,7 @@
 display_information:
   name: dekopon
   description: Your fresh and zesty agent
-  background_color: "#2c2d30"
+  background_color: "#ff6a3d"
 features:
   # Without the messages tab, Slack renders "Sending messages to this app has been
   # turned off" in the DM view and the gateway's primary route is unreachable.
@@ -57,6 +61,7 @@ oauth_config:
       - chat:write
       - files:read
       - im:history
+      - reactions:write
 settings:
   event_subscriptions:
     bot_events:

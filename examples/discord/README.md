@@ -56,6 +56,7 @@ transports:
   - name: community-discord
     kind: discordGateway
     botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
+    activity: { mode: native } # optional; absent/off preserves reply-only behavior
 
 routes:
   - transport: community-discord
@@ -77,6 +78,12 @@ its transient thread IDs.
 In guild channels, Discord's structured `mentions` array decides whether the bot was addressed.
 Ambient messages never start a model session. Direct messages are addressed by definition. Bot,
 webhook, self-authored, and system messages are dropped.
+
+With native activity enabled, an authorized session triggers Discord's channel typing indicator and
+renews it around every eight seconds inside Discord's ten-second lease. It starts only after fresh
+broker authorization, never holds the final-message REST lock, and stops renewing before the reply.
+Discord has no explicit clear endpoint; the final message clears it sooner. Activity errors and rate
+limits are cosmetic and never alter the answer.
 
 ## 3. Map Discord users at the broker
 

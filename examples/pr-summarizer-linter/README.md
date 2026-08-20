@@ -40,10 +40,12 @@ credential, or authorize the resulting comment.
 
 ## 1. Create the Slack app
 
-Follow [`../slack/README.md`](../slack/README.md): create the app from the manifest, generate the
-app-level token (`xapp-…`, scope `connections:write`), install it for the bot token (`xoxb-…`), and
-find the workspace `T…` team ID and permitted sender’s `U…` member ID. Socket Mode needs no public
-HTTP endpoint or inbound firewall rule.
+Follow [`../slack/README.md`](../slack/README.md): create the app from
+[`manifest-agent.yaml`](../slack/manifest-agent.yaml), generate the app-level token (`xapp-…`, scope
+`connections:write`), install it for the bot token (`xoxb-…`), and find the workspace `T…` team ID
+and permitted sender’s `U…` member ID. Socket Mode needs no public HTTP endpoint or inbound firewall
+rule. Slack shows its native Working/Stop session while an authorized review runs; a workspace
+without the Agent feature degrades to the temporary `:tangerine:` reaction.
 
 ## 2. Create the GitHub token
 
@@ -177,7 +179,8 @@ new commits arrived after inspection, it returns `head-changed` before the POST.
 say not to retry: the new revision needs a new review. Drafts may receive comments, but closed or
 merged pull requests are refused.
 
-The final Slack answer reports what was posted and its review ID. On an internal failure it instead
+The final Slack answer reports what was posted and its review ID, after which the Agent session
+returns to `active` (or the fallback reaction is removed). On an internal failure it instead
 receives the fixed sentence `The agent could not complete this request.`; model, provider, and
 transport error text never leaks back into chat.
 

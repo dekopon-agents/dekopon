@@ -21,10 +21,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
-    config::DISCORD_ENDPOINT,
+    config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
-        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget,
-        TransportError, TransportIdentity, bound_inbound, floor_boundary,
+        ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
+        InboundMessage, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
+        bound_inbound, floor_boundary,
     },
 };
 
@@ -45,6 +46,9 @@ const IDENTIFY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+const MAX_ACTIVITY_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
@@ -73,6 +77,7 @@ pub(crate) struct DiscordTransport {
     seen: Dedup,
     pending: VecDeque<InboundMessage>,
     failures: u32,
+    activity: ActivityMode,
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +99,7 @@ impl DiscordTransport {
         name: String,
         endpoint: String,
         token: String,
+        activity: ActivityMode,
     ) -> Result<Self, TransportError> {
         let http = client()?;
         let production = endpoint == DISCORD_ENDPOINT;
@@ -108,6 +114,7 @@ impl DiscordTransport {
                 http,
                 production,
                 rest_lock: Mutex::new(()),
+                activity_cooldown_until: std::sync::Mutex::new(None),
             }),
             gateway_url: None,
             session_starts: None,
@@ -123,6 +130,7 @@ impl DiscordTransport {
             seen: Dedup::new(DEDUP_CAPACITY),
             pending: VecDeque::new(),
             failures: 0,
+            activity,
         })
     }
 
@@ -516,6 +524,9 @@ impl DiscordTransport {
                 channel_id: channel_id.to_owned(),
                 reply_to: (!direct).then(|| message_id.to_owned()),
             },
+            activity: (self.activity == ActivityMode::Native).then(|| ActivityTarget::Discord {
+                channel_id: channel_id.to_owned(),
+            }),
         }))
     }
 
@@ -548,11 +559,11 @@ impl ChatTransport for DiscordTransport {
         })
     }
 
-    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>> {
+    fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
             loop {
                 if let Some(message) = self.pending.pop_front() {
-                    return Ok(message);
+                    return Ok(TransportEvent::Message(Box::new(message)));
                 }
                 if self.socket.is_none() {
                     tokio::time::sleep(self.backoff()).await;
@@ -571,7 +582,9 @@ impl ChatTransport for DiscordTransport {
                     }
                 }
                 match self.pump().await {
-                    Ok(PumpResult::Message(message)) => return Ok(*message),
+                    Ok(PumpResult::Message(message)) => {
+                        return Ok(TransportEvent::Message(message));
+                    }
                     Ok(PumpResult::Ready | PumpResult::Idle) => {}
                     Err(error) => {
                         self.socket = None;
@@ -597,6 +610,11 @@ impl ChatTransport for DiscordTransport {
     fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
         Some(Arc::clone(&self.replier) as Arc<dyn AssetFetcher>)
     }
+
+    fn activity(&self) -> Option<Arc<dyn ChatActivity>> {
+        (self.activity == ActivityMode::Native)
+            .then(|| Arc::clone(&self.replier) as Arc<dyn ChatActivity>)
+    }
 }
 
 /// REST and CDN half shared by all in-flight sessions on one Discord transport.
@@ -607,6 +625,9 @@ pub(crate) struct DiscordReplier {
     production: bool,
     /// Serializes Create Message calls so reactive rate-limit waits cannot race each other.
     rest_lock: Mutex<()>,
+    /// Typing is cosmetic: a 429 suppresses later pulses until Discord's own retry deadline rather
+    /// than sleeping under the final-reply lock or delaying the answer.
+    activity_cooldown_until: std::sync::Mutex<Option<Instant>>,
 }
 
 impl ChatReplier for DiscordReplier {
@@ -650,6 +671,85 @@ impl ChatReplier for DiscordReplier {
             }
             Ok(())
         })
+    }
+}
+
+impl ChatActivity for DiscordReplier {
+    fn show(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            let ActivityTarget::Discord { channel_id } = target else {
+                return Err(TransportError::Response);
+            };
+            if !is_snowflake(&channel_id) {
+                return Err(TransportError::Response);
+            }
+            let now = Instant::now();
+            if self
+                .activity_cooldown_until
+                .lock()
+                .expect("Discord activity cooldown")
+                .is_some_and(|until| until > now)
+            {
+                return Ok(());
+            }
+            let response = self
+                .http
+                .post(format!(
+                    "{}/api/v{API_VERSION}/channels/{channel_id}/typing",
+                    self.endpoint
+                ))
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .timeout(ACTIVITY_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            if response.status().as_u16() == 429 {
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                let body = serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|_| TransportError::Response)?;
+                let seconds = body["retry_after"]
+                    .as_f64()
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                    .ok_or(TransportError::Response)?;
+                let wait =
+                    Duration::from_secs_f64(seconds.min(MAX_ACTIVITY_COOLDOWN.as_secs_f64()));
+                *self
+                    .activity_cooldown_until
+                    .lock()
+                    .expect("Discord activity cooldown") = Some(Instant::now() + wait);
+                return Err(TransportError::Service {
+                    code: "http-429".to_owned(),
+                });
+            }
+            if !response.status().is_success() {
+                return Err(TransportError::Service {
+                    code: format!("http-{}", response.status().as_u16()),
+                });
+            }
+            *self
+                .activity_cooldown_until
+                .lock()
+                .expect("Discord activity cooldown") = None;
+            Ok(())
+        })
+    }
+
+    fn hide(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            if !matches!(target, ActivityTarget::Discord { .. }) {
+                return Err(TransportError::Response);
+            }
+            // Discord exposes no explicit clear. Stopping renewal leaves at most the remainder of
+            // the ten-second native lease, and sending the final message clears it sooner.
+            Ok(())
+        })
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        Some(ACTIVITY_REFRESH_INTERVAL)
     }
 }
 
@@ -1036,7 +1136,7 @@ mod unit_tests {
     use super::{
         DiscordTransport, SessionStarts, allowed_asset_url, gateway_url, is_fatal, split_message,
     };
-    use crate::transport::TransportError;
+    use crate::{config::ActivityMode, transport::TransportError};
     use tokio::time::Instant;
 
     #[test]
@@ -1079,6 +1179,7 @@ mod unit_tests {
             "discord".to_owned(),
             "http://127.0.0.1:1".to_owned(),
             "test-token".to_owned(),
+            ActivityMode::Off,
         )
         .expect("transport builds");
         transport.session_starts = Some(SessionStarts {
