@@ -31,6 +31,26 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Native HTTP telemetry now records the failure class and its static sanitized message, emits the
+  `accounting.http.request` record for every attempt including one refused before a destination was
+  resolved, omits status rather than reporting `0` when no response arrived, and publishes accounted
+  bytes under `dekopon.http.*.accounted_bytes` instead of the OTel payload-size names.
+- Broker-mediated HTTP now reuses one resolution and one pinned client per execution context while
+  the `(host, addresses)` pin set is unchanged, so a multi-call capability shares a warm connection
+  instead of paying a fresh lookup and TLS handshake per request.
+- Destinations resolving to more addresses than the native pin set holds are now deduplicated and
+  truncated, with every retained address still validated, instead of failing the whole request.
+
+### Fixed
+
+- Fixed `http.request` spans mis-parenting concurrent trace events: the span is now attached with
+  `Instrument` rather than an entered guard held across DNS, connection, and body awaits.
+- Fixed IPv6 literal destinations, which could never match a grant or be resolved because the URL
+  host was carried bracketed into the canonical authority and the resolver lookup.
+- Native HTTP client-builder failures are now reported as `internal` rather than as a wire-level
+  protocol failure.
+- HTTP call evidence now records a status-less entry for a request the credential binding refuses,
+  so evidence counts reconcile with the request budget the attempt consumed.
 
 ### Security
 
