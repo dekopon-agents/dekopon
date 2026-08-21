@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_host::CommandResolution;
 use dekopon_broker_protocol::{
-    BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED,
-    ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, read_frame, write_frame,
+    BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError,
+    RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_core::{InvocationId, TraceId};
 use dekopon_telemetry::TraceContextParts;
@@ -21,6 +21,34 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
+
+/// First pause after a retryable `accept` failure.
+const ACCEPT_BACKOFF_MS: u64 = 100;
+/// Ceiling that pause doubles to, so a condition that persists cannot become a hot log loop.
+const MAX_ACCEPT_BACKOFF_MS: u64 = 1_000;
+
+/// Stable, low-cardinality name for an `accept` failure the loop can survive, or `None` if fatal.
+///
+/// Exiting is the expensive answer here. This is the privileged daemon: the process ends, the
+/// container restarts, every provider recompiles under Cranelift before the socket rebinds, and
+/// durable audit state waits through all of it — minutes, against a five-minute startup probe.
+/// Descriptor exhaustion (which the unauthenticated `--http-bind` listener can cause on its own),
+/// kernel buffer exhaustion, a client that vanished between its connect and this accept, and a
+/// signal interruption are all conditions the next accept can succeed through. None of them say
+/// the listener is broken, and none of them are worth a cold start.
+pub(crate) fn retryable_accept_error(error: &io::Error) -> Option<&'static str> {
+    match error.raw_os_error()? {
+        libc::EMFILE => Some("process-descriptor-limit"),
+        libc::ENFILE => Some("system-descriptor-limit"),
+        // `accept` reports the same kernel-memory pressure under either name depending on the
+        // platform and the allocation that failed.
+        libc::ENOBUFS | libc::ENOMEM => Some("kernel-memory"),
+        libc::ECONNABORTED => Some("connection-aborted"),
+        libc::ECONNRESET => Some("connection-reset"),
+        libc::EINTR => Some("interrupted"),
+        _ => None,
+    }
+}
 
 pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: &TraceId) -> tracing::Span {
     tracing::info_span!("broker.invocation", invocation = %invocation, trace = %trace)
@@ -99,16 +127,38 @@ where
     {
         let semaphore = Arc::new(Semaphore::new(self.limits.max_connections));
         let mut tasks = JoinSet::new();
+        let mut accept_backoff_ms = ACCEPT_BACKOFF_MS;
         tokio::pin!(shutdown);
 
         loop {
-            while let Some(result) = tasks.try_join_next() {
-                observe_task(result)?;
-            }
             tokio::select! {
                 () = &mut shutdown => break,
+                // Without this branch a finished connection is only observed when the *next* one
+                // arrives, so `broker_outcome_unaudited` — the one failure an operator must act
+                // on — waits on unrelated traffic to be logged at all.
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => observe_task(result)?,
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.map_err(|source| ServerError::Accept { source })?;
+                    let stream = match accepted {
+                        Ok((stream, _)) => {
+                            accept_backoff_ms = ACCEPT_BACKOFF_MS;
+                            stream
+                        }
+                        Err(source) => {
+                            let Some(kind) = retryable_accept_error(&source) else {
+                                return Err(ServerError::Accept { source });
+                            };
+                            tracing::warn!(
+                                event = "broker_accept_retried",
+                                error.kind = kind,
+                                backoff_ms = accept_backoff_ms,
+                                error = %crate::error_chain(&source),
+                            );
+                            tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
+                            accept_backoff_ms =
+                                accept_backoff_ms.saturating_mul(2).min(MAX_ACCEPT_BACKOFF_MS);
+                            continue;
+                        }
+                    };
                     let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
                         drop(stream);
                         tracing::warn!(event = "broker_connection_rejected", reason = "connection_limit");
@@ -168,6 +218,14 @@ fn observe_task(
                     event = "broker_outcome_unaudited",
                     category = error.category(),
                     invocation.id = %invocation,
+                    error = %cause,
+                ),
+                // Exhaustion is the second one an operator must act on, and the only signal it
+                // produces: every client sees a refusal it cannot retry out of, and nothing else
+                // in the process reports that the bound was reached.
+                None if error.is_capacity_exhausted() => tracing::error!(
+                    event = "broker_capacity_exhausted",
+                    category = error.category(),
                     error = %cause,
                 ),
                 None => tracing::warn!(
@@ -563,6 +621,12 @@ async fn write_broker_failure(
                 source: error,
             },
         )
+    } else if error.capacity_failure_code().is_some() {
+        (
+            ERROR_CAPACITY_EXHAUSTED,
+            "a bounded broker resource is exhausted and will not recover without operator action",
+            ConnectionError::CapacityExhausted { source: error },
+        )
     } else if let Some(code) = error.storage_failure_code() {
         (
             code,
@@ -591,6 +655,12 @@ enum ConnectionError {
     },
     #[error("invalid request")]
     InvalidRequest,
+    #[error("a bounded broker resource is exhausted")]
+    CapacityExhausted {
+        /// The exhaustion the wire code names.
+        #[source]
+        source: BrokerError,
+    },
     #[error("broker could not audit the outcome of {invocation}")]
     OutcomeUnaudited {
         /// Invocation whose external effect may already have completed.
@@ -616,9 +686,15 @@ impl ConnectionError {
             Self::OutcomeUnaudited { invocation, .. } => Some(invocation),
             Self::PeerCredentials { .. }
             | Self::InvalidRequest
+            | Self::CapacityExhausted { .. }
             | Self::Broker { .. }
             | Self::Write(_) => None,
         }
+    }
+
+    /// Whether the failure ends every subsequent request the same way until an operator acts.
+    const fn is_capacity_exhausted(&self) -> bool {
+        matches!(self, Self::CapacityExhausted { .. })
     }
 
     const fn category(&self) -> &'static str {
@@ -626,6 +702,7 @@ impl ConnectionError {
             Self::PeerCredentials { .. } => "peer-credentials",
             Self::InvalidRequest => "invalid-request",
             Self::OutcomeUnaudited { .. } => "broker-outcome-unaudited",
+            Self::CapacityExhausted { .. } => "broker-capacity-exhausted",
             Self::Broker { .. } => "broker",
             Self::Write(_) => "response-write",
         }
