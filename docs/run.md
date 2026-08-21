@@ -17,7 +17,7 @@ dekopon auth chatgpt <login | status | logout | export>
 
 **`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
 
-Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
+Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
 The checked-in Rust echo provider is immediately runnable:
 
@@ -260,6 +260,14 @@ Direct-operation bounds are configurable on `inspect`, `invoke`, and `prompt` wi
 - `--max-output-bytes`
 - `--fuel`
 - `--timeout-ms`
+
+`--max-memory-bytes` bounds each linear memory rather than the whole store, so the host also applies
+fixed ceilings on table elements, tables, linear memories, and core instances per store. Those have
+no flag: they close the `table.grow` path, where one cheap instruction under fuel accounting could
+otherwise make the host allocate far past the memory bound. `--max-output-bytes` likewise bounds
+what the host will parse, not peak allocation — the buffered-string contract lifts the whole guest
+string into host memory before it can be measured, and the store's memory limits are what bound
+that.
 
 The host supplies no WASI, filesystem, network, environment, clock, random, credential, JSONL, or
 durable-file imports. It accepts only capabilities declaring `read-only`. Consequently this path
