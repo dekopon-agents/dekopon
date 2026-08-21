@@ -110,6 +110,12 @@ pub(crate) fn initialize(
 
     let shutdown_timeout = Duration::from_millis(telemetry.otel_export_timeout_ms);
 
+    // Process state rather than a parameter: it describes the sink's retention scope, not the call.
+    // Applied before the endpoint check because `--trace` is a sink too — a local Chrome file is
+    // exactly as in scope for payloads as a remote receiver, and a flag that silently did nothing
+    // without an endpoint would be the same "configures nothing" failure the broker guard refuses.
+    dekopon_core::set_telemetry_payloads(telemetry.otel_telemetry_payloads);
+
     // No endpoint means no exporter, no provider, and no extra layer: the subscriber built here is
     // exactly the one a build without this feature would install. Telemetry settings are not even
     // validated on this path — with export disabled they configure nothing.
@@ -127,43 +133,20 @@ pub(crate) fn initialize(
         });
     };
 
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(TraceError::Configuration(
-            "OTLP endpoint must not be empty".to_owned(),
-        ));
-    }
-    // The signal path is appended as text, so a query or fragment would end up behind it:
-    // `http://host/api/default?org=x` becomes `...?org=x/v1/traces`, which is a valid URI that
-    // silently posts to the wrong place. Reject it here rather than let it surface as a 404.
-    if let Some(index) = endpoint.find(['?', '#']) {
-        return Err(TraceError::Configuration(format!(
-            "OTLP endpoint must be a base URL without a query or fragment; found {:?} at byte {index}",
-            &endpoint[index..index + 1]
-        )));
-    }
-    if shutdown_timeout.is_zero() {
-        return Err(TraceError::Configuration(
-            "OTLP export timeout must be greater than zero".to_owned(),
-        ));
-    }
-    let service_name = telemetry.otel_service_name.trim();
-    if service_name.is_empty() {
-        return Err(TraceError::Configuration(
-            "OpenTelemetry service name must not be empty".to_owned(),
-        ));
-    }
-
-    // Process state rather than a parameter: it describes the sink's retention scope, not the call.
-    dekopon_core::set_telemetry_payloads(telemetry.otel_telemetry_payloads);
-
+    // Endpoint, service name, and timeout are validated by the exporter crate rather than here:
+    // one copy of that policy means one place a new rule has to be added.
     let settings = ExporterSettings::new(
         endpoint,
         telemetry.otlp_transport,
-        service_name,
+        &telemetry.otel_service_name,
         "dekopon-run",
+        env!("CARGO_PKG_VERSION"),
         shutdown_timeout,
-    )?;
+    )
+    .map_err(|error| match error {
+        TelemetryError::Configuration(message) => TraceError::Configuration(message),
+        other => TraceError::Telemetry(other),
+    })?;
 
     let tracer_provider = settings.tracer_provider()?;
     let tracer = tracer_provider.tracer("dekopon-run");
@@ -217,8 +200,51 @@ pub(crate) enum TraceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TraceError, initialize};
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::{layer::Context, registry};
+
+    use super::{EnvFilter, Layer as _, OTEL_LOG_FILTER, TRACE_FILTER, TraceError, initialize};
     use crate::cli::{TelemetryArgs, Transport};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// Records the target of every event a layer is actually asked to handle.
+    #[derive(Clone, Default)]
+    struct RecordTargets(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordTargets {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            self.0
+                .lock()
+                .expect("target log")
+                .push(event.metadata().target().to_owned());
+        }
+    }
+
+    /// Neither OTLP layer may see the exporter's own diagnostics. `internal-logs` is enabled
+    /// workspace-wide, so a layer that accepted them would export the failures of its own export.
+    /// The SDK crates log under their package names, hyphens and all, which is why the log filter
+    /// silences the `opentelemetry` prefix rather than an exact target.
+    #[test]
+    fn the_otlp_layers_never_see_the_exporters_own_records() {
+        for filter in [TRACE_FILTER, OTEL_LOG_FILTER] {
+            let recorded = RecordTargets::default();
+            let subscriber = registry().with(recorded.clone().with_filter(EnvFilter::new(filter)));
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(target: "opentelemetry", "api diagnostic");
+                tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
+                tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
+                tracing::info!(target: "dekopon_run", "runner event");
+            });
+
+            assert_eq!(
+                *recorded.0.lock().expect("target log"),
+                vec!["dekopon_run".to_owned()],
+                "{filter}"
+            );
+        }
+    }
 
     /// A query or fragment would sit in front of the appended signal path, producing a URI that
     /// parses and posts to the wrong place. Failing at configuration time names the real problem.
