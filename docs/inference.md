@@ -4,10 +4,10 @@ This document follows a Slack message from `dekopond` into the ChatGPT subscript
 
 **Status: Current, except where marked Exploration.** Dekopon sends cache-affinity hints,
 preserves append-only model turns, reports provider-declared cache usage, can keep a bounded
-conversation in gateway memory, and optionally stores/retrieves namespace-isolated durable chat
-turns through a generated JSONL provider. It does not cache completed answers, request extended
-provider retention, use provider-managed conversation objects, or automatically replay durable
-memory.
+conversation in gateway memory, can explicitly generate one bounded outbound image, and optionally
+stores/retrieves namespace-isolated durable chat turns through a generated JSONL provider. It does
+not cache completed answers, request extended provider retention, use provider-managed conversation
+objects, retain generated image bytes, or automatically replay durable memory.
 
 The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex backend rather than the public OpenAI Platform API. Public OpenAI documentation is useful context, but it is not a contract for that endpoint. This distinction is load-bearing throughout this document.
 
@@ -19,6 +19,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | How do we cache calls? | Dekopon relies on the provider's prompt-prefix cache. It sends the complete request every time. It does not memoize model answers or tool effects locally. |
 | How long is the cache fresh on a ChatGPT subscription? | **OpenAI does not publish a retention contract for the subscription endpoint Dekopon calls.** Public API policies range from short in-memory retention to model-specific extended retention, but those values cannot be promised here. |
 | Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. A shared client could reuse connections and coordinate credential refresh, but that is a different optimization. |
+| How does outbound image generation work? | A route may explicitly name a separate public OpenAI Images backend. Its chat model can call `generate_image` once; one bounded PNG is carried outside the transcript to the authenticated Slack/Discord/Telegram/local reply target. Existing Chat Completions and private ChatGPT subscription contracts are not claimed to generate images themselves. |
 | How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs per sender in `dekopond` memory, bounded by idle time, turns, bytes, and total conversation count. Every message is authorized afresh. |
 | Does Dekopon have a memory framework? | **No general framework.** It has a focused conversation window plus optional durable on-demand recent/literal-search chat turns—not task, semantic, vector, editable-fact, or automatically replayed memory. |
 
@@ -50,7 +51,8 @@ Slack event
   -> POST https://chatgpt.com/backend-api/codex/responses
   -> SSE events become AssistantTurn
   -> tool call? append opaque replay items + tool output and call the model again
-  -> exact bounded final answer receives complete Slack transport acceptance
+       `generate_image`? one fixed-endpoint request, one PNG leaves through a byte-free output slot
+  -> exact bounded text plus optional PNG receives complete Slack transport acceptance
   -> one fresh hidden record request when the all-three durable surface is effective
   -> persistent route separately stores only the new question and final answer in gateway memory
 ```
@@ -211,6 +213,31 @@ This is conversation continuity, not evidence continuity. The broker audit is wh
 History is untrusted prompt text. It is not sent to the broker as policy input. The prompt cache key also stays out of authorization. Every capability invocation still becomes a fresh proposal that only the broker may authorize.
 
 Grant-set invalidation has one known limit: it compares capability identifiers. Tightening a capability's execution constraints or changing its credential while retaining the same identifier does not currently invalidate history. [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) records that live limitation.
+
+## Outbound image generation
+
+A route can name one entry from `imageGenerators`. That explicit reference adds a gateway-owned
+`generate_image` meta tool to the existing chat model; no reference means no tool, no image
+credential read, and byte-identical text-only replies. The generator is a separate model client so
+the existing OpenAI-compatible Chat Completions and undocumented ChatGPT/Codex subscription
+endpoints remain only the orchestrators they already are. Dekopon does not claim either contract
+natively emits generated images.
+
+One valid tool call supplies one non-empty prompt of at most 4 KiB. The fixed public OpenAI Images
+client asks the configured GPT Image model for one 1024×1024 PNG, bounds the encoded response,
+decodes at most 8 MiB, validates the PNG signature, and gives the bytes to a request-local output
+slot. A second call is refused even when the first failed, because a failed request may still have
+incurred cost. The model reads only a fixed success/failure sentence and then produces the textual
+caption; generated bytes never become a `ModelMessage`, tool result, prompt transcript, or
+`PromptOutcome`.
+
+The gateway owns the filename/media type and sends the image only to the reply coordinates from the
+authenticated inbound envelope. Slack uses the external file-upload sequence, Discord a multipart
+attachment, Telegram `sendPhoto`, and the local socket an omitted-when-empty base64 `images` field.
+A receipt means the complete text/image reply was accepted; a non-atomic later failure is partial
+delivery and suppresses durable recording. Persistent and durable memory keep only final text, not
+the PNG or the generation prompt, so a follow-up can discuss the caption but cannot edit prior
+pixels without generating a new image.
 
 ## Optional durable chat-turn retrieval
 

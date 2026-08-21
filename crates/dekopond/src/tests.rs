@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -10,8 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits,
+    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits,
+    IMAGE_GENERATION_TOOL_NAME, PromptLimits,
 };
 use dekopon_broker_protocol::{
     AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
@@ -19,9 +21,12 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
-use dekopon_model::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-    ModelTool, ModelToolCall,
+use dekopon_model::{
+    image::{GeneratedImage, ImageGenerationError, ImageGenerator},
+    model::{
+        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+        ModelTool, ModelToolCall,
+    },
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -32,21 +37,22 @@ use crate::{
     asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ActivityMode, ConversationPolicy, ConversationWindow, ModelConfig,
-        NativeActivityConfig, ResolvedBroker, RouteMatch, SlackActivityConfig,
+        self, ActivityMode, ConversationPolicy, ConversationWindow, ImageGeneratorConfig,
+        ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch, SlackActivityConfig,
         SlackActivityFallback, SlackExperience, SocketDiscovery,
     },
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
-        UNAUTHORIZED_REPLY, memory_record_outcome_category, run_session,
+        BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelFactory, SessionError,
+        SessionGate, SessionRunner, UNAUTHORIZED_REPLY, configured_image_generators,
+        memory_record_outcome_category, run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
-        ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
-        bound_outbound,
+        OutboundReply, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
+        bound_inbound, bound_outbound,
     },
 };
 
@@ -54,6 +60,12 @@ const SUBJECT: &str = "tel.16034700182";
 
 fn subject() -> ExternalSubject {
     SUBJECT.parse().expect("canonical subject fixture")
+}
+
+fn generated_image() -> GeneratedImage {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(b"kitty pixels");
+    GeneratedImage::from_png(png).expect("generated PNG fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +131,8 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 
     assert_eq!(resolved.transports.len(), 1);
     assert_eq!(resolved.routes.len(), 1);
+    assert!(resolved.image_generators.is_empty());
+    assert!(resolved.routes[0].image_generator.is_none());
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
     assert_eq!(resolved.routes[0].limits.max_steps, 8);
@@ -130,6 +144,73 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     // route had before conversations existed.
     assert_eq!(resolved.sessions.max_conversations, 1024);
     assert_eq!(resolved.routes[0].conversation, ConversationPolicy::OneShot);
+}
+
+#[tokio::test]
+async fn image_generation_is_named_and_route_opt_in() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["imageGenerators"] = json!([{
+        "name": "openai-images",
+        "kind": "openaiImages",
+        "model": "gpt-image-1",
+        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+        "timeoutMs": 120_000
+    }]);
+    document["routes"][0]["imageGenerator"] = json!("openai-images");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("an explicitly bound image generator resolves");
+
+    assert_eq!(resolved.image_generators.len(), 1);
+    assert_eq!(resolved.image_generators[0].name(), "openai-images");
+    assert_eq!(
+        resolved.routes[0].image_generator.as_deref(),
+        Some("openai-images")
+    );
+    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
+        .expect("the route binds its named generator");
+    assert_eq!(
+        routes
+            .route("dev", &ConversationKind::DirectMessage)
+            .expect("route matches")
+            .image_generator
+            .as_deref(),
+        Some("openai-images")
+    );
+}
+
+#[test]
+fn a_missing_image_model_credential_fails_before_chat_starts() {
+    let variable = "DEKOPOND_TEST_MISSING_IMAGE_KEY_7C83E9";
+    assert!(
+        std::env::var_os(variable).is_none(),
+        "fixture must stay unset"
+    );
+    let configured = [ImageGeneratorConfig::OpenaiImages {
+        name: "pictures".to_owned(),
+        model: "gpt-image-1".to_owned(),
+        api_key_env: variable.to_owned(),
+        timeout_ms: 120_000,
+    }];
+    let referenced = BTreeSet::from(["pictures".to_owned()]);
+    let error = match configured_image_generators(&configured, &referenced) {
+        Err(error) => error,
+        Ok(_) => panic!("a named credential is required at startup"),
+    };
+
+    assert!(matches!(
+        error,
+        ImageGeneratorStartupError::MissingCredential { .. }
+    ));
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("pictures"));
+    assert!(diagnostic.contains(variable));
+
+    let unused = configured_image_generators(&configured, &BTreeSet::new())
+        .expect("an unreferenced generator reads no credential");
+    assert!(unused.is_empty());
 }
 
 #[tokio::test]
@@ -247,6 +328,62 @@ async fn invalid_configurations_fail_closed_at_startup() {
             "unknown field inside a model",
             mutate(|document| {
                 document["models"][0]["temperature"] = json!(0.7);
+            }),
+        ),
+        (
+            "unknown field inside an image generator",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 120_000,
+                    "endpoint": "https://attacker.example"
+                }]);
+            }),
+        ),
+        (
+            "duplicate image generator name",
+            mutate(|document| {
+                let generator = json!({
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 120_000
+                });
+                document["imageGenerators"] = json!([generator.clone(), generator]);
+            }),
+        ),
+        (
+            "invalid image credential environment name",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "sk-live-secret-not-a-name",
+                    "timeoutMs": 120_000
+                }]);
+            }),
+        ),
+        (
+            "zero image generator timeout",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 0
+                }]);
+            }),
+        ),
+        (
+            "route names an unknown image generator",
+            mutate(|document| {
+                document["routes"][0]["imageGenerator"] = json!("missing");
             }),
         ),
         (
@@ -1075,6 +1212,22 @@ fn answer(text: &str) -> AssistantTurn {
     }
 }
 
+fn generate_image(prompt: &str) -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "image-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                arguments: json!({"prompt": prompt}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
 fn inspect_agent_config() -> AssistantTurn {
     AssistantTurn {
         content: None,
@@ -1095,11 +1248,16 @@ fn inspect_agent_config() -> AssistantTurn {
 #[derive(Default)]
 struct RecordingReplier {
     replies: Mutex<Vec<String>>,
+    image_bytes: Mutex<Vec<usize>>,
 }
 
 impl RecordingReplier {
     fn replies(&self) -> Vec<String> {
         self.replies.lock().expect("reply lock").clone()
+    }
+
+    fn image_bytes(&self) -> Vec<usize> {
+        self.image_bytes.lock().expect("image reply lock").clone()
     }
 }
 
@@ -1107,10 +1265,16 @@ impl ChatReplier for RecordingReplier {
     fn reply(
         &self,
         _target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
-            self.replies.lock().expect("reply lock").push(text);
+            self.replies.lock().expect("reply lock").push(reply.text);
+            if let Some(image) = reply.image {
+                self.image_bytes
+                    .lock()
+                    .expect("image reply lock")
+                    .push(image.bytes().len());
+            }
             Ok(DeliveryReceipt::new("test-acceptance"))
         })
     }
@@ -1173,13 +1337,13 @@ impl ChatReplier for RecordingSurface {
     fn reply(
         &self,
         _target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.events
                 .lock()
                 .expect("surface event lock")
-                .push(format!("reply:{text}"));
+                .push(format!("reply:{}", reply.text));
             Ok(DeliveryReceipt::new("recording-surface"))
         })
     }
@@ -1230,7 +1394,7 @@ impl ChatReplier for DelayedSurface {
     fn reply(
         &self,
         _target: ReplyTarget,
-        _text: String,
+        _reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.events
@@ -1248,7 +1412,7 @@ impl ChatReplier for PartialDeliveryReplier {
     fn reply(
         &self,
         _target: ReplyTarget,
-        _text: String,
+        _reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async { Err(TransportError::PartialDelivery) })
     }
@@ -1345,6 +1509,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         model_class: Some("reasoning".to_owned()),
         instructions: Some("Answer briefly.".to_owned()),
         model: Arc::new(model),
+        image_generator: None,
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -1445,6 +1610,7 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
+        image_generators: HashMap::new(),
         activities: HashMap::new(),
         active_sessions: Default::default(),
         usage_reports: None,
@@ -1554,6 +1720,58 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     assert_eq!(claim.subject.canonical(), SUBJECT);
     assert_eq!(claim.agent.as_str(), "reviewer");
     assert_eq!(claim.scope.transport.as_str(), "dev");
+}
+
+struct TestImageGenerator;
+
+impl ImageGenerator for TestImageGenerator {
+    fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(b"kitty pixels");
+        GeneratedImage::from_png(png)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_route_generator_yields_an_image_reply() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([
+        generate_image("a cheerful watercolor kitten"),
+        answer("Here is your kitty."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("runner is uniquely owned")
+        .image_generators
+        .insert("openai-images".to_owned(), Arc::new(TestImageGenerator));
+    let mut route = route(model_config());
+    route.image_generator = Some("openai-images".to_owned());
+
+    run_session(
+        runner,
+        route,
+        message("draw me a kitty cat"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["Here is your kitty."]);
+    assert_eq!(replier.image_bytes(), [20]);
+    assert_eq!(models.requests(), 2);
+    assert!(
+        models
+            .tool_names(0)
+            .contains(&IMAGE_GENERATION_TOOL_NAME.to_owned())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3499,12 +3717,17 @@ async fn next_message(transport: &mut dyn ChatTransport) -> InboundMessage {
 struct HttpMock {
     base: String,
     calls: Arc<Mutex<Vec<(String, String)>>>,
+    headers: Arc<Mutex<Vec<String>>>,
 }
 
 impl HttpMock {
     /// Paths and request bodies the transport sent, in order.
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().expect("mock call log").clone()
+    }
+
+    fn headers(&self) -> Vec<String> {
+        self.headers.lock().expect("mock header log").clone()
     }
 }
 
@@ -3521,6 +3744,8 @@ where
     let listener = tokio::net::TcpListener::from_std(listener).expect("mock endpoint adopts");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let recorded_headers = Arc::clone(&headers);
     tokio::spawn(async move {
         let handler = Arc::new(handler);
         loop {
@@ -3529,15 +3754,20 @@ where
             };
             let handler = Arc::clone(&handler);
             let recorded = Arc::clone(&recorded);
+            let recorded_headers = Arc::clone(&recorded_headers);
             tokio::spawn(async move {
                 let mut stream = stream;
-                let Some((path, body)) = read_http_request(&mut stream).await else {
+                let Some((path, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
                 recorded
                     .lock()
                     .expect("mock call log")
                     .push((path.clone(), body.clone()));
+                recorded_headers
+                    .lock()
+                    .expect("mock header log")
+                    .push(headers);
                 let response = handler(&path, &body);
                 let encoded = serde_json::to_vec(&response).expect("mock response serializes");
                 let headers = format!(
@@ -3555,6 +3785,7 @@ where
     HttpMock {
         base: format!("http://{address}"),
         calls,
+        headers,
     }
 }
 
@@ -3622,12 +3853,6 @@ where
     }
 }
 
-/// Reads one complete HTTP request, returning its path (with query) and body.
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
-    let (path, _headers, body) = read_http_request_parts(stream).await?;
-    Some((path, body))
-}
-
 /// The same request with raw headers retained for credential-boundary assertions.
 async fn read_http_request_parts(
     stream: &mut tokio::net::TcpStream,
@@ -3668,7 +3893,9 @@ async fn read_http_request_parts(
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
-    let body = String::from_utf8(bytes[header_end..].to_vec()).ok()?;
+    // Multipart image bodies contain arbitrary bytes. Lossy rendering preserves every ASCII
+    // boundary/header/JSON field tests assert on while still letting the mock answer a PNG upload.
+    let body = String::from_utf8_lossy(&bytes[header_end..]).into_owned();
     Some((path, headers, body))
 }
 
@@ -4616,6 +4843,80 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload_url() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let response_base = Arc::clone(&base);
+    let api = spawn_http_mock(move |path, _body| match path {
+        "/api/files.getUploadURLExternal" => json!({
+            "ok": true,
+            "upload_url": format!("{}/upload", response_base.lock().expect("base lock")),
+            "file_id": "f-generated"
+        }),
+        "/upload" => json!({"uploaded": true}),
+        "/api/files.completeUploadExternal" => {
+            json!({"ok": true, "files": [{"id": "f-generated"}]})
+        }
+        other => panic!("unexpected Slack image call: {other}"),
+    });
+    *base.lock().expect("base lock") = api.base.clone();
+    let replier = slack(&api.base).replier();
+
+    let receipt = replier
+        .reply(
+            ReplyTarget::Slack {
+                channel: "d0123abc".to_owned(),
+                thread_ts: Some("1712345678.000100".to_owned()),
+            },
+            OutboundReply::with_image("Here is your kitty.", generated_image()),
+        )
+        .await
+        .expect("the complete file share is accepted");
+    assert!(receipt.accepted());
+
+    let calls = api.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[0].1.contains("filename=generated-image.png"));
+    assert!(calls[0].1.contains("length=20"));
+    assert!(calls[1].1.contains("kitty pixels"));
+    let completed: Value = serde_json::from_str(&calls[2].1).expect("completion JSON");
+    assert_eq!(completed["channel_id"], "d0123abc");
+    assert_eq!(completed["thread_ts"], "1712345678.000100");
+    assert_eq!(completed["initial_comment"], "Here is your kitty.");
+    let headers = api.headers();
+    assert_eq!(headers.len(), 3);
+    assert!(
+        !headers[1].to_ascii_lowercase().contains("authorization:"),
+        "the service-selected upload URL must never receive the bot token"
+    );
+}
+
+#[test]
+fn slack_generated_upload_urls_are_origin_bounded() {
+    use crate::transport::slack::is_slack_upload_url;
+
+    assert!(is_slack_upload_url(
+        "https://files.slack.com/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(!is_slack_upload_url(
+        "https://files.slack.com.evil.test/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(!is_slack_upload_url(
+        "https://files.slack.com@evil.test/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(is_slack_upload_url(
+        "http://127.0.0.1:9000/upload",
+        "http://127.0.0.1:9000"
+    ));
+    assert!(!is_slack_upload_url(
+        "http://127.0.0.1:9001/upload",
+        "http://127.0.0.1:9000"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses() {
     let slack_http = spawn_raw_http_mock(|_| {
         (
@@ -4632,7 +4933,7 @@ async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses()
                     channel: "d0123abc".to_owned(),
                     thread_ts: None,
                 },
-                "answer".to_owned(),
+                OutboundReply::text("answer"),
             )
             .await
             .is_err()
@@ -4661,7 +4962,7 @@ async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses()
                     reply_to: None,
                     message_thread_id: None,
                 },
-                "answer".to_owned(),
+                OutboundReply::text("answer"),
             )
             .await
             .is_err()
@@ -5205,7 +5506,7 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
 
     transport
         .replier()
-        .reply(message.reply, "@everyone **done**".to_owned())
+        .reply(message.reply, OutboundReply::text("@everyone **done**"))
         .await
         .expect("Discord answer posts");
     let posted = http
@@ -5219,6 +5520,53 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
     assert_eq!(body["allowed_mentions"]["replied_user"], false);
     assert_eq!(body["message_reference"]["message_id"], DISCORD_MESSAGE);
     assert_eq!(body["message_reference"]["fail_if_not_exists"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let http = spawn_http_mock(move |path, _body| {
+        assert_eq!(path, "/api/v10/channels/222222222222222222/messages");
+        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+            json!({
+                "id": "444444444444444444",
+                "channel_id": DISCORD_CHANNEL,
+                "attachments": [{
+                    "id": "555555555555555555",
+                    "filename": "generated-image.png"
+                }]
+            })
+        } else {
+            // A long answer needs a second text-only message. Failing after the image-bearing first
+            // post must be reported as partial rather than as no delivery.
+            json!({})
+        }
+    });
+    let transport = discord(&http.base);
+
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: Some(DISCORD_MESSAGE.to_owned()),
+            },
+            OutboundReply::with_image("x".repeat(3_000), generated_image()),
+        )
+        .await
+        .expect_err("the second chunk fails after the image was accepted");
+    assert!(matches!(error, TransportError::PartialDelivery));
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 2);
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"payload_json\""));
+    assert!(multipart.contains("name=\"files[0]\""));
+    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("kitty pixels"));
+    assert!(multipart.contains("\"attachments\""));
+    assert!(multipart.contains(DISCORD_MESSAGE));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5314,7 +5662,7 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
-            "after a short rate limit".to_owned(),
+            OutboundReply::text("after a short rate limit"),
         )
         .await
         .expect("the bounded retry succeeds");
@@ -5350,7 +5698,7 @@ async fn discord_failure_after_one_accepted_chunk_is_partial_delivery() {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
-            "x".repeat(3_000),
+            OutboundReply::text("x".repeat(3_000)),
         )
         .await
         .expect_err("the second chunk fails after the first was accepted");
@@ -5891,7 +6239,7 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
         .expect("chat action succeeds");
     transport
         .replier()
-        .reply(message.reply, "done".to_owned())
+        .reply(message.reply, OutboundReply::text("done"))
         .await
         .expect("topic reply succeeds");
 
@@ -5999,7 +6347,7 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
     assert_eq!(message.thread.as_deref(), Some("77"));
     transport
         .replier()
-        .reply(message.reply, "inside topic".to_owned())
+        .reply(message.reply, OutboundReply::text("inside topic"))
         .await
         .expect("topic reply is accepted");
     let body = http
@@ -6011,6 +6359,161 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
     assert_eq!(body["chat_id"], -1001);
     assert_eq!(body["message_thread_id"], 77);
     assert_eq!(body["reply_to_message_id"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() {
+    let http = spawn_http_mock(|path, _body| {
+        assert!(path.contains("sendPhoto"));
+        json!({
+            "ok": true,
+            "result": {
+                "message_id": 12,
+                "message_thread_id": 77,
+                "chat": {"id": -1001},
+                "photo": [{"file_id": "photo-small"}, {"file_id": "photo-large"}]
+            }
+        })
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: Some(3),
+                message_thread_id: Some(77),
+            },
+            OutboundReply::with_image("Here is your kitty.", generated_image()),
+        )
+        .await
+        .expect("photo and caption are accepted together");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 1);
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"photo\""));
+    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("kitty pixels"));
+    assert!(multipart.contains("Here is your kitty."));
+    assert!(multipart.contains("name=\"reply_parameters\""));
+    assert!(multipart.contains("\"message_id\":3"));
+    assert!(multipart.contains("-1001"));
+    assert!(multipart.contains("77"));
+    assert!(multipart.contains("3"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_splits_long_generated_image_text_without_losing_it() {
+    let message_ids = Arc::new(AtomicUsize::new(20));
+    let next_id = Arc::clone(&message_ids);
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("sendPhoto") {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "chat": {"id": 42},
+                    "photo": [{"file_id": "photo"}]
+                }
+            })
+        } else {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": next_id.fetch_add(1, Ordering::SeqCst),
+                    "chat": {"id": 42}
+                }
+            })
+        }
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+    let text = format!("{}\n{}", "a".repeat(4_000), "b".repeat(1_000));
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: Some(3),
+                message_thread_id: None,
+            },
+            OutboundReply::with_image(text.clone(), generated_image()),
+        )
+        .await
+        .expect("photo and every bounded text chunk are accepted");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 3, "one photo plus two text chunks");
+    let delivered = calls[1..]
+        .iter()
+        .map(|(_, body)| {
+            serde_json::from_str::<Value>(body).expect("text request JSON")["text"]
+                .as_str()
+                .expect("text field")
+                .to_owned()
+        })
+        .collect::<String>();
+    assert_eq!(delivered, text);
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|(_, body)| !body.contains("reply_to_message_id")),
+        "the photo already owns the inbound reply reference"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_photo() {
+    let http = spawn_http_mock(|path, _body| {
+        if path.contains("sendPhoto") {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "chat": {"id": 42},
+                    "photo": [{"file_id": "photo"}]
+                }
+            })
+        } else {
+            json!({"ok": false, "description": "message rejected"})
+        }
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_image("x".repeat(1_025), generated_image()),
+        )
+        .await
+        .expect_err("the photo succeeded before the text failed");
+    assert!(matches!(error, TransportError::PartialDelivery));
+    assert_eq!(http.calls().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -6075,7 +6578,11 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     let reply = tokio::spawn({
         let replier = transport.replier();
         let target = first.reply.clone();
-        async move { replier.reply(target, "accepted locally".to_owned()).await }
+        async move {
+            replier
+                .reply(target, OutboundReply::text("accepted locally"))
+                .await
+        }
     });
     use tokio::io::{AsyncBufReadExt as _, BufReader};
     let mut client = BufReader::new(client);
@@ -6084,15 +6591,56 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         .read_line(&mut line)
         .await
         .expect("the flushed reply reaches the local caller");
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).expect("local reply is JSON")["reply"],
-        "accepted locally"
+    let text_response = serde_json::from_str::<Value>(&line).expect("local reply is JSON");
+    assert_eq!(text_response["reply"], "accepted locally");
+    assert!(
+        text_response.get("images").is_none(),
+        "text-only local replies keep their exact legacy shape"
     );
     assert!(
         reply
             .await
             .expect("reply task completes")
             .expect("local write and flush are accepted")
+            .accepted()
+    );
+
+    let image_reply = tokio::spawn({
+        let replier = transport.replier();
+        let target = second.reply.clone();
+        async move {
+            replier
+                .reply(
+                    target,
+                    OutboundReply::with_image("a local kitty", generated_image()),
+                )
+                .await
+        }
+    });
+    line.clear();
+    client
+        .read_line(&mut line)
+        .await
+        .expect("the generated image reaches the local caller");
+    let response = serde_json::from_str::<Value>(&line).expect("image reply is JSON");
+    assert_eq!(response["reply"], "a local kitty");
+    assert_eq!(response["images"][0]["filename"], "generated-image.png");
+    assert_eq!(response["images"][0]["mediaType"], "image/png");
+    assert_eq!(
+        STANDARD
+            .decode(
+                response["images"][0]["data"]
+                    .as_str()
+                    .expect("base64 image")
+            )
+            .expect("image data decodes"),
+        generated_image().bytes()
+    );
+    assert!(
+        image_reply
+            .await
+            .expect("image reply task completes")
+            .expect("image write and flush are accepted")
             .accepted()
     );
 }

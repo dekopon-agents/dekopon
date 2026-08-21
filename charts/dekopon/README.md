@@ -91,7 +91,7 @@ failure naming that file rather than a broker that starts and then refuses to se
 
 ### What does not need any of this
 
-- **Chat-service and model credentials.** `dekopond.yaml` names environment variable *names*, never values,
+- **Chat-service, chat-model, and optional image-model credentials.** `dekopond.yaml` names environment variable *names*, never values,
   so those are ordinary `secretKeyRef` entries under `gateway.env` with no file hygiene at all.
 - **`OTEL_EXPORTER_OTLP_HEADERS`.** The broker's `telemetry` block has no credential field by
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters

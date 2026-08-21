@@ -25,6 +25,7 @@ use std::{
     },
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
 use futures_util::future::BoxFuture;
@@ -36,8 +37,8 @@ use tokio::{
 };
 
 use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, ReplyTarget,
-    TransportError, TransportEvent, TransportIdentity, bound_inbound,
+    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
+    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
 };
 
 /// Longest line the development transport accepts, matching the inbound text bound plus envelope.
@@ -253,13 +254,22 @@ impl ChatReplier for LocalReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Local { connection } = target else {
                 return Err(TransportError::Response);
             };
-            let line = serde_json::json!({ "reply": text }).to_string();
+            let OutboundReply { text, image } = reply;
+            let mut response = serde_json::json!({ "reply": text });
+            if let Some(image) = image {
+                response["images"] = serde_json::json!([{
+                    "filename": image.filename(),
+                    "mediaType": image.media_type(),
+                    "data": STANDARD.encode(image.bytes()),
+                }]);
+            }
+            let line = response.to_string();
             let sender = self
                 .connections
                 .lock()
