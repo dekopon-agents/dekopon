@@ -180,7 +180,7 @@ jobs:
             --plan .github/release-crates.txt \
             --changelog CHANGELOG.md
       - name: Package every publishable crate
-        run: cargo package --workspace --exclude dekopon-testkit --locked
+        run: cargo package --workspace --locked
       - name: Prepare package cache for saving
         run: .github/scripts/prepare-package-cache.sh
 

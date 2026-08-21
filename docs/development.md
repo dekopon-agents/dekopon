@@ -41,7 +41,6 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Shared prompt loop, safe agent-configuration/image-generation meta views, and session capability dispatch | `crates/dekopon-agent/src/` | Inline prompt/meta-tool, one-attempt byte-free image output, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests |
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
-| Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `gh/`, `skylight-private/`, `memory-chat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
 | End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
@@ -53,7 +52,7 @@ Tests intentionally live beside the crate that owns the behavior. The top-level 
 
 ### Catalog resources or validation
 
-Update protocol types first, then config validation, testkit builders, CLI rendering, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
+Update protocol types first, then config validation, CLI rendering, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
 
 ### CLI behavior
 
@@ -199,7 +198,7 @@ cargo +1.89.0 test --workspace --all-features --locked
 For package metadata, include lists, or dependency-boundary changes, run from a clean tree:
 
 ```console
-cargo package --workspace --exclude dekopon-testkit --locked
+cargo package --workspace --locked
 ```
 
 The storage host, immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only integration fixtures, so Cargo may warn that `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, or `tests/server.rs` is not included in the published package. After verification, CI runs `.github/scripts/prepare-package-cache.sh` to remove unpacked test-source directories from `target/package`: they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations while saving the cache.

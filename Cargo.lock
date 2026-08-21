@@ -1082,18 +1082,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-testkit"
-version = "0.9.0"
-dependencies = [
- "dekopon-capability",
- "dekopon-config",
- "dekopon-core",
- "dekopon-protocol",
- "serde_yaml_ng",
- "tempfile",
-]
-
-[[package]]
 name = "dekopon-webui"
 version = "0.9.0"
 dependencies = [
