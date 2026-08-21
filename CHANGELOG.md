@@ -22,6 +22,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- The `--http-bind` web UI now serves at most sixteen concurrent connections, refusing rather than
+  queuing further ones, and drops any connection that exceeds a thirty-second budget from accept to
+  close; both ceilings are configurable through `dekopon_webui::serve_with_limits`.
+- The web UI emits one `debug` tracing event per request with method, path, status, and response
+  bytes, and no query string or body.
+- Web UI provider pages are rendered once at broker startup instead of per request, the dashboard's
+  agent inventory is shared by reference rather than deep-copied per render, and the provider page's
+  "Manifest API" row now shows the manifest's own `apiVersion` value instead of the Rust variant
+  name.
+- The web UI's "Fuel yield interval" row now reports the interval `dekopon-broker-host` actually
+  configures rather than re-deriving it.
+
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
@@ -43,6 +55,8 @@ All notable changes to Dekopon are documented here. The format is based on
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Every web UI response now carries the closed no-store/nosniff/no-referrer/CSP header set,
+  including the 405 axum produces for a mutating method, which previously left the router unprotected.
 
 ## [0.9.0] - 2026-08-20
 
