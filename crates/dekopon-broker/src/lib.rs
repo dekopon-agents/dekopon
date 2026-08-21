@@ -1006,6 +1006,13 @@ pub struct BrokerLimits {
     /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,
     /// Maximum invocation IDs retained for this process lifetime.
+    ///
+    /// Size this against `auditMaxRecords` rather than below it. The ledger never evicts, and
+    /// restart restores one entry per durable Decision event, so the bound is cumulative across
+    /// restarts rather than per process. A denial costs one audit record and one ledger slot,
+    /// which means a denial-heavy history exhausts a ledger sized at half the audit budget first
+    /// — before the designed [`AuditError::Full`] refusal ever fires. Reaching this bound is
+    /// `capacity-exhausted`: permanent, and an operator's problem rather than a client's.
     pub max_replay_ids: usize,
 }
 
@@ -1167,6 +1174,18 @@ fn is_memory_capability(capability: &CapabilityId) -> bool {
     matches!(
         capability.as_str(),
         MEMORY_RECORD | MEMORY_RECENT | MEMORY_SEARCH
+    )
+}
+
+/// The model-facing note announcing durable chat memory.
+///
+/// Shared by the live surface and the startup frame ceiling so the check measures the exact bytes
+/// a session would receive.
+fn memory_prompt_note(max_lookback_turns: u32) -> String {
+    format!(
+        "Durable chat memory is available on demand. Use `memory recent --last N` or `memory \
+         search --query TEXT`. Searches inspect at most {max_lookback_turns} prior turns. Do not \
+         claim recall without retrieving it."
     )
 }
 
@@ -2635,6 +2654,46 @@ where
         capabilities
     }
 
+    /// The widest capability answer this broker could ever produce.
+    ///
+    /// [`Self::capabilities`], [`Self::command_words`], and the chat surface are all policy
+    /// filters over exactly these values, for every context the broker can build — direct peer,
+    /// attested, or chat. Enumerating those contexts is not possible here: the agent catalog
+    /// belongs to the gateway, and production policy conditions on `context.agent`, so a broker
+    /// that guessed an agent would measure a surface no session ever receives. Bounding them is
+    /// what a startup frame check actually needs, because a ceiling that fits proves that no
+    /// session's answer can overflow the frame.
+    #[must_use]
+    pub fn capability_ceiling(&self) -> (Vec<AvailableCapability>, Vec<String>) {
+        let mut capabilities = self
+            .constraints
+            .iter()
+            .filter_map(|(capability, _)| self.available_capability(capability))
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
+        let mut words = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .flat_map(|(_, words)| words.iter().cloned())
+            .collect::<Vec<_>>();
+        words.sort();
+        words.dedup();
+        (capabilities, words)
+    }
+
+    /// The chat memory surface a session could be told about, sized for the frame check.
+    ///
+    /// Policy still decides whether any given session sees it; this is only its byte cost.
+    #[must_use]
+    pub fn chat_memory_ceiling(&self) -> Option<ChatMemorySurface> {
+        let config = self.chat_memory.as_ref()?;
+        Some(ChatMemorySurface {
+            max_lookback_turns: config.max_lookback_turns,
+            prompt_note: memory_prompt_note(config.max_lookback_turns),
+        })
+    }
+
     /// Evaluates and, when allowed, executes one authenticated proposal exactly once.
     pub async fn invoke(
         &self,
@@ -3018,12 +3077,7 @@ where
         }
         Some(ChatMemorySurface {
             max_lookback_turns: config.max_lookback_turns,
-            prompt_note: format!(
-                "Durable chat memory is available on demand. Use `memory recent --last N` or \
-                 `memory search --query TEXT`. Searches inspect at most {} prior turns. Do not \
-                 claim recall without retrieving it.",
-                config.max_lookback_turns
-            ),
+            prompt_note: memory_prompt_note(config.max_lookback_turns),
         })
     }
 
@@ -4470,15 +4524,10 @@ pub enum BrokerError {
 }
 
 impl BrokerError {
-    /// Invocation whose provider work may already have completed with no terminal audit record.
+    /// Stable pre-execution class for a broker-owned storage failure, when that is what happened.
     ///
-    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
-    /// execution: the external effect may have taken place, nothing durably recorded its
-    /// outcome, and the request must not be resubmitted under any identifier. `None` when
-    /// execution provably never began, so resubmission under a fresh identifier is safe.
-    ///
-    /// Transports are expected to preserve this distinction; collapsing both cases into one
-    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
+    /// Nothing executed, so a corrected request may use a fresh invocation identifier — the class
+    /// only says which storage condition an operator has to reconcile first.
     #[must_use]
     pub const fn storage_failure_code(&self) -> Option<&'static str> {
         let Self::Storage { source } = self else {
@@ -4496,6 +4545,47 @@ impl BrokerError {
         })
     }
 
+    /// Stable class for an exhaustion that no resubmission can outlast.
+    ///
+    /// The retriable class is for a broker that could not complete *this* request. These two
+    /// cannot complete any request. The replay ledger never evicts and restart restores it from
+    /// durable history, so a fresh invocation identifier fails identically and keeps failing; the
+    /// audit log does not rotate, so a full one refuses every append until an operator raises the
+    /// bound or moves the file. Reporting either as `broker-unavailable` invites an unbounded
+    /// retry loop against a permanently capped broker.
+    ///
+    /// A *terminal* audit failure is deliberately absent: [`Self::OutcomeAudit`] is an unaudited
+    /// outcome first, whatever exhausted it, and that classification must not be weakened here.
+    #[must_use]
+    pub const fn capacity_failure_code(&self) -> Option<&'static str> {
+        match self {
+            Self::ReplayLedgerFull { .. } => Some("capacity-exhausted"),
+            Self::DecisionAudit {
+                source: AuditError::Full { .. },
+            } => Some("capacity-exhausted"),
+            Self::MemoryUnavailable
+            | Self::InvalidMemoryInput
+            | Self::Storage { .. }
+            | Self::Authorization { .. }
+            | Self::DecisionEvidence { .. }
+            | Self::DecisionAudit { .. }
+            | Self::OutcomeEvidence { .. }
+            | Self::StorageOutcome { .. }
+            | Self::OutcomeAudit { .. } => None,
+        }
+    }
+
+    /// Invocation whose provider work may already have completed with no terminal audit record.
+    ///
+    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
+    /// execution: the external effect may have taken place, nothing durably recorded its
+    /// outcome, and the request must not be resubmitted under any identifier. `None` when
+    /// execution provably never began — which makes resubmission *safe*, not useful:
+    /// [`Self::capacity_failure_code`] separates the failures a retry can outlive from the
+    /// exhaustions it cannot.
+    ///
+    /// Transports are expected to preserve this distinction; collapsing both cases into one
+    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
     #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {

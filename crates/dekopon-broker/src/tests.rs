@@ -535,6 +535,48 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     }
 }
 
+/// A permanent exhaustion is not a momentary outage. The replay ledger never evicts and is
+/// restored from durable history at startup, and the audit log does not rotate, so a client told
+/// to resubmit under a fresh identifier would loop against a broker that is capped forever.
+#[test]
+fn exhausted_bounds_are_terminal_rather_than_retriable() {
+    for error in [
+        super::BrokerError::ReplayLedgerFull { maximum: 100_000 },
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Full { maximum: 200_000 },
+        },
+    ] {
+        assert_eq!(error.capacity_failure_code(), Some("capacity-exhausted"));
+        assert_eq!(
+            error.unaudited_outcome(),
+            None,
+            "an exhaustion refuses before execution"
+        );
+        assert_eq!(error.storage_failure_code(), None);
+    }
+
+    // The same exhaustion *after* execution stays an unaudited outcome: the effect may already
+    // have happened, and that classification outranks how the append failed.
+    let invocation = "invoke-terminal"
+        .parse::<InvocationId>()
+        .expect("valid invocation fixture");
+    let terminal = super::BrokerError::OutcomeAudit {
+        invocation: invocation.clone(),
+        source: super::AuditError::Full { maximum: 200_000 },
+    };
+    assert_eq!(terminal.capacity_failure_code(), None);
+    assert_eq!(terminal.unaudited_outcome(), Some(&invocation));
+
+    // And an ordinary durable failure is still the retriable class.
+    assert_eq!(
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Poisoned,
+        }
+        .capacity_failure_code(),
+        None
+    );
+}
+
 #[test]
 fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     for scope in [

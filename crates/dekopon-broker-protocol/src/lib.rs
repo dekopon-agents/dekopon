@@ -81,6 +81,16 @@ pub const ERROR_STORAGE_TIMEOUT: &str = "storage-timeout";
 pub const ERROR_STORAGE_CORRUPT: &str = "storage-corrupt";
 pub const ERROR_STORAGE_IO: &str = "storage-io";
 
+/// Stable failure code: a bounded broker resource is exhausted and nothing executed.
+///
+/// Distinct from [`ERROR_BROKER_UNAVAILABLE`] because the exhaustion is permanent rather than
+/// momentary: the replay ledger never evicts and is restored from durable history on restart, and
+/// the audit log does not rotate. Resubmission under a fresh invocation identifier is *safe* — no
+/// provider work began — and it is also futile, because it fails identically until an operator
+/// raises `maxReplayIds` / `auditMaxRecords` or moves the audit file aside. A client must not
+/// retry this.
+pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
+
 /// Exact protocol version carried by every envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolVersion {
