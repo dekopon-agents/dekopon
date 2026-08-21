@@ -14,6 +14,12 @@ LEGACY_CHANGELOGLESS_TAGS = frozenset(
     {"v0.2.0", "v0.3.0", "v0.4.0", "v0.5.0", "v0.6.0", "v0.7.0"}
 )
 
+# cargo-machete finds a dependency nothing uses; it cannot see a whole crate nothing depends on.
+# These two are the only members allowed to have no workspace consumer: they are guest bindings
+# compiled into provider components, whose in-repository callers are the excluded
+# examples/providers/* workspaces.
+GUEST_BINDING_PACKAGES = frozenset({"dekopon-provider-http", "dekopon-provider-storage"})
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -41,6 +47,35 @@ def read_plan(path: Path) -> list[str]:
     return configured
 
 
+def verify_libraries_are_consumed(workspace: dict[str, dict]) -> None:
+    """Require every non-binary member to be a dependency of some other member."""
+
+    consumed: set[str] = set()
+    for name, package in workspace.items():
+        for dependency in package["dependencies"]:
+            if dependency["name"] in workspace and dependency["name"] != name:
+                consumed.add(dependency["name"])
+
+    libraries = {
+        name
+        for name, package in workspace.items()
+        if not any("bin" in target["kind"] for target in package["targets"])
+    }
+    dead = sorted(libraries - consumed - GUEST_BINDING_PACKAGES)
+    if dead:
+        raise SystemExit(
+            "no workspace member depends on these library crates; give each a consumer "
+            f"or delete it: {', '.join(dead)}"
+        )
+
+    stale = sorted(GUEST_BINDING_PACKAGES - (libraries - consumed))
+    if stale:
+        raise SystemExit(
+            "these guest-binding exemptions are obsolete and must be removed from "
+            f"GUEST_BINDING_PACKAGES: {', '.join(stale)}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
@@ -52,6 +87,8 @@ def main() -> None:
         for package in metadata["packages"]
         if package["id"] in members
     }
+
+    verify_libraries_are_consumed(workspace)
 
     versions = {package["version"] for package in workspace.values()}
     if len(versions) != 1:
