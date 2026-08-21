@@ -31,6 +31,15 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- `ClientError::Protocol` now carries the exchange phase and renders its bounded framing detail, and
+  `ClientError::may_have_executed` covers both a lost response and `outcome-unaudited`. A script
+  reaching that state receives `denied` (exit `126`) instead of a retryable failure. Invalid frame
+  bounds now surface as the separate `ClientError::Limits`, and `capabilities_for` is removed in
+  favor of `session_surface_for`.
+- Frame payloads are now read incrementally, so a peer-claimed in-bound length no longer allocates
+  before any payload byte arrives, and one frame is written with one `write_all` instead of two.
+- `AgentInventory::validate` and `ModelUsageReport::validate` name the offending agent and the exact
+  bound; `dekopon-brokerd` logs that reason server-side while the wire message stays generic.
 
 ### Security
 

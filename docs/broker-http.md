@@ -108,6 +108,10 @@ A failure response carries a stable code and a bounded message. The code is the 
 
 The server logs `broker_outcome_unaudited` with the invocation identifier for exactly this case, so the invocation needing manual reconciliation is identifiable without correlating client-side state.
 
+A failure response is not the only way to reach that state. Nothing ties a client's `io_timeout` to broker-side execution deadlines, so a client whose response read fails is in the same position: the complete request frame was delivered and the outcome is unknown to it. `ClientError` therefore records which half of the exchange failed — a request-phase framing failure delivered nothing, a response-phase one delivered everything — and `ClientError::may_have_executed` covers both that case and the `outcome-unaudited` code. A caller submitting a write must map it to a non-retryable result: `dekopon-agent` reports it to a script as `denied` (exit `126`) rather than as a generic failure, because a retry carries a fresh invocation identifier and replay rejection cannot recognize it as a duplicate.
+
+Invalid informational reports are also diagnosable server-side without widening the wire: `AgentInventory::validate` and `ModelUsageReport::validate` name the offending agent and the exact bound, `dekopon-brokerd` logs that as `broker_agent_inventory_rejected` / `broker_model_usage_rejected`, and the response stays the generic `invalid-request`.
+
 Successful informational reports return `acknowledged`; invalid bounds return `invalid-request`, and a mapped peer without an attestor grant receives `unauthenticated`. Reporting failures are non-authoritative and must never be interpreted as provider work or retried as an invocation.
 
 ## HTTP component contract
