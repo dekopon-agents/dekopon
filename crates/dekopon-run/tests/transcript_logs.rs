@@ -224,4 +224,40 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
             "{sentinel} missing from transcript: {verbose}"
         );
     }
+
+    // The transcript is shipped once and then extended, never re-shipped whole. Turn N's message
+    // vector strictly contains turn N-1's, so logging all of it every turn costs a session O(N^2)
+    // payload bytes to repeat what `agent.model.answer`, `agent.tool.script`, and
+    // `agent.tool.output` already said on the turn that produced it.
+    let prompts = verbose
+        .lines()
+        .filter(|line| line.contains("agent.model.prompt"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(prompts.len(), 2, "one prompt event per turn: {verbose}");
+    assert!(
+        prompts[0].contains("transcript.scope=full"),
+        "{}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains(PROMPT_SENTINEL), "{}", prompts[0]);
+
+    assert!(
+        prompts[1].contains("transcript.scope=delta"),
+        "{}",
+        prompts[1]
+    );
+    // The second request still carries the whole conversation — `message.count` says how much of
+    // it there is — and the event carries only what this turn appended.
+    assert!(prompts[1].contains("message.count=3"), "{}", prompts[1]);
+    assert!(
+        !prompts[1].contains(PROMPT_SENTINEL),
+        "the prompt was re-shipped: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains(SCRIPT_SENTINEL),
+        "the appended tool traffic is missing: {}",
+        prompts[1]
+    );
 }
