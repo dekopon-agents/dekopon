@@ -1,0 +1,73 @@
+# Slack Agent app profile for dekopond.
+#
+# Use this instead of manifest.yaml only when the workspace plan and admin policy enable Slack's
+# Agent messaging experience. The same Socket Mode and bot credentials are used, but Agent DMs are
+# thread-scoped and `agents.sessions.setStatus(processing)` creates Slack's native Working/Stop UI.
+# After one explicitly addressed message is freshly authorized, the same authenticated sender may
+# continue inside that exact Agent thread without repeating the mention. Dekopon handles
+# `agent_session_stopped` cooperatively and queues a best-effort return to `active`.
+# Slack also requires the `app_home_opened` bot event whenever `agent_view` is enabled; opening App
+# Home is not itself a prompt, so dekopond safely acknowledges and ignores that event.
+#
+# If Agent status returns `feature_disabled` or another permanent installation error, dekopond
+# degrades to the fixed `:tangerine:` reaction requested by `classicFallback: reaction`, and then
+# to no activity if reactions are unavailable. Final replies are independent of every activity API.
+#
+# The bot scope split is:
+# - `assistant:write`: declares the installed app as an Agent.
+# - `chat:write`: posts replies and manages Agent session status.
+# - `reactions:write`: optional free/classic fallback; pair `classicFallback: none` with removing it.
+# - `message.im`/`im:history`: direct-message prompts.
+# - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
+# - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
+#   traffic so the transport can admit only exact freshly authorized sender/thread continuations.
+#   All other ambient messages are dropped before routing, authorization, telemetry, or inference.
+# - `files:read`: lazy access to attachments the sender included.
+# - `files:write`: shares the one bounded PNG an explicitly image-enabled route generated.
+#
+# An xapp token with app-level `connections:write` is still generated manually; app manifests do
+# not declare app-level tokens. Reinstall the app whenever bot scopes change.
+display_information:
+  name: dekopon
+  description: Your fresh and zesty agent
+  background_color: "#ff6a3d"
+features:
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  agent_view:
+    agent_description: A fresh and zesty agent for safely completing bounded tasks.
+    suggested_prompts:
+      - title: Review a pull request
+        message: Review this pull request and summarize the important findings.
+      - title: Check an incident
+        message: Help me investigate this incident and identify the next safe step.
+  bot_user:
+    display_name: dekopon
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - assistant:write
+      - channels:history
+      - chat:write
+      - files:read
+      - files:write
+      - groups:history
+      - im:history
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - agent_session_stopped
+      - app_home_opened
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

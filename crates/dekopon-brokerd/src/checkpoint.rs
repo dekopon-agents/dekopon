@@ -430,30 +430,36 @@ mod tests {
             trace: "trace-checkpoint"
                 .parse::<TraceId>()
                 .expect("valid trace fixture"),
-            principal: "caller"
-                .parse::<PrincipalId>()
-                .expect("valid principal fixture"),
-            actor: Actor::Agent {
+            principal: Some(
+                "caller"
+                    .parse::<PrincipalId>()
+                    .expect("valid principal fixture"),
+            ),
+            actor: Some(Actor::Agent {
                 agent: "checkpoint-test"
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
-            },
+            }),
             via: None,
             attested_subject: None,
             capability: "echo.echo"
                 .parse::<CapabilityId>()
                 .expect("valid capability fixture"),
             provider: None,
-            authorized_by: "broker"
-                .parse::<PrincipalId>()
-                .expect("valid principal fixture"),
+            authorized_by: Some(
+                "broker"
+                    .parse::<PrincipalId>()
+                    .expect("valid principal fixture"),
+            ),
             decision_id: format!("decision-{invocation}"),
-            policy_revision: "policy-checkpoint".to_owned(),
+            policy_revision: Some("policy-checkpoint".to_owned()),
             policy_ids: Vec::new(),
             policy_digest: None,
             allowed: false,
             reason: Some("policy-denied".to_owned()),
             decision_digest: format!("sha256:{}", "a".repeat(64)),
+            storage_scope_commitment: None,
+            storage: None,
         }
     }
 

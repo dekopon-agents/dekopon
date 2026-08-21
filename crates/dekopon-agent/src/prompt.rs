@@ -5,11 +5,14 @@
 //! offer credential-free agent configuration and chat-asset tools. Provider work still happens
 //! only inside the script instead of across many small capability-shaped model tools.
 
-use std::{fmt, time::Instant};
+use std::{fmt, sync::Mutex, time::Instant};
 
-use dekopon_model::model::{
-    ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool, ModelToolCall,
-    ModelUsage, assistant_message,
+use dekopon_model::{
+    image::{GeneratedImage, ImageGenerator, MAX_IMAGE_PROMPT_BYTES},
+    model::{
+        ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool,
+        ModelToolCall, ModelUsage, assistant_message,
+    },
 };
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
@@ -34,6 +37,12 @@ pub const AGENT_CONFIG_TOOL_NAME: &str = "inspect_agent_config";
 /// The tool a model calls to look at something a person attached to their message.
 pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 
+/// The tool a model calls to create one image for its final chat reply.
+pub const IMAGE_GENERATION_TOOL_NAME: &str = "generate_image";
+
+/// The tool an optional chat continuation may call to post nothing.
+pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
+
 /// Tool calls a single model turn may request.
 ///
 /// This bound used to cover one capability invocation each, so 32 was a statement about how much
@@ -43,9 +52,22 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 /// enforces across the session.
 ///
 /// What is left is a well-formedness bound. A scripting tool expresses a multi-step plan *inside*
-/// one script, so a correct turn calls it once; a handful of calls is tolerated for models that
-/// split work across parallel calls, and anything beyond that is a runaway rather than a plan.
-const MAX_TOOL_CALLS_PER_TURN: usize = 4;
+/// one script, while embedder-owned meta tools can legitimately fan out over a bounded attachment
+/// set. Ten calls leave room for that parallel work; anything beyond ten is a runaway rather than
+/// a plan.
+const MAX_TOOL_CALLS_PER_TURN: usize = 10;
+
+/// Trusted request-scoped guidance for an unaddressed continuation in an owned chat thread.
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This message is an unaddressed continuation inside a \
+chat thread the agent already owns. Reply when doing so would materially help. If no response is \
+needed—for example, the people are talking to each other, acknowledged the result, or already \
+resolved the point—call `decline_chat_reply` instead. That call posts nothing to chat. Do not reply \
+merely to have the last word.";
+
+/// A decline after provider work would hide something the session already did.
+const DECLINE_AFTER_WORK_RESULT: &str = "A chat reply is required because this session already \
+invoked a capability. No tool calls from this turn were run. Provide a concise reply describing \
+what happened instead.";
 
 /// Script execution boundary consumed by the prompt loop.
 ///
@@ -114,6 +136,31 @@ pub trait AssetSource {
     fn is_empty(&self) -> bool;
 }
 
+/// Request-local slot through which one generated image leaves the prompt loop.
+///
+/// The bytes never become a model message or part of [`PromptOutcome`]. An embedder takes the slot
+/// only after a successful session and drops it on failure or cancellation, which keeps generated
+/// content out of transcripts, persistent history, and accidental `Debug` output.
+#[derive(Default)]
+pub struct GeneratedImageOutput(Mutex<Option<GeneratedImage>>);
+
+impl GeneratedImageOutput {
+    /// Removes the generated image, if this session produced one.
+    pub fn take(&self) -> Option<GeneratedImage> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn store(&self, image: GeneratedImage) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image);
+    }
+}
+
 /// Observes provider-reported token accounting without influencing a model session.
 ///
 /// The observer receives one call after every successfully decoded model response, including a
@@ -122,6 +169,16 @@ pub trait AssetSource {
 pub trait ModelUsageObserver: Send + Sync {
     /// Records the provider's report, or `None` when it reported no token counts.
     fn observe(&self, usage: Option<ModelUsage>);
+}
+
+/// Request-scoped cooperative cancellation visible from the synchronous prompt loop.
+///
+/// Cancellation is not rollback: a model request or provider effect already accepted elsewhere may
+/// still finish. The probe prevents the next model turn or tool invocation from starting and lets
+/// an embedding gateway suppress a stale terminal answer.
+pub trait CancellationProbe: Send + Sync {
+    /// Whether the session should stop at its next cooperative boundary.
+    fn is_cancelled(&self) -> bool;
 }
 
 /// Bounds on one prompt session.
@@ -133,11 +190,23 @@ pub struct PromptLimits {
     pub max_capability_calls: u32,
 }
 
+/// Whether a completed prompt session should publish its final text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplyDisposition {
+    /// Publish the non-empty final answer normally.
+    Send,
+    /// Publish nothing because an optional chat continuation explicitly declined.
+    Suppress,
+}
+
 /// Result of a completed prompt/tool session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptOutcome {
-    /// Final assistant text.
+    /// Final assistant text. Empty only when [`Self::disposition`] is
+    /// [`ReplyDisposition::Suppress`].
     pub answer: String,
+    /// Whether the embedding surface should deliver `answer`.
+    pub disposition: ReplyDisposition,
     /// Number of model requests made.
     pub model_turns: u32,
     /// Number of scripts the model ran.
@@ -265,8 +334,17 @@ pub struct SessionInputs<'a> {
     limits: PromptLimits,
     options: Option<&'a CompletionOptions>,
     assets: Option<&'a dyn AssetSource>,
+    image_generation: Option<ImageGeneration<'a>>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
+    cancellation: Option<&'a dyn CancellationProbe>,
+    optional_reply: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ImageGeneration<'a> {
+    generator: &'a dyn ImageGenerator,
+    output: &'a GeneratedImageOutput,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -279,8 +357,11 @@ impl<'a> SessionInputs<'a> {
             limits,
             options: None,
             assets: None,
+            image_generation: None,
             usage_observer: None,
             agent_config: None,
+            cancellation: None,
+            optional_reply: false,
         }
     }
 
@@ -305,6 +386,17 @@ impl<'a> SessionInputs<'a> {
         self
     }
 
+    /// Adds one explicitly configured image generator and its request-local output slot.
+    #[must_use]
+    pub const fn with_image_generation(
+        mut self,
+        generator: &'a dyn ImageGenerator,
+        output: &'a GeneratedImageOutput,
+    ) -> Self {
+        self.image_generation = Some(ImageGeneration { generator, output });
+        self
+    }
+
     /// Adds an informational observer for provider-reported token accounting.
     #[must_use]
     pub const fn with_usage_observer(mut self, observer: &'a dyn ModelUsageObserver) -> Self {
@@ -318,6 +410,24 @@ impl<'a> SessionInputs<'a> {
         self.agent_config = Some(config);
         self
     }
+
+    /// Adds a request-scoped cooperative cancellation probe.
+    #[must_use]
+    pub const fn with_cancellation(mut self, cancellation: &'a dyn CancellationProbe) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Lets the model decline one unaddressed, transport-owned chat continuation.
+    ///
+    /// This is deliberately request-scoped rather than an agent default: explicit mentions and
+    /// direct messages still require an answer, while a conversational thread follow-up may need
+    /// no last word from the agent.
+    #[must_use]
+    pub const fn with_optional_reply(mut self) -> Self {
+        self.optional_reply = true;
+        self
+    }
 }
 
 /// Optional, request-scoped surfaces handed to the inner model loop.
@@ -325,8 +435,11 @@ impl<'a> SessionInputs<'a> {
 struct SessionExtensions<'a> {
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
+    image_generation: Option<ImageGeneration<'a>>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
+    cancellation: Option<&'a dyn CancellationProbe>,
+    optional_reply: bool,
 }
 
 /// Runs one bounded prompt/tool session from a [`SessionInputs`].
@@ -349,8 +462,11 @@ where
         limits,
         options,
         assets,
+        image_generation,
         usage_observer,
         agent_config,
+        cancellation,
+        optional_reply,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -366,6 +482,9 @@ where
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
     }
+    if optional_reply {
+        messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
+    }
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
@@ -377,13 +496,18 @@ where
         SessionExtensions {
             options,
             assets,
+            image_generation,
             usage_observer,
             agent_config,
+            cancellation,
+            optional_reply,
         },
     );
     history.record(match &result {
-        Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
-        Err(_) => ConversationTurn::unanswered(prompt),
+        Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+            ConversationTurn::completed(prompt, outcome.answer.as_str())
+        }
+        Ok(_) | Err(_) => ConversationTurn::unanswered(prompt),
     });
     result
 }
@@ -406,8 +530,11 @@ where
     let SessionExtensions {
         options,
         assets,
+        image_generation,
         usage_observer,
         agent_config,
+        cancellation,
+        optional_reply,
     } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
@@ -419,6 +546,12 @@ where
     if assets.is_some() {
         model_tools.push(asset_tool());
     }
+    if image_generation.is_some() {
+        model_tools.push(image_generation_tool());
+    }
+    if optional_reply {
+        model_tools.push(decline_reply_tool());
+    }
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -428,8 +561,12 @@ where
     let _session = session_span.enter();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
+    // One attempt, successful or not. A failed image request may still have incurred provider
+    // cost, so letting the model retry would quietly widen the route's explicit one-call bound.
+    let mut image_generation_attempted = false;
 
     for model_turns in 1..=limits.max_steps {
+        check_cancelled(cancellation)?;
         // Usage fields are declared empty and recorded once the provider answers: token counts
         // are response data, and they belong on the turn span so a trace query can price a
         // session without leaving the trace.
@@ -519,15 +656,18 @@ where
             );
         }
         drop(model_entered);
+        check_cancelled(cancellation)?;
         messages.push(assistant_message(&turn));
 
         if turn.tool_calls.is_empty() {
+            check_cancelled(cancellation)?;
             let answer = turn
                 .content
                 .filter(|content| !content.trim().is_empty())
                 .ok_or(PromptError::EmptyAnswer)?;
             return Ok(PromptOutcome {
                 answer,
+                disposition: ReplyDisposition::Send,
                 model_turns,
                 script_calls,
                 capability_invocations,
@@ -550,7 +690,60 @@ where
             });
         }
 
+        let decline_requested = optional_reply
+            && turn
+                .tool_calls
+                .iter()
+                .any(|call| call.function.name == DECLINE_REPLY_TOOL_NAME);
+        if decline_requested {
+            // A terminal decline does not need tool results, but malformed correlation IDs and
+            // arguments are still malformed model output rather than a magic escape hatch.
+            for (index, call) in turn.tool_calls.iter().enumerate() {
+                if call.id.trim().is_empty() {
+                    reject_tool_call(model_turns, index + 1, "empty-tool-call-id");
+                    return Err(PromptError::EmptyToolCallId);
+                }
+                if call.function.name == DECLINE_REPLY_TOOL_NAME {
+                    decline_reply_argument(&call.function.name, &call.function.arguments)?;
+                }
+            }
+            if capability_invocations == 0 {
+                check_cancelled(cancellation)?;
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "agent.reply.declined",
+                        model.turn = model_turns,
+                    },
+                    "optional chat reply declined"
+                );
+                return Ok(PromptOutcome {
+                    answer: String::new(),
+                    disposition: ReplyDisposition::Suppress,
+                    model_turns,
+                    script_calls,
+                    capability_invocations,
+                });
+            }
+
+            // Once a capability ran, silence could conceal an external effect. If no model turn
+            // remains, return a distinct error so the embedding surface can post a fixed warning
+            // not to retry blindly. Otherwise answer every call in this turn without running any
+            // of them, then require the model to report what the earlier work did.
+            if model_turns == limits.max_steps {
+                return Err(PromptError::UnreportedCapabilityWork);
+            }
+            for call in &turn.tool_calls {
+                messages.push(ModelMessage::tool(
+                    call.id.clone(),
+                    DECLINE_AFTER_WORK_RESULT.to_owned(),
+                ));
+            }
+            continue;
+        }
+
         for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
+            check_cancelled(cancellation)?;
             let tool_call_index = tool_call_index + 1;
             if call.id.trim().is_empty() {
                 reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
@@ -572,6 +765,20 @@ where
                 && let Some(source) = assets
             {
                 fetch_asset_into(&mut messages, source, &call, model_turns, tool_call_index)?;
+                continue;
+            }
+            if call.function.name == IMAGE_GENERATION_TOOL_NAME
+                && let Some(generation) = image_generation
+            {
+                generate_image_into(
+                    &mut messages,
+                    generation,
+                    &mut image_generation_attempted,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                    cancellation,
+                )?;
                 continue;
             }
             // The model-selected name is deliberately not copied into telemetry: it is untrusted
@@ -620,7 +827,9 @@ where
                 // `run_script` returns no `Result`: a failed script is an outcome the model reads
                 // and recovers from, so the `prompt.script` span always closes normally and
                 // reports the script's own exit code rather than a host error.
+                check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script, remaining);
+                check_cancelled(cancellation)?;
                 if dekopon_core::telemetry_payloads() {
                     tracing::info!(
                         target: "dekopon_agent::audit",
@@ -645,6 +854,14 @@ where
     Err(PromptError::MaxSteps {
         maximum: limits.max_steps,
     })
+}
+
+fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), PromptError> {
+    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+        Err(PromptError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Renders one script outcome the way a terminal would: output, then an exit-code trailer.
@@ -723,6 +940,23 @@ fn script_tool(command_words: &[String]) -> ModelTool {
     }
 }
 
+fn decline_reply_tool() -> ModelTool {
+    ModelTool {
+        name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+        description: "Post nothing to chat and end this optional continuation. Call this instead \
+                      of writing text when a reply would not materially help or would merely take \
+                      the last word. Call it before running capabilities; once capability work has \
+                      happened, a concise report is required."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn agent_config_tool() -> ModelTool {
     ModelTool {
         name: AGENT_CONFIG_TOOL_NAME.to_owned(),
@@ -771,6 +1005,27 @@ fn inspect_agent_config_into(
     Ok(())
 }
 
+/// Requires the decline tool's argument object to be exactly empty.
+fn decline_reply_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    if !arguments.is_empty() {
+        return Err(PromptError::DeclineReplyArgumentsNotEmpty {
+            tool: tool.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Requires the meta tool's argument object to be exactly empty.
 fn agent_config_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
@@ -803,6 +1058,156 @@ fn is_textual(mime: &str) -> bool {
             mime,
             "application/json" | "application/xml" | "application/x-yaml" | "application/yaml"
         )
+}
+
+fn image_generation_tool() -> ModelTool {
+    ModelTool {
+        name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+        description:
+            "Generate one PNG to attach to your final chat reply. Call this only when the \
+                      user asks you to create or draw an image. The session permits one attempt. \
+                      After it succeeds, finish with a short textual caption; the gateway delivers \
+                      the image separately from your text."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "maxLength": MAX_IMAGE_PROMPT_BYTES,
+                    "description": "A self-contained visual description for the image generator."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Executes the route's one image-generation attempt without putting bytes into model messages.
+fn generate_image_into(
+    messages: &mut Vec<ModelMessage>,
+    generation: ImageGeneration<'_>,
+    attempted: &mut bool,
+    call: &ModelToolCall,
+    model_turn: u32,
+    tool_call_index: usize,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Result<(), PromptError> {
+    let prompt = match image_prompt_argument(&call.function.name, &call.function.arguments) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            return Err(error);
+        }
+    };
+    if *attempted {
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.image_generation.refused",
+                model.turn = model_turn,
+                tool_call.index = tool_call_index,
+                reason = "session-limit",
+            },
+            "image generation refused"
+        );
+        messages.push(ModelMessage::tool(
+            call.id.clone(),
+            "This session has already used its one image-generation attempt. Finish with the image already queued, or answer without one.",
+        ));
+        return Ok(());
+    }
+    *attempted = true;
+    check_cancelled(cancellation)?;
+    let started = Instant::now();
+    let span = tracing::info_span!(
+        "prompt.image_generation",
+        model.turn = model_turn,
+        tool_call.index = tool_call_index,
+        image.bytes = tracing::field::Empty,
+    );
+    let result = {
+        let _entered = span.enter();
+        generation.generator.generate(&prompt)
+    };
+    match result {
+        Ok(image) => {
+            span.record("image.bytes", image.bytes().len());
+            tracing::info!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "accounting.model.image_generation",
+                    model.turn = model_turn,
+                    duration_ms = milliseconds(started.elapsed()),
+                    image.bytes = image.bytes().len(),
+                    outcome = "succeeded",
+                },
+                "image generation accounted"
+            );
+            // Cancellation cannot stop or unbill an already-running HTTP request, which is why
+            // accounting happens above. It can still keep those bytes from reaching chat.
+            check_cancelled(cancellation)?;
+            generation.output.store(image);
+            messages.push(ModelMessage::tool(
+                call.id.clone(),
+                "Generated one image for delivery with your final chat reply.",
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "accounting.model.image_generation",
+                    model.turn = model_turn,
+                    duration_ms = milliseconds(started.elapsed()),
+                    outcome = "failed",
+                    error.type = error.category(),
+                },
+                "image generation failed"
+            );
+            // Fixed gateway-authored text: provider diagnostics can contain reflected prompt text
+            // and never belong in the next model request.
+            messages.push(ModelMessage::tool(
+                call.id.clone(),
+                "Image generation failed. Answer without an image.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn image_prompt_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(mut arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    let prompt = arguments
+        .remove("prompt")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| PromptError::MissingImagePrompt {
+            tool: tool.to_owned(),
+        })?;
+    if !arguments.is_empty() {
+        return Err(PromptError::UnexpectedImageArguments {
+            tool: tool.to_owned(),
+        });
+    }
+    if prompt.len() > MAX_IMAGE_PROMPT_BYTES {
+        return Err(PromptError::ImagePromptTooLarge {
+            actual: prompt.len(),
+            maximum: MAX_IMAGE_PROMPT_BYTES,
+        });
+    }
+    Ok(prompt)
 }
 
 fn asset_tool() -> ModelTool {
@@ -1013,6 +1418,9 @@ the entire point of this tool.";
 /// [`format_script_outcome`] so it can recover.
 #[derive(Debug, Error)]
 pub enum PromptError {
+    /// The embedding caller stopped the session at a cooperative boundary.
+    #[error("prompt session was cancelled")]
+    Cancelled,
     /// A zero-length loop was requested.
     #[error("prompt max steps must be greater than zero")]
     ZeroSteps,
@@ -1054,6 +1462,12 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// The optional-reply decline tool received fields despite having no arguments.
+    #[error("model arguments for tool {tool:?} must be an empty object")]
+    DeclineReplyArgumentsNotEmpty {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
     /// Tool arguments carried no script to run.
     #[error("model arguments for tool {tool:?} must include a string \"script\" field")]
     MissingScript {
@@ -1066,6 +1480,29 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// Image-generation arguments carried no non-empty prompt.
+    #[error("model arguments for tool {tool:?} must include a non-empty string \"prompt\" field")]
+    MissingImagePrompt {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// Image-generation arguments contained fields outside the strict one-prompt schema.
+    #[error("model arguments for tool {tool:?} contain unexpected fields")]
+    UnexpectedImageArguments {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// The model-authored image prompt exceeded the fixed byte ceiling.
+    #[error("image generation prompt is {actual} bytes; maximum is {maximum}")]
+    ImagePromptTooLarge {
+        /// Actual UTF-8 byte length.
+        actual: usize,
+        /// Fixed maximum UTF-8 byte length.
+        maximum: usize,
+    },
+    /// Capability work ran, then the model tried to decline with no reporting turn left.
+    #[error("model tried to suppress a reply after capability work with no reporting turn left")]
+    UnreportedCapabilityWork,
     /// The model ended without text or a tool call.
     #[error("model returned neither tool calls nor a final answer")]
     EmptyAnswer,
@@ -1085,6 +1522,7 @@ impl PromptError {
     #[must_use]
     pub fn telemetry_kind(&self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::ZeroSteps => "zero-steps",
             Self::Model(_) => "model",
             Self::UnknownTool(_) => "unknown-tool",
@@ -1093,8 +1531,13 @@ impl PromptError {
             Self::InvalidArguments { .. } => "invalid-json-arguments",
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
             Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
+            Self::DeclineReplyArgumentsNotEmpty { .. } => "decline-reply-arguments-not-empty",
             Self::MissingScript { .. } => "missing-script",
             Self::MissingAssetId { .. } => "missing-asset-id",
+            Self::MissingImagePrompt { .. } => "missing-image-prompt",
+            Self::UnexpectedImageArguments { .. } => "unexpected-image-arguments",
+            Self::ImagePromptTooLarge { .. } => "image-prompt-too-large",
+            Self::UnreportedCapabilityWork => "unreported-capability-work",
             Self::EmptyAnswer => "empty-answer",
             Self::MaxSteps { .. } => "max-steps",
         }
@@ -1138,12 +1581,18 @@ fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
-    use dekopon_model::model::{
-        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, ModelUsage,
+    use dekopon_model::{
+        image::{GeneratedImage, ImageGenerationError, ImageGenerator},
+        model::{
+            AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall,
+            ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+        },
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
@@ -1153,11 +1602,12 @@ mod tests {
     };
 
     use super::{
-        AGENT_CONFIG_TOOL_NAME, ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History,
-        HistoryLimits, ModelUsageObserver, PromptError, PromptLimits, SCRIPT_TOOL_NAME,
-        ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_tool,
+        AGENT_CONFIG_TOOL_NAME, CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
+        DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, GeneratedImageOutput, History, HistoryLimits,
+        IMAGE_GENERATION_TOOL_NAME, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
+        PromptLimits, ReplyDisposition, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs,
+        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1298,11 +1748,253 @@ mod tests {
         }
     }
 
+    fn image_call(id: &str, prompt: &str) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                id: id.to_owned(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                    arguments: json!({"prompt": prompt}).to_string(),
+                },
+            }],
+            usage: None,
+            replay_items: Vec::new(),
+        }
+    }
+
+    fn decline_call(id: &str, arguments: Value) -> ModelToolCall {
+        ModelToolCall {
+            id: id.to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn decline(arguments: Value) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![decline_call("decline-call", arguments)],
+            usage: None,
+            replay_items: Vec::new(),
+        }
+    }
+
+    struct FixedImageGenerator {
+        calls: AtomicUsize,
+    }
+
+    impl ImageGenerator for FixedImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(b"secret-generated-pixels");
+            GeneratedImage::from_png(bytes)
+        }
+    }
+
+    struct CancellingImageGenerator(Arc<AtomicBool>);
+
+    impl ImageGenerator for CancellingImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            self.0.store(true, Ordering::SeqCst);
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(b"cancelled pixels");
+            GeneratedImage::from_png(bytes)
+        }
+    }
+
+    struct AtomicCancellation(Arc<AtomicBool>);
+
+    impl CancellationProbe for AtomicCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FailingImageGenerator;
+
+    impl ImageGenerator for FailingImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            Err(ImageGenerationError::Configuration(
+                "provider diagnostic sentinel".to_owned(),
+            ))
+        }
+    }
+
     fn limits(max_steps: u32, max_capability_calls: u32) -> PromptLimits {
         PromptLimits {
             max_steps,
             max_capability_calls,
         }
+    }
+
+    struct Cancelled;
+
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_pre_cancelled_session_never_reaches_the_model_or_history() {
+        let model = ScriptedModel::new([answer("too late")]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("stop", limits(2, 2)).with_cancellation(&Cancelled),
+            &mut history,
+        )
+        .expect_err("cancellation is a terminal session outcome");
+
+        assert!(matches!(error, PromptError::Cancelled));
+        assert!(
+            model
+                .observed_messages
+                .lock()
+                .expect("message observations lock")
+                .is_empty(),
+            "no model request starts after cancellation"
+        );
+        assert_eq!(
+            history.len(),
+            1,
+            "the prompt loop records an unanswered turn"
+        );
+    }
+
+    #[test]
+    fn a_route_generator_yields_one_byte_free_image_output() {
+        let model = ScriptedModel::new([
+            image_call("image-1", "a tiny orange kitten"),
+            // A second request cannot turn one configured generation into ambient unbounded cost.
+            image_call("image-2", "another kitten"),
+            answer("Here is your kitten."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let generator = FixedImageGenerator {
+            calls: AtomicUsize::new(0),
+        };
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw me a kitty cat", limits(3, 1))
+                .with_image_generation(&generator, &output),
+            &mut history,
+        )
+        .expect("the image tool is a recoverable model turn");
+
+        assert_eq!(outcome.answer, "Here is your kitten.");
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        let image = output.take().expect("one generated output");
+        assert_eq!(image.media_type(), "image/png");
+        assert_eq!(output.take().map(|image| image.bytes().len()), None);
+        let tool_results = model.tool_messages();
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.contains("Generated one image"))
+        );
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.contains("one image-generation attempt"))
+        );
+        let transcript = serde_json::to_string(
+            &*model
+                .observed_messages
+                .lock()
+                .expect("message observations lock"),
+        )
+        .expect("transcript serializes");
+        assert!(
+            !transcript.contains("secret-generated-pixels"),
+            "generated bytes entered model messages: {transcript}"
+        );
+        assert!(
+            model
+                .observed_tools
+                .lock()
+                .expect("tool observations lock")
+                .iter()
+                .all(|tools| tools
+                    .iter()
+                    .any(|tool| tool.name == IMAGE_GENERATION_TOOL_NAME))
+        );
+    }
+
+    #[test]
+    fn cancellation_during_generation_discards_the_accounted_image() {
+        let model = ScriptedModel::new([image_call("image-1", "a kitten")]);
+        let runtime = RecordingRuntime::new(0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let generator = CancellingImageGenerator(Arc::clone(&cancelled));
+        let probe = AtomicCancellation(cancelled);
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw", limits(2, 1))
+                .with_image_generation(&generator, &output)
+                .with_cancellation(&probe),
+            &mut history,
+        )
+        .expect_err("cancellation wins after the billed generation request returns");
+
+        assert!(matches!(error, PromptError::Cancelled));
+        assert!(
+            output.take().is_none(),
+            "cancelled bytes must not leave the loop"
+        );
+        assert!(
+            model.tool_messages().is_empty(),
+            "no later model turn starts"
+        );
+    }
+
+    #[test]
+    fn image_provider_diagnostics_never_return_to_the_chat_model() {
+        let model = ScriptedModel::new([
+            image_call("image-1", "a kitten"),
+            answer("I could not draw that."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw", limits(2, 1))
+                .with_image_generation(&FailingImageGenerator, &output),
+            &mut history,
+        )
+        .expect("generation failure is a fixed tool outcome");
+
+        assert!(output.take().is_none());
+        let results = model.tool_messages();
+        assert!(
+            results
+                .iter()
+                .any(|result| result == "Image generation failed. Answer without an image.")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| !result.contains("provider diagnostic sentinel"))
+        );
     }
 
     fn agent_config() -> AgentConfigView {
@@ -2080,6 +2772,206 @@ mod tests {
     }
 
     #[test]
+    fn an_optional_thread_continuation_can_decline_without_an_answer() {
+        let model = ScriptedModel::new([decline(json!({}))]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("OK, thanks", limits(2, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect("declining an optional continuation succeeds");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert!(outcome.answer.is_empty());
+        assert_eq!(outcome.model_turns, 1);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "OK, thanks");
+        assert_eq!(history.turns()[0].answer(), None);
+
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert_eq!(
+            tools[0].last().map(|tool| tool.name.as_str()),
+            Some(DECLINE_REPLY_TOOL_NAME)
+        );
+        drop(tools);
+        assert!(
+            model
+                .first_roles()
+                .iter()
+                .any(|(role, content)| role == &"system" && content.contains("last word")),
+            "the model is explicitly told that silence is available"
+        );
+    }
+
+    #[test]
+    fn required_replies_are_not_offered_the_decline_tool_or_instruction() {
+        let model = ScriptedModel::new([answer("You are welcome.")]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("thanks", limits(2, 4)),
+            &mut history,
+        )
+        .expect("an ordinary prompt answers");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Send);
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .all(|tool| tool.name != DECLINE_REPLY_TOOL_NAME)
+        );
+        assert!(
+            model
+                .first_roles()
+                .iter()
+                .all(|(_, content)| !content.contains("decline_chat_reply"))
+        );
+    }
+
+    #[test]
+    fn a_decline_requested_alongside_work_runs_nothing() {
+        let model = ScriptedModel::new([AssistantTurn {
+            content: None,
+            tool_calls: vec![
+                ModelToolCall {
+                    id: "image-call".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                        arguments: json!({"prompt": "should not be generated"}).to_string(),
+                    },
+                },
+                decline_call("decline-call", json!({})),
+                ModelToolCall {
+                    id: "script-call".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: SCRIPT_TOOL_NAME.to_owned(),
+                        arguments: json!({"script": "echo should-not-run"}).to_string(),
+                    },
+                },
+            ],
+            usage: None,
+            replay_items: Vec::new(),
+        }]);
+        let runtime = RecordingRuntime::new(1);
+        let generator = FixedImageGenerator {
+            calls: AtomicUsize::new(0),
+        };
+        let image = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("conversation moved on", limits(2, 4))
+                .with_image_generation(&generator, &image)
+                .with_optional_reply(),
+            &mut history,
+        )
+        .expect("the no-reply decision is terminal");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert!(image.take().is_none());
+        assert_eq!(outcome.capability_invocations, 0);
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .any(|tool| tool.name == IMAGE_GENERATION_TOOL_NAME)
+        );
+        assert!(
+            tools[0]
+                .iter()
+                .any(|tool| tool.name == DECLINE_REPLY_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn capability_work_requires_a_reply_even_if_the_model_later_declines() {
+        let model = ScriptedModel::new([
+            script_call("script-call", "echo did-work"),
+            decline(json!({})),
+            answer("I completed the capability call."),
+        ]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("maybe do this", limits(4, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect("the model reports work instead of hiding it");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Send);
+        assert_eq!(outcome.answer, "I completed the capability call.");
+        assert_eq!(outcome.capability_invocations, 1);
+        assert!(
+            model
+                .tool_messages()
+                .iter()
+                .any(|message| message.contains("a concise reply describing what happened"))
+        );
+    }
+
+    #[test]
+    fn a_final_turn_decline_after_capability_work_is_a_distinct_unsafe_retry_warning() {
+        let model = ScriptedModel::new([
+            script_call("script-call", "echo did-work"),
+            decline(json!({})),
+        ]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("maybe do this", limits(2, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect_err("work cannot disappear behind a final-turn decline");
+
+        assert!(matches!(error, PromptError::UnreportedCapabilityWork));
+        assert_eq!(
+            history.turns().last().and_then(ConversationTurn::answer),
+            None
+        );
+    }
+
+    #[test]
+    fn the_decline_tool_rejects_model_supplied_fields() {
+        let model = ScriptedModel::new([decline(json!({"message": "secret"}))]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("optional", limits(1, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect_err("the decline tool has no model-controlled payload");
+
+        assert!(matches!(
+            error,
+            PromptError::DeclineReplyArgumentsNotEmpty { .. }
+        ));
+    }
+
+    #[test]
     fn runs_a_model_script_and_returns_the_final_answer() {
         let model = ScriptedModel::new([
             script_call("call-1", "echo.echo --message hi | jq -r .message"),
@@ -2220,8 +3112,45 @@ mod tests {
     }
 
     #[test]
-    fn bounds_script_fan_out_per_model_turn() {
-        let tool_calls = (0..5)
+    fn accepts_ten_tool_calls_in_one_model_turn() {
+        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 10);
+        let tool_calls = (0..MAX_TOOL_CALLS_PER_TURN)
+            .map(|index| ModelToolCall {
+                id: format!("call-{index}"),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: SCRIPT_TOOL_NAME.to_owned(),
+                    arguments: json!({ "script": "echo hi" }).to_string(),
+                },
+            })
+            .collect();
+        let model = ScriptedModel::new([
+            AssistantTurn {
+                content: None,
+                tool_calls,
+                usage: None,
+                replay_items: Vec::new(),
+            },
+            answer("done"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+
+        let outcome = run_prompt(&model, &runtime, "fan out", None, limits(2, 32))
+            .expect("ten calls remain inside the per-turn bound");
+
+        assert_eq!(
+            outcome.script_calls,
+            u32::try_from(MAX_TOOL_CALLS_PER_TURN).expect("tool-call bound fits u32")
+        );
+        assert_eq!(
+            runtime.scripts.lock().expect("script lock").len(),
+            MAX_TOOL_CALLS_PER_TURN
+        );
+    }
+
+    #[test]
+    fn rejects_eleven_tool_calls_in_one_model_turn() {
+        let tool_calls = (0..=MAX_TOOL_CALLS_PER_TURN)
             .map(|index| ModelToolCall {
                 id: format!("call-{index}"),
                 kind: "function".to_owned(),
@@ -2240,9 +3169,15 @@ mod tests {
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "fan out", None, limits(1, 32))
-            .expect_err("script fan-out must be bounded");
+            .expect_err("eleven calls must exceed the per-turn bound");
 
-        assert!(matches!(error, PromptError::TooManyToolCalls { .. }));
+        assert!(matches!(
+            error,
+            PromptError::TooManyToolCalls {
+                actual: 11,
+                maximum: 10
+            }
+        ));
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
     }
 

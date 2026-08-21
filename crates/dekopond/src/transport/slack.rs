@@ -7,12 +7,17 @@
 //! redeliveries that happen anyway across a reconnect.
 
 use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -20,14 +25,24 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
+    config::{
+        ActivityMode, SLACK_ENDPOINT, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+    },
     transport::{
-        AssetFetcher, ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget,
-        TransportError, TransportIdentity, bound_inbound, floor_boundary,
+        ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SessionStop, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        bound_inbound, floor_boundary,
     },
 };
 
 /// Redeliveries this transport remembers across reconnects.
 const DEDUP_CAPACITY: usize = 1024;
+/// Freshly authorized sender/thread claims retained by one Agent transport.
+///
+/// Bounded independently from conversation history: this registry decides only whether a message
+/// may wake a session, never what the session remembers or what the broker authorizes.
+const OWNED_THREAD_CAPACITY: usize = 1024;
 /// Message subtypes that are a person making a new request rather than an event about a message.
 ///
 /// An allowlist rather than a deny list: a subtype Slack introduces later is dropped until someone
@@ -46,6 +61,10 @@ const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// First reconnect delay; doubles up to [`MAX_BACKOFF`].
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
+/// Activity must never inherit the final reply/file client's general 30-second wait.
+const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Fixed gateway-owned reaction used by classic/free-workspace fallback.
+const ACTIVITY_REACTION: &str = "tangerine";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -60,8 +79,11 @@ pub(crate) struct SlackTransport {
     identity: TransportIdentity,
     team_id: Option<String>,
     seen: Dedup,
-    pending: VecDeque<InboundMessage>,
+    pending: VecDeque<TransportEvent>,
     failures: u32,
+    experience: SlackExperience,
+    activity: SlackActivityConfig,
+    thread_ownership: Arc<SlackThreadOwnership>,
 }
 
 impl SlackTransport {
@@ -72,8 +94,11 @@ impl SlackTransport {
         endpoint: String,
         app_token: String,
         bot_token: String,
+        experience: SlackExperience,
+        activity: SlackActivityConfig,
     ) -> Result<Self, TransportError> {
         let http = client()?;
+        let thread_ownership = Arc::new(SlackThreadOwnership::new(OWNED_THREAD_CAPACITY));
         Ok(Self {
             name,
             endpoint: endpoint.clone(),
@@ -83,6 +108,11 @@ impl SlackTransport {
                 endpoint,
                 bot_token: Redacted::new(bot_token),
                 http,
+                experience,
+                fallback: activity.classic_fallback,
+                agent_status_available: AtomicBool::new(true),
+                reaction_available: AtomicBool::new(true),
+                active_activity: Mutex::new(HashMap::new()),
             }),
             socket: None,
             identity: TransportIdentity::default(),
@@ -90,6 +120,9 @@ impl SlackTransport {
             seen: Dedup::new(DEDUP_CAPACITY),
             pending: VecDeque::new(),
             failures: 0,
+            experience,
+            activity,
+            thread_ownership,
         })
     }
 
@@ -183,8 +216,16 @@ impl SlackTransport {
             .ok_or(TransportError::Response)?
             .to_owned();
         let event = &payload["event"];
-        if let Some(message) = self.routable(&team, event)? {
-            self.pending.push_back(message);
+        if self.experience == SlackExperience::Agent
+            && event["type"].as_str() == Some("agent_session_stopped")
+        {
+            if let Some(stopped) = self.session_stopped(&team, event)? {
+                self.pending
+                    .push_back(TransportEvent::SessionStopped(stopped));
+            }
+        } else if let Some(message) = self.routable(&team, event)? {
+            self.pending
+                .push_back(TransportEvent::Message(Box::new(message)));
         }
         Ok(())
     }
@@ -228,23 +269,50 @@ impl SlackTransport {
         if text.trim().is_empty() && assets.is_empty() {
             return Ok(None);
         }
-        if !self.seen.insert(format!("{channel}:{ts}")) {
-            return Ok(None);
-        }
-
         let thread_ts = event["thread_ts"].as_str().map(str::to_owned);
+        let root_ts = thread_ts.clone().unwrap_or_else(|| ts.to_owned());
         let conversation = if event["channel_type"].as_str() == Some("im") {
             ConversationKind::DirectMessage
         } else {
             ConversationKind::Channel(channel.to_owned())
         };
-        // A channel answer joins the thread it was asked in, starting one on the inbound message
-        // when there is none; a DM has no threads to join and answering in one would hide the
-        // reply behind a disclosure triangle.
-        let reply_thread = match &conversation {
-            ConversationKind::DirectMessage => None,
-            ConversationKind::Channel(_) => {
-                Some(thread_ts.clone().unwrap_or_else(|| ts.to_owned()))
+        // `message.channels`/`message.groups` expose ambient traffic to an Agent installation so
+        // an owned thread can continue without another mention. Drop everything else here, before
+        // it reaches routing, authorization, payload telemetry, or a model. An app_mention event is
+        // authenticated structured evidence; mention syntax is retained as a defensive fallback
+        // because the parallel message event may win the dedup race.
+        let explicitly_addressed =
+            event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(&text);
+        let thread_continuation = match (&conversation, self.experience) {
+            (ConversationKind::Channel(_), SlackExperience::Agent) => {
+                let claim = ThreadClaim::Slack {
+                    team_id: team.to_owned(),
+                    channel_id: channel.to_owned(),
+                    thread_ts: root_ts.clone(),
+                    user_id: user.to_owned(),
+                };
+                let inherited = !explicitly_addressed && self.thread_ownership.owns(&claim);
+                if !explicitly_addressed && !inherited {
+                    return Ok(None);
+                }
+                Some(ThreadContinuation { claim, inherited })
+            }
+            (ConversationKind::Channel(_), SlackExperience::Classic) if !explicitly_addressed => {
+                return Ok(None);
+            }
+            _ => None,
+        };
+        if !self.seen.insert(format!("{channel}:{ts}")) {
+            return Ok(None);
+        }
+        // Agent sessions are thread-scoped even in DMs. Classic DMs deliberately retain today's
+        // top-level reply and whole-DM conversation behavior; a cosmetic API result never decides
+        // which model the installed app exposes.
+        let is_channel = matches!(&conversation, ConversationKind::Channel(_));
+        let reply_thread = match (&conversation, self.experience) {
+            (ConversationKind::DirectMessage, SlackExperience::Classic) => None,
+            (ConversationKind::DirectMessage | ConversationKind::Channel(_), _) => {
+                Some(root_ts.clone())
             }
         };
         // The conversation is the thread the answer joins, never `thread_ts`. Slack omits
@@ -255,8 +323,9 @@ impl SlackTransport {
         // "simplify" this back to `thread_ts`; that is the bug.
         //
         // Prefixed with the channel because a Slack `ts` is only unique within its channel, and
-        // this identity has to stand on its own once it leaves the transport. A direct message has
-        // no thread to join, so the whole conversation is the DM channel.
+        // this identity has to stand on its own once it leaves the transport. A classic direct
+        // message has no thread to join and uses the DM channel; Agent mode intentionally uses the
+        // root thread for one Slack session per task.
         let conversation_id = match &reply_thread {
             Some(thread) => format!("{channel}:{thread}"),
             None => channel.to_owned(),
@@ -264,20 +333,54 @@ impl SlackTransport {
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
+            transport_kind: ChatTransportKind::Slack,
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
             channel: channel.to_owned(),
-            thread: thread_ts,
+            thread: match self.experience {
+                SlackExperience::Agent => Some(root_ts.clone()),
+                SlackExperience::Classic => thread_ts,
+            },
             conversation_id,
             message_id: ts.to_owned(),
             text,
             assets,
             conversation,
-            // Slack's event text carries its mention syntax, so the shared fallback checks it.
-            addressed: None,
+            addressed: is_channel.then_some(explicitly_addressed),
+            thread_continuation,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
                 thread_ts: reply_thread,
             },
+            activity: (self.activity.mode == ActivityMode::Native).then(|| ActivityTarget::Slack {
+                channel_id: channel.to_owned(),
+                thread_ts: root_ts,
+                message_ts: ts.to_owned(),
+                initiator_user_id: user.to_owned(),
+            }),
+        }))
+    }
+
+    fn session_stopped(
+        &self,
+        team: &str,
+        event: &Value,
+    ) -> Result<Option<SessionStop>, TransportError> {
+        // Slack's event reference currently names these `channel` and `user`. Accept the `_id`
+        // spellings as authenticated-envelope aliases as well so an SDK/schema rollout cannot turn
+        // the mandatory Stop control into a silently ignored event.
+        let (Some(channel), Some(thread_ts), Some(user)) = (
+            event["channel"]
+                .as_str()
+                .or_else(|| event["channel_id"].as_str()),
+            event["thread_ts"].as_str(),
+            event["user"].as_str().or_else(|| event["user_id"].as_str()),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(SessionStop {
+            transport: self.name.clone(),
+            conversation_id: format!("{channel}:{thread_ts}"),
+            subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
         }))
     }
 
@@ -312,11 +415,11 @@ impl ChatTransport for SlackTransport {
         })
     }
 
-    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>> {
+    fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
             loop {
-                if let Some(message) = self.pending.pop_front() {
-                    return Ok(message);
+                if let Some(event) = self.pending.pop_front() {
+                    return Ok(event);
                 }
                 if self.socket.is_none() {
                     tokio::time::sleep(self.backoff()).await;
@@ -350,6 +453,16 @@ impl ChatTransport for SlackTransport {
     fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
         Some(Arc::clone(&self.replier) as Arc<dyn AssetFetcher>)
     }
+
+    fn activity(&self) -> Option<Arc<dyn ChatActivity>> {
+        (self.activity.mode == ActivityMode::Native)
+            .then(|| Arc::clone(&self.replier) as Arc<dyn ChatActivity>)
+    }
+
+    fn thread_ownership(&self) -> Option<Arc<dyn ThreadOwnership>> {
+        (self.experience == SlackExperience::Agent)
+            .then(|| Arc::clone(&self.thread_ownership) as Arc<dyn ThreadOwnership>)
+    }
 }
 
 /// The bot-token half of a Slack transport.
@@ -357,18 +470,38 @@ pub(crate) struct SlackReplier {
     endpoint: String,
     bot_token: Redacted<String>,
     http: reqwest::Client,
+    experience: SlackExperience,
+    fallback: SlackActivityFallback,
+    /// Permanently disabled after Slack says this installation cannot use Agent sessions.
+    agent_status_available: AtomicBool,
+    /// Permanently disabled after Slack says this bot lacks reaction authority.
+    reaction_available: AtomicBool,
+    /// What this generation may have created, so cleanup never removes a pre-existing reaction.
+    active_activity: Mutex<HashMap<ActivityTarget, SlackActivityAttempt>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SlackActivityAttempt {
+    agent_status: bool,
+    reaction: bool,
 }
 
 impl ChatReplier for SlackReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
             };
+            let OutboundReply { text, image } = reply;
+            if let Some(image) = image {
+                return self
+                    .upload_generated_image(channel, thread_ts, text, image)
+                    .await;
+            }
             // A `markdown` block, so Slack translates the model's CommonMark instead of this
             // process doing it. Slack's `text` field is mrkdwn — a proprietary syntax where bold is
             // `*one asterisk*` — so an answer posted through it arrives with its formatting as
@@ -377,6 +510,7 @@ impl ChatReplier for SlackReplier {
             //
             // `text` stays as the notification fallback, which is the one place blocks do not
             // render. It carries the answer unchanged rather than a second translation of it.
+            let expected_channel = channel.clone();
             let mut body = json!({
                 "channel": channel,
                 "text": text,
@@ -397,8 +531,422 @@ impl ChatReplier for SlackReplier {
                 .send()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
-            check_ok(response).await.map(|_| ())
+            let body = check_ok(response).await?;
+            let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
+            let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
+            if response_channel != expected_channel || !canonical_timestamp(timestamp) {
+                return Err(TransportError::Response);
+            }
+            Ok(DeliveryReceipt::new(format!(
+                "{}:{timestamp}",
+                response_channel.to_ascii_lowercase()
+            )))
         })
+    }
+}
+
+impl SlackReplier {
+    /// Uses Slack's current external-upload flow. The service-selected upload URL receives only
+    /// image bytes; the bot token returns to the fixed Web API origin for completion.
+    async fn upload_generated_image(
+        &self,
+        channel: String,
+        thread_ts: Option<String>,
+        text: String,
+        image: GeneratedImage,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let length = image.bytes().len().to_string();
+        let described = check_ok(
+            self.http
+                .post(format!("{}/api/files.getUploadURLExternal", self.endpoint))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .form(&[("filename", image.filename()), ("length", length.as_str())])
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?,
+        )
+        .await?;
+        let upload_url = described["upload_url"]
+            .as_str()
+            .ok_or(TransportError::Response)?;
+        let file_id = described["file_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(TransportError::Response)?
+            .to_owned();
+        if !is_slack_upload_url(upload_url, &self.endpoint) {
+            return Err(TransportError::Response);
+        }
+        let uploaded = self
+            .http
+            .post(upload_url)
+            .header("content-type", image.media_type())
+            .body(image.into_bytes())
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if !uploaded.status().is_success() {
+            return Err(TransportError::Service {
+                code: format!("http-{}", uploaded.status().as_u16()),
+            });
+        }
+
+        let mut body = json!({
+            "files": [{"id": file_id, "title": "Generated image"}],
+            "channel_id": channel,
+        });
+        if !text.is_empty() {
+            body["initial_comment"] = Value::String(text);
+        }
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts);
+        }
+        let completed = check_ok(
+            self.http
+                .post(format!(
+                    "{}/api/files.completeUploadExternal",
+                    self.endpoint
+                ))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .header("content-type", "application/json; charset=utf-8")
+                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?,
+        )
+        .await?;
+        let accepted = completed["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["id"] == file_id));
+        if !accepted {
+            return Err(TransportError::Response);
+        }
+        Ok(DeliveryReceipt::new(format!("slack-file:{file_id}")))
+    }
+}
+
+impl ChatActivity for SlackReplier {
+    fn show(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            let ActivityTarget::Slack {
+                channel_id,
+                thread_ts,
+                message_ts,
+                initiator_user_id,
+            } = &target
+            else {
+                return Err(TransportError::Response);
+            };
+
+            let mut agent_error = None;
+            if self.experience == SlackExperience::Agent
+                && self.agent_status_available.load(Ordering::Acquire)
+            {
+                self.update_attempt(&target, |attempt| attempt.agent_status = true);
+                match self
+                    .set_agent_status(channel_id, thread_ts, "processing", Some(initiator_user_id))
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        if permanent_agent_error(&error) {
+                            self.update_attempt(&target, |attempt| attempt.agent_status = false);
+                            if self.agent_status_available.swap(false, Ordering::AcqRel) {
+                                tracing::warn!(
+                                    event = "gateway_activity_degraded",
+                                    transport = "slack",
+                                    surface = "agent-status"
+                                );
+                            }
+                        }
+                        agent_error = Some(error);
+                    }
+                }
+            }
+
+            if self.fallback == SlackActivityFallback::Reaction
+                && self.reaction_available.load(Ordering::Acquire)
+            {
+                match self
+                    .set_reaction(channel_id, message_ts, "reactions.add")
+                    .await
+                {
+                    Ok(()) => {
+                        // Cleanup ownership requires a confirmed successful add. A lost response
+                        // may leave a harmless marker, but can never authorize this generation to
+                        // remove a reaction the bot already had.
+                        self.update_attempt(&target, |attempt| attempt.reaction = true);
+                        return Ok(());
+                    }
+                    Err(TransportError::Service { code }) if code == "already_reacted" => {
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        if permanent_reaction_error(&error)
+                            && self.reaction_available.swap(false, Ordering::AcqRel)
+                        {
+                            tracing::warn!(
+                                event = "gateway_activity_degraded",
+                                transport = "slack",
+                                surface = "reaction"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            match agent_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn hide(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            let ActivityTarget::Slack {
+                channel_id,
+                thread_ts,
+                message_ts,
+                ..
+            } = &target
+            else {
+                return Err(TransportError::Response);
+            };
+            let attempt = self
+                .active_activity
+                .lock()
+                .expect("Slack activity registry")
+                .remove(&target)
+                .unwrap_or_default();
+            let mut first_error = None;
+            if attempt.agent_status
+                && let Err(error) = self
+                    .set_agent_status(channel_id, thread_ts, "active", None)
+                    .await
+            {
+                first_error = Some(error);
+            }
+            if attempt.reaction
+                && let Err(error) = self
+                    .set_reaction(channel_id, message_ts, "reactions.remove")
+                    .await
+                && !matches!(&error, TransportError::Service { code } if code == "no_reaction")
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl SlackReplier {
+    fn update_attempt(
+        &self,
+        target: &ActivityTarget,
+        update: impl FnOnce(&mut SlackActivityAttempt),
+    ) {
+        let mut active = self
+            .active_activity
+            .lock()
+            .expect("Slack activity registry");
+        update(active.entry(target.clone()).or_default());
+    }
+
+    async fn set_agent_status(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        status: &str,
+        initiator_user_id: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let mut body = json!({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "status": status,
+        });
+        if let Some(initiator_user_id) = initiator_user_id {
+            body["initiator_user_id"] = Value::String(initiator_user_id.to_owned());
+        }
+        self.post_activity_json("agents.sessions.setStatus", &body)
+            .await
+    }
+
+    async fn set_reaction(
+        &self,
+        channel: &str,
+        timestamp: &str,
+        method: &str,
+    ) -> Result<(), TransportError> {
+        self.post_activity_json(
+            method,
+            &json!({
+                "channel": channel,
+                "timestamp": timestamp,
+                "name": ACTIVITY_REACTION,
+            }),
+        )
+        .await
+    }
+
+    async fn post_activity_json(&self, method: &str, body: &Value) -> Result<(), TransportError> {
+        let response = self
+            .http
+            .post(format!("{}/api/{method}", self.endpoint))
+            .header(
+                "authorization",
+                format!("Bearer {}", self.bot_token.expose()),
+            )
+            .header("content-type", "application/json; charset=utf-8")
+            .body(serde_json::to_vec(body).map_err(|_| TransportError::Response)?)
+            .timeout(ACTIVITY_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        check_ok(response).await.map(|_| ())
+    }
+}
+
+fn permanent_agent_error(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::Service { code }
+            if matches!(
+                code.as_str(),
+                "feature_disabled"
+                    | "missing_scope"
+                    | "not_allowed_token_type"
+                    | "method_deprecated"
+                    | "deprecated_endpoint"
+            )
+    )
+}
+
+fn permanent_reaction_error(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::Service { code }
+            if matches!(code.as_str(), "missing_scope" | "not_allowed_token_type")
+    )
+}
+
+/// Bounded Agent-thread ownership fed only by freshly authorized sessions.
+struct SlackThreadOwnership {
+    owned: Mutex<OwnedThreads>,
+}
+
+impl SlackThreadOwnership {
+    fn new(capacity: usize) -> Self {
+        Self {
+            owned: Mutex::new(OwnedThreads::new(capacity)),
+        }
+    }
+
+    fn owns(&self, claim: &ThreadClaim) -> bool {
+        let key = SlackThreadKey::from_claim(claim);
+        self.owned
+            .lock()
+            .expect("Slack thread ownership registry")
+            .contains(&key)
+    }
+}
+
+impl ThreadOwnership for SlackThreadOwnership {
+    fn claim(&self, claim: ThreadClaim) {
+        let key = SlackThreadKey::from_claim(&claim);
+        self.owned
+            .lock()
+            .expect("Slack thread ownership registry")
+            .claim(key);
+    }
+
+    fn revoke(&self, claim: &ThreadClaim) {
+        let key = SlackThreadKey::from_claim(claim);
+        self.owned
+            .lock()
+            .expect("Slack thread ownership registry")
+            .revoke(&key);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SlackThreadKey {
+    team_id: String,
+    channel_id: String,
+    thread_ts: String,
+    user_id: String,
+}
+
+impl SlackThreadKey {
+    fn from_claim(claim: &ThreadClaim) -> Self {
+        let ThreadClaim::Slack {
+            team_id,
+            channel_id,
+            thread_ts,
+            user_id,
+        } = claim;
+        Self {
+            team_id: team_id.to_ascii_lowercase(),
+            channel_id: channel_id.to_ascii_lowercase(),
+            thread_ts: thread_ts.to_owned(),
+            user_id: user_id.to_ascii_lowercase(),
+        }
+    }
+}
+
+struct OwnedThreads {
+    order: VecDeque<SlackThreadKey>,
+    owned: HashSet<SlackThreadKey>,
+    capacity: usize,
+}
+
+impl OwnedThreads {
+    fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            owned: HashSet::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn contains(&self, key: &SlackThreadKey) -> bool {
+        self.owned.contains(key)
+    }
+
+    /// Claims or refreshes one sender/thread and evicts the least recently authorized claim.
+    fn claim(&mut self, key: SlackThreadKey) {
+        if self.owned.contains(&key) {
+            self.order.retain(|candidate| candidate != &key);
+        } else {
+            self.owned.insert(key.clone());
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.owned.remove(&evicted);
+            }
+        }
+    }
+
+    fn revoke(&mut self, key: &SlackThreadKey) {
+        if self.owned.remove(key) {
+            self.order.retain(|candidate| candidate != key);
+        }
     }
 }
 
@@ -575,6 +1123,30 @@ pub(crate) fn is_slack_file_url(url: &str) -> bool {
         .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
+/// Whether Slack's service-selected upload URL is safe to receive generated bytes.
+///
+/// No credential is attached either way. Origin binding still matters because generated chat
+/// content should not be sent to an arbitrary host named by a malformed service response.
+pub(crate) fn is_slack_upload_url(url: &str, endpoint: &str) -> bool {
+    let (Ok(url), Ok(endpoint)) = (reqwest::Url::parse(url), reqwest::Url::parse(endpoint)) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if endpoint.as_str().trim_end_matches('/') == SLACK_ENDPOINT {
+        let host = url.host_str().unwrap_or_default();
+        return url.scheme() == "https"
+            && (host == "files.slack.com" || host.ends_with(".files.slack.com"));
+    }
+    url.scheme() == "http"
+        && url.origin() == endpoint.origin()
+        && matches!(
+            url.host_str().map(str::to_ascii_lowercase).as_deref(),
+            Some("localhost" | "127.0.0.1" | "::1")
+        )
+}
+
 /// One HTTP client shared across a transport's calls, with redirects refused.
 pub(crate) fn client() -> Result<reqwest::Client, TransportError> {
     reqwest::Client::builder()
@@ -605,21 +1177,77 @@ async fn post_form(
 ///
 /// The code is Slack's own stable vocabulary (`invalid_auth`, `channel_not_found`), never a token
 /// or a message body, so it is safe to log and to carry in an error.
+fn canonical_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        seconds.len() == 10
+            && fraction.len() == 6
+            && !seconds.starts_with('0')
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 async fn check_ok(response: reqwest::Response) -> Result<Value, TransportError> {
+    let status = response.status();
     let bytes = response
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
     let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
-    if body["ok"] == Value::Bool(true) {
+    if status.is_success() && body["ok"] == Value::Bool(true) {
         return Ok(body);
     }
     Err(TransportError::Service {
-        code: body["error"]
-            .as_str()
-            .unwrap_or("unknown")
-            .chars()
-            .take(64)
-            .collect(),
+        code: if status.is_success() {
+            body["error"]
+                .as_str()
+                .unwrap_or("unknown")
+                .chars()
+                .take(64)
+                .collect()
+        } else {
+            format!("http-{}", status.as_u16())
+        },
     })
+}
+
+#[cfg(test)]
+mod owned_thread_tests {
+    use super::{OwnedThreads, SlackThreadKey};
+
+    fn key(thread: &str, user: &str) -> SlackThreadKey {
+        SlackThreadKey {
+            team_id: "t0123abc".to_owned(),
+            channel_id: "c0123abc".to_owned(),
+            thread_ts: thread.to_owned(),
+            user_id: user.to_owned(),
+        }
+    }
+
+    #[test]
+    fn claims_refresh_lru_order_and_revoke_exactly_one_sender_thread() {
+        let first = key("1.000001", "u1");
+        let second = key("2.000002", "u1");
+        let other_sender = key("1.000001", "u2");
+        let mut owned = OwnedThreads::new(2);
+
+        owned.claim(first.clone());
+        owned.claim(second.clone());
+        owned.claim(first.clone());
+        owned.claim(other_sender.clone());
+
+        assert!(owned.contains(&first), "a refreshed claim remains owned");
+        assert!(owned.contains(&other_sender));
+        assert!(
+            !owned.contains(&second),
+            "the least recently authorized claim is evicted"
+        );
+
+        owned.revoke(&first);
+        assert!(!owned.contains(&first));
+        assert!(
+            owned.contains(&other_sender),
+            "revocation is exact to one sender/thread"
+        );
+    }
 }

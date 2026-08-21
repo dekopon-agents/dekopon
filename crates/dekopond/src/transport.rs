@@ -5,9 +5,11 @@
 //! the broker alone maps to a principal. Message text is untrusted end to end and is bounded before
 //! it reaches a model.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
+use dekopon_model::image::GeneratedImage;
 
 use crate::asset::{AssetSourceRef, PendingAsset};
 use futures_util::future::BoxFuture;
@@ -30,6 +32,8 @@ pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 pub(crate) struct InboundMessage {
     /// The configured transport name this arrived on.
     pub transport: String,
+    /// Transport family that authenticated this message.
+    pub transport_kind: ChatTransportKind,
     /// The sender, taken from the authenticated transport payload and nowhere else.
     pub subject: ExternalSubject,
     /// Service-native conversation identifier.
@@ -67,12 +71,79 @@ pub(crate) struct InboundMessage {
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
-    /// text cannot override the authenticated structure. Other transports use `None` and the
-    /// routing loop applies their identifier/handle syntax through
+    /// text cannot override the authenticated structure. Slack supplies the authenticated
+    /// `app_mention` event type (with mention syntax as a defensive fallback). Other transports
+    /// use `None` and the routing loop applies their identifier/handle syntax through
     /// [`TransportIdentity::is_addressed`]. Direct messages ignore this field.
     pub addressed: Option<bool>,
+    /// Slack Agent thread ownership carried from authenticated transport state.
+    ///
+    /// An explicitly addressed message proposes a claim that the session records only after fresh
+    /// broker authorization. `inherited` is true only when the same authenticated sender later
+    /// speaks in that exact claimed thread without mentioning the bot. No model text can create or
+    /// select this state.
+    pub thread_continuation: Option<ThreadContinuation>,
     /// Whatever the transport needs to answer this message.
     pub reply: ReplyTarget,
+    /// Authenticated service-native coordinates for best-effort in-flight activity.
+    ///
+    /// Absent for transports or messages with no configured activity surface. These values come
+    /// only from the transport envelope and are never model-controlled.
+    pub activity: Option<ActivityTarget>,
+}
+
+/// One event produced by a chat transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TransportEvent {
+    /// A user message eligible for ordinary routing.
+    Message(Box<InboundMessage>),
+    /// A user asked the service's native Agent/session UI to stop one active run.
+    SessionStopped(SessionStop),
+}
+
+/// Authenticated request to stop one native chat session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionStop {
+    pub transport: String,
+    pub conversation_id: String,
+    pub subject: ExternalSubject,
+}
+
+/// One authenticated service-native thread claim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ThreadClaim {
+    Slack {
+        team_id: String,
+        channel_id: String,
+        thread_ts: String,
+        user_id: String,
+    },
+}
+
+/// How one Slack Agent channel message entered routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadContinuation {
+    pub claim: ThreadClaim,
+    /// `true` only when a prior freshly authorized message claimed this exact sender/thread.
+    pub inherited: bool,
+}
+
+/// Service-native destination for transient in-flight activity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ActivityTarget {
+    Slack {
+        channel_id: String,
+        thread_ts: String,
+        message_ts: String,
+        initiator_user_id: String,
+    },
+    Discord {
+        channel_id: String,
+    },
+    Telegram {
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+    },
 }
 
 /// Whether a message arrived in a private conversation or a shared one.
@@ -98,11 +169,10 @@ pub(crate) enum ReplyTarget {
     Telegram {
         chat_id: i64,
         reply_to: Option<i64>,
+        message_thread_id: Option<i64>,
     },
     /// The development transport answers on the connection the request arrived on.
-    Local {
-        connection: u64,
-    },
+    Local { connection: u64 },
 }
 
 /// Who the bot is on one service, resolved at connect time for self-filtering and @-mentions.
@@ -154,8 +224,9 @@ pub(crate) trait ChatTransport: Send {
     /// Authenticates, resolves the bot's own identity, and opens the wakeup path.
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>>;
 
-    /// Waits for the next routable message, reconnecting internally as needed.
-    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>>;
+    /// Waits for the next routable message or native session-control event, reconnecting internally
+    /// as needed.
+    fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>>;
 
     /// A cheaply cloned handle sessions use to answer.
     ///
@@ -170,12 +241,112 @@ pub(crate) trait ChatTransport: Send {
     fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
         None
     }
+
+    /// Best-effort native activity for authorized sessions on this transport.
+    ///
+    /// Defaulted to absent so the local development transport and future transports preserve their
+    /// reply-only behavior without implementing a cosmetic surface.
+    fn activity(&self) -> Option<Arc<dyn ChatActivity>> {
+        None
+    }
+
+    /// Bounded transport-owned registry for authenticated thread continuation.
+    ///
+    /// Defaulted to absent because only Slack's Agent experience currently owns threaded channel
+    /// sessions. A claim is made by the session after fresh authorization, never by the transport
+    /// reader merely seeing an event.
+    fn thread_ownership(&self) -> Option<Arc<dyn ThreadOwnership>> {
+        None
+    }
+}
+
+/// Transport-owned, authorization-fed thread continuation state.
+///
+/// The transport reader consults this state to distinguish one sender's claimed Agent thread from
+/// ambient channel history. The session mutates it only after a fresh broker answer.
+pub(crate) trait ThreadOwnership: Send + Sync {
+    fn claim(&self, claim: ThreadClaim);
+    fn revoke(&self, claim: &ThreadClaim);
+}
+
+/// Transport-owned renderer for the service's native in-flight activity.
+///
+/// The shared coordinator owns lifecycle and refresh timing; implementations own credentials,
+/// exact endpoints, fallback, and per-installation degradation. Failures are cosmetic and never
+/// become session failures.
+pub(crate) trait ChatActivity: Send + Sync {
+    /// Starts or renews activity for one authenticated target under a short driver-owned deadline.
+    ///
+    /// The coordinator deliberately retains an issued call across sealing so later cleanup cannot
+    /// be reordered ahead of bytes already sent to the service.
+    fn show(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>>;
+
+    /// Clears activity where the service supports it, or performs a no-op for expiring signals.
+    fn hide(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>>;
+
+    /// Renewal interval for expiring signals; `None` for durable state transitions such as Slack.
+    fn refresh_interval(&self) -> Option<Duration>;
+}
+
+/// One complete terminal chat reply.
+///
+/// Text and generated bytes travel as separate typed fields. The image's own `Debug` is
+/// metadata-only, so formatting this value cannot place PNG bytes in a log.
+#[derive(Debug)]
+pub(crate) struct OutboundReply {
+    pub text: String,
+    pub image: Option<GeneratedImage>,
+}
+
+impl OutboundReply {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            image: None,
+        }
+    }
+
+    pub(crate) fn with_image(text: impl Into<String>, image: GeneratedImage) -> Self {
+        Self {
+            text: text.into(),
+            image: Some(image),
+        }
+    }
 }
 
 /// The answering half of a transport, shared by every in-flight session on it.
 pub(crate) trait ChatReplier: Send + Sync {
-    fn reply(&self, target: ReplyTarget, text: String)
-    -> BoxFuture<'_, Result<(), TransportError>>;
+    fn reply(
+        &self,
+        target: ReplyTarget,
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>>;
+}
+
+/// Opaque proof that one complete bounded answer reached service/kernel transport acceptance.
+///
+/// It is intentionally non-serializable and fully redacted. It does not claim human receipt.
+pub(crate) struct DeliveryReceipt {
+    acceptance: String,
+}
+
+impl DeliveryReceipt {
+    pub(crate) fn new(acceptance: impl Into<String>) -> Self {
+        Self {
+            acceptance: acceptance.into(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn accepted(&self) -> bool {
+        !self.acceptance.is_empty()
+    }
+}
+
+impl std::fmt::Debug for DeliveryReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeliveryReceipt([REDACTED])")
+    }
 }
 
 /// Resolves an attachment reference back into the bytes a model can look at.
@@ -211,6 +382,8 @@ pub enum TransportError {
     Service { code: String },
     #[error("chat service response was not the expected shape")]
     Response,
+    #[error("chat service accepted only part of a split answer")]
+    PartialDelivery,
     #[error("chat socket closed")]
     Closed,
     #[error("transport input/output failed")]
@@ -230,6 +403,7 @@ impl TransportError {
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::Response => "response",
+            Self::PartialDelivery => "partial-delivery",
             Self::Closed => "closed",
             Self::Io(_) => "io",
             Self::InsecureSocket { .. } => "insecure-socket",

@@ -24,6 +24,12 @@ transports:
     # tokens.
     appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
     botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+    # This example uses examples/slack/manifest-agent.yaml. Agent DMs are thread-scoped; if the
+    # workspace plan/admin disables Agent status, the fixed tangerine reaction is used instead.
+    experience: agent
+    activity:
+      mode: native
+      classicFallback: reaction
 
 models:
   - name: local-reasoning

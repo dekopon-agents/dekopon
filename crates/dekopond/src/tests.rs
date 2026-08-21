@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -10,18 +10,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits, PromptLimits,
+    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
+    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, PromptLimits,
 };
 use dekopon_broker_protocol::{
-    AvailableCapability, BrokerRequest, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame,
-    write_frame,
+    AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
+    InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
-use dekopon_model::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-    ModelTool, ModelToolCall,
+use dekopon_model::{
+    image::{GeneratedImage, ImageGenerationError, ImageGenerator},
+    model::{
+        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+        ModelTool, ModelToolCall,
+    },
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -32,19 +37,22 @@ use crate::{
     asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ConversationPolicy, ConversationWindow, ModelConfig, ResolvedBroker, RouteMatch,
-        SocketDiscovery,
+        self, ActivityMode, ConversationPolicy, ConversationWindow, ImageGeneratorConfig,
+        ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch, SlackActivityConfig,
+        SlackActivityFallback, SlackExperience, SocketDiscovery,
     },
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
-        UNAUTHORIZED_REPLY, run_session,
+        BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelFactory, SessionError,
+        SessionGate, SessionRunner, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
+        configured_image_generators, memory_record_outcome_category, run_session,
     },
     transport::{
-        ChatReplier, ChatTransport, ConversationKind, InboundMessage, MAX_INBOUND_TEXT_BYTES,
-        MAX_OUTBOUND_TEXT_BYTES, ReplyTarget, TransportError, TransportIdentity, bound_inbound,
-        bound_outbound,
+        ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
+        DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
+        OutboundReply, ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership,
+        TransportError, TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
     },
 };
 
@@ -52,6 +60,12 @@ const SUBJECT: &str = "tel.16034700182";
 
 fn subject() -> ExternalSubject {
     SUBJECT.parse().expect("canonical subject fixture")
+}
+
+fn generated_image() -> GeneratedImage {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(b"kitty pixels");
+    GeneratedImage::from_png(png).expect("generated PNG fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +131,8 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 
     assert_eq!(resolved.transports.len(), 1);
     assert_eq!(resolved.routes.len(), 1);
+    assert!(resolved.image_generators.is_empty());
+    assert!(resolved.routes[0].image_generator.is_none());
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
     assert_eq!(resolved.routes[0].limits.max_steps, 8);
@@ -128,6 +144,133 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     // route had before conversations existed.
     assert_eq!(resolved.sessions.max_conversations, 1024);
     assert_eq!(resolved.routes[0].conversation, ConversationPolicy::OneShot);
+}
+
+#[tokio::test]
+async fn image_generation_is_named_and_route_opt_in() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["imageGenerators"] = json!([{
+        "name": "openai-images",
+        "kind": "openaiImages",
+        "model": "gpt-image-1",
+        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+        "timeoutMs": 120_000
+    }]);
+    document["routes"][0]["imageGenerator"] = json!("openai-images");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("an explicitly bound image generator resolves");
+
+    assert_eq!(resolved.image_generators.len(), 1);
+    assert_eq!(resolved.image_generators[0].name(), "openai-images");
+    assert_eq!(
+        resolved.routes[0].image_generator.as_deref(),
+        Some("openai-images")
+    );
+    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
+        .expect("the route binds its named generator");
+    assert_eq!(
+        routes
+            .route("dev", &ConversationKind::DirectMessage)
+            .expect("route matches")
+            .image_generator
+            .as_deref(),
+        Some("openai-images")
+    );
+}
+
+#[test]
+fn a_missing_image_model_credential_fails_before_chat_starts() {
+    let variable = "DEKOPOND_TEST_MISSING_IMAGE_KEY_7C83E9";
+    assert!(
+        std::env::var_os(variable).is_none(),
+        "fixture must stay unset"
+    );
+    let configured = [ImageGeneratorConfig::OpenaiImages {
+        name: "pictures".to_owned(),
+        model: "gpt-image-1".to_owned(),
+        api_key_env: variable.to_owned(),
+        timeout_ms: 120_000,
+    }];
+    let referenced = BTreeSet::from(["pictures".to_owned()]);
+    let error = match configured_image_generators(&configured, &referenced) {
+        Err(error) => error,
+        Ok(_) => panic!("a named credential is required at startup"),
+    };
+
+    assert!(matches!(
+        error,
+        ImageGeneratorStartupError::MissingCredential { .. }
+    ));
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("pictures"));
+    assert!(diagnostic.contains(variable));
+
+    let unused = configured_image_generators(&configured, &BTreeSet::new())
+        .expect("an unreferenced generator reads no credential");
+    assert!(unused.is_empty());
+}
+
+#[tokio::test]
+async fn slack_activity_and_experience_are_explicit_and_strict() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({
+        "name": "workspace-slack",
+        "kind": "slackSocketMode",
+        "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
+        "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+        "experience": "agent",
+        "activity": {"mode": "native", "classicFallback": "reaction"}
+    });
+    document["routes"][0]["transport"] = json!("workspace-slack");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("the Agent profile resolves");
+    assert!(matches!(
+        resolved.transports.first(),
+        Some(config::TransportConfig::SlackSocketMode {
+            experience: SlackExperience::Agent,
+            activity: SlackActivityConfig {
+                mode: ActivityMode::Native,
+                classic_fallback: SlackActivityFallback::Reaction,
+            },
+            ..
+        })
+    ));
+
+    document["transports"][0]["activity"]["unexpected"] = json!(true);
+    assert!(
+        load(directory.path(), &document).await.is_err(),
+        "unknown cosmetic settings still fail strict decoding"
+    );
+}
+
+#[tokio::test]
+async fn native_activity_is_off_unless_a_transport_opts_in() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({
+        "name": "community-discord",
+        "kind": "discordGateway",
+        "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN"
+    });
+    document["routes"][0]["transport"] = json!("community-discord");
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("the default remains reply-only");
+    assert!(matches!(
+        resolved.transports.first(),
+        Some(config::TransportConfig::DiscordGateway {
+            activity: NativeActivityConfig {
+                mode: ActivityMode::Off,
+            },
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -185,6 +328,62 @@ async fn invalid_configurations_fail_closed_at_startup() {
             "unknown field inside a model",
             mutate(|document| {
                 document["models"][0]["temperature"] = json!(0.7);
+            }),
+        ),
+        (
+            "unknown field inside an image generator",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 120_000,
+                    "endpoint": "https://attacker.example"
+                }]);
+            }),
+        ),
+        (
+            "duplicate image generator name",
+            mutate(|document| {
+                let generator = json!({
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 120_000
+                });
+                document["imageGenerators"] = json!([generator.clone(), generator]);
+            }),
+        ),
+        (
+            "invalid image credential environment name",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "sk-live-secret-not-a-name",
+                    "timeoutMs": 120_000
+                }]);
+            }),
+        ),
+        (
+            "zero image generator timeout",
+            mutate(|document| {
+                document["imageGenerators"] = json!([{
+                    "name": "pictures",
+                    "kind": "openaiImages",
+                    "model": "gpt-image-1",
+                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+                    "timeoutMs": 0
+                }]);
+            }),
+        ),
+        (
+            "route names an unknown image generator",
+            mutate(|document| {
+                document["routes"][0]["imageGenerator"] = json!("missing");
             }),
         ),
         (
@@ -320,6 +519,31 @@ async fn invalid_configurations_fail_closed_at_startup() {
             "model API key variable that is not a variable name",
             mutate(|document| {
                 document["models"][0]["apiKeyEnv"] = json!("sk-live-not-a-variable");
+            }),
+        ),
+        (
+            "a Slack reaction fallback while activity is off",
+            mutate(|document| {
+                document["transports"][0] = json!({
+                    "name": "dev",
+                    "kind": "slackSocketMode",
+                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
+                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+                    "activity": {"mode": "off", "classicFallback": "reaction"}
+                });
+            }),
+        ),
+        (
+            "classic native Slack activity with no visible fallback",
+            mutate(|document| {
+                document["transports"][0] = json!({
+                    "name": "dev",
+                    "kind": "slackSocketMode",
+                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
+                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+                    "experience": "classic",
+                    "activity": {"mode": "native", "classicFallback": "none"}
+                });
             }),
         ),
         (
@@ -988,6 +1212,54 @@ fn answer(text: &str) -> AssistantTurn {
     }
 }
 
+fn generate_image(prompt: &str) -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "image-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                arguments: json!({"prompt": prompt}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+fn script_call(script: &str) -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "script-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: "bash".to_owned(),
+                arguments: json!({"script": script}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+fn decline_reply() -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "decline-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
 fn inspect_agent_config() -> AssistantTurn {
     AssistantTurn {
         content: None,
@@ -1008,11 +1280,16 @@ fn inspect_agent_config() -> AssistantTurn {
 #[derive(Default)]
 struct RecordingReplier {
     replies: Mutex<Vec<String>>,
+    image_bytes: Mutex<Vec<usize>>,
 }
 
 impl RecordingReplier {
     fn replies(&self) -> Vec<String> {
         self.replies.lock().expect("reply lock").clone()
+    }
+
+    fn image_bytes(&self) -> Vec<usize> {
+        self.image_bytes.lock().expect("image reply lock").clone()
     }
 }
 
@@ -1020,12 +1297,175 @@ impl ChatReplier for RecordingReplier {
     fn reply(
         &self,
         _target: ReplyTarget,
-        text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
-            self.replies.lock().expect("reply lock").push(text);
+            self.replies.lock().expect("reply lock").push(reply.text);
+            if let Some(image) = reply.image {
+                self.image_bytes
+                    .lock()
+                    .expect("image reply lock")
+                    .push(image.bytes().len());
+            }
+            Ok(DeliveryReceipt::new("test-acceptance"))
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingThreadOwnership {
+    claimed: Mutex<Vec<ThreadClaim>>,
+    revoked: Mutex<Vec<ThreadClaim>>,
+}
+
+impl ThreadOwnership for RecordingThreadOwnership {
+    fn claim(&self, claim: ThreadClaim) {
+        self.claimed.lock().expect("claim lock").push(claim);
+    }
+
+    fn revoke(&self, claim: &ThreadClaim) {
+        self.revoked
+            .lock()
+            .expect("revoke lock")
+            .push(claim.clone());
+    }
+}
+
+#[derive(Default)]
+struct RecordingSurface {
+    events: Mutex<Vec<String>>,
+    shown: tokio::sync::Notify,
+    hidden: tokio::sync::Notify,
+}
+
+impl RecordingSurface {
+    fn events(&self) -> Vec<String> {
+        self.events.lock().expect("surface event lock").clone()
+    }
+
+    async fn wait_until_shown(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.shown.notified())
+            .await
+            .expect("activity becomes visible");
+    }
+
+    async fn wait_until_hidden(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.hidden.notified())
+            .await
+            .expect("activity cleanup completes");
+    }
+}
+
+impl ChatActivity for RecordingSurface {
+    fn show(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("surface event lock")
+                .push("show".to_owned());
+            self.shown.notify_one();
             Ok(())
         })
+    }
+
+    fn hide(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("surface event lock")
+                .push("hide".to_owned());
+            self.hidden.notify_one();
+            Ok(())
+        })
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl ChatReplier for RecordingSurface {
+    fn reply(
+        &self,
+        _target: ReplyTarget,
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("surface event lock")
+                .push(format!("reply:{}", reply.text));
+            Ok(DeliveryReceipt::new("recording-surface"))
+        })
+    }
+}
+
+#[derive(Default)]
+struct DelayedSurface {
+    events: Mutex<Vec<&'static str>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    hidden: tokio::sync::Notify,
+}
+
+impl ChatActivity for DelayedSurface {
+    fn show(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("delayed surface events")
+                .push("show-start");
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.events
+                .lock()
+                .expect("delayed surface events")
+                .push("show-finish");
+            Ok(())
+        })
+    }
+
+    fn hide(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("delayed surface events")
+                .push("hide");
+            self.hidden.notify_one();
+            Ok(())
+        })
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl ChatReplier for DelayedSurface {
+    fn reply(
+        &self,
+        _target: ReplyTarget,
+        _reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+        Box::pin(async move {
+            self.events
+                .lock()
+                .expect("delayed surface events")
+                .push("reply");
+            Ok(DeliveryReceipt::new("delayed-surface"))
+        })
+    }
+}
+
+struct PartialDeliveryReplier;
+
+impl ChatReplier for PartialDeliveryReplier {
+    fn reply(
+        &self,
+        _target: ReplyTarget,
+        _reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+        Box::pin(async { Err(TransportError::PartialDelivery) })
     }
 }
 
@@ -1044,6 +1484,35 @@ fn capability(id: &str) -> AvailableCapability {
         }
     }))
     .expect("capability fixture decodes")
+}
+
+fn memory_surface_response() -> ResponseEnvelope {
+    ResponseEnvelope::chat_capabilities(
+        vec![
+            capability("memory.chat.recent"),
+            capability("memory.chat.search"),
+        ],
+        vec!["memory".to_owned()],
+        Some(ChatMemorySurface {
+            max_lookback_turns: 200,
+            prompt_note: "Durable memory is available only on demand.".to_owned(),
+        }),
+    )
+}
+
+fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationResult {
+    serde_json::from_value(json!({
+        "invocation": "record-result-fixture",
+        "decision": {
+            "decisionId": "record-result-decision",
+            "authorizedBy": "broker",
+            "policyRevision": "record-result-policy"
+        },
+        "outcome": outcome,
+        "error": error,
+        "evidence": []
+    }))
+    .expect("record result fixture decodes")
 }
 
 /// Serves a fixed script of broker responses over a private Unix socket.
@@ -1091,6 +1560,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         model_class: Some("reasoning".to_owned()),
         instructions: Some("Answer briefly.".to_owned()),
         model: Arc::new(model),
+        image_generator: None,
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -1137,18 +1607,57 @@ fn model_config() -> ModelConfig {
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
         transport: "dev".to_owned(),
+        transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
         subject: subject(),
         channel: "dev".to_owned(),
         thread: None,
         conversation_id: "dev".to_owned(),
-        message_id: "1".to_owned(),
+        message_id: "0123456789abcdef0123456789abcdef-1-1".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
         conversation: ConversationKind::DirectMessage,
         // Direct messages ignore addressing. Channel tests opt into structured addressing where
         // that is the behavior under test.
         addressed: None,
+        thread_continuation: None,
         reply: ReplyTarget::Local { connection: 1 },
+        activity: None,
+    }
+}
+
+fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
+    ThreadContinuation {
+        claim: ThreadClaim::Slack {
+            team_id: "t0123abc".to_owned(),
+            channel_id: "c0123abc".to_owned(),
+            thread_ts: "1700000000.000001".to_owned(),
+            user_id: "u9xyz".to_owned(),
+        },
+        inherited,
+    }
+}
+
+fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
+    InboundMessage {
+        transport: "scientist-slack".to_owned(),
+        transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
+        subject: "slack.t0123abc.u9xyz"
+            .parse()
+            .expect("Slack subject fixture"),
+        channel: "c0123abc".to_owned(),
+        thread: Some("1700000000.000001".to_owned()),
+        conversation_id: "c0123abc:1700000000.000001".to_owned(),
+        message_id: "1700000000.000002".to_owned(),
+        text: text.to_owned(),
+        assets: Vec::new(),
+        conversation: ConversationKind::Channel("c0123abc".to_owned()),
+        addressed: Some(!inherited),
+        thread_continuation: Some(slack_thread_continuation(inherited)),
+        reply: ReplyTarget::Slack {
+            channel: "c0123abc".to_owned(),
+            thread_ts: Some("1700000000.000001".to_owned()),
+        },
+        activity: None,
     }
 }
 
@@ -1189,6 +1698,10 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
+        image_generators: HashMap::new(),
+        activities: HashMap::new(),
+        thread_ownership: HashMap::new(),
+        active_sessions: Default::default(),
         usage_reports: None,
     })
 }
@@ -1202,11 +1715,15 @@ struct BlockedModel {
     entered_signal: tokio::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     release_signal: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    answer: String,
+    turn: AssistantTurn,
 }
 
 impl BlockedModel {
-    fn new(answer: &str) -> Arc<Self> {
+    fn new(answer_text: &str) -> Arc<Self> {
+        Self::with_turn(answer(answer_text))
+    }
+
+    fn with_turn(turn: AssistantTurn) -> Arc<Self> {
         let (entered, entered_signal) = std::sync::mpsc::channel();
         let (release, release_signal) = std::sync::mpsc::channel();
         Arc::new(Self {
@@ -1214,7 +1731,7 @@ impl BlockedModel {
             entered_signal: tokio::sync::Mutex::new(entered_signal),
             release: Mutex::new(Some(release)),
             release_signal: Mutex::new(Some(release_signal)),
-            answer: answer.to_owned(),
+            turn,
         })
     }
 
@@ -1254,7 +1771,7 @@ impl ChatModel for BlockedHandle {
         if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
             let _ = receiver.recv_timeout(Duration::from_secs(30));
         }
-        Ok(answer(&self.0.answer))
+        Ok(self.0.turn.clone())
     }
 }
 
@@ -1286,11 +1803,802 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     // The gateway asked on the sender's behalf, not its own: the broker sees a subject and an
     // agent, and maps the subject to a principal itself.
     let request = observed.recv().await.expect("stub broker saw one request");
-    let BrokerRequest::CapabilitiesFor { subject, agent } = request.request else {
-        panic!("a session must open an attested leg: {request:?}");
+    let BrokerRequest::CapabilitiesForChat { claim } = request.request else {
+        panic!("a session must open a chat-scoped attested leg: {request:?}");
     };
-    assert_eq!(subject.canonical(), SUBJECT);
-    assert_eq!(agent.as_str(), "reviewer");
+    assert_eq!(claim.subject.canonical(), SUBJECT);
+    assert_eq!(claim.agent.as_str(), "reviewer");
+    assert_eq!(claim.scope.transport.as_str(), "dev");
+}
+
+struct TestImageGenerator;
+
+impl ImageGenerator for TestImageGenerator {
+    fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(b"kitty pixels");
+        GeneratedImage::from_png(png)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_route_generator_yields_an_image_reply() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([
+        generate_image("a cheerful watercolor kitten"),
+        answer("Here is your kitty."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("runner is uniquely owned")
+        .image_generators
+        .insert("openai-images".to_owned(), Arc::new(TestImageGenerator));
+    let mut route = route(model_config());
+    route.image_generator = Some("openai-images".to_owned());
+
+    run_session(
+        runner,
+        route,
+        message("draw me a kitty cat"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["Here is your kitty."]);
+    assert_eq!(replier.image_bytes(), [20]);
+    assert_eq!(models.requests(), 2);
+    assert!(
+        models
+            .tool_names(0)
+            .contains(&IMAGE_GENERATION_TOOL_NAME.to_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Claimed.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("<@u0botbot> help", false);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent claim")
+        .claim
+        .clone();
+
+    run_session(
+        runner,
+        route(model_config()),
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(*ownership.claimed.lock().expect("claim lock"), [expected]);
+    assert!(ownership.revoked.lock().expect("revoke lock").is_empty());
+    assert_eq!(replier.replies(), ["Claimed."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_sender_loses_owned_thread_continuation() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &[])).await;
+    let models = ModelScript::forbidden();
+    let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("anything else?", true);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent continuation")
+        .claim
+        .clone();
+
+    run_session(
+        runner,
+        route(model_config()),
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert!(ownership.claimed.lock().expect("claim lock").is_empty());
+    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
+    assert_eq!(replier.replies(), [UNAUTHORIZED_REPLY]);
+    assert_eq!(models.requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::new([decline_reply()]);
+    let replier = Arc::new(RecordingReplier::default());
+    let activity = Arc::new(RecordingSurface::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .activities
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&activity) as Arc<dyn ChatActivity>,
+        );
+    let route = persistent_route(model_config(), window());
+    let mut message = owned_slack_message("OK, thanks", true);
+    message.activity = Some(ActivityTarget::Slack {
+        channel_id: "c0123abc".to_owned(),
+        thread_ts: "1700000000.000001".to_owned(),
+        message_ts: "1700000000.000002".to_owned(),
+        initiator_user_id: "u9xyz".to_owned(),
+    });
+    let key = ConversationKey::new(
+        &message.transport,
+        &message.conversation_id,
+        &message.subject.canonical(),
+    );
+
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert!(
+        replier.replies().is_empty(),
+        "declining must not call chat.postMessage"
+    );
+    activity.wait_until_hidden().await;
+    assert_eq!(
+        activity.events().last().map(String::as_str),
+        Some("hide"),
+        "declining must return native activity to its inactive state"
+    );
+    assert_eq!(models.requests(), 1);
+    assert!(
+        models
+            .tool_names(0)
+            .iter()
+            .any(|name| name == DECLINE_REPLY_TOOL_NAME)
+    );
+    assert!(
+        models
+            .prompt(0)
+            .iter()
+            .any(|(role, text)| role == "system" && text.contains("last word"))
+    );
+    let remembered = runner.conversations.begin(
+        &key,
+        &granted(&["memory.chat.recent", "memory.chat.search"]),
+        window(),
+        Instant::now(),
+    );
+    assert_eq!(remembered.history.turns().len(), 1);
+    assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
+    assert_eq!(remembered.history.turns()[0].answer(), None);
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("authorization request")
+            .request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "no Slack acceptance means no durable-memory record request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("echo.echo '{}'"), decline_reply()]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut route = persistent_route(model_config(), window());
+    route.limits.max_steps = 2;
+
+    run_session(
+        runner,
+        route,
+        owned_slack_message("maybe do this", true),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), [UNREPORTED_WORK_REPLY]);
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("authorization request")
+            .request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("capability invocation")
+            .request,
+        BrokerRequest::InvokeForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "the warning is not a delivered model answer and must not be durably recorded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_retried() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::error("outcome-unaudited", "do not retry"),
+            // Keep the listener alive for a third exchange. If recording retries, the request is
+            // observed and receives this response instead of merely failing to reconnect after
+            // the fixture exits.
+            ResponseEnvelope::error("outcome-unaudited", "still do not retry"),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("The exact accepted answer.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("the exact sender text"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["The exact accepted answer."]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    let record = observed.recv().await.expect("one record request");
+    let BrokerRequest::RecordDeliveredTurnForChat { turn, attestation } = record.request else {
+        panic!("expected hidden record operation: {record:?}");
+    };
+    assert_eq!(turn.user, "the exact sender text");
+    assert_eq!(turn.assistant, "The exact accepted answer.");
+    assert_eq!(
+        turn.delivery,
+        dekopon_broker_protocol::DeliveryIdentity::Local {
+            transport: "dev".parse().expect("transport"),
+            conversation: "dev".to_owned(),
+            boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            connection: 1,
+            sequence: 1,
+        }
+    );
+    assert_eq!(turn.id, attestation.invocation);
+    assert!(
+        observed.try_recv().is_err(),
+        "outcome-unknown must never trigger a retry"
+    );
+}
+
+#[test]
+fn record_outcomes_have_a_stable_content_free_failure_vocabulary() {
+    for (outcome, error, expected) in [
+        (InvocationOutcome::Succeeded, None, None),
+        (
+            InvocationOutcome::Denied,
+            Some("policy detail sentinel"),
+            Some("denied"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-capacity"),
+            Some("dedup-capacity"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("dedup-conflict"),
+            Some("dedup-conflict"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("memory-corrupt"),
+            Some("memory-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("result-too-large"),
+            Some("result-too-large"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-quota"),
+            Some("storage-quota"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-busy"),
+            Some("storage-busy"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-timeout"),
+            Some("storage-timeout"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-corrupt"),
+            Some("storage-corrupt"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("storage-io"),
+            Some("storage-io"),
+        ),
+        (
+            InvocationOutcome::Failed,
+            Some("untrusted future detail sentinel"),
+            Some("failed"),
+        ),
+    ] {
+        assert_eq!(
+            memory_record_outcome_category(&record_result(outcome, error)),
+            expected
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_retry() {
+    for (outcome, error) in [
+        (InvocationOutcome::Denied, Some("policy-denied")),
+        (InvocationOutcome::Failed, Some("provider-failure")),
+        (InvocationOutcome::Failed, Some("dedup-capacity")),
+        (InvocationOutcome::Failed, Some("dedup-conflict")),
+        (InvocationOutcome::Failed, Some("storage-quota")),
+        (InvocationOutcome::Failed, Some("storage-busy")),
+        (InvocationOutcome::Failed, Some("storage-timeout")),
+        (InvocationOutcome::Failed, Some("storage-corrupt")),
+        (InvocationOutcome::Failed, Some("storage-io")),
+    ] {
+        let directory = temporary();
+        let result = record_result(outcome, error);
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![
+                memory_surface_response(),
+                ResponseEnvelope::invocation(result.clone()),
+                ResponseEnvelope::invocation(result),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([answer("The delivered answer remains delivered.")]);
+        let replier = Arc::new(RecordingReplier::default());
+
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route(model_config()),
+            message("record this once"),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+
+        assert_eq!(
+            replier.replies(),
+            ["The delivered answer remains delivered."]
+        );
+        assert!(matches!(
+            observed.recv().await.expect("surface request").request,
+            BrokerRequest::CapabilitiesForChat { .. }
+        ));
+        assert!(matches!(
+            observed.recv().await.expect("record request").request,
+            BrokerRequest::RecordDeliveredTurnForChat { .. }
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "{outcome:?}/{error:?} unexpectedly retried"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_text() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::scripted([None]);
+    let replier = Arc::new(RecordingReplier::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("the model will fail"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert_eq!(replier.replies(), [FAILURE_REPLY]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "the fixed gateway failure reply must not be recorded"
+    );
+
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::new([answer("one chunk lands and another fails")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("partial delivery"),
+        Arc::new(PartialDeliveryReplier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "partial transport delivery must not be recorded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authorized_work_shows_activity_until_after_the_durable_reply() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let model = BlockedModel::new("All good.");
+    let surface = Arc::new(RecordingSurface::default());
+    let mut runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner)
+        .expect("fixture has one runner owner")
+        .activities
+        .insert(
+            "dev".to_owned(),
+            Arc::clone(&surface) as Arc<dyn ChatActivity>,
+        );
+    let mut inbound = message("how are things?");
+    inbound.activity = Some(ActivityTarget::Discord {
+        channel_id: "200000000000000001".to_owned(),
+    });
+
+    let session = tokio::spawn(run_session(
+        runner,
+        route(model_config()),
+        inbound,
+        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+    ));
+    surface.wait_until_shown().await;
+    model.wait_until_entered().await;
+    model.release();
+    session.await.expect("the session completes");
+    surface.wait_until_hidden().await;
+
+    assert_eq!(surface.events(), ["show", "reply:All good.", "hide"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let model = BlockedModel::new("not delayed");
+    let surface = Arc::new(DelayedSurface::default());
+    let mut runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner)
+        .expect("fixture has one runner owner")
+        .activities
+        .insert(
+            "dev".to_owned(),
+            Arc::clone(&surface) as Arc<dyn ChatActivity>,
+        );
+    let mut inbound = message("do it");
+    inbound.activity = Some(ActivityTarget::Discord {
+        channel_id: "200000000000000001".to_owned(),
+    });
+    let session = tokio::spawn(run_session(
+        runner,
+        route(model_config()),
+        inbound,
+        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), surface.entered.notified())
+        .await
+        .expect("activity call starts");
+    model.wait_until_entered().await;
+    model.release();
+
+    tokio::time::timeout(Duration::from_secs(1), session)
+        .await
+        .expect("cosmetic I/O cannot delay the answer")
+        .expect("session task completes");
+    assert_eq!(
+        surface
+            .events
+            .lock()
+            .expect("delayed surface events")
+            .as_slice(),
+        ["show-start", "reply"]
+    );
+
+    surface.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), surface.hidden.notified())
+        .await
+        .expect("cleanup follows the issued show");
+    assert_eq!(
+        surface
+            .events
+            .lock()
+            .expect("delayed surface events")
+            .as_slice(),
+        ["show-start", "reply", "show-finish", "hide"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_work_never_publishes_activity() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+    )
+    .await;
+    let surface = Arc::new(RecordingSurface::default());
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture has one runner owner")
+        .activities
+        .insert(
+            "dev".to_owned(),
+            Arc::clone(&surface) as Arc<dyn ChatActivity>,
+        );
+    let mut inbound = message("not authorized");
+    inbound.activity = Some(ActivityTarget::Discord {
+        channel_id: "200000000000000001".to_owned(),
+    });
+
+    run_session(
+        runner,
+        route(model_config()),
+        inbound,
+        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(
+        surface.events(),
+        [format!("reply:{UNAUTHORIZED_REPLY}")],
+        "activity begins only after the broker's fresh grant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_recording() {
+    let directory = temporary();
+    let (broker, mut observed) =
+        stub_broker(directory.path(), vec![memory_surface_response()]).await;
+    let model = BlockedModel::new("stale answer");
+    let surface = Arc::new(RecordingSurface::default());
+    let mut runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner)
+        .expect("fixture has one runner owner")
+        .activities
+        .insert(
+            "dev".to_owned(),
+            Arc::clone(&surface) as Arc<dyn ChatActivity>,
+        );
+    let mut inbound = message("stop this");
+    inbound.activity = Some(ActivityTarget::Slack {
+        channel_id: "d0123abc".to_owned(),
+        thread_ts: "1700000000.000001".to_owned(),
+        message_ts: "1700000000.000001".to_owned(),
+        initiator_user_id: "u9xyz".to_owned(),
+    });
+    let route = persistent_route(model_config(), window());
+    let session_runner = Arc::clone(&runner);
+    let session = tokio::spawn(run_session(
+        session_runner,
+        route,
+        inbound,
+        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+    ));
+    surface.wait_until_shown().await;
+    model.wait_until_entered().await;
+
+    let mut controls = tokio::task::JoinSet::new();
+    crate::stop_session(
+        &runner,
+        &mut controls,
+        crate::transport::SessionStop {
+            transport: "dev".to_owned(),
+            conversation_id: "dev".to_owned(),
+            subject: "tel.999".parse().expect("other canonical subject"),
+        },
+    );
+    assert_eq!(
+        controls.len(),
+        0,
+        "another chat user cannot stop the initiator's work"
+    );
+    crate::stop_session(
+        &runner,
+        &mut controls,
+        crate::transport::SessionStop {
+            transport: "dev".to_owned(),
+            conversation_id: "dev".to_owned(),
+            subject: subject(),
+        },
+    );
+    while controls.join_next().await.is_some() {}
+    model.release();
+    session.await.expect("the cancelled session exits");
+    surface.wait_until_hidden().await;
+
+    let events = surface.events();
+    assert!(events.contains(&"show".to_owned()), "{events:?}");
+    assert!(events.contains(&"hide".to_owned()), "{events:?}");
+    assert!(events.contains(&format!("reply:{}", crate::session::STOPPED_REPLY)));
+    assert!(!events.iter().any(|event| event.contains("stale answer")));
+    assert_eq!(
+        runner.conversations.tracked(),
+        0,
+        "a cancelled turn is never committed to persistent history"
+    );
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "a cancelled turn is never durably recorded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::error(
+                "unexpected-invocation",
+                "tool work should have been cancelled",
+            ),
+        ],
+    )
+    .await;
+    let model = BlockedModel::with_turn(AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "late-tool".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: "bash".to_owned(),
+                arguments: json!({"script": "echo.echo '{}'"}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    });
+    let replier = Arc::new(RecordingReplier::default());
+    let session = tokio::spawn(run_session(
+        runner_with(
+            broker,
+            Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+            4,
+        ),
+        route(model_config()),
+        message("cancel during shutdown"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    ));
+    model.wait_until_entered().await;
+    let first = observed
+        .recv()
+        .await
+        .expect("authorization request was sent");
+    assert!(matches!(
+        first.request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+
+    session.abort();
+    assert!(
+        session
+            .await
+            .expect_err("session task is aborted")
+            .is_cancelled(),
+        "the async owner is gone"
+    );
+    model.release();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.recv())
+            .await
+            .is_err(),
+        "the cancellation guard prevents the model's late tool call reaching the broker"
+    );
+    assert!(replier.replies().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1366,7 +2674,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     let request = observed.recv().await.expect("one capability listing");
     assert!(matches!(
         request.request,
-        BrokerRequest::CapabilitiesFor { .. }
+        BrokerRequest::CapabilitiesForChat { .. }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -1451,16 +2759,33 @@ async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
     .await;
     let models = ModelScript::forbidden();
     let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("hello", true);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("owned continuation")
+        .claim
+        .clone();
 
     run_session(
-        runner(broker, Arc::clone(&models), 4),
+        runner,
         route(model_config()),
-        message("hello"),
+        message,
         Arc::clone(&replier) as Arc<dyn ChatReplier>,
     )
     .await;
 
     assert_eq!(replier.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
+    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -1651,8 +2976,8 @@ fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) 
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
         assert!(
-            matches!(request.request, BrokerRequest::CapabilitiesFor { .. }),
-            "every session opens an attested leg: {request:?}"
+            matches!(request.request, BrokerRequest::CapabilitiesForChat { .. }),
+            "every session opens a chat-scoped attested leg: {request:?}"
         );
         count += 1;
     }
@@ -2483,8 +3808,15 @@ impl ChatTransport for FakeTransport {
         Box::pin(async move { Ok(TransportIdentity::default()) })
     }
 
-    fn next(&mut self) -> BoxFuture<'_, Result<InboundMessage, TransportError>> {
-        Box::pin(async move { self.inbound.recv().await.ok_or(TransportError::Closed) })
+    fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
+        Box::pin(async move {
+            self.inbound
+                .recv()
+                .await
+                .map(Box::new)
+                .map(TransportEvent::Message)
+                .ok_or(TransportError::Closed)
+        })
     }
 
     fn replier(&self) -> Arc<dyn ChatReplier> {
@@ -2506,10 +3838,11 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
     sender
         .send(message("first"))
         .expect("fixture accepts a message");
-    assert_eq!(
-        received.recv().await.expect("the reader forwards it").text,
-        "first"
-    );
+    let TransportEvent::Message(received) = received.recv().await.expect("the reader forwards it")
+    else {
+        panic!("the fixture sent a message event");
+    };
+    assert_eq!(received.text, "first");
 
     drop(sender);
     reader.await.expect("the reader ends with its transport");
@@ -2608,6 +3941,57 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Useful follow-up.")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let replier = Arc::new(RecordingReplier::default());
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let repliers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )]);
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut continuation = message("and then?");
+    continuation.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    continuation.addressed = Some(false);
+    continuation.thread_continuation = Some(slack_thread_continuation(true));
+
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        &mut sessions,
+        continuation,
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the owned continuation starts one session"
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.expect("continuation session completes");
+    }
+
+    assert_eq!(models.requests(), 1);
+    assert_eq!(replier.replies(), ["Useful follow-up."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     // The property a route matching every channel must not quietly cost: a route decides *which*
     // agent answers, and the mention decides *whether* anything answers at all. Widening the first
@@ -2676,11 +4060,19 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
 // ---------------------------------------------------------------------------
 
 /// The next routable message from any transport, failing the test rather than hanging on it.
+fn expect_message(event: TransportEvent) -> InboundMessage {
+    let TransportEvent::Message(message) = event else {
+        panic!("expected a message event");
+    };
+    *message
+}
+
 async fn next_message(transport: &mut dyn ChatTransport) -> InboundMessage {
-    tokio::time::timeout(Duration::from_secs(5), transport.next())
+    let event = tokio::time::timeout(Duration::from_secs(5), transport.next())
         .await
         .expect("a message arrives before the test gives up")
-        .expect("a routable message")
+        .expect("a routable event");
+    expect_message(event)
 }
 
 /// A loopback HTTP mock serving Slack's token-only methods.
@@ -2690,12 +4082,17 @@ async fn next_message(transport: &mut dyn ChatTransport) -> InboundMessage {
 struct HttpMock {
     base: String,
     calls: Arc<Mutex<Vec<(String, String)>>>,
+    headers: Arc<Mutex<Vec<String>>>,
 }
 
 impl HttpMock {
     /// Paths and request bodies the transport sent, in order.
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().expect("mock call log").clone()
+    }
+
+    fn headers(&self) -> Vec<String> {
+        self.headers.lock().expect("mock header log").clone()
     }
 }
 
@@ -2712,6 +4109,8 @@ where
     let listener = tokio::net::TcpListener::from_std(listener).expect("mock endpoint adopts");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let recorded_headers = Arc::clone(&headers);
     tokio::spawn(async move {
         let handler = Arc::new(handler);
         loop {
@@ -2720,15 +4119,20 @@ where
             };
             let handler = Arc::clone(&handler);
             let recorded = Arc::clone(&recorded);
+            let recorded_headers = Arc::clone(&recorded_headers);
             tokio::spawn(async move {
                 let mut stream = stream;
-                let Some((path, body)) = read_http_request(&mut stream).await else {
+                let Some((path, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
                 recorded
                     .lock()
                     .expect("mock call log")
                     .push((path.clone(), body.clone()));
+                recorded_headers
+                    .lock()
+                    .expect("mock header log")
+                    .push(headers);
                 let response = handler(&path, &body);
                 let encoded = serde_json::to_vec(&response).expect("mock response serializes");
                 let headers = format!(
@@ -2746,6 +4150,7 @@ where
     HttpMock {
         base: format!("http://{address}"),
         calls,
+        headers,
     }
 }
 
@@ -2813,12 +4218,6 @@ where
     }
 }
 
-/// Reads one complete HTTP request, returning its path (with query) and body.
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
-    let (path, _headers, body) = read_http_request_parts(stream).await?;
-    Some((path, body))
-}
-
 /// The same request with raw headers retained for credential-boundary assertions.
 async fn read_http_request_parts(
     stream: &mut tokio::net::TcpStream,
@@ -2859,7 +4258,9 @@ async fn read_http_request_parts(
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
-    let body = String::from_utf8(bytes[header_end..].to_vec()).ok()?;
+    // Multipart image bodies contain arbitrary bytes. Lossy rendering preserves every ASCII
+    // boundary/header/JSON field tests assert on while still letting the mock answer a PNG upload.
+    let body = String::from_utf8_lossy(&bytes[header_end..]).into_owned();
     Some((path, headers, body))
 }
 
@@ -2951,13 +4352,33 @@ fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) ->
     event
 }
 
+fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
+    let mut event = channel_message(user, ts, thread_ts, text);
+    event["type"] = json!("app_mention");
+    event
+}
+
 /// One Slack transport pointed at loopback mocks.
 fn slack(endpoint: &str) -> crate::transport::slack::SlackTransport {
+    slack_with(
+        endpoint,
+        SlackExperience::Classic,
+        SlackActivityConfig::default(),
+    )
+}
+
+fn slack_with(
+    endpoint: &str,
+    experience: SlackExperience,
+    activity: SlackActivityConfig,
+) -> crate::transport::slack::SlackTransport {
     crate::transport::slack::SlackTransport::new(
         "scientist-slack".to_owned(),
         endpoint.to_owned(),
         "xapp-test-app-token".to_owned(),
         "xoxb-test-bot-token".to_owned(),
+        experience,
+        activity,
     )
     .expect("slack transport builds")
 }
@@ -3003,10 +4424,12 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     .await;
     let model = BlockedModel::new("All good.");
     let replier = transport.replier();
-    let message = transport
-        .next()
-        .await
-        .expect("one routable message arrives");
+    let message = expect_message(
+        transport
+            .next()
+            .await
+            .expect("one routable message arrives"),
+    );
 
     let session = tokio::spawn(run_session(
         runner_with(
@@ -3055,7 +4478,7 @@ async fn a_redelivered_slack_envelope_is_routed_once() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let first = transport.next().await.expect("the first delivery routes");
+    let first = expect_message(transport.next().await.expect("the first delivery routes"));
     assert_eq!(first.text, "hello");
     assert!(
         tokio::time::timeout(Duration::from_millis(300), transport.next())
@@ -3080,10 +4503,12 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let message = tokio::time::timeout(Duration::from_secs(10), transport.next())
-        .await
-        .expect("the transport reconnects on its own")
-        .expect("a message arrives on the second socket");
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the transport reconnects on its own")
+            .expect("a message arrives on the second socket"),
+    );
     assert_eq!(message.text, "after reconnect");
     assert_eq!(
         http.calls()
@@ -3125,10 +4550,12 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let message = tokio::time::timeout(Duration::from_secs(5), transport.next())
-        .await
-        .expect("the third envelope routes")
-        .expect("a routable message");
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(5), transport.next())
+            .await
+            .expect("the third envelope routes")
+            .expect("a routable message"),
+    );
     assert_eq!(message.text, "a real question");
     assert_eq!(message.subject.canonical(), "slack.t0123abc.u9xyz");
 }
@@ -3421,6 +4848,402 @@ async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_agent_continues_only_an_exact_claimed_sender_thread() {
+    let root = "1700000000.000001";
+    let socket = spawn_socket_mock(vec![
+        // Channel-history scopes deliver this ambient top-level message. It must disappear inside
+        // the transport before routing, authorization, telemetry payloads, or a model.
+        events_envelope(
+            "envelope-ambient",
+            channel_message("u9xyz", "1700000000.000000", None, "ambient"),
+        ),
+        events_envelope(
+            "envelope-opening",
+            app_mention("u9xyz", root, None, "<@u0botbot> start here"),
+        ),
+        events_envelope(
+            "envelope-owned",
+            channel_message("u9xyz", "1700000000.000002", Some(root), "and then?"),
+        ),
+        events_envelope(
+            "envelope-revoked",
+            channel_message("u9xyz", "1700000000.000003", Some(root), "still there?"),
+        ),
+        events_envelope(
+            "envelope-other-user",
+            channel_message("u8other", "1700000000.000004", Some(root), "I am chatting"),
+        ),
+        events_envelope(
+            "envelope-other-thread",
+            channel_message(
+                "u9xyz",
+                "1700000000.000005",
+                Some("1699999999.000009"),
+                "another thread",
+            ),
+        ),
+        events_envelope(
+            "envelope-explicit",
+            app_mention(
+                "u9xyz",
+                "1700000000.000006",
+                Some(root),
+                "<@u0botbot> explicit again",
+            ),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Agent,
+        SlackActivityConfig::default(),
+    );
+    transport.connect().await.expect("Slack Agent connects");
+
+    let opening = next_message(&mut transport).await;
+    let opening_continuation = opening
+        .thread_continuation
+        .expect("an explicit Agent channel message proposes a claim");
+    assert!(!opening_continuation.inherited);
+    assert_eq!(opening.addressed, Some(true));
+
+    let ownership = transport
+        .thread_ownership()
+        .expect("Agent transport owns a bounded thread registry");
+    ownership.claim(opening_continuation.claim.clone());
+    let inherited = next_message(&mut transport).await;
+    assert_eq!(inherited.text, "and then?");
+    assert_eq!(inherited.addressed, Some(false));
+    assert!(
+        inherited
+            .thread_continuation
+            .as_ref()
+            .is_some_and(|continuation| continuation.inherited)
+    );
+
+    ownership.revoke(&opening_continuation.claim);
+    let explicit = next_message(&mut transport).await;
+    assert_eq!(explicit.text, "<@u0botbot> explicit again");
+    assert_eq!(explicit.addressed, Some(true));
+    assert!(
+        explicit
+            .thread_continuation
+            .as_ref()
+            .is_some_and(|continuation| !continuation.inherited)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states() {
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        direct_message("u9xyz", "1700000000.000001", "handle this"),
+    )]);
+    let socket_url = socket.url.clone();
+    let http = spawn_http_mock(move |path, _body| match path {
+        "/api/auth.test" => json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}),
+        "/api/apps.connections.open" => json!({"ok": true, "url": socket_url.clone()}),
+        "/api/agents.sessions.setStatus" => json!({"ok": true, "status": "processing"}),
+        _ => json!({"ok": false, "error": "unknown_method"}),
+    });
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Agent,
+        SlackActivityConfig {
+            mode: ActivityMode::Native,
+            classic_fallback: SlackActivityFallback::Reaction,
+        },
+    );
+    transport.connect().await.expect("Slack Agent connects");
+    let message = next_message(&mut transport).await;
+
+    assert_eq!(message.thread.as_deref(), Some("1700000000.000001"));
+    assert_eq!(message.conversation_id, "d0123abc:1700000000.000001");
+    assert_eq!(
+        message.reply,
+        ReplyTarget::Slack {
+            channel: "d0123abc".to_owned(),
+            thread_ts: Some("1700000000.000001".to_owned()),
+        }
+    );
+    let target = message.activity.expect("Agent activity target");
+    let activity = transport.activity().expect("native activity is configured");
+    activity
+        .show(target.clone())
+        .await
+        .expect("processing status succeeds");
+    activity.hide(target).await.expect("active status succeeds");
+
+    let status_calls = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/agents.sessions.setStatus")
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).expect("status body is JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(status_calls.len(), 2);
+    assert_eq!(status_calls[0]["status"], "processing");
+    assert_eq!(status_calls[0]["channel_id"], "d0123abc");
+    assert_eq!(status_calls[0]["thread_ts"], "1700000000.000001");
+    assert_eq!(status_calls[0]["initiator_user_id"], "u9xyz");
+    assert_eq!(status_calls[1]["status"], "active");
+    assert!(status_calls[1].get("initiator_user_id").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() {
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "envelope-1",
+            direct_message("u9xyz", "1700000000.000001", "first"),
+        ),
+        events_envelope(
+            "envelope-2",
+            direct_message("u9xyz", "1700000000.000002", "second"),
+        ),
+    ]);
+    let socket_url = socket.url.clone();
+    let http = spawn_http_mock(move |path, _body| match path {
+        "/api/auth.test" => json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}),
+        "/api/apps.connections.open" => json!({"ok": true, "url": socket_url.clone()}),
+        "/api/agents.sessions.setStatus" => json!({"ok": false, "error": "feature_disabled"}),
+        "/api/reactions.add" | "/api/reactions.remove" => json!({"ok": true}),
+        _ => json!({"ok": false, "error": "unknown_method"}),
+    });
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Agent,
+        SlackActivityConfig {
+            mode: ActivityMode::Native,
+            classic_fallback: SlackActivityFallback::Reaction,
+        },
+    );
+    transport.connect().await.expect("Slack connects");
+    let activity = transport.activity().expect("activity configured");
+
+    for _ in 0..2 {
+        let target = next_message(&mut transport)
+            .await
+            .activity
+            .expect("activity target");
+        activity
+            .show(target.clone())
+            .await
+            .expect("reaction fallback succeeds");
+        activity
+            .hide(target)
+            .await
+            .expect("owned reaction is removed");
+    }
+
+    let calls = http.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(path, _)| path == "/api/agents.sessions.setStatus")
+            .count(),
+        1,
+        "feature_disabled trips one installation-wide breaker"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(path, _)| path == "/api/reactions.add")
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(path, _)| path == "/api/reactions.remove")
+            .count(),
+        2
+    );
+    for (_, body) in calls
+        .iter()
+        .filter(|(path, _)| path.starts_with("/api/reactions."))
+    {
+        let body = serde_json::from_str::<Value>(body).expect("reaction body is JSON");
+        assert_eq!(body["name"], "tangerine");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_does_not_remove_a_reaction_this_generation_did_not_add() {
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        direct_message("u9xyz", "1700000000.000001", "already marked"),
+    )]);
+    let socket_url = socket.url.clone();
+    let http = spawn_http_mock(move |path, _body| match path {
+        "/api/auth.test" => json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}),
+        "/api/apps.connections.open" => json!({"ok": true, "url": socket_url.clone()}),
+        "/api/reactions.add" => json!({"ok": false, "error": "already_reacted"}),
+        "/api/reactions.remove" => json!({"ok": true}),
+        _ => json!({"ok": false, "error": "unknown_method"}),
+    });
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Classic,
+        SlackActivityConfig {
+            mode: ActivityMode::Native,
+            classic_fallback: SlackActivityFallback::Reaction,
+        },
+    );
+    transport.connect().await.expect("classic Slack connects");
+    let target = next_message(&mut transport)
+        .await
+        .activity
+        .expect("reaction target");
+    let activity = transport.activity().expect("fallback configured");
+    activity
+        .show(target.clone())
+        .await
+        .expect("a pre-existing bot reaction is already visible");
+    activity.hide(target).await.expect("cleanup is a no-op");
+
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/reactions.remove")
+            .count(),
+        0,
+        "cleanup ownership comes only from a successful add"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-1",
+        direct_message("u9xyz", "1700000000.000001", "ambiguous add"),
+    )]);
+    let socket_url = socket.url.clone();
+    let http = spawn_raw_http_mock(move |path| match path {
+        "/api/auth.test" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}))
+                .expect("auth response serializes"),
+        ),
+        "/api/apps.connections.open" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({"ok": true, "url": socket_url.clone()}))
+                .expect("socket response serializes"),
+        ),
+        // The service may have accepted the add even though the response was lost/malformed. The
+        // only safe ownership rule is to leave the possible marker rather than remove old state.
+        "/api/reactions.add" => (200, "application/json", b"not-json".to_vec()),
+        "/api/reactions.remove" => (200, "application/json", br#"{"ok":true}"#.to_vec()),
+        _ => (404, "application/json", br#"{"ok":false}"#.to_vec()),
+    });
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Classic,
+        SlackActivityConfig {
+            mode: ActivityMode::Native,
+            classic_fallback: SlackActivityFallback::Reaction,
+        },
+    );
+    transport.connect().await.expect("classic Slack connects");
+    let target = next_message(&mut transport)
+        .await
+        .activity
+        .expect("reaction target");
+    let activity = transport.activity().expect("fallback configured");
+    assert!(activity.show(target.clone()).await.is_err());
+    activity
+        .hide(target)
+        .await
+        .expect("there is nothing owned to clear");
+
+    assert!(
+        !http
+            .calls()
+            .iter()
+            .any(|(path, _)| path == "/api/reactions.remove"),
+        "an ambiguous add response cannot authorize removal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_prompts() {
+    let mut socket = spawn_socket_mock(vec![
+        events_envelope(
+            "stop-envelope",
+            json!({
+                "type": "agent_session_stopped",
+                "channel": "d0123abc",
+                "thread_ts": "1700000000.000001",
+                "message_ts": "1700000000.000002",
+                "user": "u9xyz"
+            }),
+        ),
+        events_envelope(
+            "stop-envelope-alias",
+            json!({
+                "type": "agent_session_stopped",
+                "channel_id": "d0123abc",
+                "thread_ts": "1700000000.000003",
+                "message_ts": "1700000000.000004",
+                "user_id": "u9xyz"
+            }),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Agent,
+        SlackActivityConfig::default(),
+    );
+    transport.connect().await.expect("Slack Agent connects");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), transport.next())
+        .await
+        .expect("control event arrives")
+        .expect("control event decodes");
+    assert_eq!(
+        event,
+        TransportEvent::SessionStopped(crate::transport::SessionStop {
+            transport: "scientist-slack".to_owned(),
+            conversation_id: "d0123abc:1700000000.000001".to_owned(),
+            subject: "slack.t0123abc.u9xyz"
+                .parse()
+                .expect("canonical Slack subject"),
+        })
+    );
+    let alias = tokio::time::timeout(Duration::from_secs(5), transport.next())
+        .await
+        .expect("aliased control event arrives")
+        .expect("aliased control event decodes");
+    assert_eq!(
+        alias,
+        TransportEvent::SessionStopped(crate::transport::SessionStop {
+            transport: "scientist-slack".to_owned(),
+            conversation_id: "d0123abc:1700000000.000003".to_owned(),
+            subject: "slack.t0123abc.u9xyz"
+                .parse()
+                .expect("canonical Slack subject"),
+        })
+    );
+
+    let mut acknowledged = Vec::new();
+    for _ in 0..2 {
+        let ack = tokio::time::timeout(Duration::from_secs(5), socket.acks.recv())
+            .await
+            .expect("Stop envelope was acknowledged")
+            .expect("mock received the ack");
+        acknowledged.push(
+            serde_json::from_str::<Value>(&ack).expect("ack is JSON")["envelope_id"]
+                .as_str()
+                .expect("ack id")
+                .to_owned(),
+        );
+    }
+    assert_eq!(acknowledged, ["stop-envelope", "stop-envelope-alias"]);
+}
+
 // ---------------------------------------------------------------------------
 // Slack markdown rendering
 // ---------------------------------------------------------------------------
@@ -3474,6 +5297,133 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     // The fallback a push notification shows, which is the one place blocks do not render.
     assert_eq!(body["text"], answer_text);
     assert_eq!(body["channel"], "d0123abc");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload_url() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let response_base = Arc::clone(&base);
+    let api = spawn_http_mock(move |path, _body| match path {
+        "/api/files.getUploadURLExternal" => json!({
+            "ok": true,
+            "upload_url": format!("{}/upload", response_base.lock().expect("base lock")),
+            "file_id": "f-generated"
+        }),
+        "/upload" => json!({"uploaded": true}),
+        "/api/files.completeUploadExternal" => {
+            json!({"ok": true, "files": [{"id": "f-generated"}]})
+        }
+        other => panic!("unexpected Slack image call: {other}"),
+    });
+    *base.lock().expect("base lock") = api.base.clone();
+    let replier = slack(&api.base).replier();
+
+    let receipt = replier
+        .reply(
+            ReplyTarget::Slack {
+                channel: "d0123abc".to_owned(),
+                thread_ts: Some("1712345678.000100".to_owned()),
+            },
+            OutboundReply::with_image("Here is your kitty.", generated_image()),
+        )
+        .await
+        .expect("the complete file share is accepted");
+    assert!(receipt.accepted());
+
+    let calls = api.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[0].1.contains("filename=generated-image.png"));
+    assert!(calls[0].1.contains("length=20"));
+    assert!(calls[1].1.contains("kitty pixels"));
+    let completed: Value = serde_json::from_str(&calls[2].1).expect("completion JSON");
+    assert_eq!(completed["channel_id"], "d0123abc");
+    assert_eq!(completed["thread_ts"], "1712345678.000100");
+    assert_eq!(completed["initial_comment"], "Here is your kitty.");
+    let headers = api.headers();
+    assert_eq!(headers.len(), 3);
+    assert!(
+        !headers[1].to_ascii_lowercase().contains("authorization:"),
+        "the service-selected upload URL must never receive the bot token"
+    );
+}
+
+#[test]
+fn slack_generated_upload_urls_are_origin_bounded() {
+    use crate::transport::slack::is_slack_upload_url;
+
+    assert!(is_slack_upload_url(
+        "https://files.slack.com/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(!is_slack_upload_url(
+        "https://files.slack.com.evil.test/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(!is_slack_upload_url(
+        "https://files.slack.com@evil.test/upload/v1/abc",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(is_slack_upload_url(
+        "http://127.0.0.1:9000/upload",
+        "http://127.0.0.1:9000"
+    ));
+    assert!(!is_slack_upload_url(
+        "http://127.0.0.1:9001/upload",
+        "http://127.0.0.1:9000"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses() {
+    let slack_http = spawn_raw_http_mock(|_| {
+        (
+            500,
+            "application/json",
+            br#"{"ok":true,"channel":"d0123abc","ts":"1712345678.000100"}"#.to_vec(),
+        )
+    });
+    let slack = slack(&slack_http.base).replier();
+    assert!(
+        slack
+            .reply(
+                ReplyTarget::Slack {
+                    channel: "d0123abc".to_owned(),
+                    thread_ts: None,
+                },
+                OutboundReply::text("answer"),
+            )
+            .await
+            .is_err()
+    );
+
+    let telegram_http = spawn_raw_http_mock(|_| {
+        (
+            500,
+            "application/json",
+            br#"{"ok":true,"result":{"message_id":7,"chat":{"id":42}}}"#.to_vec(),
+        )
+    });
+    let telegram = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        telegram_http.base,
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport")
+    .replier();
+    assert!(
+        telegram
+            .reply(
+                ReplyTarget::Telegram {
+                    chat_id: 42,
+                    reply_to: None,
+                    message_thread_id: None,
+                },
+                OutboundReply::text("answer"),
+            )
+            .await
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3894,7 +5844,10 @@ fn discord_handler(gateway_url: String) -> impl Fn(&str, &str) -> Value + Send +
                 "max_concurrency": 1
             }
         }),
-        path if path.starts_with("/api/v10/channels/") => json!({"id": "444444444444444444"}),
+        path if path.starts_with("/api/v10/channels/") => json!({
+            "id": "444444444444444444",
+            "channel_id": DISCORD_CHANNEL,
+        }),
         _ => json!({"code": 10002, "message": "Unknown Application"}),
     }
 }
@@ -3904,6 +5857,7 @@ fn discord(endpoint: &str) -> crate::transport::discord::DiscordTransport {
         "community-discord".to_owned(),
         endpoint.to_owned(),
         "discord-test-bot-token".to_owned(),
+        ActivityMode::Off,
     )
     .expect("Discord transport builds")
 }
@@ -4009,7 +5963,7 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
 
     transport
         .replier()
-        .reply(message.reply, "@everyone **done**".to_owned())
+        .reply(message.reply, OutboundReply::text("@everyone **done**"))
         .await
         .expect("Discord answer posts");
     let posted = http
@@ -4023,6 +5977,93 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
     assert_eq!(body["allowed_mentions"]["replied_user"], false);
     assert_eq!(body["message_reference"]["message_id"], DISCORD_MESSAGE);
     assert_eq!(body["message_reference"]["fail_if_not_exists"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let http = spawn_http_mock(move |path, _body| {
+        assert_eq!(path, "/api/v10/channels/222222222222222222/messages");
+        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+            json!({
+                "id": "444444444444444444",
+                "channel_id": DISCORD_CHANNEL,
+                "attachments": [{
+                    "id": "555555555555555555",
+                    "filename": "generated-image.png"
+                }]
+            })
+        } else {
+            // A long answer needs a second text-only message. Failing after the image-bearing first
+            // post must be reported as partial rather than as no delivery.
+            json!({})
+        }
+    });
+    let transport = discord(&http.base);
+
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: Some(DISCORD_MESSAGE.to_owned()),
+            },
+            OutboundReply::with_image("x".repeat(3_000), generated_image()),
+        )
+        .await
+        .expect_err("the second chunk fails after the image was accepted");
+    assert!(matches!(error, TransportError::PartialDelivery));
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 2);
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"payload_json\""));
+    assert!(multipart.contains("name=\"files[0]\""));
+    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("kitty pixels"));
+    assert!(multipart.contains("\"attachments\""));
+    assert!(multipart.contains(DISCORD_MESSAGE));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_native_activity_triggers_typing_on_the_authenticated_channel() {
+    let event = discord_message(
+        "300000000000000099",
+        "200000000000000099",
+        None,
+        DISCORD_USER,
+        false,
+        "please wait",
+    );
+    let socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = crate::transport::discord::DiscordTransport::new(
+        "community-discord".to_owned(),
+        http.base.clone(),
+        "discord-test-bot-token".to_owned(),
+        ActivityMode::Native,
+    )
+    .expect("Discord transport builds");
+    transport.connect().await.expect("Discord connects");
+    let message = next_message(&mut transport).await;
+    assert_eq!(
+        message.activity.as_ref(),
+        Some(&ActivityTarget::Discord {
+            channel_id: "200000000000000099".to_owned(),
+        })
+    );
+
+    transport
+        .activity()
+        .expect("native activity configured")
+        .show(message.activity.expect("activity target"))
+        .await
+        .expect("typing request succeeds");
+    assert!(http.calls().iter().any(|(path, body)| {
+        path == "/api/v10/channels/200000000000000099/typing" && body.is_empty()
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4055,7 +6096,15 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
                     br#"{"retry_after":0.001,"global":false}"#.to_vec(),
                 )
             } else {
-                (200, "application/json", b"{}".to_vec())
+                (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "id": "444444444444444444",
+                        "channel_id": DISCORD_CHANNEL,
+                    }))
+                    .expect("Discord response serializes"),
+                )
             }
         }
         _ => (404, "application/json", b"{}".to_vec()),
@@ -4070,10 +6119,47 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
-            "after a short rate limit".to_owned(),
+            OutboundReply::text("after a short rate limit"),
         )
         .await
         .expect("the bounded retry succeeds");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_failure_after_one_accepted_chunk_is_partial_delivery() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let http = spawn_raw_http_mock(move |path| {
+        if path == "/api/v10/channels/222222222222222222/messages" {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                return (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "id": "444444444444444444",
+                        "channel_id": DISCORD_CHANNEL,
+                    }))
+                    .expect("response serializes"),
+                );
+            }
+            return (500, "application/json", br#"{"code":500}"#.to_vec());
+        }
+        (404, "application/json", br#"{"code":404}"#.to_vec())
+    });
+    let transport = discord(&http.base);
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: None,
+            },
+            OutboundReply::text("x".repeat(3_000)),
+        )
+        .await
+        .expect_err("the second chunk fails after the first was accepted");
+    assert!(matches!(error, TransportError::PartialDelivery));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -4236,10 +6322,12 @@ async fn discord_reconnects_when_a_heartbeat_is_not_acknowledged() {
     let mut transport = discord(&http.base);
     transport.connect().await.expect("Discord connects");
 
-    let message = tokio::time::timeout(Duration::from_secs(10), transport.next())
-        .await
-        .expect("the heartbeat watchdog reconnects")
-        .expect("a message arrives on the resumed socket");
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the heartbeat watchdog reconnects")
+            .expect("a message arrives on the resumed socket"),
+    );
     assert_eq!(message.text, "the heartbeat watchdog recovered");
 
     let mut first_ops = Vec::new();
@@ -4307,10 +6395,12 @@ async fn discord_reconnects_with_resume_before_delivering_more_messages() {
     let mut transport = discord(&http.base);
     transport.connect().await.expect("Discord connects");
 
-    let message = tokio::time::timeout(Duration::from_secs(10), transport.next())
-        .await
-        .expect("the transport resumes before the test gives up")
-        .expect("a message arrives after resume");
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the transport resumes before the test gives up")
+            .expect("a message arrives after resume"),
+    );
     assert_eq!(message.text, "after resume");
 
     let resume = tokio::time::timeout(Duration::from_secs(5), second.sent.recv())
@@ -4368,6 +6458,7 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
         "tg".to_owned(),
         http.base.clone(),
         "12345:test-token".to_owned(),
+        ActivityMode::Off,
     )
     .expect("telegram transport builds");
     let identity = transport
@@ -4376,10 +6467,12 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
         .expect("telegram transport connects");
     assert_eq!(identity.handle.as_deref(), Some("dekopon_bot"));
 
-    let message = tokio::time::timeout(Duration::from_secs(5), transport.next())
-        .await
-        .expect("one update routes")
-        .expect("a routable message");
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(5), transport.next())
+            .await
+            .expect("one update routes")
+            .expect("a routable message"),
+    );
     assert_eq!(message.text, "a person asked this");
     assert_eq!(message.subject.canonical(), "telegram.16034700182");
 
@@ -4430,6 +6523,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
         "tg".to_owned(),
         http.base.clone(),
         "12345:test-token".to_owned(),
+        ActivityMode::Off,
     )
     .expect("telegram transport builds");
     transport.connect().await.expect("telegram connects");
@@ -4480,6 +6574,7 @@ async fn a_telegram_document_keeps_its_own_name_and_media_type() {
         "tg".to_owned(),
         http.base.clone(),
         "12345:test-token".to_owned(),
+        ActivityMode::Off,
     )
     .expect("telegram transport builds");
     transport.connect().await.expect("telegram connects");
@@ -4540,6 +6635,90 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [{
+                "update_id": 350,
+                "message": {
+                    "message_id": 11,
+                    "message_thread_id": 99,
+                    "from": {"id": 16034700182_i64, "is_bot": false},
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "text": "topic work"
+                }
+            }]});
+        }
+        if path.contains("sendChatAction") {
+            return json!({"ok": true, "result": true});
+        }
+        if path.contains("sendMessage") {
+            return json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "message_thread_id": 99,
+                    "chat": {"id": -1001}
+                }
+            });
+        }
+        json!({"ok": true, "result": []})
+    });
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Native,
+    )
+    .expect("Telegram transport builds");
+    transport.connect().await.expect("Telegram connects");
+    let message = next_message(&mut transport).await;
+
+    assert_eq!(message.thread.as_deref(), Some("99"));
+    assert_eq!(message.conversation_id, "-1001:topic:99");
+    assert_eq!(
+        message.reply.clone(),
+        ReplyTarget::Telegram {
+            chat_id: -1001,
+            reply_to: Some(11),
+            message_thread_id: Some(99),
+        }
+    );
+    let target = message.activity.clone().expect("topic activity target");
+    transport
+        .activity()
+        .expect("native activity configured")
+        .show(target)
+        .await
+        .expect("chat action succeeds");
+    transport
+        .replier()
+        .reply(message.reply, OutboundReply::text("done"))
+        .await
+        .expect("topic reply succeeds");
+
+    let calls = http.calls();
+    let action = calls
+        .iter()
+        .find(|(path, _)| path.contains("sendChatAction"))
+        .expect("typing action was sent");
+    let action = serde_json::from_str::<Value>(&action.1).expect("action body is JSON");
+    assert_eq!(action["action"], "typing");
+    assert_eq!(action["chat_id"], -1001);
+    assert_eq!(action["message_thread_id"], 99);
+    let reply = calls
+        .iter()
+        .find(|(path, _)| path.contains("sendMessage"))
+        .expect("reply was sent");
+    let reply = serde_json::from_str::<Value>(&reply.1).expect("reply body is JSON");
+    assert_eq!(reply["message_thread_id"], 99);
+    assert_eq!(reply["reply_to_message_id"], 11);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
     // chat: consecutive messages continue one exchange, and a group is not the private chat.
@@ -4561,6 +6740,7 @@ async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
         "tg".to_owned(),
         http.base.clone(),
         "12345:test-token".to_owned(),
+        ActivityMode::Off,
     )
     .expect("telegram transport builds");
     transport
@@ -4579,6 +6759,218 @@ async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     );
     assert_eq!(group.conversation_id, "-1001");
     assert_ne!(first.conversation_id, group.conversation_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("getUpdates") && path.contains("offset=0") {
+            let mut message = telegram_chat_message(
+                -1001,
+                "supergroup",
+                16034700182_i64,
+                false,
+                3,
+                "topic question",
+            );
+            message["message_thread_id"] = json!(77);
+            return json!({"ok": true, "result": [{"update_id": 500, "message": message}]});
+        }
+        if path.contains("sendMessage") {
+            return json!({
+                "ok": true,
+                "result": {
+                    "message_id": 4,
+                    "message_thread_id": 77,
+                    "chat": {"id": -1001, "type": "supergroup"}
+                }
+            });
+        }
+        json!({"ok": true, "result": []})
+    });
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("telegram connects");
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.conversation_id, "-1001:topic:77");
+    assert_eq!(message.thread.as_deref(), Some("77"));
+    transport
+        .replier()
+        .reply(message.reply, OutboundReply::text("inside topic"))
+        .await
+        .expect("topic reply is accepted");
+    let body = http
+        .calls()
+        .into_iter()
+        .find_map(|(path, body)| path.contains("sendMessage").then_some(body))
+        .expect("sendMessage request");
+    let body: Value = serde_json::from_str(&body).expect("request JSON");
+    assert_eq!(body["chat_id"], -1001);
+    assert_eq!(body["message_thread_id"], 77);
+    assert_eq!(body["reply_to_message_id"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() {
+    let http = spawn_http_mock(|path, _body| {
+        assert!(path.contains("sendPhoto"));
+        json!({
+            "ok": true,
+            "result": {
+                "message_id": 12,
+                "message_thread_id": 77,
+                "chat": {"id": -1001},
+                "photo": [{"file_id": "photo-small"}, {"file_id": "photo-large"}]
+            }
+        })
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: Some(3),
+                message_thread_id: Some(77),
+            },
+            OutboundReply::with_image("Here is your kitty.", generated_image()),
+        )
+        .await
+        .expect("photo and caption are accepted together");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 1);
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"photo\""));
+    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("kitty pixels"));
+    assert!(multipart.contains("Here is your kitty."));
+    assert!(multipart.contains("name=\"reply_parameters\""));
+    assert!(multipart.contains("\"message_id\":3"));
+    assert!(multipart.contains("-1001"));
+    assert!(multipart.contains("77"));
+    assert!(multipart.contains("3"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_splits_long_generated_image_text_without_losing_it() {
+    let message_ids = Arc::new(AtomicUsize::new(20));
+    let next_id = Arc::clone(&message_ids);
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("sendPhoto") {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "chat": {"id": 42},
+                    "photo": [{"file_id": "photo"}]
+                }
+            })
+        } else {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": next_id.fetch_add(1, Ordering::SeqCst),
+                    "chat": {"id": 42}
+                }
+            })
+        }
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+    let text = format!("{}\n{}", "a".repeat(4_000), "b".repeat(1_000));
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: Some(3),
+                message_thread_id: None,
+            },
+            OutboundReply::with_image(text.clone(), generated_image()),
+        )
+        .await
+        .expect("photo and every bounded text chunk are accepted");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 3, "one photo plus two text chunks");
+    let delivered = calls[1..]
+        .iter()
+        .map(|(_, body)| {
+            serde_json::from_str::<Value>(body).expect("text request JSON")["text"]
+                .as_str()
+                .expect("text field")
+                .to_owned()
+        })
+        .collect::<String>();
+    assert_eq!(delivered, text);
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|(_, body)| !body.contains("reply_to_message_id")),
+        "the photo already owns the inbound reply reference"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_photo() {
+    let http = spawn_http_mock(|path, _body| {
+        if path.contains("sendPhoto") {
+            json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "chat": {"id": 42},
+                    "photo": [{"file_id": "photo"}]
+                }
+            })
+        } else {
+            json!({"ok": false, "description": "message rejected"})
+        }
+    });
+    let transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("Telegram transport builds");
+
+    let error = transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_image("x".repeat(1_025), generated_image()),
+        )
+        .await
+        .expect_err("the photo succeeded before the text failed");
+    assert!(matches!(error, TransportError::PartialDelivery));
+    assert_eq!(http.calls().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -4628,5 +7020,84 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         first.message_id, second.message_id,
         "each request is still its own message"
     );
+    let parts = first.message_id.split('-').collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].len(), 32, "a 128-bit boot nonce prefixes every ID");
+    assert!(
+        parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert_eq!(named.conversation_id, "session-7");
+
+    // The receipt resolves only after the transport writer has completed both `write_all` and
+    // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
+    let reply = tokio::spawn({
+        let replier = transport.replier();
+        let target = first.reply.clone();
+        async move {
+            replier
+                .reply(target, OutboundReply::text("accepted locally"))
+                .await
+        }
+    });
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut client = BufReader::new(client);
+    let mut line = String::new();
+    client
+        .read_line(&mut line)
+        .await
+        .expect("the flushed reply reaches the local caller");
+    let text_response = serde_json::from_str::<Value>(&line).expect("local reply is JSON");
+    assert_eq!(text_response["reply"], "accepted locally");
+    assert!(
+        text_response.get("images").is_none(),
+        "text-only local replies keep their exact legacy shape"
+    );
+    assert!(
+        reply
+            .await
+            .expect("reply task completes")
+            .expect("local write and flush are accepted")
+            .accepted()
+    );
+
+    let image_reply = tokio::spawn({
+        let replier = transport.replier();
+        let target = second.reply.clone();
+        async move {
+            replier
+                .reply(
+                    target,
+                    OutboundReply::with_image("a local kitty", generated_image()),
+                )
+                .await
+        }
+    });
+    line.clear();
+    client
+        .read_line(&mut line)
+        .await
+        .expect("the generated image reaches the local caller");
+    let response = serde_json::from_str::<Value>(&line).expect("image reply is JSON");
+    assert_eq!(response["reply"], "a local kitty");
+    assert_eq!(response["images"][0]["filename"], "generated-image.png");
+    assert_eq!(response["images"][0]["mediaType"], "image/png");
+    assert_eq!(
+        STANDARD
+            .decode(
+                response["images"][0]["data"]
+                    .as_str()
+                    .expect("base64 image")
+            )
+            .expect("image data decodes"),
+        generated_image().bytes()
+    );
+    assert!(
+        image_reply
+            .await
+            .expect("image reply task completes")
+            .expect("image write and flush are accepted")
+            .accepted()
+    );
 }

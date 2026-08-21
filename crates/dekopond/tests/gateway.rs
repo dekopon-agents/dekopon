@@ -36,14 +36,23 @@ const GATEWAY_PRINCIPAL: &str = "dekopond-gateway";
 /// The catalog agent both the route and the attested rule name.
 const AGENT: &str = "chat-agent";
 
-fn echo_provider() -> PathBuf {
+fn provider(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("examples/providers/echo-provider.wasm")
+        .join(format!("examples/providers/{name}-provider.wasm"))
+}
+
+fn echo_provider() -> PathBuf {
+    provider("echo")
 }
 
 fn temporary() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("temporary directory");
+    let parent = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary parent");
+    let directory = tempfile::Builder::new()
+        .tempdir_in(parent)
+        .expect("temporary directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .expect("private temporary directory");
     directory
@@ -74,11 +83,35 @@ permit(principal == Dekopon::Principal::"{MAPPED_PRINCIPAL}",
        resource == Dekopon::Provider::"echo")
 when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
      && context has agent && context.agent == "{AGENT}" }};
+
+@id("chat-agent-memory")
+permit(principal == Dekopon::Principal::"{MAPPED_PRINCIPAL}",
+       action in [Dekopon::Action::"memory.chat.record",
+                  Dekopon::Action::"memory.chat.recent",
+                  Dekopon::Action::"memory.chat.search"],
+       resource == Dekopon::Provider::"memory-chat")
+when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
+     && context has agent && context.agent == "{AGENT}"
+     && context has transportKind && context.transportKind == "local"
+     && context has transport && context.transport == "dev"
+     && context has channel && context.channel == "dev"
+     && context has conversation && context.conversation == "dev" }};
 "#
     )
 }
 
 fn broker_config(directory: &Path, uid: u32) -> Value {
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    let fields = storage.as_object_mut().expect("storage limits object");
+    fields.insert(
+        "rootPath".to_owned(),
+        json!(directory.join("provider-storage")),
+    );
+    fields.insert(
+        "namespaceKeyPath".to_owned(),
+        json!(directory.join("storage-key.yaml")),
+    );
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
@@ -88,24 +121,71 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-gateway",
         "policiesPath": directory.join("policies.cedar"),
-        "providers": [echo_provider()],
+        "providers": [echo_provider(), provider("memory-chat")],
         "identities": [{
             "uid": uid,
             "principal": GATEWAY_PRINCIPAL,
             "actor": {"type": "service", "principal": GATEWAY_PRINCIPAL},
-            "attestor": {"namespaces": ["tel"]}
+            "attestor": {
+                "namespaces": ["tel"],
+                "chatScopes": [{
+                    "breadth": "exactConversation",
+                    "kind": "local",
+                    "transport": "dev",
+                    "channel": "dev",
+                    "conversation": "dev",
+                    "localSubjectService": "tel"
+                }]
+            }
         }],
         "identityMappings": [
             {"subject": MAPPED_SUBJECT, "principal": MAPPED_PRINCIPAL}
         ],
         "constraintSets": {
             "echo.echo": {
-                "provider": "echo",
-                "effect": "read-only",
-                "risk": "Low",
+                "provider": "echo", "effect": "read-only", "risk": "Low",
                 "idempotency": "idempotent",
                 "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576}
+            },
+            "memory.chat.record": {
+                "provider": "memory-chat", "effect": "local-write", "risk": "Medium",
+                "idempotency": "conditional",
+                "constraints": {
+                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
+                    "storage": {"interface":"jsonl","access":"read-write","namespace":"chat"}
+                }
+            },
+            "memory.chat.recent": {
+                "provider": "memory-chat", "effect": "read-only", "risk": "High",
+                "idempotency": "idempotent",
+                "constraints": {
+                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
+                    "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
+                }
+            },
+            "memory.chat.search": {
+                "provider": "memory-chat", "effect": "read-only", "risk": "High",
+                "idempotency": "idempotent",
+                "constraints": {
+                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
+                    "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
+                }
             }
+        },
+        "storage": storage,
+        "chatMemory": {
+            "continuityPolicy": "authority-bound",
+            "enabledAgents": [AGENT],
+            "maxLookbackTurns": 200,
+            "maxRecentTurns": 20,
+            "maxSearchResults": 20,
+            "maxQueryBytes": 256,
+            "maxResultBytes": 65_536,
+            "maxTurnBytes": 32_768,
+            "maxDedupRecords": 16_000,
+            "maxDedupBytes": 4_194_304,
+            "compactionTargetBytes": 8_388_608,
+            "compactionThresholdBytes": 12_582_912
         }
     })
 }
@@ -314,6 +394,17 @@ fn ask(socket: &Path, subject: &str, text: &str) -> String {
         .to_owned()
 }
 
+fn ask_when_idle(socket: &Path, subject: &str, text: &str) -> String {
+    for _ in 0..3_000 {
+        let reply = ask(socket, subject, text);
+        if reply != "I'm busy — try again shortly." {
+            return reply;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the prior gateway session did not release admission within thirty seconds");
+}
+
 /// Every audit event the broker durably recorded, in order.
 fn audit_events(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
@@ -364,6 +455,30 @@ impl Fixture {
         self.directory.path().join("audit.jsonl")
     }
 
+    async fn wait_for_memory_record(&self) {
+        for _ in 0..3_000 {
+            let audit = self.audit();
+            if fs::read_to_string(audit).is_ok_and(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<Value>(line)
+                            .ok()
+                            .map(|record| record["event"].clone())
+                    })
+                    .any(|event| {
+                        event["type"] == "execution"
+                            && event["capability"] == "memory.chat.record"
+                            && event["outcome"] == "Succeeded"
+                    })
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the post-acceptance memory record did not complete within thirty seconds");
+    }
+
     /// Stops both daemons and hands back the directory, which the audit file still lives in.
     async fn shutdown(self) -> tempfile::TempDir {
         let _ = self.stop_gateway.send(());
@@ -382,10 +497,18 @@ impl Fixture {
 
 /// Boots a real broker and a real gateway against one mock model endpoint.
 async fn boot(responses: Vec<Value>) -> Fixture {
-    let directory = temporary();
+    boot_in(temporary(), responses).await
+}
+
+/// Reboots both real processes over the same audit and provider-storage directory.
+async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture {
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
+    write_owner_only(
+        &directory.path().join("storage-key.yaml"),
+        b"apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    );
     write_owner_only(
         &directory.path().join("policies.cedar"),
         broker_policies().as_bytes(),
@@ -492,10 +615,15 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
         .await
         .expect("the first request completes");
     assert_eq!(first, "Two things broke.");
-    let second =
-        tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "and the second one?"))
-            .await
-            .expect("the follow-up completes");
+    // Local write+flush acceptance reaches the caller just before the gateway's one bounded
+    // post-acceptance record finishes. Wait for its exact audited success rather than sleeping and
+    // racing a slow filesystem.
+    fixture.wait_for_memory_record().await;
+    let second = tokio::task::spawn_blocking(move || {
+        ask_when_idle(&socket, MAPPED_SUBJECT, "and the second one?")
+    })
+    .await
+    .expect("the follow-up completes");
     assert_eq!(second, "The second one was the database.");
 
     let follow_up = fixture.prompt(1);
@@ -507,7 +635,12 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
         vec![
             (
                 "system",
-                "Answer in one short sentence. You have no authority of your own."
+                concat!(
+                    "Answer in one short sentence. You have no authority of your own.\n\n",
+                    "Durable chat memory is available on demand. Use `memory recent --last N` or ",
+                    "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
+                    "claim recall without retrieving it."
+                )
             ),
             ("user", "what broke?"),
             ("assistant", "Two things broke."),
@@ -517,10 +650,56 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
 
     let audit = fixture.audit();
     let _directory = fixture.shutdown().await;
-    // Conversation text is gateway memory and nothing else: the broker's durable chain never saw a
-    // word of it.
+    // Conversation text may now be in opaque provider storage, but the broker's durable audit
+    // chain still never contains a word of it.
     let serialized = serde_json::to_string(&audit_events(&audit)).expect("audit serializes");
     assert!(!serialized.contains("what broke"), "{serialized}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_recent_retrieves_the_accepted_turn_after_broker_and_gateway_restart() {
+    let fixture = boot(vec![final_answer("The retained answer.")]).await;
+    let socket = fixture.socket();
+    let first = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "remember this"))
+        .await
+        .expect("first request completes");
+    assert_eq!(first, "The retained answer.");
+    fixture.wait_for_memory_record().await;
+    let directory = fixture.shutdown().await;
+
+    let fixture = boot_in(
+        directory,
+        vec![
+            bash_tool_call(
+                "memory-1",
+                "memory recent --last 1 | jq -r '.turns[0].assistant'",
+            ),
+            final_answer("I retrieved the retained answer."),
+        ],
+    )
+    .await;
+    let socket = fixture.socket();
+    let second = tokio::task::spawn_blocking(move || {
+        ask(
+            &socket,
+            MAPPED_SUBJECT,
+            "retrieve the prior accepted answer",
+        )
+    })
+    .await
+    .expect("post-restart request completes");
+    assert_eq!(second, "I retrieved the retained answer.");
+    assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
+    let tool_output = fixture
+        .prompt(1)
+        .into_iter()
+        .find_map(|(role, content)| (role == "tool").then_some(content))
+        .expect("second model turn carries memory command output");
+    assert!(
+        tool_output.contains("The retained answer."),
+        "{tool_output}"
+    );
+    let _directory = fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

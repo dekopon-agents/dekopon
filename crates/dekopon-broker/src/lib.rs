@@ -44,10 +44,15 @@ use dekopon_broker_host::{
     BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, HttpCallEvidence,
     ProviderCapability,
 };
-pub use dekopon_broker_protocol::{AvailableCapability, InvocationRequest, SubjectAttestation};
+pub use dekopon_broker_protocol::{
+    AvailableCapability, ChatAttestation, ChatMemorySurface, ChatScopeClaim, ChatSessionClaim,
+    ChatTransportKind, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
+    SubjectAttestation,
+};
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints, Idempotency,
-    InvocationOutcome, InvocationResult, ProposedInvocation, broker::AuthorizationGate,
+    InvocationOutcome, InvocationResult, ProposedInvocation, StorageAccess, StorageInterface,
+    StorageNamespace, broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
@@ -55,6 +60,10 @@ use dekopon_core::{
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
+use dekopon_storage_host::{
+    ContinuityPolicy, StorageEvidence, StorageGrantPreparation, StorageGrantRequest,
+    StorageScopeCommitment,
+};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -75,6 +84,233 @@ const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
 const PROVIDER_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.provider-response+json";
 const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+json";
+const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evidence+json";
+
+pub const MEMORY_PROVIDER: &str = "memory-chat";
+pub const MEMORY_WORD: &str = "memory";
+pub const MEMORY_RECORD: &str = "memory.chat.record";
+pub const MEMORY_RECENT: &str = "memory.chat.recent";
+pub const MEMORY_SEARCH: &str = "memory.chat.search";
+/// Conservative complete line bound for broker-curated HMAC dedup records.
+///
+/// The current canonical JSON is 227 bytes including LF. Keeping explicit headroom decouples
+/// composition safety from incidental serde field formatting while remaining a fixed trusted
+/// bound rather than a guest claim.
+const MEMORY_DEDUP_LINE_BYTES: u64 = 256;
+/// Exact minimum canonical turn line with empty text and broker-generated HMAC fields.
+const MEMORY_MIN_TURN_LINE_BYTES: u64 = 251;
+/// SDK success/failure envelope around the provider's already-bounded result value.
+const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
+/// Curated record/query fields and worst-case JSON string escaping at the component boundary.
+const MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES: u64 = 4 * 1024;
+const MEMORY_QUERY_JSON_EXPANSION: u64 = 6;
+/// Raw/decoded collections, canonical-ABI copies, allocator metadata, and component static state.
+const MEMORY_WORKING_SET_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+/// Smallest serialized `{"turns":[],"truncated":false}` result.
+const MEMORY_MIN_RESULT_BYTES: u64 = 30;
+/// The provider owns exactly the turn and permanent-dedup logical files.
+const MEMORY_LOGICAL_FILES: u64 = 2;
+/// Size/read calls for both files plus two appends and the worst-case replacement.
+const MEMORY_RECORD_FIXED_HOST_CALLS: u64 = 5;
+/// Fixed setup/serde headroom plus a conservative instruction allowance per processed byte.
+const MEMORY_FUEL_BASE: u64 = 10_000_000;
+const MEMORY_FUEL_PER_WORK_BYTE: u64 = 256;
+/// Fixed JSONL chunk requested by the generated memory provider.
+const MEMORY_READ_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// Broker-owned bounds for the optional all-or-nothing durable chat-memory surface.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatMemoryConfig {
+    #[serde(default)]
+    pub continuity_policy: ContinuityPolicy,
+    pub enabled_agents: Vec<AgentId>,
+    pub max_lookback_turns: u32,
+    pub max_recent_turns: u32,
+    pub max_search_results: u32,
+    pub max_query_bytes: u64,
+    pub max_result_bytes: u64,
+    pub max_turn_bytes: u64,
+    pub max_dedup_records: u64,
+    pub max_dedup_bytes: u64,
+    pub compaction_target_bytes: u64,
+    pub compaction_threshold_bytes: u64,
+}
+
+impl ChatMemoryConfig {
+    /// Validates cross-file storage and memory bounds with checked arithmetic.
+    pub fn validate(
+        &self,
+        storage: &dekopon_storage_host::StorageLimits,
+    ) -> Result<(), BrokerBuildError> {
+        let positive = [
+            u64::from(self.max_lookback_turns),
+            u64::from(self.max_recent_turns),
+            u64::from(self.max_search_results),
+            self.max_query_bytes,
+            self.max_result_bytes,
+            self.max_turn_bytes,
+            self.max_dedup_records,
+            self.max_dedup_bytes,
+            self.compaction_target_bytes,
+            self.compaction_threshold_bytes,
+        ];
+        let unique_agents = self.enabled_agents.iter().collect::<BTreeSet<_>>();
+        if self.enabled_agents.is_empty()
+            || unique_agents.len() != self.enabled_agents.len()
+            || positive.contains(&0)
+            || self.max_recent_turns > self.max_lookback_turns
+            || self.max_search_results > self.max_lookback_turns
+            || self.compaction_target_bytes >= self.compaction_threshold_bytes
+            || self.compaction_threshold_bytes > storage.max_file_bytes
+            || self.max_turn_bytes < MEMORY_MIN_TURN_LINE_BYTES
+            || self.max_result_bytes < MEMORY_MIN_RESULT_BYTES
+            || self.max_dedup_bytes < MEMORY_DEDUP_LINE_BYTES
+        {
+            return Err(BrokerBuildError::InvalidChatMemory);
+        }
+        let retained = u64::from(self.max_lookback_turns)
+            .checked_mul(self.max_turn_bytes)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        // `read-file` asks for a full CHUNK even on its final partial call, and the host
+        // intentionally charges the requested bound. Round both files independently so a valid
+        // near-threshold store cannot become unreadable only because its length is not aligned.
+        let dedup_read_budget = round_up(self.max_dedup_bytes, MEMORY_READ_CHUNK_BYTES)?;
+        let turns_read_budget = round_up(self.compaction_threshold_bytes, MEMORY_READ_CHUNK_BYTES)?;
+        let read_budget = dedup_read_budget
+            .checked_add(turns_read_budget)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let host_calls = dedup_read_budget
+            .checked_div(MEMORY_READ_CHUNK_BYTES)
+            .and_then(|value| {
+                value.checked_add(turns_read_budget.checked_div(MEMORY_READ_CHUNK_BYTES)?)
+            })
+            .and_then(|value| value.checked_add(MEMORY_RECORD_FIXED_HOST_CALLS))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let write_budget = self
+            .compaction_target_bytes
+            // One record appends a bounded turn and one fixed-shape permanent dedup line before
+            // an optional replacement. Account each independently rather than assuming one bound
+            // happens to dominate the other.
+            .checked_add(self.max_turn_bytes)
+            .and_then(|value| value.checked_add(MEMORY_DEDUP_LINE_BYTES))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let threshold_with_append = self
+            .compaction_threshold_bytes
+            .checked_add(self.max_turn_bytes)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let namespace_headroom = self
+            // Immediately before compaction, the old turn file may sit just below the high
+            // threshold and then receive one maximum turn. Its staged replacement can approach
+            // the target. Using two thresholds is conservative for the replacement, but the
+            // post-append maximum turn is independent and must not disappear into entry overhead.
+            .compaction_threshold_bytes
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(self.max_turn_bytes))
+            .and_then(|value| value.checked_add(self.max_dedup_bytes.checked_mul(2)?))
+            // Generation/transaction directories, files, markers, manifest, and replacement
+            // temporaries. The fixed memory transaction has only two logical files; 32 logical
+            // entry charges conservatively cover its canonical manifest as well.
+            .and_then(|value| value.checked_add(32 * 4_096))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        if retained > self.compaction_target_bytes
+            || MEMORY_READ_CHUNK_BYTES > storage.max_read_bytes_per_call
+            || self.max_turn_bytes > storage.max_write_bytes_per_call
+            || MEMORY_DEDUP_LINE_BYTES > storage.max_write_bytes_per_call
+            || self.compaction_target_bytes > storage.max_write_bytes_per_call
+            || self.max_dedup_bytes > storage.max_file_bytes
+            || threshold_with_append > storage.max_file_bytes
+            || read_budget > storage.max_read_bytes_per_invocation
+            || write_budget > storage.max_write_bytes_per_invocation
+            || host_calls > storage.max_host_calls_per_invocation
+            || storage.max_files_per_namespace < MEMORY_LOGICAL_FILES
+            || namespace_headroom > storage.max_namespace_bytes
+            || self.max_query_bytes > 256 * 1024
+            || self.max_result_bytes > 1024 * 1024
+        {
+            return Err(BrokerBuildError::InvalidChatMemory);
+        }
+        Ok(())
+    }
+
+    fn maximum_provider_input_bytes(&self) -> Result<u64, BrokerBuildError> {
+        let record = self
+            .max_turn_bytes
+            .checked_add(MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let search = self
+            .max_query_bytes
+            .checked_mul(MEMORY_QUERY_JSON_EXPANSION)
+            .and_then(|value| value.checked_add(MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        Ok(record.max(search))
+    }
+
+    fn maximum_provider_working_set_bytes(&self) -> Result<u64, BrokerBuildError> {
+        self.compaction_threshold_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(self.max_dedup_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(self.compaction_target_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(self.max_turn_bytes))
+            .and_then(|bytes| bytes.checked_add(self.max_result_bytes))
+            .and_then(|bytes| bytes.checked_add(MEMORY_WORKING_SET_OVERHEAD_BYTES))
+            .ok_or(BrokerBuildError::InvalidChatMemory)
+    }
+
+    fn minimum_provider_fuel(&self) -> Result<u64, BrokerBuildError> {
+        let record_work = self
+            .max_dedup_bytes
+            .checked_add(self.compaction_threshold_bytes)
+            .and_then(|value| value.checked_add(self.compaction_target_bytes))
+            .and_then(|value| value.checked_add(self.max_turn_bytes))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let search_work = self
+            .compaction_threshold_bytes
+            .checked_add(self.max_query_bytes)
+            .and_then(|value| value.checked_add(self.max_result_bytes))
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        record_work
+            .max(search_work)
+            .checked_mul(MEMORY_FUEL_PER_WORK_BYTE)
+            .and_then(|value| value.checked_add(MEMORY_FUEL_BASE))
+            .ok_or(BrokerBuildError::InvalidChatMemory)
+    }
+
+    /// Validates the memory algorithm's serialized-input, result, working-set, and fuel needs
+    /// against the independent component-host ceilings.
+    pub fn validate_host_limits(
+        &self,
+        host: &dekopon_broker_host::BrokerHostLimits,
+    ) -> Result<(), BrokerBuildError> {
+        let max_input = u64::try_from(host.max_input_bytes).unwrap_or(u64::MAX);
+        let max_output = u64::try_from(host.max_output_bytes).unwrap_or(u64::MAX);
+        let max_memory = u64::try_from(host.max_memory_bytes).unwrap_or(u64::MAX);
+        let provider_output = self
+            .max_result_bytes
+            .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        if self.maximum_provider_input_bytes()? > max_input
+            || provider_output > max_output
+            || self.maximum_provider_working_set_bytes()? > max_memory
+            || self.minimum_provider_fuel()? > host.fuel
+        {
+            return Err(BrokerBuildError::InvalidChatMemory);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn enabled_for(&self, agent: &AgentId) -> bool {
+        self.enabled_agents.contains(agent)
+    }
+}
+
+fn round_up(value: u64, multiple: u64) -> Result<u64, BrokerBuildError> {
+    value
+        .checked_add(multiple.saturating_sub(1))
+        .map(|value| value / multiple * multiple)
+        .ok_or(BrokerBuildError::InvalidChatMemory)
+}
 
 /// Default maximum owner-authored constraint sets in one broker instance.
 pub const DEFAULT_MAX_CONSTRAINT_SETS: usize = 1_024;
@@ -97,6 +333,9 @@ pub struct AuthenticatedContext {
     /// The canonical external subject an attested context stands for.
     #[serde(skip_serializing_if = "Option::is_none")]
     attested_subject: Option<ExternalSubject>,
+    /// Invocation-authorized chat transport scope; absent for every legacy operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_scope: Option<ChatScopeClaim>,
 }
 
 impl AuthenticatedContext {
@@ -106,7 +345,7 @@ impl AuthenticatedContext {
     /// Agent actors may be represented by an authenticated daemon/service principal and are
     /// therefore bound by an explicit exact policy rule instead.
     pub fn new(principal: PrincipalId, actor: Actor) -> Result<Self, ContextError> {
-        Self::build(principal, actor, None, None)
+        Self::build(principal, actor, None, None, None)
     }
 
     /// Binds a broker-mapped principal derived through an authenticated attestor peer.
@@ -121,7 +360,18 @@ impl AuthenticatedContext {
         via: PrincipalId,
         subject: ExternalSubject,
     ) -> Result<Self, ContextError> {
-        Self::build(principal, actor, Some(via), Some(subject))
+        Self::build(principal, actor, Some(via), Some(subject), None)
+    }
+
+    /// Binds an invocation-authorized chat scope to an attested context.
+    pub fn attested_chat(
+        principal: PrincipalId,
+        actor: Actor,
+        via: PrincipalId,
+        subject: ExternalSubject,
+        scope: ChatScopeClaim,
+    ) -> Result<Self, ContextError> {
+        Self::build(principal, actor, Some(via), Some(subject), Some(scope))
     }
 
     fn build(
@@ -129,6 +379,7 @@ impl AuthenticatedContext {
         actor: Actor,
         via: Option<PrincipalId>,
         attested_subject: Option<ExternalSubject>,
+        chat_scope: Option<ChatScopeClaim>,
     ) -> Result<Self, ContextError> {
         let actor_principal = match &actor {
             Actor::Human { principal } | Actor::Service { principal } => Some(principal),
@@ -142,6 +393,7 @@ impl AuthenticatedContext {
             actor,
             via,
             attested_subject,
+            chat_scope,
         })
     }
 
@@ -157,6 +409,7 @@ impl AuthenticatedContext {
             actor: self.actor.clone(),
             via: None,
             attested_subject: Some(subject),
+            chat_scope: None,
         }
     }
 
@@ -182,6 +435,12 @@ impl AuthenticatedContext {
     #[must_use]
     pub fn attested_subject(&self) -> Option<&ExternalSubject> {
         self.attested_subject.as_ref()
+    }
+
+    /// Returns the trusted chat scope, only for new chat operations.
+    #[must_use]
+    pub fn chat_scope(&self) -> Option<&ChatScopeClaim> {
+        self.chat_scope.as_ref()
     }
 }
 
@@ -442,7 +701,7 @@ impl ConstraintCatalog {
             });
         }
         for (capability_id, set) in &self.sets {
-            validate_set_constraints(&set.constraints)?;
+            validate_set_constraints(set)?;
             validate_set_credential(capability_id, set, credentials)?;
             registry
                 .validate_constraints(&set.constraints)
@@ -494,6 +753,141 @@ impl CredentialStore {
     }
 }
 
+/// Explicit breadth of one owner-authored chat-scope grant.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "breadth",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ChatScopeGrant {
+    /// Every canonical channel/conversation on one configured transport.
+    TransportWide {
+        kind: ChatTransportKind,
+        transport: dekopon_core::TransportId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_subject_service: Option<String>,
+    },
+    /// Every canonical conversation in one exact channel.
+    ExactChannel {
+        kind: ChatTransportKind,
+        transport: dekopon_core::TransportId,
+        channel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_subject_service: Option<String>,
+    },
+    /// One exact canonical conversation.
+    ExactConversation {
+        kind: ChatTransportKind,
+        transport: dekopon_core::TransportId,
+        channel: String,
+        conversation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_subject_service: Option<String>,
+    },
+}
+
+impl fmt::Debug for ChatScopeGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatScopeGrant([REDACTED])")
+    }
+}
+
+impl ChatScopeGrant {
+    fn validate(&self) -> Result<(), BrokerBuildError> {
+        let (kind, scope, local_service) = match self {
+            Self::TransportWide {
+                kind,
+                local_subject_service,
+                ..
+            } => (*kind, None, local_subject_service),
+            Self::ExactChannel {
+                kind,
+                channel,
+                local_subject_service,
+                ..
+            } => (*kind, Some((channel.as_str(), None)), local_subject_service),
+            Self::ExactConversation {
+                kind,
+                channel,
+                conversation,
+                local_subject_service,
+                ..
+            } => (
+                *kind,
+                Some((channel.as_str(), Some(conversation.as_str()))),
+                local_subject_service,
+            ),
+        };
+        if kind == ChatTransportKind::Local {
+            let Some(service) = local_service else {
+                return Err(BrokerBuildError::InvalidChatScope);
+            };
+            service
+                .parse::<SubjectService>()
+                .map_err(|_| BrokerBuildError::InvalidChatScope)?;
+        } else if local_service.is_some() {
+            return Err(BrokerBuildError::InvalidChatScope);
+        }
+        if let Some((channel, conversation)) = scope {
+            let claim = ChatScopeClaim {
+                transport: self.transport().clone(),
+                kind,
+                channel: channel.to_owned(),
+                conversation: conversation.unwrap_or(channel).to_owned(),
+            };
+            if !canonical_chat_scope_shape(&claim) {
+                return Err(BrokerBuildError::InvalidChatScope);
+            }
+        }
+        Ok(())
+    }
+
+    fn transport(&self) -> &dekopon_core::TransportId {
+        match self {
+            Self::TransportWide { transport, .. }
+            | Self::ExactChannel { transport, .. }
+            | Self::ExactConversation { transport, .. } => transport,
+        }
+    }
+
+    fn permits(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
+        let (kind, transport, channel, conversation, local_service) = match self {
+            Self::TransportWide {
+                kind,
+                transport,
+                local_subject_service,
+            } => (*kind, transport, None, None, local_subject_service),
+            Self::ExactChannel {
+                kind,
+                transport,
+                channel,
+                local_subject_service,
+            } => (*kind, transport, Some(channel), None, local_subject_service),
+            Self::ExactConversation {
+                kind,
+                transport,
+                channel,
+                conversation,
+                local_subject_service,
+            } => (
+                *kind,
+                transport,
+                Some(channel),
+                Some(conversation),
+                local_subject_service,
+            ),
+        };
+        kind == scope.kind
+            && transport == &scope.transport
+            && channel.is_none_or(|value| value == &scope.channel)
+            && conversation.is_none_or(|value| value == &scope.conversation)
+            && (kind != ChatTransportKind::Local
+                || local_service.as_deref() == Some(subject.service().as_str()))
+    }
+}
+
 /// One peer's authority to attest external subjects, scoped to canonical namespaces.
 ///
 /// Grants belong to owner-controlled deployment configuration, exactly like peer identity
@@ -504,6 +898,9 @@ impl CredentialStore {
 pub struct AttestorGrant {
     /// Canonical-prefix namespaces this peer may attest, matched on segment boundaries.
     pub namespaces: Vec<String>,
+    /// Explicit chat scope authority. Empty preserves legacy subject-only attestation behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_scopes: Vec<ChatScopeGrant>,
 }
 
 impl AttestorGrant {
@@ -513,6 +910,12 @@ impl AttestorGrant {
             return Err(BrokerBuildError::InvalidAttestorScope {
                 scope: self.namespaces.len().to_string(),
             });
+        }
+        if self.chat_scopes.len() > MAX_POLICY_SCOPE_ENTRIES {
+            return Err(BrokerBuildError::InvalidChatScope);
+        }
+        for scope in &self.chat_scopes {
+            scope.validate()?;
         }
         for scope in &self.namespaces {
             let mut segments = scope.split('.');
@@ -539,6 +942,17 @@ impl AttestorGrant {
         self.namespaces
             .iter()
             .any(|namespace| subject.in_namespace(namespace))
+    }
+
+    /// Requires both existing subject namespace authority and one exact/bounded chat grant.
+    #[must_use]
+    pub fn permits_chat(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
+        self.permits(subject)
+            && canonical_chat_scope(subject, scope)
+            && self
+                .chat_scopes
+                .iter()
+                .any(|grant| grant.permits(subject, scope))
     }
 }
 
@@ -626,6 +1040,12 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
             Actor::Agent { agent } => Some(agent.as_str().to_owned()),
             Actor::Human { .. } | Actor::Service { .. } => None,
         },
+        transport_kind: context.chat_scope().map(|scope| scope.kind.to_string()),
+        transport: context
+            .chat_scope()
+            .map(|scope| scope.transport.to_string()),
+        channel: context.chat_scope().map(|scope| scope.channel.clone()),
+        conversation: context.chat_scope().map(|scope| scope.conversation.clone()),
     }
 }
 
@@ -701,9 +1121,23 @@ fn validate_set_credential(
     Ok(())
 }
 
-fn validate_set_constraints(constraints: &ExecutionConstraints) -> Result<(), BrokerBuildError> {
-    if constraints.timeout_ms == 0 || constraints.max_output_bytes == 0 {
+fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError> {
+    let constraints = &set.constraints;
+    if constraints.timeout_ms == 0
+        || constraints.max_output_bytes == 0
+        || (constraints.http.is_some() && constraints.storage.is_some())
+    {
         return Err(BrokerBuildError::InvalidPolicyConstraints);
+    }
+    if let Some(storage) = &constraints.storage {
+        let valid_effect = matches!(
+            (storage.access, set.effect),
+            (StorageAccess::ReadOnly, EffectKind::ReadOnly)
+                | (StorageAccess::ReadWrite, EffectKind::LocalWrite)
+        );
+        if !valid_effect || set.effect == EffectKind::ExternalWrite {
+            return Err(BrokerBuildError::InvalidPolicyConstraints);
+        }
     }
     let Some(http) = &constraints.http else {
         return Ok(());
@@ -727,6 +1161,107 @@ fn validate_set_constraints(constraints: &ExecutionConstraints) -> Result<(), Br
         return Err(BrokerBuildError::InvalidPolicyConstraints);
     }
     Ok(())
+}
+
+fn is_memory_capability(capability: &CapabilityId) -> bool {
+    matches!(
+        capability.as_str(),
+        MEMORY_RECORD | MEMORY_RECENT | MEMORY_SEARCH
+    )
+}
+
+fn is_reserved_memory_route(capability: &CapabilityId, set: Option<&ConstraintSet>) -> bool {
+    capability.as_str().starts_with("memory.chat.")
+        || set.is_some_and(|set| set.provider.as_str() == MEMORY_PROVIDER)
+}
+
+fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
+    let subject_matches = matches!(
+        (scope.kind, subject.service()),
+        (ChatTransportKind::Slack, SubjectService::Slack)
+            | (ChatTransportKind::Discord, SubjectService::Discord)
+            | (ChatTransportKind::Telegram, SubjectService::Telegram)
+    ) || scope.kind == ChatTransportKind::Local;
+    subject_matches && canonical_chat_scope_shape(scope)
+}
+
+fn canonical_chat_scope_shape(scope: &ChatScopeClaim) -> bool {
+    if !scope.is_bounded() {
+        return false;
+    }
+    match scope.kind {
+        ChatTransportKind::Slack => {
+            lowercase_token(&scope.channel)
+                && (scope.conversation == scope.channel
+                    || scope
+                        .conversation
+                        .split_once(':')
+                        .is_some_and(|(channel, timestamp)| {
+                            channel == scope.channel && slack_timestamp(timestamp)
+                        }))
+        }
+        ChatTransportKind::Discord => {
+            // A Discord native thread is itself the channel used for routing and replies. There is
+            // no second thread identifier, so accepting two different decimals would create an
+            // alias for one transport-derived conversation.
+            scope.conversation == scope.channel && canonical_unsigned_decimal(&scope.channel)
+        }
+        ChatTransportKind::Telegram => {
+            canonical_signed_decimal(&scope.channel)
+                && (scope.conversation == scope.channel
+                    || scope
+                        .conversation
+                        .strip_prefix(&format!("{}:topic:", scope.channel))
+                        .is_some_and(canonical_positive_service_decimal))
+        }
+        ChatTransportKind::Local => {
+            lowercase_scope_value(&scope.channel) && lowercase_scope_value(&scope.conversation)
+        }
+    }
+}
+
+fn lowercase_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn lowercase_scope_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'-' | b'_' | b':')
+        })
+}
+
+fn slack_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        seconds.len() == 10
+            && fraction.len() == 6
+            && !seconds.starts_with('0')
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn canonical_unsigned_decimal(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_positive_service_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number > 0 && number.to_string() == value)
+}
+
+fn canonical_signed_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
 }
 
 fn is_authority_scope(value: &str) -> bool {
@@ -884,6 +1419,12 @@ pub enum BrokerBuildError {
         /// The offending scope (or entry count when the list itself is invalid).
         scope: String,
     },
+    /// An owner-authored chat scope grant was noncanonical, overbroad, or malformed.
+    #[error("attestor chat scope is invalid")]
+    InvalidChatScope,
+    /// Chat-memory bounds or their composition with storage ceilings are invalid.
+    #[error("chat-memory bounds do not compose with provider/storage ceilings")]
+    InvalidChatMemory,
     /// Two identity mappings named one canonical subject.
     #[error("identity mapping duplicates subject {subject:?}")]
     DuplicateSubjectMapping {
@@ -902,10 +1443,12 @@ pub enum AuditEvent {
         invocation: InvocationId,
         /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal.
-        principal: PrincipalId,
-        /// Trusted actor.
-        actor: Actor,
+        /// Authenticated caller principal; omitted for storage-backed records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<PrincipalId>,
+        /// Trusted actor; omitted for storage-backed records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Actor>,
         /// Attestor peer for attested contexts; absent for direct peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
@@ -917,12 +1460,14 @@ pub enum AuditEvent {
         /// Selected provider when a rule matched.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
-        /// Broker principal that owns the authorization transition.
-        authorized_by: PrincipalId,
+        /// Broker principal that owns the authorization transition; omitted for storage records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorized_by: Option<PrincipalId>,
         /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision.
-        policy_revision: String,
+        /// Evaluated policy revision; omitted for storage records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_revision: Option<String>,
         /// Identifiers of the Cedar policies that determined this decision.
         ///
         /// Empty for a decision no policy reached — a deny-by-default refusal, an attestation
@@ -939,6 +1484,12 @@ pub enum AuditEvent {
         reason: Option<String>,
         /// Digest binding the complete decision material without logging it.
         decision_digest: String,
+        /// Keyed scope commitment for storage records, distinct from physical path tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage_scope_commitment: Option<StorageScopeCommitment>,
+        /// Content-free storage evidence, normally present on terminal execution only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage: Option<StorageEvidence>,
     },
     /// Terminal provider execution metadata.
     Execution {
@@ -946,10 +1497,12 @@ pub enum AuditEvent {
         invocation: InvocationId,
         /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal.
-        principal: PrincipalId,
-        /// Trusted actor.
-        actor: Actor,
+        /// Authenticated caller principal; omitted for storage-backed records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<PrincipalId>,
+        /// Trusted actor; omitted for storage-backed records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Actor>,
         /// Attestor peer for attested contexts; absent for direct peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
@@ -958,14 +1511,17 @@ pub enum AuditEvent {
         attested_subject: Option<ExternalSubject>,
         /// Executed capability.
         capability: CapabilityId,
-        /// Trusted selected provider.
-        provider: ProviderId,
-        /// Broker principal that owned the authorization transition.
-        authorized_by: PrincipalId,
+        /// Trusted selected provider; omitted for storage-backed records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<ProviderId>,
+        /// Broker principal that owned the authorization transition; omitted for storage records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorized_by: Option<PrincipalId>,
         /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision.
-        policy_revision: String,
+        /// Evaluated policy revision; omitted for storage records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_revision: Option<String>,
         /// Identifiers of the Cedar policies that authorized this execution.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
@@ -1000,6 +1556,12 @@ pub enum AuditEvent {
         /// Sanitized HTTP metadata; never paths, queries, headers, or bodies.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         http_calls: Vec<HttpCallEvidence>,
+        /// Keyed scope commitment for storage records, distinct from physical path tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage_scope_commitment: Option<StorageScopeCommitment>,
+        /// Content-free coarse storage evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage: Option<StorageEvidence>,
     },
 }
 
@@ -1595,6 +2157,7 @@ pub struct Broker<A> {
     gate: AuthorizationGate,
     audit: Arc<A>,
     replay: ReplayLedger,
+    chat_memory: Option<ChatMemoryConfig>,
 }
 
 impl<A> Broker<A>
@@ -1763,6 +2326,7 @@ where
                     maximum: limits.max_replay_ids,
                     ids: Mutex::new(restored_replay_ids),
                 },
+                chat_memory: None,
             },
             warnings,
         ))
@@ -1772,6 +2336,112 @@ where
     #[must_use]
     pub fn policy_digest(&self) -> &str {
         &self.policy_digest
+    }
+
+    /// Enables the optional all-or-nothing JSONL chat-memory surface after composition checks.
+    pub fn with_chat_memory(mut self, config: ChatMemoryConfig) -> Result<Self, BrokerBuildError> {
+        let storage_host = self
+            .registry
+            .storage_host()
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        config.validate(storage_host.limits())?;
+        config.validate_host_limits(self.registry.host_limits())?;
+        let expected = [
+            (
+                MEMORY_RECORD,
+                EffectKind::LocalWrite,
+                RiskLevel::Medium,
+                Idempotency::Conditional,
+                StorageAccess::ReadWrite,
+            ),
+            (
+                MEMORY_RECENT,
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                Idempotency::Idempotent,
+                StorageAccess::ReadOnly,
+            ),
+            (
+                MEMORY_SEARCH,
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                Idempotency::Idempotent,
+                StorageAccess::ReadOnly,
+            ),
+        ];
+        for (identifier, effect, risk, idempotency, access) in expected {
+            let capability = identifier
+                .parse::<CapabilityId>()
+                .map_err(|_| BrokerBuildError::InvalidChatMemory)?;
+            let set = self
+                .constraints
+                .get(&capability)
+                .ok_or(BrokerBuildError::InvalidChatMemory)?;
+            let storage = set
+                .constraints
+                .storage
+                .as_ref()
+                .ok_or(BrokerBuildError::InvalidChatMemory)?;
+            if set.provider.as_str() != MEMORY_PROVIDER
+                || set.effect != effect
+                || set.risk != risk
+                || set.idempotency != idempotency
+                || set.credential.is_some()
+                || !set.credential_by_agent.is_empty()
+                || storage.interface != StorageInterface::Jsonl
+                || storage.access != access
+                || storage.namespace != StorageNamespace::Chat
+                || set.constraints.http.is_some()
+                || set.constraints.max_output_bytes
+                    < if identifier == MEMORY_RECORD {
+                        MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES
+                    } else {
+                        config
+                            .max_result_bytes
+                            .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
+                            .ok_or(BrokerBuildError::InvalidChatMemory)?
+                    }
+            {
+                return Err(BrokerBuildError::InvalidChatMemory);
+            }
+        }
+        let memory_provider = self
+            .registry
+            .manifests()
+            .find(|manifest| manifest.id.as_str() == MEMORY_PROVIDER)
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
+        let declared = memory_provider
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if declared
+            != [MEMORY_RECORD, MEMORY_RECENT, MEMORY_SEARCH]
+                .into_iter()
+                .collect()
+            || self.registry.capabilities().any(|(provider, capability)| {
+                capability.id.as_str().starts_with("memory.chat.")
+                    && (provider.as_str() != MEMORY_PROVIDER
+                        || !is_memory_capability(&capability.id))
+            })
+        {
+            return Err(BrokerBuildError::InvalidChatMemory);
+        }
+        self.chat_memory = Some(config);
+        Ok(self)
+    }
+
+    /// Whether trusted routing constraints classify this capability as storage-backed.
+    ///
+    /// Used before outer span construction so generic storage providers receive the same
+    /// identity-free telemetry treatment as the built-in memory route.
+    #[must_use]
+    pub fn capability_uses_storage(&self, capability: &CapabilityId) -> bool {
+        is_reserved_memory_route(capability, self.constraints.get(capability))
+            || self
+                .constraints
+                .get(capability)
+                .is_some_and(|set| set.constraints.storage.is_some())
     }
 
     /// Asks policy whether this context may act on one capability at all.
@@ -1826,15 +2496,44 @@ where
         let reachable = self
             .constraints
             .iter()
-            .filter(|(capability, set)| self.authorize_capability(context, capability, set).allowed)
+            .filter(|(capability, set)| {
+                !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && self.authorize_capability(context, capability, set).allowed
+            })
             .map(|(_, set)| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        let storage_providers = self
+            .constraints
+            .iter()
+            .map(|(_, set)| set)
+            .filter(|set| set.constraints.storage.is_some())
+            .map(|set| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        let reserved_providers = self
+            .registry
+            .capabilities()
+            .filter(|(provider, capability)| {
+                provider.as_str() == MEMORY_PROVIDER
+                    || capability.id.as_str().starts_with("memory.chat.")
+            })
+            .map(|(provider, _)| provider.clone())
             .collect::<BTreeSet<_>>();
         let mut words = self
             .registry
             .command_words_by_provider()
             .into_iter()
-            .filter(|(provider, _)| reachable.contains(*provider))
-            .flat_map(|(_, words)| words.iter().cloned())
+            .filter(|(provider, _)| {
+                !reserved_providers.contains(*provider)
+                    && reachable.contains(*provider)
+                    && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
+            })
+            .flat_map(|(_, words)| {
+                words
+                    .iter()
+                    .filter(|word| word.as_str() != MEMORY_WORD)
+                    .cloned()
+            })
             .collect::<Vec<_>>();
         words.sort();
         words.dedup();
@@ -1858,14 +2557,45 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        self.registry.resolve_command(word, argv).await
+        let reserved_provider_word =
+            self.registry
+                .command_words_by_provider()
+                .into_iter()
+                .any(|(provider, words)| {
+                    words.iter().any(|value| value == word)
+                        && self.registry.capabilities().any(|(candidate, capability)| {
+                            candidate == provider
+                                && (candidate.as_str() == MEMORY_PROVIDER
+                                    || capability.id.as_str().starts_with("memory.chat."))
+                        })
+                });
+        if word == MEMORY_WORD || reserved_provider_word {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        let resolution = self.registry.resolve_command(word, argv).await?;
+        if matches!(
+            &resolution,
+            CommandResolution::Resolved { capability, .. }
+                if is_reserved_memory_route(capability, self.constraints.get(capability))
+        ) {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        Ok(resolution)
     }
 
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
         let mut capabilities = self
             .constraints
             .iter()
-            .filter(|(capability, set)| self.authorize_capability(context, capability, set).allowed)
+            .filter(|(capability, set)| {
+                !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && self.authorize_capability(context, capability, set).allowed
+            })
             .map(|(capability_id, set)| {
                 let (_, manifest_capability) = self
                     .registry
@@ -1892,7 +2622,15 @@ where
         context: &AuthenticatedContext,
         request: InvocationRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        self.invoke_inner(context, request, None).await
+        let refusal = is_reserved_memory_route(
+            &request.capability,
+            self.constraints.get(&request.capability),
+        )
+        .then_some(Refusal {
+            reason: "chat-scope-required",
+            policy_ids: Vec::new(),
+        });
+        self.invoke_inner(context, request, refusal).await
     }
 
     /// Evaluates one proposal attested on behalf of an external subject.
@@ -1918,6 +2656,16 @@ where
                 reason,
                 policy_ids: Vec::new(),
             }),
+            None if is_reserved_memory_route(
+                &request.capability,
+                self.constraints.get(&request.capability),
+            ) =>
+            {
+                Some(Refusal {
+                    reason: "chat-scope-required",
+                    policy_ids: Vec::new(),
+                })
+            }
             None => {
                 let decision = self.authorize_agent_prompt(&context, &attestation.agent);
                 (!decision.allowed).then_some(Refusal {
@@ -1960,6 +2708,456 @@ where
             return None;
         }
         Some((self.capabilities(&context), self.command_words(&context)))
+    }
+
+    /// Returns a freshly authorized chat surface. Scope refusal reveals no mapping or namespace.
+    #[must_use]
+    pub fn capabilities_for_chat(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        claim: &ChatSessionClaim,
+    ) -> Option<(
+        Vec<AvailableCapability>,
+        Vec<String>,
+        Option<ChatMemorySurface>,
+    )> {
+        let context = self.resolve_chat_claim(peer, grant, claim)?;
+        let mut capabilities = self.capabilities(&context);
+        let mut words = self.command_words(&context);
+        let memory = self.memory_surface(&context, &claim.agent);
+        if memory.is_some() {
+            for identifier in [MEMORY_RECENT, MEMORY_SEARCH] {
+                let capability = identifier.parse::<CapabilityId>().ok()?;
+                capabilities.push(self.available_capability(&capability)?);
+            }
+            capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
+            words.push(MEMORY_WORD.to_owned());
+            words.sort();
+            words.dedup();
+        }
+        Some((capabilities, words, memory))
+    }
+
+    /// Resolves a provider command only after chat-scope and all-three memory authority checks.
+    pub async fn resolve_command_for_chat(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        claim: &ChatSessionClaim,
+        word: &str,
+        argv: &[String],
+    ) -> Result<CommandResolution, BrokerHostError> {
+        let Some(context) = self.resolve_chat_claim(peer, grant, claim) else {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        };
+        let memory_provider_word =
+            self.registry
+                .command_words_by_provider()
+                .into_iter()
+                .any(|(provider, words)| {
+                    provider.as_str() == MEMORY_PROVIDER && words.iter().any(|value| value == word)
+                });
+        let reserved_nonmemory_provider_word = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .any(|(provider, words)| {
+                provider.as_str() != MEMORY_PROVIDER
+                    && words.iter().any(|value| value == word)
+                    && self.registry.capabilities().any(|(candidate, capability)| {
+                        candidate == provider && capability.id.as_str().starts_with("memory.chat.")
+                    })
+            });
+        if (word == MEMORY_WORD && self.memory_surface(&context, &claim.agent).is_none())
+            || (memory_provider_word && word != MEMORY_WORD)
+            || reserved_nonmemory_provider_word
+        {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        let resolution = self.registry.resolve_command(word, argv).await?;
+        if matches!(
+            &resolution,
+            CommandResolution::Resolved { capability, .. }
+                if (word != MEMORY_WORD
+                    && is_reserved_memory_route(capability, self.constraints.get(capability)))
+                    || (word == MEMORY_WORD
+                        && !matches!(capability.as_str(), MEMORY_RECENT | MEMORY_SEARCH))
+        ) {
+            return Err(BrokerHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            });
+        }
+        Ok(resolution)
+    }
+
+    /// Executes one generic proposal under invocation-bound chat authority.
+    pub async fn invoke_for_chat(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: &ChatAttestation,
+        mut request: InvocationRequest,
+    ) -> Result<InvocationResult, BrokerError> {
+        let claim = ChatSessionClaim {
+            subject: attestation.subject.clone(),
+            agent: attestation.agent.clone(),
+            scope: attestation.scope.clone(),
+        };
+        let context = self
+            .resolve_chat_claim(peer, grant, &claim)
+            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+        let mut refusal = (attestation.invocation != request.id
+            || self.resolve_chat_claim(peer, grant, &claim).is_none())
+        .then_some(Refusal {
+            reason: "chat-attestation-denied",
+            policy_ids: Vec::new(),
+        });
+        if request.capability.as_str() == MEMORY_RECORD {
+            refusal = Some(Refusal {
+                reason: "record-operation-required",
+                policy_ids: Vec::new(),
+            });
+        } else if matches!(request.capability.as_str(), MEMORY_RECENT | MEMORY_SEARCH) {
+            if self.memory_surface(&context, &attestation.agent).is_none() {
+                refusal = Some(Refusal {
+                    reason: "memory-unavailable",
+                    policy_ids: Vec::new(),
+                });
+            } else if let Err(reason) = self.curate_memory_input(&mut request) {
+                refusal = Some(Refusal {
+                    reason,
+                    policy_ids: Vec::new(),
+                });
+            }
+        } else if is_reserved_memory_route(
+            &request.capability,
+            self.constraints.get(&request.capability),
+        ) {
+            refusal = Some(Refusal {
+                reason: "memory-unavailable",
+                policy_ids: Vec::new(),
+            });
+        }
+        self.invoke_inner(&context, request, refusal).await
+    }
+
+    /// Constructs the hidden record proposal from typed post-acceptance fields only.
+    pub async fn record_delivered_turn_for_chat(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: &ChatAttestation,
+        turn: DeliveredTurnRequest,
+    ) -> Result<InvocationResult, BrokerError> {
+        let claim = ChatSessionClaim {
+            subject: attestation.subject.clone(),
+            agent: attestation.agent.clone(),
+            scope: attestation.scope.clone(),
+        };
+        let context = self
+            .resolve_chat_claim(peer, grant, &claim)
+            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+        let refusal = if attestation.invocation != turn.id
+            || self.resolve_chat_claim(peer, grant, &claim).is_none()
+        {
+            Some(Refusal {
+                reason: "chat-attestation-denied",
+                policy_ids: Vec::new(),
+            })
+        } else if self.memory_surface(&context, &attestation.agent).is_none() {
+            Some(Refusal {
+                reason: "memory-unavailable",
+                policy_ids: Vec::new(),
+            })
+        } else if !turn.is_bounded() || !turn.delivery.is_canonical_for(&attestation.scope) {
+            Some(Refusal {
+                reason: "invalid-turn",
+                policy_ids: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let request = InvocationRequest {
+            id: turn.id,
+            capability: MEMORY_RECORD
+                .parse()
+                .expect("reserved memory capability is valid"),
+            trace: turn.trace,
+            trace_parent: turn.trace_parent,
+            input: serde_json::json!({
+                "delivery": turn.delivery,
+                "user": turn.user,
+                "assistant": turn.assistant,
+            }),
+        };
+        self.invoke_inner(&context, request, refusal).await
+    }
+
+    fn resolve_chat_claim(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        claim: &ChatSessionClaim,
+    ) -> Option<AuthenticatedContext> {
+        let grant = grant?;
+        let principal = self.identities.resolve(&claim.subject)?;
+        // `chatScopes` was added for storage namespace authority. An existing subject-only
+        // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
+        // using the chat operations. It receives the legacy context with no trusted chat scope,
+        // which makes the complete durable-memory surface structurally unavailable. Once any
+        // chat scope is authored, the service-specific canonical checks and exact grant apply.
+        let context = if grant.chat_scopes.is_empty() {
+            if !grant.permits(&claim.subject) {
+                return None;
+            }
+            AuthenticatedContext::attested(
+                principal.clone(),
+                Actor::Agent {
+                    agent: claim.agent.clone(),
+                },
+                peer.principal().clone(),
+                claim.subject.clone(),
+            )
+            .ok()?
+        } else {
+            if !grant.permits_chat(&claim.subject, &claim.scope) {
+                return None;
+            }
+            AuthenticatedContext::attested_chat(
+                principal.clone(),
+                Actor::Agent {
+                    agent: claim.agent.clone(),
+                },
+                peer.principal().clone(),
+                claim.subject.clone(),
+                claim.scope.clone(),
+            )
+            .ok()?
+        };
+        self.authorize_agent_prompt(&context, &claim.agent)
+            .allowed
+            .then_some(context)
+    }
+
+    fn memory_surface(
+        &self,
+        context: &AuthenticatedContext,
+        agent: &AgentId,
+    ) -> Option<ChatMemorySurface> {
+        let config = self.chat_memory.as_ref()?;
+        if !config.enabled_for(agent) || context.chat_scope().is_none() {
+            return None;
+        }
+        for identifier in [MEMORY_RECORD, MEMORY_RECENT, MEMORY_SEARCH] {
+            let capability = identifier.parse::<CapabilityId>().ok()?;
+            let set = self.constraints.get(&capability)?;
+            if !self.authorize_capability(context, &capability, set).allowed {
+                return None;
+            }
+        }
+        Some(ChatMemorySurface {
+            max_lookback_turns: config.max_lookback_turns,
+            prompt_note: format!(
+                "Durable chat memory is available on demand. Use `memory recent --last N` or \
+                 `memory search --query TEXT`. Searches inspect at most {} prior turns. Do not \
+                 claim recall without retrieving it.",
+                config.max_lookback_turns
+            ),
+        })
+    }
+
+    fn available_capability(&self, capability: &CapabilityId) -> Option<AvailableCapability> {
+        let set = self.constraints.get(capability)?;
+        let (_, manifest) = self
+            .registry
+            .capabilities()
+            .find(|(_, candidate)| &candidate.id == capability)?;
+        let mut capability = manifest.clone();
+        capability.effect = set.effect;
+        capability.risk = set.risk;
+        capability.idempotency = set.idempotency;
+        Some(AvailableCapability {
+            provider: set.provider.clone(),
+            capability,
+        })
+    }
+
+    fn canonical_authority_surface(
+        &self,
+        context: &AuthenticatedContext,
+        interface: StorageInterface,
+        memory_route: bool,
+    ) -> Result<Vec<u8>, BrokerError> {
+        let mut encoded = AuthorityEncoder::new();
+        encoded.text("format", "dekopon-authority-surface-v1");
+        encoded.text(
+            "backend",
+            if memory_route {
+                "jsonl@0.1.0/chat-memory-format-v1"
+            } else {
+                match interface {
+                    StorageInterface::Jsonl => "jsonl@0.1.0",
+                    StorageInterface::DurableFiles => "durable-files@0.1.0/rollback-journal-v1",
+                }
+            },
+        );
+        // Principal mapping is not part of continuity. The canonical external subject is already
+        // in the base namespace, while this generation commits only the resulting effective
+        // authority. Remapping the same subject without changing that surface must not rotate.
+
+        let artifacts = self
+            .registry
+            .loaded_provider_metadata()
+            .map(|metadata| {
+                (
+                    metadata.manifest.id.clone(),
+                    metadata.artifact_sha256.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let effective_memory_surface = memory_route
+            && match context.actor() {
+                Actor::Agent { agent } => self.memory_surface(context, agent).is_some(),
+                Actor::Human { .. } | Actor::Service { .. } => false,
+            };
+        let effective = self
+            .constraints
+            .iter()
+            .filter(|(capability, set)| {
+                let reserved = is_reserved_memory_route(capability, Some(set));
+                (!reserved || (effective_memory_surface && is_memory_capability(capability)))
+                    && self.authorize_capability(context, capability, set).allowed
+            })
+            .collect::<Vec<_>>();
+        encoded.number("capabilityCount", effective.len() as u128);
+        for (capability, set) in effective {
+            encoded.text("capability", capability.as_str());
+            encoded.text("provider", set.provider.as_str());
+            encoded.byte("effect", effect_tag(set.effect));
+            encoded.byte("risk", risk_tag(set.risk));
+            encoded.byte("idempotency", idempotency_tag(set.idempotency));
+            encoded.optional_text("credential", set.credential_for(context.actor()));
+            encode_execution_constraints(&mut encoded, &set.constraints);
+            let digest = artifacts
+                .get(&set.provider)
+                .ok_or(BrokerError::MemoryUnavailable)?;
+            encoded.text("providerArtifactSha256", digest);
+        }
+
+        encode_host_limits(&mut encoded, self.registry.host_limits());
+
+        let storage = self
+            .registry
+            .storage_host()
+            .ok_or(BrokerError::MemoryUnavailable)?;
+        encode_storage_limits(&mut encoded, storage.limits());
+        if let Some(memory) = self.chat_memory.as_ref().filter(|_| memory_route) {
+            encode_memory_config(&mut encoded, memory);
+        }
+        Ok(encoded.finish())
+    }
+
+    fn prepare_storage_grant(
+        &self,
+        context: &AuthenticatedContext,
+        request: &InvocationRequest,
+        set: &ConstraintSet,
+    ) -> Result<Option<StorageGrantPreparation>, BrokerError> {
+        let Some(storage) = &set.constraints.storage else {
+            return Ok(None);
+        };
+        let scope = context.chat_scope().ok_or(BrokerError::MemoryUnavailable)?;
+        let subject = context
+            .attested_subject()
+            .ok_or(BrokerError::MemoryUnavailable)?;
+        let agent = match context.actor() {
+            Actor::Agent { agent } => agent.clone(),
+            Actor::Human { .. } | Actor::Service { .. } => {
+                return Err(BrokerError::MemoryUnavailable);
+            }
+        };
+        let memory_route =
+            set.provider.as_str() == MEMORY_PROVIDER && is_memory_capability(&request.capability);
+        let authority =
+            self.canonical_authority_surface(context, storage.interface, memory_route)?;
+        let host = self
+            .registry
+            .storage_host()
+            .ok_or(BrokerError::MemoryUnavailable)?;
+        let grant_request = StorageGrantRequest::new(
+            request.id.clone(),
+            request.capability.clone(),
+            set.provider.clone(),
+            storage.interface,
+            storage.access,
+            storage.namespace,
+            agent,
+            subject.clone(),
+            scope.kind.to_string(),
+            scope.transport.to_string(),
+            scope.channel.clone(),
+            scope.conversation.clone(),
+            if memory_route {
+                self.chat_memory
+                    .as_ref()
+                    .map_or(ContinuityPolicy::AuthorityBound, |config| {
+                        config.continuity_policy
+                    })
+            } else {
+                ContinuityPolicy::AuthorityBound
+            },
+            authority,
+        );
+        host.prepare_grant(grant_request)
+            .map(Some)
+            .map_err(|source| BrokerError::Storage { source })
+    }
+
+    fn curate_memory_input(&self, request: &mut InvocationRequest) -> Result<(), &'static str> {
+        let config = self.chat_memory.as_ref().ok_or("memory-unavailable")?;
+        request.input = match request.capability.as_str() {
+            MEMORY_RECENT => {
+                let last = request
+                    .input
+                    .as_object()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.get("last"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|last| *last > 0 && *last <= u64::from(config.max_recent_turns))
+                    .ok_or("invalid-memory-input")?;
+                serde_json::json!({
+                    "operation": "recent", "last": last,
+                    "maxLookbackTurns": config.max_lookback_turns,
+                    "maxRecentTurns": config.max_recent_turns,
+                    "maxResultBytes": config.max_result_bytes,
+                })
+            }
+            MEMORY_SEARCH => {
+                let query = request
+                    .input
+                    .as_object()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.get("query"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|query| {
+                        !query.is_empty() && query.len() as u64 <= config.max_query_bytes
+                    })
+                    .ok_or("invalid-memory-input")?;
+                serde_json::json!({
+                    "operation": "search", "query": query,
+                    "maxLookbackTurns": config.max_lookback_turns,
+                    "maxSearchResults": config.max_search_results,
+                    "maxResultBytes": config.max_result_bytes,
+                })
+            }
+            _ => return Err("invalid-memory-input"),
+        };
+        Ok(())
     }
 
     /// Derives the context an attested proposal is evaluated — or refused — under.
@@ -2008,7 +3206,15 @@ where
         // Identifiers and the decision only. Request input never reaches a span field, exactly as
         // it never reaches an audit field — a refusal must be visible without the payload that
         // was refused being visible with it.
-        let authorize = tracing::info_span!(
+        let storage_candidate = self.capability_uses_storage(&request.capability);
+        let authorize = if storage_candidate {
+            tracing::info_span!(
+                "broker.authorize",
+                invocation = %request.id,
+                outcome = tracing::field::Empty,
+            )
+        } else {
+            tracing::info_span!(
             "broker.authorize",
             invocation = %request.id,
             capability = %request.capability,
@@ -2016,17 +3222,18 @@ where
             via = tracing::field::Empty,
             outcome = tracing::field::Empty,
             input = tracing::field::Empty,
-        );
-        if let Some(subject) = context.attested_subject() {
+            )
+        };
+        if !storage_candidate && let Some(subject) = context.attested_subject() {
             authorize.record("subject", tracing::field::display(subject));
         }
-        if let Some(via) = context.via() {
+        if !storage_candidate && let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
         }
         // Opt-in only. Provider input is the payload the metadata-only default withholds; a
         // `Redacted` value inside it still renders its marker, because that is a property of the
         // value rather than of this mode.
-        if dekopon_core::telemetry_payloads() {
+        if !storage_candidate && dekopon_core::telemetry_payloads() {
             authorize.record("input", tracing::field::display(&request.input));
         }
         let (set, policy_ids) = {
@@ -2057,6 +3264,12 @@ where
                     .deny(context, &request, "unconstrained-capability", Vec::new())
                     .await;
             };
+            if set.constraints.storage.is_some() && context.chat_scope().is_none() {
+                authorize.record("outcome", "chat-scope-required");
+                return self
+                    .deny(context, &request, "chat-scope-required", Vec::new())
+                    .await;
+            }
             let decision = self.authorize_capability(context, &request.capability, &set);
             if !decision.allowed {
                 authorize.record("outcome", "policy-denied");
@@ -2073,11 +3286,15 @@ where
             (set, decision.determining_policy_ids)
         };
         let provider = set.provider.clone();
-        let execute = tracing::info_span!(
-            "broker.execute",
-            provider = %provider,
-            credential = tracing::field::Empty,
-        );
+        let execute = if set.constraints.storage.is_some() {
+            tracing::info_span!("broker.execute", storage = true)
+        } else {
+            tracing::info_span!(
+                "broker.execute",
+                provider = %provider,
+                credential = tracing::field::Empty,
+            )
+        };
         // The symbolic name only, exactly as the audit record carries it: once one capability can
         // present two credentials, a trace that names neither cannot say which organization a
         // write reached. `Redacted` keeps the value itself out of both.
@@ -2115,25 +3332,45 @@ where
             allowed: false,
             reason: Some(reason),
         };
-        let digest = decision_evidence_digest("policy-decision", &material)?;
+        let storage_host = self.registry.storage_host();
+        let storage_backed =
+            storage_host.is_some() && self.capability_uses_storage(&request.capability);
+        let digest = if storage_backed {
+            let bytes = serde_json::to_vec(&material)
+                .map_err(|source| BrokerError::DecisionEvidence { source })?;
+            storage_host
+                .as_ref()
+                .expect("storage_backed proves a configured host")
+                .evidence_commitment("policy-decision", &bytes)
+        } else {
+            decision_evidence_digest("policy-decision", &material)?
+        };
         self.audit
             .append(AuditEvent::Decision {
                 invocation: request.id.clone(),
                 trace: request.trace.clone(),
-                principal: context.principal().clone(),
-                actor: context.actor().clone(),
-                via: context.via().cloned(),
-                attested_subject: context.attested_subject().cloned(),
+                principal: (!storage_backed).then(|| context.principal().clone()),
+                actor: (!storage_backed).then(|| context.actor().clone()),
+                via: (!storage_backed).then(|| context.via().cloned()).flatten(),
+                attested_subject: (!storage_backed)
+                    .then(|| context.attested_subject().cloned())
+                    .flatten(),
                 capability: request.capability.clone(),
                 provider: None,
-                authorized_by: self.broker_principal.clone(),
+                authorized_by: (!storage_backed).then(|| self.broker_principal.clone()),
                 decision_id: decision_id.clone(),
-                policy_revision: self.policy_revision.clone(),
-                policy_ids,
-                policy_digest: Some(self.policy_digest.clone()),
+                policy_revision: (!storage_backed).then(|| self.policy_revision.clone()),
+                policy_ids: if storage_backed {
+                    Vec::new()
+                } else {
+                    policy_ids
+                },
+                policy_digest: (!storage_backed).then(|| self.policy_digest.clone()),
                 allowed: false,
                 reason: Some(reason.to_owned()),
                 decision_digest: digest.clone(),
+                storage_scope_commitment: None,
+                storage: None,
             })
             .await
             .map_err(|source| BrokerError::DecisionAudit { source })?;
@@ -2155,10 +3392,61 @@ where
     async fn execute(
         &self,
         context: &AuthenticatedContext,
-        request: InvocationRequest,
+        mut request: InvocationRequest,
         set: ConstraintSet,
         policy_ids: Vec<String>,
     ) -> Result<InvocationResult, BrokerError> {
+        // Keyed scope/evidence preparation is deliberately non-mutating. The authorization
+        // decision is durably appended before `materialize` may create a namespace, rotate a
+        // generation pointer, or update lifecycle state.
+        let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
+        let storage_scope_commitment = storage_preparation
+            .as_ref()
+            .map(StorageGrantPreparation::scope_commitment);
+        if request.capability.as_str() == MEMORY_RECORD {
+            let config = self
+                .chat_memory
+                .as_ref()
+                .ok_or(BrokerError::MemoryUnavailable)?;
+            let object = request
+                .input
+                .as_object()
+                .filter(|object| object.len() == 3)
+                .ok_or(BrokerError::InvalidMemoryInput)?;
+            let delivery: DeliveryIdentity = object
+                .get("delivery")
+                .cloned()
+                .ok_or(BrokerError::InvalidMemoryInput)
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|_| BrokerError::InvalidMemoryInput)
+                })?;
+            let delivery =
+                serde_json::to_vec(&delivery).map_err(|_| BrokerError::InvalidMemoryInput)?;
+            let user = object
+                .get("user")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(BrokerError::InvalidMemoryInput)?;
+            let assistant = object
+                .get("assistant")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(BrokerError::InvalidMemoryInput)?;
+            let preparation = storage_preparation
+                .as_ref()
+                .ok_or(BrokerError::MemoryUnavailable)?;
+            request.input = serde_json::json!({
+                "operation": "record",
+                "id": preparation.record_id(&delivery),
+                "commitment": preparation.content_commitment(user, assistant),
+                "user": user,
+                "assistant": assistant,
+                "maxTurnBytes": config.max_turn_bytes,
+                "maxLookbackTurns": config.max_lookback_turns,
+                "maxDedupRecords": config.max_dedup_records,
+                "maxDedupBytes": config.max_dedup_bytes,
+                "compactionTargetBytes": config.compaction_target_bytes,
+                "compactionThresholdBytes": config.compaction_threshold_bytes,
+            });
+        }
         let decision_id = format!("allow-{}", request.id);
         let decision = self.decision_reference(&decision_id);
         let invocation_id = request.id.clone();
@@ -2182,7 +3470,13 @@ where
                 set.constraints.clone(),
             )
             .map_err(|source| BrokerError::Authorization { source })?;
-        let decision_digest = decision_evidence_digest("authorized-invocation", &authorized)?;
+        let decision_digest = if let Some(preparation) = storage_preparation.as_ref() {
+            let bytes = serde_json::to_vec(&authorized)
+                .map_err(|source| BrokerError::DecisionEvidence { source })?;
+            preparation.evidence_commitment("authorized-invocation", &bytes)
+        } else {
+            decision_evidence_digest("authorized-invocation", &authorized)?
+        };
         let policy_evidence = Evidence {
             kind: "policy-decision".to_owned(),
             digest: decision_digest.clone(),
@@ -2194,23 +3488,59 @@ where
             .append(AuditEvent::Decision {
                 invocation: invocation_id.clone(),
                 trace: trace.clone(),
-                principal: context.principal().clone(),
-                actor: context.actor().clone(),
-                via: context.via().cloned(),
-                attested_subject: context.attested_subject().cloned(),
+                principal: storage_scope_commitment
+                    .is_none()
+                    .then(|| context.principal().clone()),
+                actor: storage_scope_commitment
+                    .is_none()
+                    .then(|| context.actor().clone()),
+                via: storage_scope_commitment
+                    .is_none()
+                    .then(|| context.via().cloned())
+                    .flatten(),
+                attested_subject: storage_scope_commitment
+                    .is_none()
+                    .then(|| context.attested_subject().cloned())
+                    .flatten(),
                 capability: capability.clone(),
-                provider: Some(set.provider.clone()),
-                authorized_by: self.broker_principal.clone(),
+                provider: storage_scope_commitment
+                    .is_none()
+                    .then(|| set.provider.clone()),
+                authorized_by: storage_scope_commitment
+                    .is_none()
+                    .then(|| self.broker_principal.clone()),
                 decision_id: decision_id.clone(),
-                policy_revision: self.policy_revision.clone(),
-                policy_ids: policy_ids.clone(),
-                policy_digest: Some(self.policy_digest.clone()),
+                policy_revision: storage_scope_commitment
+                    .is_none()
+                    .then(|| self.policy_revision.clone()),
+                policy_ids: if storage_scope_commitment.is_some() {
+                    Vec::new()
+                } else {
+                    policy_ids.clone()
+                },
+                policy_digest: storage_scope_commitment
+                    .is_none()
+                    .then(|| self.policy_digest.clone()),
                 allowed: true,
                 reason: None,
                 decision_digest,
+                storage_scope_commitment: storage_scope_commitment.clone(),
+                storage: None,
             })
             .await
             .map_err(|source| BrokerError::DecisionAudit { source })?;
+
+        let storage_grant = match storage_preparation.take() {
+            None => None,
+            Some(preparation) => Some(
+                tokio::task::spawn_blocking(move || preparation.materialize())
+                    .await
+                    .map_err(|_| BrokerError::Storage {
+                        source: dekopon_storage_host::StorageHostError::Io,
+                    })?
+                    .map_err(|source| BrokerError::Storage { source })?,
+            ),
+        };
 
         // Selected by the acting agent, falling back to the set's default; construction proved
         // every name the set can select exists and that every allowed host sits inside that
@@ -2224,12 +3554,36 @@ where
             .and_then(|name| self.credentials.get(name))
             .cloned();
         let started = Instant::now();
-        let execution = self.registry.invoke(authorized, credential).await;
+        let execution = self
+            .registry
+            .invoke_with_storage(authorized, credential, storage_grant)
+            .await;
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
+            Err(failure)
+                if matches!(
+                    failure.error.as_ref(),
+                    BrokerHostError::Storage { source }
+                        if matches!(
+                            source,
+                            dekopon_storage_host::StorageHostError::OutcomeUnaudited
+                        )
+                ) =>
+            {
+                return Err(BrokerError::StorageOutcome {
+                    invocation: invocation_id,
+                });
+            }
             Ok(output) => {
-                let output_digest =
-                    outcome_evidence_digest(&invocation_id, "provider-response", &output.output)?;
+                let output_digest = output.storage.as_ref().map_or_else(
+                    || outcome_evidence_digest(&invocation_id, "provider-response", &output.output),
+                    |storage| {
+                        Ok(storage
+                            .output_commitment
+                            .clone()
+                            .unwrap_or_else(|| storage.evidence_commitment.clone()))
+                    },
+                )?;
                 let mut evidence = vec![policy_evidence];
                 evidence.push(Evidence {
                     kind: "provider-response".to_owned(),
@@ -2237,6 +3591,14 @@ where
                     media_type: PROVIDER_EVIDENCE_MEDIA_TYPE.to_owned(),
                     uri: None,
                 });
+                if let Some(storage) = &output.storage {
+                    evidence.push(Evidence {
+                        kind: "storage".to_owned(),
+                        digest: storage.evidence_commitment.clone(),
+                        media_type: STORAGE_EVIDENCE_MEDIA_TYPE.to_owned(),
+                        uri: None,
+                    });
+                }
                 if !output.http_calls.is_empty() {
                     evidence.push(Evidence {
                         kind: "http-calls".to_owned(),
@@ -2266,6 +3628,8 @@ where
                     None,
                     Some(output_digest),
                     output.http_calls,
+                    storage_scope_commitment.clone(),
+                    output.storage,
                 );
                 (
                     InvocationResult {
@@ -2284,6 +3648,14 @@ where
                 // A failure can follow calls that already left the host; their sanitized
                 // metadata belongs in the terminal record exactly as it would on success.
                 let mut evidence = vec![policy_evidence];
+                if let Some(storage) = &failure.storage {
+                    evidence.push(Evidence {
+                        kind: "storage".to_owned(),
+                        digest: storage.evidence_commitment.clone(),
+                        media_type: STORAGE_EVIDENCE_MEDIA_TYPE.to_owned(),
+                        uri: None,
+                    });
+                }
                 if !failure.http_calls.is_empty() {
                     evidence.push(Evidence {
                         kind: "http-calls".to_owned(),
@@ -2313,6 +3685,8 @@ where
                     Some(error.clone()),
                     None,
                     failure.http_calls,
+                    storage_scope_commitment.clone(),
+                    failure.storage,
                 );
                 (
                     InvocationResult {
@@ -2347,6 +3721,297 @@ where
     }
 }
 
+/// Versioned length-prefixed authority encoding. Every field has a fixed label and binary value;
+/// no YAML/JSON formatting, map insertion order, path, or telemetry setting can affect it.
+struct AuthorityEncoder {
+    bytes: Vec<u8>,
+}
+
+impl AuthorityEncoder {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn field(&mut self, label: &str, value: &[u8]) {
+        self.bytes
+            .extend_from_slice(&(label.len() as u64).to_be_bytes());
+        self.bytes.extend_from_slice(label.as_bytes());
+        self.bytes
+            .extend_from_slice(&(value.len() as u64).to_be_bytes());
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn text(&mut self, label: &str, value: &str) {
+        self.field(label, value.as_bytes());
+    }
+
+    fn number(&mut self, label: &str, value: u128) {
+        self.field(label, &value.to_be_bytes());
+    }
+
+    fn byte(&mut self, label: &str, value: u8) {
+        self.field(label, &[value]);
+    }
+
+    fn boolean(&mut self, label: &str, value: bool) {
+        self.byte(label, u8::from(value));
+    }
+
+    fn optional_text(&mut self, label: &str, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.byte(&format!("{label}.present"), 1);
+                self.text(label, value);
+            }
+            None => self.byte(&format!("{label}.present"), 0),
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+fn effect_tag(value: EffectKind) -> u8 {
+    match value {
+        EffectKind::ReadOnly => 0,
+        EffectKind::LocalWrite => 1,
+        EffectKind::ExternalWrite => 2,
+    }
+}
+
+fn risk_tag(value: RiskLevel) -> u8 {
+    match value {
+        RiskLevel::Low => 0,
+        RiskLevel::Medium => 1,
+        RiskLevel::High => 2,
+        RiskLevel::Critical => 3,
+    }
+}
+
+fn idempotency_tag(value: Idempotency) -> u8 {
+    match value {
+        Idempotency::Idempotent => 0,
+        Idempotency::Conditional => 1,
+        Idempotency::NonIdempotent => 2,
+    }
+}
+
+fn encode_execution_constraints(
+    encoded: &mut AuthorityEncoder,
+    constraints: &ExecutionConstraints,
+) {
+    encoded.number("execution.timeoutMs", u128::from(constraints.timeout_ms));
+    encoded.number(
+        "execution.maxOutputBytes",
+        u128::from(constraints.max_output_bytes),
+    );
+    if let Some(http) = &constraints.http {
+        encoded.byte("execution.http.present", 1);
+        let hosts = http.allowed_hosts.iter().collect::<BTreeSet<_>>();
+        encoded.number("execution.http.allowedHostCount", hosts.len() as u128);
+        for host in hosts {
+            encoded.text("execution.http.allowedHost", host);
+        }
+        let methods = http.allowed_methods.iter().collect::<BTreeSet<_>>();
+        encoded.number("execution.http.allowedMethodCount", methods.len() as u128);
+        for method in methods {
+            encoded.text("execution.http.allowedMethod", method);
+        }
+        encoded.number("execution.http.maxRequests", u128::from(http.max_requests));
+        encoded.number(
+            "execution.http.maxRequestBytes",
+            u128::from(http.max_request_bytes),
+        );
+        encoded.number(
+            "execution.http.maxResponseBytes",
+            u128::from(http.max_response_bytes),
+        );
+        encoded.boolean(
+            "execution.http.allowPlaintextLoopback",
+            http.allow_plaintext_loopback,
+        );
+    } else {
+        encoded.byte("execution.http.present", 0);
+    }
+    if let Some(storage) = &constraints.storage {
+        encoded.byte("execution.storage.present", 1);
+        encoded.byte(
+            "execution.storage.interface",
+            match storage.interface {
+                StorageInterface::Jsonl => 0,
+                StorageInterface::DurableFiles => 1,
+            },
+        );
+        encoded.byte(
+            "execution.storage.access",
+            match storage.access {
+                StorageAccess::ReadOnly => 0,
+                StorageAccess::ReadWrite => 1,
+            },
+        );
+        encoded.byte(
+            "execution.storage.namespace",
+            match storage.namespace {
+                StorageNamespace::Chat => 0,
+            },
+        );
+    } else {
+        encoded.byte("execution.storage.present", 0);
+    }
+}
+
+fn encode_host_limits(
+    encoded: &mut AuthorityEncoder,
+    limits: &dekopon_broker_host::BrokerHostLimits,
+) {
+    encoded.number("host.maxMemoryBytes", limits.max_memory_bytes as u128);
+    encoded.number("host.maxTableElements", limits.max_table_elements as u128);
+    encoded.number("host.maxInstances", limits.max_instances as u128);
+    encoded.number("host.maxTables", limits.max_tables as u128);
+    encoded.number("host.maxMemories", limits.max_memories as u128);
+    encoded.number("host.maxInputBytes", limits.max_input_bytes as u128);
+    encoded.number("host.maxOutputBytes", limits.max_output_bytes as u128);
+    encoded.number("host.maxHttpRequests", u128::from(limits.max_http_requests));
+    encoded.number(
+        "host.maxHttpRequestBytes",
+        u128::from(limits.max_http_request_bytes),
+    );
+    encoded.number(
+        "host.maxHttpResponseBytes",
+        u128::from(limits.max_http_response_bytes),
+    );
+    encoded.number("host.maxHttpHeaders", limits.max_http_headers as u128);
+    encoded.number(
+        "host.maxHttpHeaderBytes",
+        limits.max_http_header_bytes as u128,
+    );
+    encoded.number("host.fuel", u128::from(limits.fuel));
+    encoded.number("host.maxTimeoutNanos", limits.max_timeout.as_nanos());
+}
+
+fn encode_memory_config(encoded: &mut AuthorityEncoder, memory: &ChatMemoryConfig) {
+    encoded.byte(
+        "memory.continuityPolicy",
+        match memory.continuity_policy {
+            ContinuityPolicy::Stable => 0,
+            ContinuityPolicy::AuthorityBound => 1,
+        },
+    );
+    encoded.number(
+        "memory.maxLookbackTurns",
+        u128::from(memory.max_lookback_turns),
+    );
+    encoded.number("memory.maxRecentTurns", u128::from(memory.max_recent_turns));
+    encoded.number(
+        "memory.maxSearchResults",
+        u128::from(memory.max_search_results),
+    );
+    encoded.number("memory.maxQueryBytes", u128::from(memory.max_query_bytes));
+    encoded.number("memory.maxResultBytes", u128::from(memory.max_result_bytes));
+    encoded.number("memory.maxTurnBytes", u128::from(memory.max_turn_bytes));
+    encoded.number(
+        "memory.maxDedupRecords",
+        u128::from(memory.max_dedup_records),
+    );
+    encoded.number("memory.maxDedupBytes", u128::from(memory.max_dedup_bytes));
+    encoded.number(
+        "memory.compactionTargetBytes",
+        u128::from(memory.compaction_target_bytes),
+    );
+    encoded.number(
+        "memory.compactionThresholdBytes",
+        u128::from(memory.compaction_threshold_bytes),
+    );
+}
+
+fn encode_storage_limits(
+    encoded: &mut AuthorityEncoder,
+    limits: &dekopon_storage_host::StorageLimits,
+) {
+    for (label, value) in [
+        ("storage.maxRootBytes", limits.max_root_bytes),
+        ("storage.maxNamespaces", limits.max_namespaces),
+        ("storage.maxNamespaceBytes", limits.max_namespace_bytes),
+        (
+            "storage.maxFilesPerNamespace",
+            limits.max_files_per_namespace,
+        ),
+        ("storage.maxFileBytes", limits.max_file_bytes),
+        ("storage.maxOpenHandles", limits.max_open_handles),
+        (
+            "storage.maxHandlesPerInvocation",
+            limits.max_handles_per_invocation,
+        ),
+        (
+            "storage.maxHostCallsPerInvocation",
+            limits.max_host_calls_per_invocation,
+        ),
+        (
+            "storage.maxReadBytesPerCall",
+            limits.max_read_bytes_per_call,
+        ),
+        (
+            "storage.maxReadBytesPerInvocation",
+            limits.max_read_bytes_per_invocation,
+        ),
+        (
+            "storage.maxWriteBytesPerCall",
+            limits.max_write_bytes_per_call,
+        ),
+        (
+            "storage.maxWriteBytesPerInvocation",
+            limits.max_write_bytes_per_invocation,
+        ),
+        (
+            "storage.maxEntropyBytesPerCall",
+            limits.max_entropy_bytes_per_call,
+        ),
+        (
+            "storage.maxEntropyBytesPerInvocation",
+            limits.max_entropy_bytes_per_invocation,
+        ),
+        ("storage.lockTimeoutMs", limits.lock_timeout_ms),
+        (
+            "storage.finalizationBudgetMs",
+            limits.finalization_budget_ms,
+        ),
+        (
+            "storage.maxPendingTransactions",
+            limits.max_pending_transactions,
+        ),
+        ("storage.startupMaxEntries", limits.startup_max_entries),
+        (
+            "storage.startupMaxTransactions",
+            limits.startup_max_transactions,
+        ),
+        (
+            "storage.maxQuarantinedNamespaces",
+            limits.max_quarantined_namespaces,
+        ),
+        (
+            "storage.retiredGenerationGraceMs",
+            limits.retired_generation_grace_ms,
+        ),
+        (
+            "storage.retiredGenerationTtlMs",
+            limits.retired_generation_ttl_ms,
+        ),
+        (
+            "storage.inactiveNamespaceTtlMs",
+            limits.inactive_namespace_ttl_ms,
+        ),
+        ("storage.gcIntervalMs", limits.gc_interval_ms),
+        (
+            "storage.gcMaxNamespacesPerPass",
+            limits.gc_max_namespaces_per_pass,
+        ),
+        ("storage.gcMaxBytesPerPass", limits.gc_max_bytes_per_pass),
+    ] {
+        encoded.number(label, u128::from(value));
+    }
+}
+
 /// A refusal decided before policy evaluation, carried into the audited denial.
 struct Refusal {
     reason: &'static str,
@@ -2374,30 +4039,43 @@ fn execution_event(
     error: Option<String>,
     output_digest: Option<String>,
     http_calls: Vec<HttpCallEvidence>,
+    storage_scope_commitment: Option<StorageScopeCommitment>,
+    storage: Option<StorageEvidence>,
 ) -> AuditEvent {
+    let storage_backed = storage_scope_commitment.is_some();
     AuditEvent::Execution {
         invocation: invocation.clone(),
         trace: trace.clone(),
-        principal: context.principal().clone(),
-        actor: context.actor().clone(),
-        via: context.via().cloned(),
-        attested_subject: context.attested_subject().cloned(),
+        principal: (!storage_backed).then(|| context.principal().clone()),
+        actor: (!storage_backed).then(|| context.actor().clone()),
+        via: (!storage_backed).then(|| context.via().cloned()).flatten(),
+        attested_subject: (!storage_backed)
+            .then(|| context.attested_subject().cloned())
+            .flatten(),
         capability: capability.clone(),
-        provider: set.provider.clone(),
-        authorized_by: authorized_by.clone(),
+        provider: (!storage_backed).then(|| set.provider.clone()),
+        authorized_by: (!storage_backed).then(|| authorized_by.clone()),
         decision_id: decision_id.to_owned(),
-        policy_revision: policy_revision.to_owned(),
-        policy_ids: policy_ids.to_vec(),
-        policy_digest: Some(policy_digest.to_owned()),
+        policy_revision: (!storage_backed).then(|| policy_revision.to_owned()),
+        policy_ids: if storage_backed {
+            Vec::new()
+        } else {
+            policy_ids.to_vec()
+        },
+        policy_digest: (!storage_backed).then(|| policy_digest.to_owned()),
         effect: set.effect,
         risk: set.risk,
         idempotency: set.idempotency,
-        credential: credential.map(str::to_owned),
+        credential: (!storage_backed)
+            .then(|| credential.map(str::to_owned))
+            .flatten(),
         outcome,
         duration_ms,
         error,
         output_digest,
         http_calls,
+        storage_scope_commitment,
+        storage,
     }
 }
 
@@ -2473,6 +4151,11 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
     match error {
         BrokerHostError::AuthorizationExceedsHostLimit { .. }
         | BrokerHostError::InvalidHttpAuthorization
+        | BrokerHostError::MixedHostAuthorization
+        | BrokerHostError::StorageDisabled
+        | BrokerHostError::MissingStorageGrant
+        | BrokerHostError::UnexpectedStorageGrant
+        | BrokerHostError::StorageGrantMismatch
         | BrokerHostError::HttpConfiguration { .. } => "authorization-constraint",
         BrokerHostError::UnknownCapability { .. }
         | BrokerHostError::ProviderDoesNotImplement { .. }
@@ -2494,7 +4177,49 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::InvalidCommandResolution { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
+        BrokerHostError::StorageCallRejected {
+            reason: "quota", ..
+        } => "storage-quota",
+        BrokerHostError::StorageCallRejected {
+            reason: "timeout", ..
+        } => "storage-timeout",
+        BrokerHostError::StorageCallRejected {
+            reason: "corrupt", ..
+        } => "storage-corrupt",
+        BrokerHostError::StorageCallRejected {
+            reason: "denied", ..
+        } => "storage-io",
+        BrokerHostError::StorageCallRejected { .. } => "storage-io",
+        BrokerHostError::Storage { source } => match source {
+            dekopon_storage_host::StorageHostError::QuotaExceeded => "storage-quota",
+            dekopon_storage_host::StorageHostError::Busy => "storage-busy",
+            dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
+            dekopon_storage_host::StorageHostError::Corrupt { .. }
+            | dekopon_storage_host::StorageHostError::CorruptLayout
+            | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
+            _ => "storage-io",
+        },
         BrokerHostError::Invoke { .. } => "provider-trap",
+        BrokerHostError::ProviderFailure {
+            provider,
+            capability,
+            code,
+            ..
+        } if provider.as_str() == MEMORY_PROVIDER
+            && is_memory_capability(capability)
+            && matches!(
+                code.as_str(),
+                "memory-corrupt" | "result-too-large" | "dedup-conflict" | "dedup-capacity"
+            ) =>
+        {
+            match code.as_str() {
+                "memory-corrupt" => "memory-corrupt",
+                "result-too-large" => "result-too-large",
+                "dedup-conflict" => "dedup-conflict",
+                "dedup-capacity" => "dedup-capacity",
+                _ => "provider-failure",
+            }
+        }
         BrokerHostError::ProviderFailure { .. } => "provider-failure",
         BrokerHostError::NoProviders
         | BrokerHostError::InvalidLimit { .. }
@@ -2522,6 +4247,18 @@ pub enum BrokerError {
     ReplayLedgerFull {
         /// Configured maximum.
         maximum: usize,
+    },
+    /// Optional chat memory was not effective for this trusted context.
+    #[error("chat memory is unavailable")]
+    MemoryUnavailable,
+    /// Trusted memory input construction rejected an impossible shape.
+    #[error("chat memory input is invalid")]
+    InvalidMemoryInput,
+    /// Storage grant derivation or housekeeping failed before provider execution.
+    #[error("broker storage authority failed")]
+    Storage {
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
     },
     /// A validated policy rule could not create authorization state.
     #[error("broker could not create constrained authorization")]
@@ -2553,6 +4290,9 @@ pub enum BrokerError {
         #[source]
         source: serde_json::Error,
     },
+    /// Storage crossed its durable marker but live finalization failed.
+    #[error("storage outcome for {invocation} is unaudited")]
+    StorageOutcome { invocation: InvocationId },
     /// Terminal execution could not be audited after provider work ended.
     #[error("broker could not audit terminal execution for {invocation}")]
     OutcomeAudit {
@@ -2575,12 +4315,32 @@ impl BrokerError {
     /// Transports are expected to preserve this distinction; collapsing both cases into one
     /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
     #[must_use]
+    pub const fn storage_failure_code(&self) -> Option<&'static str> {
+        let Self::Storage { source } = self else {
+            return None;
+        };
+        Some(match source {
+            dekopon_storage_host::StorageHostError::QuotaExceeded
+            | dekopon_storage_host::StorageHostError::Arithmetic => "storage-quota",
+            dekopon_storage_host::StorageHostError::Busy => "storage-busy",
+            dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
+            dekopon_storage_host::StorageHostError::Corrupt { .. }
+            | dekopon_storage_host::StorageHostError::CorruptLayout
+            | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
+            _ => "storage-io",
+        })
+    }
+
+    #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {
-            Self::OutcomeEvidence { invocation, .. } | Self::OutcomeAudit { invocation, .. } => {
-                Some(invocation)
-            }
+            Self::OutcomeEvidence { invocation, .. }
+            | Self::OutcomeAudit { invocation, .. }
+            | Self::StorageOutcome { invocation } => Some(invocation),
             Self::ReplayLedgerFull { .. }
+            | Self::MemoryUnavailable
+            | Self::InvalidMemoryInput
+            | Self::Storage { .. }
             | Self::Authorization { .. }
             | Self::DecisionEvidence { .. }
             | Self::DecisionAudit { .. } => None,

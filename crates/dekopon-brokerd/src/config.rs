@@ -6,8 +6,8 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, BrokerLimits, ConstraintSet, ContextError,
-    DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
+    AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
+    ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
 };
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_broker_protocol::{
@@ -16,6 +16,7 @@ use dekopon_broker_protocol::{
 use dekopon_core::{
     Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
 };
+use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -87,9 +88,25 @@ pub struct BrokerdConfig {
     pub broker_limits: BrokerLimits,
     #[serde(default)]
     pub server_limits: ServerLimitsConfig,
+    /// Optional broker-owned provider storage. Presence requires every field.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    /// Optional all-or-nothing durable chat-memory surface.
+    #[serde(default)]
+    pub chat_memory: Option<ChatMemoryConfig>,
     /// Optional OTLP export. Absent means the broker exports no telemetry.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Strict broker-owned provider-storage paths and ceilings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StorageConfig {
+    pub root_path: PathBuf,
+    pub namespace_key_path: PathBuf,
+    #[serde(flatten)]
+    pub limits: StorageLimits,
 }
 
 /// Broker-owned OTLP export settings.
@@ -286,6 +303,8 @@ pub struct ResolvedConfig {
     pub host_limits: BrokerHostLimits,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
+    pub storage: Option<StorageConfig>,
+    pub chat_memory: Option<ChatMemoryConfig>,
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
@@ -503,6 +522,40 @@ fn resolve(
     };
     let credentials_path = canonical(config.credentials_path)?;
     let policies_path = canonical(config.policies_path)?;
+    let storage = config
+        .storage
+        .map(|mut storage| {
+            // Storage paths preserve their configured spelling until every original ancestor has
+            // been walked through retained `openat(...NOFOLLOW...)` descriptors. Canonicalizing a
+            // parent here would erase precisely the symlink the storage boundary must reject.
+            storage.root_path =
+                dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
+                    .map_err(|_| ConfigError::InvalidStorage)?;
+            storage.namespace_key_path = dekopon_storage_host::resolve_namespace_key_path(
+                &resolve_path(storage.namespace_key_path),
+            )
+            .map_err(|_| ConfigError::InvalidStorage)?;
+            if storage.namespace_key_path.starts_with(&storage.root_path)
+                || storage.namespace_key_path == storage.root_path
+            {
+                return Err(ConfigError::StorageStateCollision);
+            }
+            storage
+                .limits
+                .validate()
+                .map_err(|_| ConfigError::InvalidStorage)?;
+            Ok::<_, ConfigError>(storage)
+        })
+        .transpose()?;
+    let chat_memory = config.chat_memory;
+    if chat_memory.is_some() && storage.is_none() {
+        return Err(ConfigError::ChatMemoryWithoutStorage);
+    }
+    if let (Some(memory), Some(storage)) = (&chat_memory, &storage) {
+        memory
+            .validate(&storage.limits)
+            .map_err(|_| ConfigError::InvalidChatMemory)?;
+    }
     let mut provider_set = BTreeSet::new();
     let mut providers = Vec::with_capacity(config.providers.len());
     for entry in config.providers {
@@ -542,6 +595,28 @@ fn resolve(
     }
     if let Some(policies_path) = &policies_path {
         reserved.push(policies_path.clone());
+    }
+    if let Some(storage) = &storage {
+        reserved.push(storage.namespace_key_path.clone());
+        if audit_path.starts_with(&storage.root_path)
+            || checkpoint_path.starts_with(&storage.root_path)
+            || storage.root_path == audit_path.parent().unwrap_or(Path::new("/"))
+        {
+            return Err(ConfigError::StorageStateCollision);
+        }
+    }
+    if let Some(storage) = &storage
+        && (reserved
+            .iter()
+            .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path))
+            || providers
+                .iter()
+                .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path)))
+    {
+        // Initialization owns every entry under the root and rejects unknown ones. Refuse this at
+        // config resolution rather than letting a future socket or audit file poison the storage
+        // layout after the first successful start.
+        return Err(ConfigError::StorageStateCollision);
     }
     if reserved.iter().collect::<BTreeSet<_>>().len() != reserved.len()
         || providers
@@ -603,11 +678,32 @@ fn resolve(
             minimum: maximum_response,
         });
     }
-    let minimum_shutdown = host_limits
+    if let Some(memory) = &chat_memory {
+        memory
+            .validate_host_limits(&host_limits)
+            .map_err(|_| ConfigError::InvalidChatMemory)?;
+        let result =
+            usize::try_from(memory.max_result_bytes).map_err(|_| ConfigError::InvalidChatMemory)?;
+        if result
+            .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
+            .is_none_or(|bytes| bytes > frame_limits.max_frame_bytes)
+        {
+            return Err(ConfigError::InvalidChatMemory);
+        }
+    }
+    let mut minimum_shutdown = host_limits
         .max_timeout
         .checked_add(frame_limits.io_timeout)
         .and_then(|duration| duration.checked_add(frame_limits.io_timeout))
         .ok_or(ConfigError::InvalidServerLimits)?;
+    if let Some(storage) = &storage {
+        minimum_shutdown = minimum_shutdown
+            .checked_add(Duration::from_millis(storage.limits.lock_timeout_ms))
+            .and_then(|duration| {
+                duration.checked_add(Duration::from_millis(storage.limits.finalization_budget_ms))
+            })
+            .ok_or(ConfigError::InvalidServerLimits)?;
+    }
     if config.server_limits.shutdown_grace() < minimum_shutdown {
         return Err(ConfigError::ShortShutdownGrace);
     }
@@ -642,6 +738,8 @@ fn resolve(
         host_limits,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
+        storage,
+        chat_memory,
         telemetry,
     })
 }
@@ -734,9 +832,17 @@ pub enum ConfigError {
     InvalidServerLimits,
     #[error("host timeout must be positive")]
     InvalidHostLimits,
+    #[error("invalid provider storage limits")]
+    InvalidStorage,
+    #[error("chatMemory requires storage")]
+    ChatMemoryWithoutStorage,
+    #[error("chat-memory bounds do not compose with frame, Wasm, host, and storage limits")]
+    InvalidChatMemory,
+    #[error("provider storage root/key and broker-owned files must be disjoint")]
+    StorageStateCollision,
     #[error("response frame maximum must be at least {minimum} bytes for configured host output")]
     SmallResponseFrame { minimum: usize },
-    #[error("shutdown grace must cover one host deadline and two complete frame deadlines")]
+    #[error("shutdown grace must cover host, storage lock/finalization, and two frame deadlines")]
     ShortShutdownGrace,
     #[error("invalid broker telemetry configuration")]
     Telemetry {

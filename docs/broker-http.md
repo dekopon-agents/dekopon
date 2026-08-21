@@ -4,7 +4,7 @@ This document records the implemented privileged host, local Unix broker, creden
 
 ## Current foundation
 
-The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. The broker host compiles components once, creates fresh bounded stores, links only the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata.
+The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. For HTTP operations, the broker host compiles components once, creates fresh bounded stores, links the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata. This tree additionally links the independent project-owned storage package only under the exact grant described below.
 
 `dekopon-broker` now binds a separately supplied authenticated context, asks a `dekopon-policy` Cedar engine whether it may act, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
@@ -71,6 +71,10 @@ The protocol exposes only the operations needed by a broker client:
 - submit one invocation proposal;
 - inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
 - submit one proposal attested on behalf of an external subject (`invokeFor`);
+- use invocation-bound chat operations (`capabilitiesForChat`, `resolveCommandForChat`, and
+  `invokeForChat`) only under a matching owner-authored `chatScopes` grant;
+- submit hidden post-acceptance recording only through `recordDeliveredTurnForChat` — never generic
+  invocation;
 - let a mapped attestor publish a bounded informational catalog inventory and model-token delta for the process-local web UI; and
 - receive a denied, succeeded, or failed result with bounded public evidence metadata.
 
@@ -98,6 +102,7 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `invalid-request` | The request frame could not be decoded. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
+| `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. | Yes under a fresh identifier after correcting or reconciling the storage condition. |
 
 `outcome-unaudited` is the durable-state signal that separates "nothing happened" from "something may have happened and nothing recorded it". It is emitted only for failures raised after execution began — a failed terminal audit append, or a failure to hash terminal evidence. A denied or failed *invocation* is not a failure response at all: it returns a normal result carrying its outcome and decision linkage.
 
@@ -220,6 +225,27 @@ The credential's *name* is deliberately in that list and its value is deliberate
 The bounded in-memory implementation hash-links events for tests. `FileAuditLog` persists exclusively writer-locked owner-only bounded JSONL, verifies the complete existing chain before append, synchronizes every decision/outcome, rejects partial writes, reconstructs replay IDs on restart, and can verify an exact count/head prefix. `dekopon-brokerd` maintains that count/head in a separate strict owner-only checkpoint under its own writer lock. It writes audit first, then synchronizes and atomically replaces the checkpoint; startup fails if a non-empty audit has no checkpoint or the checkpoint is not an exact verified prefix. A valid checkpoint exactly one record behind the audit is the recoverable crash window and is advanced before listening; a larger gap fails closed.
 
 This detects valid-prefix truncation relative to the retained checkpoint and makes the head available to an external verifier. It is local integrity evidence, not tamper-proof storage against a compromised broker host: coordinated rollback or deletion of both files requires independent checkpoint retention to detect. Durable remote anchoring, key-backed signatures, tenancy, and incident-response machinery remain separate work.
+
+## Storage is a sibling privileged host interface
+
+**Status: current in this tree, unreleased.** `dekopon:storage@0.1.0` is independent of HTTP.
+Constraint sets select exactly `jsonl` or `durable-files`, read-only or read-write, and chat
+namespace; combining HTTP and storage is refused. The broker derives every opaque namespace from
+the authorized context, consumes a host-instance/invocation/capability/provider-bound grant, and
+commits only a valid `Succeeded` response. Stable public classes are `storage-quota`,
+`storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io`, and
+`outcome-unaudited`. The trusted memory provider additionally allowlists only
+`memory-corrupt`, `result-too-large`, `dedup-conflict`, and `dedup-capacity`; arbitrary provider
+messages remain `provider-failure`.
+
+Chat scope is not inferred from subject authority. The claim includes configured transport ID,
+transport kind, canonical channel, and canonical conversation; owner configuration grants explicit
+breadth and Cedar sees those four trusted optional context fields. Each swapped/malformed/overbound
+field denies before namespace creation.
+
+The gateway receipt proves complete transport acceptance (service acceptance for Slack, Telegram,
+and Discord; kernel acceptance for local), not human receipt. One dedicated record request follows,
+with no automatic retry after response loss or outcome-unknown.
 
 ## Version and implementation policy
 

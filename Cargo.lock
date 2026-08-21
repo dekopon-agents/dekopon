@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-agent"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -793,13 +793,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-broker-host",
  "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
  "dekopon-policy",
+ "dekopon-storage-host",
  "fs2",
  "libc",
  "serde",
@@ -813,15 +814,17 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-host"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
+ "dekopon-storage-host",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -830,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -844,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-brokerd"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clap",
  "dekopon-broker",
@@ -854,6 +857,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-policy",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-webui",
  "fs2",
@@ -873,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-core",
  "schemars 1.2.2",
@@ -884,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -898,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -908,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-http-host"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -924,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -938,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-policy"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cedar-policy",
  "dekopon-capability",
@@ -950,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -962,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-host"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -976,14 +980,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-http"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "wit-bindgen 0.44.0",
 ]
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -994,8 +998,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-provider-storage"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.44.0",
+]
+
+[[package]]
 name = "dekopon-run"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -1030,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-shell"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1044,8 +1055,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-storage-host"
+version = "0.9.0"
+dependencies = [
+ "dekopon-capability",
+ "dekopon-core",
+ "fs2",
+ "getrandom 0.4.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dekopon-telemetry"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -1064,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-testkit"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-config",
@@ -1076,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-webui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "dekopon-broker-host",
@@ -1089,8 +1117,9 @@ dependencies = [
 
 [[package]]
 name = "dekopond"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "dekopon-agent",
  "dekopon-broker-protocol",
@@ -1100,8 +1129,10 @@ dependencies = [
  "dekopon-model",
  "dekopon-protocol",
  "dekopon-shell",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "futures-util",
+ "getrandom 0.4.3",
  "libc",
  "opentelemetry",
  "reqwest",
@@ -2164,6 +2195,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2811,6 +2852,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3715,6 +3757,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

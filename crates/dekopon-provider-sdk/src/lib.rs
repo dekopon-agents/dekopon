@@ -81,8 +81,8 @@ pub trait Provider {
     /// Rewrites one argv into a capability proposal.
     ///
     /// This is where a provider implements the ergonomic spelling of its own capabilities —
-    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. `argv[0]`
-    /// is the command word the model typed, which is always one this provider declared.
+    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. The command
+    /// word is selected before this call; `argv` contains only the arguments after it.
     ///
     /// It is a **pure rewrite and grants nothing**. What it returns is a proposal, authorized on
     /// exactly the path a direct `cap <id> {…}` call takes: constraint-set lookup, Cedar

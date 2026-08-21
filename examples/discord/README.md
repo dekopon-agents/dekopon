@@ -20,17 +20,18 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
 
 4. Scroll down to **OAuth2 URL Generator**. Under **Scopes**, select only **bot**. Selecting that
    checkbox expands the **Bot Permissions** section below it.
-5. In the expanded permissions, select exactly these four entries and leave **Administrator** and
+5. In the expanded permissions, select exactly these five entries and leave **Administrator** and
    every other permission unchecked:
    - **View Channels** under General Permissions
    - **Send Messages** under Text Permissions
    - **Send Messages in Threads** under Text Permissions
    - **Read Message History** under Text Permissions
+   - **Attach Files** under Text Permissions, for generated-image replies
 6. Copy the **Generated URL** at the bottom of the form. The URL used for the one-time server
    installation step will look like this; again, the application ID is illustrative:
 
    ```text
-   https://discord.com/oauth2/authorize?client_id=123456789012345678&permissions=274877975552&integration_type=0&scope=bot
+   https://discord.com/oauth2/authorize?client_id=123456789012345678&permissions=274878008320&integration_type=0&scope=bot
    ```
 
    Open that URL, choose the intended server, and authorize the app. The installing account needs
@@ -56,6 +57,7 @@ transports:
   - name: community-discord
     kind: discordGateway
     botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
+    activity: { mode: native } # optional; absent/off preserves reply-only behavior
 
 routes:
   - transport: community-discord
@@ -77,6 +79,12 @@ its transient thread IDs.
 In guild channels, Discord's structured `mentions` array decides whether the bot was addressed.
 Ambient messages never start a model session. Direct messages are addressed by definition. Bot,
 webhook, self-authored, and system messages are dropped.
+
+With native activity enabled, an authorized session triggers Discord's channel typing indicator and
+renews it around every eight seconds inside Discord's ten-second lease. It starts only after fresh
+broker authorization, never holds the final-message REST lock, and stops renewing before the reply.
+Discord has no explicit clear endpoint; the final message clears it sooner. Activity errors and rate
+limits are cosmetic and never alter the answer.
 
 ## 3. Map Discord users at the broker
 
@@ -114,6 +122,15 @@ and expire. If a retained URL returns 401, 403, or 404, the gateway re-reads the
 from Discord REST, selects the same attachment ID, validates the refreshed CDN URL, and retries the
 bounded download. Attachment bytes are dropped after the model request and are never written to
 conversation history.
+
+## Generated image replies
+
+A route that explicitly names an image generator may attach one gateway-named PNG to the first
+Create Message call as `multipart/form-data`. `payload_json` retains the same no-mentions policy
+and inbound reply reference as text-only JSON; `files[0]` carries at most 8 MiB. If Discord accepts
+that first post and rejects a later split text chunk, Dekopon reports partial delivery and performs
+no durable chat-memory record. No configured generator means no generation tool and byte-identical
+text-only requests. The installation needs **Attach Files**, as listed above.
 
 ## Replies
 

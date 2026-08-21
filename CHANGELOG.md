@@ -7,6 +7,89 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
+  Discord, Telegram, and the local development transport.
+- Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
+  engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
+- Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
+  search` commands, with stable or non-reusing authority-bound continuity across restarts.
+- Added chat-scope grants, invocation-bound chat attestations, and dedicated post-transport
+  `RecordDeliveredTurnForChat` recording.
+- Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
+  memory provider.
+- Added Slack Agent owned-thread continuation: after one explicitly addressed message is freshly
+  authorized, that authenticated sender can continue in the exact thread without another mention.
+- Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
+  allowing the agent to post nothing instead of always taking the last word.
+
+### Changed
+
+- Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
+  durable recording uses the exact bounded answer once and is never retried automatically.
+- Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
+  totals, using domain-separated keyed commitments and coarse counters instead.
+- Storage now uses retained descriptor-relative tree operations, base→generation lease ordering,
+  exact manifest/entry reservations, bounded finalization, strict recovery/quarantine, and
+  canonical effective-authority generations independent of configuration ordering.
+- Chat recording now uses service-typed scope-bound delivery identities and requires successful
+  Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
+- Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
+  memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- The Agent Slack manifest now requests public/private channel history events required to observe
+  continuations; ambient traffic is discarded inside the transport before routing or inference.
+
+### Security
+
+- Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,
+  gateway-owned filenames and authenticated reply targets, and never enter prompts, conversation
+  memory, durable chat records, telemetry payloads, provider components, or broker protocol.
+- Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
+  execute hidden memory recording. Storage imports receive only an exact interface/access grant.
+- Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
+  claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Bound Slack continuation ownership to an exact transport-authenticated workspace/channel/thread/
+  sender tuple, claimed only after fresh authorization, revoked on refusal, capped in memory, and
+  cleared on restart. A decline selected alongside work runs nothing, and capability work requires
+  a visible reply—or a fixed audit-before-retry warning when the turn budget is exhausted—rather
+  than permitting the model to hide an effect.
+
+## [0.9.0] - 2026-08-20
+
+### Added
+
+- Added the opt-in Exploration-only `skylight-private` broker provider proof of concept with two
+  unofficial, private, unsupported, mock-only account/frame reads. It is absent from default
+  catalogs, images, policies, and deployments (#120).
+- Added opt-in native in-flight activity for Slack, Discord, and Telegram chat sessions: Slack Agent
+  `processing`/Stop lifecycle with classic/free `:tangerine:` reaction fallback, Discord typing,
+  Telegram topic-aware chat actions, separate classic/Agent Slack manifests, and Slack's required
+  Agent View App Home event subscription (#122, #124).
+
+### Changed
+
+- Application release tags now publish all crates.io packages automatically through trusted
+  publishing; manual workflow dispatch remains an idempotent recovery path (#121).
+
+### Security
+
+- Bound each Skylight read to one fixed HTTPS GET and a static short-lived destination-bound broker
+  bearer, while keeping authorization and OAuth out of the guest and projecting only bounded IDs
+  and optional frame names. The pinned pyskylight MIT notice is adjacent to source and artifact
+  (#120).
+- Derive activity and Stop targets only from authenticated chat envelopes, start activity only after
+  fresh broker authorization, prevent model-controlled status content, and cooperatively suppress
+  later model/tool work, stale answers, and history commits after a Slack Agent Stop event (#122).
+
+## [0.8.1] - 2026-08-20
+
+### Fixed
+
+- Raised the per-model-turn tool-call ceiling from four to ten so bounded multi-attachment requests
+  reach the attachment-specific limit instead of failing the entire session as runaway fan-out
+  (#118).
+
 ## [0.8.0] - 2026-08-20
 
 ### Added
@@ -240,7 +323,9 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/dekopon-agents/dekopon/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dekopon-agents/dekopon/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dekopon-agents/dekopon/compare/v0.5.0...v0.6.0

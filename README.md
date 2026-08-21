@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.8.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.9.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
-## What works today in 0.8.0
+## What works today in 0.9.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -21,9 +21,27 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - An unprivileged chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
+- Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
+  a classic/free `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat
+  actions. Activity failure never changes the answer, and Stop is cooperative rather than rollback.
+- Unreleased: Slack Agent channel threads become owned per authenticated sender only after fresh
+  authorization. That sender can continue without repeating the mention, while the optional
+  `decline_chat_reply` decision lets the agent post nothing when a response would only take the
+  last word. Ambient channel history never reaches routing or inference.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
+- Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+- Unreleased: generic broker-owned JSONL and durable-file provider storage plus optional on-demand
+  durable chat memory. Memory is model-queryable only under an effective all-three grant and is
+  recorded once after gateway-attested complete transport acceptance; it is never automatically
+  replayed into a prompt.
+
+New in 0.9.0 — native chat activity without moving authority:
+
+- **Slack Agent sessions.** An explicitly Agent-configured transport uses Slack's native Working/Stop lifecycle, setting `processing` only after fresh broker authorization and returning the session to `active` after the durable reply. Stop cooperatively prevents later model turns, capability calls, stale answers, and history commits; it cannot roll back work already in progress.
+- **Compatible classic fallback.** Agent capability failures degrade to an opt-in fixed `:tangerine:` reaction and then no-op. Classic and Agent conversation semantics remain explicit, activity stays off by default, and no cosmetic failure changes or delays the answer.
+- **Native leases elsewhere.** Discord typing and Telegram topic-aware chat actions renew only while authorized work is running. Targets and cadence come from authenticated transport state rather than model content.
 
 New in 0.8.0 — Discord support without moving authority:
 
@@ -55,7 +73,13 @@ New in 0.5.0 — chat that can see what you sent it. One documented invariant wa
 
 ## What does not work yet
 
-Agent memory that outlives a conversation. A gateway session replays a bounded per-sender window of earlier turns; nothing carries across conversations, and there is no task store. `dekopond` also runs under the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping rather than isolation; a dedicated gateway UID, where `via` becomes real separation, remains committed direction. See [`docs/dekopond.md`](docs/dekopond.md) for the current contract and [`docs/inference.md`](docs/inference.md#what-a-memory-framework-could-buy) for the explicitly exploratory memory-framework tradeoffs.
+Automatic memory replay, semantic/vector memory, cross-agent sharing, task memory, deletion/export UX,
+SQLite, and encryption-at-rest claims do not exist. Optional durable chat turns carry across broker
+and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope and
+are retrieved on demand with `memory recent` or `memory search`. JSONL deduplication is permanent
+but finite; recording stops with `dedup-capacity` while reads continue. `dekopond` also runs under
+the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping
+rather than isolation; a dedicated gateway UID remains committed direction.
 
 There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Catalog provider and status resources remain declarations only. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
@@ -79,31 +103,31 @@ From there, [`examples/pr-summarizer-linter`](examples/pr-summarizer-linter/READ
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.8.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.8.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.9.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.9.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.8.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.8.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.8.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.9.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.9.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.9.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.8.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.8.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.9.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.9.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-The workspace contains twenty-one public crates at `0.8.0`. After the separate crates.io publication dispatch completes:
+The unreleased workspace contains twenty-three public crates; the published `0.9.0` release contains twenty-one. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
-cargo install --locked --version 0.8.0 dekopon
-cargo install --locked --version 0.8.0 dekopon-run
-cargo install --locked --version 0.8.0 dekopon-brokerd
-cargo install --locked --version 0.8.0 dekopond
+cargo install --locked --version 0.9.0 dekopon
+cargo install --locked --version 0.9.0 dekopon-run
+cargo install --locked --version 0.9.0 dekopon-brokerd
+cargo install --locked --version 0.9.0 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
 
-Publication is a separate manual workflow dispatch rather than a tag-push side effect (see [Maintainer release process](#maintainer-release-process)), so a tag can exist for a while before its crates do.
+Crates.io publication is part of the release-tag workflow (see [Maintainer release process](#maintainer-release-process)). A manual dispatch remains available only to recover an interrupted tag publication; already-published immutable versions are skipped.
 
 ### From a checkout
 
@@ -136,7 +160,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.8.0` through the chart's `image.tag` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.9.0` through the chart's `image.tag` value.
 
 ## Run the flagship example
 
@@ -208,16 +232,16 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and agent memory that outlives a conversation. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 
-Releases deliberately separate preparation, GitHub artifacts, and crates.io publication:
+Releases deliberately separate reviewed preparation from automated publication:
 
 1. Start from a clean, current `main`. Update release-facing status/install text in the root and crate READMEs before tagging—the packaged README is immutable on crates.io. Move the completed [`CHANGELOG.md`](CHANGELOG.md) entries from `[Unreleased]` into a dated `[VERSION]` section and leave an `[Unreleased]` heading for later work; CI and the tag workflow reject a missing or empty release section. Run the full validation matrix in [`docs/development.md`](docs/development.md), including `cargo package --workspace --exclude dekopon-testkit --locked`.
 2. Use `cargo release <VERSION>` to preview the shared-version commit and tag, then `cargo release <VERSION> --execute` after review. [`release.toml`](release.toml) creates the commit and tag but intentionally does not push or publish anything.
-3. Let pull-request CI verify formatting, clippy, tests, rustdoc, package contents, dependency policy, the changelog, and the runner privilege boundary before landing the version commit. CI does not repeat those expensive jobs on the resulting `main` commit. Push the matching `v<VERSION>` tag; the `Release` workflow checks the immutable tag against the shared workspace version, changelog, and publication plan, then builds three CLI archives, attests them, and creates the GitHub release.
-4. A tag push **does not publish crates**. Ensure every public package has the crates.io GitHub trusted publisher `dekopon-agents/dekopon`, workflow `release.yml`, environment `crates-io`; a brand-new crate name must be bootstrapped with an explicitly authorized scoped credential, then registered immediately. Dispatch the same `Release` workflow with the existing tag and `publish_to_crates=true`, then approve the protected environment. The dispatch packages and publishes crates without rebuilding platform archives or replacing the existing GitHub release. It obtains a short-lived OIDC token and publishes every public crate in checked dependency order. It skips an immutable version already present, making a partially completed publication recoverable; an explicit crates.io new-package `429` waits until the server's retry time, while every other publication failure stops the job.
+3. Let pull-request CI verify formatting, clippy, tests, rustdoc, package contents, dependency policy, the changelog, and the runner privilege boundary before landing the version commit. CI does not repeat those expensive jobs on the resulting `main` commit. Push the matching `v<VERSION>` tag; that explicitly authorized tag is the single publication gate. The `Release` workflow checks the immutable tag against the shared workspace version, changelog, and publication plan, builds and attests three CLI archives, creates the GitHub release, publishes the container image, updates the Homebrew tap, and publishes every public crate in checked dependency order through a short-lived OIDC credential.
+4. Ensure every public package has the crates.io GitHub trusted publisher `dekopon-agents/dekopon`, workflow `release.yml`, environment `crates-io`. The environment name is part of that OIDC identity but has no required-reviewer rule; approving the release tag is sufficient. A brand-new crate name must still be bootstrapped with an explicitly authorized scoped credential, then registered immediately. If tag publication is interrupted, dispatch the same `Release` workflow with the existing tag and `publish_to_crates=true`; the recovery packages only the immutable tag, does not rebuild its other artifacts, and skips crate versions already present. An explicit crates.io new-package `429` waits until the server's retry time, while every other publication failure stops the job.
 5. Verify the GitHub release, every crates.io package version, and fresh `cargo install --locked ... --version <VERSION>` commands before announcing the release.
 
 The dependency-ordered crate list lives in [`.github/release-crates.txt`](.github/release-crates.txt). Pull-request CI and release validation fail if that list omits a publishable workspace crate, includes a private/unknown crate, contains duplicates, or places a dependent before its dependency. Never move an existing tag or attempt to overwrite a published crate version; fix release automation on `main` and cut a new patch version when published bytes must change.

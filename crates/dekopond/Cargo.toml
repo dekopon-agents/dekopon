@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
@@ -24,9 +25,10 @@ dekopon-protocol.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 libc.workspace = true
 opentelemetry.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,6 +42,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 dekopon-brokerd.workspace = true
+dekopon-storage-host.workspace = true
 tempfile.workspace = true
 
 [lints]
