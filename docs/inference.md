@@ -53,8 +53,9 @@ Slack event
   -> tool call? append opaque replay items + tool output and call the model again
        `generate_image`? one fixed-endpoint request, one PNG leaves through a byte-free output slot
   -> exact bounded text plus optional PNG receives complete Slack transport acceptance
-  -> one fresh hidden record request when the all-three durable surface is effective
-  -> persistent route separately stores only the new question and final answer in gateway memory
+     or an optional owned-thread continuation declines and sends no reply
+  -> one fresh hidden record request only after an accepted reply and effective durable surface
+  -> persistent route stores only the new question and final answer, or a declined user-only turn
 ```
 
 The broker authorization leg is new for every Slack message. Neither remembered text nor a prompt cache key enters Cedar policy or grants a capability.
@@ -194,7 +195,9 @@ A persistent conversation is keyed by transport, a transport-derived conversatio
 3. the store compares the newly granted capability identifiers with those stored beside the conversation;
 4. an idle or grant-changed entry is dropped;
 5. surviving `(question, final answer)` pairs are replayed before the new message;
-6. the new exchange is appended and the oldest whole turns are trimmed until both bounds hold.
+6. the new exchange is appended and the oldest whole turns are trimmed until both bounds hold. An
+   inherited Slack Agent follow-up may explicitly decline its optional reply before capability work;
+   that stores the user message alone and performs no Slack delivery or durable recording.
 
 The store is bounded by `sessions.maxConversations` across the process. Capacity evicts least-recently-used entries. Idle eviction is lazy: stale text may remain resident until lookup, capacity pressure, or process exit, but it is never replayed after its timeout.
 
@@ -203,8 +206,10 @@ The store is bounded by `sessions.maxConversations` across the process. Capacity
 - model reasoning, including encrypted replay items;
 - function/tool calls;
 - scripts and capability outputs;
-- system instructions, which are supplied fresh from the catalog; and
-- the gateway's fixed failure sentence.
+- system instructions, which are supplied fresh from the catalog;
+- the gateway's fixed failure sentence; and
+- any synthetic assistant text for a deliberate no-reply decision—there is none, so only the user
+  message remains in the in-process turn.
 
 This is conversation continuity, not evidence continuity. The broker audit is where authorized effects remain verifiable.
 
@@ -264,9 +269,11 @@ records are `memory-corrupt`, and finite dedup exhaustion is `dedup-capacity` wh
 
 Recording occurs only after fresh authorization, model success, and complete service/kernel
 transport acceptance. It is gateway-attested—not broker proof of delivery and not proof a person
-read it. There is exactly one request and no automatic retry after any uncertain outcome. Durable
-text remains untrusted model context after explicit retrieval and never enters identity or Cedar as
-content.
+read it. A deliberately declined owned-thread continuation makes no reply call and therefore has
+no receipt and no durable record; configured native activity still receives its cosmetic cleanup.
+There is exactly one record request after an accepted answer
+and no automatic retry after any uncertain outcome. Durable text remains untrusted model context
+after explicit retrieval and never enters identity or Cedar as content.
 
 ## What other projects do
 

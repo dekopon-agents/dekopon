@@ -14,9 +14,9 @@ and replies with the answer.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
-  its own traffic. Unmatched traffic is ignored, and a channel additionally requires the bot
-  to be @-mentioned — a route decides which agent answers, the mention decides whether
-  anything answers at all, and neither widens a grant.
+  its own traffic. Unmatched traffic is ignored, and a channel initially requires the bot to be
+  @-mentioned. In Slack Agent mode, fresh authorization claims that exact sender/thread so later
+  unmentioned follow-ups can continue; every other ambient channel message remains ignored.
 - **Chat assets** — Slack, Discord, and Telegram photos/files become numbered, bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
@@ -29,7 +29,8 @@ and replies with the answer.
   failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
   bounded model turns, bounded capability calls, cooperative Stop checks, and one fixed line on
-  failure.
+  failure. An unaddressed owned-thread follow-up also offers `decline_chat_reply`, which ends a
+  no-work session without sending anything to chat instead of making the agent take the last word.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
 - **Conversations** — one independent session per message unless a route sets

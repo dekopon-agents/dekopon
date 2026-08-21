@@ -19,7 +19,7 @@ use dekopon_agent::{
     meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
     prompt::{
         CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
-        SessionInputs, run_prompt_session,
+        ReplyDisposition, SessionInputs, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -46,7 +46,7 @@ use crate::{
     routes::BoundRoute,
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
-        ReplyTarget, SessionStop, bound_inbound, bound_outbound,
+        ReplyTarget, SessionStop, ThreadOwnership, bound_inbound, bound_outbound,
     },
 };
 
@@ -63,6 +63,8 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 /// or a transport diagnostic, and chat is the last place any of those belong: the operator reads
 /// the category from telemetry, and the sender reads a sentence.
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
+/// Fixed warning when capability work may have happened but the model produced no report.
+pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
 /// Confirmation sent when Slack's authenticated Agent-session Stop event wins the completion race.
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
 /// One transport-independent normalization for a successful empty model answer.
@@ -70,7 +72,7 @@ pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const SESSION_RUNNING: u8 = 0;
 const SESSION_CANCELLED: u8 = 1;
-const SESSION_ANSWERING: u8 = 2;
+const SESSION_COMPLETING: u8 = 2;
 
 /// One conversation, for in-flight serialization only.
 ///
@@ -222,11 +224,11 @@ impl SessionCancellation {
         Self(Arc::new(AtomicU8::new(SESSION_RUNNING)))
     }
 
-    fn claim_answer(&self) -> bool {
+    fn claim_completion(&self) -> bool {
         self.0
             .compare_exchange(
                 SESSION_RUNNING,
-                SESSION_ANSWERING,
+                SESSION_COMPLETING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -427,6 +429,8 @@ pub(crate) struct SessionRunner {
     pub image_generators: HashMap<String, Arc<dyn ImageGenerator>>,
     /// Optional service-native in-flight activity, by transport name.
     pub activities: HashMap<String, Arc<dyn ChatActivity>>,
+    /// Bounded transport-owned Slack Agent thread claims, by transport name.
+    pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     /// Native Agent sessions that can receive authenticated Stop events.
     pub active_sessions: ActiveSessions,
     /// Best-effort informational usage deltas for the broker-hosted web UI.
@@ -494,7 +498,7 @@ fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
     }
 }
 
-/// Runs one routed message end to end, answering in chat whatever happens.
+/// Runs one routed message end to end, answering unless an optional continuation declines.
 pub(crate) async fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
@@ -577,6 +581,7 @@ async fn session(
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
+            revoke_thread_ownership(runner, message);
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
@@ -606,6 +611,7 @@ async fn session(
     // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
     // holding exactly the text the revocation was about.
     if granted.is_empty() {
+        revoke_thread_ownership(runner, message);
         runner
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
@@ -613,6 +619,10 @@ async fn session(
         answer(replier, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
+    // An Agent thread becomes a continuation surface only after this exact sender's fresh broker
+    // grant succeeded. Merely mentioning the bot, or putting coordinates in model text, cannot
+    // claim one.
+    claim_thread_ownership(runner, message);
     let agent_config = agent_config_view(
         route.agent.as_str(),
         &route.description,
@@ -749,6 +759,10 @@ async fn session(
     let usage = Arc::new(UsageAccumulator::default());
     let observed_usage = Arc::clone(&usage);
     let prompt_cancellation = cancellation.clone();
+    let reply_optional = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Built before the accumulator exists, so a model client that cannot be constructed
@@ -779,6 +793,9 @@ async fn session(
         if let Some(generator) = image_generator.as_deref() {
             inputs = inputs.with_image_generation(generator, &generated_image);
         }
+        if reply_optional {
+            inputs = inputs.with_optional_reply();
+        }
         let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
             .map_err(SessionError::from);
         // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
@@ -808,7 +825,7 @@ async fn session(
     let (outcome, turn, generated_image) = match result {
         Ok(session) => session,
         Err(_) => {
-            if !cancellation.claim_answer() {
+            if !cancellation.claim_completion() {
                 tracing::info!(event = "gateway_session_cancelled");
                 activity.finish_in_background();
                 return "cancelled";
@@ -824,15 +841,16 @@ async fn session(
 
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
         || cancellation.is_cancelled()
-        || !cancellation.claim_answer()
+        || !cancellation.claim_completion()
     {
         tracing::info!(event = "gateway_session_cancelled");
         activity.finish_in_background();
         return "cancelled";
     }
 
-    // Seal renewal before terminal delivery, but do no remote cleanup on this latency-sensitive
-    // path. Slack's explicit `active` and reaction removal run only after the durable answer.
+    // Seal renewal before terminal delivery or deliberate silence, but do no remote cleanup on
+    // this latency-sensitive path. Slack's explicit `active` and reaction removal run only after
+    // the completion decision is durable in gateway state.
     activity.seal();
 
     // The exchange when the session answered, and the bare question when it did not. The fixed
@@ -847,9 +865,28 @@ async fn session(
             .commit(&key, &granted, window, turn, &cache_key, Instant::now());
     }
 
+    if matches!(
+        &outcome,
+        Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
+    ) {
+        // No reply call means no acceptance receipt and therefore no durable recording. Native
+        // activity still returns to its inactive state through the separate cosmetic surface. The
+        // unanswered in-process turn was committed above so a later continuation still sees what
+        // the person said. Activity cleanup remains best effort and cannot create a chat message.
+        activity.finish_in_background();
+        return "declined";
+    }
+
     let (answer_text, completed_outcome, recordable) = match outcome {
         Ok(outcome) if outcome.answer.is_empty() => (EMPTY_REPLY.to_owned(), "answered", true),
         Ok(outcome) => (outcome.answer, "answered", true),
+        Err(SessionError::Prompt(PromptError::UnreportedCapabilityWork)) => {
+            tracing::error!(
+                event = "gateway_session_failed",
+                category = "unreported-capability-work"
+            );
+            (UNREPORTED_WORK_REPLY.to_owned(), "failed", false)
+        }
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
@@ -876,6 +913,24 @@ async fn session(
             completed_outcome
         }
         Some(_) | None => "reply-failed",
+    }
+}
+
+fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.claim(continuation.claim.clone());
+    }
+}
+
+fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.revoke(&continuation.claim);
     }
 }
 

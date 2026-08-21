@@ -19,7 +19,11 @@ authoritative copy of each:
   tool call, and cannot carry provider replay state out of the session that produced it —
   which is also what lets one conversation replay identically on either model backend
   rather than losing encrypted reasoning silently on the way across. The session's own
-  exchange is recorded even when the session fails, so a failed turn is not silently lost.
+  exchange is recorded even when the session fails, so a failed turn is not silently lost. A chat
+  embedder may mark one request's reply optional; the loop then prompts and offers
+  `decline_chat_reply`, returning a typed suppressed disposition and remembering the user-only turn.
+  The tool is absent from ordinary prompts, capability work makes a visible reply mandatory, and
+  exhausting the turn budget there returns a distinct error so the embedder can warn against retry.
 - `prompt::ModelUsageObserver` — an optional informational callback invoked for every decoded model response, including an explicit absence of provider usage; it cannot influence the session.
 - `prompt::CancellationProbe` — optional cooperative cancellation checked before and after model
   calls and before each tool/script boundary. It prevents subsequent work but cannot roll back a

@@ -19,6 +19,10 @@ All notable changes to Dekopon are documented here. The format is based on
   `RecordDeliveredTurnForChat` recording.
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
+- Added Slack Agent owned-thread continuation: after one explicitly addressed message is freshly
+  authorized, that authenticated sender can continue in the exact thread without another mention.
+- Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
+  allowing the agent to post nothing instead of always taking the last word.
 
 ### Changed
 
@@ -33,6 +37,8 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- The Agent Slack manifest now requests public/private channel history events required to observe
+  continuations; ambient traffic is discarded inside the transport before routing or inference.
 
 ### Security
 
@@ -43,6 +49,11 @@ All notable changes to Dekopon are documented here. The format is based on
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Bound Slack continuation ownership to an exact transport-authenticated workspace/channel/thread/
+  sender tuple, claimed only after fresh authorization, revoked on refusal, capped in memory, and
+  cleared on restart. A decline selected alongside work runs nothing, and capability work requires
+  a visible reply—or a fixed audit-before-retry warning when the turn budget is exhausted—rather
+  than permitting the model to hide an effect.
 
 ## [0.9.0] - 2026-08-20
 

@@ -3,7 +3,7 @@
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
 //! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
-//! image.
+//! image unless an optional owned-thread continuation deliberately declines.
 //!
 //! # Authority
 //!
@@ -71,8 +71,9 @@ use crate::{
     },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        OutboundReply, SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
+        discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
+        telegram::TelegramTransport,
     },
 };
 
@@ -180,6 +181,7 @@ where
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
+    let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -205,6 +207,9 @@ where
         if let Some(activity) = transport.activity() {
             activities.insert(spec.name().to_owned(), activity);
         }
+        if let Some(ownership) = transport.thread_ownership() {
+            thread_ownership.insert(spec.name().to_owned(), ownership);
+        }
         transports.push(transport);
     }
 
@@ -229,6 +234,7 @@ where
         asset_fetchers,
         image_generators,
         activities,
+        thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
     });
@@ -566,14 +572,23 @@ fn dispatch(
         );
         return;
     };
-    // A channel route that fired on every message would be noise and cost, so a shared
-    // conversation requires the bot to be addressed. A direct message is addressed by definition.
+    // A channel route that fired on every message would be noise and cost. Shared conversations
+    // therefore require an explicit address, except for one Slack Agent continuation that the
+    // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
+    // A direct message is addressed by definition.
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
             .is_some_and(|identity| identity.is_addressed(&message.text))
     });
-    if matches!(message.conversation, ConversationKind::Channel(_)) && !addressed {
+    let inherited_thread = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
+    if matches!(message.conversation, ConversationKind::Channel(_))
+        && !addressed
+        && !inherited_thread
+    {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,

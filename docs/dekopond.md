@@ -210,13 +210,15 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
 - `classic` (default) retains top-level DM replies and one whole-DM conversation. With native
   activity and `classicFallback: reaction`, the gateway adds its fixed `:tangerine:` reaction to
   the inbound message and removes only a reaction that generation successfully added.
-- `agent` makes DMs thread-scoped like Slack Agent sessions. After fresh broker authorization the
-  gateway calls `agents.sessions.setStatus(processing)` once; Slack owns the standard Working UI
-  and one-hour processing timeout, so the gateway does not waste rate limit on a heartbeat. After
-  the durable reply it asynchronously returns the session to `active`. `feature_disabled`,
-  `missing_scope`, and equivalent permanent
-  installation errors disable Agent status for that transport and select the configured reaction
-  fallback, then no-op if reactions are also unavailable. It never guesses the workspace plan.
+- `agent` makes DMs thread-scoped like Slack Agent sessions and enables authorization-fed channel
+  thread continuation. After fresh broker authorization the gateway calls
+  `agents.sessions.setStatus(processing)` once; Slack owns the standard Working UI and one-hour
+  processing timeout, so the gateway does not waste rate limit on a heartbeat. After a reply or
+  deliberate no-reply completion it asynchronously returns the session to `active`; no-reply means
+  no chat message, not omission of that cosmetic cleanup.
+  `feature_disabled`, `missing_scope`, and equivalent permanent installation errors disable Agent
+  status for that transport and select the configured reaction fallback, then no-op if reactions
+  are also unavailable. It never guesses the workspace plan.
 
 Slack's native `processing` state includes a Stop button. The transport acknowledges
 `agent_session_stopped` before handling it, derives its user and thread only from Slack's envelope,
@@ -226,6 +228,29 @@ queues `active`, and sends `Stopped.` An already-running synchronous model reque
 effect cannot be rolled back and may finish before the prompt loop reaches its next cooperative
 boundary. Unknown, duplicate, and other-user Stop events are ignored.
 
+The Agent manifest also subscribes to `message.channels` and `message.groups`, requiring
+`channels:history` and `groups:history`, so the transport can hear follow-ups that contain no new
+mention. This is deliberately **owned-thread continuation**, not ambient activation:
+
+- an explicitly addressed channel message proposes an exact authenticated
+  `(workspace, channel, root thread, sender)` claim;
+- only a fresh non-empty broker capability surface installs or refreshes that claim;
+- a later unmentioned event must match every coordinate and is still freshly authorized before
+  activity or inference; another sender and another thread remain ambient;
+- a definitive authorization refusal removes the claim; the 1,024-entry LRU and every claim vanish
+  on process restart; and
+- all unmatched channel-history events are discarded inside the Slack transport before routing,
+  authorization, payload telemetry, or model spend.
+
+An inherited continuation is the only request whose reply is optional. The prompt explicitly says
+that the agent need not take the last word and offers `decline_chat_reply`; selecting it before any
+capability work posts nothing, produces no transport receipt or durable recording, and remembers
+the user's message as a user-only in-process turn. A decline selected in the same turn as work runs
+none of that work. If an earlier capability invocation already happened, silence is refused and the
+model must send a concise report. With no model turn left, the gateway posts a fixed warning that
+capability work was attempted and the audit must be checked before retrying. Explicit mentions and
+DMs never receive the decline tool.
+
 The protocol's one sharp edge is redelivery: Slack expects an acknowledgment within roughly three seconds and resends the envelope otherwise. A Dekopon session takes far longer than that, so **the acknowledgment is sent before any processing begins** — before parsing, before routing, before any model call. A bounded ring of 1024 seen `(channel, ts)` pairs absorbs the redeliveries that happen anyway across a reconnect.
 
 - `disconnect` envelopes are routine (Slack rotates sockets on its own schedule) and trigger a reconnect with jittered exponential backoff capped at 60 seconds.
@@ -234,7 +259,7 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 - A message's attachments become **chat assets**, described in the prompt and fetched only on demand. See [Chat assets](#chat-assets) below. The transport reports what arrived and nothing more: names and media types come from the event, so they are sender-controlled and untrusted exactly like the message text. An upload posted with no comment is still a request — the reference note is then the whole message. A message with neither text nor a file is not a request and is dropped.
 - `channel_type: im` is a direct message; anything else is a channel.
 - Subject: `slack.<team>.<user>`, lowercased.
-- A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A classic direct message has no thread to join; an Agent direct message is intentionally rooted at `thread_ts = event.thread_ts || event.ts`, and that root also scopes admission, history, status, and Stop.
+- A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A classic direct message has no thread to join; an Agent direct message is intentionally rooted at `thread_ts = event.thread_ts || event.ts`, and that root also scopes admission, history, status, Stop, and owned continuation.
 - An answer is posted in a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), which carries the model's CommonMark unchanged and lets Slack render it. The `text` field is mrkdwn — a proprietary syntax where bold is `*one asterisk*` and a link is `<url|label>` — so an answer posted through it alone arrives with `**bold**` as four literal asterisks, and tables and task lists cannot be expressed in it at all. Translating in this process would be a second translation of what Slack is about to translate, so the gateway does none: the block gets the answer verbatim. `text` is still sent as the notification fallback, the one place blocks do not render. The block caps a payload at 12,000 characters, which the 8 KiB outbound bound already sits under.
 
 ### Discord Gateway
@@ -323,7 +348,7 @@ Leaving `channel` out exists because naming them does not scale. One route per c
 
 **Declaration order is the whole precedence rule.** Routes are consulted top to bottom, so a named-channel route written above a catch-all keeps that channel for itself while the catch-all takes everything else — special handling in `#incidents`, the default everywhere else. Nothing sorts by specificity, deliberately: a hidden ranking is how an operator ends up unable to say which route answered.
 
-In a channel the bot must additionally be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; the mention decides whether anything answers at all**, and widening the first leaves the second exactly where it stood. A channel route that fired on every message would be noise and cost. On Slack the app is not even offered the traffic — the manifest in [`../examples/slack/`](../examples/slack/README.md) subscribes to `app_mention` and not to channel history. Discord intentionally receives the non-privileged message event surface and drops ambient guild traffic before admission.
+A channel initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Discord and Telegram retain that rule on every message. Slack classic does too. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. Every continuation is authorized again and may decline to post; all non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
 
 ### Being available in a channel is not authority
 
@@ -339,7 +364,7 @@ Each routed message runs one session. On a `oneShot` route — the default, and 
 2. **Authorization.** The session opens an attested broker leg with `capabilitiesForChat(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or activity write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
 3. **Activity.** When the transport opted in, one session-owned generation starts immediately after the fresh grant. The service renders it; the model supplies no target, status text, frame, emoji, or timing. The coordinator permits one request at a time, refreshes expiring signals, seals synchronously before terminal delivery, and queues cleanup afterwards so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop renewal for that generation; permanent Slack installation failures additionally trip a transport-wide fallback breaker.
 4. **Execution.** On a `persistent` route the session first looks up its conversation, keyed on `(transport, the conversation identity, the sender's canonical subject)`. An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then, as before: the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg, an explicitly named image generator adds its one-attempt meta tool, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
-5. **Answer and optional durable recording.** The session's final bounded text and optional generated PNG go back to chat. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. **The fixed failure line and generated bytes are never stored.** A session that reached the model and failed records its question with nothing in the in-process answer's place, which is truthful and is what makes the retry after it answerable; a session refused at step 2 records nothing at all. When optional durable memory is authorized, only textual turns whose complete text/image reply received transport acceptance are recorded, exactly once and without automatic retry. Failure replies, partial delivery, reply errors, and sessions won by an authenticated Stop event are never durably recorded.
+5. **Answer, deliberate silence, and optional durable recording.** A required session's final bounded text and optional generated PNG go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, cleans up activity, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. **The fixed failure line and generated bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. When optional durable memory is authorized, only textual turns whose complete text/image reply received transport acceptance are recorded, exactly once and without automatic retry. Declines, failure replies, partial delivery, reply errors, and sessions won by an authenticated Stop event are never durably recorded.
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -371,7 +396,7 @@ The visible consequence of the subject in the key is that in a channel the bot r
 
 ### Prior turns are compacted
 
-A stored turn is `(the user's message, the final answer)`, or the message alone when the session failed before it produced one. Every intermediate step — the model's tool calls, the scripts it authored, and their output — is dropped at write-back and never replayed.
+A stored turn is `(the user's message, the final answer)`, or the message alone when the session failed or deliberately declined an optional reply. Every intermediate step — the model's tool calls, the scripts it authored, and their output — is dropped at write-back and never replayed.
 
 The number that forces this: one script's combined output can reach 256 KiB, which is `dekopon-shell`'s default `max_output_bytes` in [`../crates/dekopon-shell/src/limits.rs`](../crates/dekopon-shell/src/limits.rs). Replaying full transcripts would let a single earlier turn cost more than the entire window budget, and it would do so most on exactly the sessions that did the most work.
 
@@ -510,7 +535,7 @@ Spans follow [`observability.md`](observability.md):
 
 | Span | Fields |
 |---|---|
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's spans join the same trace through the proposal's `traceparent`.
@@ -521,7 +546,7 @@ The prompt cache key is behind that same gate, as `gateway.session.cache_key`, a
 
 Conversations add to both lists, and change the meaning of one field that already exists. `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. The second-order effect is the one that catches people: on a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_stopped`. Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot.
+Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_stopped`. Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## The single-UID caveat
 
