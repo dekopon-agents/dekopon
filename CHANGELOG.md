@@ -37,6 +37,11 @@ All notable changes to Dekopon are documented here. The format is based on
 - A piped value now moves from one pipeline stage to the next and is shared with a function body's
   statements rather than deep-copied for each of them, and `grep` no longer copies every input line
   it tests.
+- `jq` reuses one filter worker per thread instead of spawning and joining a thread per call, and
+  values cross that boundary directly rather than through JSON text on each side. A filter output
+  JSON cannot represent — `nan`, `infinite`, a byte string, a non-string object key, or nesting
+  past 128 containers — is still refused, now by name rather than as a parse error, and a float no
+  longer loses its last bit to the round trip.
 
 ### Fixed
 

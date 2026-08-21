@@ -49,6 +49,8 @@ One residual is worth stating plainly rather than leaving to be discovered. jaq 
 
 Dropping the receiver is the cancellation check for every filter that *does* yield — it fails its next send and returns — so what accumulates is only the non-terminating kind. Each abandonment logs a `tracing::warn!` with the elapsed time, `dekopon_shell::abandoned_filter_workers()` reports how many are still running, and past a small ceiling `jq` refuses to start another filter rather than adding one more spinning thread to a host that is already saturated.
 
+The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `curl ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name, as the JSON parser refused them before, and output nesting keeps the same 128-container ceiling that parser applied.
+
 ## Observability
 
 Each script run opens a `tracing` span named `shell.script`, and every command word inside it opens
