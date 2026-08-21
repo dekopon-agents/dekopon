@@ -150,7 +150,10 @@ impl StorageKey {
             &self.0,
             &encoded_fields(&[b"dekopon-storage-domain-v1".as_slice(), domain.as_bytes()]),
         );
-        hmac_sha256(&domain_key, &encoded_fields(fields))
+        let message = encoded_fields(fields);
+        #[cfg(test)]
+        note_hashed(message.len() as u64);
+        hmac_sha256(&domain_key, &message)
     }
 
     pub(crate) fn token(&self, domain: &str, fields: &[&[u8]]) -> String {
@@ -194,6 +197,8 @@ impl StorageKey {
             hmac.update(&buffer[..read]);
             remaining -= read as u64;
         }
+        #[cfg(test)]
+        note_hashed(final_length);
         let mut extra = [0_u8; 1];
         if reader.read(&mut extra)? != 0 {
             return Err(std::io::Error::new(
@@ -223,6 +228,26 @@ fn validate_key_ancestors(parent: &Path, key: &Path) -> Result<(), StorageHostEr
         current = ancestor.parent();
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Message bytes fed to HMAC on this thread.
+    ///
+    /// Test-only instrumentation. Hashing cost is a behavior this crate has to hold to—reserving a
+    /// positional write must not depend on file size—so it is measured rather than assumed.
+    static HASHED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_hashed(bytes: u64) {
+    HASHED_BYTES.with(|cell| cell.set(cell.get().saturating_add(bytes)));
+}
+
+/// Message bytes hashed on this thread so far.
+#[cfg(test)]
+pub(crate) fn hashed_bytes() -> u64 {
+    HASHED_BYTES.with(std::cell::Cell::get)
 }
 
 pub(crate) fn encoded_fields(fields: &[&[u8]]) -> Vec<u8> {

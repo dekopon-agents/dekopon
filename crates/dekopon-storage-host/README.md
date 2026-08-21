@@ -23,7 +23,11 @@ unique replacement temporaries, exact serialized manifests, staging, and entry c
 atomically before mutation. The process ledger is rebuilt once at startup and then reconciled only
 by host-owned mutations, so a stale concurrent scan cannot lower it; failed cleanup retains its
 reservation. Sparse gaps, growing truncate, JSONL's host-added LF, and old/new replacement headroom
-consume write/quota budgets. Metadata-only size/stat calls do not load a whole file; retained native
+consume write/quota budgets. Reservations are sized rather than hashed: a commitment is one fixed
+width, so the pre-mutation manifest is measured with a fixed-width placeholder that the manifest
+validator rejects, and the real content HMAC is computed once on the commit path over the real
+bytes. A positional write therefore reserves in proportion to its change set, never to the file it
+is appending to. Metadata-only size/stat calls do not load a whole file; retained native
 file bytes are independently bounded by the invocation read ceiling, and recovery hashes valid
 large targets/stages through a fixed-size streaming buffer rather than retaining them whole.
 

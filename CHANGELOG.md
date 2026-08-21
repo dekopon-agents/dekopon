@@ -39,6 +39,11 @@ All notable changes to Dekopon are documented here. The format is based on
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
 - The Agent Slack manifest now requests public/private channel history events required to observe
   continuations; ambient traffic is discarded inside the transport before routing or inference.
+- Storage reservations now size the candidate manifest with a fixed-width commitment placeholder
+  instead of recomputing a content HMAC over every dirty file on every positional write, so
+  appending frames costs bytes hashed linear in the change set rather than quadratic in file size.
+  Reservations are byte-identical and durable manifests still carry real commitments over real
+  bytes.
 
 ### Security
 

@@ -484,30 +484,20 @@ impl StorageTransaction {
             return Err(StorageHostError::QuotaExceeded);
         }
 
-        let changes = self.candidate_changes(overrides)?;
-        let manifest_bytes = encode_manifest(&self.key, &self.namespace, changes)?;
-        let staged = manifest_bytes
-            .document
-            .changes
-            .iter()
-            .filter(|change| change.new.is_some())
-            .count() as u64;
+        let candidate = self.candidate_reservation(overrides)?;
         // Transaction directory + manifest + commit + applied/finalized marker, plus a base poison
         // marker. Failure-state headroom is reserved before staging: a base marker can fail while
         // the already-retired transaction remains the durable unknown-by-default evidence.
-        let mut desired = 6_u64
-            .checked_add(staged)
+        let desired = 6_u64
+            .checked_add(candidate.staged)
             .and_then(|entries| entries.checked_mul(ENTRY_CHARGE))
-            .and_then(|bytes| bytes.checked_add(manifest_bytes.encoded.len() as u64))
+            .and_then(|bytes| bytes.checked_add(candidate.manifest_bytes))
+            .and_then(|bytes| bytes.checked_add(candidate.staged_bytes))
             .ok_or(StorageHostError::Arithmetic)?;
-        for change in &manifest_bytes.document.changes {
-            if change.new.is_some() {
-                desired = desired
-                    .checked_add(change.new_size)
-                    .ok_or(StorageHostError::Arithmetic)?;
-            }
-        }
-        let staged_entries = staged.checked_add(6).ok_or(StorageHostError::Arithmetic)?;
+        let staged_entries = candidate
+            .staged
+            .checked_add(6)
+            .ok_or(StorageHostError::Arithmetic)?;
         let result = self
             .reservation
             .as_mut()
@@ -521,9 +511,34 @@ impl StorageTransaction {
         result
     }
 
+    /// Reservation inputs for a candidate transaction, derived without hashing any file contents.
+    ///
+    /// Every positional write reserves, so committing to complete candidate bytes here cost
+    /// `O(N^2)` bytes hashed to append `N` frames to one file. A reservation only reads sizes, and
+    /// a commitment is a fixed-width string that JSON never escapes, so a change set built with
+    /// [`placeholder_commitment`] encodes to a byte-identical manifest length and yields the
+    /// identical reservation. Only counts are returned: a placeholder has no path to durable bytes.
+    fn candidate_reservation(
+        &self,
+        overrides: &[(&str, Option<&[u8]>)],
+    ) -> Result<CandidateReservation, StorageHostError> {
+        let changes = self.candidate_change_set(overrides, placeholder_commitment)?;
+        let manifest = encode_manifest(&self.key, &self.namespace, changes)?;
+        CandidateReservation::from_manifest(&manifest)
+    }
+
+    /// The durable change set: every `new` is a real HMAC over the real candidate bytes.
     fn candidate_changes(
         &self,
         overrides: &[(&str, Option<&[u8]>)],
+    ) -> Result<Vec<Change>, StorageHostError> {
+        self.candidate_change_set(overrides, file_commitment)
+    }
+
+    fn candidate_change_set(
+        &self,
+        overrides: &[(&str, Option<&[u8]>)],
+        commitment: CommitmentFn,
     ) -> Result<Vec<Change>, StorageHostError> {
         let mut tokens = self
             .entries
@@ -550,7 +565,7 @@ impl StorageTransaction {
             changes.push(Change {
                 token,
                 old: entry.original_commitment.clone(),
-                new: data.map(|bytes| file_commitment(&self.key, bytes)),
+                new: data.map(|bytes| commitment(&self.key, bytes)),
                 new_size: data.map_or(0, |bytes| bytes.len() as u64),
             });
         }
@@ -1051,6 +1066,42 @@ struct Change {
     old: Option<String>,
     new: Option<String>,
     new_size: u64,
+}
+
+/// The complete set of quantities [`StorageTransaction::reserve_candidate`] reads from a candidate
+/// manifest.
+///
+/// Byte counts and nothing else, deliberately: the reservation path builds its manifest from
+/// placeholder commitments, and a `CandidateReservation` has no representation that could be
+/// staged, encoded, or written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateReservation {
+    /// Files that would be staged, one transaction directory entry each.
+    staged: u64,
+    /// Encoded manifest length.
+    manifest_bytes: u64,
+    /// Total staged file bytes.
+    staged_bytes: u64,
+}
+
+impl CandidateReservation {
+    fn from_manifest(manifest: &EncodedManifest) -> Result<Self, StorageHostError> {
+        let mut staged = 0_u64;
+        let mut staged_bytes = 0_u64;
+        for change in &manifest.document.changes {
+            if change.new.is_some() {
+                staged = staged.checked_add(1).ok_or(StorageHostError::Arithmetic)?;
+                staged_bytes = staged_bytes
+                    .checked_add(change.new_size)
+                    .ok_or(StorageHostError::Arithmetic)?;
+            }
+        }
+        Ok(Self {
+            staged,
+            manifest_bytes: manifest.encoded.len() as u64,
+            staged_bytes,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -1739,8 +1790,33 @@ fn poison(namespace: &Directory) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+/// Width of every commitment this crate produces: `hmac-sha256:` plus 32 hex-encoded bytes.
+const COMMITMENT_CHARS: usize = "hmac-sha256:".len() + 64;
+
+/// Fixed-width stand-in for a file commitment, used only while sizing a reservation.
+///
+/// It is deliberately *not* commitment-shaped: [`is_commitment`] rejects it, so [`verify_manifest`]
+/// rejects any manifest carrying it and [`apply_manifest_data`] refuses before touching data. It is
+/// exactly as wide as a real commitment and contains only characters JSON never escapes, so a
+/// manifest encoded with it is byte-for-byte the same length as the durable one.
+const RESERVATION_PLACEHOLDER: &str =
+    "reservation-placeholder-not-a-commitment-never-durable-000000000000000000000";
+const _: () = assert!(RESERVATION_PLACEHOLDER.len() == COMMITMENT_CHARS);
+
+/// How a candidate change set commits to file contents.
+type CommitmentFn = fn(&StorageKey, &[u8]) -> String;
+
+/// The durable commitment. Hashes the complete file and belongs on the commit path.
 fn file_commitment(key: &StorageKey, bytes: &[u8]) -> String {
     key.commitment(DOMAIN_CONTENT, &[b"file", bytes])
+}
+
+/// The reservation-path substitute for [`file_commitment`]. Hashes nothing.
+///
+/// Its one caller is [`StorageTransaction::candidate_reservation`], which returns byte counts
+/// rather than a manifest.
+fn placeholder_commitment(_key: &StorageKey, _bytes: &[u8]) -> String {
+    RESERVATION_PLACEHOLDER.to_owned()
 }
 
 fn streamed_file_commitment(
@@ -1793,9 +1869,14 @@ mod tests {
 
     use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
 
-    use super::PostMarkerFault;
+    use super::{
+        COMMITMENT_CHARS, CandidateReservation, Change, FileEntry, ManifestDocument,
+        PostMarkerFault, RESERVATION_PLACEHOLDER, StorageTransaction, encode_manifest,
+        file_commitment, is_commitment, verify_manifest,
+    };
     use crate::{
-        ContinuityPolicy, StorageGrantRequest, StorageHost, StorageHostError, StorageLimits,
+        ContinuityPolicy, OpenOptions, StorageGrantRequest, StorageHost, StorageHostError,
+        StorageLimits,
     };
 
     #[test]
@@ -2119,6 +2200,380 @@ mod tests {
                 .into_iter()
                 .filter_map(|path| fs::read(path).ok())
                 .any(|bytes| bytes == b"{\"budget\":true}\n")
+        );
+    }
+
+    fn probe_host(limits: StorageLimits) -> (tempfile::TempDir, StorageHost) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let directory = temporary.path().canonicalize().expect("canonical tempdir");
+        let key = directory.join("key.yaml");
+        fs::write(
+            &key,
+            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        let host =
+            StorageHost::open(directory.join("storage"), &key, limits).expect("durable-files host");
+        (temporary, host)
+    }
+
+    fn vfs_transaction(host: &StorageHost, invocation: &str) -> StorageTransaction {
+        let grant = host
+            .grant(StorageGrantRequest::new(
+                invocation.parse().expect("invocation"),
+                "probe.vfs".parse().expect("capability"),
+                "storage-probe".parse().expect("provider"),
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadWrite,
+                StorageNamespace::Chat,
+                "reviewer".parse().expect("agent"),
+                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "slack",
+                "scientist-slack",
+                "c0123abc",
+                "c0123abc:1712345678.000100",
+                ContinuityPolicy::Stable,
+                b"authority".to_vec(),
+            ))
+            .expect("grant");
+        host.begin(grant).expect("transaction")
+    }
+
+    /// The pre-change reservation computation, kept verbatim as the property-test oracle.
+    fn real_commitment_reservation(
+        transaction: &StorageTransaction,
+        overrides: &[(&str, Option<&[u8]>)],
+    ) -> Result<CandidateReservation, StorageHostError> {
+        let changes = transaction.candidate_changes(overrides)?;
+        let manifest = encode_manifest(&transaction.key, &transaction.namespace, changes)?;
+        CandidateReservation::from_manifest(&manifest)
+    }
+
+    #[track_caller]
+    fn assert_reservations_agree(
+        transaction: &StorageTransaction,
+        overrides: &[(&str, Option<&[u8]>)],
+        shape: &str,
+    ) {
+        let expected = real_commitment_reservation(transaction, overrides);
+        let actual = transaction.candidate_reservation(overrides);
+        match (&expected, &actual) {
+            (Ok(expected), Ok(actual)) => assert_eq!(expected, actual, "{shape}"),
+            (Err(expected), Err(actual)) => assert_eq!(
+                format!("{expected:?}"),
+                format!("{actual:?}"),
+                "{shape}: refusals differ"
+            ),
+            _ => panic!("{shape}: {expected:?} against {actual:?}"),
+        }
+    }
+
+    fn token_at(index: usize) -> String {
+        format!("{index:064x}")
+    }
+
+    fn install_entry(
+        transaction: &mut StorageTransaction,
+        token: &str,
+        original: Option<&[u8]>,
+        data: Option<Vec<u8>>,
+        dirty: bool,
+        loaded: bool,
+    ) {
+        let entry = FileEntry {
+            token: token.to_owned(),
+            original_commitment: original.map(|bytes| file_commitment(&transaction.key, bytes)),
+            data,
+            disk_exists: original.is_some(),
+            disk_size: original.map_or(0, |bytes| bytes.len() as u64),
+            loaded,
+            dirty,
+            identity: 1,
+        };
+        transaction.entries.insert(token.to_owned(), entry);
+    }
+
+    /// One deterministic xorshift stream. A property test needs many shapes, not real entropy.
+    struct Shapes(u64);
+
+    impl Shapes {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn every_commitment_is_one_fixed_width_that_the_placeholder_matches_but_never_impersonates() {
+        let (_temporary, host) = probe_host(StorageLimits::default());
+        let transaction = vfs_transaction(&host, "commitment-width");
+        for bytes in [
+            b"".as_slice(),
+            b"\x00",
+            &[0xff; 1],
+            &[0x5a; 4096],
+            &vec![0x00; 1024 * 1024],
+        ] {
+            let commitment = file_commitment(&transaction.key, bytes);
+            assert_eq!(commitment.chars().count(), COMMITMENT_CHARS);
+            assert_eq!(commitment.len(), RESERVATION_PLACEHOLDER.len());
+            assert!(is_commitment(&commitment));
+            // Encoded length must not depend on the value: neither shape can be JSON-escaped.
+            assert_eq!(
+                serde_json::to_vec(&commitment)
+                    .expect("commitment json")
+                    .len(),
+                serde_json::to_vec(RESERVATION_PLACEHOLDER)
+                    .expect("placeholder json")
+                    .len()
+            );
+        }
+        // The placeholder is deliberately not commitment-shaped, so the durable validator rejects
+        // it even if one ever reached an encoded manifest.
+        assert!(!is_commitment(RESERVATION_PLACEHOLDER));
+        transaction.abort();
+    }
+
+    #[test]
+    fn a_manifest_carrying_the_reservation_placeholder_never_validates() {
+        let (_temporary, host) = probe_host(StorageLimits::default());
+        let transaction = vfs_transaction(&host, "placeholder-refused");
+        let token = token_at(1);
+        let real = encode_manifest(
+            &transaction.key,
+            &transaction.namespace,
+            vec![Change {
+                token: token.clone(),
+                old: None,
+                new: Some(file_commitment(&transaction.key, b"durable")),
+                new_size: 7,
+            }],
+        )
+        .expect("real manifest");
+        let placeholder = encode_manifest(
+            &transaction.key,
+            &transaction.namespace,
+            vec![Change {
+                token,
+                old: None,
+                new: Some(RESERVATION_PLACEHOLDER.to_owned()),
+                new_size: 7,
+            }],
+        )
+        .expect("placeholder manifest");
+        // Identical size, which is the whole point, and an authentic MAC over its own body.
+        assert_eq!(real.encoded.len(), placeholder.encoded.len());
+        let limits = StorageLimits::default();
+        verify_manifest(&real.document, &transaction.key, &limits).expect("real manifest verifies");
+        assert!(matches!(
+            verify_manifest(&placeholder.document, &transaction.key, &limits),
+            Err(StorageHostError::Corrupt { scope: "manifest" })
+        ));
+        // The same refusal survives a round trip through the durable encoding.
+        let decoded: ManifestDocument =
+            serde_json::from_slice(&placeholder.encoded).expect("decode placeholder manifest");
+        assert!(matches!(
+            verify_manifest(&decoded, &transaction.key, &limits),
+            Err(StorageHostError::Corrupt { scope: "manifest" })
+        ));
+        transaction.abort();
+    }
+
+    #[test]
+    fn placeholder_reservations_equal_real_commitment_reservations_for_every_candidate_shape() {
+        let limits = StorageLimits {
+            // Keeps the `max_file_bytes` boundary reachable without hashing 16 MiB per case on the
+            // oracle path.
+            max_file_bytes: 64 * 1024,
+            ..StorageLimits::default()
+        };
+        let (_temporary, host) = probe_host(limits);
+        let mut transaction = vfs_transaction(&host, "reservation-property");
+        let maximum = usize::try_from(transaction.limits.max_file_bytes).expect("bounded");
+        let lengths = [0_usize, 1, 2, 17, 512, 4096, maximum - 1, maximum];
+        let empty = Vec::new();
+        let small = vec![b'c'; 17];
+        let large = vec![b'c'; maximum];
+
+        // Named shapes first, so a reviewer sees the boundaries this covers without reading the
+        // generator below.
+        assert_reservations_agree(&transaction, &[], "empty transaction, no overrides");
+
+        install_entry(
+            &mut transaction,
+            &token_at(1),
+            None,
+            Some(empty.clone()),
+            true,
+            true,
+        );
+        assert_reservations_agree(&transaction, &[], "one dirty zero-length file");
+        assert_reservations_agree(
+            &transaction,
+            &[(&token_at(1), Some(&small))],
+            "override shadowing a dirty entry",
+        );
+        assert_reservations_agree(
+            &transaction,
+            &[(&token_at(1), Some(&small)), (&token_at(1), Some(&large))],
+            "repeated override for one token",
+        );
+        assert_reservations_agree(
+            &transaction,
+            &[(&token_at(1), None)],
+            "override deleting a dirty entry",
+        );
+
+        install_entry(
+            &mut transaction,
+            &token_at(2),
+            Some(&small),
+            Some(large.clone()),
+            true,
+            true,
+        );
+        assert_reservations_agree(&transaction, &[], "sparse growth to max_file_bytes");
+        install_entry(
+            &mut transaction,
+            &token_at(3),
+            Some(&small),
+            None,
+            true,
+            true,
+        );
+        assert_reservations_agree(&transaction, &[], "dirty deletion of a loaded file");
+        for index in 4..12 {
+            install_entry(
+                &mut transaction,
+                &token_at(index),
+                Some(&small),
+                Some(vec![b'd'; index * 331]),
+                true,
+                true,
+            );
+        }
+        assert_reservations_agree(&transaction, &[], "eleven dirty files");
+        install_entry(
+            &mut transaction,
+            &token_at(12),
+            Some(&small),
+            None,
+            false,
+            false,
+        );
+        assert_reservations_agree(&transaction, &[], "an unloaded clean entry is not a change");
+        assert_reservations_agree(
+            &transaction,
+            &[(&token_at(12), Some(&small))],
+            "override against an unloaded entry",
+        );
+        assert_reservations_agree(
+            &transaction,
+            &[(&token_at(900), Some(&small))],
+            "override without an entry",
+        );
+
+        let mut shapes = Shapes(0x9e37_79b9_7f4a_7c15);
+        for case in 0..192 {
+            transaction.entries.clear();
+            let count = shapes.below(6);
+            let mut tokens = Vec::with_capacity(count);
+            for index in 0..count {
+                let token = token_at(index);
+                let original = (shapes.below(3) != 0)
+                    .then(|| vec![b'o'; lengths[shapes.below(lengths.len())]]);
+                let data = (shapes.below(4) != 0)
+                    .then(|| vec![b'c'; lengths[shapes.below(lengths.len())]]);
+                install_entry(
+                    &mut transaction,
+                    &token,
+                    original.as_deref(),
+                    data,
+                    shapes.below(2) == 0,
+                    shapes.below(16) != 0,
+                );
+                tokens.push(token);
+            }
+            let mut owned: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+            for _ in 0..shapes.below(4) {
+                let token = if tokens.is_empty() || shapes.below(8) == 0 {
+                    token_at(900 + shapes.below(3))
+                } else {
+                    tokens[shapes.below(tokens.len())].clone()
+                };
+                let data = (shapes.below(4) != 0)
+                    .then(|| vec![b'v'; lengths[shapes.below(lengths.len())]]);
+                owned.push((token, data));
+            }
+            let overrides = owned
+                .iter()
+                .map(|(token, data)| (token.as_str(), data.as_deref()))
+                .collect::<Vec<_>>();
+            assert_reservations_agree(&transaction, &overrides, &format!("generated case {case}"));
+            assert_reservations_agree(
+                &transaction,
+                &[],
+                &format!("generated case {case} without overrides"),
+            );
+        }
+        transaction.abort();
+    }
+
+    #[test]
+    fn appending_frames_never_recommits_to_the_whole_file() {
+        const FRAME: u64 = 4096;
+        const FRAMES: u64 = 1_000;
+
+        let (_temporary, host) = probe_host(StorageLimits::default());
+        let mut transaction = vfs_transaction(&host, "append-cost");
+        let handle = transaction
+            .vfs_open(
+                "wal.db",
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    create: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open");
+        let frame = vec![0x5a_u8; usize::try_from(FRAME).expect("bounded frame")];
+        let before = crate::key::hashed_bytes();
+        let started = std::time::Instant::now();
+        for index in 0..FRAMES {
+            transaction
+                .vfs_write_at(handle, index * FRAME, &frame)
+                .expect("append");
+        }
+        let hashed = crate::key::hashed_bytes() - before;
+        let elapsed = started.elapsed();
+        let written = FRAMES * FRAME;
+        println!("{FRAMES} appends of {FRAME} B hashed {hashed} bytes in {elapsed:?}");
+        // Recommitting to the whole candidate file on every write hashes `written * FRAMES / 2`,
+        // roughly 2 GiB here. Reserving a write may cost the manifest, never the file again.
+        assert!(
+            hashed <= written,
+            "{FRAMES} appends totalling {written} bytes hashed {hashed} bytes: \
+             the reservation path is committing to complete file contents"
+        );
+
+        // The durable path still commits to the real bytes: the file itself, plus the staged copy
+        // and the on-disk target that `apply_manifest_data` re-reads.
+        transaction.vfs_close(handle).expect("close");
+        let before_commit = crate::key::hashed_bytes();
+        transaction.commit().expect("commit");
+        let commit_hashed = crate::key::hashed_bytes() - before_commit;
+        println!("commit hashed {commit_hashed} bytes for a {written}-byte file");
+        assert!(
+            commit_hashed >= written,
+            "commit hashed only {commit_hashed} bytes for a {written}-byte file"
         );
     }
 
