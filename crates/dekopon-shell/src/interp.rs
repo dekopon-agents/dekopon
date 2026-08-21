@@ -1344,6 +1344,11 @@ fn invert(status: ExitCode) -> ExitCode {
 ///
 /// One result keeps its structure so `x=$(cap ... )` stays JSON; several are joined as text
 /// because that is what a caller reading multiple lines expects.
+///
+/// The join honors [`CommandResult::suppress_newline`] the same way [`Evaluator::emit`] does. A
+/// capture is still a stream of writes: `v=$(printf '%s' a; printf '%s' b)` is `ab` in bash, and
+/// inserting the newline the script explicitly suppressed silently corrupted every value a model
+/// assembled piecewise — a URL, a JSON fragment — with no diagnostic anywhere.
 fn reduce_captured(captured: Vec<CommandResult>) -> Value {
     match captured.len() {
         0 => Value::String(String::new()),
@@ -1351,13 +1356,20 @@ fn reduce_captured(captured: Vec<CommandResult>) -> Value {
             .into_iter()
             .next()
             .map_or(Value::Null, |result| result.value),
-        _ => Value::String(
-            captured
-                .iter()
-                .map(|result| display(&result.value))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        _ => {
+            let mut text = String::new();
+            // Seeded as if the (absent) result before the first one suppressed its terminator, so
+            // nothing is prefixed to the capture.
+            let mut previous_suppressed = true;
+            for result in &captured {
+                if !previous_suppressed {
+                    text.push('\n');
+                }
+                text.push_str(&display(&result.value));
+                previous_suppressed = result.suppress_newline;
+            }
+            Value::String(text)
+        }
     }
 }
 

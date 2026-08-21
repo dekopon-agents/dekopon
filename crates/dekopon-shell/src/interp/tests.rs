@@ -357,6 +357,28 @@ fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
 }
 
 #[test]
+fn a_capture_honors_the_newline_a_command_suppressed() {
+    // Assembling a value piecewise with `printf` is a common model idiom, and a capture that joins
+    // every result with "\n" corrupts every one of them: broken URLs, broken JSON fragments, no
+    // diagnostic. bash prints `ab` for both of these.
+    assert_eq!(
+        output(r#"v=$(printf '%s' a; printf '%s' b); echo "$v""#),
+        "ab"
+    );
+    assert_eq!(output(r#"v=$(echo -n a; echo -n b); echo "$v""#), "ab");
+    // A result that did not suppress its terminator still separates the next one.
+    assert_eq!(
+        output(r#"v=$(echo a; echo b); echo "$v" | wc -l"#),
+        "2".to_owned()
+    );
+    assert_eq!(output(r#"v=$(printf '%s' a; echo b); echo "$v""#), "ab");
+    assert_eq!(
+        output(r#"v=$(echo a; printf '%s' b); echo "$v" | wc -l"#),
+        "2".to_owned()
+    );
+}
+
+#[test]
 fn indexing_is_backed_by_real_json() {
     assert_eq!(output(r#"o=$(echo.echo --a 1 --b 2); echo ${o[b]}"#), "2");
     assert_eq!(
