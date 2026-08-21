@@ -9,6 +9,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added a first text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook,
+  process-local message-ID deduplication, canonical `whatsapp.<wa_id>` subjects, and pinned Graph
+  API text replies.
+- Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
+  operator-owned exact-path webhook ingress.
 - Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
   engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
 - Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
@@ -34,6 +39,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Security
 
+- WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender
+  come only from the signed envelope, transport secrets remain gateway-only, and outcome-unknown
+  Graph sends are never blindly retried.
 - Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest

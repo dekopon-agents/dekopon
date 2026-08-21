@@ -18,8 +18,9 @@ is the only description of what goes in them.
 
 ## What it deploys
 
-One `Deployment`, `replicas: 1`, `strategy: Recreate`, no `Service` and no `Ingress` — neither
-daemon serves HTTP or binds a TCP port, so there is nothing to expose.
+One `Deployment`, `replicas: 1`, `strategy: Recreate`, and no chart-owned `Ingress`. An opt-in
+ClusterIP `Service` exposes only a configured gateway webhook port for operator-owned exact-path
+routing; it is disabled by default. The broker never receives a TCP surface.
 
 | Container | Kind | Runs |
 |---|---|---|
@@ -150,13 +151,13 @@ appends **no audit record**, so probing does not consume the audit log's bounded
   socket only after that work is done, so "the socket answers" is exactly "fully started". The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
   against durable audit state is the worst thing this chart can produce.
-- **`readinessProbe`**, 30 s period. It gates nothing — there is no Service — but it is free and it
-  is the difference between `kubectl get pod` saying `1/1` and saying something true.
-- **No `livenessProbe`.** Nothing routes traffic here, so a restart fixes nothing a human would not
-  fix better, and it would kill a broker mid-invocation.
-- **No gateway probes.** `dekopond` binds nothing and already probes the broker once at startup,
-  exiting non-zero when it does not answer. "Is it healthy" and "is the process running" are the
-  same question.
+- **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
+  webhook Service is enabled, prevents traffic while the broker is unavailable.
+- **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
+  on the configured webhook port. It fails closed when `dekopond.yaml` binds loopback, names a
+  different port, or does not configure an inbound listener.
+- **No `livenessProbe`.** An automatic restart could kill a broker mid-invocation or lose an
+  acknowledged in-memory webhook delivery. Process failure and readiness already remain visible.
 
 One consequence worth knowing: the probe runs `dekopon-run`, which reads
 `OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
@@ -488,6 +489,12 @@ onto these paths: a real deny-by-default configuration that starts, loads the ba
 there so you can install the chart and watch a broker become ready before you give it anything that
 matters. Replace it. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
 model endpoint, and an agent catalog, and the chart can invent none of them.
+
+`gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
+The chart intentionally does not create an Ingress: the operator must route only the configured
+callback path and terminate public TLS outside the pod. A Kubernetes Service cannot reach loopback,
+so the corresponding transport must bind `0.0.0.0:<gateway.service.port>`. The TCP readiness probe
+keeps the Service endpoint unavailable when the configuration and chart port disagree.
 
 ## Install
 

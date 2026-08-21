@@ -18,6 +18,7 @@ pub(crate) mod discord;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod whatsapp;
 
 /// Inbound chat text is bounded before prompting, because a chat service's own message ceiling is
 /// not a bound this daemon chose.
@@ -143,8 +144,13 @@ pub(crate) enum ReplyTarget {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
     },
+    WhatsApp {
+        recipient: String,
+    },
     /// The development transport answers on the connection the request arrived on.
-    Local { connection: u64 },
+    Local {
+        connection: u64,
+    },
 }
 
 /// Who the bot is on one service, resolved at connect time for self-filtering and @-mentions.

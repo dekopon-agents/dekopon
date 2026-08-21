@@ -4,9 +4,10 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** Chat-transport wakeups, chat-scoped attested routing, bounded sessions,
-persistent conversations, truthful transport-acceptance receipts, and optional broker-owned durable
-chat memory are implemented and tested. A route is `oneShot` unless configured otherwise; durable
+**Status: Current.** Chat-transport wakeups, including a first text-only Meta WhatsApp Cloud API
+webhook, chat-scoped attested routing, bounded sessions, persistent conversations, truthful
+transport-acceptance receipts, and optional broker-owned durable chat memory are implemented and
+tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. A
 dedicated gateway UID remains **committed direction**.
 
@@ -54,6 +55,16 @@ transports:
     kind: telegramLongPoll
     botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
     activity: { mode: native }                # renewable native typing; optional/off by default
+  - name: whatsapp
+    kind: whatsappCloudApi
+    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    bind: 0.0.0.0:9080                     # pod bind; expose only through exact-path TLS ingress
+    callbackPath: /webhooks/whatsapp
+    wabaId: "123456789"
+    phoneNumberId: "987654321"
+    graphApiVersion: v23.0                 # explicit; no implicit/latest version
   - name: dev
     kind: local
     socketPath: /path/to/dekopond-dev.sock
@@ -258,6 +269,49 @@ identity, replies, and activity, so a forum-topic pulse cannot appear in another
 around every four seconds inside Telegram's five-second lease. There is no explicit clear; renewal
 stops before the final message, which clears the action. Calls override the long-poll client's
 70-second timeout with a short deadline, honor `retry_after`, and remain cosmetic.
+
+### Meta WhatsApp Cloud API
+
+The `whatsappCloudApi` transport is an inbound plain-HTTP listener intended to sit behind
+Cloudflare Tunnel and Traefik (or equivalent operator-owned HTTPS termination). Its configured
+callback path exposes only GET subscription verification and POST webhook delivery. GET requires
+exactly one `hub.mode=subscribe`, verify token, and challenge, compares the token in constant time,
+and returns the decoded challenge without JSON quoting. POST bounds connection time, headers, body,
+concurrency, message count, and queue depth; requires exactly one
+`X-Hub-Signature-256` whose value is `sha256=<lowercase hex>`; and verifies HMAC-SHA256 over the exact raw body before JSON
+parsing. The callback path is a literal lowercase-segment path—wildcards, captures, empty segments,
+and trailing slashes are rejected at startup. Responses carry `Cache-Control: no-store`; errors and
+logs are content-free.
+
+Only `object=whatsapp_business_account`, `field=messages`, `messaging_product=whatsapp` events for
+the configured exact WABA/receiving-phone tuple may produce sessions. Every entry, change, and
+message in a signed batch is inspected. Status-only, unknown, malformed non-message, unsupported
+message type, wrong-destination, and self/echo messages are acknowledged and ignored. Ordinary text
+uses signed `messages[].from` both as reply target and as the sole identity source; profile names,
+display phone numbers, message text, WABA IDs, and phone-number IDs cannot assert the sender.
+Canonical subject is `whatsapp.<wa_id>`. The WABA, receiving phone number, and sender remain in the
+transport-derived chat scope as `<waba>:<phone-number-id>:<wa_id>`.
+
+The handler claims signed `messages[].id` values in a 4,096-entry process-local set and atomically
+enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text
+messages, and the queue admits at most 512 messages across 64 delivery slots. Duplicates seen by
+that running process are acknowledged without another session. This is deliberately not durable
+exactly-once: restart forgets claims, and a crash after 200 but before queue drain may lose the
+accepted work. Queue saturation returns 503 and rolls back new claims so Meta can redeliver.
+
+Replies are one bounded JSON POST to the pinned
+`https://graph.facebook.com/{version}/{phone-number-id}/messages` endpoint with the gateway-held
+bearer token. Redirects are disabled, responses and time are bounded, and Meta error bodies never
+reach chat or logs. Text is capped at 4,096 Unicode scalar values with an explicit truncation marker.
+No send is retried: a timeout after request transmission is outcome-unknown and blindly resending
+could duplicate a visible answer. After Graph accepts the reply, the signed inbound message ID
+becomes the service-typed delivery identity for optional durable chat memory, bound to the WABA
+and receiving phone number in the attested scope. Failed or outcome-unknown replies record no delivered turn. Free-form text remains
+subject to Meta's customer-service window; there is no template fallback.
+
+Media, templates, interactive messages, reactions, activity, status processing, business-management
+APIs, embedded signup, webhook multiplexing, and daemon TLS termination are non-goals. See
+[`../examples/whatsapp/`](../examples/whatsapp/README.md) for placeholder-only setup.
 
 ### Local development transport
 

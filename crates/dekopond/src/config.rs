@@ -11,6 +11,7 @@
 use std::{
     collections::BTreeSet,
     env, io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -55,6 +56,8 @@ pub const SLACK_ENDPOINT: &str = "https://slack.com";
 pub const DISCORD_ENDPOINT: &str = "https://discord.com";
 /// The only non-loopback Telegram origin this daemon will talk to.
 pub const TELEGRAM_ENDPOINT: &str = "https://api.telegram.org";
+/// The only non-loopback Meta Graph API origin this daemon will send WhatsApp replies to.
+pub const WHATSAPP_GRAPH_ENDPOINT: &str = "https://graph.facebook.com";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum ConfigApiVersion {
@@ -190,6 +193,22 @@ pub enum TransportConfig {
         #[serde(default)]
         endpoint: Option<String>,
     },
+    /// Meta WhatsApp Cloud API: a signed public webhook receives text and Graph API sends replies.
+    WhatsappCloudApi {
+        name: String,
+        app_secret_env: String,
+        verify_token_env: String,
+        access_token_env: String,
+        /// Plain HTTP listener behind operator-owned TLS termination.
+        bind: SocketAddr,
+        callback_path: String,
+        waba_id: String,
+        phone_number_id: String,
+        graph_api_version: String,
+        /// Overridable only to the pinned production origin or literal loopback HTTP for tests.
+        #[serde(default)]
+        graph_endpoint: Option<String>,
+    },
     /// Telegram long polling: the poll is the wakeup and advancing the offset is the ack.
     TelegramLongPoll {
         name: String,
@@ -212,6 +231,7 @@ impl TransportConfig {
         match self {
             Self::SlackSocketMode { name, .. }
             | Self::DiscordGateway { name, .. }
+            | Self::WhatsappCloudApi { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
         }
@@ -223,6 +243,7 @@ impl TransportConfig {
         match self {
             Self::SlackSocketMode { .. } => "slackSocketMode",
             Self::DiscordGateway { .. } => "discordGateway",
+            Self::WhatsappCloudApi { .. } => "whatsappCloudApi",
             Self::TelegramLongPoll { .. } => "telegramLongPoll",
             Self::Local { .. } => "local",
         }
@@ -790,6 +811,49 @@ pub(crate) fn resolve(
                     endpoint: Some(endpoint),
                 }
             }
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => {
+                validate_env_name(&app_secret_env)?;
+                validate_env_name(&verify_token_env)?;
+                validate_env_name(&access_token_env)?;
+                if !canonical_positive_decimal(&waba_id)
+                    || !canonical_positive_decimal(&phone_number_id)
+                {
+                    return Err(ConfigError::InvalidWhatsappScope { name });
+                }
+                if bind.port() == 0 {
+                    return Err(ConfigError::InvalidWhatsappBind { name });
+                }
+                if !valid_whatsapp_callback_path(&callback_path) {
+                    return Err(ConfigError::InvalidWhatsappCallback { name });
+                }
+                if !valid_graph_version(&graph_api_version) {
+                    return Err(ConfigError::InvalidWhatsappGraphVersion { name });
+                }
+                let graph_endpoint = validate_endpoint(graph_endpoint, WHATSAPP_GRAPH_ENDPOINT)?;
+                TransportConfig::WhatsappCloudApi {
+                    name,
+                    app_secret_env,
+                    verify_token_env,
+                    access_token_env,
+                    bind,
+                    callback_path,
+                    waba_id,
+                    phone_number_id,
+                    graph_api_version,
+                    graph_endpoint: Some(graph_endpoint),
+                }
+            }
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
@@ -997,6 +1061,41 @@ fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<Strin
     })
 }
 
+fn canonical_positive_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_whatsapp_callback_path(value: &str) -> bool {
+    value.len() <= 256
+        && value.starts_with('/')
+        && !value.ends_with('/')
+        && value.split('/').skip(1).all(|segment| {
+            !segment.is_empty()
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+        })
+}
+
+fn valid_graph_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix('v') else {
+        return false;
+    };
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    minor == "0"
+        && !major.is_empty()
+        && major.len() <= 3
+        && !major.starts_with('0')
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn is_loopback_authority(authority: &str) -> bool {
     // Anything before `@` is userinfo and anything after `/` is a path; neither is the host the
     // socket would connect to, and both are how a remote authority disguises itself as loopback.
@@ -1012,10 +1111,7 @@ fn is_loopback_authority(authority: &str) -> bool {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host),
     };
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "::1")
 }
 
 /// Strict configuration failure.
@@ -1067,6 +1163,14 @@ pub enum ConfigError {
         "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
     )]
     InvalidSlackActivity { name: String },
+    #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
+    InvalidWhatsappBind { name: String },
+    #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
+    InvalidWhatsappScope { name: String },
+    #[error("WhatsApp transport {name:?} has an invalid callback path")]
+    InvalidWhatsappCallback { name: String },
+    #[error("WhatsApp transport {name:?} must pin a Graph API version such as v23.0")]
+    InvalidWhatsappGraphVersion { name: String },
     #[error("route names unknown transport {transport:?}")]
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
