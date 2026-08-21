@@ -2042,6 +2042,25 @@ pub enum AuditError {
     },
 }
 
+impl AuditError {
+    /// Stable low-cardinality classification for logs and span fields.
+    ///
+    /// A designed refusal, a handle that stays dead until restart, and a filesystem that stopped
+    /// accepting writes need three different operator responses, so the failure that reaches
+    /// telemetry must name which one happened.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::Full { .. } => "full",
+            Self::Poisoned => "poisoned",
+            Self::RecordTooLarge { .. } => "record-too-large",
+            Self::SequenceOverflow => "sequence-overflow",
+            Self::Serialize { .. } => "serialize",
+            Self::Io { .. } => "io",
+        }
+    }
+}
+
 /// Audit-chain verification failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuditIntegrityError {
@@ -2668,8 +2687,8 @@ where
             }
             None => {
                 let decision = self.authorize_agent_prompt(&context, &attestation.agent);
-                (!decision.allowed).then_some(Refusal {
-                    reason: "agent-denied",
+                (!decision.allowed).then(|| Refusal {
+                    reason: denial_reason(&decision, "agent-denied"),
                     policy_ids: decision.determining_policy_ids,
                 })
             }
@@ -2683,6 +2702,11 @@ where
     /// a policy that does not let this principal drive this agent at all — which callers must not
     /// conflate with "allowed to ask, granted nothing" (`Some` with an empty list). Answering a
     /// refused caller with an empty list would tell it whether the subject is mapped.
+    ///
+    /// The bare `Option` keeps the wire answer opaque, so the refusal class is reported here
+    /// instead: one `broker_capabilities_refused` event names the class and the canonical subject
+    /// on the broker's own side of the socket, where a session that never invokes would otherwise
+    /// leave no trace of why it saw nothing.
     #[must_use]
     pub fn capabilities_for(
         &self,
@@ -2692,19 +2716,35 @@ where
         agent: &AgentId,
     ) -> Option<(Vec<AvailableCapability>, Vec<String>)> {
         if !grant.is_some_and(|grant| grant.permits(subject)) {
+            report_inspection_refusal("attestation-denied", peer, subject, agent);
             return None;
         }
-        let principal = self.identities.resolve(subject)?;
-        let context = AuthenticatedContext::attested(
+        let Some(principal) = self.identities.resolve(subject) else {
+            report_inspection_refusal("unmapped-subject", peer, subject, agent);
+            return None;
+        };
+        let context = match AuthenticatedContext::attested(
             principal.clone(),
             Actor::Agent {
                 agent: agent.clone(),
             },
             peer.principal().clone(),
             subject.clone(),
-        )
-        .ok()?;
-        if !self.authorize_agent_prompt(&context, agent).allowed {
+        ) {
+            Ok(context) => context,
+            Err(_) => {
+                report_inspection_refusal("attestation-denied", peer, subject, agent);
+                return None;
+            }
+        };
+        let decision = self.authorize_agent_prompt(&context, agent);
+        if !decision.allowed {
+            report_inspection_refusal(
+                denial_reason(&decision, "agent-denied"),
+                peer,
+                subject,
+                agent,
+            );
             return None;
         }
         Some((self.capabilities(&context), self.command_words(&context)))
@@ -2722,7 +2762,13 @@ where
         Vec<String>,
         Option<ChatMemorySurface>,
     )> {
-        let context = self.resolve_chat_claim(peer, grant, claim)?;
+        let context = match self.resolve_chat_claim(peer, grant, claim) {
+            Ok(context) => context,
+            Err(reason) => {
+                report_inspection_refusal(reason, peer, &claim.subject, &claim.agent);
+                return None;
+            }
+        };
         let mut capabilities = self.capabilities(&context);
         let mut words = self.command_words(&context);
         let memory = self.memory_surface(&context, &claim.agent);
@@ -2748,7 +2794,7 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        let Some(context) = self.resolve_chat_claim(peer, grant, claim) else {
+        let Ok(context) = self.resolve_chat_claim(peer, grant, claim) else {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
@@ -2810,9 +2856,9 @@ where
         };
         let context = self
             .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
         let mut refusal = (attestation.invocation != request.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_none())
+            || self.resolve_chat_claim(peer, grant, &claim).is_err())
         .then_some(Refusal {
             reason: "chat-attestation-denied",
             policy_ids: Vec::new(),
@@ -2861,9 +2907,9 @@ where
         };
         let context = self
             .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
         let refusal = if attestation.invocation != turn.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_none()
+            || self.resolve_chat_claim(peer, grant, &claim).is_err()
         {
             Some(Refusal {
                 reason: "chat-attestation-denied",
@@ -2898,14 +2944,21 @@ where
         self.invoke_inner(&context, request, refusal).await
     }
 
+    /// Derives the chat context, or the stable refusal class that stopped it.
+    ///
+    /// The class exists so an inspection refusal can be reported once by its caller; the wire
+    /// answer stays the same opaque nothing it was.
     fn resolve_chat_claim(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         claim: &ChatSessionClaim,
-    ) -> Option<AuthenticatedContext> {
-        let grant = grant?;
-        let principal = self.identities.resolve(&claim.subject)?;
+    ) -> Result<AuthenticatedContext, &'static str> {
+        let grant = grant.ok_or("attestation-denied")?;
+        let principal = self
+            .identities
+            .resolve(&claim.subject)
+            .ok_or("unmapped-subject")?;
         // `chatScopes` was added for storage namespace authority. An existing subject-only
         // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
         // using the chat operations. It receives the legacy context with no trusted chat scope,
@@ -2913,7 +2966,7 @@ where
         // chat scope is authored, the service-specific canonical checks and exact grant apply.
         let context = if grant.chat_scopes.is_empty() {
             if !grant.permits(&claim.subject) {
-                return None;
+                return Err("attestation-denied");
             }
             AuthenticatedContext::attested(
                 principal.clone(),
@@ -2923,10 +2976,10 @@ where
                 peer.principal().clone(),
                 claim.subject.clone(),
             )
-            .ok()?
+            .map_err(|_| "attestation-denied")?
         } else {
             if !grant.permits_chat(&claim.subject, &claim.scope) {
-                return None;
+                return Err("attestation-denied");
             }
             AuthenticatedContext::attested_chat(
                 principal.clone(),
@@ -2937,11 +2990,14 @@ where
                 claim.subject.clone(),
                 claim.scope.clone(),
             )
-            .ok()?
+            .map_err(|_| "attestation-denied")?
         };
-        self.authorize_agent_prompt(&context, &claim.agent)
-            .allowed
-            .then_some(context)
+        let decision = self.authorize_agent_prompt(&context, &claim.agent);
+        if decision.allowed {
+            Ok(context)
+        } else {
+            Err(denial_reason(&decision, "agent-denied"))
+        }
     }
 
     fn memory_surface(
@@ -3212,6 +3268,7 @@ where
                 "broker.authorize",
                 invocation = %request.id,
                 outcome = tracing::field::Empty,
+                policy.errors_present = tracing::field::Empty,
             )
         } else {
             tracing::info_span!(
@@ -3221,6 +3278,7 @@ where
             subject = tracing::field::Empty,
             via = tracing::field::Empty,
             outcome = tracing::field::Empty,
+            policy.errors_present = tracing::field::Empty,
             input = tracing::field::Empty,
             )
         };
@@ -3271,15 +3329,25 @@ where
                     .await;
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
+            // A policy that errors at evaluation time denies exactly like a policy that does not
+            // match, so the flag is the only thing that separates a broken rule from a working one.
+            // It is a flag rather than the error text on purpose: an explanation must not become a
+            // per-request channel for policy source or entity data.
+            authorize.record("policy.errors_present", decision.errors_present);
             if !decision.allowed {
-                authorize.record("outcome", "policy-denied");
+                let reason = denial_reason(&decision, "policy-denied");
+                authorize.record("outcome", reason);
+                if decision.errors_present {
+                    // The invocation identifier only: it joins this event to the authorize span,
+                    // which is where the capability lives when the route may carry one.
+                    tracing::warn!(
+                        event = "broker_policy_evaluation_error",
+                        invocation = %request.id,
+                        policy.target = "capability",
+                    );
+                }
                 return self
-                    .deny(
-                        context,
-                        &request,
-                        "policy-denied",
-                        decision.determining_policy_ids,
-                    )
+                    .deny(context, &request, reason, decision.determining_policy_ids)
                     .await;
             }
             authorize.record("outcome", "allowed");
@@ -3287,12 +3355,19 @@ where
         };
         let provider = set.provider.clone();
         let execute = if set.constraints.storage.is_some() {
-            tracing::info_span!("broker.execute", storage = true)
+            tracing::info_span!(
+                "broker.execute",
+                storage = true,
+                outcome = tracing::field::Empty,
+                error = tracing::field::Empty,
+            )
         } else {
             tracing::info_span!(
                 "broker.execute",
                 provider = %provider,
                 credential = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                error = tracing::field::Empty,
             )
         };
         // The symbolic name only, exactly as the audit record carries it: once one capability can
@@ -3373,7 +3448,10 @@ where
                 storage: None,
             })
             .await
-            .map_err(|source| BrokerError::DecisionAudit { source })?;
+            .map_err(|source| {
+                report_audit_failure("decision", &request.id, &source);
+                BrokerError::DecisionAudit { source }
+            })?;
         Ok(InvocationResult {
             invocation: request.id.clone(),
             decision,
@@ -3528,7 +3606,12 @@ where
                 storage: None,
             })
             .await
-            .map_err(|source| BrokerError::DecisionAudit { source })?;
+            .map_err(|source| {
+                tracing::Span::current().record("outcome", "decision-unaudited");
+                tracing::Span::current().record("error", source.category());
+                report_audit_failure("decision", &invocation_id, &source);
+                BrokerError::DecisionAudit { source }
+            })?;
 
         let storage_grant = match storage_preparation.take() {
             None => None,
@@ -3702,13 +3785,31 @@ where
             }
         };
 
-        self.audit
-            .append(audit_event)
-            .await
-            .map_err(|source| BrokerError::OutcomeAudit {
-                invocation: invocation_id,
+        // The same sanitized pair the terminal audit record carries. A trace that ends at "the
+        // provider ran" cannot say whether the effect worked, and `error` here is the classified
+        // reason the client is already told, never provider output.
+        let execution = tracing::Span::current();
+        execution.record(
+            "outcome",
+            if matches!(result.outcome, InvocationOutcome::Succeeded) {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+        if let Some(error) = result.error.as_deref() {
+            execution.record("error", error);
+        }
+
+        self.audit.append(audit_event).await.map_err(|source| {
+            execution.record("outcome", "outcome-unaudited");
+            execution.record("error", source.category());
+            report_audit_failure("outcome", &invocation_id, &source);
+            BrokerError::OutcomeAudit {
+                invocation: invocation_id.clone(),
                 source,
-            })?;
+            }
+        })?;
         Ok(result)
     }
 
@@ -4016,6 +4117,70 @@ fn encode_storage_limits(
 struct Refusal {
     reason: &'static str,
     policy_ids: Vec<String>,
+}
+
+/// Separates a policy that could not be evaluated from one that simply did not match.
+///
+/// Both deny, and until now both denied identically in audit and telemetry, so a Cedar evaluation
+/// error — an extension call on a malformed value, say — was indistinguishable from a clean
+/// no-match by anything an operator can read.
+const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'static str {
+    if decision.errors_present {
+        "policy-error"
+    } else {
+        denied
+    }
+}
+
+/// Names why an attested inspection saw nothing, on the broker's own side of the socket.
+///
+/// The response stays opaque — it must not tell a refused caller whether the subject is mapped —
+/// so this event is the only place the refusal class and the canonical subject meet. It is what
+/// makes an unmapped sender diagnosable without a payload-carrying gateway span.
+fn report_inspection_refusal(
+    reason: &'static str,
+    peer: &AuthenticatedContext,
+    subject: &ExternalSubject,
+    agent: &AgentId,
+) {
+    tracing::warn!(
+        event = "broker_capabilities_refused",
+        reason,
+        subject = %subject,
+        agent = %agent,
+        via = %peer.principal(),
+    );
+}
+
+/// Reports why the broker could not durably account for a decision or an outcome.
+///
+/// This is the most consequential failure the broker can have and it used to be anonymous: the
+/// wire code and the connection log both carried a category with no cause, so a bounded log
+/// reaching its limit, a poisoned handle, and a full filesystem all read the same.
+fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: &AuditError) {
+    tracing::error!(
+        event = "broker_audit_append_failed",
+        audit.stage = stage,
+        category = source.category(),
+        invocation = %invocation,
+        error = %error_chain(source),
+    );
+}
+
+/// Renders an error and its sources as one `a: b: c` line.
+///
+/// The chain is the point: `AuditError::Io`'s own message says only that a durable append failed,
+/// and the errno that says *why* — `ENOSPC`, the deployment's named top risk — lives one level
+/// down.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
 }
 
 #[allow(
