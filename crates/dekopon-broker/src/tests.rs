@@ -753,7 +753,7 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
     assert_eq!(audit.checkpoint().await, checkpoint);
     assert_eq!(
         audit
-            .replay_ids()
+            .take_replay_ids()
             .await
             .iter()
             .map(InvocationId::as_str)
@@ -764,6 +764,18 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
         .append(decision("invoke-three", true))
         .await
         .expect("append continues verified chain");
+    // Startup-only state: the broker's replay ledger owns these ids now, so nothing keeps
+    // accumulating a second copy of them here for the life of the process.
+    assert!(
+        audit.take_replay_ids().await.is_empty(),
+        "restored identifiers are handed over once, not retained and re-served"
+    );
+    // The reconcile window still answers for the current head and the record before it.
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 3);
+    assert!(audit.contains_checkpoint(3, head.as_deref()).await);
+    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
+    assert!(!audit.contains_checkpoint(2, head.as_deref()).await);
     drop(audit);
 
     let records = fs::read_to_string(&path)

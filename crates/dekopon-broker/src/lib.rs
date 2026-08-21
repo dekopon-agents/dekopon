@@ -1682,8 +1682,12 @@ struct FileAuditState {
     file: File,
     count: usize,
     head: Option<String>,
-    record_hashes: Vec<String>,
-    replay_ids: BTreeSet<InvocationId>,
+    /// The hash before `head`: the whole reconcile window, since an audit log can be at most one
+    /// append ahead of its checkpoint. Retaining every verified hash instead would hold roughly
+    /// 20 MB at the production record cap for the process lifetime, for a startup-only check.
+    previous_head: Option<String>,
+    /// Decision identifiers restored at startup, until the broker's replay ledger takes them.
+    replay_ids: Option<BTreeSet<InvocationId>>,
     poisoned: bool,
 }
 
@@ -1729,7 +1733,7 @@ impl FileAuditLog {
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);
-        let (count, head, record_hashes, replay_ids) =
+        let (count, head, previous_head, replay_ids) =
             scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
         let mut file = reader.into_inner();
         file.seek(SeekFrom::End(0))
@@ -1743,8 +1747,8 @@ impl FileAuditLog {
                 file,
                 count,
                 head,
-                record_hashes,
-                replay_ids,
+                previous_head,
+                replay_ids: Some(replay_ids),
                 poisoned: false,
             }),
         })
@@ -1763,20 +1767,36 @@ impl FileAuditLog {
     }
 
     /// Reports whether a retained sequence/head pair is an exact verified chain prefix.
+    ///
+    /// Only the reconcile window is answered for: the current head, the record before it, and the
+    /// empty chain. A checkpoint further behind than one append is not a prefix this log will
+    /// confirm — reconciliation rejects that gap on its own, and confirming it would mean keeping
+    /// every verified hash resident forever.
     pub async fn contains_checkpoint(&self, count: usize, head: Option<&str>) -> bool {
         let state = self.state.lock().await;
         match count {
             0 => head.is_none(),
-            count if count <= state.record_hashes.len() => {
-                head == Some(state.record_hashes[count - 1].as_str())
+            count if count == state.count => head == state.head.as_deref(),
+            count if Some(count) == state.count.checked_sub(1) => {
+                head == state.previous_head.as_deref()
             }
             _ => false,
         }
     }
 
-    /// Returns invocation IDs reconstructed from verified decision records.
-    pub async fn replay_ids(&self) -> Vec<InvocationId> {
-        self.state.lock().await.replay_ids.iter().cloned().collect()
+    /// Returns invocation IDs reconstructed from verified decision records, once.
+    ///
+    /// Consuming on purpose. The only caller hands them straight to the broker's replay ledger,
+    /// which owns them from then on; keeping a second copy here would duplicate the ledger at
+    /// startup and then grow it forever on a path nothing reads again. A later call returns
+    /// nothing, and appends stop recording once they have been taken.
+    pub async fn take_replay_ids(&self) -> Vec<InvocationId> {
+        let mut state = self.state.lock().await;
+        state
+            .replay_ids
+            .take()
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1824,10 +1844,11 @@ impl AuditLog for FileAuditLog {
             return Err(AuditError::Io { source });
         }
         state.count += 1;
-        state.head = Some(record.record_hash.clone());
-        state.record_hashes.push(record.record_hash.clone());
-        if let AuditEvent::Decision { invocation, .. } = &record.event {
-            state.replay_ids.insert(invocation.clone());
+        state.previous_head = state.head.replace(record.record_hash.clone());
+        if let Some(ids) = state.replay_ids.as_mut()
+            && let AuditEvent::Decision { invocation, .. } = &record.event
+        {
+            ids.insert(invocation.clone());
         }
         state.poisoned = false;
         Ok(record)
@@ -1838,14 +1859,22 @@ async fn scan_audit_file(
     reader: &mut BufReader<File>,
     maximum_records: usize,
     maximum_line_bytes: usize,
-) -> Result<(usize, Option<String>, Vec<String>, BTreeSet<InvocationId>), FileAuditError> {
+) -> Result<
+    (
+        usize,
+        Option<String>,
+        Option<String>,
+        BTreeSet<InvocationId>,
+    ),
+    FileAuditError,
+> {
     let mut count = 0_usize;
     let mut previous = None::<String>;
-    let mut record_hashes = Vec::new();
+    let mut before_previous = None::<String>;
     let mut replay_ids = BTreeSet::new();
     loop {
         let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
-            return Ok((count, previous, record_hashes, replay_ids));
+            return Ok((count, previous, before_previous, replay_ids));
         };
         if count >= maximum_records {
             return Err(FileAuditError::TooManyRecords {
@@ -1862,8 +1891,7 @@ async fn scan_audit_file(
         if let AuditEvent::Decision { invocation, .. } = &record.event {
             replay_ids.insert(invocation.clone());
         }
-        record_hashes.push(record.record_hash.clone());
-        previous = Some(record.record_hash);
+        before_previous = previous.replace(record.record_hash);
         count += 1;
     }
 }

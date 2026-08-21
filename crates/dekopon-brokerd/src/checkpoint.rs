@@ -261,16 +261,23 @@ pub async fn reconcile(
         None => return Err(CheckpointError::MissingForNonEmptyAudit),
         Some(stored) => {
             let records = stored.records()?;
+            // The size of the gap is classified before the hash is compared. An audit log can be
+            // at most one append ahead of its checkpoint, and it retains exactly that window, so
+            // a checkpoint further behind is a gap rather than a prefix anything could confirm —
+            // and an operator needs to be told which of the two it is.
+            if records != current.0 && records.checked_add(1) != Some(current.0) {
+                if records > current.0 {
+                    return Err(CheckpointError::AuditMismatch);
+                }
+                return Err(CheckpointError::AuditAheadByMultiple {
+                    checkpoint_records: records,
+                    audit_records: current.0,
+                });
+            }
             if !audit.contains_checkpoint(records, stored.head()).await {
                 return Err(CheckpointError::AuditMismatch);
             }
             if records != current.0 || stored.head() != current.1.as_deref() {
-                if records.checked_add(1) != Some(current.0) {
-                    return Err(CheckpointError::AuditAheadByMultiple {
-                        checkpoint_records: records,
-                        audit_records: current.0,
-                    });
-                }
                 store.write(current.0, current.1.as_deref()).await?;
             }
         }
@@ -701,6 +708,15 @@ mod tests {
                 checkpoint_records: 0,
                 audit_records: 2
             })
+        ));
+
+        // A checkpoint claiming more records than the audit holds is the other direction: the
+        // audit lost records, which is a mismatch rather than a checkpoint that fell behind.
+        let ahead = StoredCheckpoint::new(5, Some(&format!("sha256:{}", "c".repeat(64))))
+            .expect("well-formed ahead checkpoint");
+        assert!(matches!(
+            reconcile(&audit, &gap_store, Some(&ahead)).await,
+            Err(CheckpointError::AuditMismatch)
         ));
     }
 

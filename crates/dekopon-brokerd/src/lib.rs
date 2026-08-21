@@ -148,7 +148,7 @@ where
     checkpoint::reconcile(&file_audit, &checkpoint_store, stored_checkpoint.as_ref())
         .await
         .map_err(BrokerdError::Checkpoint)?;
-    let replay_ids = file_audit.replay_ids().await;
+    let replay_ids = file_audit.take_replay_ids().await;
     let audit = Arc::new(checkpoint::CheckpointedAuditLog::new(
         file_audit,
         checkpoint_store,
