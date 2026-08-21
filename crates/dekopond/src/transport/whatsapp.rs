@@ -645,6 +645,7 @@ fn parse_delivery(state: &WebhookState, root: &Value) -> Result<Vec<InboundMessa
                     assets: Vec::new(),
                     conversation: ConversationKind::DirectMessage,
                     addressed: None,
+                    thread_continuation: None,
                     reply: ReplyTarget::WhatsApp {
                         recipient: sender.to_owned(),
                     },

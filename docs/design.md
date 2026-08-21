@@ -102,7 +102,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-telemetry` | OTLP exporter settings and subscriber wiring, with ingest credentials read only from the environment | **Current** library shared by the executables |
 | `dekopon-webui` | GET-only, unauthenticated operational HTML for broker-loaded providers, Wasmtime counters, credential-free OTLP settings, and bounded gateway-reported agent/token status | **Current** library embedded only in `dekopon-brokerd`; listener enablement is explicit |
 | `dekopon-run` | One-shot direct invocation, a single model scripting tool, local/OTLP trace export, audit-safe lifecycle logs, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
-| `dekopond` | Chat-transport wakeups, including a signed text-only WhatsApp Cloud API webhook, attested routing, opt-in route-scoped image generation, text/image replies, best-effort native in-flight activity, cooperatively cancellable bounded agent sessions with no broker authority, credential-free self-inspection, and bounded per-sender conversation history | **Current** unprivileged daemon; a route is one independent session per message unless it opts into `mode: persistent`, generation/activity are explicit opt-ins after authorization, WhatsApp TLS terminates outside the daemon and replay handling is process-local, and a dedicated gateway UID remains **committed direction** |
+| `dekopond` | Chat-transport wakeups, including a signed text-only WhatsApp Cloud API webhook, attested routing, opt-in route-scoped image generation, text/image replies, authorization-fed Slack Agent thread ownership, optional no-reply decisions, best-effort native in-flight activity, cooperatively cancellable bounded agent sessions with no broker authority, credential-free self-inspection, and bounded per-sender conversation history | **Current** unprivileged daemon; a route is one independent session per message unless it opts into `mode: persistent`, generation/activity are explicit opt-ins after authorization, Slack continuation is installed only after authorization, WhatsApp TLS terminates outside the daemon and replay handling is process-local, and a dedicated gateway UID remains **committed direction** |
 | `dekopon-brokerd` | Owner-only Unix peer authentication, Cedar authorization, destination-bound credential resolution, replay restoration, provider execution, evidence, durable audit, atomic local checkpoint verification, and an explicitly enabled unauthenticated read-only web view | **Current** privileged process; independent remote/signed anchoring remains direction |
 | Cedar policy adapter | Declarative authorization with strict startup validation and per-decision explanations | **Current**; it replaced the exact-match evaluator outright |
 | Exact policy evaluator | Principal/actor/capability/provider rules with deny-by-default matching | **Removed.** Its authorization half is now Cedar; its execution half survives unchanged as owner-authored constraint sets, still validated against loaded manifests, host ceilings, and the credential store |
@@ -125,6 +125,14 @@ continuity policies always include provider, agent, canonical sender, transport,
 conversation: `stable` deliberately survives semantic authority changes; the default
 `authority-bound` persists an opaque pointer and random epoch so A→B→A creates three generations.
 The store has finite permanent deduplication and no deletion/export UX or encryption-at-rest claim.
+
+Slack Agent channel continuation is also current in this tree and unreleased. One explicitly
+addressed, freshly authorized message claims an exact workspace/channel/thread/sender tuple in a
+bounded gateway-only registry. Only that sender's later message in that thread bypasses the repeat
+mention, and every continuation is authorized again. The prompt marks that unaddressed follow-up as
+optional and offers one payload-free decline tool; choosing it before capability work produces no
+chat post, acceptance receipt, or durable-memory record. Capability work makes a reply mandatory;
+if no model turn remains, the gateway posts a fixed warning to inspect audit before retrying.
 
 ## Current control paths
 

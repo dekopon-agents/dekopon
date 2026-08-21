@@ -12,8 +12,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, HistoryLimits,
-    IMAGE_GENERATION_TOOL_NAME, PromptLimits,
+    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
+    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, PromptLimits,
 };
 use dekopon_broker_protocol::{
     AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
@@ -45,14 +45,15 @@ use crate::{
     routes::{RouteError, RoutingTable},
     session::{
         BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelFactory, SessionError,
-        SessionGate, SessionRunner, UNAUTHORIZED_REPLY, configured_image_generators,
-        memory_record_outcome_category, run_session,
+        SessionGate, SessionRunner, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
+        configured_image_generators, memory_record_outcome_category, run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
-        OutboundReply, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, bound_outbound, credential_value,
+        OutboundReply, ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership,
+        TransportError, TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
+        credential_value,
     },
 };
 
@@ -1320,6 +1321,38 @@ fn generate_image(prompt: &str) -> AssistantTurn {
     }
 }
 
+fn script_call(script: &str) -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "script-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: "bash".to_owned(),
+                arguments: json!({"script": script}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+fn decline_reply() -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "decline-call".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
 fn inspect_agent_config() -> AssistantTurn {
     AssistantTurn {
         content: None,
@@ -1369,6 +1402,25 @@ impl ChatReplier for RecordingReplier {
             }
             Ok(DeliveryReceipt::new("test-acceptance"))
         })
+    }
+}
+
+#[derive(Default)]
+struct RecordingThreadOwnership {
+    claimed: Mutex<Vec<ThreadClaim>>,
+    revoked: Mutex<Vec<ThreadClaim>>,
+}
+
+impl ThreadOwnership for RecordingThreadOwnership {
+    fn claim(&self, claim: ThreadClaim) {
+        self.claimed.lock().expect("claim lock").push(claim);
+    }
+
+    fn revoke(&self, claim: &ThreadClaim) {
+        self.revoked
+            .lock()
+            .expect("revoke lock")
+            .push(claim.clone());
     }
 }
 
@@ -1660,6 +1712,7 @@ fn message(text: &str) -> InboundMessage {
         // Direct messages ignore addressing. Channel tests opt into structured addressing where
         // that is the behavior under test.
         addressed: None,
+        thread_continuation: None,
         reply: ReplyTarget::Local { connection: 1 },
         activity: None,
     }
@@ -1698,6 +1751,42 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         }
     );
     assert!(delivery.is_canonical_for(&claim.scope));
+}
+
+fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
+    ThreadContinuation {
+        claim: ThreadClaim::Slack {
+            team_id: "t0123abc".to_owned(),
+            channel_id: "c0123abc".to_owned(),
+            thread_ts: "1700000000.000001".to_owned(),
+            user_id: "u9xyz".to_owned(),
+        },
+        inherited,
+    }
+}
+
+fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
+    InboundMessage {
+        transport: "scientist-slack".to_owned(),
+        transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
+        subject: "slack.t0123abc.u9xyz"
+            .parse()
+            .expect("Slack subject fixture"),
+        channel: "c0123abc".to_owned(),
+        thread: Some("1700000000.000001".to_owned()),
+        conversation_id: "c0123abc:1700000000.000001".to_owned(),
+        message_id: "1700000000.000002".to_owned(),
+        text: text.to_owned(),
+        assets: Vec::new(),
+        conversation: ConversationKind::Channel("c0123abc".to_owned()),
+        addressed: Some(!inherited),
+        thread_continuation: Some(slack_thread_continuation(inherited)),
+        reply: ReplyTarget::Slack {
+            channel: "c0123abc".to_owned(),
+            thread_ts: Some("1700000000.000001".to_owned()),
+        },
+        activity: None,
+    }
 }
 
 fn runner(
@@ -1739,6 +1828,7 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         image_generators: HashMap::new(),
         activities: HashMap::new(),
+        thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
         usage_reports: None,
     })
@@ -1898,6 +1988,214 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
         models
             .tool_names(0)
             .contains(&IMAGE_GENERATION_TOOL_NAME.to_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Claimed.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("<@u0botbot> help", false);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent claim")
+        .claim
+        .clone();
+
+    run_session(
+        runner,
+        route(model_config()),
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(*ownership.claimed.lock().expect("claim lock"), [expected]);
+    assert!(ownership.revoked.lock().expect("revoke lock").is_empty());
+    assert_eq!(replier.replies(), ["Claimed."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_sender_loses_owned_thread_continuation() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &[])).await;
+    let models = ModelScript::forbidden();
+    let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("anything else?", true);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent continuation")
+        .claim
+        .clone();
+
+    run_session(
+        runner,
+        route(model_config()),
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert!(ownership.claimed.lock().expect("claim lock").is_empty());
+    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
+    assert_eq!(replier.replies(), [UNAUTHORIZED_REPLY]);
+    assert_eq!(models.requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+    )
+    .await;
+    let models = ModelScript::new([decline_reply()]);
+    let replier = Arc::new(RecordingReplier::default());
+    let activity = Arc::new(RecordingSurface::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .activities
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&activity) as Arc<dyn ChatActivity>,
+        );
+    let route = persistent_route(model_config(), window());
+    let mut message = owned_slack_message("OK, thanks", true);
+    message.activity = Some(ActivityTarget::Slack {
+        channel_id: "c0123abc".to_owned(),
+        thread_ts: "1700000000.000001".to_owned(),
+        message_ts: "1700000000.000002".to_owned(),
+        initiator_user_id: "u9xyz".to_owned(),
+    });
+    let key = ConversationKey::new(
+        &message.transport,
+        &message.conversation_id,
+        &message.subject.canonical(),
+    );
+
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message,
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert!(
+        replier.replies().is_empty(),
+        "declining must not call chat.postMessage"
+    );
+    activity.wait_until_hidden().await;
+    assert_eq!(
+        activity.events().last().map(String::as_str),
+        Some("hide"),
+        "declining must return native activity to its inactive state"
+    );
+    assert_eq!(models.requests(), 1);
+    assert!(
+        models
+            .tool_names(0)
+            .iter()
+            .any(|name| name == DECLINE_REPLY_TOOL_NAME)
+    );
+    assert!(
+        models
+            .prompt(0)
+            .iter()
+            .any(|(role, text)| role == "system" && text.contains("last word"))
+    );
+    let remembered = runner.conversations.begin(
+        &key,
+        &granted(&["memory.chat.recent", "memory.chat.search"]),
+        window(),
+        Instant::now(),
+    );
+    assert_eq!(remembered.history.turns().len(), 1);
+    assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
+    assert_eq!(remembered.history.turns()[0].answer(), None);
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("authorization request")
+            .request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "no Slack acceptance means no durable-memory record request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("echo.echo '{}'"), decline_reply()]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut route = persistent_route(model_config(), window());
+    route.limits.max_steps = 2;
+
+    run_session(
+        runner,
+        route,
+        owned_slack_message("maybe do this", true),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), [UNREPORTED_WORK_REPLY]);
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("authorization request")
+            .request,
+        BrokerRequest::CapabilitiesForChat { .. }
+    ));
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("capability invocation")
+            .request,
+        BrokerRequest::InvokeForChat { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "the warning is not a delivered model answer and must not be durably recorded"
     );
 }
 
@@ -2589,16 +2887,33 @@ async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
     .await;
     let models = ModelScript::forbidden();
     let replier = Arc::new(RecordingReplier::default());
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let message = owned_slack_message("hello", true);
+    let expected = message
+        .thread_continuation
+        .as_ref()
+        .expect("owned continuation")
+        .claim
+        .clone();
 
     run_session(
-        runner(broker, Arc::clone(&models), 4),
+        runner,
         route(model_config()),
-        message("hello"),
+        message,
         Arc::clone(&replier) as Arc<dyn ChatReplier>,
     )
     .await;
 
     assert_eq!(replier.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
+    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -3754,6 +4069,57 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Useful follow-up.")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let replier = Arc::new(RecordingReplier::default());
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let repliers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )]);
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut continuation = message("and then?");
+    continuation.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    continuation.addressed = Some(false);
+    continuation.thread_continuation = Some(slack_thread_continuation(true));
+
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        &mut sessions,
+        continuation,
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the owned continuation starts one session"
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.expect("continuation session completes");
+    }
+
+    assert_eq!(models.requests(), 1);
+    assert_eq!(replier.replies(), ["Useful follow-up."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     // The property a route matching every channel must not quietly cost: a route decides *which*
     // agent answers, and the mention decides *whether* anything answers at all. Widening the first
@@ -4111,6 +4477,12 @@ fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) ->
     if let Some(thread_ts) = thread_ts {
         event["thread_ts"] = json!(thread_ts);
     }
+    event
+}
+
+fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
+    let mut event = channel_message(user, ts, thread_ts, text);
+    event["type"] = json!("app_mention");
     event
 }
 
@@ -4601,6 +4973,92 @@ async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
             channel: "d0123abc".to_owned(),
             thread_ts: None,
         }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_agent_continues_only_an_exact_claimed_sender_thread() {
+    let root = "1700000000.000001";
+    let socket = spawn_socket_mock(vec![
+        // Channel-history scopes deliver this ambient top-level message. It must disappear inside
+        // the transport before routing, authorization, telemetry payloads, or a model.
+        events_envelope(
+            "envelope-ambient",
+            channel_message("u9xyz", "1700000000.000000", None, "ambient"),
+        ),
+        events_envelope(
+            "envelope-opening",
+            app_mention("u9xyz", root, None, "<@u0botbot> start here"),
+        ),
+        events_envelope(
+            "envelope-owned",
+            channel_message("u9xyz", "1700000000.000002", Some(root), "and then?"),
+        ),
+        events_envelope(
+            "envelope-revoked",
+            channel_message("u9xyz", "1700000000.000003", Some(root), "still there?"),
+        ),
+        events_envelope(
+            "envelope-other-user",
+            channel_message("u8other", "1700000000.000004", Some(root), "I am chatting"),
+        ),
+        events_envelope(
+            "envelope-other-thread",
+            channel_message(
+                "u9xyz",
+                "1700000000.000005",
+                Some("1699999999.000009"),
+                "another thread",
+            ),
+        ),
+        events_envelope(
+            "envelope-explicit",
+            app_mention(
+                "u9xyz",
+                "1700000000.000006",
+                Some(root),
+                "<@u0botbot> explicit again",
+            ),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack_with(
+        &http.base,
+        SlackExperience::Agent,
+        SlackActivityConfig::default(),
+    );
+    transport.connect().await.expect("Slack Agent connects");
+
+    let opening = next_message(&mut transport).await;
+    let opening_continuation = opening
+        .thread_continuation
+        .expect("an explicit Agent channel message proposes a claim");
+    assert!(!opening_continuation.inherited);
+    assert_eq!(opening.addressed, Some(true));
+
+    let ownership = transport
+        .thread_ownership()
+        .expect("Agent transport owns a bounded thread registry");
+    ownership.claim(opening_continuation.claim.clone());
+    let inherited = next_message(&mut transport).await;
+    assert_eq!(inherited.text, "and then?");
+    assert_eq!(inherited.addressed, Some(false));
+    assert!(
+        inherited
+            .thread_continuation
+            .as_ref()
+            .is_some_and(|continuation| continuation.inherited)
+    );
+
+    ownership.revoke(&opening_continuation.claim);
+    let explicit = next_message(&mut transport).await;
+    assert_eq!(explicit.text, "<@u0botbot> explicit again");
+    assert_eq!(explicit.addressed, Some(true));
+    assert!(
+        explicit
+            .thread_continuation
+            .as_ref()
+            .is_some_and(|continuation| !continuation.inherited)
     );
 }
 

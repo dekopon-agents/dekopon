@@ -166,6 +166,7 @@ impl LocalTransport {
                     // require. Channel routes are a chat-service concept.
                     conversation: ConversationKind::DirectMessage,
                     addressed: Some(true),
+                    thread_continuation: None,
                     reply: ReplyTarget::Local { connection },
                     activity: None,
                 };

@@ -523,6 +523,7 @@ impl DiscordTransport {
             assets,
             conversation,
             addressed: Some(addressed),
+            thread_continuation: None,
             reply: ReplyTarget::Discord {
                 channel_id: channel_id.to_owned(),
                 reply_to: (!direct).then(|| message_id.to_owned()),

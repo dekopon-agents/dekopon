@@ -24,6 +24,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
   a classic/free `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat
   actions. Activity failure never changes the answer, and Stop is cooperative rather than rollback.
+- Unreleased: Slack Agent channel threads become owned per authenticated sender only after fresh
+  authorization. That sender can continue without repeating the mention, while the optional
+  `decline_chat_reply` decision lets the agent post nothing when a response would only take the
+  last word. Ambient channel history never reaches routing or inference.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
 - Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
