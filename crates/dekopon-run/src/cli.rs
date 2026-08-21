@@ -1,9 +1,9 @@
 //! Command-line syntax for `dekopon-run`.
 
-use std::{io, num::NonZeroU32, path::PathBuf};
+use std::{io, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
-use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES};
+use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits};
 use dekopon_core::{
     CapabilityId, ExternalSubject, InvocationId, PROVIDER_COMPONENT_EXTENSION, TraceId,
 };
@@ -268,17 +268,42 @@ pub struct BrokerConnectionArgs {
     #[arg(long, value_name = "UID")]
     pub server_uid: Option<u32>,
 
-    /// Maximum JSON frame bytes, excluding the four-byte prefix.
-    #[arg(long, default_value_t = DEFAULT_MAX_FRAME_BYTES, value_name = "BYTES")]
-    pub max_frame_bytes: usize,
+    /// Maximum JSON frame bytes, excluding the four-byte prefix; defaults to 2 MiB.
+    #[arg(long, value_name = "BYTES")]
+    pub max_frame_bytes: Option<usize>,
 
-    /// Deadline for connect and each complete frame operation.
-    #[arg(
-        long,
-        default_value_t = DEFAULT_IO_TIMEOUT.as_millis() as u64,
-        value_name = "MILLISECONDS"
-    )]
-    pub io_timeout_ms: u64,
+    /// Deadline for connect and each complete frame operation; defaults to 30000.
+    #[arg(long, value_name = "MILLISECONDS")]
+    pub io_timeout_ms: Option<u64>,
+}
+
+impl BrokerConnectionArgs {
+    /// Frame limits for one broker connection, applying the protocol defaults for unset flags.
+    ///
+    /// The defaults live here rather than in `clap` so an unset flag stays distinguishable from an
+    /// explicitly passed one; [`Self::any_flag_supplied`] depends on that distinction.
+    #[must_use]
+    pub fn frame_limits(&self) -> FrameLimits {
+        FrameLimits {
+            max_frame_bytes: self.max_frame_bytes.unwrap_or(DEFAULT_MAX_FRAME_BYTES),
+            io_timeout: self
+                .io_timeout_ms
+                .map_or(DEFAULT_IO_TIMEOUT, Duration::from_millis),
+        }
+    }
+
+    /// Whether the operator passed any broker connection flag.
+    ///
+    /// A connection flag that silently configures nothing is worse than a refusal, so every field
+    /// here belongs in the check — including the two that used to carry `clap` defaults and were
+    /// therefore indistinguishable from unset.
+    #[must_use]
+    pub const fn any_flag_supplied(&self) -> bool {
+        self.socket.is_some()
+            || self.server_uid.is_some()
+            || self.max_frame_bytes.is_some()
+            || self.io_timeout_ms.is_some()
+    }
 }
 
 /// Optional OTLP/HTTP export settings for runner traces and audit-safe logs.
@@ -304,9 +329,10 @@ pub struct TelemetryArgs {
     )]
     pub otlp_transport: Transport,
 
-    /// Include provider payloads and HTTP URLs in span fields.
+    /// Include provider payloads and HTTP URLs in span fields, in every configured sink.
     ///
-    /// Declares the telemetry sink in scope for the data this runner handles. Credentials are
+    /// Declares the telemetry sink in scope for the data this runner handles, including a local
+    /// `--trace` file, which is why it applies with or without an OTLP endpoint. Credentials are
     /// unaffected: redacted values render their marker in either mode.
     #[arg(
         long,

@@ -182,7 +182,8 @@ By default a prompt session is direct-only and contacts no broker, so a local de
 
 This is what makes an HTTP-capable capability reachable at all. Direct mode's linker is import-free by construction, so a component there cannot perform I/O; `curl` and any fetching capability therefore resolve over the broker leg or not at all. Dispatch checks the direct registry first — a capability that can run locally always does, without an authorization decision or an audit record — and falls through to the broker only for what direct mode cannot serve. The broker remains the sole authority: `dekopon-run` submits an identity-free proposal per call and reports back whatever the broker decided, so a policy refusal surfaces to the script as exit code `126` (denied) rather than a generic failure, and a capability outside the session as `127`. Each call carries a freshly generated invocation ID extending one per-session trace ID, because the broker treats an invocation ID as a durable replay-rejection key.
 
-Passing `--socket` or `--server-uid` without `--broker` is a usage error rather than a silent no-op:
+Passing any broker connection flag — `--socket`, `--server-uid`, `--max-frame-bytes`, or
+`--io-timeout-ms` — without `--broker` is a usage error rather than a silent no-op:
 
 ```console
 cargo run -p dekopon-run -- prompt \
