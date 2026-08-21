@@ -40,6 +40,9 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 /// The tool a model calls to create one image for its final chat reply.
 pub const IMAGE_GENERATION_TOOL_NAME: &str = "generate_image";
 
+/// The tool an optional chat continuation may call to post nothing.
+pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
+
 /// Tool calls a single model turn may request.
 ///
 /// This bound used to cover one capability invocation each, so 32 was a statement about how much
@@ -53,6 +56,18 @@ pub const IMAGE_GENERATION_TOOL_NAME: &str = "generate_image";
 /// set. Ten calls leave room for that parallel work; anything beyond ten is a runaway rather than
 /// a plan.
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
+
+/// Trusted request-scoped guidance for an unaddressed continuation in an owned chat thread.
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This message is an unaddressed continuation inside a \
+chat thread the agent already owns. Reply when doing so would materially help. If no response is \
+needed—for example, the people are talking to each other, acknowledged the result, or already \
+resolved the point—call `decline_chat_reply` instead. That call posts nothing to chat. Do not reply \
+merely to have the last word.";
+
+/// A decline after provider work would hide something the session already did.
+const DECLINE_AFTER_WORK_RESULT: &str = "A chat reply is required because this session already \
+invoked a capability. No tool calls from this turn were run. Provide a concise reply describing \
+what happened instead.";
 
 /// Script execution boundary consumed by the prompt loop.
 ///
@@ -175,11 +190,23 @@ pub struct PromptLimits {
     pub max_capability_calls: u32,
 }
 
+/// Whether a completed prompt session should publish its final text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplyDisposition {
+    /// Publish the non-empty final answer normally.
+    Send,
+    /// Publish nothing because an optional chat continuation explicitly declined.
+    Suppress,
+}
+
 /// Result of a completed prompt/tool session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptOutcome {
-    /// Final assistant text.
+    /// Final assistant text. Empty only when [`Self::disposition`] is
+    /// [`ReplyDisposition::Suppress`].
     pub answer: String,
+    /// Whether the embedding surface should deliver `answer`.
+    pub disposition: ReplyDisposition,
     /// Number of model requests made.
     pub model_turns: u32,
     /// Number of scripts the model ran.
@@ -311,6 +338,7 @@ pub struct SessionInputs<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    optional_reply: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +361,7 @@ impl<'a> SessionInputs<'a> {
             usage_observer: None,
             agent_config: None,
             cancellation: None,
+            optional_reply: false,
         }
     }
 
@@ -388,6 +417,17 @@ impl<'a> SessionInputs<'a> {
         self.cancellation = Some(cancellation);
         self
     }
+
+    /// Lets the model decline one unaddressed, transport-owned chat continuation.
+    ///
+    /// This is deliberately request-scoped rather than an agent default: explicit mentions and
+    /// direct messages still require an answer, while a conversational thread follow-up may need
+    /// no last word from the agent.
+    #[must_use]
+    pub const fn with_optional_reply(mut self) -> Self {
+        self.optional_reply = true;
+        self
+    }
 }
 
 /// Optional, request-scoped surfaces handed to the inner model loop.
@@ -399,6 +439,7 @@ struct SessionExtensions<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    optional_reply: bool,
 }
 
 /// Runs one bounded prompt/tool session from a [`SessionInputs`].
@@ -425,6 +466,7 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        optional_reply,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -439,6 +481,9 @@ where
     let mut messages = Vec::new();
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
+    }
+    if optional_reply {
+        messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
     }
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
@@ -455,11 +500,14 @@ where
             usage_observer,
             agent_config,
             cancellation,
+            optional_reply,
         },
     );
     history.record(match &result {
-        Ok(outcome) => ConversationTurn::completed(prompt, outcome.answer.as_str()),
-        Err(_) => ConversationTurn::unanswered(prompt),
+        Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+            ConversationTurn::completed(prompt, outcome.answer.as_str())
+        }
+        Ok(_) | Err(_) => ConversationTurn::unanswered(prompt),
     });
     result
 }
@@ -486,6 +534,7 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        optional_reply,
     } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
@@ -499,6 +548,9 @@ where
     }
     if image_generation.is_some() {
         model_tools.push(image_generation_tool());
+    }
+    if optional_reply {
+        model_tools.push(decline_reply_tool());
     }
 
     let session_span = tracing::info_span!(
@@ -615,6 +667,7 @@ where
                 .ok_or(PromptError::EmptyAnswer)?;
             return Ok(PromptOutcome {
                 answer,
+                disposition: ReplyDisposition::Send,
                 model_turns,
                 script_calls,
                 capability_invocations,
@@ -635,6 +688,58 @@ where
                 actual: turn.tool_calls.len(),
                 maximum: MAX_TOOL_CALLS_PER_TURN,
             });
+        }
+
+        let decline_requested = optional_reply
+            && turn
+                .tool_calls
+                .iter()
+                .any(|call| call.function.name == DECLINE_REPLY_TOOL_NAME);
+        if decline_requested {
+            // A terminal decline does not need tool results, but malformed correlation IDs and
+            // arguments are still malformed model output rather than a magic escape hatch.
+            for (index, call) in turn.tool_calls.iter().enumerate() {
+                if call.id.trim().is_empty() {
+                    reject_tool_call(model_turns, index + 1, "empty-tool-call-id");
+                    return Err(PromptError::EmptyToolCallId);
+                }
+                if call.function.name == DECLINE_REPLY_TOOL_NAME {
+                    decline_reply_argument(&call.function.name, &call.function.arguments)?;
+                }
+            }
+            if capability_invocations == 0 {
+                check_cancelled(cancellation)?;
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "agent.reply.declined",
+                        model.turn = model_turns,
+                    },
+                    "optional chat reply declined"
+                );
+                return Ok(PromptOutcome {
+                    answer: String::new(),
+                    disposition: ReplyDisposition::Suppress,
+                    model_turns,
+                    script_calls,
+                    capability_invocations,
+                });
+            }
+
+            // Once a capability ran, silence could conceal an external effect. If no model turn
+            // remains, return a distinct error so the embedding surface can post a fixed warning
+            // not to retry blindly. Otherwise answer every call in this turn without running any
+            // of them, then require the model to report what the earlier work did.
+            if model_turns == limits.max_steps {
+                return Err(PromptError::UnreportedCapabilityWork);
+            }
+            for call in &turn.tool_calls {
+                messages.push(ModelMessage::tool(
+                    call.id.clone(),
+                    DECLINE_AFTER_WORK_RESULT.to_owned(),
+                ));
+            }
+            continue;
         }
 
         for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
@@ -835,6 +940,23 @@ fn script_tool(command_words: &[String]) -> ModelTool {
     }
 }
 
+fn decline_reply_tool() -> ModelTool {
+    ModelTool {
+        name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+        description: "Post nothing to chat and end this optional continuation. Call this instead \
+                      of writing text when a reply would not materially help or would merely take \
+                      the last word. Call it before running capabilities; once capability work has \
+                      happened, a concise report is required."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn agent_config_tool() -> ModelTool {
     ModelTool {
         name: AGENT_CONFIG_TOOL_NAME.to_owned(),
@@ -880,6 +1002,27 @@ fn inspect_agent_config_into(
         "agent configuration inspected"
     );
     messages.push(ModelMessage::tool(call.id.clone(), result));
+    Ok(())
+}
+
+/// Requires the decline tool's argument object to be exactly empty.
+fn decline_reply_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    if !arguments.is_empty() {
+        return Err(PromptError::DeclineReplyArgumentsNotEmpty {
+            tool: tool.to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -1319,6 +1462,12 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// The optional-reply decline tool received fields despite having no arguments.
+    #[error("model arguments for tool {tool:?} must be an empty object")]
+    DeclineReplyArgumentsNotEmpty {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
     /// Tool arguments carried no script to run.
     #[error("model arguments for tool {tool:?} must include a string \"script\" field")]
     MissingScript {
@@ -1351,6 +1500,9 @@ pub enum PromptError {
         /// Fixed maximum UTF-8 byte length.
         maximum: usize,
     },
+    /// Capability work ran, then the model tried to decline with no reporting turn left.
+    #[error("model tried to suppress a reply after capability work with no reporting turn left")]
+    UnreportedCapabilityWork,
     /// The model ended without text or a tool call.
     #[error("model returned neither tool calls nor a final answer")]
     EmptyAnswer,
@@ -1379,11 +1531,13 @@ impl PromptError {
             Self::InvalidArguments { .. } => "invalid-json-arguments",
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
             Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
+            Self::DeclineReplyArgumentsNotEmpty { .. } => "decline-reply-arguments-not-empty",
             Self::MissingScript { .. } => "missing-script",
             Self::MissingAssetId { .. } => "missing-asset-id",
             Self::MissingImagePrompt { .. } => "missing-image-prompt",
             Self::UnexpectedImageArguments { .. } => "unexpected-image-arguments",
             Self::ImagePromptTooLarge { .. } => "image-prompt-too-large",
+            Self::UnreportedCapabilityWork => "unreported-capability-work",
             Self::EmptyAnswer => "empty-answer",
             Self::MaxSteps { .. } => "max-steps",
         }
@@ -1448,12 +1602,12 @@ mod tests {
     };
 
     use super::{
-        AGENT_CONFIG_TOOL_NAME, CancellationProbe, ConversationTurn, DEFAULT_MAX_BYTES,
-        DEFAULT_MAX_TURNS, GeneratedImageOutput, History, HistoryLimits,
+        AGENT_CONFIG_TOOL_NAME, CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
+        DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, GeneratedImageOutput, History, HistoryLimits,
         IMAGE_GENERATION_TOOL_NAME, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
-        PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool,
-        format_script_outcome, run_prompt, run_prompt_session, run_prompt_with_history,
-        run_prompt_with_history_and_options, script_tool,
+        PromptLimits, ReplyDisposition, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs,
+        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1605,6 +1759,26 @@ mod tests {
                     arguments: json!({"prompt": prompt}).to_string(),
                 },
             }],
+            usage: None,
+            replay_items: Vec::new(),
+        }
+    }
+
+    fn decline_call(id: &str, arguments: Value) -> ModelToolCall {
+        ModelToolCall {
+            id: id.to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: DECLINE_REPLY_TOOL_NAME.to_owned(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn decline(arguments: Value) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![decline_call("decline-call", arguments)],
             usage: None,
             replay_items: Vec::new(),
         }
@@ -2595,6 +2769,179 @@ mod tests {
             PromptError::AgentConfigArgumentsNotEmpty { .. }
         ));
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
+    }
+
+    #[test]
+    fn an_optional_thread_continuation_can_decline_without_an_answer() {
+        let model = ScriptedModel::new([decline(json!({}))]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("OK, thanks", limits(2, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect("declining an optional continuation succeeds");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert!(outcome.answer.is_empty());
+        assert_eq!(outcome.model_turns, 1);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].user(), "OK, thanks");
+        assert_eq!(history.turns()[0].answer(), None);
+
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert_eq!(
+            tools[0].last().map(|tool| tool.name.as_str()),
+            Some(DECLINE_REPLY_TOOL_NAME)
+        );
+        drop(tools);
+        assert!(
+            model
+                .first_roles()
+                .iter()
+                .any(|(role, content)| role == &"system" && content.contains("last word")),
+            "the model is explicitly told that silence is available"
+        );
+    }
+
+    #[test]
+    fn required_replies_are_not_offered_the_decline_tool_or_instruction() {
+        let model = ScriptedModel::new([answer("You are welcome.")]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("thanks", limits(2, 4)),
+            &mut history,
+        )
+        .expect("an ordinary prompt answers");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Send);
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .all(|tool| tool.name != DECLINE_REPLY_TOOL_NAME)
+        );
+        assert!(
+            model
+                .first_roles()
+                .iter()
+                .all(|(_, content)| !content.contains("decline_chat_reply"))
+        );
+    }
+
+    #[test]
+    fn a_decline_requested_alongside_work_runs_nothing() {
+        let model = ScriptedModel::new([AssistantTurn {
+            content: None,
+            tool_calls: vec![
+                decline_call("decline-call", json!({})),
+                ModelToolCall {
+                    id: "script-call".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: SCRIPT_TOOL_NAME.to_owned(),
+                        arguments: json!({"script": "echo should-not-run"}).to_string(),
+                    },
+                },
+            ],
+            usage: None,
+            replay_items: Vec::new(),
+        }]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("conversation moved on", limits(2, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect("the no-reply decision is terminal");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert_eq!(outcome.capability_invocations, 0);
+    }
+
+    #[test]
+    fn capability_work_requires_a_reply_even_if_the_model_later_declines() {
+        let model = ScriptedModel::new([
+            script_call("script-call", "echo did-work"),
+            decline(json!({})),
+            answer("I completed the capability call."),
+        ]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("maybe do this", limits(4, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect("the model reports work instead of hiding it");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Send);
+        assert_eq!(outcome.answer, "I completed the capability call.");
+        assert_eq!(outcome.capability_invocations, 1);
+        assert!(
+            model
+                .tool_messages()
+                .iter()
+                .any(|message| message.contains("a concise reply describing what happened"))
+        );
+    }
+
+    #[test]
+    fn a_final_turn_decline_after_capability_work_is_a_distinct_unsafe_retry_warning() {
+        let model = ScriptedModel::new([
+            script_call("script-call", "echo did-work"),
+            decline(json!({})),
+        ]);
+        let runtime = RecordingRuntime::new(1);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("maybe do this", limits(2, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect_err("work cannot disappear behind a final-turn decline");
+
+        assert!(matches!(error, PromptError::UnreportedCapabilityWork));
+        assert_eq!(
+            history.turns().last().and_then(ConversationTurn::answer),
+            None
+        );
+    }
+
+    #[test]
+    fn the_decline_tool_rejects_model_supplied_fields() {
+        let model = ScriptedModel::new([decline(json!({"message": "secret"}))]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("optional", limits(1, 4)).with_optional_reply(),
+            &mut history,
+        )
+        .expect_err("the decline tool has no model-controlled payload");
+
+        assert!(matches!(
+            error,
+            PromptError::DeclineReplyArgumentsNotEmpty { .. }
+        ));
     }
 
     #[test]

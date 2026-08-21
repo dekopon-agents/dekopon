@@ -71,10 +71,18 @@ pub(crate) struct InboundMessage {
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
-    /// text cannot override the authenticated structure. Other transports use `None` and the
-    /// routing loop applies their identifier/handle syntax through
+    /// text cannot override the authenticated structure. Slack supplies the authenticated
+    /// `app_mention` event type (with mention syntax as a defensive fallback). Other transports
+    /// use `None` and the routing loop applies their identifier/handle syntax through
     /// [`TransportIdentity::is_addressed`]. Direct messages ignore this field.
     pub addressed: Option<bool>,
+    /// Slack Agent thread ownership carried from authenticated transport state.
+    ///
+    /// An explicitly addressed message proposes a claim that the session records only after fresh
+    /// broker authorization. `inherited` is true only when the same authenticated sender later
+    /// speaks in that exact claimed thread without mentioning the bot. No model text can create or
+    /// select this state.
+    pub thread_continuation: Option<ThreadContinuation>,
     /// Whatever the transport needs to answer this message.
     pub reply: ReplyTarget,
     /// Authenticated service-native coordinates for best-effort in-flight activity.
@@ -99,6 +107,25 @@ pub(crate) struct SessionStop {
     pub transport: String,
     pub conversation_id: String,
     pub subject: ExternalSubject,
+}
+
+/// One authenticated service-native thread claim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ThreadClaim {
+    Slack {
+        team_id: String,
+        channel_id: String,
+        thread_ts: String,
+        user_id: String,
+    },
+}
+
+/// How one Slack Agent channel message entered routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadContinuation {
+    pub claim: ThreadClaim,
+    /// `true` only when a prior freshly authorized message claimed this exact sender/thread.
+    pub inherited: bool,
 }
 
 /// Service-native destination for transient in-flight activity.
@@ -222,6 +249,24 @@ pub(crate) trait ChatTransport: Send {
     fn activity(&self) -> Option<Arc<dyn ChatActivity>> {
         None
     }
+
+    /// Bounded transport-owned registry for authenticated thread continuation.
+    ///
+    /// Defaulted to absent because only Slack's Agent experience currently owns threaded channel
+    /// sessions. A claim is made by the session after fresh authorization, never by the transport
+    /// reader merely seeing an event.
+    fn thread_ownership(&self) -> Option<Arc<dyn ThreadOwnership>> {
+        None
+    }
+}
+
+/// Transport-owned, authorization-fed thread continuation state.
+///
+/// The transport reader consults this state to distinguish one sender's claimed Agent thread from
+/// ambient channel history. The session mutates it only after a fresh broker answer.
+pub(crate) trait ThreadOwnership: Send + Sync {
+    fn claim(&self, claim: ThreadClaim);
+    fn revoke(&self, claim: &ThreadClaim);
 }
 
 /// Transport-owned renderer for the service's native in-flight activity.
