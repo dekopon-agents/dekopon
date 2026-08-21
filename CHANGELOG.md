@@ -48,6 +48,11 @@ All notable changes to Dekopon are documented here. The format is based on
   `write_frame` on every session open — the exact failure the check exists to prevent.
 - A finished connection task is now observed as soon as it completes rather than on the next accept,
   so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+- `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
+  suspended. The section awaits the replay ledger and, on every denial, a durable audit append that
+  fsyncs, so whatever the runtime polled next on that thread was exported as a child of another
+  request's authorization while that request's own later events lost it. The span instruments the
+  section instead of being held across the awaits; its fields and values are unchanged.
 
 ### Changed
 
@@ -70,6 +75,23 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- A capabilities answer now costs one Cedar pass instead of two. The capability listing and the
+  command words are derived from a single authorized constraint-set filter, `capability_view`, used
+  by the readiness probe's `capabilities`, `capabilitiesFor`, `capabilitiesForChat`, and the startup
+  frame check. Both halves still come from the one evaluation an invocation would receive, so a
+  listing can no more disagree with a decision than before.
+- The durable audit log no longer retains every record hash and a second copy of every restored
+  invocation identifier for the life of the process — roughly 30 MB at the production caps, for
+  state read only at startup. It keeps the one-record reconcile window `contains_checkpoint`
+  actually needs, and `FileAuditLog::replay_ids` becomes the consuming `take_replay_ids`, because
+  the broker's own replay ledger owns those identifiers from then on. Records on disk are
+  byte-identical, and an audit file written by an earlier build still verifies.
+- Hot-path allocations are gone from the paths every chat message crosses: an audit event is
+  serialized once for both its hash material and its durable line, evidence digests stream into the
+  hasher instead of copying an entire provider response to prefix a label, `ExternalSubject`
+  namespace checks and identity resolution compare segments instead of building a canonical string,
+  identifier deserialization reuses its buffer, and `dekopon-policy` parses its constant Cedar
+  entity type names once at construction rather than three times per authorization.
 
 ### Security
 
