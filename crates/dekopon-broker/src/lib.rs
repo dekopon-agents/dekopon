@@ -963,7 +963,10 @@ impl AttestorGrant {
 /// resolve to nothing and fail closed; principals are never minted on demand.
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
-    mappings: BTreeMap<String, PrincipalId>,
+    // Keyed by the subject itself rather than its rendered canonical form: the canonical string is
+    // injective over the segments, so the two keys are equivalent, and a lookup on the attested
+    // path no longer allocates one just to throw it away.
+    mappings: BTreeMap<ExternalSubject, PrincipalId>,
 }
 
 impl IdentityDirectory {
@@ -979,10 +982,12 @@ impl IdentityDirectory {
     ) -> Result<Self, BrokerBuildError> {
         let mut mappings = BTreeMap::new();
         for (subject, principal) in entries {
-            let canonical = subject.canonical();
-            if mappings.insert(canonical.clone(), principal).is_some() {
-                return Err(BrokerBuildError::DuplicateSubjectMapping { subject: canonical });
+            if mappings.contains_key(&subject) {
+                return Err(BrokerBuildError::DuplicateSubjectMapping {
+                    subject: subject.canonical(),
+                });
             }
+            mappings.insert(subject, principal);
         }
         Ok(Self { mappings })
     }
@@ -990,7 +995,7 @@ impl IdentityDirectory {
     /// Resolves one canonical subject to its stable principal.
     #[must_use]
     pub fn resolve(&self, subject: &ExternalSubject) -> Option<&PrincipalId> {
-        self.mappings.get(&subject.canonical())
+        self.mappings.get(subject)
     }
 
     /// Iterates the mapped principals, for construction-time policy validation.
