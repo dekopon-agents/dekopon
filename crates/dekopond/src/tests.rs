@@ -3649,6 +3649,78 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
     );
 }
 
+/// A socket that negotiates and then says nothing: the handshake succeeds, the greeting never comes.
+fn spawn_mute_socket_mock() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("socket mock binds");
+    let address = listener.local_addr().expect("socket mock address");
+    listener
+        .set_nonblocking(true)
+        .expect("socket mock is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("socket mock adopts");
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(_socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        // Held open, negotiated, and mute for as long as the test runs.
+        std::future::pending::<()>().await;
+    });
+    format!("ws://{address}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
+    // A half-open connection — a NAT table forgetting the flow, a partition with no RST — reads
+    // exactly like a healthy socket with nothing to say. Slack pings about every 30 seconds and
+    // never goes quiet on its own, so silence past the deadline is a dead path: without one, the
+    // reader waits on it forever and every route on this workspace goes silent with no log line.
+    let second = spawn_socket_mock(vec![events_envelope(
+        "envelope-2",
+        direct_message("u9xyz", "1700000000.000002", "after the wedge"),
+    )]);
+    let wedged = spawn_socket_mock(Vec::new());
+    let http = spawn_http_mock(slack_handler(vec![wedged.url.clone(), second.url.clone()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+    transport.connect().await.expect("slack transport connects");
+
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the transport gives up on a socket that stopped speaking")
+            .expect("a message arrives on the socket that replaced it"),
+    );
+    assert_eq!(message.text, "after the wedge");
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        2,
+        "the wedged socket must be replaced rather than held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_socket_that_never_greets_fails_inside_open() {
+    // The same wedge one round earlier: neither the handshake nor the `hello` wait had a deadline
+    // of its own, so a URL that accepts a connection and then stops parks `connect` for good.
+    let http = spawn_http_mock(slack_handler(vec![spawn_mute_socket_mock()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+
+    let error = tokio::time::timeout(Duration::from_secs(10), transport.connect())
+        .await
+        .expect("open bounds the greeting it waits for")
+        .expect_err("a socket that never greets is not a connected transport");
+
+    assert_eq!(
+        error.category(),
+        "closed",
+        "an expired deadline takes the reconnect path the backoff loop already owns"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_messages_the_bot_itself_posted_are_never_routed() {
     // Both checks matter: another app's post carries `bot_id`, and this app's own post arrives with
