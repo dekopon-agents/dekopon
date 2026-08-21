@@ -35,11 +35,21 @@
 //! reads the host process environment — including through `jq`, whose standard library exports an
 //! `env` filter that is deliberately not linked.
 //!
+//! One residual is stated rather than hidden: a `jq` filter that never produces an output cannot be
+//! stopped cooperatively, so one that outlives its script keeps a thread busy. See
+//! [`abandoned_filter_workers`].
+//!
 //! # Observability
 //!
-//! Every command word a script runs emits a `shell.command` span with a `shell.command.started` /
-//! `shell.command.completed` event pair, so a trace reads as the ordered list of commands a script
-//! actually executed rather than as one opaque "a script ran" entry.
+//! Each script run opens one `shell.script` span carrying the totals for the whole run, and every
+//! command word inside it opens a `shell.command` span — no events — carrying the command name
+//! (from a fixed vocabulary, or `<withheld>`), its resolution kind, its argument count, its exit
+//! code, and a stable outcome label. A trace therefore reads as the ordered list of commands a
+//! script actually executed rather than as one opaque "a script ran" entry.
+//!
+//! A model-authored `while` loop can execute tens of thousands of command words inside one tool
+//! call, so only the first few hundred spans are emitted at INFO; the rest drop to DEBUG, and the
+//! `shell.script` span's counters keep the totals in constant size either way.
 //!
 //! This crate depends on `tracing` and nothing else for that. It knows no exporter, no collector,
 //! and no telemetry protocol; the embedding binary's own subscriber decides where these go, the
@@ -310,6 +320,22 @@ impl Interpreter {
 /// Parses and evaluates one script under default bounds.
 pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
     Interpreter::new(Limits::default()).run(script, invoker)
+}
+
+/// Returns how many abandoned `jq` filter workers are still running in this process.
+///
+/// jaq offers no interruption point, so a filter that produces no output at all — `jq 'def f: f;
+/// f'` — cannot be stopped when its script's deadline passes. Its thread is abandoned and spins
+/// until the process exits. A filter that produces output stops at its next one, so this counter
+/// falls back to zero on its own; what stays is the non-terminating kind, and each one is a core
+/// this process will never get back. `jq` refuses to start new filters once too many have
+/// accumulated.
+///
+/// A long-lived embedder should surface this as a gauge. A one-shot runner can ignore it: the
+/// process is about to exit anyway.
+#[must_use]
+pub fn abandoned_filter_workers() -> usize {
+    builtins::jq::abandoned_workers()
 }
 
 #[cfg(test)]
