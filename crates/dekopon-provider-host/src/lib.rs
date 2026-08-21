@@ -91,21 +91,6 @@ pub struct InvocationOutput {
     pub output: Value,
 }
 
-/// Host-facing behavior of one loaded provider implementation.
-///
-/// The trait deliberately carries no authorization semantics. Implementations in immediate mode
-/// must remain read-only and unprivileged.
-pub trait Provider {
-    /// Returns the validated component manifest.
-    fn manifest(&self) -> &ProviderManifest;
-
-    /// Returns the component source path.
-    fn source(&self) -> &Path;
-
-    /// Invokes one capability in a fresh bounded execution context.
-    fn invoke(&self, capability: &CapabilityId, input: &Value) -> Result<Value, ProviderHostError>;
-}
-
 struct Runtime {
     engine: Engine,
     limits: HostLimits,
@@ -213,16 +198,26 @@ impl WasmProvider {
     }
 }
 
-impl Provider for WasmProvider {
-    fn manifest(&self) -> &ProviderManifest {
+impl WasmProvider {
+    /// Returns the validated component manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &ProviderManifest {
         &self.manifest
     }
 
-    fn source(&self) -> &Path {
-        &self.source
-    }
-
-    fn invoke(&self, capability: &CapabilityId, input: &Value) -> Result<Value, ProviderHostError> {
+    /// Invokes one capability in a fresh bounded execution context.
+    ///
+    /// This carries no authorization semantics: immediate mode is read-only and unprivileged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderHostError`] when the component does not implement the capability, the
+    /// input is not object-shaped, execution exceeds a bound, or the response does not decode.
+    pub fn invoke(
+        &self,
+        capability: &CapabilityId,
+        input: &Value,
+    ) -> Result<Value, ProviderHostError> {
         if !self
             .manifest
             .capabilities
