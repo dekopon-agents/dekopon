@@ -107,8 +107,10 @@ policy, authorization path, or effect authority. Media, templates, interactivity
 processing, business management, embedded signup, webhook multiplexing, and TLS termination remain
 out of scope.
 
-## Unreleased — broker-owned provider storage and durable on-demand chat memory
+## Unreleased — generated image replies, provider storage, and durable on-demand chat memory
 
+- Explicit route-scoped OpenAI Images generators: one bounded prompt/attempt/PNG per session,
+  native Slack/Discord/Telegram uploads, and a byte-free local/text-history/durable-memory contract.
 - Independent `dekopon:storage@0.1.0` JSONL and durable-files interfaces, feature-gated guest
   bindings, and a Wasmtime-independent secure native storage host.
 - Exact storage interface/access authority, opaque keyed namespaces, non-reusing authority-bound

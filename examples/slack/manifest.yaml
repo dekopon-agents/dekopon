@@ -13,6 +13,7 @@
 #   when the bot is explicitly addressed — dekopond ignores unaddressed channel
 #   traffic by design.
 # - `chat:write`, so the gateway can reply.
+# - `files:write`, so an explicitly image-enabled route can share its one generated PNG.
 # - `reactions:write`, so `activity.mode: native` with `classicFallback: reaction`
 #   can add and later remove the fixed `:tangerine:` in-flight marker. Remove this scope and leave
 #   activity off when even that cosmetic message mutation is unwanted.
@@ -40,7 +41,8 @@
 # The gateway does not read a file just because one arrived. Each is named in the
 # prompt as `Chat Asset #N`, and the bytes are fetched only if the model calls
 # `fetch_chat_asset` with that number. Nothing else in Dekopon gains authority from
-# this scope: no policy, no provider credential, no way to write anything back.
+# this scope: no policy and no provider credential. `files:write` below is the separate,
+# explicit presentation permission used only for generated reply images.
 display_information:
   name: dekopon
   description: Your fresh and zesty agent
@@ -60,6 +62,7 @@ oauth_config:
       - app_mentions:read
       - chat:write
       - files:read
+      - files:write
       - im:history
       - reactions:write
 settings:

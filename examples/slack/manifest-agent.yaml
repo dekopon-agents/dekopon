@@ -18,6 +18,7 @@
 # - `message.im`/`im:history`: direct-message prompts.
 # - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
 # - `files:read`: lazy access to attachments the sender included.
+# - `files:write`: shares the one bounded PNG an explicitly image-enabled route generated.
 #
 # An xapp token with app-level `connections:write` is still generated manually; app manifests do
 # not declare app-level tokens. Reinstall the app whenever bot scopes change.
@@ -46,6 +47,7 @@ oauth_config:
       - assistant:write
       - chat:write
       - files:read
+      - files:write
       - im:history
       - reactions:write
 settings:

@@ -14,6 +14,8 @@ All notable changes to Dekopon are documented here. The format is based on
   API text replies.
 - Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
   operator-owned exact-path webhook ingress.
+- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
+  Discord, Telegram, and the local development transport.
 - Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
   engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
 - Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
@@ -25,6 +27,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- A route that names an image generator on the text-only WhatsApp transport is now a startup
+  failure, rather than paying a model for a PNG that has no delivery path.
 - A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
   sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
   the first chunk reports `partial-delivery` and records no delivered turn.
@@ -56,6 +60,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - A failed WhatsApp `accept()` is now classified instead of ending the listener: a dead connection is
   ignored and descriptor or buffer exhaustion is retried after a short pause, so one transient
   failure can no longer silently take the only inbound transport off the air for the process's life.
+- Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,
+  gateway-owned filenames and authenticated reply targets, and never enter prompts, conversation
+  memory, durable chat records, telemetry payloads, provider components, or broker protocol.
 - Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest

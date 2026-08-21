@@ -29,8 +29,8 @@ use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, ReplyTarget,
-    TransportError, TransportEvent, TransportIdentity, bound_inbound,
+    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
+    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -251,6 +251,7 @@ impl WhatsappTransport {
             .build()
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         let replier = Arc::new(WhatsappReplier {
+            transport: name.clone(),
             endpoint: graph_endpoint,
             version: graph_api_version,
             phone_number_id: phone_number_id.clone(),
@@ -803,6 +804,7 @@ fn text_response(status: StatusCode, body: String) -> Response {
 }
 
 struct WhatsappReplier {
+    transport: String,
     endpoint: String,
     version: String,
     phone_number_id: String,
@@ -857,12 +859,23 @@ impl ChatReplier for WhatsappReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::WhatsApp { recipient } = target else {
                 return Err(TransportError::Response);
             };
+            let OutboundReply { text, image } = reply;
+            if image.is_some() {
+                // Configuration refuses an image generator on a WhatsApp route, so reaching here
+                // means the two disagree. Say which one rather than dropping bytes silently:
+                // sending an image needs Meta's media upload, which this transport does not have.
+                tracing::error!(
+                    event = "gateway_whatsapp_image_unsupported",
+                    transport = %self.transport,
+                );
+                return Err(TransportError::Response);
+            }
             let mut accepted = 0_usize;
             let mut last_id = None;
             for chunk in split_message(&text) {
@@ -1362,6 +1375,7 @@ mod tests {
             request
         });
         let replier = WhatsappReplier {
+            transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
             phone_number_id: "456".to_owned(),
@@ -1377,7 +1391,7 @@ mod tests {
                 ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
                 },
-                "hello".to_owned(),
+                OutboundReply::text("hello"),
             )
             .await
             .expect("reply");
@@ -1417,6 +1431,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
         let replier = WhatsappReplier {
+            transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
             phone_number_id: "456".to_owned(),
@@ -1432,7 +1447,7 @@ mod tests {
                     ReplyTarget::WhatsApp {
                         recipient: "1603".to_owned()
                     },
-                    "hello".to_owned(),
+                    OutboundReply::text("hello"),
                 )
                 .await
                 .is_err()
@@ -1516,6 +1531,7 @@ mod tests {
             bodies
         });
         let replier = WhatsappReplier {
+            transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
             phone_number_id: "456".to_owned(),
@@ -1534,7 +1550,7 @@ mod tests {
                 ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
                 },
-                answer.clone(),
+                OutboundReply::text(answer.clone()),
             )
             .await
             .expect("reply");
