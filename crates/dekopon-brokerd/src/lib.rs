@@ -395,6 +395,22 @@ where
     Ok(AuditCheckpoint { records, head })
 }
 
+/// Renders an error and its sources as one `a: b: c` line.
+///
+/// Every failure this service logs is a wrapper whose own message names the layer rather than the
+/// cause: `ConnectionError::Broker` says "broker failed", and the errno that says why is two
+/// levels down. The chain is the diagnosable part.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
+}
+
 async fn storage_gc_loop(
     host: Option<dekopon_storage_host::StorageHost>,
     interval: Option<Duration>,

@@ -157,17 +157,23 @@ fn observe_task(
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
+            // The category answers "which failure class"; the chain answers "why", which is the
+            // half that used to be dropped. `ENOSPC` during an audit append reaches an operator
+            // only through this line.
+            let cause = crate::error_chain(&error);
             // An unaudited outcome is the only connection failure an operator must act on: it
             // names the one invocation whose effect may have happened with nothing recording it.
             match error.unaudited_outcome() {
                 Some(invocation) => tracing::error!(
                     event = "broker_outcome_unaudited",
                     category = error.category(),
-                    invocation.id = %invocation
+                    invocation.id = %invocation,
+                    error = %cause,
                 ),
                 None => tracing::warn!(
                     event = "broker_connection_failed",
-                    category = error.category()
+                    category = error.category(),
+                    error = %cause,
                 ),
             }
             Ok(())
@@ -180,6 +186,40 @@ fn observe_task(
             Err(ServerError::ConnectionTask)
         }
     }
+}
+
+/// Stable, low-cardinality name for a framing failure.
+///
+/// The wire answer for every one of these is the same generic code, so this label is the only
+/// thing that tells a slow client from an oversized frame from unreadable JSON.
+const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
+    match error {
+        ProtocolError::InvalidFrameLimit { .. } => "invalid-frame-limit",
+        ProtocolError::ZeroTimeout => "zero-timeout",
+        ProtocolError::Timeout => "timeout",
+        ProtocolError::Io { .. } => "io",
+        ProtocolError::EmptyFrame => "empty-frame",
+        ProtocolError::FrameTooLarge { .. } => "frame-too-large",
+        ProtocolError::Serialize { .. } => "serialize",
+        ProtocolError::Deserialize { .. } => "deserialize",
+    }
+}
+
+/// Records why a provider could not rewrite a command word.
+///
+/// The model is told only that the word could not be rewritten, which is right — a guest trap is
+/// not something it can act on — so the host error has to land here or nowhere.
+fn report_command_resolve_failure(word: &str, error: &dekopon_broker_host::BrokerHostError) {
+    tracing::warn!(
+        target: "dekopon_brokerd::audit",
+        {
+            audit.event = "command.resolve.failed",
+            command.word = %word,
+            error.kind = "provider",
+            error = %crate::error_chain(error),
+        },
+        "command-word rewrite failed"
+    );
 }
 
 async fn handle<A>(
@@ -208,7 +248,15 @@ where
     };
     let request = match read_frame::<_, RequestEnvelope>(&mut stream, limits).await {
         Ok(request) => request,
-        Err(_) => {
+        Err(error) => {
+            // A timeout, an oversized frame, and unreadable JSON are one wire code and three
+            // different operator problems. The kind and the bounded message stay here; the frame's
+            // own contents never do, so a decode failure cannot become a payload channel.
+            tracing::warn!(
+                event = "broker_request_frame_invalid",
+                error.kind = protocol_error_kind(&error),
+                error = %error,
+            );
             write_frame(
                 &mut stream,
                 &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid"),
@@ -267,10 +315,13 @@ where
                     Ok(CommandResolution::Failed { error }) => {
                         ResponseEnvelope::command_declined(error.message)
                     }
-                    Err(_) => ResponseEnvelope::error(
-                        ERROR_PROVIDER,
-                        "command word could not be rewritten",
-                    ),
+                    Err(error) => {
+                        report_command_resolve_failure(&word, &error);
+                        ResponseEnvelope::error(
+                            ERROR_PROVIDER,
+                            "command word could not be rewritten",
+                        )
+                    }
                 }
             }
         }
@@ -285,16 +336,7 @@ where
                     ResponseEnvelope::command_declined(error.message)
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        target: "dekopon_brokerd::audit",
-                        {
-                            audit.event = "command.resolve.failed",
-                            command.word = %word,
-                            error.kind = "provider",
-                        },
-                        "command-word rewrite failed"
-                    );
-                    let _ = error;
+                    report_command_resolve_failure(&word, &error);
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be rewritten")
                 }
             }
@@ -367,7 +409,7 @@ where
                     .await
                 {
                     Ok(result) => ResponseEnvelope::invocation(result),
-                    Err(error) => return write_broker_failure(&mut stream, limits, &error).await,
+                    Err(error) => return write_broker_failure(&mut stream, limits, error).await,
                 }
             }
         }
@@ -404,7 +446,7 @@ where
                     .await
                 {
                     Ok(result) => ResponseEnvelope::invocation(result),
-                    Err(error) => return write_broker_failure(&mut stream, limits, &error).await,
+                    Err(error) => return write_broker_failure(&mut stream, limits, error).await,
                 }
             }
         }
@@ -456,7 +498,7 @@ where
             {
                 Ok(result) => ResponseEnvelope::invocation(result),
                 Err(error) => {
-                    return write_broker_failure(&mut stream, limits, &error).await;
+                    return write_broker_failure(&mut stream, limits, error).await;
                 }
             }
         }
@@ -491,7 +533,7 @@ where
             match broker.invoke(context, invocation).instrument(span).await {
                 Ok(result) => ResponseEnvelope::invocation(result),
                 Err(error) => {
-                    return write_broker_failure(&mut stream, limits, &error).await;
+                    return write_broker_failure(&mut stream, limits, error).await;
                 }
             }
         }
@@ -509,27 +551,29 @@ where
 async fn write_broker_failure(
     stream: &mut UnixStream,
     limits: FrameLimits,
-    error: &BrokerError,
+    error: BrokerError,
 ) -> Result<(), ConnectionError> {
     let (code, message, failure) = if let Some(invocation) = error.unaudited_outcome() {
+        let invocation = invocation.clone();
         (
             ERROR_OUTCOME_UNAUDITED,
             "provider work may already have completed and its outcome was not audited",
             ConnectionError::OutcomeUnaudited {
-                invocation: invocation.clone(),
+                invocation,
+                source: error,
             },
         )
     } else if let Some(code) = error.storage_failure_code() {
         (
             code,
             "broker-owned provider storage failed before provider execution",
-            ConnectionError::Broker,
+            ConnectionError::Broker { source: error },
         )
     } else {
         (
             ERROR_BROKER_UNAVAILABLE,
             "broker could not durably complete the request",
-            ConnectionError::Broker,
+            ConnectionError::Broker { source: error },
         )
     };
     write_frame(stream, &ResponseEnvelope::error(code, message), limits)
@@ -551,9 +595,16 @@ enum ConnectionError {
     OutcomeUnaudited {
         /// Invocation whose external effect may already have completed.
         invocation: InvocationId,
+        /// The broker failure that ended the request, kept so the log can name its cause.
+        #[source]
+        source: BrokerError,
     },
     #[error("broker failed")]
-    Broker,
+    Broker {
+        /// The broker failure the wire code deliberately generalizes.
+        #[source]
+        source: BrokerError,
+    },
     #[error("response write failed")]
     Write(#[source] ProtocolError),
 }
@@ -562,10 +613,11 @@ impl ConnectionError {
     /// Invocation whose provider work may already have completed with no terminal audit record.
     const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {
-            Self::OutcomeUnaudited { invocation } => Some(invocation),
-            Self::PeerCredentials { .. } | Self::InvalidRequest | Self::Broker | Self::Write(_) => {
-                None
-            }
+            Self::OutcomeUnaudited { invocation, .. } => Some(invocation),
+            Self::PeerCredentials { .. }
+            | Self::InvalidRequest
+            | Self::Broker { .. }
+            | Self::Write(_) => None,
         }
     }
 
@@ -574,7 +626,7 @@ impl ConnectionError {
             Self::PeerCredentials { .. } => "peer-credentials",
             Self::InvalidRequest => "invalid-request",
             Self::OutcomeUnaudited { .. } => "broker-outcome-unaudited",
-            Self::Broker => "broker",
+            Self::Broker { .. } => "broker",
             Self::Write(_) => "response-write",
         }
     }
