@@ -1000,6 +1000,7 @@ dependencies = [
  "dekopon-provider-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "wasmtime",

@@ -29,7 +29,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -79,6 +79,24 @@ impl Default for HostLimits {
     }
 }
 
+/// Operational host settings that bound nothing a component may do.
+///
+/// These are separate from [`HostLimits`] for the same reason the broker host keeps them apart:
+/// a limit is part of what a call is allowed to consume, while a cache directory only decides
+/// where already-compiled machine code is kept between processes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostOptions {
+    /// Directory for Wasmtime's content-addressed compilation cache.
+    ///
+    /// `None` recompiles every component with Cranelift in every process, which is the dominant
+    /// cost of a short `inspect` or `invoke`. A hit is keyed by the artifact bytes and the engine
+    /// configuration, so a rebuilt component compiles again rather than being served stale.
+    ///
+    /// The cache holds compiled code this process executes: point it only at a directory the
+    /// invoking user controls.
+    pub compile_cache_dir: Option<PathBuf>,
+}
+
 /// Successful output from a routed provider invocation.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,13 +131,23 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(limits: HostLimits) -> Result<Self, ProviderHostError> {
+    fn new(limits: HostLimits, options: &HostOptions) -> Result<Self, ProviderHostError> {
         validate_limits(&limits)?;
 
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        if let Some(directory) = &options.compile_cache_dir {
+            let mut cache = CacheConfig::new();
+            cache.with_directory(directory);
+            config.cache(Some(Cache::new(cache).map_err(|source| {
+                ProviderHostError::CompileCache {
+                    path: directory.clone(),
+                    source,
+                }
+            })?));
+        }
         let engine = Engine::new(&config).map_err(|source| ProviderHostError::Engine { source })?;
 
         Ok(Self {
@@ -337,12 +365,25 @@ impl ProviderRegistry {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
+        Self::load_with_options(sources, limits, &HostOptions::default())
+    }
+
+    /// Loads and validates all components, optionally reusing a persistent compilation cache.
+    pub fn load_with_options<I, P>(
+        sources: I,
+        limits: HostLimits,
+        options: &HostOptions,
+    ) -> Result<Self, ProviderHostError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
         let sources = sources.into_iter().map(Into::into).collect::<Vec<_>>();
         if sources.is_empty() {
             return Err(ProviderHostError::NoProviders);
         }
 
-        let runtime = Arc::new(Runtime::new(limits)?);
+        let runtime = Arc::new(Runtime::new(limits, options)?);
         let mut providers = Vec::with_capacity(sources.len());
         let mut provider_ids = BTreeSet::new();
         let mut routes = BTreeMap::new();
@@ -596,6 +637,15 @@ pub enum ProviderHostError {
     /// Wasmtime engine initialization failed.
     #[error("could not initialize the Wasmtime engine")]
     Engine {
+        /// Wasmtime error.
+        #[source]
+        source: wasmtime::Error,
+    },
+    /// The persistent compilation cache directory could not be prepared.
+    #[error("could not open the provider compilation cache at {}", path.display())]
+    CompileCache {
+        /// Configured cache directory.
+        path: PathBuf,
         /// Wasmtime error.
         #[source]
         source: wasmtime::Error,

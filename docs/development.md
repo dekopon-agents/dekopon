@@ -143,7 +143,7 @@ Neither that workflow nor `.github/workflows/container-image.yml` triggers on `r
 
 Immediate host:
 
-- A `ProviderRegistry` retains compiled Wasmtime `Component` values for its lifetime. There is no cross-process or on-disk compilation cache.
+- A `ProviderRegistry` retains compiled Wasmtime `Component` values for its lifetime. `HostOptions::compile_cache_dir`, exposed as `dekopon-run --compile-cache`, is the only cross-process cache and is off unless a directory is named.
 - Every describe or invoke operation creates a fresh bounded store and component instance.
 - One shared runtime mutex serializes immediate component execution; current calls are not parallel.
 - The linker is empty: no WASI, filesystem, network, environment, clock, random, or credential imports reach a component.

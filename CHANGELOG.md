@@ -19,6 +19,10 @@ All notable changes to Dekopon are documented here. The format is based on
   memory provider.
 - Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
   restart reads compiled provider code back instead of running Cranelift again.
+- Added an optional `dekopon-run --compile-cache <DIRECTORY>` (`DEKOPON_RUN_COMPILE_CACHE`) backed by
+  `dekopon-provider-host`'s `HostOptions::compile_cache_dir`, so repeated `inspect`, `invoke`,
+  `shell`, and `prompt` processes read Wasmtime's compiled provider code back instead of running
+  Cranelift again.
 - Added an optional broker `hostLimits.maxTotalMemoryBytes` aggregate guest-memory ceiling, so
   concurrent invocations past the budget are refused instead of being OOM-killed. The broker also
   states the `maxConnections` × `maxMemoryBytes` worst case in one startup line.
