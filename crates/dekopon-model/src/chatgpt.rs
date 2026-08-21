@@ -592,11 +592,12 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .split('.')
         .nth(1)
         .ok_or_else(|| ChatGptError::Protocol("access token is not a JWT".to_owned()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| ChatGptError::Protocol("access token has invalid JWT encoding".to_owned()))?;
-    let payload = serde_json::from_slice::<Value>(&bytes)
-        .map_err(|_| ChatGptError::Protocol("access token has invalid JWT JSON".to_owned()))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|source| {
+        ChatGptError::Protocol(format!("access token has invalid JWT encoding: {source}"))
+    })?;
+    let payload = serde_json::from_slice::<Value>(&bytes).map_err(|source| {
+        ChatGptError::Protocol(format!("access token has invalid JWT JSON: {source}"))
+    })?;
     payload
         .get(JWT_AUTH_CLAIM)
         .and_then(|claim| claim.get("chatgpt_account_id"))
@@ -1035,6 +1036,12 @@ fn format_provider_error(event: &Value) -> String {
 fn read_error_body(response: http::Response<ureq::Body>) -> String {
     let mut body = response.into_parts().1.into_reader().take(16 * 1024);
     let mut text = String::new();
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "best-effort diagnostic read on a path that has already failed; a short or \
+                  interrupted body leaves whatever arrived in `text`, and reporting the read \
+                  error instead of the service's own message would lose the useful half"
+    )]
     let _ = body.read_to_string(&mut text);
     sanitize_diagnostic(&text)
 }
@@ -1148,6 +1155,12 @@ fn save_credentials(path: &Path, credentials: &ChatGptCredentials) -> Result<(),
         })
     })();
     if result.is_err() {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of a temporary the write already failed on; the caller is being \
+                      given that write error, and a leftover 0600 temporary is not worth \
+                      replacing it with a cleanup error"
+        )]
         let _ = fs::remove_file(&temporary);
     }
     result
@@ -1177,6 +1190,12 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "SystemTimeError carries only how far the clock sits before the epoch, which is the \
+              same fact the message already states; the operator's fix is to set the clock either \
+              way"
+)]
 fn unix_time() -> Result<u64, ChatGptError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1321,6 +1340,34 @@ mod tests {
         assert_eq!(
             extract_account_id(&fake_access("acct-test")).expect("valid fixture"),
             "acct-test"
+        );
+    }
+
+    /// A rejected login is the one moment an operator has to tell a truncated token apart from a
+    /// token whose payload is not JSON at all, and the two used to render identically bar four
+    /// words. Neither decoder echoes token content: base64 reports the byte that cannot be part of
+    /// the token, and `serde_json` reports a position.
+    #[test]
+    fn a_malformed_access_token_reports_which_decode_failed_and_where() {
+        let bad_base64 = extract_account_id("header.not base64!.signature")
+            .expect_err("a non-base64 payload segment is rejected")
+            .to_string();
+        assert!(bad_base64.contains("invalid JWT encoding"), "{bad_base64}");
+        assert!(
+            bad_base64.len()
+                > "invalid ChatGPT authentication response: access token has invalid JWT encoding"
+                    .len(),
+            "the decoder's own diagnosis is threaded through: {bad_base64}"
+        );
+
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"not\": ");
+        let bad_json = extract_account_id(&format!("header.{payload}.signature"))
+            .expect_err("a payload that is not JSON is rejected")
+            .to_string();
+        assert!(bad_json.contains("invalid JWT JSON"), "{bad_json}");
+        assert!(
+            bad_json.contains("column"),
+            "serde_json's position survives: {bad_json}"
         );
     }
 

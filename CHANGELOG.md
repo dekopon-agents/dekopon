@@ -51,6 +51,27 @@ All notable changes to Dekopon are documented here. The format is based on
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
 - The Agent Slack manifest now requests public/private channel history events required to observe
   continuations; ambient traffic is discarded inside the transport before routing or inference.
+- A chat-service reply that is not valid JSON is now reported as `malformed-response` carrying the
+  parse position, distinct from the well-formed-but-missing-field `response` class it previously
+  shared, so an interposed proxy's HTML error page and a renamed API field no longer look alike.
+- A broker `policy-denied` the policy engine never evaluated — a request the Cedar schema does not
+  admit — now emits `policy.request.refused` naming the reason. The wire result and audit reason
+  stay `policy-denied`, so the taxonomy callers act on is unchanged.
+- A retained storage document that fails to decode now emits `storage_document_decode_failed` with
+  the decode class, line, and column, and nothing else; a corruption error previously named a scope
+  and left no description of what was actually wrong with the retained state.
+- Broker daemon configuration failures now name what refused them: an invalid storage path, storage
+  limit, or frame limit reports the offending field and its underlying cause rather than collapsing
+  into one shared "invalid limits" message.
+- Native HTTP malformed-URI failures now carry the parser's reason, and a failed DNS lookup is
+  traced inside the `http.request` span rather than being reduced to `outcome=failed`.
+
+### Fixed
+
+- Fixed span parenting under `.await` in three places: `http.request`, the broker's authorization
+  section, and `runner.command` each held a `tracing` span guard across suspension points, so a
+  concurrent task's events could parent under the wrong span and the holder's own events lost their
+  parent on resume. Each now attaches with `Instrument`.
 
 ### Security
 

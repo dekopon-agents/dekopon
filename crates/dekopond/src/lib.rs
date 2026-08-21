@@ -269,6 +269,11 @@ where
         .is_err()
     {
         usage_reporter.abort();
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "reaping a handle this line just aborted, which yields JoinError::Cancelled; \
+                      a reporter that had failed on its own would have completed the timeout above"
+        )]
         let _ = usage_reporter.await;
         tracing::warn!(event = "gateway_usage_reporter_abandoned");
     }

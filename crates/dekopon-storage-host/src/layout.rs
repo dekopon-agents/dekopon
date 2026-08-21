@@ -50,6 +50,12 @@ impl EntryStream {
             };
             let entry =
                 entry.map_err(|source| self.directory.io_error(std::io::Error::from(source)))?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "Utf8Error reports only the offending byte offset inside a physical name \
+                          this crate never exports; the `non-utf8-entry` scope is the complete \
+                          diagnosis"
+            )]
             let name = entry
                 .file_name()
                 .to_str()
@@ -116,6 +122,11 @@ impl Layout {
             api_version: LAYOUT_VERSION.to_owned(),
             key_commitment: key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]),
         };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing this owned two-string document has no failing case, and \
+                      TryFromIntError carries only out-of-range, which Arithmetic already states"
+        )]
         let encoded = u64::try_from(
             serde_json::to_vec(&document)
                 .map_err(|_| StorageHostError::CorruptLayout)?
@@ -170,13 +181,15 @@ impl Layout {
         }
         writer
             .try_lock_exclusive()
-            .map_err(|_| StorageHostError::SecondWriter)?;
+            .map_err(|source| writer_lock_failure(&root, source))?;
 
         let key_commitment = key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]);
         let (namespaces, transactions, quarantine, trash) = if has_layout {
             let encoded = root.read_bounded("layout", 4_096)?;
-            let document: LayoutDocument =
-                serde_json::from_slice(&encoded).map_err(|_| StorageHostError::CorruptLayout)?;
+            let document: LayoutDocument = serde_json::from_slice(&encoded).map_err(|error| {
+                crate::report_decode_failure("layout", &error);
+                StorageHostError::CorruptLayout
+            })?;
             if document.api_version != LAYOUT_VERSION || document.key_commitment != key_commitment {
                 return Err(StorageHostError::KeyMismatch);
             }
@@ -208,6 +221,10 @@ impl Layout {
                 api_version: LAYOUT_VERSION.to_owned(),
                 key_commitment,
             };
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "serializing this owned two-string document has no failing case"
+            )]
             let mut encoded =
                 serde_json::to_vec(&document).map_err(|_| StorageHostError::CorruptLayout)?;
             encoded.push(b'\n');
@@ -496,6 +513,12 @@ impl Directory {
         let mut entries = Vec::new();
         for entry in &mut directory {
             let entry = entry.map_err(|source| self.io_error(std::io::Error::from(source)))?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "Utf8Error reports only the offending byte offset inside a physical name \
+                          this crate never exports; the `non-utf8-entry` scope is the complete \
+                          diagnosis"
+            )]
             let name = entry
                 .file_name()
                 .to_str()
@@ -588,6 +611,10 @@ impl Directory {
                 scope: "oversized-file",
             });
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, which Arithmetic already states"
+        )]
         let capacity = usize::try_from(metadata.len()).map_err(|_| StorageHostError::Arithmetic)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(maximum.saturating_add(1))
@@ -640,6 +667,12 @@ impl Directory {
             self.sync()
         })();
         if result.is_err() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "unique-name rollback cleanup: the create/write/rename failure in `result` \
+                          is the reported cause, and a leftover `tmp-` entry is recognized \
+                          reservation the next scan still charges"
+            )]
             let _ = self.remove_file_if_exists(&temporary);
         }
         result
@@ -715,6 +748,19 @@ impl Directory {
 
     pub(crate) fn sync(&self) -> Result<(), StorageHostError> {
         self.file.sync_all().map_err(|source| self.io_error(source))
+    }
+}
+
+/// Classifies one `writer.lock` acquisition failure.
+///
+/// Only a would-block refusal proves another conforming writer holds the root. Every other error
+/// is the filesystem itself failing or refusing advisory locks, which must surface as root I/O
+/// carrying its cause rather than as a second writer an operator would then go looking for.
+fn writer_lock_failure(root: &Directory, source: std::io::Error) -> StorageHostError {
+    if source.kind() == std::io::ErrorKind::WouldBlock {
+        StorageHostError::SecondWriter
+    } else {
+        root.io_error(source)
     }
 }
 
@@ -1094,4 +1140,27 @@ pub(crate) fn scan_root_usage(
         }
     }
     Ok(usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::{Directory, writer_lock_failure};
+    use crate::StorageHostError;
+
+    #[test]
+    fn only_a_would_block_writer_lock_failure_is_a_second_writer() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let root = Directory::open_path(temporary.path(), false).expect("root directory");
+        assert!(matches!(
+            writer_lock_failure(&root, Error::from(ErrorKind::WouldBlock)),
+            StorageHostError::SecondWriter
+        ));
+        // A filesystem that fails or refuses advisory locks is not another conforming writer.
+        assert!(matches!(
+            writer_lock_failure(&root, Error::from(ErrorKind::Unsupported)),
+            StorageHostError::RootIo { source, .. } if source.kind() == ErrorKind::Unsupported
+        ));
+    }
 }

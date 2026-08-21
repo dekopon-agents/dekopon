@@ -1379,6 +1379,11 @@ fn value_bytes(value: &Value) -> u64 {
         }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for a `shift` operand \
+              the message quotes back in full; all three mean the same thing to the script author"
+)]
 fn parse_shift_count(arguments: &[String]) -> Result<usize, CommandFailure> {
     match arguments {
         [] => Ok(1),
@@ -1416,6 +1421,12 @@ fn parse_level(command: &str, arguments: &[String]) -> Result<u32, CommandFailur
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for an `exit`/`return` \
+              operand the message quotes back in full; an out-of-range status is not a different \
+              user mistake from a non-numeric one here"
+)]
 fn parse_status(
     command: &str,
     arguments: &[String],

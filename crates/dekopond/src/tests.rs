@@ -1612,6 +1612,11 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
 ///
 /// A real socket rather than an in-memory duplex, because the client authenticates the server by
 /// socket ownership and peer UID before it writes a byte.
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "the stub's observation channel is unbounded and its reply goes to a socket the test \
+              owns; either failing shows up as the test's own missing request or timeout"
+)]
 async fn stub_broker(
     directory: &Path,
     responses: Vec<ResponseEnvelope>,
@@ -1874,6 +1879,11 @@ impl BlockedModel {
 
     fn release(&self) {
         if let Some(sender) = self.release.lock().expect("release lock").take() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a blocked model that already gave up on being released fails the test at \
+                          its own recv_timeout, not here"
+            )]
             let _ = sender.send(());
         }
     }
@@ -1888,6 +1898,11 @@ impl ModelFactory for Arc<BlockedModel> {
 struct BlockedHandle(Arc<BlockedModel>);
 
 impl ChatModel for BlockedHandle {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
+                  wait_until_entered, and a release that never arrives is bounded by the timeout"
+    )]
     fn complete(
         &self,
         _messages: &[ModelMessage],
@@ -4225,6 +4240,11 @@ impl HttpMock {
 }
 
 /// Serves loopback HTTP until the test drops, answering through `handler`.
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "a mock that cannot finish writing its canned response leaves the transport under \
+              test without one, which is what the calling test already asserts on"
+)]
 fn spawn_http_mock<H>(handler: H) -> HttpMock
 where
     H: Fn(&str, &str) -> Value + Send + Sync + 'static,
@@ -4297,6 +4317,11 @@ impl RawHttpMock {
     }
 }
 
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "a mock that cannot finish writing its canned response leaves the transport under \
+              test without one, which is what the calling test already asserts on"
+)]
 fn spawn_raw_http_mock<H>(handler: H) -> RawHttpMock
 where
     H: Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
@@ -4427,6 +4452,11 @@ fn spawn_socket_mock(frames: Vec<Value>) -> SocketMock {
         }
         while let Some(Ok(message)) = socket.next().await {
             if let Message::Text(text) = message {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the acknowledgement channel is unbounded, so a send fails only once \
+                              the test dropped its receiver and stopped caring"
+                )]
                 let _ = acks.send(text.to_string());
             }
         }
@@ -5793,6 +5823,11 @@ async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
         // No fetcher is wired, so each of these fails for its own reason; what matters is that the
         // budget is spent by the attempt rather than by the success.
         for id in 1..=4 {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "the comment above is the point: each of these four is expected to fail, \
+                          and only the fifth call's refusal is asserted on"
+            )]
             let _ = assets.fetch(id);
         }
         assets.fetch(5).expect_err("the budget is spent")
@@ -5849,6 +5884,12 @@ fn spawn_discord_socket_mock(
     spawn_discord_socket_mock_with_heartbeat(frames, resume_gateway_url, 60_000, true)
 }
 
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "the observation channel is unbounded and the heartbeat acknowledgement goes back \
+              over a socket the transport under test is reading; a test that needed either one \
+              fails waiting for it"
+)]
 fn spawn_discord_socket_mock_with_heartbeat(
     frames: Vec<Value>,
     resume_gateway_url: Option<String>,

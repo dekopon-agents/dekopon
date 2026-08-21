@@ -635,6 +635,73 @@ fn an_undeclared_principal_stays_fatal_under_leniency() {
     );
 }
 
+/// "Undeclared" and "could never be a principal" are different diagnoses with different fixes, and
+/// collapsing the second into the first sends an operator to add an identity they cannot spell.
+#[test]
+fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
+    let error = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"Ops Team",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("a malformed principal must refuse startup");
+    let PolicyBuildError::MalformedPrincipal {
+        ref principal,
+        ref source,
+        ..
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(principal, "Ops Team");
+    assert!(
+        source.to_string().contains('O'),
+        "the parse error names the offending character: {source}"
+    );
+}
+
+/// A capability the world never declared cannot even be phrased as a Cedar question. The answer is
+/// still a denial — but a blanket denial that explains itself, rather than one indistinguishable
+/// from a deployment that simply granted nothing.
+#[test]
+fn a_request_the_schema_cannot_express_says_so() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("the world declares everything this policy names");
+
+    let decision = engine.authorize(capability_request(
+        "cpetersen",
+        "gh.pull-request.approve",
+        PolicyContext::default(),
+    ));
+    assert!(!decision.allowed);
+    assert!(decision.errors_present);
+    let refusal = decision
+        .refusal
+        .expect("a request the schema cannot express explains itself");
+    assert!(
+        refusal.contains("gh.pull-request.approve"),
+        "the refusal names the undeclared action: {refusal}"
+    );
+
+    // Every decision Cedar actually reached leaves the field alone, denials included.
+    assert!(
+        engine
+            .authorize(capability_request(
+                "direct-caller",
+                "echo.echo",
+                PolicyContext::default()
+            ))
+            .refusal
+            .is_none()
+    );
+}
+
 /// A `forbid` naming an unloaded capability must not fail open once that provider is loaded.
 ///
 /// Keeping the policy whole is what makes this safe: the same text refuses the capability the

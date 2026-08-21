@@ -283,6 +283,12 @@ impl BoundCredential {
 
     /// Renders the header value, marked sensitive so the transport never debugs it.
     fn render(&self) -> Result<HeaderValue, HttpError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`InvalidHeaderValue` reports only that parsing failed, and `bearer` already \
+                      restricted these bytes to ASCII graphic and space; nothing derived from a \
+                      credential value may be reported anyway"
+        )]
         let mut value = HeaderValue::from_str(self.header_value.expose()).map_err(|_| {
             // Unreachable when construction validated the bytes; message carries no value detail.
             http_error(ErrorCode::Internal, "credential could not be rendered")
@@ -558,6 +564,11 @@ impl BufferedHttpClient {
         request: Request,
         grant: &HttpConstraints,
     ) -> Result<PreparedRequest, HttpError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`http::method::InvalidMethod` is an opaque unit error whose whole content is \
+                      \"invalid HTTP method\", which the replacement already states"
+        )]
         let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| {
             http_error(ErrorCode::InvalidMethod, "method is not a valid HTTP token")
         })?;
@@ -581,8 +592,16 @@ impl BufferedHttpClient {
             ));
         }
 
-        let url = Url::parse(&request.uri)
-            .map_err(|_| http_error(ErrorCode::InvalidUri, "URI is not a valid absolute URL"))?;
+        // `url::ParseError` names which rule the URI broke — "relative URL without a base",
+        // "invalid port number", "invalid IPv6 address" — from a fixed set of strings that quote
+        // no part of the input. It is the guest's own URI, so returning the structural reason
+        // leaks nothing while turning an undifferentiated `InvalidUri` into an actionable one.
+        let url = Url::parse(&request.uri).map_err(|error| {
+            http_error(
+                ErrorCode::InvalidUri,
+                format!("URI is not a valid absolute URL: {error}"),
+            )
+        })?;
         if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
             return Err(http_error(
                 ErrorCode::InvalidUri,
@@ -650,6 +669,11 @@ impl BufferedHttpClient {
                     "request headers exceed the host limit",
                 ));
             }
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`InvalidHeaderName` is an opaque unit error naming neither the offending \
+                          byte nor its position"
+            )]
             let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
                 http_error(ErrorCode::InvalidHeader, "request header name is invalid")
             })?;
@@ -659,6 +683,11 @@ impl BufferedHttpClient {
                     "request header is broker-owned or hop-by-hop",
                 ));
             }
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`InvalidHeaderValue` is an opaque unit error naming neither the \
+                          offending byte nor its position"
+            )]
             let value = HeaderValue::from_bytes(&header.value).map_err(|_| {
                 http_error(ErrorCode::InvalidHeader, "request header value is invalid")
             })?;
@@ -680,6 +709,11 @@ impl BufferedHttpClient {
         }
 
         let remaining = self.remaining()?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", which \
+                      the Timeout message already states"
+        )]
         let addresses = timeout(remaining, resolve_destination(&host, port))
             .await
             .map_err(|_| http_error(ErrorCode::Timeout, "destination resolution timed out"))??;
@@ -728,6 +762,11 @@ impl BufferedHttpClient {
             .build()
             .map_err(|error| map_reqwest_error(&error))?;
 
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", which \
+                      the Timeout message already states"
+        )]
         let response = timeout(
             remaining,
             client
@@ -777,6 +816,11 @@ impl BufferedHttpClient {
         let mut stream = response.bytes_stream();
         loop {
             let remaining = self.remaining()?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", \
+                          which the Timeout message already states"
+            )]
             let chunk = match timeout(remaining, stream.next())
                 .await
                 .map_err(|_| http_error(ErrorCode::Timeout, "response body timed out"))?
@@ -872,7 +916,16 @@ struct PreparedRequest {
 async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError> {
     let addresses = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|_| http_error(ErrorCode::Dns, "destination could not be resolved"))?;
+        .map_err(|error| {
+            // NXDOMAIN, a resolver that timed out, and an unreachable network all arrive here and
+            // all leave as `Dns`, so without this the operator side of a resolution failure is
+            // indistinguishable. The resolver's verdict is host infrastructure state rather than
+            // anything the guest asked about, which is why it goes to the trace and not into the
+            // returned message; it names no host, so it stays inside the sanitized set the
+            // enclosing `http.request` span already carries `server.address` for.
+            tracing::debug!(error = %error, "destination resolution failed");
+            http_error(ErrorCode::Dns, "destination could not be resolved")
+        })?;
     bounded_addresses(addresses)
 }
 
@@ -1330,6 +1383,48 @@ mod tests {
             .expect_err("guest authorization header must fail before connection");
         assert_eq!(error.code, ErrorCode::InvalidHeader);
         assert_eq!(client.policy_violation(), Some("invalid-http-request"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_uris_name_the_rule_they_broke() {
+        // `InvalidUri` on its own is not actionable: a provider author needs to know whether the
+        // URI was relative, carried a bad port, or had a malformed host. `url::ParseError` says
+        // exactly that, from a fixed set of strings none of which quote the URI back.
+        let mut client = BufferedHttpClient::authorized(
+            grant("api.example.test".to_owned(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "/relative/only".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a relative reference is not an absolute URL");
+        assert_eq!(error.code, ErrorCode::InvalidUri);
+        assert!(
+            error.message.contains("relative URL without a base"),
+            "{error}"
+        );
+
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "https://api.example.test:notaport/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a malformed port is not an absolute URL");
+        assert_eq!(error.code, ErrorCode::InvalidUri);
+        assert!(error.message.contains("invalid port number"), "{error}");
+        // The URI itself never appears in a message that crosses back to the guest unmodified.
+        assert!(!error.message.contains("api.example.test"), "{error}");
     }
 
     fn credential_for(authority: &str) -> BoundCredential {

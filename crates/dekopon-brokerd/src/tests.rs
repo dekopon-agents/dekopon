@@ -765,9 +765,70 @@ async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
     write_config(&path, &document);
     assert!(matches!(
         config::load(&path, uid).await,
-        Err(config::ConfigError::InvalidStorage)
+        Err(config::ConfigError::StoragePath { .. })
     ));
     assert!(!actual.join("provider-storage").exists());
+}
+
+/// A refused deployment has to name the bound it broke. Both of these sections are validated by
+/// another crate that already says which field and which ceiling, and the operator reading a
+/// failed start is the only audience for that.
+#[tokio::test]
+async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
+
+    let mut document = attested_document(uid);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+        ("maxFileBytes".to_owned(), json!(0)),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a zero storage ceiling is not a deployable configuration");
+    let config::ConfigError::InvalidStorage {
+        source: dekopon_storage_host::StorageConfigError::Zero { field },
+    } = error
+    else {
+        panic!("the refused storage field must survive into the configuration error: {error}");
+    };
+    assert_eq!(field, "maxFileBytes");
+
+    let mut document = attested_document(uid);
+    document["serverLimits"] = json!({
+        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
+        "ioTimeoutMs": 0,
+        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
+        "auditMaxRecords": dekopon_broker::DEFAULT_MAX_AUDIT_RECORDS,
+        "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
+        "shutdownGraceMs": 120_000
+    });
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a zero frame I/O timeout is not a deployable configuration");
+    assert!(
+        matches!(
+            error,
+            config::ConfigError::InvalidFrameLimits {
+                source: dekopon_broker_protocol::ProtocolError::ZeroTimeout
+            }
+        ),
+        "a zero I/O timeout must be distinguishable from an out-of-range frame ceiling: {error}"
+    );
 }
 
 #[tokio::test]

@@ -334,7 +334,7 @@ impl DiscordTransport {
             match frame {
                 Some(Ok(Message::Text(text))) => {
                     return serde_json::from_str::<Value>(&text)
-                        .map_err(|_| TransportError::Response);
+                        .map_err(TransportError::MalformedResponse);
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     self.socket
@@ -451,6 +451,11 @@ impl DiscordTransport {
     }
 
     async fn send(&mut self, value: Value) -> Result<(), TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let encoded = serde_json::to_string(&value).map_err(|_| TransportError::Response)?;
         self.socket
             .as_mut()
@@ -732,7 +737,7 @@ impl ChatActivity for DiscordReplier {
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
@@ -786,6 +791,11 @@ impl DiscordReplier {
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let encoded = serde_json::to_vec(body).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
@@ -804,7 +814,7 @@ impl DiscordReplier {
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .ok_or(TransportError::Response)?;
@@ -853,9 +863,19 @@ impl DiscordReplier {
             "filename": filename,
             "description": "Generated image",
         }]);
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "mime_str only rejects strings that are not a media type, and \
+                          GeneratedImage::media_type returns a fixed IANA type"
+            )]
             let part = reqwest::multipart::Part::bytes(bytes.clone())
                 .file_name(filename.clone())
                 .mime_str(&media_type)
@@ -877,7 +897,7 @@ impl DiscordReplier {
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&response_bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .ok_or(TransportError::Response)?;
@@ -1133,6 +1153,13 @@ fn is_fatal(error: &TransportError) -> bool {
 /// Adds the fixed v10 JSON query after proving the service-selected URL cannot receive the token
 /// outside Discord (or the explicit loopback test boundary).
 fn gateway_url(raw: &str, production: bool) -> Result<String, TransportError> {
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "url::ParseError names a syntax rule in a fixed string, and the three checks \
+                  below reject a well-formed but unacceptable gateway URL as the same \
+                  TransportError::Response; the distinction an operator acts on is whether \
+                  Discord's URL was refused at all"
+    )]
     let mut url = reqwest::Url::parse(raw).map_err(|_| TransportError::Response)?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(TransportError::Response);
@@ -1231,7 +1258,8 @@ async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
-    let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
+    let body =
+        serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() {
         return Ok(body);
     }

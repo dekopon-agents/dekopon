@@ -120,6 +120,12 @@ pub(crate) fn evaluate(
                 Err(message) => Produced::Failed(message),
             };
             // A closed receiver means the evaluator already gave up on this filter.
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a closed receiver is the normal end of a filter the budget cut short, \
+                          and the returned SendError only hands back the message nobody is left \
+                          to read; this thread has no caller to report to either way"
+            )]
             let _ = sender.send(message);
         })
         .map_err(|error| {

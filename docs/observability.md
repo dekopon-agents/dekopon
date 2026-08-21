@@ -295,6 +295,13 @@ none of them reach a span field.
 `provider.compile` covers startup component compilation rather than per-invocation work, so it
 answers "why was the broker slow to become ready" rather than "why was that call slow".
 
+A `policy-denied` outcome the policy engine never actually evaluated additionally emits
+`audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The
+wire result and the audit reason both stay `policy-denied`, because the request is still denied and
+the taxonomy callers act on must not shift; this event is the only place an operator learns the
+denial came from a request the schema does not admit — a deployment defect — rather than from a
+policy that considered it and said no.
+
 `broker.execute`'s `credential` is the owner-authored symbolic name from `broker.yaml`, never the
 secret and never the header. It exists because one capability can present a different credential per
 acting agent, and a trace that named none of them would make two writes to two different
@@ -315,6 +322,12 @@ principal/policy revision, policy IDs/digest, and credential. A separate keyed a
 commitment is never equal to a physical namespace token. Storage decision/output/evidence values use
 separate `hmac-sha256:` domains, preventing the ordinary unkeyed low-entropy dictionary oracle.
 Historical and current non-storage records retain their previous `sha256:` encoding and bytes.
+
+A retained storage document that fails to decode emits `storage_document_decode_failed` at `WARN`
+under `category = "storage"`. It carries the static document kind plus the `serde_json` failure's
+class, line, and column, and nothing else: that set separates a truncated write from an unknown or
+wrongly typed field without exporting a logical name, a path, an opaque token, or any document
+content. The rejected bytes are never echoed.
 
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded

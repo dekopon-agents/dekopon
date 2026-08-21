@@ -108,6 +108,12 @@ impl LocalTransport {
                     let line = format!("{}\n", reply.line);
                     let accepted = writer.write_all(line.as_bytes()).await.is_ok()
                         && writer.flush().await.is_ok();
+                    #[allow(
+                        clippy::let_underscore_must_use,
+                        reason = "a oneshot send fails only when the replier stopped waiting for \
+                                  the acknowledgement, which is the same hung-up caller the \
+                                  `accepted` check below already ends the loop for"
+                    )]
                     let _ = reply.ack.send(accepted);
                     if !accepted {
                         break;
@@ -252,6 +258,12 @@ impl LocalReplier {
 }
 
 impl ChatReplier for LocalReplier {
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "both discards are the same hung-up connection: SendError hands back the \
+                  LocalWrite this call just built, and oneshot::error::RecvError is a unit struct \
+                  meaning the writer task dropped the acknowledgement"
+    )]
     fn reply(
         &self,
         target: ReplyTarget,
@@ -337,6 +349,11 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard), TransportError> {
     }
     let listener = UnixListener::bind(path).map_err(TransportError::Io)?;
     if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of a socket that is about to be reported as unusable anyway; the \
+                      set_permissions error below is the one that explains the failure"
+        )]
         let _ = fs::remove_file(path);
         return Err(TransportError::Io(error));
     }
@@ -346,6 +363,11 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard), TransportError> {
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.nlink() != 1
     {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of a socket this function has just judged insecure; the refusal \
+                      below is the reported outcome either way"
+        )]
         let _ = fs::remove_file(path);
         return Err(TransportError::InsecureSocket {
             path: path.display().to_string(),
@@ -375,6 +397,11 @@ impl Drop for SocketGuard {
                 && metadata.dev() == self.device
                 && metadata.ino() == self.inode
         }) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "teardown in Drop, where there is no caller to report to; the inode was \
+                          just confirmed to be this transport's own socket"
+            )]
             let _ = fs::remove_file(&self.path);
         }
     }

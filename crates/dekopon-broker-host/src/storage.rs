@@ -172,6 +172,12 @@ impl StorageState {
         let deadline = Instant::now()
             .checked_add(active.finalization_budget)
             .ok_or(StorageHostError::Arithmetic)?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "a `JoinError` from `spawn_blocking` distinguishes only a panic from runtime \
+                      cancellation, and the panic hook has already printed the panic with its \
+                      location; `call` above classes the same failure as `Io` for the same reason"
+        )]
         let finished = tokio::task::spawn_blocking(move || {
             active_jobs.wait();
             let transaction = transaction
@@ -402,6 +408,11 @@ impl durable::Host for StoreState {
             .call(move |tx| tx.vfs_open(&name, options))
             .await;
         Ok(match opened {
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`ResourceTable::push` fails only with `ResourceTableError::Full`, so the \
+                          discarded value is single-valued and adds nothing to the guest's `Io`"
+            )]
             Ok(handle) => self
                 .table
                 .push(FileResource { handle })
@@ -720,6 +731,11 @@ mod tests {
             let mut state = StorageState::active(transaction);
             state
                 .call(move |_transaction| {
+                    #[allow(
+                        clippy::let_underscore_must_use,
+                        reason = "the oneshot only unblocks the test below; a dropped receiver \
+                                  means the test already failed on `started_receive`"
+                    )]
                     let _ = started_send.send(());
                     std::thread::sleep(Duration::from_millis(150));
                     Ok(())

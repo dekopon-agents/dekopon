@@ -62,6 +62,12 @@ fn mock_http() -> (String, thread::JoinHandle<()>) {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set fixture timeout");
         let mut buffer = [0_u8; 4096];
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the fixture discards the request bytes by design and replies unconditionally; \
+                      a read that actually failed breaks the exchange the span assertions below \
+                      depend on"
+        )]
         let _ = stream.read(&mut buffer);
         stream
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")

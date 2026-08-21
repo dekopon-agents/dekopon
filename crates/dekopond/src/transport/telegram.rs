@@ -403,6 +403,11 @@ impl ChatActivity for TelegramReplier {
             if let Some(message_thread_id) = message_thread_id {
                 body["message_thread_id"] = json!(message_thread_id);
             }
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
+                          keys and serde_json::Number rejects non-finite floats"
+            )]
             let response = self
                 .http
                 .post(format!(
@@ -420,8 +425,8 @@ impl ChatActivity for TelegramReplier {
                 .bytes()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let body =
-                serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
+            let body = serde_json::from_slice::<Value>(&bytes)
+                .map_err(TransportError::MalformedResponse)?;
             if body["ok"] == Value::Bool(true) {
                 *self
                     .activity_cooldown_until
@@ -545,6 +550,11 @@ impl TelegramReplier {
         if let Some(message_thread_id) = message_thread_id {
             body["message_thread_id"] = json!(message_thread_id);
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let response = self
             .http
             .post(format!(
@@ -587,6 +597,11 @@ impl TelegramReplier {
         caption: Option<&str>,
         image: GeneratedImage,
     ) -> Result<DeliveryReceipt, TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "mime_str only rejects strings that are not a media type, and this one is the \
+                      literal above it"
+        )]
         let part = reqwest::multipart::Part::bytes(image.into_bytes())
             .file_name("generated-image.png")
             .mime_str("image/png")
@@ -681,7 +696,8 @@ async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
-    let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
+    let body =
+        serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() && body["ok"] == Value::Bool(true) {
         return Ok(body);
     }

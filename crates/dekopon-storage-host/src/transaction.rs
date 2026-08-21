@@ -896,6 +896,11 @@ impl StorageTransaction {
         if check_budget(deadline).is_err() {
             return;
         }
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the entry is already unlinked and its charge released, so this parent sync \
+                      is crash-durability only: restart reconstructs whichever state survived"
+        )]
         let _ = self.trash_root.sync();
     }
 
@@ -921,6 +926,12 @@ impl StorageTransaction {
         directory.sync()
     }
 
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "every discarded call here rolls back a marker whose own publish already failed; \
+                  the in-process poison registry, not this file, is what stops the base, and \
+                  recovery treats a surviving `poisoned` entry as poisoned either way"
+    )]
     fn persist_poison_best_effort(&mut self) {
         let directory = self.namespace.base_directory.clone();
         if directory.exists("poisoned").unwrap_or(true) {
@@ -956,6 +967,12 @@ impl StorageTransaction {
         }
     }
 
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "both discarded calls remove a `finalized` marker whose publish already failed; \
+                  recovery gives `finalized.pending` precedence of unknown over `finalized`, so a \
+                  failed removal reaches the same outcome this function returns"
+    )]
     fn post_marker_failure(mut self) -> Result<StorageEvidence, StorageHostError> {
         if let Some(retired) = &self.retired_transaction
             && let Ok(directory) = self.trash_root.open_directory(retired)
@@ -1077,6 +1094,12 @@ struct EncodedManifest {
     encoded: Vec<u8>,
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "serializing these owned string/integer manifest structs has no failing case; \
+              serde_json fails only on a non-string map key or a Serialize implementation error, \
+              and neither exists here"
+)]
 fn encode_manifest(
     key: &StorageKey,
     namespace: &Namespace,
@@ -1297,7 +1320,10 @@ pub(crate) fn recover_retired_transactions(
         validate_empty_marker(&transaction, "finalized.pending", finalized_pending)?;
         let manifest: ManifestDocument =
             serde_json::from_slice(&transaction.read_bounded("manifest", MAX_MANIFEST_BYTES)?)
-                .map_err(|_| StorageHostError::Corrupt { scope: "manifest" })?;
+                .map_err(|error| {
+                    crate::report_decode_failure("retired-manifest", &error);
+                    StorageHostError::Corrupt { scope: "manifest" }
+                })?;
         verify_manifest(&manifest, key, limits)?;
         // Unknown wins over every optimistic hint. Most importantly, absence of the one durable
         // final marker is itself unknown; live reconciliation must not depend on successfully
@@ -1401,7 +1427,10 @@ fn recover_transaction(
 
     let manifest: ManifestDocument =
         serde_json::from_slice(&transaction.read_bounded("manifest", MAX_MANIFEST_BYTES)?)
-            .map_err(|_| StorageHostError::Corrupt { scope: "manifest" })?;
+            .map_err(|error| {
+                crate::report_decode_failure("manifest", &error);
+                StorageHostError::Corrupt { scope: "manifest" }
+            })?;
     verify_manifest(&manifest, key, limits)?;
     if has_applied && !has_commit {
         return Err(StorageHostError::Corrupt {
@@ -1608,6 +1637,11 @@ fn verify_manifest(
         generation: manifest.generation.clone(),
         changes: manifest.changes.clone(),
     };
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "re-serializing the already-decoded manifest body has no failing case; every \
+                  rejection of retained bytes happens in the checks above and the MAC below"
+    )]
     let encoded =
         serde_json::to_vec(&body).map_err(|_| StorageHostError::Corrupt { scope: "manifest" })?;
     let expected = key.commitment(DOMAIN_MANIFEST, &[encoded.as_slice()]);
@@ -1770,6 +1804,11 @@ fn maybe_check_budget(deadline: Option<Instant>) -> Result<(), StorageHostError>
     deadline.map_or(Ok(()), check_budget)
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "TryFromIntError carries only out-of-range, which Arithmetic already states, and an \
+              exact clock value may not be exported as storage telemetry"
+)]
 pub(crate) fn monotonic_ns() -> Result<u64, StorageHostError> {
     use std::sync::OnceLock;
     static START: OnceLock<Instant> = OnceLock::new();
@@ -1777,6 +1816,12 @@ pub(crate) fn monotonic_ns() -> Result<u64, StorageHostError> {
         .map_err(|_| StorageHostError::Arithmetic)
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "SystemTimeError carries only how far the clock sits before the epoch and \
+              TryFromIntError only out-of-range; Clock and Arithmetic already state both, and \
+              neither value may be exported as storage telemetry"
+)]
 pub(crate) fn wall_ms() -> Result<u64, StorageHostError> {
     u64::try_from(
         SystemTime::now()

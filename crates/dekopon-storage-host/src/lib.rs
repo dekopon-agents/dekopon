@@ -413,6 +413,11 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let ledger = QuotaLedger::new(limits.clone(), usage);
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "the discarded value is the rejected raw-entropy Vec<u8> itself, whose only \
+                      reportable property is the length EntropyLength already names"
+        )]
         let id: [u8; 32] = random_bytes(32)?
             .try_into()
             .map_err(|_| StorageHostError::EntropyLength)?;
@@ -881,6 +886,25 @@ fn quarantine_isolated_namespaces(
         }
     }
     Ok(())
+}
+
+/// Reports why one retained document did not decode without echoing the rejected bytes.
+///
+/// A corruption error names a scope and nothing else, and the physical file is under an opaque
+/// token, so the discarded `serde_json` failure is the only description of what is actually wrong
+/// with the retained state. Class, line, and column are its complete content-free part: they
+/// separate a truncated write from an unknown or wrongly typed field without exporting a name, a
+/// path, a token, or any document content.
+pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::Error) {
+    tracing::warn!(
+        event = "storage_document_decode_failed",
+        category = "storage",
+        storage.document = document,
+        decode.class = ?error.classify(),
+        decode.line = error.line(),
+        decode.column = error.column(),
+        "retained storage document did not decode"
+    );
 }
 
 fn isolated_namespace_corruption(error: &StorageHostError) -> bool {

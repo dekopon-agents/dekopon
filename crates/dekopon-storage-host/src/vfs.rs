@@ -175,10 +175,19 @@ impl StorageTransaction {
         if offset >= size {
             return Ok(Vec::new());
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, which Arithmetic already states"
+        )]
         let length = usize::try_from(u64::from(maximum).min(size - offset))
             .map_err(|_| StorageHostError::Arithmetic)?;
         if entry.loaded {
             let bytes = entry.data.as_ref().ok_or(StorageHostError::NotFound)?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, \
+                          which InvalidArgument already states"
+            )]
             let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
             Ok(bytes[start..start + length].to_vec())
         } else {
@@ -211,6 +220,11 @@ impl StorageTransaction {
             .and_then(|entry| entry.data.as_ref())
             .map(Vec::len)
             .ok_or(StorageHostError::NotFound)?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, which \
+                      InvalidArgument already states"
+        )]
         let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
         let end = start
             .checked_add(bytes.len())
@@ -269,6 +283,11 @@ impl StorageTransaction {
         if !state.write {
             return Err(StorageHostError::PermissionDenied);
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, and a truncate target above usize \
+                      is above every configured ceiling, which QuotaExceeded already states"
+        )]
         let target = usize::try_from(size).map_err(|_| StorageHostError::QuotaExceeded)?;
         self.load_token(&state.token)?;
         let current_length = self

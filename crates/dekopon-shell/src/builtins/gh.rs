@@ -544,6 +544,12 @@ fn insert_paging(input: &mut Map<String, Value>, options: &mut Options) {
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for an operand the \
+              message quotes back in full; the writer of `gh pr view abc` is better served by \
+              seeing \"abc\" than by \"invalid digit found in string\""
+)]
 fn require_number(options: &mut Options, command: &str) -> Result<u64, CommandFailure> {
     let positional = options.require_positional(command, "number")?;
     let number = positional.parse::<u64>().map_err(|_| {
@@ -593,6 +599,11 @@ fn take_value(
     Ok(value.clone())
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for a flag value the \
+              message quotes back in full alongside the flag that wanted a number"
+)]
 fn take_number(arguments: &[String], index: &mut usize, flag: &str) -> Result<u64, CommandFailure> {
     let value = take_value(arguments, index, flag)?;
     value.parse::<u64>().map_err(|_| {

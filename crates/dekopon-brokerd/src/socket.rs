@@ -92,6 +92,10 @@ fn validate_ancestors(path: &Path) -> Result<(), SocketError> {
     Ok(())
 }
 
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "each `remove_file` here only rolls back a socket this call just created, on a path already returning the SocketError that explains the failure; a leftover socket is the lesser problem and must not replace that cause"
+)]
 pub async fn bind(
     path: &Path,
     expected_uid: u32,
@@ -222,6 +226,10 @@ impl SocketGuard {
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the last-resort teardown for a guard nobody called `cleanup` on; a Drop cannot report a SocketError and the explicit path already does"
+        )]
         let _ = self.cleanup();
     }
 }

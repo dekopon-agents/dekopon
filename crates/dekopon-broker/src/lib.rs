@@ -57,7 +57,7 @@ use dekopon_capability::{
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, SubjectService, TraceId,
+    RiskLevel, SubjectError, SubjectService, TraceId,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
@@ -827,7 +827,7 @@ impl ChatScopeGrant {
             };
             service
                 .parse::<SubjectService>()
-                .map_err(|_| BrokerBuildError::InvalidChatScope)?;
+                .map_err(|source| BrokerBuildError::InvalidChatScopeService { source })?;
         } else if local_service.is_some() {
             return Err(BrokerBuildError::InvalidChatScope);
         }
@@ -1443,6 +1443,17 @@ pub enum BrokerBuildError {
     /// An owner-authored chat scope grant was noncanonical, overbroad, or malformed.
     #[error("attestor chat scope is invalid")]
     InvalidChatScope,
+    /// A local chat scope grant named a service the external subject grammar does not define.
+    ///
+    /// Separate from [`Self::InvalidChatScope`] because it is the one chat-scope rejection whose
+    /// cause is a free-form operator string rather than a structural rule: the source names the
+    /// offending value, which is what turns a typo in the owner config into a one-line fix.
+    #[error("attestor chat scope names an invalid local subject service")]
+    InvalidChatScopeService {
+        /// Why the service segment was rejected; its message quotes the offending value.
+        #[source]
+        source: SubjectError,
+    },
     /// Chat-memory bounds or their composition with storage ceilings are invalid.
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
@@ -1929,6 +1940,13 @@ fn verify_file_record(
             source: AuditIntegrityError::PreviousHash { index },
         });
     }
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "the only failure `audit_record_hash` reports is `AuditError::Serialize`, and \
+                  `AuditHashMaterial` is a derived-Serialize tree of integers, bools, strings, \
+                  and string newtypes — no map with non-string keys and no float, so serde_json \
+                  has no failure to describe"
+    )]
     let expected = audit_record_hash(
         record.sequence,
         record.previous_hash.as_deref(),
@@ -2106,6 +2124,13 @@ pub fn verify_audit_chain(records: &[AuditRecord]) -> Result<(), AuditIntegrityE
         if record.previous_hash.as_deref() != previous {
             return Err(AuditIntegrityError::PreviousHash { index });
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "the only failure `audit_record_hash` reports is `AuditError::Serialize`, \
+                      and `AuditHashMaterial` is a derived-Serialize tree of integers, bools, \
+                      strings, and string newtypes — no map with non-string keys and no float, \
+                      so serde_json has no failure to describe"
+        )]
         let expected = audit_record_hash(
             record.sequence,
             record.previous_hash.as_deref(),
@@ -2391,6 +2416,12 @@ where
             ),
         ];
         for (identifier, effect, risk, idempotency, access) in expected {
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`identifier` is one of the MEMORY_RECORD/RECENT/SEARCH constants this \
+                          crate defines, so the parse cannot fail and an IdentifierError could \
+                          only restate a literal we control"
+            )]
             let capability = identifier
                 .parse::<CapabilityId>()
                 .map_err(|_| BrokerBuildError::InvalidChatMemory)?;
@@ -3301,6 +3332,22 @@ where
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
             if !decision.allowed {
+                // A refusal means policy never ran: the broker asked a question the schema does
+                // not admit, which is a deployment defect rather than an authorization outcome.
+                // It presents as an ordinary `policy-denied` on the wire — the audit reason stays
+                // stable and the denial is still a denial — so this event is the only place the
+                // operator learns the difference.
+                if let Some(cause) = &decision.refusal {
+                    tracing::warn!(
+                        target: "dekopon_broker::audit",
+                        {
+                            audit.event = "policy.request.refused",
+                            capability.id = %request.capability,
+                            error.reason = %cause,
+                        },
+                        "policy request could not be constructed"
+                    );
+                }
                 authorize.record("outcome", "policy-denied");
                 return self
                     .deny(
@@ -3452,6 +3499,14 @@ where
                 .as_object()
                 .filter(|object| object.len() == 3)
                 .ok_or(BrokerError::InvalidMemoryInput)?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "not wire input: every externally reachable entry point refuses \
+                          MEMORY_RECORD, so the only proposal reaching here is the one \
+                          `record_delivered_turn_for_chat` builds from a typed DeliveryIdentity \
+                          — this is that value's own round trip, and serde has no malformed \
+                          input to name"
+            )]
             let delivery: DeliveryIdentity = object
                 .get("delivery")
                 .cloned()
@@ -3459,6 +3514,11 @@ where
                 .and_then(|value| {
                     serde_json::from_value(value).map_err(|_| BrokerError::InvalidMemoryInput)
                 })?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "`DeliveryIdentity` is a derived-Serialize enum of strings and integers, \
+                          so serde_json has no failure to describe"
+            )]
             let delivery =
                 serde_json::to_vec(&delivery).map_err(|_| BrokerError::InvalidMemoryInput)?;
             let user = object
@@ -3574,9 +3634,7 @@ where
             Some(preparation) => Some(
                 tokio::task::spawn_blocking(move || preparation.materialize())
                     .await
-                    .map_err(|_| BrokerError::Storage {
-                        source: dekopon_storage_host::StorageHostError::Io,
-                    })?
+                    .map_err(|source| BrokerError::StorageTask { source })?
                     .map_err(|source| BrokerError::Storage { source })?,
             ),
         };
@@ -4299,6 +4357,18 @@ pub enum BrokerError {
         #[source]
         source: dekopon_storage_host::StorageHostError,
     },
+    /// The blocking task that materializes the storage grant never returned a result.
+    ///
+    /// Distinct from [`Self::Storage`] because the storage host reported nothing: the task
+    /// panicked or the runtime cancelled it. Folding it into `StorageHostError::Io` sent an
+    /// operator looking at the filesystem for a bug that is in the code. It keeps `Storage`'s
+    /// wire classification — the same preparation step failed, before any provider ran.
+    #[error("broker storage materialization did not complete")]
+    StorageTask {
+        /// Panic payload or cancellation from the blocking task.
+        #[source]
+        source: tokio::task::JoinError,
+    },
     /// A validated policy rule could not create authorization state.
     #[error("broker could not create constrained authorization")]
     Authorization {
@@ -4355,8 +4425,12 @@ impl BrokerError {
     /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
     #[must_use]
     pub const fn storage_failure_code(&self) -> Option<&'static str> {
-        let Self::Storage { source } = self else {
-            return None;
+        let source = match self {
+            Self::Storage { source } => source,
+            // A join failure never reached the storage host, but it failed the same preparation
+            // step at the same point, so it keeps that step's wire classification.
+            Self::StorageTask { .. } => return Some("storage-io"),
+            _ => return None,
         };
         Some(match source {
             dekopon_storage_host::StorageHostError::QuotaExceeded
@@ -4380,6 +4454,7 @@ impl BrokerError {
             | Self::MemoryUnavailable
             | Self::InvalidMemoryInput
             | Self::Storage { .. }
+            | Self::StorageTask { .. }
             | Self::Authorization { .. }
             | Self::DecisionEvidence { .. }
             | Self::DecisionAudit { .. } => None,

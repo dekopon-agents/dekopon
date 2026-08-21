@@ -763,6 +763,11 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 self.expect_brace_close(line)?;
+                #[allow(
+                    clippy::map_err_ignore,
+                    reason = "the loop above accepted only ASCII digits, so overflow is the one \
+                              reachable ParseIntError and the message already says out of range"
+                )]
                 let position = digits.parse::<usize>().map_err(|_| {
                     LexError::new(
                         line,

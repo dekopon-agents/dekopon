@@ -40,6 +40,10 @@ pub struct StoredCheckpoint {
 
 impl StoredCheckpoint {
     fn new(records: usize, head: Option<&str>) -> Result<Self, CheckpointError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, which RecordOverflow already states"
+        )]
         let records = u64::try_from(records).map_err(|_| CheckpointError::RecordOverflow)?;
         let checkpoint = Self {
             api_version: CheckpointApiVersion::V1Alpha1,
@@ -50,6 +54,10 @@ impl StoredCheckpoint {
         Ok(checkpoint)
     }
 
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "TryFromIntError carries only out-of-range, which RecordOverflow already states"
+    )]
     pub fn records(&self) -> Result<usize, CheckpointError> {
         usize::try_from(self.records).map_err(|_| CheckpointError::RecordOverflow)
     }
@@ -227,6 +235,10 @@ impl AuditLog for CheckpointedAuditLog {
             return Err(AuditError::Poisoned);
         }
         let record = self.audit.append(event).await?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, which SequenceOverflow already states"
+        )]
         let records = usize::try_from(record.sequence).map_err(|_| AuditError::SequenceOverflow)?;
         if let Err(error) = self
             .checkpoint

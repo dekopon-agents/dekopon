@@ -135,6 +135,11 @@ impl ServiceStatus {
 }
 
 fn increment(counter: &AtomicU64) {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the update closure returns Some unconditionally, so fetch_update's Err half — \
+                  the closure declining the update — is unconstructible here"
+    )]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(1))
     });
