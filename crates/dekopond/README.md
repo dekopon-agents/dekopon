@@ -36,7 +36,8 @@ and replies with the answer.
 - **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
   standing prompt, route limits, and fresh subject-specific effective Cedar grants. The fixed
   shape omits raw policy, identity, endpoints, paths, and all credential names and values. Calls
-  are repeatable under the prompt loop's shared bounds, with no inspection-specific counter.
+  are repeatable under the prompt loop's shared bounds, with no inspection-specific counter; a
+  repeat points at the copy already in the conversation instead of appending a second one.
 - **Informational status** — after the broker probe, the gateway best-effort reports a bounded
   content-free catalog inventory; each session separately coalesces provider-reported model usage.
   These feed only the broker-hosted web UI, reset with the broker process, and never affect a

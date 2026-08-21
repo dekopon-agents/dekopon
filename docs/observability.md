@@ -64,6 +64,22 @@ a missing field means "unreported", never "free".
 `accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
 URL path or query, no headers, no bodies.
 
+### Bounded session outcomes
+
+Three more `dekopon-agent` records fire in either payload mode, because each is a bounded outcome an
+operator needs without opting in to content:
+
+| Event | Carries |
+|---|---|
+| `agent.asset.fetched` | The asset number, its media type, its byte count, and whether the text was clamped to the prompt's textual bound |
+| `agent.asset.refused` | The asset number and the gateway-authored reason the model was handed |
+| `agent.tool.rejected` | The turn and tool-call index, and a stable `error.type` such as `unknown-tool` |
+
+Neither asset event carries the file's bytes or the sender's own file name, which is untrusted text.
+A refusal reason is gateway-authored rather than sender-supplied, which is why that one is recorded
+verbatim. A textual asset larger than the prompt bound is clamped with a trailer the model reads,
+not dropped and not failed — `asset.truncated` is how an operator sees that it happened.
+
 ### The broker-hosted live token view
 
 The optional `dekopon-brokerd --http-bind <ADDRESS>` web UI mirrors provider-reported model usage into process-local counters. `dekopond` observes every successfully decoded model response — including one followed by a later tool/session failure and one whose provider omitted usage — coalesces bounded deltas, and reports them over the authenticated Unix protocol. Input, cached input, output, reasoning output, and total counts keep separate “unreported call” totals, so an omitted value never becomes zero. Reporting is best effort and cannot delay or fail an answer; a dropped report remains present in normal `accounting.model.turn` telemetry when that exporter received it. The UI therefore answers “what this broker process has heard since startup,” not billing reconciliation. It resets on broker restart, is self-reported by the gateway, and never replaces OTLP accounting or durable authorization audit.
@@ -183,7 +199,7 @@ attested context was derived.
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
+The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
 
@@ -220,10 +236,10 @@ eviction is not the place to leak them at the metadata level.
 
 The history itself is not a new signal. It is chat text and model output, already excluded by the
 data-minimization rules below, and it appears only where those already send it: with
-`telemetryPayloads` enabled, `agent.model.prompt` carries the full message list for the turn, which
-on a seeded session now includes the replayed window. That event becomes larger and older than it
-was — enabling payloads on a persistent route declares the sink in scope for a conversation rather
-than for a message.
+`telemetryPayloads` enabled, the session's first `agent.model.prompt` carries its opening message
+list, which on a seeded session now includes the replayed window. That event becomes larger and
+older than it was — enabling payloads on a persistent route declares the sink in scope for a
+conversation rather than for a message.
 
 ### Reading the prompt cache
 
@@ -327,18 +343,28 @@ With `telemetryPayloads` enabled, these events join the accounting and refusal o
 
 | Event | Carries |
 |---|---|
-| `agent.model.prompt` | The full message list sent to the model for this turn |
+| `agent.model.prompt` | The session's opening message list on its first turn, and on every later turn only the messages appended since the previous one |
 | `agent.model.answer` | Assistant text and the tool calls it requested, with arguments |
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
 | `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 
+`agent.model.prompt` is emitted whole once per session and extended thereafter. Turn N's message
+list strictly contains turn N-1's, and everything appended since was already emitted by
+`agent.model.answer`, `agent.tool.script`, and `agent.tool.output` on the turn that produced it, so
+re-sending the whole list every turn cost a long session O(N²) payload bytes of near-duplicates.
+`transcript.scope` says which shape an event carries (`full` or `delta`) and `message.count` gives
+the size of the request that was actually sent, so a reader can tell a trimmed session from a
+truncated log. Concatenating a session's events in order still reconstructs the exact transcript.
+
 `accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
 available without opting in to content. `agent.config.inspected` also fires in either mode and
-carries only the bounded result byte count; it never logs the configuration itself. When payloads
-are enabled, the credential-free meta result naturally appears as a tool message inside the next
-`agent.model.prompt` transcript, just as script output does. The per-command detail that used to arrive as
+carries only the bounded result byte count and whether this call repeated an earlier one; it never
+logs the configuration itself. When payloads are enabled, the credential-free meta result naturally
+appears as a tool message inside the next `agent.model.prompt` transcript, just as script output
+does — once per session, because a repeated inspection is answered with a short pointer at the copy
+already in the conversation rather than a second full copy. The per-command detail that used to arrive as
 `shell.command.started`/`.completed` pairs now lives on the `shell.command` span, which carries the
 command word, its kind, its argument count, its exit code, and its outcome.
 
