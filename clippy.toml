@@ -1,0 +1,6 @@
+# Tracing span guards are RAII handles on a thread-local stack. Holding one across `.await`
+# reparents every span opened by whatever task the executor resumes on that thread.
+await-holding-invalid-types = [
+    { path = "tracing::span::Entered", reason = "guard across .await corrupts trace parenting; use span.in_scope(..) or .instrument(span)" },
+    { path = "tracing::span::EnteredSpan", reason = "use tracing::Instrument instead of entering a span across .await" },
+]

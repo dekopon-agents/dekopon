@@ -25,6 +25,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
+use tracing::Instrument as _;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
@@ -440,11 +441,12 @@ impl BufferedHttpClient {
         if dekopon_core::telemetry_payloads() {
             span.record("url.full", request.uri.as_str());
         }
-        let _entered = span.enter();
-
         let evidence_index = self.evidence.len();
         self.attempted = true;
-        let result = self.send_checked(request).await;
+        // Instrumented rather than entered: this awaits DNS, connection, and body reads, and an
+        // `Entered` guard held across them stays on the thread that parked the future, so a
+        // concurrent request's events parent under this span instead of their own.
+        let result = self.send_checked(request).instrument(span.clone()).await;
 
         // `prepare` is what learns the method and authority, so the evidence entry it pushed is
         // the only sanitized source for them; a request rejected before that point simply has

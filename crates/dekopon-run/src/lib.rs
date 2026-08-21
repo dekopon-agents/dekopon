@@ -77,9 +77,10 @@ pub async fn run(cli: Cli) -> i32 {
         command.name = command_name,
         otel.kind = "internal"
     );
-    let exit_code = {
-        let _entered = command_span.enter();
-
+    // Instrumented rather than entered: an `Entered` guard held across an `.await` stays on the
+    // thread that parked the future, so any future refactor that polls `run` on a worker would
+    // silently mis-parent every event emitted there.
+    let exit_code = async {
         match evaluate(&cli).await {
             Ok(output) => match write_output(&output.text) {
                 Ok(()) => output.exit_code,
@@ -112,7 +113,9 @@ pub async fn run(cli: Cli) -> i32 {
                 1
             }
         }
-    };
+    }
+    .instrument(command_span.clone())
+    .await;
 
     // Close the root span before flushing short-lived OTLP exporters.
     drop(command_span);
