@@ -101,12 +101,17 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
+| `capacity-exhausted` | A bounded broker resource — the replay ledger or the audit log — is full. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. | Yes under a fresh identifier after correcting or reconciling the storage condition. |
 
 `outcome-unaudited` is the durable-state signal that separates "nothing happened" from "something may have happened and nothing recorded it". It is emitted only for failures raised after execution began — a failed terminal audit append, or a failure to hash terminal evidence. A denied or failed *invocation* is not a failure response at all: it returns a normal result carrying its outcome and decision linkage.
 
 The server logs `broker_outcome_unaudited` with the invocation identifier for exactly this case, so the invocation needing manual reconciliation is identifiable without correlating client-side state.
+
+`capacity-exhausted` separates a permanent exhaustion from a momentary one. `broker-unavailable` invites a retry under a fresh invocation identifier; the replay ledger and the audit log are conditions under which that retry can never succeed. Neither structure evicts or rotates, and restart does not clear the ledger — `scan_audit_file` restores an entry for every Decision event in durable history — so a client told `broker-unavailable` would loop against a permanently capped broker. The server logs `broker_capacity_exhausted` alongside the refusal; the fix is an operator raising `brokerLimits.maxReplayIds` or `serverLimits.auditMaxRecords`, or moving the audit file aside, not anything the caller can do.
+
+Size `maxReplayIds` against `auditMaxRecords` rather than below it. The ledger bound is cumulative across restarts for the same reason: one restored identifier per durable Decision event. A denial costs one audit record and one ledger slot, while an executed invocation costs two audit records and one slot, so a denial-heavy history exhausts a ledger sized at half the audit budget *first* — before the designed `AuditError::Full` refusal the audit bound exists to produce. The stock `maxReplayIds` of 100 000 is therefore undersized for the chart's `auditMaxRecords: 200000`; set them equal.
 
 Successful informational reports return `acknowledged`; invalid bounds return `invalid-request`, and a mapped peer without an attestor grant receives `unauthenticated`. Reporting failures are non-authoritative and must never be interpreted as provider work or retried as an invocation.
 

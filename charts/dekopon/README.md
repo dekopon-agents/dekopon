@@ -298,6 +298,23 @@ refusal and `ENOSPC` in the middle of an append is not. If you raise `auditMaxLi
 
 `serverLimits` is all-or-nothing: when the section is present every field is required.
 
+### Size `maxReplayIds` with it
+
+`auditMaxRecords` is not the only bound that ends in a permanent refusal, and it is not the first
+one a busy deployment reaches. The broker's replay ledger holds `brokerLimits.maxReplayIds`
+invocation identifiers (stock **100 000**), never evicts, and is restored from durable history at
+startup — one entry per Decision event — so it is cumulative across restarts exactly like the audit
+file. A *denial* costs one audit record and one full ledger slot, while an executed invocation costs
+two audit records and one slot, so with the stock ledger against `auditMaxRecords: 200000` a
+denial-heavy history exhausts the ledger at half the audit budget, before the designed
+`AuditError::Full` refusal ever fires.
+
+Either bound reached answers every client `capacity-exhausted` and logs
+`broker_capacity_exhausted`. Neither is recoverable by retry or by restart. Set `maxReplayIds` to at
+least `auditMaxRecords`. The ledger holds one bounded identifier string per entry, so matching
+200 000 costs tens of MiB of resident memory — cheaper than a broker that refuses every invocation
+until someone edits a values file and rolls the pod.
+
 ## Storage, uninstall, and recovery
 
 The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it. This is not

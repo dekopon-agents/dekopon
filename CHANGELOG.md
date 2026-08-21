@@ -32,8 +32,30 @@ All notable changes to Dekopon are documented here. The format is based on
   the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
   `broker.execute` records `outcome` and the classified `error`.
 
+### Fixed
+
+- A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
+  `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
+  logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
+  accept failure stays fatal.
+- Broker shutdown now drains the Unix listener, the provider-storage GC, and the web UI concurrently
+  against one shared deadline. They previously ran in sequence, each under its own full
+  `shutdownGraceMs`, so a process with `--http-bind` could take two or three graces to exit against a
+  `terminationGracePeriodSeconds` that budgets one.
+- Startup frame validation now also bounds the capability response an attested session receives, not
+  only each direct peer's. In a gateway deployment the peer holds almost nothing while the mapped
+  principals hold the real capability sets, so an oversized response passed startup and then failed
+  `write_frame` on every session open — the exact failure the check exists to prevent.
+- A finished connection task is now observed as soon as it completes rather than on the next accept,
+  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+
 ### Changed
 
+- An exhausted replay ledger or audit log now answers the new stable failure code
+  `capacity-exhausted` and logs `broker_capacity_exhausted`, instead of the retriable
+  `broker-unavailable`. Neither bound evicts, rotates, or clears on restart, so a client was being
+  invited to retry forever. `maxReplayIds` must be sized against `auditMaxRecords`, which is now
+  documented in `docs/broker-http.md` and the chart README.
 - A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
   service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
   significant failed.
