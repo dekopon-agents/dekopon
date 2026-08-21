@@ -19,6 +19,7 @@ pub(crate) mod discord;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod whatsapp;
 
 /// Inbound chat text is bounded before prompting, because a chat service's own message ceiling is
 /// not a bound this daemon chose.
@@ -171,8 +172,13 @@ pub(crate) enum ReplyTarget {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
     },
+    WhatsApp {
+        recipient: String,
+    },
     /// The development transport answers on the connection the request arrived on.
-    Local { connection: u64 },
+    Local {
+        connection: u64,
+    },
 }
 
 /// Who the bot is on one service, resolved at connect time for self-filtering and @-mentions.
@@ -374,6 +380,8 @@ pub(crate) trait AssetFetcher: Send + Sync {
 pub enum TransportError {
     #[error("transport credential environment variable {name} is not set")]
     MissingCredential { name: String },
+    #[error("transport credential environment variable {name} is set to an empty value")]
+    EmptyCredential { name: String },
     #[error("transport credential environment variable {name} is not UTF-8")]
     NonUtf8Credential { name: String },
     #[error("chat service request failed")]
@@ -399,6 +407,7 @@ impl TransportError {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::MissingCredential { .. } => "missing-credential",
+            Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
@@ -417,11 +426,27 @@ pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
     let value = std::env::var_os(name).ok_or_else(|| TransportError::MissingCredential {
         name: name.to_owned(),
     })?;
-    value
+    let value = value
         .into_string()
         .map_err(|_| TransportError::NonUtf8Credential {
             name: name.to_owned(),
-        })
+        })?;
+    credential_value(name, value)
+}
+
+/// Rejects an exported-but-empty credential, which is a misconfiguration rather than a secret.
+///
+/// A blank value is not a weak token, it is the absence of one presented as presence: an empty HMAC
+/// key verifies signatures anybody can compute, and an empty bearer token is still sent as a header.
+/// One definition here rather than per transport, because every transport reads its credentials
+/// through [`read_credential`].
+pub(crate) fn credential_value(name: &str, value: String) -> Result<String, TransportError> {
+    if value.trim().is_empty() {
+        return Err(TransportError::EmptyCredential {
+            name: name.to_owned(),
+        });
+    }
+    Ok(value)
 }
 
 /// Bounds untrusted inbound text, keeping the head and saying so.

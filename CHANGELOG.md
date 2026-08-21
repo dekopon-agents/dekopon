@@ -9,6 +9,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added a first text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook,
+  process-local message-ID deduplication, canonical `whatsapp.<wa_id>` subjects, and pinned Graph
+  API text replies.
+- Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
+  operator-owned exact-path webhook ingress.
 - Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
   Discord, Telegram, and the local development transport.
 - Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
@@ -26,6 +31,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- A route that names an image generator on the text-only WhatsApp transport is now a startup
+  failure, rather than paying a model for a PNG that has no delivery path.
+- A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
+  sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
+  the first chunk reports `partial-delivery` and records no delivered turn.
+- A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
+  name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
@@ -42,6 +54,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Security
 
+- WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender
+  come only from the signed envelope, transport secrets remain gateway-only, and outcome-unknown
+  Graph sends are never blindly retried.
+- Every refused WhatsApp webhook request now names its reason in telemetry, rate-limited to one
+  content-free line per reason per minute carrying the count it stands for, so a wrong app secret is
+  visible without letting an unauthenticated caller drive log volume.
+- A transport credential environment variable that is exported but blank is now a startup failure
+  naming the variable: an empty HMAC key verifies signatures anyone can compute, and an empty bearer
+  token is still sent as a header.
+- A failed WhatsApp `accept()` is now classified instead of ending the listener: a dead connection is
+  ignored and descriptor or buffer exhaustion is retried after a short pause, so one transient
+  failure can no longer silently take the only inbound transport off the air for the process's life.
 - Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,
   gateway-owned filenames and authenticated reply targets, and never enter prompts, conversation
   memory, durable chat records, telemetry payloads, provider components, or broker protocol.

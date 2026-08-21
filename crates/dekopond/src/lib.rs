@@ -73,7 +73,7 @@ use crate::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
         OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
         discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
-        telegram::TelegramTransport,
+        telegram::TelegramTransport, whatsapp::WhatsappTransport,
     },
 };
 
@@ -694,6 +694,31 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
                 transport::read_credential(bot_token_env)?,
                 activity.mode,
+            )?),
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => Box::new(WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
             )?),
             TransportConfig::TelegramLongPoll {
                 name,

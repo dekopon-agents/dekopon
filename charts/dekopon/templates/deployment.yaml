@@ -267,9 +267,25 @@ spec:
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # No probes. dekopond serves no HTTP and binds no socket of its own, and it already
-          # probes the broker once at startup and exits non-zero when the broker does not answer,
-          # so "is it healthy" is the same question as "is the process still running".
+{{- if .Values.gateway.service.enabled }}
+          # The chart cannot parse an existing dekopond.yaml. Keep this port equal to the
+          # WhatsApp transport's non-loopback bind port or the readiness probe fails closed.
+          ports:
+            - name: webhook
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: webhook
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+{{- else }}
+          # Without an inbound Service, dekopond has no generic health endpoint. It probes the
+          # broker once at startup and exits non-zero when the broker does not answer.
+{{- end }}
+          # No liveness probe: restarting a gateway during model work can lose an acknowledged
+          # in-memory webhook delivery, and process failure is already visible to Kubernetes.
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
           volumeMounts:

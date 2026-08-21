@@ -1071,7 +1071,7 @@ async fn record_delivered_turn(
     }
 }
 
-fn delivery_identity(
+pub(crate) fn delivery_identity(
     message: &InboundMessage,
     claim: &ChatSessionClaim,
 ) -> Option<DeliveryIdentity> {
@@ -1093,6 +1093,20 @@ fn delivery_identity(
             Some(DeliveryIdentity::Telegram {
                 chat: claim.scope.channel.clone(),
                 topic,
+                message: message.message_id.clone(),
+            })
+        }
+        dekopon_broker_protocol::ChatTransportKind::Whatsapp => {
+            let mut parts = claim.scope.channel.split(':');
+            let waba = parts.next()?.to_owned();
+            let phone_number = parts.next()?.to_owned();
+            let _sender = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(DeliveryIdentity::Whatsapp {
+                waba,
+                phone_number,
                 message: message.message_id.clone(),
             })
         }

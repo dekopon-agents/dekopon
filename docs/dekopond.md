@@ -4,9 +4,10 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** Chat-transport wakeups, chat-scoped attested routing, bounded sessions,
-persistent conversations, truthful transport-acceptance receipts, and optional broker-owned durable
-chat memory are implemented and tested. A route is `oneShot` unless configured otherwise; durable
+**Status: Current.** Chat-transport wakeups, including a first text-only Meta WhatsApp Cloud API
+webhook, chat-scoped attested routing, bounded sessions, persistent conversations, truthful
+transport-acceptance receipts, and optional broker-owned durable chat memory are implemented and
+tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. A
 dedicated gateway UID remains **committed direction**.
 
@@ -54,6 +55,16 @@ transports:
     kind: telegramLongPoll
     botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
     activity: { mode: native }                # renewable native typing; optional/off by default
+  - name: whatsapp
+    kind: whatsappCloudApi
+    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    bind: 0.0.0.0:9080                     # pod bind; expose only through exact-path TLS ingress
+    callbackPath: /webhooks/whatsapp
+    wabaId: "123456789"
+    phoneNumberId: "987654321"
+    graphApiVersion: v23.0                 # explicit; no implicit/latest version
   - name: dev
     kind: local
     socketPath: /path/to/dekopond-dev.sock
@@ -123,7 +134,7 @@ The `conversation:` block is tagged on `mode`, and both halves are strict: an un
 
 ### No secrets in this file
 
-Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**.
+Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
 
 ### Startup fails closed
 
@@ -133,9 +144,10 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
-- a transport endpoint override that is neither its pinned production origin (Slack, Discord, or Telegram) nor a literal loopback `http://` URL;
+- a transport endpoint override that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
-- a missing chat or named image-generator credential environment variable;
+- a missing or blank chat or named image-generator credential environment variable;
+- a route naming an image generator on a text-only transport, which today means `whatsappCloudApi`;
 - an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
   Slack activity with a reaction fallback, or classic native activity with no reaction fallback,
   is also refused because the configured fallback could never take effect;
@@ -190,7 +202,11 @@ durable memory, provider output, broker protocol, evidence, or audit.
 
 Delivery uses each service's native upload path: Slack's three-step external file flow, Discord
 multipart Create Message, Telegram multipart `sendPhoto`, and an omitted-when-empty base64 `images`
-array on the local socket. `DeliveryReceipt` covers the complete text/image reply. If Telegram or a
+array on the local socket. WhatsApp has no path here — the Cloud API transport is text-only, and
+sending an image through it would need Meta's separate media upload — so a route that names an image
+generator on a `whatsappCloudApi` transport is a startup failure. Discovering that at reply time
+would mean paying a model for a PNG and then dropping it. `DeliveryReceipt` covers the complete
+text/image reply. If Telegram or a
 split Discord reply accepts only part, the session is `reply-failed` and performs no durable record.
 Persistent history remembers only final text; editing or referring to prior pixels requires a fresh
 generation.
@@ -318,6 +334,65 @@ failure after any accepted part is partial delivery. With
 around every four seconds inside Telegram's five-second lease. There is no explicit clear; renewal
 stops before the final message, which clears the action. Calls override the long-poll client's
 70-second timeout with a short deadline, honor `retry_after`, and remain cosmetic.
+
+### Meta WhatsApp Cloud API
+
+The `whatsappCloudApi` transport is an inbound plain-HTTP listener intended to sit behind
+Cloudflare Tunnel and Traefik (or equivalent operator-owned HTTPS termination). Its configured
+callback path exposes only GET subscription verification and POST webhook delivery. GET requires
+exactly one `hub.mode=subscribe`, verify token, and challenge, compares the token in constant time,
+and returns the decoded challenge without JSON quoting. POST bounds connection time, headers, body,
+concurrency, message count, and queue depth; requires exactly one
+`X-Hub-Signature-256` whose value is `sha256=<lowercase hex>`; and verifies HMAC-SHA256 over the exact raw body before JSON
+parsing. The callback path is a literal lowercase-segment path—wildcards, captures, empty segments,
+and trailing slashes are rejected at startup. Responses carry `Cache-Control: no-store`; errors and
+logs are content-free.
+
+Only `object=whatsapp_business_account`, `field=messages`, `messaging_product=whatsapp` events for
+the configured exact WABA/receiving-phone tuple may produce sessions. Every entry, change, and
+message in a signed batch is inspected. Status-only, unknown, malformed non-message, unsupported
+message type, wrong-destination, and self/echo messages are acknowledged and ignored. Ordinary text
+uses signed `messages[].from` both as reply target and as the sole identity source; profile names,
+display phone numbers, message text, WABA IDs, and phone-number IDs cannot assert the sender.
+Canonical subject is `whatsapp.<wa_id>`. The WABA, receiving phone number, and sender remain in the
+transport-derived chat scope as `<waba>:<phone-number-id>:<wa_id>`.
+
+The handler claims signed `messages[].id` values in a 4,096-entry process-local set and atomically
+enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text
+messages, and the queue admits at most 512 messages across 64 delivery slots. Duplicates seen by
+that running process are acknowledged without another session. This is deliberately not durable
+exactly-once: restart forgets claims, and a crash after 200 but before queue drain may lose the
+accepted work. Queue saturation returns 503 and rolls back new claims so Meta can redeliver.
+
+Replies are bounded JSON POSTs to the pinned
+`https://graph.facebook.com/{version}/{phone-number-id}/messages` endpoint with the gateway-held
+bearer token. Redirects are disabled, responses and time are bounded, and Meta error bodies never
+reach chat or logs. WhatsApp accepts 4,096 Unicode scalar values per text message and the session's
+own outbound bound is 8 KiB, so a long answer is split at a line boundary where one exists and sent
+as consecutive messages rather than truncated — the same rule the Discord transport follows. A
+failure after the first chunk is `partial-delivery`: the answer arrived in part, the underlying
+service category is logged once as `gateway_whatsapp_reply_partial`, and no delivered turn is
+recorded. No send is retried: a timeout after request transmission is outcome-unknown and blindly
+resending could duplicate a visible answer. After Graph accepts every chunk, the signed inbound
+message ID becomes the service-typed delivery identity for optional durable chat memory, bound to
+the WABA and receiving phone number in the attested scope. Failed or outcome-unknown replies record
+no delivered turn. Free-form text remains subject to Meta's customer-service window; there is no
+template fallback.
+
+Refusals are visible without being a megaphone. Every refused request emits
+`gateway_whatsapp_webhook_refused` with a stable `reason` — `unsigned`, `signature`, `oversize`,
+`malformed`, `saturated`, `timeout`, `verification`, `unavailable` — its HTTP status, and nothing
+about its content. A stranger decides how often those happen, so each reason is emitted at most once
+a minute carrying the number of refusals it stands for: a wrong app secret is one obvious line, and
+a flood is still one line a minute. A failed `accept()` is classified rather than treated as the end
+of the listener, because nothing restarts a transport reader: a dead connection is debug-level and
+ignored, descriptor or buffer exhaustion is warned and retried after a short pause, and only a
+listening socket that can never serve again stops the loop with
+`gateway_whatsapp_listener_stopped`.
+
+Media, templates, interactive messages, reactions, activity, status processing, business-management
+APIs, embedded signup, webhook multiplexing, and daemon TLS termination are non-goals. See
+[`../examples/whatsapp/`](../examples/whatsapp/README.md) for placeholder-only setup.
 
 ### Local development transport
 

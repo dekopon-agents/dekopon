@@ -9,8 +9,10 @@ waits for a wakeup, routes each authenticated message to a named agent from the 
 runs one bounded model session with the sandboxed shell plus safe on-demand meta tools,
 and replies with the answer.
 
-- **Transports** — Slack Socket Mode and Discord Gateway (outbound WebSockets, so no public HTTP
-  endpoint), Telegram long polling, and an owner-only Unix development socket.
+- **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
+  polling, a raw-body-HMAC-authenticated text-only WhatsApp Cloud API webhook with pinned Graph
+  replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
+  it expects operator-owned TLS termination and exact-path routing.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps

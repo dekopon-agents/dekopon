@@ -53,6 +53,7 @@ use crate::{
         DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
         OutboundReply, ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership,
         TransportError, TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
+        credential_value,
     },
 };
 
@@ -246,6 +247,79 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
     assert!(
         load(directory.path(), &document).await.is_err(),
         "unknown cosmetic settings still fail strict decoding"
+    );
+}
+
+#[tokio::test]
+async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({
+        "name": "support-whatsapp",
+        "kind": "whatsappCloudApi",
+        "appSecretEnv": "DEKOPOND_WHATSAPP_APP_SECRET",
+        "verifyTokenEnv": "DEKOPOND_WHATSAPP_VERIFY_TOKEN",
+        "accessTokenEnv": "DEKOPOND_WHATSAPP_ACCESS_TOKEN",
+        "bind": "127.0.0.1:9080",
+        "callbackPath": "/webhooks/whatsapp",
+        "wabaId": "123456",
+        "phoneNumberId": "789012",
+        "graphApiVersion": "v23.0"
+    });
+    document["routes"][0]["transport"] = json!("support-whatsapp");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("explicit WhatsApp configuration resolves");
+    assert!(matches!(
+        resolved.transports.first(),
+        Some(config::TransportConfig::WhatsappCloudApi {
+            callback_path,
+            graph_endpoint: Some(endpoint),
+            ..
+        }) if callback_path == "/webhooks/whatsapp"
+            && endpoint == config::WHATSAPP_GRAPH_ENDPOINT
+    ));
+
+    for (field, invalid) in [
+        ("appSecretEnv", json!("pasted secret")),
+        ("bind", json!("127.0.0.1:0")),
+        ("callbackPath", json!("relative")),
+        ("callbackPath", json!("/webhooks/{wildcard}")),
+        ("callbackPath", json!("/webhooks//whatsapp")),
+        ("callbackPath", json!("/webhooks/whatsapp/")),
+        ("wabaId", json!("0123")),
+        ("graphApiVersion", json!("latest")),
+        ("graphApiVersion", json!("v01.0")),
+        ("graphApiVersion", json!("v23.1")),
+        ("graphEndpoint", json!("https://evil.example")),
+    ] {
+        let mut invalid_document = document.clone();
+        invalid_document["transports"][0][field] = invalid;
+        assert!(
+            load(directory.path(), &invalid_document).await.is_err(),
+            "invalid {field} must fail closed"
+        );
+    }
+
+    // The transport is text-only. A route that pairs it with an image generator would pay a model
+    // for a PNG this transport has no way to deliver, so the pair is refused at startup rather
+    // than dropped at reply time.
+    let mut with_images = document.clone();
+    with_images["imageGenerators"] = json!([{
+        "name": "openai-images",
+        "kind": "openaiImages",
+        "model": "gpt-image-1",
+        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+        "timeoutMs": 120_000
+    }]);
+    with_images["routes"][0]["imageGenerator"] = json!("openai-images");
+    let error = load(directory.path(), &with_images)
+        .await
+        .expect_err("a text-only transport cannot carry a generated image");
+    assert!(
+        error.to_string().contains("text-only"),
+        "the refusal names why: {error}"
     );
 }
 
@@ -1047,6 +1121,25 @@ fn a_long_answer_keeps_its_beginning_and_its_conclusion() {
     assert!(bounded.contains("truncated by the gateway"), "{bounded}");
 }
 
+#[test]
+fn an_exported_but_blank_credential_is_refused_by_name() {
+    for blank in ["", " ", "\n\t "] {
+        let error = credential_value("DEKOPOND_WHATSAPP_APP_SECRET", blank.to_owned())
+            .expect_err("a blank credential is the absence of one");
+        assert!(
+            matches!(&error, TransportError::EmptyCredential { name }
+                if name == "DEKOPOND_WHATSAPP_APP_SECRET"),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), "empty-credential");
+    }
+    assert_eq!(
+        credential_value("DEKOPOND_WHATSAPP_APP_SECRET", " token ".to_owned())
+            .expect("a credential with surrounding space is still a credential"),
+        " token "
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -1623,6 +1716,41 @@ fn message(text: &str) -> InboundMessage {
         reply: ReplyTarget::Local { connection: 1 },
         activity: None,
     }
+}
+
+#[test]
+fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
+    let mut inbound = message("hello");
+    inbound.transport = "support-whatsapp".to_owned();
+    inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
+    inbound.subject = ExternalSubject::whatsapp("16034700182").expect("subject");
+    inbound.channel = "123:456:16034700182".to_owned();
+    inbound.conversation_id = inbound.channel.clone();
+    inbound.message_id = "wamid.delivery".to_owned();
+    inbound.reply = ReplyTarget::WhatsApp {
+        recipient: "16034700182".to_owned(),
+    };
+    let claim = dekopon_broker_protocol::ChatSessionClaim {
+        subject: inbound.subject.clone(),
+        agent: "reviewer".parse().expect("agent"),
+        scope: dekopon_broker_protocol::ChatScopeClaim {
+            transport: "support-whatsapp".parse().expect("transport"),
+            kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
+            channel: inbound.channel.clone(),
+            conversation: inbound.conversation_id.clone(),
+        },
+    };
+    let delivery = crate::session::delivery_identity(&inbound, &claim)
+        .expect("WhatsApp replies can be recorded after transport acceptance");
+    assert_eq!(
+        delivery,
+        dekopon_broker_protocol::DeliveryIdentity::Whatsapp {
+            waba: "123".to_owned(),
+            phone_number: "456".to_owned(),
+            message: "wamid.delivery".to_owned(),
+        }
+    );
+    assert!(delivery.is_canonical_for(&claim.scope));
 }
 
 fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
