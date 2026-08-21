@@ -20,6 +20,27 @@ Read in this order:
 9. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon: the 1Password service account, the External Secrets store already running against it, and the file hygiene no Kubernetes volume satisfies.
 10. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
+## Build a provider
+
+**Status: Current in v0.8.0; pre-production.** A Dekopon provider is executable WebAssembly Component code, not a native plugin, configuration file, or separate process. Its imports state structural requirements; only the selected host decides which interfaces exist.
+
+The complete **[Build and run an import-free Wasm provider with Rust](https://dekopon-agents.github.io/guides/provider-sdk/)** walkthrough deliberately pins v0.7.0. The v0.8.0 provider contract and host path are unchanged, but follow the guide's exact versions as one tested set.
+
+| Need | Start here |
+|---|---|
+| Import-free local computation | [`echo/src/lib.rs`](../examples/providers/echo/src/lib.rs), [`dekopon-provider-sdk`](../crates/dekopon-provider-sdk/README.md), and [`run.md`](run.md#rust-provider-interface) |
+| Broker-mediated buffered HTTP | [`jsonplaceholder/src/lib.rs`](../examples/providers/jsonplaceholder/src/lib.rs), [`dekopon-provider-http`](../crates/dekopon-provider-http/README.md), and [`broker-http.md`](broker-http.md) |
+| Provider checks and generated components | [`development.md`](development.md#provider-example-workspaces) |
+| Trust boundaries and limitations | [`security-model.md`](security-model.md) |
+
+The base world exports `describe` and `invoke` and imports nothing. Direct `dekopon-run` accepts only declared read-only capabilities and links no provider host services. Under those interfaces, a component has no API for processes, host files, environment, networking, clock, randomness, or credentials. Wasmtime still executes in the host process; its limits are not a production sandbox claim.
+
+The broker additionally links only `dekopon:http/client@1.0.0`. Any broker invocation—including pure computation—requires operator-installed bytes, trusted identity mapping, an exact constraint set, Cedar policy, and audit/path configuration. Existing HTTP providers also need a composed WIT world and narrowly scoped authority. Provider code controls paths, queries, bodies, and endpoint semantics inside the host-enforced envelope, so use fixed request shapes and validate all input and responses.
+
+If the design needs another import, private-network access, files, processes, streaming, durable guest state, path-level enforcement, or authentication beyond the current destination-bound `Authorization` credential, treat it as a host/platform change rather than provider-only work.
+
+Keep the host, SDK, HTTP facade, provider WIT, HTTP WIT, and manifest API versions explicit. Matching host load tests—not version labels alone—prove compatibility.
+
 ### Change a specific area
 
 | Work | Read | Why |
