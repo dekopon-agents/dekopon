@@ -32,6 +32,7 @@ use std::{
     fmt,
     future::Future,
     io::{self, SeekFrom},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -3353,13 +3354,18 @@ where
         if !storage_candidate && dekopon_core::telemetry_payloads() {
             authorize.record("input", tracing::field::display(&request.input));
         }
-        let (set, policy_ids) = {
-            let _entered = authorize.enter();
+        // Instrumented rather than entered with a guard: this section awaits the replay ledger and,
+        // on every denial, a durable audit append that fsyncs. A guard held across those awaits
+        // stays entered on the worker thread while this task is suspended, so another connection's
+        // spans parent under this request's authorization and this request's own events lose it
+        // when the task resumes elsewhere.
+        let authorized = async {
             if !self.replay.reserve(&request.id).await? {
                 authorize.record("outcome", "replayed-invocation");
                 return self
                     .deny(context, &request, "replayed-invocation", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A refused attestation or agent gate still consumes its invocation identifier above:
             // the denial is a decision about this exact proposal, and letting the same identifier
@@ -3368,7 +3374,8 @@ where
                 authorize.record("outcome", refusal.reason);
                 return self
                     .deny(context, &request, refusal.reason, refusal.policy_ids)
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A missing constraint set means there is nothing to execute regardless of what policy
             // says. Under `Leniency::Strict` this is defense in depth behind the startup check;
@@ -3379,13 +3386,15 @@ where
                 authorize.record("outcome", "unconstrained-capability");
                 return self
                     .deny(context, &request, "unconstrained-capability", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             };
             if set.constraints.storage.is_some() && context.chat_scope().is_none() {
                 authorize.record("outcome", "chat-scope-required");
                 return self
                     .deny(context, &request, "chat-scope-required", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
             // A policy that errors at evaluation time denies exactly like a policy that does not
@@ -3407,10 +3416,20 @@ where
                 }
                 return self
                     .deny(context, &request, reason, decision.determining_policy_ids)
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             authorize.record("outcome", "allowed");
-            (set, decision.determining_policy_ids)
+            Ok(ControlFlow::Continue((
+                set,
+                decision.determining_policy_ids,
+            )))
+        }
+        .instrument(authorize.clone())
+        .await?;
+        let (set, policy_ids) = match authorized {
+            ControlFlow::Break(denied) => return Ok(denied),
+            ControlFlow::Continue(allowed) => allowed,
         };
         let provider = set.provider.clone();
         let execute = if set.constraints.storage.is_some() {
