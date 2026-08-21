@@ -71,6 +71,27 @@ URL path or query, no headers, no bodies.
 
 The optional `dekopon-brokerd --http-bind <ADDRESS>` web UI mirrors provider-reported model usage into process-local counters. `dekopond` observes every successfully decoded model response — including one followed by a later tool/session failure and one whose provider omitted usage — coalesces bounded deltas, and reports them over the authenticated Unix protocol. Input, cached input, output, reasoning output, and total counts keep separate “unreported call” totals, so an omitted value never becomes zero. Reporting is best effort and cannot delay or fail an answer; a dropped report remains present in normal `accounting.model.turn` telemetry when that exporter received it. The UI therefore answers “what this broker process has heard since startup,” not billing reconciliation. It resets on broker restart, is self-reported by the gateway, and never replaces OTLP accounting or durable authorization audit.
 
+## Refusals, errors, and outcomes
+
+The other half of what survives trace expiry is the record of something a process refused or could
+not do. These fire in either payload mode, because each carries a fixed category rather than the
+untrusted text that triggered it:
+
+| Event | Emitted by | Carries |
+|---|---|---|
+| `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
+| `agent.image_generation.refused` | `dekopon-agent` | model turn, tool-call index, and a stable `reason` such as `session-limit`; never the model-authored generation prompt |
+| `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
+| `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, and its byte count — never the bytes and never the sender's file name |
+| `guest.invocation.completed` | `dekopon-run` | the capability id, the provider id on success, iteration index, duration, and `outcome` for one direct-mode component invocation |
+| `runner.command.failed` | `dekopon-run` | the command name and a stable `error.type`, including the `output-write` failure that has no other surface |
+| `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
+| `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
+| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word and a stable `error.kind`, recorded when a provider's own rewrite fails rather than declines |
+
+An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
+this file does not mention, so a rename lands here in the same change.
+
 ## Enable OTLP export
 
 Export remains disabled unless an endpoint is configured:

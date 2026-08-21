@@ -19,6 +19,8 @@ All notable changes to Dekopon are documented here. The format is based on
   `RecordDeliveredTurnForChat` recording.
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
+- Documented the nine refusal, error, and outcome audit events `docs/observability.md` had never
+  named, and made an emitted `audit.event` name absent from that file a CI failure.
 
 ### Changed
 
