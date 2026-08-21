@@ -2842,6 +2842,14 @@ mod tests {
         let model = ScriptedModel::new([AssistantTurn {
             content: None,
             tool_calls: vec![
+                ModelToolCall {
+                    id: "image-call".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                        arguments: json!({"prompt": "should not be generated"}).to_string(),
+                    },
+                },
                 decline_call("decline-call", json!({})),
                 ModelToolCall {
                     id: "script-call".to_owned(),
@@ -2856,19 +2864,38 @@ mod tests {
             replay_items: Vec::new(),
         }]);
         let runtime = RecordingRuntime::new(1);
+        let generator = FixedImageGenerator {
+            calls: AtomicUsize::new(0),
+        };
+        let image = GeneratedImageOutput::default();
         let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("conversation moved on", limits(2, 4)).with_optional_reply(),
+            SessionInputs::new("conversation moved on", limits(2, 4))
+                .with_image_generation(&generator, &image)
+                .with_optional_reply(),
             &mut history,
         )
         .expect("the no-reply decision is terminal");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert!(image.take().is_none());
         assert_eq!(outcome.capability_invocations, 0);
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .any(|tool| tool.name == IMAGE_GENERATION_TOOL_NAME)
+        );
+        assert!(
+            tools[0]
+                .iter()
+                .any(|tool| tool.name == DECLINE_REPLY_TOOL_NAME)
+        );
     }
 
     #[test]
