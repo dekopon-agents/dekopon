@@ -16,3 +16,16 @@ dekopon-provider-sdk = { path = "../../../crates/dekopon-provider-sdk" }
 # decoded component import table is the generated proof of that property.
 dekopon-provider-storage = { path = "../../../crates/dekopon-provider-storage", default-features = false }
 serde_json = "1.0.140"
+
+# Each provider example is its own workspace, so the repository's [workspace.lints] table cannot
+# reach guest code. This is the reachable part of it. `unsafe_code` is deliberately absent: a
+# provider that generates its own bindings expands wit-bindgen's `export!` into `unsafe extern "C"`
+# shims at the crate root, where no scoped `#[allow]` can reach, so denying it here would only
+# force a crate-wide allow that protects nothing.
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
