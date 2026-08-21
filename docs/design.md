@@ -135,11 +135,11 @@ parse dekopon CLI
   -> resolve one config source
   -> parse YAML/JSON once
   -> validate a typed catalog
-  -> execute through ResourceReader
+  -> execute through LocalConfigReader
   -> render a typed result
 ```
 
-Command handlers do not manipulate YAML. `LocalConfigReader` implements `ResourceReader`; a future daemon client may implement the same read boundary. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
+Command handlers do not manipulate YAML. `LocalConfigReader` is the one reader; a read abstraction returns when a second implementation exists rather than in anticipation of one. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
 
 Model-account lifecycle is a separate operator path that does not resolve or parse the catalog:
 

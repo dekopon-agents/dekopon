@@ -19,7 +19,7 @@ use crate::{
     auth::AuthError,
     catalog::{CatalogError, LocalConfigReader},
     cli::{Cli, Command},
-    command::{execute, version_result},
+    command::{CatalogCommand, CommandResult, execute, version_result},
     render::{RenderError, render},
 };
 
@@ -61,17 +61,22 @@ fn evaluate(cli: &Cli) -> Result<String, AppError> {
     let result = match &cli.command {
         Command::Version => version_result(),
         Command::Auth { account } => auth::execute(account)?,
-        _ => {
-            tracing::debug!(config = ?cli.config, "resolving local configuration");
-            let catalog = load_discovered(cli.config.clone())
-                .map_err(|error| AppError::Config(Box::new(error)))?;
-            tracing::debug!(source = %catalog.source().display(), "loaded validated catalog");
-            let reader = LocalConfigReader::new(catalog);
-            execute(&cli.command, &reader)?
-        }
+        Command::Get { resource } => with_catalog(cli, CatalogCommand::Get(resource))?,
+        Command::Describe { resource } => with_catalog(cli, CatalogCommand::Describe(resource))?,
+        Command::Validate => with_catalog(cli, CatalogCommand::Validate)?,
+        Command::Config { command } => with_catalog(cli, CatalogCommand::Config(command))?,
     };
 
     render(&result, cli.output).map_err(AppError::Render)
+}
+
+fn with_catalog(cli: &Cli, command: CatalogCommand<'_>) -> Result<CommandResult, AppError> {
+    tracing::debug!(config = ?cli.config, "resolving local configuration");
+    let catalog =
+        load_discovered(cli.config.clone()).map_err(|error| AppError::Config(Box::new(error)))?;
+    tracing::debug!(source = %catalog.source().display(), "loaded validated catalog");
+    let reader = LocalConfigReader::new(catalog);
+    Ok(execute(command, &reader)?)
 }
 
 fn write_output(output: &str) -> io::Result<()> {

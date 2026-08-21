@@ -18,7 +18,7 @@ dekopon
   -> render a typed result
 ```
 
-`ResourceReader` separates command execution from `LocalConfigReader`, leaving room for a daemon-backed reader without spreading YAML handling through commands. The same operator surface owns model-account lifecycle without loading the catalog:
+Command execution is separated from configuration: `LocalConfigReader` owns every catalog read, and the typed `CatalogCommand` it is executed against excludes the two commands that never load a catalog, so no YAML handling spreads into command dispatch. The same operator surface owns model-account lifecycle without loading the catalog:
 
 ```text
 dekopon auth chatgpt
