@@ -146,8 +146,10 @@ policy exposes to this peer. It is evaluated from the constraint catalog and the
 appends **no audit record**, so probing does not consume the audit log's bounded record budget.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
-  component through Cranelift at every start and there is no compilation cache, and it binds the
-  socket only after that work is done, so "the socket answers" is exactly "fully started". The
+  component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
+  started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
+  a restart read compiled code back from disk instead of recompiling, but the cold path is still
+  Cranelift and the probe budget still has to cover it. The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
   against durable audit state is the worst thing this chart can produce.
 - **`readinessProbe`**, 30 s period. It gates nothing — there is no Service — but it is free and it

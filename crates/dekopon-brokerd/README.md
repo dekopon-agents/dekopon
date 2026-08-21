@@ -309,7 +309,32 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata and each mapped capability response to fit the frame ceiling. Shutdown grace must cover one configured host deadline plus two complete frame deadlines.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required except the two optional entries described below. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata and each mapped capability response to fit the frame ceiling. Shutdown grace must cover one configured host deadline plus two complete frame deadlines.
+
+### Compilation cache and the concurrent memory budget
+
+```yaml
+compileCachePath: /var/lib/dekopon/compile-cache
+hostLimits:
+  # …every other field…
+  maxTotalMemoryBytes: 268435456
+```
+
+`compileCachePath` is optional. Absent, Cranelift compiles every component at every start and the
+socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
+broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back
+instead. The directory holds code this privileged process executes, so its parent must be
+owner-only under the same rule as the socket and audit paths; the broker creates the directory
+itself. Components already compile concurrently rather than one at a time either way.
+
+`hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst
+case is `serverLimits.maxConnections` × `maxMemoryBytes` — 64 × 64 MiB = 4 GiB at the defaults,
+which no small container survives. The broker states that product in one startup line so it is
+budgeted rather than discovered. Optional `hostLimits.maxTotalMemoryBytes` enforces it: a store that
+cannot reserve its share is refused before it exists, turning an OOM kill into a failed invocation.
+It must be at least `maxMemoryBytes`, and it is deliberately absent from the authority commitment —
+it is a concurrency budget, not a ceiling an authorization could narrow, so changing it does not
+rotate stored authority.
 
 ```console
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon

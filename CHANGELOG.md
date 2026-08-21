@@ -17,8 +17,22 @@ All notable changes to Dekopon are documented here. The format is based on
   `RecordDeliveredTurnForChat` recording.
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
+- Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
+  restart reads compiled provider code back instead of running Cranelift again.
+- Added an optional broker `hostLimits.maxTotalMemoryBytes` aggregate guest-memory ceiling, so
+  concurrent invocations past the budget are refused instead of being OOM-killed. The broker also
+  states the `maxConnections` × `maxMemoryBytes` worst case in one startup line.
 
 ### Changed
+
+- Broker provider components now compile concurrently through Wasmtime's parallel Cranelift backend
+  instead of one at a time on a single core, while conflict reporting and the first reported
+  failure stay in configured order.
+- Broker provider imports are now linked once per component into a cached `InstancePre`, so an
+  invocation, description, or command rewrite no longer rebuilds a linker and re-resolves imports.
+- The `provider.compile` span now carries the component path, artifact bytes, and elapsed
+  milliseconds; each loaded provider emits one info event; `resolve_command` runs inside a
+  `provider.resolve_command` span carrying the provider and the command word.
 
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
@@ -31,6 +45,16 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+
+### Fixed
+
+- A broker provider artifact is now read once and its recorded SHA-256 is of the exact buffer
+  Cranelift compiled, replacing a before/after comparison that a change-and-revert could pass. The
+  unreachable `ArtifactChanged`, `DuplicateProvider`, and `DuplicateCapability` broker-host error
+  variants are gone.
+- A provider exporting `resolve-command` with the wrong signature is now reported as a type
+  mismatch instead of as an absent export, and the export is proven from the component's own type
+  rather than by instantiating it once at startup.
 
 ### Security
 

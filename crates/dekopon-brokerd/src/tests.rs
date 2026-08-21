@@ -578,6 +578,85 @@ async fn a_group_writable_provider_directory_refuses_to_load() {
         .expect("a private provider directory loads");
 }
 
+fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Value {
+    let defaults = dekopon_broker_host::BrokerHostLimits::default();
+    let mut limits = json!({
+        "maxMemoryBytes": defaults.max_memory_bytes,
+        "maxTableElements": defaults.max_table_elements,
+        "maxInstances": defaults.max_instances,
+        "maxTables": defaults.max_tables,
+        "maxMemories": defaults.max_memories,
+        "maxInputBytes": defaults.max_input_bytes,
+        "maxOutputBytes": defaults.max_output_bytes,
+        "maxHttpRequests": defaults.max_http_requests,
+        "maxHttpRequestBytes": defaults.max_http_request_bytes,
+        "maxHttpResponseBytes": defaults.max_http_response_bytes,
+        "maxHttpHeaders": defaults.max_http_headers,
+        "maxHttpHeaderBytes": defaults.max_http_header_bytes,
+        "fuel": defaults.fuel,
+        "maxTimeoutMs": u64::try_from(defaults.max_timeout.as_millis()).unwrap_or(u64::MAX),
+    });
+    if let Some(maximum) = max_total_memory_bytes {
+        limits["maxTotalMemoryBytes"] = json!(maximum);
+    }
+    limits
+}
+
+/// Per-store limits bound one invocation; the connection ceiling decides how many exist at once.
+/// Configuration is where that product becomes a stated number rather than an OOM kill.
+#[tokio::test]
+async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let policies = directory.path().join("policies.cedar");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(&policies, POLICIES.as_bytes());
+
+    let mut document = attested_document(uid);
+    document["compileCachePath"] = json!("compile-cache");
+    document["hostLimits"] = host_limits_document(Some(256 * 1024 * 1024));
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("an aggregate ceiling above one store loads");
+    assert_eq!(
+        resolved.host_options.compile_cache_dir.as_deref(),
+        Some(
+            directory
+                .path()
+                .canonicalize()
+                .expect("canonical fixture directory")
+                .join("compile-cache")
+                .as_path()
+        )
+    );
+    assert_eq!(
+        resolved.host_options.max_total_memory_bytes,
+        Some(256 * 1024 * 1024)
+    );
+    assert_eq!(
+        resolved.worst_case_guest_memory_bytes,
+        resolved.server_limits.max_connections * resolved.host_limits.max_memory_bytes
+    );
+
+    // A ceiling below one store could never admit a single invocation.
+    document["hostLimits"] = host_limits_document(Some(
+        u64::try_from(dekopon_broker_host::BrokerHostLimits::default().max_memory_bytes)
+            .expect("default fits u64")
+            - 1,
+    ));
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("an unusable aggregate ceiling refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::InvalidHostLimits),
+        "{error:?}"
+    );
+}
+
 /// An empty directory is almost certainly a mount that did not happen or a build that did not run,
 /// so it gets its own error rather than the generic "no providers".
 #[tokio::test]
