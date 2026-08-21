@@ -812,29 +812,116 @@ async fn durable_audit_rejects_non_private_permissions() {
     assert!(matches!(error, FileAuditError::Io { .. }));
 }
 
+/// Pins exactly which HTTP scopes this broker starts with, now that the grammar is shared.
+///
+/// The rules moved into `HttpConstraints::validate` so the capability gate and the HTTP host stop
+/// carrying weaker copies. Nothing here may become acceptable, and nothing already acceptable may
+/// start failing: this is the same broker startup decision, made in one place.
 #[test]
 fn policy_http_scope_values_are_bounded() {
-    let constraints = ExecutionConstraints {
-        http: Some(dekopon_capability::HttpConstraints {
-            allowed_hosts: vec![" ".to_owned()],
-            allowed_methods: vec!["GET".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 1,
-            max_response_bytes: 1,
-            allow_plaintext_loopback: false,
-        }),
-        ..ExecutionConstraints::default()
+    fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
+        ConstraintSet {
+            provider: "echo".parse().expect("provider"),
+            effect: dekopon_capability::EffectKind::ReadOnly,
+            risk: dekopon_core::RiskLevel::Low,
+            idempotency: dekopon_capability::Idempotency::Idempotent,
+            credential: None,
+            credential_by_agent: Default::default(),
+            constraints: ExecutionConstraints {
+                http: Some(http),
+                ..ExecutionConstraints::default()
+            },
+        }
+    }
+
+    let valid = dekopon_capability::HttpConstraints {
+        allowed_hosts: vec!["api.github.com".to_owned(), "127.0.0.1:8080".to_owned()],
+        allowed_methods: vec!["GET".to_owned(), "POST".to_owned(), "PATCH".to_owned()],
+        max_requests: 1,
+        max_request_bytes: 1,
+        max_response_bytes: 1,
+        allow_plaintext_loopback: false,
     };
-    let set = ConstraintSet {
-        provider: "echo".parse().expect("provider"),
-        effect: dekopon_capability::EffectKind::ReadOnly,
-        risk: dekopon_core::RiskLevel::Low,
-        idempotency: dekopon_capability::Idempotency::Idempotent,
-        credential: None,
-        credential_by_agent: Default::default(),
-        constraints,
-    };
-    assert!(super::validate_set_constraints(&set).is_err());
+    assert!(super::validate_set_constraints(&constrain(valid.clone())).is_ok());
+
+    let rejected_hosts = [
+        String::new(),
+        " ".to_owned(),
+        " api.github.com".to_owned(),
+        "api.github.com ".to_owned(),
+        "*".to_owned(),
+        "a/b".to_owned(),
+        "user@host".to_owned(),
+        "host?query".to_owned(),
+        "host#fragment".to_owned(),
+        "host\tname".to_owned(),
+        "h".repeat(513),
+    ];
+    for host in rejected_hosts {
+        let set = constrain(dekopon_capability::HttpConstraints {
+            allowed_hosts: vec![host.clone()],
+            ..valid.clone()
+        });
+        assert!(
+            super::validate_set_constraints(&set).is_err(),
+            "host {host:?} must not start this broker"
+        );
+    }
+
+    let rejected_methods = [
+        String::new(),
+        "GET POST".to_owned(),
+        "GE\tT".to_owned(),
+        "G/T".to_owned(),
+        "M".repeat(65),
+    ];
+    for method in rejected_methods {
+        let set = constrain(dekopon_capability::HttpConstraints {
+            allowed_methods: vec![method.clone()],
+            ..valid.clone()
+        });
+        assert!(
+            super::validate_set_constraints(&set).is_err(),
+            "method {method:?} must not start this broker"
+        );
+    }
+
+    let unbounded = [
+        dekopon_capability::HttpConstraints {
+            allowed_hosts: Vec::new(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_methods: Vec::new(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_hosts: (0..65).map(|index| format!("h{index}.test")).collect(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_methods: (0..65).map(|index| format!("M{index}")).collect(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_requests: 0,
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_request_bytes: 0,
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_response_bytes: 0,
+            ..valid
+        },
+    ];
+    for http in unbounded {
+        assert!(
+            super::validate_set_constraints(&constrain(http.clone())).is_err(),
+            "{http:?} must not start this broker"
+        );
+    }
 }
 
 /// The authored spelling of a per-agent credential, and what selection does with it.
