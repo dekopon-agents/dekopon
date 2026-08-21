@@ -46,6 +46,9 @@ All notable changes to Dekopon are documented here. The format is based on
   being read as an end anchor plus a stray backslash.
 - A command substitution now honors a suppressed trailing newline, so `v=$(printf '%s' a; printf
   '%s' b)` is `ab` rather than `a\nb`.
+- A command that produces no value no longer contributes a blank line to a command substitution, so
+  `$(true; echo a)` and `$(echo a; true)` are both `a` rather than gaining a leading or trailing
+  newline.
 
 ### Security
 

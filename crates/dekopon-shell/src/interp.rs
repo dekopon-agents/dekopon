@@ -192,12 +192,21 @@ impl Evaluator<'_> {
         self.output.push_block(line);
     }
 
+    /// Writes what one pipeline produced, to the capture that is collecting it or to the output.
+    ///
+    /// A command that produced no value writes nothing, and that has to be decided *before* the
+    /// capture branch rather than after it. `$(true; echo a)` is `a` in bash; retaining `true`'s
+    /// null in the capture made it a second element, and [`reduce_captured`] joins elements with a
+    /// newline — so the substitution silently gained a leading blank line, or a trailing one for
+    /// `$(echo a; true)`, depending on where the command that produced nothing happened to sit.
+    /// The status such a command reported is unaffected: it travels through `last_status`, not
+    /// through the capture.
     fn emit(&mut self, result: CommandResult) {
-        if let Some(capture) = self.captures.last_mut() {
-            capture.push(result);
+        if result.value.is_null() {
             return;
         }
-        if result.value.is_null() {
+        if let Some(capture) = self.captures.last_mut() {
+            capture.push(result);
             return;
         }
         let text = display(&result.value);

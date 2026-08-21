@@ -284,6 +284,25 @@ fn diagnostics_inside_a_substitution_still_reach_the_output() {
 }
 
 #[test]
+fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
+    // Outside a capture, a command that produced no value writes nothing. Inside one it used to
+    // become an element of the captured stream, and a capture joins its elements with a newline —
+    // so `true` contributed a blank line whose position depended only on where it sat. bash prints
+    // `a` for both of these.
+    assert_eq!(output(r#"x=$(true; echo a); echo "[$x]""#), "[a]");
+    assert_eq!(output(r#"x=$(echo a; true); echo "[$x]""#), "[a]");
+    // A command that selected nothing is the same case: `grep` with no match produces no value.
+    assert_eq!(
+        output(r#"x=$(echo hi | grep zz; echo a); echo "[$x]""#),
+        "[a]"
+    );
+    // Real output is still joined line by line, and the status a null-valued command reported
+    // still reaches `$?`, because it travels through `last_status` rather than the capture.
+    assert_eq!(output(r#"x=$(echo a; echo b); echo "[$x]""#), "[a\nb]");
+    assert_eq!(output("x=$(echo a; false); echo $?"), "1");
+}
+
+#[test]
 fn an_interpolated_substitution_still_reports_its_status() {
     assert_eq!(output("x=a$(false); echo $?"), "1");
     assert_eq!(output("x=$(false); echo $?"), "1");
