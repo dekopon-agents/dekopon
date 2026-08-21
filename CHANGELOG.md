@@ -7,6 +7,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Serialized ChatGPT subscription refreshes across processes on an advisory lock beside the
+  credential file, adopting a record another process rotated instead of presenting a refresh token
+  the provider has already invalidated, and kept a turn alive on the freshly rotated in-memory
+  credential when persisting it fails.
+- Reported the endpoint's own error body on a failed chat completion, device authorization, or token
+  request instead of a bare `http status: <code>`, including the OAuth `error` code that
+  distinguishes an expired credential from a transient rejection.
+- Kept a device login polling through a transient network failure until its fifteen-minute deadline
+  rather than discarding the user code on one dropped packet.
+
+### Security
+
+- Swept abandoned `chatgpt-auth.tmp-*` staging files, which hold access and refresh tokens in the
+  clear, on every credential save and on `dekopon auth chatgpt logout`, and `fsync`ed the credential
+  directory after the rename so a rotated credential cannot be lost to a power failure.
+
 ## [0.9.0] - 2026-08-20
 
 ### Added
