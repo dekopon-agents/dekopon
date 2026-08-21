@@ -5,11 +5,14 @@
 //! offer credential-free agent configuration and chat-asset tools. Provider work still happens
 //! only inside the script instead of across many small capability-shaped model tools.
 
-use std::{fmt, time::Instant};
+use std::{fmt, sync::Mutex, time::Instant};
 
-use dekopon_model::model::{
-    ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool, ModelToolCall,
-    ModelUsage, assistant_message,
+use dekopon_model::{
+    image::{GeneratedImage, ImageGenerator, MAX_IMAGE_PROMPT_BYTES},
+    model::{
+        ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool,
+        ModelToolCall, ModelUsage, assistant_message,
+    },
 };
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
@@ -33,6 +36,9 @@ pub const AGENT_CONFIG_TOOL_NAME: &str = "inspect_agent_config";
 
 /// The tool a model calls to look at something a person attached to their message.
 pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
+
+/// The tool a model calls to create one image for its final chat reply.
+pub const IMAGE_GENERATION_TOOL_NAME: &str = "generate_image";
 
 /// Tool calls a single model turn may request.
 ///
@@ -113,6 +119,31 @@ pub trait AssetSource {
     /// The tool is not offered when it answers `true`, because a tool that can only fail is a tool
     /// a model will still try.
     fn is_empty(&self) -> bool;
+}
+
+/// Request-local slot through which one generated image leaves the prompt loop.
+///
+/// The bytes never become a model message or part of [`PromptOutcome`]. An embedder takes the slot
+/// only after a successful session and drops it on failure or cancellation, which keeps generated
+/// content out of transcripts, persistent history, and accidental `Debug` output.
+#[derive(Default)]
+pub struct GeneratedImageOutput(Mutex<Option<GeneratedImage>>);
+
+impl GeneratedImageOutput {
+    /// Removes the generated image, if this session produced one.
+    pub fn take(&self) -> Option<GeneratedImage> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn store(&self, image: GeneratedImage) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image);
+    }
 }
 
 /// Observes provider-reported token accounting without influencing a model session.
@@ -276,9 +307,16 @@ pub struct SessionInputs<'a> {
     limits: PromptLimits,
     options: Option<&'a CompletionOptions>,
     assets: Option<&'a dyn AssetSource>,
+    image_generation: Option<ImageGeneration<'a>>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageGeneration<'a> {
+    generator: &'a dyn ImageGenerator,
+    output: &'a GeneratedImageOutput,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -291,6 +329,7 @@ impl<'a> SessionInputs<'a> {
             limits,
             options: None,
             assets: None,
+            image_generation: None,
             usage_observer: None,
             agent_config: None,
             cancellation: None,
@@ -315,6 +354,17 @@ impl<'a> SessionInputs<'a> {
     #[must_use]
     pub const fn with_assets(mut self, assets: &'a dyn AssetSource) -> Self {
         self.assets = Some(assets);
+        self
+    }
+
+    /// Adds one explicitly configured image generator and its request-local output slot.
+    #[must_use]
+    pub const fn with_image_generation(
+        mut self,
+        generator: &'a dyn ImageGenerator,
+        output: &'a GeneratedImageOutput,
+    ) -> Self {
+        self.image_generation = Some(ImageGeneration { generator, output });
         self
     }
 
@@ -345,6 +395,7 @@ impl<'a> SessionInputs<'a> {
 struct SessionExtensions<'a> {
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
+    image_generation: Option<ImageGeneration<'a>>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
@@ -370,6 +421,7 @@ where
         limits,
         options,
         assets,
+        image_generation,
         usage_observer,
         agent_config,
         cancellation,
@@ -399,6 +451,7 @@ where
         SessionExtensions {
             options,
             assets,
+            image_generation,
             usage_observer,
             agent_config,
             cancellation,
@@ -429,6 +482,7 @@ where
     let SessionExtensions {
         options,
         assets,
+        image_generation,
         usage_observer,
         agent_config,
         cancellation,
@@ -443,6 +497,9 @@ where
     if assets.is_some() {
         model_tools.push(asset_tool());
     }
+    if image_generation.is_some() {
+        model_tools.push(image_generation_tool());
+    }
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -452,6 +509,9 @@ where
     let _session = session_span.enter();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
+    // One attempt, successful or not. A failed image request may still have incurred provider
+    // cost, so letting the model retry would quietly widen the route's explicit one-call bound.
+    let mut image_generation_attempted = false;
 
     for model_turns in 1..=limits.max_steps {
         check_cancelled(cancellation)?;
@@ -600,6 +660,20 @@ where
                 && let Some(source) = assets
             {
                 fetch_asset_into(&mut messages, source, &call, model_turns, tool_call_index)?;
+                continue;
+            }
+            if call.function.name == IMAGE_GENERATION_TOOL_NAME
+                && let Some(generation) = image_generation
+            {
+                generate_image_into(
+                    &mut messages,
+                    generation,
+                    &mut image_generation_attempted,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                    cancellation,
+                )?;
                 continue;
             }
             // The model-selected name is deliberately not copied into telemetry: it is untrusted
@@ -841,6 +915,156 @@ fn is_textual(mime: &str) -> bool {
             mime,
             "application/json" | "application/xml" | "application/x-yaml" | "application/yaml"
         )
+}
+
+fn image_generation_tool() -> ModelTool {
+    ModelTool {
+        name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+        description:
+            "Generate one PNG to attach to your final chat reply. Call this only when the \
+                      user asks you to create or draw an image. The session permits one attempt. \
+                      After it succeeds, finish with a short textual caption; the gateway delivers \
+                      the image separately from your text."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "maxLength": MAX_IMAGE_PROMPT_BYTES,
+                    "description": "A self-contained visual description for the image generator."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Executes the route's one image-generation attempt without putting bytes into model messages.
+fn generate_image_into(
+    messages: &mut Vec<ModelMessage>,
+    generation: ImageGeneration<'_>,
+    attempted: &mut bool,
+    call: &ModelToolCall,
+    model_turn: u32,
+    tool_call_index: usize,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Result<(), PromptError> {
+    let prompt = match image_prompt_argument(&call.function.name, &call.function.arguments) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            return Err(error);
+        }
+    };
+    if *attempted {
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.image_generation.refused",
+                model.turn = model_turn,
+                tool_call.index = tool_call_index,
+                reason = "session-limit",
+            },
+            "image generation refused"
+        );
+        messages.push(ModelMessage::tool(
+            call.id.clone(),
+            "This session has already used its one image-generation attempt. Finish with the image already queued, or answer without one.",
+        ));
+        return Ok(());
+    }
+    *attempted = true;
+    check_cancelled(cancellation)?;
+    let started = Instant::now();
+    let span = tracing::info_span!(
+        "prompt.image_generation",
+        model.turn = model_turn,
+        tool_call.index = tool_call_index,
+        image.bytes = tracing::field::Empty,
+    );
+    let result = {
+        let _entered = span.enter();
+        generation.generator.generate(&prompt)
+    };
+    match result {
+        Ok(image) => {
+            span.record("image.bytes", image.bytes().len());
+            tracing::info!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "accounting.model.image_generation",
+                    model.turn = model_turn,
+                    duration_ms = milliseconds(started.elapsed()),
+                    image.bytes = image.bytes().len(),
+                    outcome = "succeeded",
+                },
+                "image generation accounted"
+            );
+            // Cancellation cannot stop or unbill an already-running HTTP request, which is why
+            // accounting happens above. It can still keep those bytes from reaching chat.
+            check_cancelled(cancellation)?;
+            generation.output.store(image);
+            messages.push(ModelMessage::tool(
+                call.id.clone(),
+                "Generated one image for delivery with your final chat reply.",
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "accounting.model.image_generation",
+                    model.turn = model_turn,
+                    duration_ms = milliseconds(started.elapsed()),
+                    outcome = "failed",
+                    error.type = error.category(),
+                },
+                "image generation failed"
+            );
+            // Fixed gateway-authored text: provider diagnostics can contain reflected prompt text
+            // and never belong in the next model request.
+            messages.push(ModelMessage::tool(
+                call.id.clone(),
+                "Image generation failed. Answer without an image.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn image_prompt_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(mut arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    let prompt = arguments
+        .remove("prompt")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| PromptError::MissingImagePrompt {
+            tool: tool.to_owned(),
+        })?;
+    if !arguments.is_empty() {
+        return Err(PromptError::UnexpectedImageArguments {
+            tool: tool.to_owned(),
+        });
+    }
+    if prompt.len() > MAX_IMAGE_PROMPT_BYTES {
+        return Err(PromptError::ImagePromptTooLarge {
+            actual: prompt.len(),
+            maximum: MAX_IMAGE_PROMPT_BYTES,
+        });
+    }
+    Ok(prompt)
 }
 
 fn asset_tool() -> ModelTool {
@@ -1107,6 +1331,26 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// Image-generation arguments carried no non-empty prompt.
+    #[error("model arguments for tool {tool:?} must include a non-empty string \"prompt\" field")]
+    MissingImagePrompt {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// Image-generation arguments contained fields outside the strict one-prompt schema.
+    #[error("model arguments for tool {tool:?} contain unexpected fields")]
+    UnexpectedImageArguments {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// The model-authored image prompt exceeded the fixed byte ceiling.
+    #[error("image generation prompt is {actual} bytes; maximum is {maximum}")]
+    ImagePromptTooLarge {
+        /// Actual UTF-8 byte length.
+        actual: usize,
+        /// Fixed maximum UTF-8 byte length.
+        maximum: usize,
+    },
     /// The model ended without text or a tool call.
     #[error("model returned neither tool calls nor a final answer")]
     EmptyAnswer,
@@ -1137,6 +1381,9 @@ impl PromptError {
             Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
             Self::MissingScript { .. } => "missing-script",
             Self::MissingAssetId { .. } => "missing-asset-id",
+            Self::MissingImagePrompt { .. } => "missing-image-prompt",
+            Self::UnexpectedImageArguments { .. } => "unexpected-image-arguments",
+            Self::ImagePromptTooLarge { .. } => "image-prompt-too-large",
             Self::EmptyAnswer => "empty-answer",
             Self::MaxSteps { .. } => "max-steps",
         }
@@ -1180,12 +1427,18 @@ fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
-    use dekopon_model::model::{
-        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, ModelUsage,
+    use dekopon_model::{
+        image::{GeneratedImage, ImageGenerationError, ImageGenerator},
+        model::{
+            AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall,
+            ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+        },
     };
     use dekopon_shell::{ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
@@ -1196,10 +1449,11 @@ mod tests {
 
     use super::{
         AGENT_CONFIG_TOOL_NAME, CancellationProbe, ConversationTurn, DEFAULT_MAX_BYTES,
-        DEFAULT_MAX_TURNS, History, HistoryLimits, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver,
-        PromptError, PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs,
-        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        DEFAULT_MAX_TURNS, GeneratedImageOutput, History, HistoryLimits,
+        IMAGE_GENERATION_TOOL_NAME, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
+        PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool,
+        format_script_outcome, run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -1340,6 +1594,64 @@ mod tests {
         }
     }
 
+    fn image_call(id: &str, prompt: &str) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                id: id.to_owned(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                    arguments: json!({"prompt": prompt}).to_string(),
+                },
+            }],
+            usage: None,
+            replay_items: Vec::new(),
+        }
+    }
+
+    struct FixedImageGenerator {
+        calls: AtomicUsize,
+    }
+
+    impl ImageGenerator for FixedImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(b"secret-generated-pixels");
+            GeneratedImage::from_png(bytes)
+        }
+    }
+
+    struct CancellingImageGenerator(Arc<AtomicBool>);
+
+    impl ImageGenerator for CancellingImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            self.0.store(true, Ordering::SeqCst);
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(b"cancelled pixels");
+            GeneratedImage::from_png(bytes)
+        }
+    }
+
+    struct AtomicCancellation(Arc<AtomicBool>);
+
+    impl CancellationProbe for AtomicCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FailingImageGenerator;
+
+    impl ImageGenerator for FailingImageGenerator {
+        fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+            Err(ImageGenerationError::Configuration(
+                "provider diagnostic sentinel".to_owned(),
+            ))
+        }
+    }
+
     fn limits(max_steps: u32, max_capability_calls: u32) -> PromptLimits {
         PromptLimits {
             max_steps,
@@ -1381,6 +1693,133 @@ mod tests {
             history.len(),
             1,
             "the prompt loop records an unanswered turn"
+        );
+    }
+
+    #[test]
+    fn a_route_generator_yields_one_byte_free_image_output() {
+        let model = ScriptedModel::new([
+            image_call("image-1", "a tiny orange kitten"),
+            // A second request cannot turn one configured generation into ambient unbounded cost.
+            image_call("image-2", "another kitten"),
+            answer("Here is your kitten."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let generator = FixedImageGenerator {
+            calls: AtomicUsize::new(0),
+        };
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw me a kitty cat", limits(3, 1))
+                .with_image_generation(&generator, &output),
+            &mut history,
+        )
+        .expect("the image tool is a recoverable model turn");
+
+        assert_eq!(outcome.answer, "Here is your kitten.");
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        let image = output.take().expect("one generated output");
+        assert_eq!(image.media_type(), "image/png");
+        assert_eq!(output.take().map(|image| image.bytes().len()), None);
+        let tool_results = model.tool_messages();
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.contains("Generated one image"))
+        );
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.contains("one image-generation attempt"))
+        );
+        let transcript = serde_json::to_string(
+            &*model
+                .observed_messages
+                .lock()
+                .expect("message observations lock"),
+        )
+        .expect("transcript serializes");
+        assert!(
+            !transcript.contains("secret-generated-pixels"),
+            "generated bytes entered model messages: {transcript}"
+        );
+        assert!(
+            model
+                .observed_tools
+                .lock()
+                .expect("tool observations lock")
+                .iter()
+                .all(|tools| tools
+                    .iter()
+                    .any(|tool| tool.name == IMAGE_GENERATION_TOOL_NAME))
+        );
+    }
+
+    #[test]
+    fn cancellation_during_generation_discards_the_accounted_image() {
+        let model = ScriptedModel::new([image_call("image-1", "a kitten")]);
+        let runtime = RecordingRuntime::new(0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let generator = CancellingImageGenerator(Arc::clone(&cancelled));
+        let probe = AtomicCancellation(cancelled);
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw", limits(2, 1))
+                .with_image_generation(&generator, &output)
+                .with_cancellation(&probe),
+            &mut history,
+        )
+        .expect_err("cancellation wins after the billed generation request returns");
+
+        assert!(matches!(error, PromptError::Cancelled));
+        assert!(
+            output.take().is_none(),
+            "cancelled bytes must not leave the loop"
+        );
+        assert!(
+            model.tool_messages().is_empty(),
+            "no later model turn starts"
+        );
+    }
+
+    #[test]
+    fn image_provider_diagnostics_never_return_to_the_chat_model() {
+        let model = ScriptedModel::new([
+            image_call("image-1", "a kitten"),
+            answer("I could not draw that."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let output = GeneratedImageOutput::default();
+        let mut history = History::default();
+
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("draw", limits(2, 1))
+                .with_image_generation(&FailingImageGenerator, &output),
+            &mut history,
+        )
+        .expect("generation failure is a fixed tool outcome");
+
+        assert!(output.take().is_none());
+        let results = model.tool_messages();
+        assert!(
+            results
+                .iter()
+                .any(|result| result == "Image generation failed. Answer without an image.")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| !result.contains("provider diagnostic sentinel"))
         );
     }
 

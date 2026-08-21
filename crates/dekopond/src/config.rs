@@ -127,6 +127,9 @@ pub struct DekopondConfig {
     pub broker: BrokerConfig,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    /// Named image-generation backends. Empty unless a route explicitly opts in.
+    #[serde(default)]
+    pub image_generators: Vec<ImageGeneratorConfig>,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -320,6 +323,62 @@ impl ModelConfig {
     }
 }
 
+/// One explicitly configured image-generation backend.
+///
+/// The production endpoint is fixed inside `dekopon-model`; authored configuration chooses only
+/// the model, credential variable, and deadline. This keeps model output from selecting where a
+/// credential or image prompt is sent.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ImageGeneratorConfig {
+    /// OpenAI's public Images API returning one inline PNG.
+    OpenaiImages {
+        name: String,
+        model: String,
+        api_key_env: String,
+        timeout_ms: u64,
+    },
+}
+
+impl ImageGeneratorConfig {
+    /// Operator-chosen name routes refer to.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::OpenaiImages { name, .. } => name,
+        }
+    }
+
+    /// Configured image model identifier.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        match self {
+            Self::OpenaiImages { model, .. } => model,
+        }
+    }
+
+    /// Environment variable containing the model credential.
+    #[must_use]
+    pub fn api_key_env(&self) -> &str {
+        match self {
+            Self::OpenaiImages { api_key_env, .. } => api_key_env,
+        }
+    }
+
+    /// Whole-request deadline in milliseconds.
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::OpenaiImages { timeout_ms, .. } => *timeout_ms,
+        }
+    }
+}
+
 /// Which conversations on a transport a route claims.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(
@@ -449,6 +508,9 @@ pub struct RouteConfig {
     /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
+    /// Explicitly enables the named image generator for this route.
+    #[serde(default)]
+    pub image_generator: Option<String>,
     #[serde(default)]
     pub limits: RouteLimits,
     /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
@@ -497,6 +559,8 @@ pub struct ResolvedRoute {
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
+    /// Named image generator, already proved to exist.
+    pub image_generator: Option<String>,
     pub limits: RouteLimits,
     pub conversation: ConversationPolicy,
 }
@@ -581,6 +645,7 @@ pub struct ResolvedConfig {
     pub broker: ResolvedBroker,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    pub image_generators: Vec<ImageGeneratorConfig>,
     pub routes: Vec<ResolvedRoute>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
@@ -833,6 +898,24 @@ pub(crate) fn resolve(
         }
     }
 
+    let mut image_generator_names = BTreeSet::new();
+    for generator in &config.image_generators {
+        let name = generator.name().to_owned();
+        if name.trim().is_empty() {
+            return Err(ConfigError::UnnamedImageGenerator);
+        }
+        if !image_generator_names.insert(name.clone()) {
+            return Err(ConfigError::DuplicateImageGenerator { name });
+        }
+        if generator.model().trim().is_empty() {
+            return Err(ConfigError::UnnamedImageModel { name });
+        }
+        if generator.timeout_ms() == 0 {
+            return Err(ConfigError::InvalidImageGeneratorTimeout { name });
+        }
+        validate_env_name(generator.api_key_env())?;
+    }
+
     let mut routes = Vec::with_capacity(config.routes.len());
     for route in config.routes {
         if !transport_names.contains(&route.transport) {
@@ -845,6 +928,13 @@ pub(crate) fn resolve(
         {
             return Err(ConfigError::UnknownRouteModel {
                 model: model.clone(),
+            });
+        }
+        if let Some(generator) = &route.image_generator
+            && !image_generator_names.contains(generator)
+        {
+            return Err(ConfigError::UnknownRouteImageGenerator {
+                generator: generator.clone(),
             });
         }
         if route.limits.max_steps == 0 || route.limits.max_capability_calls == 0 {
@@ -881,6 +971,7 @@ pub(crate) fn resolve(
             r#match: route.r#match,
             agent: route.agent,
             model: route.model,
+            image_generator: route.image_generator,
             limits: route.limits,
             conversation,
         });
@@ -944,6 +1035,7 @@ pub(crate) fn resolve(
         broker,
         transports,
         models: config.models,
+        image_generators: config.image_generators,
         routes,
         sessions: config.sessions,
         shutdown_grace,
@@ -1063,6 +1155,14 @@ pub enum ConfigError {
     DuplicateModel { name: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
+    #[error("every image generator must have a name")]
+    UnnamedImageGenerator,
+    #[error("image generator name {name:?} is declared more than once")]
+    DuplicateImageGenerator { name: String },
+    #[error("image generator {name:?} must name a model")]
+    UnnamedImageModel { name: String },
+    #[error("image generator {name:?} must have a timeout greater than zero")]
+    InvalidImageGeneratorTimeout { name: String },
     #[error(
         "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
     )]
@@ -1071,6 +1171,8 @@ pub enum ConfigError {
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
     UnknownRouteModel { model: String },
+    #[error("route names unknown image generator {generator:?}")]
+    UnknownRouteImageGenerator { generator: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]

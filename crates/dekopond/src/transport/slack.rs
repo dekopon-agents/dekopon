@@ -17,6 +17,7 @@ use std::{
 
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -24,11 +25,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
-    config::{ActivityMode, SlackActivityConfig, SlackActivityFallback, SlackExperience},
+    config::{
+        ActivityMode, SLACK_ENDPOINT, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+    },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, ReplyTarget, SessionStop, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, floor_boundary,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SessionStop, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
     },
 };
 
@@ -447,12 +450,18 @@ impl ChatReplier for SlackReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
             };
+            let OutboundReply { text, image } = reply;
+            if let Some(image) = image {
+                return self
+                    .upload_generated_image(channel, thread_ts, text, image)
+                    .await;
+            }
             // A `markdown` block, so Slack translates the model's CommonMark instead of this
             // process doing it. Slack's `text` field is mrkdwn — a proprietary syntax where bold is
             // `*one asterisk*` — so an answer posted through it arrives with its formatting as
@@ -493,6 +502,92 @@ impl ChatReplier for SlackReplier {
                 response_channel.to_ascii_lowercase()
             )))
         })
+    }
+}
+
+impl SlackReplier {
+    /// Uses Slack's current external-upload flow. The service-selected upload URL receives only
+    /// image bytes; the bot token returns to the fixed Web API origin for completion.
+    async fn upload_generated_image(
+        &self,
+        channel: String,
+        thread_ts: Option<String>,
+        text: String,
+        image: GeneratedImage,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let length = image.bytes().len().to_string();
+        let described = check_ok(
+            self.http
+                .post(format!("{}/api/files.getUploadURLExternal", self.endpoint))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .form(&[("filename", image.filename()), ("length", length.as_str())])
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?,
+        )
+        .await?;
+        let upload_url = described["upload_url"]
+            .as_str()
+            .ok_or(TransportError::Response)?;
+        let file_id = described["file_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(TransportError::Response)?
+            .to_owned();
+        if !is_slack_upload_url(upload_url, &self.endpoint) {
+            return Err(TransportError::Response);
+        }
+        let uploaded = self
+            .http
+            .post(upload_url)
+            .header("content-type", image.media_type())
+            .body(image.into_bytes())
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if !uploaded.status().is_success() {
+            return Err(TransportError::Service {
+                code: format!("http-{}", uploaded.status().as_u16()),
+            });
+        }
+
+        let mut body = json!({
+            "files": [{"id": file_id, "title": "Generated image"}],
+            "channel_id": channel,
+        });
+        if !text.is_empty() {
+            body["initial_comment"] = Value::String(text);
+        }
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts);
+        }
+        let completed = check_ok(
+            self.http
+                .post(format!(
+                    "{}/api/files.completeUploadExternal",
+                    self.endpoint
+                ))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .header("content-type", "application/json; charset=utf-8")
+                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?,
+        )
+        .await?;
+        let accepted = completed["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["id"] == file_id));
+        if !accepted {
+            return Err(TransportError::Response);
+        }
+        Ok(DeliveryReceipt::new(format!("slack-file:{file_id}")))
     }
 }
 
@@ -881,6 +976,30 @@ pub(crate) fn is_slack_file_url(url: &str) -> bool {
     SLACK_FILE_HOSTS
         .iter()
         .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+}
+
+/// Whether Slack's service-selected upload URL is safe to receive generated bytes.
+///
+/// No credential is attached either way. Origin binding still matters because generated chat
+/// content should not be sent to an arbitrary host named by a malformed service response.
+pub(crate) fn is_slack_upload_url(url: &str, endpoint: &str) -> bool {
+    let (Ok(url), Ok(endpoint)) = (reqwest::Url::parse(url), reqwest::Url::parse(endpoint)) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if endpoint.as_str().trim_end_matches('/') == SLACK_ENDPOINT {
+        let host = url.host_str().unwrap_or_default();
+        return url.scheme() == "https"
+            && (host == "files.slack.com" || host.ends_with(".files.slack.com"));
+    }
+    url.scheme() == "http"
+        && url.origin() == endpoint.origin()
+        && matches!(
+            url.host_str().map(str::to_ascii_lowercase).as_deref(),
+            Some("localhost" | "127.0.0.1" | "::1")
+        )
 }
 
 /// One HTTP client shared across a transport's calls, with redirects refused.

@@ -18,8 +18,8 @@ use dekopon_agent::{
     BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
     meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
     prompt::{
-        CancellationProbe, History, ModelUsageObserver, PromptError, SessionInputs,
-        run_prompt_session,
+        CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
+        SessionInputs, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -30,6 +30,7 @@ use dekopon_broker_protocol::{
 };
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
+    image::{ImageGenerationError, ImageGenerator, OpenAiImageGenerator},
     model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
 };
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
@@ -40,12 +41,12 @@ use tracing::Instrument as _;
 use crate::{
     activity::{ActivityControl, ActivityLease},
     asset::{self, AssetStore, SessionAssets},
-    config::{ConversationPolicy, ModelConfig, ResolvedBroker},
+    config::{ConversationPolicy, ImageGeneratorConfig, ModelConfig, ResolvedBroker},
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, ReplyTarget,
-        SessionStop, bound_inbound, bound_outbound,
+        AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
+        ReplyTarget, SessionStop, bound_inbound, bound_outbound,
     },
 };
 
@@ -88,6 +89,46 @@ pub(crate) trait ModelFactory: Send + Sync {
 
 /// The real factory: whatever `models:` configured, constructed exactly as `dekopon-run` does.
 pub(crate) struct ConfiguredModels;
+
+/// Builds each route-referenced image generator once at startup, resolving only credentials that
+/// a bound route can actually use before any transport begins accepting messages.
+pub(crate) fn configured_image_generators(
+    configured: &[ImageGeneratorConfig],
+    referenced: &BTreeSet<String>,
+) -> Result<HashMap<String, Arc<dyn ImageGenerator>>, ImageGeneratorStartupError> {
+    configured
+        .iter()
+        .filter(|generator| referenced.contains(generator.name()))
+        .map(|generator| {
+            let variable = generator.api_key_env();
+            let credential = std::env::var(variable).map_err(|error| match error {
+                std::env::VarError::NotPresent => ImageGeneratorStartupError::MissingCredential {
+                    generator: generator.name().to_owned(),
+                    variable: variable.to_owned(),
+                },
+                std::env::VarError::NotUnicode(_) => {
+                    ImageGeneratorStartupError::NonUtf8Credential {
+                        generator: generator.name().to_owned(),
+                        variable: variable.to_owned(),
+                    }
+                }
+            })?;
+            let client = match generator {
+                ImageGeneratorConfig::OpenaiImages {
+                    model, timeout_ms, ..
+                } => OpenAiImageGenerator::new(
+                    model,
+                    credential,
+                    std::time::Duration::from_millis(*timeout_ms),
+                )?,
+            };
+            Ok((
+                generator.name().to_owned(),
+                Arc::new(client) as Arc<dyn ImageGenerator>,
+            ))
+        })
+        .collect()
+}
 
 impl ModelFactory for ConfiguredModels {
     fn build(&self, model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
@@ -381,6 +422,9 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
+    /// Named model-credential image generators, built once at startup. A route receives one only
+    /// when it explicitly names it.
+    pub image_generators: HashMap<String, Arc<dyn ImageGenerator>>,
     /// Optional service-native in-flight activity, by transport name.
     pub activities: HashMap<String, Arc<dyn ChatActivity>>,
     /// Native Agent sessions that can receive authenticated Stop events.
@@ -620,6 +664,20 @@ async fn session(
 
     let memory_surface = leg.chat_memory_surface().cloned();
     let chat_claim = chat_claim(route, message).ok();
+    let image_generator = match &route.image_generator {
+        Some(name) => match runner.image_generators.get(name) {
+            Some(generator) => Some(Arc::clone(generator)),
+            None => {
+                tracing::error!(
+                    event = "gateway_session_failed",
+                    category = "image-generator-unavailable"
+                );
+                answer(replier, message, FAILURE_REPLY).await;
+                return "failed";
+            }
+        },
+        None => None,
+    };
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
     let limits = route.limits;
@@ -697,7 +755,7 @@ async fn session(
         // returns without a turn: nothing was asked, so there is no exchange to remember.
         let model = match models.build(&model_config) {
             Ok(model) => model,
-            Err(error) => return (Err(error), None),
+            Err(error) => return (Err(error), None, None),
         };
         let runtime = ShellRuntime {
             invoker: CancelAwareInvoker {
@@ -710,19 +768,19 @@ async fn session(
         // `history` is the accumulator rather than a return value, so this session's exchange is
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
-        let outcome = run_prompt_session(
-            model.as_ref(),
-            &runtime,
-            SessionInputs::new(&text, limits)
-                .with_system(instructions.as_deref())
-                .with_options(&options)
-                .with_assets(&assets)
-                .with_usage_observer(observed_usage.as_ref())
-                .with_agent_config(&agent_config)
-                .with_cancellation(&prompt_cancellation),
-            &mut history,
-        )
-        .map_err(SessionError::from);
+        let generated_image = GeneratedImageOutput::default();
+        let mut inputs = SessionInputs::new(&text, limits)
+            .with_system(instructions.as_deref())
+            .with_options(&options)
+            .with_assets(&assets)
+            .with_usage_observer(observed_usage.as_ref())
+            .with_agent_config(&agent_config)
+            .with_cancellation(&prompt_cancellation);
+        if let Some(generator) = image_generator.as_deref() {
+            inputs = inputs.with_image_generation(generator, &generated_image);
+        }
+        let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+            .map_err(SessionError::from);
         // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
         // in the one module that owns it. The single exception is the message the loop refuses
         // outright: a zero step budget builds no request, records nothing, and would otherwise make
@@ -732,7 +790,8 @@ async fn session(
             Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
             _ => history.turns().last().cloned(),
         };
-        (outcome, turn)
+        let image = outcome.is_ok().then(|| generated_image.take()).flatten();
+        (outcome, turn, image)
     })
     .await;
 
@@ -746,7 +805,7 @@ async fn session(
         tracing::warn!(event = "gateway_usage_report_dropped");
     }
 
-    let (outcome, turn) = match result {
+    let (outcome, turn, generated_image) = match result {
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_answer() {
@@ -800,7 +859,11 @@ async fn session(
         }
     };
     let delivered_answer = bound_outbound(&answer_text);
-    let delivery = deliver(replier, message, delivered_answer.clone()).await;
+    let reply = match generated_image {
+        Some(image) => OutboundReply::with_image(delivered_answer.clone(), image),
+        None => OutboundReply::text(delivered_answer.clone()),
+    };
+    let delivery = deliver(replier, message, reply).await;
     activity.finish_in_background();
     match delivery {
         Some(receipt) if receipt.accepted() => {
@@ -1055,7 +1118,7 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
 /// text, every chat service rejects or mangles an oversized post, and one bound at the session
 /// boundary is one place to read rather than three places to keep in agreement.
 async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: &str) -> bool {
-    deliver(replier, message, bound_outbound(text))
+    deliver(replier, message, OutboundReply::text(bound_outbound(text)))
         .await
         .is_some()
 }
@@ -1063,15 +1126,28 @@ async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: 
 async fn deliver(
     replier: &Arc<dyn ChatReplier>,
     message: &InboundMessage,
-    text: String,
+    reply: OutboundReply,
 ) -> Option<DeliveryReceipt> {
-    match replier.reply(message.reply.clone(), text).await {
+    match replier.reply(message.reply.clone(), reply).await {
         Ok(receipt) => Some(receipt),
         Err(error) => {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
             None
         }
     }
+}
+
+/// Startup failure while resolving one named image generator.
+#[derive(Debug, Error)]
+pub enum ImageGeneratorStartupError {
+    #[error("image generator {generator:?} credential environment variable {variable} is not set")]
+    MissingCredential { generator: String, variable: String },
+    #[error(
+        "image generator {generator:?} credential environment variable {variable} is not UTF-8"
+    )]
+    NonUtf8Credential { generator: String, variable: String },
+    #[error("image generator client configuration is invalid")]
+    Client(#[from] ImageGenerationError),
 }
 
 /// A session that could not run to completion.

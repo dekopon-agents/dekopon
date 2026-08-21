@@ -9,6 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
+  Discord, Telegram, and the local development transport.
 - Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
   engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
 - Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
@@ -34,6 +36,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Security
 
+- Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,
+  gateway-owned filenames and authenticated reply targets, and never enter prompts, conversation
+  memory, durable chat records, telemetry payloads, provider components, or broker protocol.
 - Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest

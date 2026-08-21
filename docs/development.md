@@ -24,7 +24,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/pr-summarizer-linter/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, and environment-credential tests |
 | Operator CLI and model auth commands | `crates/dekopon/src/` | `crates/dekopon/tests/cli.rs` |
-| Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE tests |
+| Model clients, bounded OpenAI image generation, and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
 | Provider storage WIT and guest facade | `wit/storage/`, `crates/dekopon-provider-storage/` | Feature/import inspection, mirror comparisons, package workflow |
@@ -38,9 +38,9 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Broker operational web UI | `crates/dekopon-webui/src/`; Wasmtime observations in `crates/dekopon-broker-host/src/{metrics,metadata}.rs` | Router/rendering, escaping/security-header, provider-detail, live-counter, artifact/interface, and GET-only tests in `crates/dekopon-webui/src/tests.rs`; real bind/redirect coverage in `crates/dekopon-brokerd/tests/server.rs` |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
-| Shared prompt loop, safe agent-configuration meta view, and session capability dispatch | `crates/dekopon-agent/src/` | Inline prompt/meta-tool, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests |
+| Shared prompt loop, safe agent-configuration/image-generation meta views, and session capability dispatch | `crates/dekopon-agent/src/` | Inline prompt/meta-tool, one-attempt byte-free image output, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests |
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
-| Chat gateway configuration, transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting and rotation, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
+| Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
 | Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `gh/`, `skylight-private/`, `memory-chat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
 | End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
@@ -63,7 +63,7 @@ Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exi
 
 ### Model clients or prompt tools
 
-Generic model types and transports belong in `dekopon-model`; the immediate bounded tool loop belongs in `dekopon-run`. Keep credentials inside the selected model client and out of providers and traces. Mock network protocols in tests; never read or import another application's credential store.
+Generic model types and transports belong in `dekopon-model`; the immediate bounded tool loop belongs in `dekopon-run`. Gateway image generation is also a model client: its fixed public endpoint and credential remain in `dekopon-model`, while the shared prompt loop carries generated bytes through a request-local output slot rather than a model message. Keep credentials and generated bytes inside their typed boundaries and out of providers, broker protocol, history, and traces. Mock network protocols in tests; never read or import another application's credential store.
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must still validate its capability-specific fields and constraints.
 

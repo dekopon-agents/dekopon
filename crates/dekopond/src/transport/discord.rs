@@ -15,6 +15,7 @@ use std::{
 
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
@@ -25,8 +26,8 @@ use crate::{
     config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, ReplyTarget, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, floor_boundary,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
     },
 };
 
@@ -636,7 +637,7 @@ impl ChatReplier for DiscordReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Discord {
@@ -650,6 +651,7 @@ impl ChatReplier for DiscordReplier {
             {
                 return Err(TransportError::Response);
             }
+            let OutboundReply { text, mut image } = reply;
             let _guard = self.rest_lock.lock().await;
             let mut accepted = 0_usize;
             let mut last_id = None;
@@ -671,7 +673,14 @@ impl ChatReplier for DiscordReplier {
                         "fail_if_not_exists": false,
                     });
                 }
-                match self.create_message(&channel_id, &body).await {
+                let result = match image.take() {
+                    Some(image) => {
+                        self.create_message_with_image(&channel_id, &body, image)
+                            .await
+                    }
+                    None => self.create_message(&channel_id, &body).await,
+                };
+                match result {
                     Ok(id) => {
                         accepted += 1;
                         last_id = Some(id);
@@ -818,6 +827,85 @@ impl DiscordReplier {
                 .as_str()
                 .ok_or(TransportError::Response)?;
             if !is_snowflake(response_id) || response_channel != channel_id {
+                return Err(TransportError::Response);
+            }
+            return Ok(response_id.to_owned());
+        }
+    }
+
+    async fn create_message_with_image(
+        &self,
+        channel_id: &str,
+        body: &Value,
+        image: GeneratedImage,
+    ) -> Result<String, TransportError> {
+        let url = format!(
+            "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
+            self.endpoint
+        );
+        let filename = image.filename().to_owned();
+        let media_type = image.media_type().to_owned();
+        let bytes = image.into_bytes();
+        let mut payload = body.clone();
+        payload["attachments"] = json!([{
+            "id": 0,
+            "filename": filename,
+            "description": "Generated image",
+        }]);
+        let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
+        let mut retried = false;
+        loop {
+            let part = reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name(filename.clone())
+                .mime_str(&media_type)
+                .map_err(|_| TransportError::Response)?;
+            let form = reqwest::multipart::Form::new()
+                .text("payload_json", payload.clone())
+                .part("files[0]", part);
+            let response = self
+                .http
+                .post(&url)
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            if response.status().as_u16() == 429 {
+                let response_bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                let body = serde_json::from_slice::<Value>(&response_bytes)
+                    .map_err(|_| TransportError::Response)?;
+                let seconds = body["retry_after"]
+                    .as_f64()
+                    .ok_or(TransportError::Response)?;
+                if retried
+                    || !seconds.is_finite()
+                    || seconds < 0.0
+                    || seconds > MAX_RATE_LIMIT_WAIT.as_secs_f64()
+                {
+                    return Err(TransportError::Service {
+                        code: "http-429".to_owned(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+                retried = true;
+                continue;
+            }
+            let response = decode(response).await?;
+            let response_id = response["id"].as_str().ok_or(TransportError::Response)?;
+            let response_channel = response["channel_id"]
+                .as_str()
+                .ok_or(TransportError::Response)?;
+            let accepted_image = response["attachments"]
+                .as_array()
+                .is_some_and(|attachments| {
+                    attachments.len() == 1
+                        && attachments[0]["id"].as_str().is_some_and(is_snowflake)
+                        && attachments[0]["filename"].as_str() == Some(filename.as_str())
+                });
+            if !is_snowflake(response_id) || response_channel != channel_id || !accepted_image {
                 return Err(TransportError::Response);
             }
             return Ok(response_id.to_owned());

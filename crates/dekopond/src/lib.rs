@@ -2,13 +2,16 @@
 //!
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
-//! shell and safe on-demand meta tools, and replies with the answer.
+//! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
+//! image.
 //!
 //! # Authority
 //!
 //! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
 //! question and to ask a model — and it never holds a provider credential, a policy, or an
-//! authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an *attested*
+//! authorization. Explicit route-scoped image generation is model inference inside this
+//! unprivileged boundary, with no provider or broker credential. Every provider effect a session
+//! drives is submitted to `dekopon-brokerd` as an *attested*
 //! proposal naming the sender's canonical subject, and the broker alone maps that subject to a
 //! principal, decides what it may do, and executes it. The daemon's dependency set excludes every
 //! privileged broker crate for the same reason `dekopon-run`'s does, and CI enforces it.
@@ -50,8 +53,9 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
     ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
-    NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry, SlackActivityConfig,
-    SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig, TransportConfig,
+    ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
+    SlackActivityConfig, SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig,
+    TransportConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;
@@ -61,10 +65,13 @@ use crate::{
     asset::AssetStore,
     conversation::ConversationStore,
     routes::RoutingTable,
-    session::{ConfiguredModels, STOPPED_REPLY, SessionGate, SessionRunner},
+    session::{
+        ConfiguredModels, ImageGeneratorStartupError, STOPPED_REPLY, SessionGate, SessionRunner,
+        configured_image_generators,
+    },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
+        OutboundReply, SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
         local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
     },
 };
@@ -129,6 +136,16 @@ where
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
+    // Resolve model credentials and construct the fixed-endpoint clients before a chat transport
+    // accepts work. A route naming image generation must not start as a tool that can only fail.
+    let referenced_image_generators = config
+        .routes
+        .iter()
+        .filter_map(|route| route.image_generator.clone())
+        .collect::<BTreeSet<_>>();
+    let image_generators =
+        configured_image_generators(&config.image_generators, &referenced_image_generators)
+            .map_err(DekopondError::ImageGenerator)?;
     let inventory = agent_inventory(&catalog);
     let heartbeat_inventory = inventory.clone();
 
@@ -210,6 +227,7 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
+        image_generators,
         activities,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
@@ -594,7 +612,7 @@ fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request
     sessions.spawn(async move {
         if let Err(error) = reply
             .replier
-            .reply(reply.target, STOPPED_REPLY.to_owned())
+            .reply(reply.target, OutboundReply::text(STOPPED_REPLY))
             .await
         {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
@@ -698,6 +716,9 @@ pub enum DekopondError {
     /// A route could not be bound to a catalog agent and a configured model.
     #[error("gateway route cannot be satisfied")]
     Route(#[from] RouteError),
+    /// A named image generator could not resolve its model credential or client.
+    #[error("configured image generator is unavailable")]
+    ImageGenerator(#[source] ImageGeneratorStartupError),
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
