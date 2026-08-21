@@ -377,7 +377,17 @@ where
         }
     }
 
-    socket_guard.cleanup()?;
+    // The socket must not outlive its listener, so cleanup still runs here — but its result is
+    // held rather than returned. A stale socket path is a smaller problem than the failure that
+    // ended service, and returning it first would replace the real cause and skip the final
+    // checkpoint and `broker_stopped` entirely.
+    let cleanup = socket_guard.cleanup();
+    if let Err(error) = &cleanup {
+        tracing::warn!(
+            event = "broker_socket_cleanup_failed",
+            error = %error_chain(error)
+        );
+    }
     broker_result.ok_or(BrokerdError::Server(ServerError::ConnectionTask))??;
     if web_shutdown_timed_out {
         return Err(BrokerdError::WebUiShutdownTimeout);
@@ -392,6 +402,7 @@ where
         audit_records = records,
         audit_head = head.as_deref().unwrap_or("none")
     );
+    cleanup?;
     Ok(AuditCheckpoint { records, head })
 }
 
