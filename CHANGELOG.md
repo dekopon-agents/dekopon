@@ -46,6 +46,9 @@ All notable changes to Dekopon are documented here. The format is based on
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Retained Helm chart claims now also carry `argocd.argoproj.io/sync-options:
+  Prune=false,Delete=false`, so a GitOps prune cannot delete the audit chain, its checkpoint, the
+  live ChatGPT credential, or durable provider data that only a Helm-uninstall annotation protected.
 
 ## [0.9.0] - 2026-08-20
 

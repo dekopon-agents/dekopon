@@ -346,6 +346,13 @@ deleting one of the two files to dodge that is precisely the thing the design re
 both together is a rollback local state cannot detect. Move the volume deliberately, with both files,
 or not at all.
 
+It carries `argocd.argoproj.io/sync-options: Prune=false,Delete=false` for the same reason, because
+Helm's annotation means nothing to a GitOps controller. Argo CD syncing with `prune: true` deletes
+any live object the rendered desired state stops containing, and this claim stops being rendered the
+moment somebody sets `state.existingClaim` or the chart source fails to resolve. `Prune=false`
+covers the sync, `Delete=false` covers the `Application` itself being deleted, and Argo reads both
+off the live object. Both annotations follow `state.keepOnUninstall`.
+
 `state.existingClaim` points the pod at a claim you manage. The init container still takes its root
 to `65532:0700`.
 
@@ -494,6 +501,11 @@ stringData:
 
 No credential fields: the package is public and the pull is anonymous.
 
+One more thing this chart does for you: the retained claims carry
+`argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so `syncPolicy.automated.prune: true`
+cannot take the audit chain when the claim stops being rendered. See
+[Storage, uninstall, and recovery](#storage-uninstall-and-recovery).
+
 ## Configuration values
 
 Each of the four operator-supplied files is either inline, in which case the chart writes a Secret,
@@ -587,8 +599,9 @@ own volume. It may post one review comment and has no approval, request-changes,
 
 `providerStorage.enabled` creates (or mounts) a claim physically separate from `state`, mounted only
 into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
-`helm.sh/resource-policy: keep`; an existing claim remains operator-owned. Rendering fails when the
-resolved audit and provider-storage claim names are equal.
+`helm.sh/resource-policy: keep` and `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so
+neither an uninstall nor a GitOps prune takes durable provider data; an existing claim remains
+operator-owned. Rendering fails when the resolved audit and provider-storage claim names are equal.
 
 The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
 operator-managed, so uninstall cannot delete the key for retained data. The init container alone
