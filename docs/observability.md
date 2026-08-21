@@ -254,8 +254,8 @@ that a key and a canonical subject never share a record.
 
 | Span | Crate | Fields |
 |---|---|---|
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one |
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`), `policy.errors_present`; `subject` and `via` on attested proposals |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, request/response body sizes, `outcome` |
@@ -275,6 +275,45 @@ secret and never the header. It exists because one capability can present a diff
 acting agent, and a trace that named none of them would make two writes to two different
 organizations look identical — the same reason the terminal audit record carries it. A `Redacted`
 value renders its marker in either payload mode, so the value cannot arrive by another route.
+
+`broker.authorize`'s `policy.errors_present` is Cedar's evaluation-error flag, and `policy-error` is
+the `outcome` and audit reason it produces. A policy that errors while deciding — an extension call
+on a malformed value, say — denies exactly like a policy that does not match, so without this pair a
+broken rule and a clean no-match are the same record. It stays a flag rather than the error text on
+purpose: an explanation must not become a per-request channel for policy source or entity data.
+
+## Broker failure events
+
+Every broker failure answers its caller with a deliberately generic wire code, so the log line is the
+only place the cause exists. These events carry it:
+
+| Event | Level | Emitted by | Carries |
+|---|---|---|---|
+| `broker_capabilities_refused` | warn | `dekopon-broker` | `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `policy-error`), canonical `subject`, `agent`, `via` |
+| `broker_policy_evaluation_error` | warn | `dekopon-broker` | `invocation`, `policy.target` |
+| `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `outcome`), `category` (`full`, `poisoned`, `record-too-large`, `sequence-overflow`, `serialize`, `io`), `invocation`, and the error's source chain |
+| `broker_request_frame_invalid` | warn | `dekopon-brokerd` | `error.kind` (`timeout`, `io`, `empty-frame`, `frame-too-large`, `deserialize`, …) and the bounded protocol message |
+| `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
+| `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
+| `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
+
+`broker_capabilities_refused` exists because `capabilitiesFor` answers a refused caller with the same
+opaque nothing whatever went wrong — a distinguishable answer would tell an unauthorized gateway
+whether a subject is mapped. The class and the canonical subject therefore land on the broker's own
+side of the socket, which is what makes bootstrapping an `identityMapping` for a new sender possible
+without reading the subject out of a payload-carrying gateway span. It marks refusals, not traffic:
+an honored session emits nothing.
+
+The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed" and
+`AuditError::Io` as "durable audit append failed"; the errno that says *why* — `ENOSPC` on an audit
+filesystem shared with anything else — lives one or two levels down, and these events render the
+whole chain as one `a: b: c` line. Frame contents never join it: a decode failure names its kind, not
+the bytes that failed to decode.
+
+`broker_socket_cleanup_failed` is reported but does not preempt the shutdown result. A stale socket
+path is a smaller problem than the failure that ended service, so the serve error, the final audit
+checkpoint, and `broker_stopped` all come first and the cleanup error surfaces only when nothing
+more significant failed.
 
 ## Storage telemetry and audit privacy
 

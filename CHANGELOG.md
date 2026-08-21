@@ -18,8 +18,25 @@ All notable changes to Dekopon are documented here. The format is based on
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
 
+### Added
+
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
 ### Changed
 
+- A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
+  service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
+  significant failed.
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
