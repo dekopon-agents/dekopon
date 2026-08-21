@@ -200,11 +200,37 @@ pub mod __wit {
     });
 }
 
+/// Last-resort [`ComponentResponse`] when the real one cannot be serialized.
+///
+/// Hand-written because the failing operation is the encoder itself.
+/// `fallback_literals_decode_into_their_wire_types` pins it to the type.
+const INVOKE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"provider response could not be serialized"}}"#;
+
+/// Last-resort [`CommandResolution`] when the real one cannot be serialized.
+///
+/// Hand-written for the same reason as [`INVOKE_SERIALIZATION_FALLBACK`], and pinned by the same
+/// test.
+const RESOLVE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command resolution could not be serialized"}}"#;
+
+/// Manifest returned when `P::manifest()` cannot be serialized.
+///
+/// A host refuses this manifest either way — it declares no capabilities — but the description
+/// carries the serialization error rather than being empty, so the refusal is traceable to the
+/// real cause instead of sending an operator hunting for a blank description that exists nowhere
+/// in their source.
+fn describe_fallback(error: &serde_json::Error) -> String {
+    serde_json::json!({
+        "apiVersion": "dekopon.dev/provider/v1alpha1",
+        "id": "invalid",
+        "description": format!("manifest serialization failed: {error}"),
+        "capabilities": [],
+    })
+    .to_string()
+}
+
 #[doc(hidden)]
 pub fn __describe<P: Provider>() -> String {
-    serde_json::to_string(&P::manifest()).unwrap_or_else(|_error| {
-        r#"{"apiVersion":"dekopon.dev/provider/v1alpha1","id":"invalid","description":"","capabilities":[]}"#.to_owned()
-    })
+    serde_json::to_string(&P::manifest()).unwrap_or_else(|error| describe_fallback(&error))
 }
 
 #[doc(hidden)]
@@ -235,9 +261,8 @@ pub fn __invoke<P: Provider>(capability: String, input_json: String) -> String {
         },
     };
 
-    serde_json::to_string(&response).unwrap_or_else(|_error| {
-        r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"provider response could not be serialized"}}"#.to_owned()
-    })
+    serde_json::to_string(&response)
+        .unwrap_or_else(|_error| INVOKE_SERIALIZATION_FALLBACK.to_owned())
 }
 
 #[doc(hidden)]
@@ -255,9 +280,8 @@ pub fn __resolve_command<P: Provider>(argv: Vec<String>) -> String {
         },
     };
 
-    serde_json::to_string(&resolution).unwrap_or_else(|_error| {
-        r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command resolution could not be serialized"}}"#.to_owned()
-    })
+    serde_json::to_string(&resolution)
+        .unwrap_or_else(|_error| RESOLVE_SERIALIZATION_FALLBACK.to_owned())
 }
 
 /// Exports a Rust [`Provider`] implementation as the import-free Dekopon WIT world.
@@ -357,8 +381,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        __describe, __invoke, CapabilityId, ComponentResponse, EffectKind, Idempotency, Provider,
-        ProviderApiVersion, ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+        __describe, __invoke, CapabilityId, CommandResolution, ComponentFailure, ComponentResponse,
+        EffectKind, INVOKE_SERIALIZATION_FALLBACK, Idempotency, Provider, ProviderApiVersion,
+        ProviderCapability, ProviderError, ProviderManifest, RESOLVE_SERIALIZATION_FALLBACK,
+        RiskLevel, describe_fallback,
     };
 
     struct Echo;
@@ -423,5 +449,62 @@ mod tests {
                 .expect("response parses");
 
         assert!(matches!(response, ComponentResponse::Failed { .. }));
+    }
+
+    /// The manifest fallback must name why it exists.
+    ///
+    /// `id: "invalid"` parses as a `ProviderId`, so a host decodes this manifest and then refuses
+    /// it. Before, the description was empty and the operator got "description must not be empty"
+    /// for a description that appears nowhere in their source.
+    #[test]
+    fn describe_fallback_reports_the_serialization_error() {
+        let error = serde_json::from_str::<ProviderManifest>("{").expect_err("malformed manifest");
+        let encoded = describe_fallback(&error);
+
+        let manifest =
+            serde_json::from_str::<ProviderManifest>(&encoded).expect("fallback manifest decodes");
+        assert_eq!(manifest.id.as_str(), "invalid");
+        assert!(
+            manifest
+                .description
+                .starts_with("manifest serialization failed: "),
+            "{}",
+            manifest.description
+        );
+        assert!(manifest.description.contains(&error.to_string()));
+        assert!(manifest.capabilities.is_empty());
+    }
+
+    /// Each hardcoded fallback is written by hand because the encoder is what failed. Nothing but
+    /// this test stops a new required field on one of these types from silently invalidating them.
+    #[test]
+    fn fallback_literals_decode_into_their_wire_types() {
+        let error = serde_json::from_str::<ProviderManifest>("{").expect_err("malformed manifest");
+        serde_json::from_str::<ProviderManifest>(&describe_fallback(&error))
+            .expect("describe fallback decodes as a manifest");
+
+        let response = serde_json::from_str::<ComponentResponse>(INVOKE_SERIALIZATION_FALLBACK)
+            .expect("invoke fallback decodes as a component response");
+        assert_eq!(
+            response,
+            ComponentResponse::Failed {
+                error: ComponentFailure {
+                    code: "serialization-failed".to_owned(),
+                    message: "provider response could not be serialized".to_owned(),
+                },
+            }
+        );
+
+        let resolution = serde_json::from_str::<CommandResolution>(RESOLVE_SERIALIZATION_FALLBACK)
+            .expect("resolve fallback decodes as a command resolution");
+        assert_eq!(
+            resolution,
+            CommandResolution::Failed {
+                error: ComponentFailure {
+                    code: "serialization-failed".to_owned(),
+                    message: "command resolution could not be serialized".to_owned(),
+                },
+            }
+        );
     }
 }
