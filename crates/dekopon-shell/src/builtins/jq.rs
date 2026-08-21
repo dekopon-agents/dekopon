@@ -161,12 +161,15 @@ pub(crate) fn abandoned_workers() -> usize {
     ABANDONED_WORKERS.load(Ordering::SeqCst)
 }
 
-/// One filter worker's liveness, shared with the evaluator paying for it.
+/// One *filter's* liveness, shared with the evaluator paying for it.
+///
+/// Scoped to a job rather than to the thread serving it: a worker outlives the filters it runs, and
+/// what is charged, released, and counted is a filter nobody could stop.
 ///
 /// Whichever side reaches the end first wins the exchange: the evaluator charges an abandonment
-/// only when the worker had not already returned, and the worker releases that charge only when it
-/// was in fact the one abandoned. Without the exchange, a filter that finishes in the same instant
-/// the deadline trips would be counted as spinning forever.
+/// only when the filter had not already returned, and the worker releases that charge only when its
+/// filter was in fact the one abandoned. Without the exchange, a filter that finishes in the same
+/// instant the deadline trips would be counted as spinning forever.
 struct Worker(AtomicU8);
 
 impl Worker {
