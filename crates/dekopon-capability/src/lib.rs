@@ -51,9 +51,7 @@
 
 use std::fmt;
 
-use dekopon_core::{
-    Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
-};
+use dekopon_core::{Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, TraceId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,31 +120,15 @@ pub struct Permission {
     pub resource: Option<String>,
 }
 
-/// Human- and policy-readable metadata for a capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CapabilityDescriptor {
-    /// Stable capability identifier.
-    pub id: CapabilityId,
-    /// Provider that implements this capability.
-    pub provider: ProviderId,
-    /// Concise operator-facing description.
-    pub description: String,
-    /// External-effect class.
-    pub effect: EffectKind,
-    /// Coarse policy risk input.
-    pub risk: RiskLevel,
-    /// Retry behavior.
-    pub idempotency: Idempotency,
-    /// Least-privilege provider permissions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permissions: Vec<Permission>,
-}
-
 /// An invocation proposed by a model, agent, or human.
 ///
 /// This type carries intent but no authority to execute an external effect.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+///
+/// Deliberately not [`Deserialize`]: the wire type a broker decodes is
+/// `dekopon_broker_protocol::InvocationRequest`, which the broker converts here after
+/// authenticating the envelope. Deriving `Deserialize` would offer a decoding path that no caller
+/// should take.
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
     /// Unique invocation identifier.
@@ -281,6 +263,10 @@ impl Default for ExecutionConstraints {
 ///
 /// Receipts are emitted by the broker transition and cannot be assembled with a public
 /// struct literal.
+///
+/// The accessors below exist for evidence and audit inspection inside the broker boundary.
+/// Receipt data reaches every other consumer by [`Serialize`] into the evidence digest, not by
+/// being read field by field.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationReceipt {
@@ -538,7 +524,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthorizationError, ExecutionConstraints, HttpConstraints, ProposedInvocation, broker,
+        AuthorizationError, EffectKind, ExecutionConstraints, HttpConstraints, Idempotency,
+        ProposedInvocation, broker,
     };
 
     fn proposal() -> ProposedInvocation {
@@ -553,6 +540,34 @@ mod tests {
             "trace-1".parse::<TraceId>().expect("valid fixture"),
             json!({"body": "Looks good"}),
         )
+    }
+
+    /// `Display` feeds the web UI and operator errors; serde feeds manifests and constraint-set
+    /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
+    /// variant from rendering one string to an operator and a different one to the audit record.
+    #[test]
+    fn display_matches_the_serde_rendering_for_every_variant() {
+        for effect in [
+            EffectKind::ReadOnly,
+            EffectKind::LocalWrite,
+            EffectKind::ExternalWrite,
+        ] {
+            assert_eq!(
+                serde_json::to_value(effect).expect("effect serializes"),
+                json!(effect.to_string()),
+            );
+        }
+
+        for idempotency in [
+            Idempotency::Idempotent,
+            Idempotency::Conditional,
+            Idempotency::NonIdempotent,
+        ] {
+            assert_eq!(
+                serde_json::to_value(idempotency).expect("idempotency serializes"),
+                json!(idempotency.to_string()),
+            );
+        }
     }
 
     #[test]
