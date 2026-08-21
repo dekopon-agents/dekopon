@@ -99,22 +99,17 @@ impl ExternalSubject {
         Self::build(SubjectService::Discord, None, subject)
     }
 
-    /// A Telegram account: `telegram.<user id>`.
+    /// A Telegram account: `telegram.<user id>`, all digits.
     pub fn telegram(user: &str) -> Result<Self, SubjectError> {
-        let subject = normalize_segment(user, "subject")?;
+        let subject = digits_segment(user, "subject")?;
         Self::build(SubjectService::Telegram, None, subject)
     }
 
     /// A telephone number: `tel.<digits>`, with one leading `+` stripped.
     pub fn telephone(number: &str) -> Result<Self, SubjectError> {
         let digits = number.strip_prefix('+').unwrap_or(number);
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(SubjectError::InvalidSegment {
-                segment: "subject",
-                value: number.to_owned(),
-            });
-        }
-        Self::build(SubjectService::Tel, None, digits.to_owned())
+        let subject = digits_segment(digits, "subject")?;
+        Self::build(SubjectService::Tel, None, subject)
     }
 
     fn build(
@@ -214,8 +209,10 @@ impl FromStr for ExternalSubject {
         let subject = require_canonical_segment(subject, "subject")?;
         let numeric = match service {
             SubjectService::Discord => is_discord_snowflake(&subject),
-            SubjectService::Tel => subject.bytes().all(|byte| byte.is_ascii_digit()),
-            _ => true,
+            SubjectService::Telegram | SubjectService::Tel => {
+                subject.bytes().all(|byte| byte.is_ascii_digit())
+            }
+            SubjectService::Slack => true,
         };
         if !numeric {
             return Err(SubjectError::InvalidSegment {
@@ -245,6 +242,16 @@ impl<'de> Deserialize<'de> for ExternalSubject {
 fn normalize_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
     let normalized = value.to_ascii_lowercase();
     require_canonical_segment(&normalized, segment)
+}
+
+fn digits_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SubjectError::InvalidSegment {
+            segment,
+            value: value.to_owned(),
+        });
+    }
+    Ok(value.to_owned())
 }
 
 fn numeric_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
@@ -389,6 +396,10 @@ mod tests {
             "discord.18446744073709551616",
             "discord.123.extra",
             "telegram.5551234.extra",
+            // An identityMappings typo, refused at broker startup rather than accepted as a
+            // canonical subject no transport can ever produce.
+            "telegram.alice",
+            "telegram.abc123",
             "tel.not-digits",
             "tel.+1603",
             "sms.5551234",
@@ -403,6 +414,7 @@ mod tests {
         assert!(ExternalSubject::slack("team space", "user").is_err());
         assert!(ExternalSubject::discord("not-a-snowflake").is_err());
         assert!(ExternalSubject::telephone("call-me").is_err());
+        assert!(ExternalSubject::telegram("alice").is_err());
     }
 
     #[test]
