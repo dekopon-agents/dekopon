@@ -37,6 +37,10 @@ All notable changes to Dekopon are documented here. The format is based on
 - A piped value now moves from one pipeline stage to the next and is shared with a function body's
   statements rather than deep-copied for each of them, and `grep` no longer copies every input line
   it tests.
+- Command-word and namespace resolution now ask `CapabilityInvoker` membership questions
+  (`has_command_word`, `grants_namespace`) instead of materializing, sorting, and deduplicating both
+  session legs' capability and command-word lists for every command a script runs. Resolution order
+  is unchanged.
 - `jq` reuses one filter worker per thread instead of spawning and joining a thread per call, and
   values cross that boundary directly rather than through JSON text on each side. A filter output
   JSON cannot represent — `nan`, `infinite`, a byte string, a non-string object key, or nesting

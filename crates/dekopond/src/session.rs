@@ -237,8 +237,18 @@ impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
         self.inner.is_granted(capability)
     }
 
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.inner.grants_namespace(namespace)
+    }
+
     fn command_words(&self) -> Vec<String> {
         self.inner.command_words()
+    }
+
+    // Forwarded rather than left to the default, which would answer this session's every command
+    // word by materializing both legs' command-word lists first.
+    fn has_command_word(&self, word: &str) -> bool {
+        self.inner.has_command_word(word)
     }
 
     fn resolve_command(
