@@ -5,14 +5,20 @@
 //! 1. words this shell refuses outright (`eval`, `exec`, `source`, job control, `declare`),
 //! 2. shell functions declared earlier in the same script,
 //! 3. the fixed builtin table,
-//! 4. capability fallback, and
-//! 5. `cap <id>`, which is itself a builtin and therefore already covered by step 3.
+//! 4. command words declared by the session's loaded providers,
+//! 5. capability fallback, and
+//! 6. `cap <id>`, which is itself a builtin and therefore already covered by step 3.
 //!
 //! Otherwise the word is "command not found", exit code 127.
 //!
-//! Steps 3 and 4 cannot collide. Every builtin name is separator-free, and capability fallback only
+//! Steps 3 and 5 cannot collide. Every builtin name is separator-free, and capability fallback only
 //! fires for words containing `.`, `-`, or `_`. The two sets are disjoint by construction, not by
 //! luck, and [`tests::builtin_and_capability_namespaces_are_disjoint`] proves it.
+//!
+//! Step 4 could collide with either, and would win: a provider word matching a builtin would hide
+//! it, and a capability-shaped provider word would shadow the capability of that name. Neither is
+//! resolved here — `dekopon_core::command_word_conflicts` refuses both at load, so a manifest that
+//! would shadow something never reaches this table.
 
 use std::collections::BTreeSet;
 
