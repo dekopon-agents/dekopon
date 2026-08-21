@@ -18,7 +18,6 @@ dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 wit-bindgen.workspace = true
 
 [lints]

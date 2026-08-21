@@ -758,7 +758,6 @@ version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
- "dekopon-capability",
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
@@ -993,7 +992,6 @@ dependencies = [
  "dekopon-core",
  "serde",
  "serde_json",
- "thiserror",
  "wit-bindgen 0.44.0",
 ]
 
@@ -1008,7 +1006,6 @@ dependencies = [
 name = "dekopon-run"
 version = "0.9.0"
 dependencies = [
- "async-trait",
  "clap",
  "dekopon-agent",
  "dekopon-broker",
@@ -1023,10 +1020,7 @@ dependencies = [
  "dekopon-telemetry",
  "opentelemetry",
  "opentelemetry-appender-tracing",
- "opentelemetry-http",
- "opentelemetry-otlp",
  "opentelemetry_sdk",
- "reqwest",
  "rustix",
  "serde",
  "serde_json",
@@ -1077,17 +1071,14 @@ version = "0.9.0"
 dependencies = [
  "async-trait",
  "opentelemetry",
- "opentelemetry-appender-tracing",
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest",
  "serde",
  "thiserror",
- "tonic",
  "tracing",
  "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]
