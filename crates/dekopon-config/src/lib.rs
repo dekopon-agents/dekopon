@@ -98,7 +98,7 @@ impl LocalCatalog {
                         &origin,
                         Kind::Agent,
                         resource.api_version,
-                        resource.kind,
+                        resource.kind.into(),
                     )?;
                     let id =
                         parse_id::<AgentId>(&source, &origin, "Agent", &resource.metadata.name)?;
@@ -120,7 +120,7 @@ impl LocalCatalog {
                         &origin,
                         Kind::Capability,
                         resource.api_version,
-                        resource.kind,
+                        resource.kind.into(),
                     )?;
                     let id = parse_id::<CapabilityId>(
                         &source,
@@ -146,7 +146,7 @@ impl LocalCatalog {
                         &origin,
                         Kind::Provider,
                         resource.api_version,
-                        resource.kind,
+                        resource.kind.into(),
                     )?;
                     let id = parse_id::<ProviderId>(
                         &source,
