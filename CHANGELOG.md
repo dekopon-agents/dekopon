@@ -33,7 +33,10 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
-
+- The Helm chart's `terminationGracePeriodSeconds` now covers both drains in sequence — the
+  gateway's and then the broker's `shutdownGraceMs` plus `drainBudget.bufferSeconds`, 270 s at the
+  shipped defaults — and `helm template` refuses a shorter budget instead of letting the kubelet
+  SIGKILL a draining broker mid-invocation and mid-audit-append.
 ### Security
 
 - Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,

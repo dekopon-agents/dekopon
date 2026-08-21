@@ -38,9 +38,10 @@ both directions. `dekopond` probes the broker once at startup and exits non-zero
 does not answer, so a plain second container would crash-loop its way to a working state; a sidecar
 with a startup probe means Kubernetes does not start `dekopond` at all until the broker answers a
 real request. Termination runs the other way — the gateway drains first, the broker second — which
-is the order the audit chain wants. This needs Kubernetes 1.29 or newer, and `Chart.yaml` declares
-`kubeVersion: ">=1.29.0-0"` so an older cluster refuses the install instead of deadlocking on an
-init container that never exits.
+is the order the audit chain wants, and the reason the pod's grace is a sum rather than a maximum;
+see [Draining takes both graces, in sequence](#draining-takes-both-graces-in-sequence). This needs
+Kubernetes 1.29 or newer, and `Chart.yaml` declares `kubeVersion: ">=1.29.0-0"` so an older cluster
+refuses the install instead of deadlocking on an init container that never exits.
 
 ## Why an init container, and not a volume mount
 
@@ -162,6 +163,44 @@ One consequence worth knowing: the probe runs `dekopon-run`, which reads
 `OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
 container, or every probe exports a trace. `OTEL_EXPORTER_OTLP_HEADERS` is safe and is what the
 broker's own telemetry block needs.
+
+## Draining takes both graces, in sequence
+
+The sidecar ordering that makes startup work also makes shutdown serial. The kubelet stops the
+gateway's container first and only starts stopping the broker sidecar once that container is gone,
+so the pod's `terminationGracePeriodSeconds` has to cover **both** drains added together — not the
+larger of the two. `dekopond` drains in-flight sessions for its own `shutdownGraceMs`,
+`dekopon-brokerd` then drains connections for `serverLimits.shutdownGraceMs`, and both default to
+`120000`.
+
+Whatever is still draining when the pod's grace expires is `SIGKILL`ed. For the gateway that
+abandons a model turn somebody is waiting on; for the broker it lands mid-invocation and
+mid-audit-append, which is the one place this chart cannot promise a clean failure.
+
+`terminationGracePeriodSeconds` therefore defaults to **270** — 120 + 120 +
+`drainBudget.bufferSeconds` — and the chart asserts the arithmetic at template time. A grace shorter
+than the two configured graces plus the buffer is a refused `helm template` naming both numbers, not
+a kill nobody notices until a record is torn:
+
+```console
+$ helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml \
+    --set terminationGracePeriodSeconds=180
+Error: ... terminationGracePeriodSeconds is 180, but the containers stop in sequence: dekopond
+drains for 120000 ms and then dekopon-brokerd drains for 120000 ms ... That needs 270 seconds.
+```
+
+The buffer — 30 s by default — is everything the two graces do not name: `SIGTERM` delivery and the
+kubelet's per-container bookkeeping, and each daemon's telemetry flush, since an OTLP exporter can
+burn its whole `exportTimeoutMs` against a collector that is itself restarting.
+
+The chart reads `shutdownGraceMs` out of an **inline** config. An `existingSecret` is opaque to it,
+and an inline config may leave the key out and take the daemon's default, so
+`drainBudget.assumedBrokerShutdownGraceMs` and `drainBudget.assumedGatewayShutdownGraceMs` are what
+the assertion believes in those cases. They configure nothing. If your Secret says something other
+than `120000`, correct them there or the arithmetic is guarding a number you are not running.
+
+None of this makes shutdown grace-window-dependent: a longer window is not a durability mechanism,
+and every append, checkpoint and rename still has to be crash-safe on its own.
 
 ## The ChatGPT credential is seeded once
 
@@ -475,7 +514,8 @@ Use `existingSecret` for credentials. An inline value is stored in the release, 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, or `constraintSets` with no corresponding value supplied;
-or `paths.catalogDir` is inside `paths.configDir`. When provider storage is enabled, its root and
+`paths.catalogDir` is inside `paths.configDir`; or `terminationGracePeriodSeconds` is shorter than
+the two drains it has to cover in sequence. When provider storage is enabled, its root and
 key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with
 every chart-owned mount (`config`, runtime, audit state, catalog, `/tmp`, and both projected
 configuration/key sources); a nested mount would otherwise shadow or destructively replace those
