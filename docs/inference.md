@@ -269,8 +269,9 @@ records are `memory-corrupt`, and finite dedup exhaustion is `dedup-capacity` wh
 
 Recording occurs only after fresh authorization, model success, and complete service/kernel
 transport acceptance. It is gateway-attested—not broker proof of delivery and not proof a person
-read it. A deliberately declined owned-thread continuation makes no transport call and therefore
-has no receipt and no durable record. There is exactly one record request after an accepted answer
+read it. A deliberately declined owned-thread continuation makes no reply call and therefore has
+no receipt and no durable record; configured native activity still receives its cosmetic cleanup.
+There is exactly one record request after an accepted answer
 and no automatic retry after any uncertain outcome. Durable text remains untrusted model context
 after explicit retrieval and never enters identity or Cedar as content.
 

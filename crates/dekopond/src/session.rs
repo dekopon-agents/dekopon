@@ -869,7 +869,8 @@ async fn session(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
-        // No transport call means no acceptance receipt and therefore no durable recording. The
+        // No reply call means no acceptance receipt and therefore no durable recording. Native
+        // activity still returns to its inactive state through the separate cosmetic surface. The
         // unanswered in-process turn was committed above so a later continuation still sees what
         // the person said. Activity cleanup remains best effort and cannot create a chat message.
         activity.finish_in_background();

@@ -214,7 +214,8 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
   thread continuation. After fresh broker authorization the gateway calls
   `agents.sessions.setStatus(processing)` once; Slack owns the standard Working UI and one-hour
   processing timeout, so the gateway does not waste rate limit on a heartbeat. After a reply or
-  deliberate no-reply completion it asynchronously returns the session to `active`.
+  deliberate no-reply completion it asynchronously returns the session to `active`; no-reply means
+  no chat message, not omission of that cosmetic cleanup.
   `feature_disabled`, `missing_scope`, and equivalent permanent installation errors disable Agent
   status for that transport and select the configured reaction fallback, then no-op if reactions
   are also unavailable. It never guesses the workspace plan.
