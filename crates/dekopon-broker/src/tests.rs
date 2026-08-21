@@ -5,10 +5,10 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
-    ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageNamespace,
+    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
+    StorageAccess, StorageConstraints, StorageInterface, StorageNamespace,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, TraceId};
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
@@ -17,6 +17,52 @@ use super::{
     encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
     is_reserved_memory_route, verify_audit_chain,
 };
+
+/// A terminal execution event, for the record shapes a decision-only fixture never reaches.
+fn execution(invocation: &str) -> AuditEvent {
+    AuditEvent::Execution {
+        invocation: invocation
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        trace: "trace-test"
+            .parse::<TraceId>()
+            .expect("valid trace fixture"),
+        principal: Some(
+            "caller"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        actor: Some(Actor::Agent {
+            agent: "reviewer".parse::<AgentId>().expect("valid agent fixture"),
+        }),
+        via: None,
+        attested_subject: None,
+        capability: "echo.echo"
+            .parse::<CapabilityId>()
+            .expect("valid capability fixture"),
+        provider: Some("echo".parse().expect("valid provider fixture")),
+        authorized_by: Some(
+            "broker"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        decision_id: format!("decision-{invocation}"),
+        policy_revision: Some("policy-test".to_owned()),
+        policy_ids: vec!["allow-echo".to_owned()],
+        policy_digest: None,
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        idempotency: Idempotency::Idempotent,
+        credential: None,
+        outcome: InvocationOutcome::Succeeded,
+        duration_ms: 3,
+        error: None,
+        output_digest: Some(format!("sha256:{}", "b".repeat(64))),
+        http_calls: Vec::new(),
+        storage_scope_commitment: None,
+        storage: None,
+    }
+}
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {
@@ -955,4 +1001,86 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
             .contains("credentialByAgent"),
         "an empty override map must stay off the wire"
     );
+}
+
+/// Two records written by an earlier build, hashes and all.
+///
+/// The durable chain is the one thing in this crate that outlives the process that wrote it. If a
+/// change to how a record is serialized, hashed, or laid out reaches disk, an operator's existing
+/// audit file stops verifying — so this fixture is a literal, not something the test regenerates.
+const CHAIN_FIXTURE: &str = concat!(
+    r#"{"sequence":1,"event":{"type":"decision","invocation":"invoke-one","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-one","policy_revision":"policy-test","allowed":true,"decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce"}"#,
+    "\n",
+    r#"{"sequence":2,"previousHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce","event":{"type":"decision","invocation":"invoke-two","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-two","policy_revision":"policy-test","allowed":false,"reason":"policy-denied","decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf"}"#,
+    "\n",
+);
+
+#[tokio::test]
+async fn an_existing_chain_still_verifies_and_appends_the_same_bytes() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    fs::write(&path, CHAIN_FIXTURE).expect("write retained chain");
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owner-only fixture");
+
+    // Opening re-derives every record hash from the retained bytes, so a changed hash material,
+    // domain, or field order fails right here.
+    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+        .await
+        .expect("a chain written by an earlier build still verifies");
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 2);
+    assert_eq!(
+        head.as_deref(),
+        Some("sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf")
+    );
+
+    // And a record appended now continues that same chain in the same encoding.
+    let appended = audit
+        .append(decision("invoke-three", true))
+        .await
+        .expect("append continues the retained chain");
+    drop(audit);
+    let raw = fs::read_to_string(&path).expect("read continued chain");
+    assert!(raw.starts_with(CHAIN_FIXTURE), "{raw}");
+    let records = raw
+        .lines()
+        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("valid durable record"))
+        .collect::<Vec<_>>();
+    verify_audit_chain(&records).expect("the continued chain verifies end to end");
+    assert_eq!(records[2], appended);
+}
+
+/// The durable line is spliced around one serialization of the event rather than serializing the
+/// record; this is what proves the splice and the derived encoding are the same bytes.
+#[tokio::test]
+async fn durable_lines_match_the_record_encoding() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    let audit = FileAuditLog::open(&path, 8, 16 * 1024)
+        .await
+        .expect("create durable audit");
+    let mut appended = Vec::new();
+    for event in [
+        decision("invoke-first", true),
+        decision("invoke-second", false),
+        execution("invoke-second"),
+    ] {
+        appended.push(audit.append(event).await.expect("append succeeds"));
+    }
+    drop(audit);
+    for (line, record) in fs::read_to_string(&path)
+        .expect("read durable chain")
+        .lines()
+        .zip(&appended)
+    {
+        assert_eq!(
+            line.as_bytes(),
+            serde_json::to_vec(record)
+                .expect("records reserialize")
+                .as_slice(),
+            "record {} is not written as it serializes",
+            record.sequence
+        );
+    }
 }

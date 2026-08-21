@@ -67,6 +67,7 @@ use dekopon_storage_host::{
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -1816,15 +1817,22 @@ impl AuditLog for FileAuditLog {
             .and_then(|value| value.checked_add(1))
             .ok_or(AuditError::SequenceOverflow)?;
         let previous_hash = state.head.clone();
-        let record_hash = audit_record_hash(sequence, previous_hash.as_deref(), &event)?;
+        let encoded = encode_audit_event(&event)?;
+        let record_hash = encoded_audit_record_hash(sequence, previous_hash.as_deref(), &encoded)?;
+        // The one serialization of the event covers both the hash material and the durable line.
+        let mut line = serde_json::to_vec(&AuditRecordLine {
+            sequence,
+            previous_hash: previous_hash.as_deref(),
+            event: &encoded,
+            record_hash: &record_hash,
+        })
+        .map_err(|source| AuditError::Serialize { source })?;
         let record = AuditRecord {
             sequence,
             previous_hash,
             event,
             record_hash,
         };
-        let mut line =
-            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
         if line.len() > self.maximum_line_bytes {
             return Err(AuditError::RecordTooLarge {
                 length: line.len(),
@@ -2176,13 +2184,40 @@ pub fn verify_audit_chain(records: &[AuditRecord]) -> Result<(), AuditIntegrityE
 struct AuditHashMaterial<'a> {
     sequence: u64,
     previous_hash: Option<&'a str>,
-    event: &'a AuditEvent,
+    event: &'a RawValue,
+}
+
+/// The durable JSONL shape of [`AuditRecord`], over an already-serialized event.
+///
+/// Field names, order, and the absent-`previousHash` rule must stay identical to `AuditRecord`'s
+/// derived encoding: this is the same bytes on disk, written without serializing the event a
+/// second time. `durable_line_matches_the_record_encoding` fails if the two ever diverge.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditRecordLine<'a> {
+    sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_hash: Option<&'a str>,
+    event: &'a RawValue,
+    record_hash: &'a str,
+}
+
+fn encode_audit_event(event: &AuditEvent) -> Result<Box<RawValue>, AuditError> {
+    serde_json::value::to_raw_value(event).map_err(|source| AuditError::Serialize { source })
 }
 
 fn audit_record_hash(
     sequence: u64,
     previous_hash: Option<&str>,
     event: &AuditEvent,
+) -> Result<String, AuditError> {
+    encoded_audit_record_hash(sequence, previous_hash, &encode_audit_event(event)?)
+}
+
+fn encoded_audit_record_hash(
+    sequence: u64,
+    previous_hash: Option<&str>,
+    event: &RawValue,
 ) -> Result<String, AuditError> {
     let bytes = serde_json::to_vec(&AuditHashMaterial {
         sequence,
@@ -4389,18 +4424,24 @@ fn outcome_evidence_digest(
 }
 
 fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut material = Vec::with_capacity(label.len() + 1 + bytes.len());
-    material.extend_from_slice(label.as_bytes());
-    material.push(0);
-    material.extend_from_slice(&bytes);
-    Ok(domain_digest(EVIDENCE_HASH_DOMAIN, &material))
+    // Streamed rather than concatenated: the serialized value here is a whole provider response,
+    // up to the host output ceiling, and the joined buffer existed only to be hashed once.
+    Ok(digest_parts(
+        EVIDENCE_HASH_DOMAIN,
+        &[label.as_bytes(), &[0], &serde_json::to_vec(value)?],
+    ))
 }
 
 fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
+    digest_parts(domain, &[bytes])
+}
+
+fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(bytes);
+    for part in parts {
+        hasher.update(part);
+    }
     format!("sha256:{}", hex_bytes(&hasher.finalize()))
 }
 
