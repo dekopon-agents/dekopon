@@ -208,6 +208,28 @@ fn functions_participate_in_pipelines_in_both_directions() {
 }
 
 #[test]
+fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
+    // The frame's stdin is shared, not consumed, so each pipeline in a body is offered the same
+    // value however many statements precede it and whether or not they read it.
+    assert_eq!(
+        output("g() { cat; cat; }\necho payload | g"),
+        "payload\npayload"
+    );
+    assert_eq!(
+        output("g() { true; echo first; cat; }\necho payload | g"),
+        "first\npayload"
+    );
+    // Structure survives being handed from stage to stage rather than copied into each one.
+    assert_eq!(output(r#"echo.echo --a 1 --b two | jq '.b' | cat"#), "two");
+    assert_eq!(
+        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; echo.echo --a 1 --b 2 | g"#),
+        "1\n2"
+    );
+    // A here-document still replaces whatever a pipe would have supplied.
+    assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
+}
+
+#[test]
 fn prefix_assignments_are_transient_and_applied_after_expansion() {
     // `x=new echo "[$x]"` must print the *old* value and must not outlive the command.
     assert_eq!(

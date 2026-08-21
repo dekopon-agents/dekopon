@@ -34,6 +34,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - Script traces now open one `shell.script` span per run carrying the whole run's command totals,
   and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
   one span per step.
+- A piped value now moves from one pipeline stage to the next and is shared with a function body's
+  statements rather than deep-copied for each of them, and `grep` no longer copies every input line
+  it tests.
 
 ### Fixed
 
