@@ -6,8 +6,9 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    io,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -48,6 +49,10 @@ const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const GRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_GRAPH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_WHATSAPP_TEXT_CHARS: usize = 4096;
+/// One refusal reason is reported at most this often, with the count it stands for.
+const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// How long the accept loop waits after running out of descriptors or socket buffers.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(crate) struct WhatsappTransport {
     name: String,
@@ -69,8 +74,113 @@ struct WebhookState {
     phone_number_id: String,
     sender: mpsc::Sender<QueuedDelivery>,
     dedup: Arc<Mutex<Dedup>>,
+    refusals: Arc<Mutex<RefusalLog>>,
     queue_capacity: Arc<Semaphore>,
     concurrency: Arc<Semaphore>,
+}
+
+/// Why one webhook request was refused, as a stable low-cardinality telemetry reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refusal {
+    /// No usable `X-Hub-Signature-256`, so there was nothing to verify.
+    Unsigned,
+    /// A signature that does not match the app secret over these exact bytes.
+    Signature,
+    /// Headers or a body past the bounds this listener accepts.
+    Oversize,
+    /// Signed, but not a delivery this transport can read.
+    Malformed,
+    /// Concurrency or queue capacity is spent; Meta should redeliver.
+    Saturated,
+    /// The request did not finish inside the handler deadline.
+    Timeout,
+    /// A subscription-verification challenge that did not prove the verify token.
+    Verification,
+    /// Internal state this handler needs is unusable.
+    Unavailable,
+}
+
+impl Refusal {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Unsigned => 0,
+            Self::Signature => 1,
+            Self::Oversize => 2,
+            Self::Malformed => 3,
+            Self::Saturated => 4,
+            Self::Timeout => 5,
+            Self::Verification => 6,
+            Self::Unavailable => 7,
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Unsigned => "unsigned",
+            Self::Signature => "signature",
+            Self::Oversize => "oversize",
+            Self::Malformed => "malformed",
+            Self::Saturated => "saturated",
+            Self::Timeout => "timeout",
+            Self::Verification => "verification",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Per-reason emission windows, so a refusal always leaves a trace and never a flood.
+///
+/// The callback is this daemon's only public surface, so an unauthenticated stranger decides how
+/// often refusals happen. Emitting one line each would let that stranger write unbounded volume
+/// into a shared log sink; emitting none is how a wrong app secret becomes invisible. One line per
+/// reason per window, carrying how many it stands for, is both.
+struct RefusalLog {
+    windows: [Option<Instant>; Refusal::COUNT],
+    suppressed: [u64; Refusal::COUNT],
+}
+
+impl RefusalLog {
+    const fn new() -> Self {
+        Self {
+            windows: [None; Refusal::COUNT],
+            suppressed: [0; Refusal::COUNT],
+        }
+    }
+
+    /// Reports how many earlier refusals of this reason an emission now stands for, or nothing when
+    /// this reason has already been reported inside the current window.
+    fn admit(&mut self, refusal: Refusal, now: Instant) -> Option<u64> {
+        let index = refusal.index();
+        let due =
+            self.windows[index].is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_WINDOW);
+        if !due {
+            self.suppressed[index] = self.suppressed[index].saturating_add(1);
+            return None;
+        }
+        self.windows[index] = Some(now);
+        Some(std::mem::take(&mut self.suppressed[index]))
+    }
+}
+
+/// Answers one refused request, naming its reason once per window and nothing about its content.
+fn refuse(state: &WebhookState, refusal: Refusal, status: StatusCode) -> Response {
+    // A poisoned refusal log must not silence the refusal it exists to record.
+    let admitted = match state.refusals.lock() {
+        Ok(mut log) => log.admit(refusal, Instant::now()),
+        Err(_) => Some(0),
+    };
+    if let Some(suppressed) = admitted {
+        tracing::warn!(
+            event = "gateway_whatsapp_webhook_refused",
+            transport = %state.name,
+            reason = refusal.reason(),
+            status = status.as_u16(),
+            suppressed,
+        );
+    }
+    content_free(status)
 }
 
 struct QueuedDelivery {
@@ -107,15 +217,19 @@ impl Dedup {
         accepted
     }
 
-    fn rollback(&mut self, messages: &[InboundMessage]) {
-        for message in messages {
-            self.ids.remove(&message.message_id);
+    /// Undoes a claim that never reached the queue, so Meta's redelivery is accepted rather than
+    /// silently acknowledged as a duplicate of work nothing is doing.
+    fn release(&mut self, claimed: &[String]) {
+        for id in claimed {
+            self.ids.remove(id);
         }
         self.order.retain(|id| self.ids.contains(id));
     }
 }
 
 impl WhatsappTransport {
+    /// Every credential arrives non-empty: [`crate::transport::read_credential`] refuses an
+    /// exported-but-blank variable, because an empty app secret is an HMAC key anyone can guess.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: String,
@@ -129,9 +243,6 @@ impl WhatsappTransport {
         verify_token: String,
         access_token: String,
     ) -> Result<Self, TransportError> {
-        if app_secret.is_empty() || verify_token.is_empty() || access_token.is_empty() {
-            return Err(TransportError::Response);
-        }
         let (sender, receiver) = mpsc::channel(WEBHOOK_QUEUE);
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -158,6 +269,7 @@ impl WhatsappTransport {
                 phone_number_id,
                 sender,
                 dedup: Arc::new(Mutex::new(Dedup::new())),
+                refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
             },
@@ -198,15 +310,47 @@ impl ChatTransport for WhatsappTransport {
                     content_free(StatusCode::METHOD_NOT_ALLOWED)
                 })
                 .with_state(self.state.clone());
+            let name = self.name.clone();
             self.server = Some(tokio::spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 let connection_limit = Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY));
                 loop {
                     tokio::select! {
                         accepted = listener.accept() => {
-                            let Ok((stream, _peer)) = accepted else {
-                                tracing::error!(event = "gateway_whatsapp_listener_stopped");
-                                return;
+                            let stream = match accepted {
+                                Ok((stream, _peer)) => stream,
+                                // One failed accept is not a failed listener. Ending the loop here
+                                // is permanent — nothing restarts a transport reader — so only a
+                                // socket that can never serve again may end it.
+                                Err(error) => match classify_accept(&error) {
+                                    AcceptFailure::Connection => {
+                                        tracing::debug!(
+                                            event = "gateway_whatsapp_accept_failed",
+                                            transport = %name,
+                                            kind = "connection",
+                                            error = %error,
+                                        );
+                                        continue;
+                                    }
+                                    AcceptFailure::Exhausted => {
+                                        tracing::warn!(
+                                            event = "gateway_whatsapp_accept_failed",
+                                            transport = %name,
+                                            kind = "exhausted",
+                                            error = %error,
+                                        );
+                                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                                        continue;
+                                    }
+                                    AcceptFailure::Fatal => {
+                                        tracing::error!(
+                                            event = "gateway_whatsapp_listener_stopped",
+                                            transport = %name,
+                                            error = %error,
+                                        );
+                                        return;
+                                    }
+                                },
                             };
                             let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
                                 // Drop immediately: even slow pre-header clients are concurrency-bound.
@@ -275,56 +419,92 @@ impl ChatTransport for WhatsappTransport {
     }
 }
 
+/// What a failed `accept()` says about the listening socket itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptFailure {
+    /// One connection died before it was handed over; the listener is unaffected.
+    Connection,
+    /// Descriptors or socket buffers are spent; the listener works again once one is freed.
+    Exhausted,
+    /// The listening socket can no longer serve anything.
+    Fatal,
+}
+
+fn classify_accept(error: &io::Error) -> AcceptFailure {
+    match error.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::WouldBlock => AcceptFailure::Connection,
+        io::ErrorKind::OutOfMemory => AcceptFailure::Exhausted,
+        _ => match error.raw_os_error() {
+            // Process or system descriptor and buffer exhaustion. A pod under its memory limit with
+            // many half-open connections reaches these, and every one of them is temporary.
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                AcceptFailure::Exhausted
+            }
+            _ => AcceptFailure::Fatal,
+        },
+    }
+}
+
 async fn verify_subscription(
     State(state): State<WebhookState>,
     RawQuery(query): RawQuery,
 ) -> Response {
     let Some(query) = query.filter(|query| query.len() <= MAX_QUERY_BYTES) else {
-        return content_free(StatusCode::FORBIDDEN);
+        return refuse(&state, Refusal::Verification, StatusCode::FORBIDDEN);
     };
     let Ok(fields) = parse_query(&query) else {
-        return content_free(StatusCode::FORBIDDEN);
+        return refuse(&state, Refusal::Verification, StatusCode::FORBIDDEN);
     };
     let (Some(mode), Some(token), Some(challenge)) = (
         exactly_one(&fields, "hub.mode"),
         exactly_one(&fields, "hub.verify_token"),
         exactly_one(&fields, "hub.challenge"),
     ) else {
-        return content_free(StatusCode::FORBIDDEN);
+        return refuse(&state, Refusal::Verification, StatusCode::FORBIDDEN);
     };
     if mode != "subscribe"
         || !constant_time_eq(token.as_bytes(), state.verify_token.expose().as_bytes())
     {
-        return content_free(StatusCode::FORBIDDEN);
+        return refuse(&state, Refusal::Verification, StatusCode::FORBIDDEN);
     }
     text_response(StatusCode::OK, challenge.to_owned())
 }
 
 async fn receive_webhook(State(state): State<WebhookState>, request: Request) -> Response {
     let Ok(permit) = Arc::clone(&state.concurrency).try_acquire_owned() else {
-        return content_free(StatusCode::SERVICE_UNAVAILABLE);
+        return refuse(&state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
     match tokio::time::timeout(
         WEBHOOK_REQUEST_TIMEOUT,
-        process_webhook(state, request, permit),
+        process_webhook(&state, request, permit),
     )
     .await
     {
         Ok(response) => response,
-        Err(_) => content_free(StatusCode::REQUEST_TIMEOUT),
+        Err(_) => refuse(&state, Refusal::Timeout, StatusCode::REQUEST_TIMEOUT),
     }
 }
 
+/// Verifies, parses, claims, and enqueues one signed delivery.
+///
+/// Everything from the dedup claim to the enqueue is synchronous on purpose: the caller's deadline
+/// can only cancel this at an `.await`, and a cancellation between claiming a message ID and
+/// queueing it would drop that message and swallow Meta's redelivery of it.
 async fn process_webhook(
-    state: WebhookState,
+    state: &WebhookState,
     request: Request,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     if !headers_bounded(request.headers()) {
-        return content_free(StatusCode::BAD_REQUEST);
+        return refuse(state, Refusal::Oversize, StatusCode::BAD_REQUEST);
     }
     let Some(signature) = exact_signature(request.headers()) else {
-        return content_free(StatusCode::UNAUTHORIZED);
+        return refuse(state, Refusal::Unsigned, StatusCode::UNAUTHORIZED);
     };
     if request
         .headers()
@@ -333,44 +513,56 @@ async fn process_webhook(
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_WEBHOOK_BODY_BYTES)
     {
-        return content_free(StatusCode::PAYLOAD_TOO_LARGE);
+        return refuse(state, Refusal::Oversize, StatusCode::PAYLOAD_TOO_LARGE);
     }
     let body = match to_bytes(request.into_body(), MAX_WEBHOOK_BODY_BYTES).await {
         Ok(body) => body,
-        Err(_) => return content_free(StatusCode::PAYLOAD_TOO_LARGE),
+        Err(_) => return refuse(state, Refusal::Oversize, StatusCode::PAYLOAD_TOO_LARGE),
     };
     if !valid_hmac_sha256(state.app_secret.expose(), &body, &signature) {
-        return content_free(StatusCode::UNAUTHORIZED);
+        return refuse(state, Refusal::Signature, StatusCode::UNAUTHORIZED);
     }
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return content_free(StatusCode::BAD_REQUEST),
+        Err(_) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
-    let messages = match parse_delivery(&state, &value) {
+    let messages = match parse_delivery(state, &value) {
         Ok(messages) => messages,
-        Err(()) => return content_free(StatusCode::BAD_REQUEST),
+        Err(()) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
     let mut dedup = match state.dedup.lock() {
         Ok(dedup) => dedup,
-        Err(_) => return content_free(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => {
+            return refuse(
+                state,
+                Refusal::Unavailable,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
     };
     let accepted = dedup.claim(messages);
     if accepted.is_empty() {
         return content_free(StatusCode::OK);
     }
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
+    // Only the claimed IDs are needed to undo the claim, so the messages themselves move into the
+    // delivery rather than being held a second time for a path that usually does not run.
+    let claimed: Vec<String> = accepted
+        .iter()
+        .map(|message| message.message_id.clone())
+        .collect();
     let Ok(capacity) = Arc::clone(&state.queue_capacity).try_acquire_many_owned(permit_count)
     else {
-        dedup.rollback(&accepted);
-        return content_free(StatusCode::SERVICE_UNAVAILABLE);
+        dedup.release(&claimed);
+        return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
     let delivery = QueuedDelivery {
-        messages: accepted.clone().into(),
+        messages: accepted.into(),
         _capacity: capacity,
     };
     if state.sender.try_send(delivery).is_err() {
-        dedup.rollback(&accepted);
-        return content_free(StatusCode::SERVICE_UNAVAILABLE);
+        dedup.release(&claimed);
+        return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     }
     content_free(StatusCode::OK)
 }
@@ -618,6 +810,49 @@ struct WhatsappReplier {
     http: reqwest::Client,
 }
 
+impl WhatsappReplier {
+    /// One text message, sent exactly once and never retried.
+    async fn send_text(&self, recipient: &str, body: &str) -> Result<String, TransportError> {
+        let payload = serde_json::to_vec(&json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": { "preview_url": false, "body": body }
+        }))
+        .map_err(|_| TransportError::Response)?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/{}/{}/messages",
+                self.endpoint, self.version, self.phone_number_id
+            ))
+            .bearer_auth(self.access_token.expose())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let status = response.status();
+        let bytes = bounded_response(response).await?;
+        if !status.is_success() {
+            return Err(TransportError::Service {
+                code: status.as_u16().to_string(),
+            });
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| TransportError::Response)?;
+        if value.get("messaging_product").and_then(Value::as_str) != Some("whatsapp") {
+            return Err(TransportError::Response);
+        }
+        value
+            .pointer("/messages/0/id")
+            .and_then(Value::as_str)
+            .filter(|id| canonical_whatsapp_message_id(id))
+            .map(str::to_owned)
+            .ok_or(TransportError::Response)
+    }
+}
+
 impl ChatReplier for WhatsappReplier {
     fn reply(
         &self,
@@ -628,45 +863,30 @@ impl ChatReplier for WhatsappReplier {
             let ReplyTarget::WhatsApp { recipient } = target else {
                 return Err(TransportError::Response);
             };
-            let body = bounded_whatsapp_text(&text);
-            let payload = serde_json::to_vec(&json!({
-                "messaging_product": "whatsapp",
-                "recipient_type": "individual",
-                "to": recipient,
-                "type": "text",
-                "text": { "preview_url": false, "body": body }
-            }))
-            .map_err(|_| TransportError::Response)?;
-            let response = self
-                .http
-                .post(format!(
-                    "{}/{}/{}/messages",
-                    self.endpoint, self.version, self.phone_number_id
-                ))
-                .bearer_auth(self.access_token.expose())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(payload)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let status = response.status();
-            let bytes = bounded_response(response).await?;
-            if !status.is_success() {
-                return Err(TransportError::Service {
-                    code: status.as_u16().to_string(),
-                });
+            let mut accepted = 0_usize;
+            let mut last_id = None;
+            for chunk in split_message(&text) {
+                match self.send_text(&recipient, &chunk).await {
+                    Ok(id) => {
+                        accepted += 1;
+                        last_id = Some(id);
+                    }
+                    // Name the cause here: the session only learns that a split answer arrived in
+                    // part, and the service code behind that is otherwise discarded.
+                    Err(error) if accepted > 0 => {
+                        tracing::warn!(
+                            event = "gateway_whatsapp_reply_partial",
+                            category = error.category(),
+                            delivered = accepted,
+                        );
+                        return Err(TransportError::PartialDelivery);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let value: Value =
-                serde_json::from_slice(&bytes).map_err(|_| TransportError::Response)?;
-            if value.get("messaging_product").and_then(Value::as_str) != Some("whatsapp") {
-                return Err(TransportError::Response);
-            }
-            let message_id = value
-                .pointer("/messages/0/id")
-                .and_then(Value::as_str)
-                .filter(|id| canonical_whatsapp_message_id(id))
-                .ok_or(TransportError::Response)?;
-            Ok(DeliveryReceipt::new(message_id))
+            Ok(DeliveryReceipt::new(
+                last_id.ok_or(TransportError::Response)?,
+            ))
         })
     }
 }
@@ -690,13 +910,34 @@ async fn bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Transp
     Ok(bytes)
 }
 
-fn bounded_whatsapp_text(text: &str) -> String {
-    if text.chars().count() <= MAX_WHATSAPP_TEXT_CHARS {
-        return text.to_owned();
+/// Splits an answer into service-sized messages, preferring a line boundary.
+///
+/// Not truncation: the session's own outbound bound is 8 KiB, which is twice what one WhatsApp text
+/// message may carry, so an answer longer than the service ceiling is the ordinary case rather than
+/// an abusive one, and dropping its second half would lose the conclusion. Unicode scalar values
+/// are what Meta counts.
+fn split_message(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
     }
-    const MARKER: &str = "\n[truncated by the gateway]";
-    let keep = MAX_WHATSAPP_TEXT_CHARS - MARKER.chars().count();
-    text.chars().take(keep).chain(MARKER.chars()).collect()
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        // The byte offset of the scalar just past this chunk's ceiling, or the end of the text.
+        let mut end = text[start..]
+            .char_indices()
+            .nth(MAX_WHATSAPP_TEXT_CHARS)
+            .map_or(text.len(), |(index, _)| start + index);
+        if end < text.len()
+            && let Some(newline) = text[start..end].rfind('\n')
+            && newline > 0
+        {
+            end = start + newline + 1;
+        }
+        chunks.push(text[start..end].to_owned());
+        start = end;
+    }
+    chunks
 }
 
 #[cfg(test)]
@@ -720,6 +961,7 @@ mod tests {
                 phone_number_id: "456".to_owned(),
                 sender,
                 dedup: Arc::new(Mutex::new(Dedup::new())),
+                refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(1)),
             },
@@ -800,7 +1042,7 @@ mod tests {
         .expect("json");
         let (state, mut receiver) = state_and_receiver();
         let first = process_webhook(
-            state.clone(),
+            &state,
             signed_request(&body),
             Arc::clone(&state.concurrency)
                 .acquire_owned()
@@ -812,7 +1054,7 @@ mod tests {
         assert_eq!(receiver.recv().await.expect("batch").messages.len(), 1);
 
         let duplicate = process_webhook(
-            state.clone(),
+            &state,
             signed_request(&body),
             Arc::clone(&state.concurrency)
                 .acquire_owned()
@@ -826,7 +1068,7 @@ mod tests {
         let mut changed = body.clone();
         changed.push(b' ');
         let wrong_raw_bytes = process_webhook(
-            state.clone(),
+            &state,
             Request::builder()
                 .method("POST")
                 .header("x-hub-signature-256", signature(b"secret", &body))
@@ -841,7 +1083,7 @@ mod tests {
         assert_eq!(wrong_raw_bytes.status(), StatusCode::UNAUTHORIZED);
 
         let duplicate_signature = process_webhook(
-            state.clone(),
+            &state,
             Request::builder()
                 .method("POST")
                 .header("x-hub-signature-256", signature(b"secret", &body))
@@ -867,7 +1109,7 @@ mod tests {
                 builder = builder.header("x-hub-signature-256", value);
             }
             let response = process_webhook(
-                state.clone(),
+                &state,
                 builder.body(Body::from(body.clone())).expect("request"),
                 Arc::clone(&state.concurrency)
                     .acquire_owned()
@@ -892,7 +1134,7 @@ mod tests {
         let (mut state, mut receiver) = state_and_receiver();
         state.queue_capacity = Arc::new(Semaphore::new(0));
         let saturated = process_webhook(
-            state.clone(),
+            &state,
             signed_request(&body),
             Arc::clone(&state.concurrency)
                 .acquire_owned()
@@ -904,7 +1146,7 @@ mod tests {
 
         state.queue_capacity.add_permits(1);
         let retried = process_webhook(
-            state.clone(),
+            &state,
             signed_request(&body),
             Arc::clone(&state.concurrency)
                 .acquire_owned()
@@ -1201,13 +1443,179 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_text_bound_counts_unicode_scalars() {
-        assert_eq!(
-            bounded_whatsapp_text(&"🦀".repeat(4096)).chars().count(),
-            4096
+    fn long_answers_split_by_unicode_scalars_without_losing_text() {
+        assert_eq!(split_message(&"🦀".repeat(4096)).len(), 1);
+
+        let answer = format!("BEGIN{}END", "🦀".repeat(4097));
+        let chunks = split_message(&answer);
+        assert!(
+            chunks.len() > 1,
+            "an answer past the ceiling is not one post"
         );
-        let bounded = bounded_whatsapp_text(&"🦀".repeat(4097));
-        assert_eq!(bounded.chars().count(), 4096);
-        assert!(bounded.ends_with("[truncated by the gateway]"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= MAX_WHATSAPP_TEXT_CHARS)
+        );
+        assert_eq!(
+            chunks.concat(),
+            answer,
+            "every scalar the model wrote is still sent"
+        );
+
+        let lines = format!("{}\ntail", "x".repeat(MAX_WHATSAPP_TEXT_CHARS - 1));
+        let split = split_message(&lines);
+        assert_eq!(split.len(), 2);
+        assert!(split[0].ends_with('\n'), "a line boundary is preferred");
+        assert_eq!(split.concat(), lines);
+
+        assert_eq!(split_message(""), vec![String::new()]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_past_the_service_ceiling_is_sent_as_more_than_one_message() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("read");
+                    assert!(read > 0, "complete request");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(split) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_end = split + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .expect("content length");
+                        if request.len() >= header_end + length {
+                            let body: Value =
+                                serde_json::from_slice(&request[header_end..]).expect("json body");
+                            bodies
+                                .push(body["text"]["body"].as_str().expect("text body").to_owned());
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 66\r\nConnection: close\r\n\r\n{\"messaging_product\":\"whatsapp\",\"messages\":[{\"id\":\"wamid.reply\"}]}").await.expect("write");
+            }
+            bodies
+        });
+        let replier = WhatsappReplier {
+            endpoint: format!("http://{address}"),
+            version: "v23.0".to_owned(),
+            phone_number_id: "456".to_owned(),
+            access_token: Redacted::new("access-secret".to_owned()),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        };
+        // The session's own outbound bound is twice the WhatsApp ceiling, so this length is
+        // reachable from an ordinary answer rather than only from abuse.
+        let answer = format!("BEGIN{}END", "x".repeat(MAX_WHATSAPP_TEXT_CHARS));
+        let receipt = replier
+            .reply(
+                ReplyTarget::WhatsApp {
+                    recipient: "1603".to_owned(),
+                },
+                answer.clone(),
+            )
+            .await
+            .expect("reply");
+        assert!(receipt.accepted());
+        let bodies = server.await.expect("server");
+        assert_eq!(bodies.len(), 2, "one post per service-sized chunk");
+        assert_eq!(bodies.concat(), answer, "no part of the answer is dropped");
+    }
+
+    #[test]
+    fn every_refusal_reason_is_reported_once_per_window_with_its_count() {
+        let mut log = RefusalLog::new();
+        let start = Instant::now();
+        assert_eq!(log.admit(Refusal::Signature, start), Some(0));
+        assert_eq!(log.admit(Refusal::Signature, start), None);
+        assert_eq!(log.admit(Refusal::Signature, start), None);
+        // A different reason is never hidden by a noisy one.
+        assert_eq!(log.admit(Refusal::Saturated, start), Some(0));
+        assert_eq!(
+            log.admit(Refusal::Signature, start + REFUSAL_LOG_WINDOW),
+            Some(2),
+            "the emission stands for the ones it replaced"
+        );
+        assert_eq!(
+            log.admit(Refusal::Signature, start + REFUSAL_LOG_WINDOW * 2),
+            Some(0),
+            "the count resets with each emission"
+        );
+
+        let mut reasons: Vec<&str> = [
+            Refusal::Unsigned,
+            Refusal::Signature,
+            Refusal::Oversize,
+            Refusal::Malformed,
+            Refusal::Saturated,
+            Refusal::Timeout,
+            Refusal::Verification,
+            Refusal::Unavailable,
+        ]
+        .iter()
+        .map(|refusal| refusal.reason())
+        .collect();
+        assert_eq!(reasons.len(), Refusal::COUNT);
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(
+            reasons.len(),
+            Refusal::COUNT,
+            "each reason has its own slot and its own name"
+        );
+    }
+
+    #[test]
+    fn only_an_unusable_listening_socket_ends_the_accept_loop() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                classify_accept(&io::Error::from(kind)),
+                AcceptFailure::Connection,
+                "{kind:?} is one dead connection, not a dead listener"
+            );
+        }
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::Exhausted,
+                "exhaustion recovers once something is freed"
+            );
+        }
+        assert_eq!(
+            classify_accept(&io::Error::from_raw_os_error(libc::EBADF)),
+            AcceptFailure::Fatal
+        );
+        assert_eq!(
+            classify_accept(&io::Error::from(io::ErrorKind::InvalidInput)),
+            AcceptFailure::Fatal
+        );
     }
 }

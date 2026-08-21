@@ -25,6 +25,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
+  sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
+  the first chunk reports `partial-delivery` and records no delivered turn.
+- A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
+  name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
@@ -42,6 +47,15 @@ All notable changes to Dekopon are documented here. The format is based on
 - WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender
   come only from the signed envelope, transport secrets remain gateway-only, and outcome-unknown
   Graph sends are never blindly retried.
+- Every refused WhatsApp webhook request now names its reason in telemetry, rate-limited to one
+  content-free line per reason per minute carrying the count it stands for, so a wrong app secret is
+  visible without letting an unauthenticated caller drive log volume.
+- A transport credential environment variable that is exported but blank is now a startup failure
+  naming the variable: an empty HMAC key verifies signatures anyone can compute, and an empty bearer
+  token is still sent as a header.
+- A failed WhatsApp `accept()` is now classified instead of ending the listener: a dead connection is
+  ignored and descriptor or buffer exhaustion is retried after a short pause, so one transient
+  failure can no longer silently take the only inbound transport off the air for the process's life.
 - Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest

@@ -193,6 +193,28 @@ emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-s
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
 
+### The WhatsApp webhook is the one signal a stranger can drive
+
+Every other transport's volume is bounded by a service the daemon dialed. The WhatsApp callback is
+public, so an unauthenticated caller decides how many refusals happen, and this sink is a 30-day
+retention claim rather than an infinite one. Refusals are therefore rate-limited rather than
+per-request, and they are the only WhatsApp events at `info` or above:
+
+| Event | Level | Fields |
+|---|---|---|
+| `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`, `unavailable`), `status`, `suppressed` |
+| `gateway_whatsapp_accept_failed` | debug for `kind=connection`, warn for `kind=exhausted` | `transport`, `kind`, `error` |
+| `gateway_whatsapp_listener_stopped` | error | `transport`, `error` |
+| `gateway_whatsapp_reply_partial` | warn | `category`, `delivered` |
+
+`suppressed` is the count this line stands for: each reason is emitted at most once a minute, and
+the next emission carries how many refusals were folded into the gap. A misconfigured app secret is
+therefore one `reason=signature` line a minute rather than one per delivery attempt, and reading the
+rate means reading `suppressed` rather than counting lines. `error` on the accept and listener
+events is the operating system's message for a socket call — never a request, a body, or a sender.
+None of these carries a phone number, a WABA identifier, a message ID, or message text; the sender's
+canonical subject still arrives only through `gateway.message.received` under the payload gate.
+
 ### What conversation history changes
 
 A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —

@@ -46,7 +46,7 @@ use crate::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
         ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
-        bound_outbound,
+        bound_outbound, credential_value,
     },
 };
 
@@ -961,6 +961,25 @@ fn a_long_answer_keeps_its_beginning_and_its_conclusion() {
     assert!(bounded.starts_with("BEGIN"), "{bounded}");
     assert!(bounded.ends_with("END"), "{bounded}");
     assert!(bounded.contains("truncated by the gateway"), "{bounded}");
+}
+
+#[test]
+fn an_exported_but_blank_credential_is_refused_by_name() {
+    for blank in ["", " ", "\n\t "] {
+        let error = credential_value("DEKOPOND_WHATSAPP_APP_SECRET", blank.to_owned())
+            .expect_err("a blank credential is the absence of one");
+        assert!(
+            matches!(&error, TransportError::EmptyCredential { name }
+                if name == "DEKOPOND_WHATSAPP_APP_SECRET"),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), "empty-credential");
+    }
+    assert_eq!(
+        credential_value("DEKOPOND_WHATSAPP_APP_SECRET", " token ".to_owned())
+            .expect("a credential with surrounding space is still a credential"),
+        " token "
+    );
 }
 
 // ---------------------------------------------------------------------------
