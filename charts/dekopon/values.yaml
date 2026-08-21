@@ -7,9 +7,9 @@
 
 image:
   repository: ghcr.io/dekopon-agents/dekopon
-  # Empty means "v" + .Chart.AppVersion. The published tag is the Git tag, so it carries the v.
-  # There is no `latest` and there is no image for v0.3.0 — the image workflow landed after that
-  # release. v0.4.0 is the first release it runs for, which is what appVersion names.
+  # Empty means "v" + .Chart.AppVersion, which names the application release this chart deploys.
+  # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
+  # image for v0.3.0 or earlier — the image workflow landed after that release.
   tag: ""
   # Prefer a digest once one exists; it pins across the arm64/amd64 index.
   digest: ""

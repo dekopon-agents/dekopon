@@ -37,6 +37,10 @@ All notable changes to Dekopon are documented here. The format is based on
   gateway's and then the broker's `shutdownGraceMs` plus `drainBudget.bufferSeconds`, 270 s at the
   shipped defaults — and `helm template` refuses a shorter budget instead of letting the kubelet
   SIGKILL a draining broker mid-invocation and mid-audit-append.
+- The Helm chart's `appVersion` now names the current application release, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.4.0` on pods running a
+  later one.
+
 ### Security
 
 - Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,

@@ -385,15 +385,19 @@ They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1`
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
 force an application release, and an application release should not republish an unchanged chart.
 
-`appVersion` is `0.4.0`, the **first release the container-image workflow runs for**. `v0.3.0`
-predates that workflow and no image was ever published for it, so setting `appVersion: 0.3.0` would
-ship a chart whose default pulls nothing.
+`appVersion` is `0.9.0`, the current application release. It is not decorative: `dekopon.labels`
+renders it as `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a
+cluster answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running,
+and every dashboard and alert built on that label reporting the same wrong number. It has to move in
+the application's release-prep commit, alongside the workspace version. The floor is `v0.4.0`:
+`v0.3.0` and earlier predate the container-image workflow and have no image at all, so an
+`appVersion` below that would ship a chart whose default pulls nothing.
 
 The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.4.0
+ghcr.io/dekopon-agents/dekopon:v0.9.0
 ```
 
 There is no `latest`. Prefer `image.digest` once a release exists; it pins across the
@@ -543,7 +547,7 @@ model endpoint, and an agent catalog, and the chart can invent none of them.
 
 ## Install
 
-From the registry, once a `dekopon-chart-*` tag has been published and the package made public:
+From the registry:
 
 ```console
 helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.1.0
@@ -576,13 +580,15 @@ own volume. It may post one review comment and has no approval, request-changes,
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout, but no
   `kubectl apply` has happened.
-- No image exists to pull yet. The daemons have never been started from this configuration.
-- **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
-  `chart-publish.yml` has never run and nothing exists at
-  `oci://ghcr.io/dekopon-agents/charts/dekopon`. What *is* proven is packaging: CI packages the
-  chart, lints the archive, and diffs the archive's rendered output against the source tree's for
-  both value sets, so the tarball that would be pushed is known to be complete and to render
-  identically.
+- The daemons have never been started from this configuration. The image an empty `image.tag`
+  resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every release from
+  `v0.4.0` — but nothing here has watched one boot.
+- `dekopon-chart-0.1.0` is published at `oci://ghcr.io/dekopon-agents/charts/dekopon` and that
+  version is now immutable, so the working tree is ahead of the registry: `appVersion` and every
+  chart change since sit under `[Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md) until a human
+  cuts the next `dekopon-chart-*` tag. Packaging itself is proven on every CI run — the chart is
+  packaged, the archive linted, and the archive's rendered output diffed against the source tree's
+  for both value sets.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a
   separate rpi-homelab change.
