@@ -95,16 +95,24 @@ pub(crate) fn run(
         captures: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
         allow_clock: limits.allow_clock,
+        counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
     };
 
-    let exit_code = match evaluator.execute_program(&program) {
-        Ok(Flow::Exit(code)) => code,
-        Ok(Flow::Return(code)) => code,
-        Ok(_) => evaluator.last_status,
-        Err(fatal) => evaluator.report_fatal(&fatal),
+    // One span for the whole run, so the totals have a home that costs the same whether a script
+    // ran three commands or thirty thousand. Every `shell.command` span nests inside it.
+    let script = telemetry::script_span();
+    let exit_code = {
+        let _entered = script.enter();
+        match evaluator.execute_program(&program) {
+            Ok(Flow::Exit(code)) => code,
+            Ok(Flow::Return(code)) => code,
+            Ok(_) => evaluator.last_status,
+            Err(fatal) => evaluator.report_fatal(&fatal),
+        }
     };
+    evaluator.counters.record_on(&script);
 
     evaluator.output.finish();
     ScriptOutcome {
@@ -135,6 +143,8 @@ struct Evaluator<'a> {
     curl_capability: Option<String>,
     /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
     allow_clock: bool,
+    /// Per-script command totals, and the cap on how many command spans reach INFO.
+    counters: telemetry::ScriptCounters,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
 }
@@ -695,7 +705,8 @@ impl Evaluator<'_> {
     /// them gets its own span nested inside the `xargs` one, which is exactly the syscall-by-
     /// syscall reading this instrumentation exists to give.
     ///
-    /// See [`telemetry`] for what these spans may and may not carry.
+    /// See [`telemetry`] for what these spans may and may not carry, and for the per-script cap
+    /// that decides which of them are emitted at INFO.
     fn run_argv(
         &mut self,
         argv: &[String],
@@ -716,15 +727,8 @@ impl Evaluator<'_> {
         };
         let name = telemetry::traceable_name(kind, command);
 
-        let span = tracing::info_span!(
-            "shell.command",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = arguments.len(),
-            shell.command.exit_code = tracing::field::Empty,
-            capability.namespace = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
+        let level = self.counters.charge(kind);
+        let span = telemetry::command_span(level, name, kind, arguments.len());
         // Recorded only for `not-granted`, where it comes from the session's own granted set rather
         // than from the script. See `telemetry::name_is_fixed_vocabulary`.
         if let Some(Resolution::NotGranted { namespace }) = resolution.as_ref() {
@@ -753,6 +757,7 @@ impl Evaluator<'_> {
         };
         span.record("shell.command.exit_code", status.get());
         span.record("outcome", outcome);
+        self.counters.record_status(status);
         executed
     }
 

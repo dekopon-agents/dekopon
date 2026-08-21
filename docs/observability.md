@@ -183,7 +183,7 @@ attested context was derived.
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
+The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
 
@@ -340,7 +340,8 @@ carries only the bounded result byte count; it never logs the configuration itse
 are enabled, the credential-free meta result naturally appears as a tool message inside the next
 `agent.model.prompt` transcript, just as script output does. The per-command detail that used to arrive as
 `shell.command.started`/`.completed` pairs now lives on the `shell.command` span, which carries the
-command word, its kind, its argument count, its exit code, and its outcome.
+command word, its kind, its argument count, its exit code, and its outcome — and, past the
+per-script span cap, on the `shell.script` span's counters.
 
 ## Redacting secrets
 
@@ -371,12 +372,12 @@ One generated OpenTelemetry trace links the command to spans such as:
 
 - `runner.command`, `runner.prompt`, `runner.shell`, and `prompt.session`;
 - `prompt.model_turn` and `model.complete`;
-- `prompt.script` and `shell.command`; and
+- `prompt.script`, `shell.script`, and `shell.command`; and
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation.
 
-Inside it, `shell.command` is one span per command word the script actually ran, in execution order — a builtin, a capability call, a shell function, a word this shell refuses, or a word that resolved to nothing. A trace therefore reads as the ordered list of commands a script executed rather than as one opaque entry, and the reading survives constructs where one script word drives several executions: `xargs` mapping a command over ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is already named in this file's trace and log filters, so they flow to every configured sink with no further wiring. Each span carries:
+Inside it, the interpreter opens one `shell.script` span per run, and inside *that*, `shell.command` is one span per command word the script actually ran, in execution order — a builtin, a capability call, a shell function, a word this shell refuses, or a word that resolved to nothing. A trace therefore reads as the ordered list of commands a script executed rather than as one opaque entry, and the reading survives constructs where one script word drives several executions: `xargs` mapping a command over ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is already named in this file's trace and log filters, so they flow to every configured sink with no further wiring. Each command span carries:
 
 | Attribute | Value |
 |---|---|
@@ -386,6 +387,20 @@ Inside it, `shell.command` is one span per command word the script actually ran,
 | `shell.command.argument_count` | How many arguments the word received, never their values |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
+
+Only the first 256 command words of a run get their span at `INFO`; the rest are emitted at `DEBUG`
+and so are off wherever `RUST_LOG` is `info`. This is a volume bound, not a detail one. A
+model-authored `while` loop is bounded only by the step budget (default 100,000) and the script
+deadline, so one bash tool call can execute tens of thousands of command words, and a span for each
+is tens of megabytes exported from a workload whose whole point was to be a single round trip. What
+survives the cap is the `shell.script` span, whose counters describe the whole run in constant size:
+
+| Attribute | Value |
+|---|---|
+| `shell.script.commands` | Command words the script executed, loop iterations and `xargs` sub-invocations included |
+| `shell.script.commands_traced` | How many of those carried an `INFO` span |
+| `shell.script.capability_commands` | How many were a capability call or a provider command word |
+| `shell.script.failed_commands` | How many reported a non-zero exit code |
 
 `not-granted` splits the swing-and-a-miss out of `not-found`. A word that parses as a capability
 identifier, in a namespace this session *does* hold but naming a capability it was not granted, is a
