@@ -26,6 +26,11 @@ pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 
 /// One authenticated inbound chat message.
+///
+/// Redelivery is already rejected before one of these is built, inside the transport that knows what
+/// a redelivery looks like: Slack's `Dedup` ring keyed on `channel:ts`, Discord's on the message
+/// snowflake, and Telegram's advancing `offset`, which is the acknowledgment. Nothing downstream
+/// carries a service-native message identifier, because nothing downstream decides that question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InboundMessage {
     /// The configured transport name this arrived on.
@@ -52,8 +57,6 @@ pub(crate) struct InboundMessage {
     /// `(transport, channel, thread)` and is unchanged; this identity exists for per-conversation
     /// state that has to survive across turns.
     pub conversation_id: String,
-    /// Service-native message identifier, used only to reject redeliveries.
-    pub message_id: String,
     /// Untrusted message text, already bounded to [`MAX_INBOUND_TEXT_BYTES`].
     ///
     /// The sender's own words only. The reference lines naming attachments are appended by the
@@ -343,6 +346,45 @@ pub(crate) fn bound_outbound(text: &str) -> String {
     let head = floor_boundary(text, budget / 2);
     let tail = ceil_boundary(text, text.len() - (budget - budget / 2));
     format!("{}{MARKER}{}", &text[..head], &text[tail..])
+}
+
+/// Splits one answer into chunks a chat service will accept, preferring line boundaries.
+///
+/// `max_units` is counted in UTF-16 code units because that is what the services enforce — Discord's
+/// 2,000 and Telegram's 4,096 are both UTF-16 ceilings. Counting scalar values instead would let a
+/// chunk of astral emoji through at twice the declared size and get the whole answer rejected, with
+/// no partial delivery and nothing for the sender to read.
+///
+/// An empty answer becomes one placeholder chunk: every chat service refuses an empty post, and
+/// "the model said nothing" is a better thing for a person to see than silence.
+pub(crate) fn split_message(text: &str, max_units: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec!["[empty response]".to_owned()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let rest = &text[start..];
+        let mut units = 0;
+        let mut end = text.len();
+        for (index, character) in rest.char_indices() {
+            let next = units + character.len_utf16();
+            if next > max_units {
+                end = start + index;
+                break;
+            }
+            units = next;
+        }
+        if end < text.len()
+            && let Some(newline) = text[start..end].rfind('\n')
+            && newline > 0
+        {
+            end = start + newline + 1;
+        }
+        chunks.push(text[start..end].to_owned());
+        start = end;
+    }
+    chunks
 }
 
 /// Largest character boundary at or below `index`.

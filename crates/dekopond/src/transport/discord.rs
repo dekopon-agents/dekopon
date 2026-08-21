@@ -25,7 +25,7 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         InboundMessage, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, floor_boundary,
+        bound_inbound, floor_boundary, split_message,
     },
 };
 
@@ -50,6 +50,8 @@ const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_ACTIVITY_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
+/// How many published rate-limit deadlines one Create Message waits out before sending anyway.
+const MAX_REST_COOLDOWN_WAITS: u8 = 2;
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 const FATAL_GATEWAY_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
@@ -114,6 +116,7 @@ impl DiscordTransport {
                 http,
                 production,
                 rest_lock: Mutex::new(()),
+                rest_cooldown_until: std::sync::Mutex::new(None),
                 activity_cooldown_until: std::sync::Mutex::new(None),
             }),
             gateway_url: None,
@@ -515,7 +518,6 @@ impl DiscordTransport {
             channel: channel_id.to_owned(),
             thread: None,
             conversation_id: channel_id.to_owned(),
-            message_id: message_id.to_owned(),
             text,
             assets,
             conversation,
@@ -623,8 +625,17 @@ pub(crate) struct DiscordReplier {
     token: Redacted<String>,
     http: reqwest::Client,
     production: bool,
-    /// Serializes Create Message calls so reactive rate-limit waits cannot race each other.
+    /// Serializes REST requests so reactive rate-limit waits cannot race each other.
+    ///
+    /// Held across one request and nothing else. Sleeping under it made one throttled or multi-chunk
+    /// reply block every other session's answer, and a model waiting on `fetch_chat_asset`, for as
+    /// long as [`MAX_RATE_LIMIT_WAIT`].
     rest_lock: Mutex<()>,
+    /// When Discord's last 429 said Create Message may be tried again.
+    ///
+    /// Published rather than only slept on, so a second reply waits out the same deadline instead of
+    /// spending its own single retry rediscovering it.
+    rest_cooldown_until: std::sync::Mutex<Option<Instant>>,
     /// Typing is cosmetic: a 429 suppresses later pulses until Discord's own retry deadline rather
     /// than sleeping under the final-reply lock or delaying the answer.
     activity_cooldown_until: std::sync::Mutex<Option<Instant>>,
@@ -648,8 +659,15 @@ impl ChatReplier for DiscordReplier {
             {
                 return Err(TransportError::Response);
             }
-            let _guard = self.rest_lock.lock().await;
-            for (index, chunk) in split_message(&text).into_iter().enumerate() {
+            // The REST lock is taken per request rather than per reply. One answer's chunks still
+            // arrive in order because this loop awaits each one, and no second answer can be
+            // posting into the same conversation at the same time — admission control serializes a
+            // conversation against itself. What the reply-wide lock did add was making every other
+            // session, and every attachment refresh, wait out this reply's rate limit.
+            for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS)
+                .into_iter()
+                .enumerate()
+            {
                 let mut body = json!({
                     "content": chunk,
                     "allowed_mentions": {
@@ -762,15 +780,7 @@ impl DiscordReplier {
         let encoded = serde_json::to_vec(body).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
-            let response = self
-                .http
-                .post(&url)
-                .header("authorization", format!("Bot {}", self.token.expose()))
-                .header("content-type", "application/json")
-                .body(encoded.clone())
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            let response = self.post_message(&url, &encoded).await?;
             if response.status().as_u16() == 429 {
                 let bytes = response
                     .bytes()
@@ -790,14 +800,58 @@ impl DiscordReplier {
                         code: "http-429".to_owned(),
                     });
                 }
-                let wait = Duration::from_secs_f64(seconds);
-                tokio::time::sleep(wait).await;
+                // The wait itself happens in `post_message`, outside the REST lock.
+                *self
+                    .rest_cooldown_until
+                    .lock()
+                    .expect("Discord REST cooldown") =
+                    Some(Instant::now() + Duration::from_secs_f64(seconds));
                 retried = true;
                 continue;
             }
             decode(response).await.map(|_| ())?;
             return Ok(());
         }
+    }
+
+    /// Sends one Create Message, serialized against this transport's other REST calls.
+    ///
+    /// The lock covers the request and nothing else. Any rate-limit wait is served *before* it is
+    /// taken, so a throttled reply holds up neither another session's answer nor a mid-prompt
+    /// attachment refresh.
+    async fn post_message(
+        &self,
+        url: &str,
+        encoded: &[u8],
+    ) -> Result<reqwest::Response, TransportError> {
+        // Bounded rather than a wait loop: at most one deadline is outstanding when the call
+        // arrives, and at most one more can be published while it queues on the lock. Past that it
+        // sends and lets Discord answer, because a reply parked forever is not an improvement on a
+        // reply that is refused.
+        for _ in 0..MAX_REST_COOLDOWN_WAITS {
+            let Some(wait) = self.rest_cooldown() else {
+                break;
+            };
+            tokio::time::sleep(wait).await;
+        }
+        let _guard = self.rest_lock.lock().await;
+        self.http
+            .post(url)
+            .header("authorization", format!("Bot {}", self.token.expose()))
+            .header("content-type", "application/json")
+            .body(encoded.to_vec())
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))
+    }
+
+    /// How long Discord's last 429 still asks Create Message to wait, if at all.
+    fn rest_cooldown(&self) -> Option<Duration> {
+        let until = (*self
+            .rest_cooldown_until
+            .lock()
+            .expect("Discord REST cooldown"))?;
+        until.checked_duration_since(Instant::now())
     }
 
     fn allows_asset_url(&self, raw: &str) -> bool {
@@ -885,17 +939,20 @@ impl DiscordReplier {
         if !is_snowflake(channel_id) || !is_snowflake(message_id) || !is_snowflake(attachment_id) {
             return Err(TransportError::Response);
         }
-        let _guard = self.rest_lock.lock().await;
-        let response = self
-            .http
-            .get(format!(
-                "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}",
-                self.endpoint
-            ))
-            .header("authorization", format!("Bot {}", self.token.expose()))
-            .send()
-            .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        // Serialized with the reply path, but only for the request: reading the body back is this
+        // session's own business and no other caller's rate limit.
+        let response = {
+            let _guard = self.rest_lock.lock().await;
+            self.http
+                .get(format!(
+                    "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}",
+                    self.endpoint
+                ))
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?
+        };
         let body = decode(response).await?;
         let url = body["attachments"]
             .as_array()
@@ -953,39 +1010,6 @@ fn pending_assets(
             }
         })
         .collect()
-}
-
-fn split_message(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return vec!["[empty response]".to_owned()];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let rest = &text[start..];
-        // Discord enforces this in its UTF-16 implementation. Counting scalar values would let a
-        // chunk of 2,000 astral emoji through as 4,000 UTF-16 code units and get the whole answer
-        // rejected.
-        let mut units = 0;
-        let mut end = text.len();
-        for (index, character) in rest.char_indices() {
-            let next = units + character.len_utf16();
-            if next > MAX_MESSAGE_CHARS {
-                end = start + index;
-                break;
-            }
-            units = next;
-        }
-        if end < text.len()
-            && let Some(newline) = text[start..end].rfind('\n')
-            && newline > 0
-        {
-            end = start + newline + 1;
-        }
-        chunks.push(text[start..end].to_owned());
-        start = end;
-    }
-    chunks
 }
 
 fn is_snowflake(value: &str) -> bool {
@@ -1134,7 +1158,8 @@ mod unit_tests {
     use std::time::Duration;
 
     use super::{
-        DiscordTransport, SessionStarts, allowed_asset_url, gateway_url, is_fatal, split_message,
+        DiscordTransport, MAX_MESSAGE_CHARS, SessionStarts, allowed_asset_url, gateway_url,
+        is_fatal, split_message,
     };
     use crate::{config::ActivityMode, transport::TransportError};
     use tokio::time::Instant;
@@ -1202,7 +1227,7 @@ mod unit_tests {
     #[test]
     fn long_answers_split_without_losing_text() {
         let answer = format!("{}\n{}", "a".repeat(1_999), "🦀".repeat(2_001));
-        let chunks = split_message(&answer);
+        let chunks = split_message(&answer, MAX_MESSAGE_CHARS);
         assert!(
             chunks
                 .iter()

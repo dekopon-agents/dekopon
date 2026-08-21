@@ -39,8 +39,8 @@ use crate::{
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ModelFactory, SessionError, SessionGate, SessionRunner,
-        UNAUTHORIZED_REPLY, run_session,
+        BUSY_REPLY, FAILURE_REPLY, ModelCache, ModelFactory, SessionError, SessionGate,
+        SessionRunner, SharedModel, UNAUTHORIZED_REPLY, run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
@@ -599,6 +599,67 @@ fn informational_inventory_omits_agent_instructions() {
     assert!(!encoded.contains("instructions"), "{encoded}");
 }
 
+#[tokio::test]
+async fn a_failed_report_names_a_category_and_names_a_timeout_apart_from_one() {
+    // Reporting is informational and never retried, so this line is the whole record of it. Without
+    // a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
+    // gone", which is exactly the triage the report exists for.
+    use dekopon_broker_protocol::ClientError;
+
+    assert_eq!(crate::report_failure(Ok(Ok(()))), None);
+    assert_eq!(
+        crate::report_failure(Ok(Err(ClientError::UnsafeSocket))),
+        Some("unsafe-socket")
+    );
+    assert_eq!(
+        crate::report_failure(Ok(Err(ClientError::ServerIdentity {
+            expected: 501,
+            actual: 0
+        }))),
+        Some("server-identity")
+    );
+    let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .expect_err("a zero deadline elapses");
+    assert_eq!(
+        crate::report_failure(Err(elapsed)),
+        Some("timeout"),
+        "a broker that answered too slowly is not a broker that refused"
+    );
+}
+
+#[test]
+fn every_broker_client_failure_has_its_own_category() {
+    // A category is only triage if two different failures are two different values.
+    use dekopon_broker_protocol::ClientError;
+    use std::{collections::BTreeSet, io};
+
+    let categories = [
+        ClientError::SocketMetadata {
+            source: io::Error::from(io::ErrorKind::NotFound),
+        },
+        ClientError::UnsafeSocket,
+        ClientError::ConnectTimeout,
+        ClientError::Connect {
+            source: io::Error::from(io::ErrorKind::ConnectionRefused),
+        },
+        ClientError::PeerCredentials {
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        },
+        ClientError::ServerIdentity {
+            expected: 501,
+            actual: 0,
+        },
+        ClientError::UnexpectedResponse,
+    ]
+    .iter()
+    .map(crate::client_error_category)
+    .collect::<BTreeSet<_>>();
+
+    assert_eq!(categories.len(), 7);
+    assert!(!categories.contains("timeout"), "{categories:?}");
+}
+
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
     load(directory, document)
         .await
@@ -931,6 +992,8 @@ struct ModelScript {
     /// serialized one, and every value compared here is computed in this binary.
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
+    /// How many times a client was constructed for this script, which is the sharing assertion.
+    builds: AtomicUsize,
     forbidden: bool,
 }
 
@@ -947,6 +1010,7 @@ impl ModelScript {
             tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            builds: AtomicUsize::new(0),
             forbidden: false,
         })
     }
@@ -960,12 +1024,17 @@ impl ModelScript {
             tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            builds: AtomicUsize::new(0),
             forbidden: true,
         })
     }
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    fn builds(&self) -> usize {
+        self.builds.load(Ordering::SeqCst)
     }
 
     fn tool_names(&self, index: usize) -> Vec<String> {
@@ -1013,8 +1082,9 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(ScriptedModel(Arc::clone(self))))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(ScriptedModel(Arc::clone(self))))
     }
 }
 
@@ -1353,7 +1423,6 @@ fn message(text: &str) -> InboundMessage {
         channel: "dev".to_owned(),
         thread: None,
         conversation_id: "dev".to_owned(),
-        message_id: "1".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
         conversation: ConversationKind::DirectMessage,
@@ -1393,7 +1462,7 @@ fn runner_tracking(
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
         broker,
-        models,
+        models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
@@ -1454,8 +1523,8 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(BlockedHandle(Arc::clone(self))))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(BlockedHandle(Arc::clone(self))))
     }
 }
 
@@ -2306,6 +2375,66 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_client_serves_every_message_routed_to_the_same_model() {
+    // A model client owns an HTTP agent and its connection pool, so a client per message paid a
+    // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
+    // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    for text in ["what broke?", "and the second one?"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(models.requests(), 2, "both messages reached the model");
+    assert_eq!(
+        models.builds(),
+        1,
+        "the second message reused the first message's client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_configured_models_never_share_one_client() {
+    // The key is the configured name the loader already proved unique. Two endpoints sharing a
+    // client would send one route's messages to the other's host.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("from one"), answer("from the other")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut second = model_config();
+    if let ModelConfig::OpenaiCompatible { name, .. } = &mut second {
+        *name = "another-endpoint".to_owned();
+    }
+
+    for model in [model_config(), second] {
+        run_session(
+            Arc::clone(&runner),
+            route(model),
+            message("who answers?"),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.builds(),
+        2,
+        "each configured model built its own client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_senders_in_one_conversation_never_see_each_others_history() {
     // In a shared channel this is not a hypothetical. The admission key deliberately has no subject
     // in it; the history key deliberately does, and this is the difference that makes.
@@ -2495,7 +2624,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
         Err(SessionError::Model(ModelError::NoChoices))
     }
 }
@@ -2938,8 +3067,8 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(Self))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(Self))
     }
 }
 
@@ -5151,6 +5280,127 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
+    // The lock is there to serialize requests, not to serialize waiting. Held across the 429 sleep,
+    // one throttled reply stalled every other session's answer and any model waiting on
+    // `fetch_chat_asset` for as long as Discord asked this one reply to wait.
+    let cdn = spawn_raw_http_mock(|path| match path {
+        "/fresh/document" => (200, "application/pdf", b"fresh pdf bytes".to_vec()),
+        _ => (404, "application/json", br#"{"code":404}"#.to_vec()),
+    });
+    let channel_id = "200000000000000007";
+    let message_id = "300000000000000007";
+    let attachment_id = "400000000000000007";
+    let mut event = discord_message(
+        message_id,
+        channel_id,
+        None,
+        DISCORD_USER,
+        false,
+        "read this",
+    );
+    event["attachments"] = json!([{
+        "id": attachment_id,
+        "filename": "retained.pdf",
+        "content_type": "application/pdf",
+        "size": 15,
+        "url": format!("{}/expired/document", cdn.base)
+    }]);
+    let socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let gateway_url = socket.url.clone();
+    let fresh_url = format!("{}/fresh/document", cdn.base);
+    let posts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&posts);
+    let http = spawn_raw_http_mock(move |path| match path {
+        "/api/v10/gateway/bot" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "url": gateway_url,
+                "shards": 1,
+                "session_start_limit": {
+                    "total": 1000,
+                    "remaining": 999,
+                    "reset_after": 60_000,
+                    "max_concurrency": 1
+                }
+            }))
+            .expect("Gateway response serializes"),
+        ),
+        "/api/v10/channels/200000000000000007/messages" => {
+            // One second is long enough that the refresh below could not have finished after it by
+            // accident, and short enough to keep the test quick.
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                (
+                    429,
+                    "application/json",
+                    br#"{"retry_after":1.0,"global":false}"#.to_vec(),
+                )
+            } else {
+                (200, "application/json", b"{}".to_vec())
+            }
+        }
+        "/api/v10/channels/200000000000000007/messages/300000000000000007" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "id": "300000000000000007",
+                "attachments": [{"id": "400000000000000007", "url": fresh_url}]
+            }))
+            .expect("message response serializes"),
+        ),
+        _ => (404, "application/json", br#"{"code":10008}"#.to_vec()),
+    });
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+    let message = next_message(&mut transport).await;
+    let source = message.assets[0]
+        .source
+        .clone()
+        .expect("attachment has a source");
+    let replier = transport.replier();
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Discord has an asset fetcher");
+
+    let reply = tokio::spawn(async move {
+        replier
+            .reply(
+                ReplyTarget::Discord {
+                    channel_id: "200000000000000007".to_owned(),
+                    reply_to: None,
+                },
+                "throttled".to_owned(),
+            )
+            .await
+            .expect("the bounded retry still succeeds");
+        Instant::now()
+    });
+    // The wait only exists once Discord has answered 429, so the refresh has to start after that.
+    while posts.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let bytes = fetcher
+        .fetch(&source, 1024)
+        .await
+        .expect("the expired URL is refreshed while the reply is waiting out its rate limit");
+    let refreshed = Instant::now();
+    assert_eq!(bytes, b"fresh pdf bytes");
+    let replied = reply.await.expect("the reply task finishes");
+    assert!(
+        refreshed < replied,
+        "the attachment refresh must not queue behind the reply's rate-limit sleep"
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "the reply was retried once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn discord_refreshes_an_expired_signed_attachment_url_before_fetching_the_file() {
     let cdn = spawn_raw_http_mock(|path| match path {
         "/fresh/document" => (200, "application/pdf", b"fresh pdf bytes".to_vec()),
@@ -5696,6 +5946,111 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
+    // `sendMessage` refuses text over 4,096 UTF-16 units, and the gateway's own outbound bound is
+    // twice that. Before splitting, an ordinary long answer was rejected in full and the person who
+    // asked heard nothing at all.
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [
+                {"update_id": 400, "message": telegram_chat_message(-1001, "supergroup", 16034700182_i64, false, 21, "@dekopon_bot summarize")}
+            ]});
+        }
+        if path.contains("sendMessage") {
+            return json!({"ok": true, "result": true});
+        }
+        json!({"ok": true, "result": []})
+    });
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("Telegram connects");
+    let message = next_message(&mut transport).await;
+
+    // Astral characters are the case a scalar-value count gets wrong: 3,000 crabs are 6,000 UTF-16
+    // code units, so a splitter counting characters would post one message Telegram refuses.
+    let long = format!("{}\n{}", "a".repeat(2_000), "🦀".repeat(3_000));
+    transport
+        .replier()
+        .reply(message.reply, long.clone())
+        .await
+        .expect("a long answer is delivered");
+
+    let sent = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path.contains("sendMessage"))
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).expect("reply body is JSON"))
+        .collect::<Vec<_>>();
+    assert!(sent.len() > 1, "the answer needed more than one message");
+    assert!(
+        sent.iter().all(|body| body["text"]
+            .as_str()
+            .expect("each chunk carries text")
+            .encode_utf16()
+            .count()
+            <= 4_096),
+        "every chunk is inside Telegram's UTF-16 ceiling"
+    );
+    let rejoined = sent
+        .iter()
+        .map(|body| body["text"].as_str().unwrap_or_default())
+        .collect::<String>();
+    assert_eq!(
+        rejoined, long,
+        "splitting loses nothing and reorders nothing"
+    );
+    assert_eq!(
+        sent[0]["reply_to_message_id"], 21,
+        "the first chunk quotes the message it answers"
+    );
+    assert!(
+        sent[1..]
+            .iter()
+            .all(|body| body["reply_to_message_id"].is_null()),
+        "a continuation must not draw a second reply arrow"
+    );
+}
+
+#[test]
+fn a_chunk_never_splits_a_character_and_prefers_a_line_break() {
+    // The ceiling is in UTF-16 code units, and a chunk boundary is still a character boundary: an
+    // astral character straddling one would be two halves of a replacement glyph in both clients.
+    let text = format!("{}\n{}", "a".repeat(100), "🦀".repeat(2_048));
+    let chunks = crate::transport::split_message(&text, 4_096);
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunks[0],
+        format!("{}\n", "a".repeat(100)),
+        "the split fell on the newline rather than mid-line"
+    );
+    assert_eq!(chunks.concat(), text);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk.encode_utf16().count() <= 4_096)
+    );
+}
+
+#[test]
+fn an_empty_answer_still_becomes_one_post() {
+    // Every chat service refuses an empty message. Saying so is better than a silent failure the
+    // sender reads as the bot ignoring them.
+    assert_eq!(
+        crate::transport::split_message("", 4_096),
+        vec!["[empty response]".to_owned()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
     // chat: consecutive messages continue one exchange, and a group is not the private chat.
@@ -5781,9 +6136,9 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         first.conversation_id, second.conversation_id,
         "two requests on one connection continue one conversation"
     );
-    assert_ne!(
-        first.message_id, second.message_id,
-        "each request is still its own message"
+    assert_eq!(
+        second.text, "second",
+        "two requests on one connection are still two messages"
     );
     assert_eq!(named.conversation_id, "session-7");
 }

@@ -249,6 +249,8 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 
 Messages from bots are dropped. A private chat is a direct message; a group is a channel. Subject: `telegram.<user id>`.
 
+`sendMessage` refuses text over 4,096 UTF-16 code units, which is half the gateway's own outbound bound, so an answer is split losslessly across sequential messages the same way Discord's is. Only the first quotes the incoming message; the topic identifier goes on every one, because it is what keeps a continuation in the same forum topic.
+
 Telegram's optional `message_thread_id` is preserved consistently in admission, conversation
 identity, replies, and activity, so a forum-topic pulse cannot appear in another topic. With
 `activity.mode: native`, an authorized session sends `sendChatAction(action=typing)` and renews

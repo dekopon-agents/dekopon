@@ -324,7 +324,6 @@ impl SlackTransport {
                 SlackExperience::Classic => thread_ts,
             },
             conversation_id,
-            message_id: ts.to_owned(),
             text,
             assets,
             conversation,

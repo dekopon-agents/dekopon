@@ -107,7 +107,6 @@ impl LocalTransport {
                     let _ = writer.flush().await;
                 }
             });
-            let mut sequence = 0_u64;
             loop {
                 let mut line = Vec::new();
                 reader.set_limit(MAX_LINE_BYTES);
@@ -138,7 +137,6 @@ impl LocalTransport {
                     );
                     continue;
                 };
-                sequence += 1;
                 let message = InboundMessage {
                     transport: name.clone(),
                     subject: request.subject,
@@ -149,7 +147,6 @@ impl LocalTransport {
                     // has no threads, and the connection number would restart the conversation
                     // every time a developer reconnected.
                     conversation_id: request.channel,
-                    message_id: format!("{connection}-{sequence}"),
                     text: bound_inbound(&request.text),
                     // The development transport speaks line-delimited JSON and carries no files.
                     assets: Vec::new(),

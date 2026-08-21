@@ -61,7 +61,7 @@ use crate::{
     asset::AssetStore,
     conversation::ConversationStore,
     routes::RoutingTable,
-    session::{ConfiguredModels, STOPPED_REPLY, SessionGate, SessionRunner},
+    session::{ConfiguredModels, ModelCache, STOPPED_REPLY, SessionGate, SessionRunner},
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
         SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
@@ -155,14 +155,18 @@ where
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
     );
-    match timeout(
-        STATUS_REPORT_TIMEOUT,
-        broker_client.publish_agent_inventory(inventory),
-    )
-    .await
-    {
-        Ok(Ok(())) => tracing::info!(event = "gateway_agent_inventory_reported"),
-        Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_agent_inventory_report_failed"),
+    match report_failure(
+        timeout(
+            STATUS_REPORT_TIMEOUT,
+            broker_client.publish_agent_inventory(inventory),
+        )
+        .await,
+    ) {
+        None => tracing::info!(event = "gateway_agent_inventory_reported"),
+        Some(category) => tracing::warn!(
+            event = "gateway_agent_inventory_report_failed",
+            category = category
+        ),
     }
 
     let mut transports = Vec::with_capacity(config.transports.len());
@@ -206,7 +210,7 @@ where
     ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
-        models: Arc::new(ConfiguredModels),
+        models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
@@ -398,14 +402,18 @@ async fn report_status(
                     broker.frame,
                 ) {
                     Ok(client) => client,
-                    Err(_) => {
-                        tracing::warn!(event = "gateway_usage_report_failed");
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "gateway_usage_report_failed",
+                            category = client_error_category(&error)
+                        );
                         continue;
                     }
                 };
-                match timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_usage_report_failed"),
+                if let Some(category) = report_failure(
+                    timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await,
+                ) {
+                    tracing::warn!(event = "gateway_usage_report_failed", category = category);
                 }
             }
             _ = heartbeat.tick() => {
@@ -415,22 +423,65 @@ async fn report_status(
                     broker.frame,
                 ) {
                     Ok(client) => client,
-                    Err(_) => {
-                        tracing::warn!(event = "gateway_agent_inventory_report_failed");
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "gateway_agent_inventory_report_failed",
+                            category = client_error_category(&error)
+                        );
                         continue;
                     }
                 };
-                match timeout(
-                    STATUS_REPORT_TIMEOUT,
-                    client.publish_agent_inventory(inventory.clone()),
-                ).await {
-                    Ok(Ok(())) => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(event = "gateway_agent_inventory_report_failed")
-                    }
+                match report_failure(
+                    timeout(
+                        STATUS_REPORT_TIMEOUT,
+                        client.publish_agent_inventory(inventory.clone()),
+                    ).await,
+                ) {
+                    None => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
+                    Some(category) => tracing::warn!(
+                        event = "gateway_agent_inventory_report_failed",
+                        category = category
+                    ),
                 }
             }
         }
+    }
+}
+
+/// Why one bounded report attempt did not land, or [`None`] when it did.
+///
+/// Reporting is informational and never retried, so the log line is the whole record of it. Without
+/// a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
+/// gone", which is the triage the report exists for.
+fn report_failure(
+    result: Result<Result<(), dekopon_broker_protocol::ClientError>, tokio::time::error::Elapsed>,
+) -> Option<&'static str> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(client_error_category(&error)),
+        // Distinct from every client failure: the broker was reachable and simply did not answer
+        // inside [`STATUS_REPORT_TIMEOUT`], which is a busy broker rather than a missing one.
+        Err(_) => Some("timeout"),
+    }
+}
+
+/// Stable low-cardinality category for a broker client failure, never its message.
+///
+/// [`dekopon_broker_protocol::ClientError`] carries socket paths and bounded remote text, and
+/// `docs/observability.md` keeps both out of exported telemetry. Matched exhaustively so a new
+/// variant has to be given a name here rather than silently arriving as "other".
+fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'static str {
+    use dekopon_broker_protocol::ClientError;
+    match error {
+        ClientError::SocketMetadata { .. } => "socket-metadata",
+        ClientError::UnsafeSocket => "unsafe-socket",
+        ClientError::ConnectTimeout => "connect-timeout",
+        ClientError::Connect { .. } => "connect",
+        ClientError::PeerCredentials { .. } => "peer-credentials",
+        ClientError::ServerIdentity { .. } => "server-identity",
+        ClientError::Protocol(_) => "protocol",
+        ClientError::Remote { .. } => "remote",
+        ClientError::UnexpectedResponse => "unexpected-response",
     }
 }
 

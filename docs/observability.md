@@ -193,6 +193,12 @@ emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-s
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
 
+The informational broker reports behind the web UI are never retried, so their warning is the whole
+record of a failure. `gateway_agent_inventory_report_failed` and `gateway_usage_report_failed` carry
+a stable `category` — `unsafe-socket`, `connect`, `protocol`, `remote`, and the rest of the broker
+client's failure surface, with `timeout` reserved for a broker that did not answer inside the
+two-second report deadline. Stale inventory in the web UI is then a log query rather than a guess.
+
 ### What conversation history changes
 
 A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —

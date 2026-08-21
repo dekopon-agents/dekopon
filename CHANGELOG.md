@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- `dekopond` now builds one model client per configured model instead of one per message, so a
+  routed message no longer pays a fresh TCP and TLS handshake to the model endpoint before its
+  first token. Prompt cache keys and completion options remain per-request.
+
 ### Fixed
 
 - Bounded every Slack Socket Mode read, and opening a socket, with a 90-second liveness deadline,
@@ -17,6 +23,12 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dekopond` now exits non-zero when every chat transport has ended without a requested shutdown,
   and re-announces individually dead transports as `gateway_transports_degraded` on an interval
   instead of logging them once.
+- Telegram answers longer than 4,096 UTF-16 characters are now split losslessly across sequential
+  messages instead of being rejected whole, which left the sender with no reply at all.
+- Discord no longer holds its REST lock across a rate-limit wait, so one throttled reply stops
+  delaying other sessions' answers and mid-session attachment refreshes.
+- Gateway broker report failures now log a stable `category`, with `timeout` distinguished from a
+  client failure, on both `gateway_agent_inventory_report_failed` and `gateway_usage_report_failed`.
 
 ## [0.9.0] - 2026-08-20
 

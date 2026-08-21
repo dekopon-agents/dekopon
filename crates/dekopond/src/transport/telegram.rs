@@ -17,12 +17,17 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         InboundMessage, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, floor_boundary,
+        bound_inbound, floor_boundary, split_message,
     },
 };
 
 /// Ceiling on one attachment's file name.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
+/// `sendMessage`'s text ceiling, which the Bot API counts in UTF-16 code units.
+///
+/// Below the gateway's own 8 KiB outbound bound, so a normal long answer is two or three posts
+/// rather than a rejected one.
+const MAX_MESSAGE_UNITS: usize = 4_096;
 
 /// Server-side wait per poll, in seconds. Telegram's own ceiling is fifty.
 const POLL_SECONDS: u64 = 50;
@@ -170,7 +175,6 @@ impl TelegramTransport {
             channel: chat_id.to_string(),
             thread: message_thread_id.map(|thread| thread.to_string()),
             conversation_id,
-            message_id: message_id.to_string(),
             text: bound_inbound(text),
             assets,
             conversation,
@@ -468,26 +472,39 @@ impl ChatReplier for TelegramReplier {
             else {
                 return Err(TransportError::Response);
             };
-            let mut body = json!({ "chat_id": chat_id, "text": text });
-            if let Some(reply_to) = reply_to {
-                body["reply_to_message_id"] = json!(reply_to);
+            // The gateway's outbound bound is 8 KiB, which is twice what `sendMessage` accepts, so
+            // an ordinary long answer used to be rejected whole and the sender heard nothing at
+            // all. Only the first chunk quotes the inbound message; repeating the reference would
+            // draw one reply arrow per chunk. The topic goes on every chunk, because it is what
+            // keeps the continuation in the same forum topic rather than in the general one.
+            for (index, chunk) in split_message(&text, MAX_MESSAGE_UNITS)
+                .into_iter()
+                .enumerate()
+            {
+                let mut body = json!({ "chat_id": chat_id, "text": chunk });
+                if index == 0
+                    && let Some(reply_to) = reply_to
+                {
+                    body["reply_to_message_id"] = json!(reply_to);
+                }
+                if let Some(message_thread_id) = message_thread_id {
+                    body["message_thread_id"] = json!(message_thread_id);
+                }
+                let response = self
+                    .http
+                    .post(format!(
+                        "{}/bot{}/sendMessage",
+                        self.endpoint,
+                        self.token.expose()
+                    ))
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
+                    .send()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                decode(response).await?;
             }
-            if let Some(message_thread_id) = message_thread_id {
-                body["message_thread_id"] = json!(message_thread_id);
-            }
-            let response = self
-                .http
-                .post(format!(
-                    "{}/bot{}/sendMessage",
-                    self.endpoint,
-                    self.token.expose()
-                ))
-                .header("content-type", "application/json")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            decode(response).await.map(|_| ())
+            Ok(())
         })
     }
 }
