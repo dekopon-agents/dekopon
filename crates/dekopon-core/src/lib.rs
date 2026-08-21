@@ -12,7 +12,6 @@ mod telemetry_payloads;
 
 use std::{fmt, str::FromStr};
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
@@ -169,7 +168,8 @@ fn validate_identifier(value: &str, kind: &'static str) -> Result<(), Identifier
 macro_rules! identifier {
     ($name:ident, $label:literal, $docs:literal) => {
         #[doc = $docs]
-        #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -261,7 +261,8 @@ identifier!(
 );
 
 /// The authenticated actor responsible for an operation.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Actor {
     /// A human operator.
@@ -282,9 +283,8 @@ pub enum Actor {
 }
 
 /// Coarse risk classification used as policy input.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RiskLevel {
     /// No expected external side effect and limited data exposure.
@@ -304,9 +304,8 @@ impl fmt::Display for RiskLevel {
 }
 
 /// Operational phase reported for an agent.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum AgentStatus {
     /// Configuration intentionally prevents the agent from running.

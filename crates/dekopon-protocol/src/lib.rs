@@ -15,13 +15,11 @@ use std::{collections::BTreeMap, fmt};
 use dekopon_capability::{EffectKind, Idempotency, Permission};
 pub use dekopon_core::AgentStatus;
 use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// API version supported by this crate.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ApiVersion {
     /// Initial alpha resource format.
     #[serde(rename = "dekopon.dev/v1alpha1")]
@@ -37,9 +35,8 @@ impl fmt::Display for ApiVersion {
 }
 
 /// Resource kind discriminator.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Kind {
     /// An agent resource.
@@ -72,18 +69,9 @@ macro_rules! resource_kind {
         #[doc = $summary]
         ///
         /// Single-variant: any other `kind` fails to decode.
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            Deserialize,
-            Eq,
-            Hash,
-            JsonSchema,
-            Ord,
-            PartialEq,
-            PartialOrd,
-            Serialize,
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
         )]
         #[serde(rename_all = "PascalCase")]
         pub enum $name {
@@ -143,7 +131,8 @@ resource_kind!(
 );
 
 /// Common authored metadata.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ObjectMeta {
     /// Resource name. The configuration loader validates it as the kind-specific ID type.
@@ -165,7 +154,8 @@ impl ObjectMeta {
 }
 
 /// Desired state of an agent.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentSpec {
     /// Concise operator-facing purpose.
@@ -209,7 +199,8 @@ const fn default_enabled() -> bool {
 }
 
 /// A declarative agent resource.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agent {
     /// Resource schema version.
@@ -226,7 +217,8 @@ pub struct Agent {
 }
 
 /// Desired state of a capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CapabilitySpec {
     /// Concise operator-facing purpose.
@@ -248,7 +240,8 @@ pub struct CapabilitySpec {
 ///
 /// Nothing in Dekopon observes provider availability, so every value here came from the catalog
 /// file the CLI is echoing back.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CapabilityStatus {
     /// The declared provider is available.
@@ -266,7 +259,8 @@ impl fmt::Display for CapabilityStatus {
 }
 
 /// A declarative capability resource.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Capability {
     /// Resource schema version.
@@ -283,7 +277,8 @@ pub struct Capability {
 }
 
 /// Desired state of a provider connection.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderSpec {
     /// Concise operator-facing purpose.
@@ -303,7 +298,8 @@ pub struct ProviderSpec {
 ///
 /// Nothing in Dekopon observes provider availability, so every value here came from the catalog
 /// file the CLI is echoing back.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ProviderStatus {
     /// The provider declaration is ready for use.
@@ -321,7 +317,8 @@ impl fmt::Display for ProviderStatus {
 }
 
 /// A declarative provider resource.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Provider {
     /// Resource schema version.
@@ -338,7 +335,8 @@ pub struct Provider {
 }
 
 /// Versioned agent-list response.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentList {
     /// Resource schema version.
@@ -362,7 +360,8 @@ impl AgentList {
 }
 
 /// Versioned capability-list response.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CapabilityList {
     /// Resource schema version.
@@ -386,7 +385,8 @@ impl CapabilityList {
 }
 
 /// Versioned provider-list response.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderList {
     /// Resource schema version.
@@ -415,7 +415,6 @@ mod tests {
 
     use dekopon_capability::{EffectKind, Idempotency};
     use dekopon_core::{AgentStatus, ProviderId, RiskLevel};
-    use schemars::schema_for;
 
     use super::{
         Agent, AgentKind, AgentSpec, ApiVersion, Capability, CapabilityKind, CapabilitySpec,
@@ -537,9 +536,10 @@ spec:
         assert!(error.to_string().contains("unknown field `permisssions`"));
     }
 
+    #[cfg(feature = "schemars")]
     #[test]
     fn generates_json_schema() {
-        let schema = schema_for!(Agent);
+        let schema = schemars::schema_for!(Agent);
         let encoded = serde_json::to_value(schema).expect("schema serializes");
         assert_eq!(encoded["title"], "Agent");
     }
