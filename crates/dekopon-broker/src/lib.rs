@@ -2589,10 +2589,24 @@ where
         })
     }
 
-    /// Returns only capabilities policy allows for this exact authenticated context.
+    /// The constraint sets policy allows this exact context, one Cedar evaluation each.
     ///
-    /// The listing and the invocation decision come from the same evaluation, so a capability can
-    /// never appear here and then refuse — or be hidden here and then succeed.
+    /// Every listing filters this same list. That is what makes a listing identical to the
+    /// decision an invocation would receive: there is only ever one evaluation to disagree with.
+    fn authorized_sets(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> Vec<(&CapabilityId, &ConstraintSet)> {
+        self.constraints
+            .iter()
+            .filter(|(capability, set)| {
+                !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && self.authorize_capability(context, capability, set).allowed
+            })
+            .collect()
+    }
+
     /// Returns the command words this context may use.
     ///
     /// A word appears only when policy allows this context at least one capability of the provider
@@ -2600,15 +2614,17 @@ where
     /// principal granted nothing sees an empty vocabulary rather than a map of the deployment.
     #[must_use]
     pub fn command_words(&self, context: &AuthenticatedContext) -> Vec<String> {
-        let reachable = self
-            .constraints
+        self.reachable_command_words(context, &self.authorized_sets(context))
+    }
+
+    fn reachable_command_words(
+        &self,
+        context: &AuthenticatedContext,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<String> {
+        let reachable = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
-            .map(|(_, set)| set.provider.clone())
+            .map(|(_, set)| &set.provider)
             .collect::<BTreeSet<_>>();
         let storage_providers = self
             .constraints
@@ -2632,7 +2648,7 @@ where
             .into_iter()
             .filter(|(provider, _)| {
                 !reserved_providers.contains(*provider)
-                    && reachable.contains(*provider)
+                    && reachable.contains(provider)
                     && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
             })
             .flat_map(|(_, words)| {
@@ -2694,20 +2710,42 @@ where
         Ok(resolution)
     }
 
+    /// Returns only capabilities policy allows for this exact authenticated context.
+    ///
+    /// The listing and the invocation decision come from the same evaluation, so a capability can
+    /// never appear here and then refuse — or be hidden here and then succeed.
+    #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
-        let mut capabilities = self
-            .constraints
+        self.available_capabilities(&self.authorized_sets(context))
+    }
+
+    /// Returns the capability listing and the command words from one authorization pass.
+    ///
+    /// Both halves of a capabilities answer are policy filters over the same constraint sets, and
+    /// a session opens with one. Computing them separately evaluates every set through Cedar
+    /// twice for identical inputs on the broker's most frequent request.
+    #[must_use]
+    pub fn capability_view(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> (Vec<AvailableCapability>, Vec<String>) {
+        let authorized = self.authorized_sets(context);
+        (
+            self.available_capabilities(&authorized),
+            self.reachable_command_words(context, &authorized),
+        )
+    }
+
+    fn available_capabilities(
+        &self,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<AvailableCapability> {
+        let mut capabilities = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
             .map(|(capability_id, set)| {
                 let (_, manifest_capability) = self
                     .registry
-                    .capabilities()
-                    .find(|(_, capability)| &capability.id == capability_id)
+                    .capability(capability_id)
                     .expect("constraint validation proves every capability route");
                 let mut capability = manifest_capability.clone();
                 capability.effect = set.effect;
@@ -2875,7 +2913,7 @@ where
             );
             return None;
         }
-        Some((self.capabilities(&context), self.command_words(&context)))
+        Some(self.capability_view(&context))
     }
 
     /// Returns a freshly authorized chat surface. Scope refusal reveals no mapping or namespace.
@@ -2897,8 +2935,7 @@ where
                 return None;
             }
         };
-        let mut capabilities = self.capabilities(&context);
-        let mut words = self.command_words(&context);
+        let (mut capabilities, mut words) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
             for identifier in [MEMORY_RECENT, MEMORY_SEARCH] {
@@ -3152,10 +3189,7 @@ where
 
     fn available_capability(&self, capability: &CapabilityId) -> Option<AvailableCapability> {
         let set = self.constraints.get(capability)?;
-        let (_, manifest) = self
-            .registry
-            .capabilities()
-            .find(|(_, candidate)| &candidate.id == capability)?;
+        let (_, manifest) = self.registry.capability(capability)?;
         let mut capability = manifest.clone();
         capability.effect = set.effect;
         capability.risk = set.risk;

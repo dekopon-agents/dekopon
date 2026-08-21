@@ -547,10 +547,8 @@ fn validate_capability_responses<A: AuditLog>(
         // Command words ride in this response, so they count toward the frame bound. Leaving them
         // out would let a provider directory with a large vocabulary pass startup and then fail to
         // serve the very first session.
-        let response = ResponseEnvelope::capabilities(
-            broker.capabilities(&peer.context),
-            broker.command_words(&peer.context),
-        );
+        let (capabilities, command_words) = broker.capability_view(&peer.context);
+        let response = ResponseEnvelope::capabilities(capabilities, command_words);
         let length = encoded_capability_response(&response)?;
         if length > maximum {
             return Err(BrokerdError::CapabilityResponseTooLarge { length, maximum });
