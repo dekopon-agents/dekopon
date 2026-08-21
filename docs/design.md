@@ -186,6 +186,7 @@ Design rules:
 - Lists and rendered resources are deterministically ordered.
 - Protocol types do not depend on a transport.
 - Configuration is parsed once into protocol/domain resources.
+- Validation scans the whole catalog and reports every problem at once. Stopping at the first conflict makes an operator rediscover the next one after every fix.
 - A future network API must document negotiation and field-preservation rules before relaxing strict decoding.
 - Alpha resources may evolve, but changes must update examples, round-trip tests, schemas, and operator documentation together.
 
