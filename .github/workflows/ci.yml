@@ -172,6 +172,11 @@ jobs:
   msrv:
     name: test (Rust 1.89.0)
     runs-on: ubuntu-24.04
+    # rust-toolchain.toml pins `channel = "stable"`, which outranks the `rustup default`
+    # the toolchain action sets, so this job silently built on stable until 2026-08.
+    # RUSTUP_TOOLCHAIN outranks the toolchain file and is what actually holds the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -179,6 +184,27 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: 1.89.0
+      - name: Verify the MSRV toolchain is in effect
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=1.89.0
+          actual=$(rustc --version | cut -d' ' -f2)
+          if [ "$actual" != "$expected" ]; then
+            printf 'MSRV gate is not binding: expected rustc %s, got %s\n' "$expected" "$actual" >&2
+            rustup show >&2
+            exit 1
+          fi
+      - name: Verify the declared MSRV matches this job
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=1.89.0
+          declared=$(sed -ne 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$declared" != "$expected" ]; then
+            printf 'workspace rust-version is %s but this job pins %s; update both\n' "$declared" "$expected" >&2
+            exit 1
+          fi
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:

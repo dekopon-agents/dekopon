@@ -7,6 +7,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Held the `test (Rust 1.89.0)` job to the MSRV it names. `rust-toolchain.toml` pins `channel =
+  "stable"`, which outranks the `rustup default` the toolchain action sets, so the job installed
+  1.89.0, used it only for a cache key, and then compiled on current stable. It now exports
+  `RUSTUP_TOOLCHAIN` and fails loudly if the effective `rustc` or the workspace `rust-version`
+  drifts from the pin.
+
 ## [0.10.0] - 2026-08-22
 
 ### Added
