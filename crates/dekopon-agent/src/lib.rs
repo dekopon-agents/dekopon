@@ -27,8 +27,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use std::{
-    collections::BTreeMap,
     collections::hash_map::RandomState,
+    collections::{BTreeMap, BTreeSet},
     hash::{BuildHasher as _, Hasher as _},
     sync::atomic::{AtomicU32, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -121,6 +121,25 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
                 .is_some_and(|broker| broker.is_granted(capability))
     }
 
+    // Both membership queries ask each leg rather than merging the legs' lists and searching the
+    // merge. Dispatch asks them per command word, so building, extending, sorting, and deduping
+    // two `Vec<String>` here made a loop of a thousand commands do it a thousand times.
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.direct.grants_namespace(namespace)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.grants_namespace(namespace))
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.direct.has_command_word(word)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.has_command_word(word))
+    }
+
     fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
         self.direct.describe(capability).or_else(|| {
             self.broker
@@ -186,6 +205,12 @@ pub enum BrokerLegError {
     /// A unique session identifier could not be derived.
     #[error("could not derive a unique identifier for this broker session")]
     SessionIdentifier(#[source] IdentifierError),
+    /// The broker's capability snapshot named the same capability more than once.
+    #[error("the broker answered with duplicate capability identifiers: {capabilities}")]
+    DuplicateCapabilities {
+        /// Every repeated identifier, in identifier order.
+        capabilities: String,
+    },
 }
 
 /// The on-behalf-of claim an attested leg attaches to every call it makes.
@@ -218,8 +243,16 @@ pub struct BrokerLeg {
     ///
     /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
     /// command word a script runs, and a round trip per word would make the interpreter's cost
-    /// depend on the network rather than on the script.
-    command_words: Vec<String>,
+    /// depend on the network rather than on the script. A set rather than a list for the same
+    /// reason again: that consultation is a membership test, and a script running thousands of
+    /// commands asks it thousands of times.
+    command_words: BTreeSet<String>,
+    /// Provider namespaces this leg holds a grant in, derived from the capability set.
+    ///
+    /// Only [`CapabilityInvoker::grants_namespace`] reads it, on the path where a word was refused
+    /// — the answer that separates "the model typed nonsense" from "the model keeps reaching for
+    /// something we never granted".
+    namespaces: BTreeSet<String>,
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
@@ -314,13 +347,15 @@ impl BrokerLeg {
         attestation: Option<Attestation>,
         chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
-        let (capabilities, effective_capabilities) = snapshot(available);
+        let (capabilities, effective_capabilities) = snapshot(available)?;
+        let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
             effective_capabilities,
-            command_words,
+            command_words: command_words.into_iter().collect(),
+            namespaces,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
@@ -342,20 +377,53 @@ impl BrokerLeg {
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
     }
+
+    /// This session's trace identifier, which every invocation it makes extends.
+    ///
+    /// It is the join key between an embedding surface's own telemetry and the broker's audit
+    /// records for the same session.
+    #[must_use]
+    pub fn session_trace(&self) -> &TraceId {
+        self.identifiers.trace()
+    }
+}
+
+/// Returns the provider namespace one capability identifier belongs to.
+///
+/// A separator-free identifier is its own namespace, which is how the interpreter reads one too.
+#[cfg(unix)]
+fn namespace_of(capability: &str) -> String {
+    capability
+        .split_once('.')
+        .map_or(capability, |(namespace, _)| namespace)
+        .to_owned()
 }
 
 /// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
+///
+/// A repeated identifier is a refusal rather than a last-wins overwrite, and every repeat is named
+/// at once. The two views are built from one list, so tolerating a duplicate would make `cap
+/// --list` and `inspect_agent_config` disagree about the same session — the broker refuses
+/// duplicate routes at startup, and the client half must not quietly accept the shape the rest of
+/// the system treats as fatal.
 #[cfg(unix)]
 fn snapshot(
     capabilities: Vec<dekopon_broker_protocol::AvailableCapability>,
-) -> (
-    BTreeMap<String, CapabilityDescription>,
-    Vec<EffectiveCapabilityView>,
-) {
+) -> Result<
+    (
+        BTreeMap<String, CapabilityDescription>,
+        Vec<EffectiveCapabilityView>,
+    ),
+    BrokerLegError,
+> {
     let mut descriptions = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
     let mut effective = Vec::with_capacity(capabilities.len());
     for available in capabilities {
         let id = available.capability.id.to_string();
+        if descriptions.contains_key(&id) {
+            duplicates.insert(id.clone());
+        }
         effective.push(EffectiveCapabilityView {
             id: id.clone(),
             provider: available.provider.to_string(),
@@ -373,8 +441,13 @@ fn snapshot(
             },
         );
     }
+    if !duplicates.is_empty() {
+        return Err(BrokerLegError::DuplicateCapabilities {
+            capabilities: duplicates.into_iter().collect::<Vec<_>>().join(", "),
+        });
+    }
     effective.sort_by(|left, right| left.id.cmp(&right.id));
-    (descriptions, effective)
+    Ok((descriptions, effective))
 }
 
 #[cfg(unix)]
@@ -392,7 +465,15 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn command_words(&self) -> Vec<String> {
-        self.command_words.clone()
+        self.command_words.iter().cloned().collect()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.command_words.contains(word)
+    }
+
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
     }
 
     fn resolve_command(
@@ -402,7 +483,7 @@ impl CapabilityInvoker for BrokerLeg {
     ) -> Option<Result<(String, Value), String>> {
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
-        if !self.command_words.iter().any(|candidate| candidate == word) {
+        if !self.command_words.contains(word) {
             return None;
         }
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
@@ -527,6 +608,19 @@ impl CapabilityInvoker for BrokerLeg {
             Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
+            // The proposal reached the broker and its outcome is unknown here: a client-side read
+            // timeout cannot distinguish a `gh.issue.comment` that ran 29s against a 30s deadline
+            // from one that never ran, and `outcome-unaudited` says outright that the effect may
+            // have happened. `Failed` exits 1, which a model reads as "the call errored, try
+            // again" — and a retry carries a fresh invocation identifier, so replay rejection
+            // cannot catch the duplicate external effect. `Denied` (126) is the interpreter's only
+            // non-retryable status, so an unaudited outcome takes it and says why.
+            Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
+                reason: format!(
+                    "the broker did not record an outcome for this invocation and it may already \
+                     have taken effect; do not resubmit it ({error})"
+                ),
+            },
             // Every `ClientError` renders without the socket path, so a script cannot learn where
             // the broker lives — the interpreter refuses to read the process environment, and this
             // is the one path that could otherwise leak `DEKOPON_BROKER_SOCKET` back into it.
@@ -556,9 +650,9 @@ pub struct IdSequence {
 impl IdSequence {
     /// Derives one session's identifier space under `prefix`.
     ///
-    /// The prefix must itself be a valid identifier component (lowercase, `.`/`-`/`_`), because
-    /// the derived trace identifier is validated before use and a bad prefix fails here rather
-    /// than on the first invocation.
+    /// The prefix must itself be a valid identifier component (lowercase, `.`/`-`/`_`), and short
+    /// enough that the longest identifier derived from it still validates, because a bad prefix
+    /// fails here rather than on the first invocation.
     pub fn new(prefix: &str) -> Result<Self, IdentifierError> {
         let mut hasher = RandomState::new().build_hasher();
         hasher.write_u32(std::process::id());
@@ -569,6 +663,11 @@ impl IdSequence {
                 .unwrap_or_default(),
         );
         let trace = format!("{prefix}-{:016x}", hasher.finish()).parse::<TraceId>()?;
+        // The longest invocation identifier this session could ever derive, checked now rather
+        // than on the first call. A prefix can be short enough for a valid trace and still push
+        // every identifier built from it past the length bound, which would leave a session that
+        // constructed cleanly and then failed every capability call a model committed to.
+        format!("{trace}-{}", u32::MAX).parse::<InvocationId>()?;
         Ok(Self {
             trace,
             next: AtomicU32::new(1),
@@ -689,6 +788,30 @@ mod tests {
     }
 
     #[test]
+    fn membership_queries_agree_with_the_lists_they_replace() {
+        // Dispatch asks these per command word rather than merging both legs' lists and searching
+        // the merge. They have to answer what searching the merge would have answered, from either
+        // leg, including for a leg that overrides neither and is scanned by the default.
+        let invoker = SessionInvoker {
+            direct: FakeLeg::new("echo.echo", "direct"),
+            broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
+        };
+
+        for granted in invoker.granted() {
+            let namespace = granted.split('.').next().expect("a namespace");
+            assert!(invoker.grants_namespace(namespace), "{granted}");
+        }
+        assert!(invoker.grants_namespace("echo"));
+        assert!(invoker.grants_namespace("http-probe"));
+        assert!(!invoker.grants_namespace("gh"));
+        assert!(!invoker.grants_namespace("ech"));
+
+        // Neither `FakeLeg` contributes command words, so nothing is one.
+        assert!(invoker.command_words().is_empty());
+        assert!(!invoker.has_command_word("gh"));
+    }
+
+    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         // Omitting the broker leg has to leave a session behaving as direct mode always did, so a
         // local demo or a CI run with no daemon is unaffected.
@@ -707,7 +830,11 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
-        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, path::Path};
+        use std::{
+            collections::{BTreeMap, BTreeSet},
+            os::unix::fs::PermissionsExt as _,
+            path::Path,
+        };
 
         use dekopon_broker_protocol::{
             BrokerClient, BrokerRequest, ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome,
@@ -817,6 +944,10 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                 },
             );
+            let namespaces = capabilities
+                .keys()
+                .map(|id| crate::namespace_of(id))
+                .collect();
             BrokerLeg {
                 client: BrokerClient::new(socket, server_uid(), FrameLimits::default())
                     .expect("stub broker client"),
@@ -830,7 +961,8 @@ mod tests {
                     risk: "Low".to_owned(),
                     idempotency: "idempotent".to_owned(),
                 }],
-                command_words: Vec::new(),
+                command_words: BTreeSet::new(),
+                namespaces,
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
                 chat_memory: None,
@@ -1065,6 +1197,82 @@ mod tests {
             // The prefix reaches identifier validation verbatim, so a bad one must fail here
             // rather than on the first invocation a model already committed to.
             assert!(IdSequence::new("Not A Prefix").is_err());
+        }
+
+        #[tokio::test]
+        async fn a_prefix_only_the_derived_invocations_outgrow_fails_at_construction_too() {
+            // A prefix can leave room for the trace and none for what the trace derives: 235
+            // characters plus the separator and 16 hexadecimal digits is a 252-character trace,
+            // one under the 253-byte identifier bound, while every invocation identifier built
+            // from it is 11 characters longer. Accepting this would hand back a session whose
+            // every capability call fails with "could not derive a unique invocation identifier".
+            let prefix = "a".repeat(235);
+            let trace = format!("{prefix}-{:016x}", 0_u64);
+            assert_eq!(trace.len(), 252, "the trace itself must still be valid");
+            assert!(trace.parse::<dekopon_core::TraceId>().is_ok());
+
+            let Err(error) = IdSequence::new(&prefix) else {
+                panic!("a prefix whose derived identifiers are too long must fail construction");
+            };
+            assert!(
+                matches!(error, dekopon_core::IdentifierError::TooLong { .. }),
+                "{error}"
+            );
+        }
+
+        fn available(id: &str) -> dekopon_broker_protocol::AvailableCapability {
+            serde_json::from_value(json!({
+                "provider": "http-probe",
+                "capability": {
+                    "id": id,
+                    "description": "Fetches one broker-authorized URI",
+                    "effect": "read-only",
+                    "risk": "Low",
+                    "idempotency": "idempotent",
+                    "inputSchema": {"type": "object"}
+                }
+            }))
+            .expect("capability fixture decodes")
+        }
+
+        #[test]
+        fn a_duplicated_capability_identifier_is_a_malformed_broker_answer() {
+            // Last-wins here would leave `cap --list` and `inspect_agent_config` describing
+            // different sessions: the map keeps one entry per identifier and the effective view
+            // keeps every entry it was handed. Every repeat is named at once, the way the rest of
+            // the workspace reports conflicts.
+            let error = crate::snapshot(vec![
+                available("http-probe.fetch"),
+                available("echo.echo"),
+                available("http-probe.fetch"),
+                available("echo.echo"),
+            ])
+            .expect_err("a duplicate identifier is refused");
+
+            assert!(
+                matches!(
+                    &error,
+                    crate::BrokerLegError::DuplicateCapabilities { capabilities }
+                        if capabilities == "echo.echo, http-probe.fetch"
+                ),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn a_distinct_capability_set_indexes_both_views() {
+            let (descriptions, effective) =
+                crate::snapshot(vec![available("http-probe.fetch"), available("echo.echo")])
+                    .expect("a distinct set is accepted");
+
+            assert_eq!(descriptions.len(), 2);
+            assert_eq!(
+                effective
+                    .iter()
+                    .map(|view| view.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["echo.echo", "http-probe.fetch"]
+            );
         }
     }
 }

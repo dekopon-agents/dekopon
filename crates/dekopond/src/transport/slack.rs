@@ -20,7 +20,7 @@ use dekopon_core::{ExternalSubject, Redacted};
 use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{
@@ -63,6 +63,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// Activity must never inherit the final reply/file client's general 30-second wait.
 const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a socket may say nothing before it is treated as dead.
+///
+/// Slack pings a healthy Socket Mode connection about every 30 seconds and never lets one go quiet
+/// for this long, so silence past the deadline is a path that has gone away without TCP saying so —
+/// a NAT table dropping the flow, or a partition with no RST. Without it `socket.next()` waits
+/// forever and the workspace goes silent with no log line, no failed request, and nothing for a
+/// probe to see. The same deadline bounds opening a socket, because a connection that negotiates
+/// but never greets is the same wedge one round earlier.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
 /// Fixed gateway-owned reaction used by classic/free-workspace fallback.
 const ACTIVITY_REACTION: &str = "tangerine";
 
@@ -83,6 +92,7 @@ pub(crate) struct SlackTransport {
     failures: u32,
     experience: SlackExperience,
     activity: SlackActivityConfig,
+    deadline: Duration,
     thread_ownership: Arc<SlackThreadOwnership>,
 }
 
@@ -122,8 +132,16 @@ impl SlackTransport {
             failures: 0,
             experience,
             activity,
+            deadline: LIVENESS_DEADLINE,
             thread_ownership,
         })
+    }
+
+    /// Shortens the liveness deadline so a test can prove a wedged socket is abandoned.
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Confirms the bot token and learns the bot's own user and team identifiers.
@@ -148,29 +166,20 @@ impl SlackTransport {
         )
         .await?;
         let url = body["url"].as_str().ok_or(TransportError::Response)?;
-        let (mut socket, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
-        // Slack always greets before it delivers. Waiting for it here means a socket that
-        // negotiated but is not actually usable fails inside `open`, where the backoff lives,
-        // rather than looking like an empty conversation.
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame = serde_json::from_str::<Value>(&text)
-                        .map_err(TransportError::MalformedResponse)?;
-                    if frame["type"] == "hello" {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
-                Some(Ok(Message::Close(_) | Message::Frame(_))) => {
-                    return Err(TransportError::Closed);
-                }
-                None => return Err(TransportError::Closed),
-                Some(Err(source)) => return Err(TransportError::Request(Box::new(source))),
+        // The handshake and the greeting share one deadline. Neither has one of its own, so a URL
+        // that accepts a connection and then stops — or never completes TLS at all — would park
+        // this transport in `connect` or in its reconnect loop with nothing to observe.
+        let socket = match timeout(self.deadline, open_socket(url)).await {
+            Ok(socket) => socket?,
+            Err(_) => {
+                tracing::warn!(
+                    event = "gateway_transport_silent",
+                    transport = %self.name,
+                    phase = "open"
+                );
+                return Err(TransportError::Closed);
             }
-        }
+        };
         self.socket = Some(socket);
         self.failures = 0;
         Ok(())
@@ -178,13 +187,27 @@ impl SlackTransport {
 
     /// Reads one frame, acknowledging an events envelope before anything else happens to it.
     async fn pump(&mut self) -> Result<(), TransportError> {
+        let deadline = self.deadline;
         let socket = self.socket.as_mut().ok_or(TransportError::Closed)?;
-        let frame = match socket.next().await {
-            Some(Ok(Message::Text(text))) => text,
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => return Ok(()),
-            Some(Ok(Message::Frame(_))) => return Ok(()),
-            Some(Ok(Message::Close(_))) | None => return Err(TransportError::Closed),
-            Some(Err(source)) => return Err(TransportError::Request(Box::new(source))),
+        let frame = match timeout(deadline, socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_)))) => {
+                return Ok(());
+            }
+            Ok(Some(Ok(Message::Frame(_)))) => return Ok(()),
+            Ok(Some(Ok(Message::Close(_))) | None) => return Err(TransportError::Closed),
+            Ok(Some(Err(source))) => return Err(TransportError::Request(Box::new(source))),
+            // Reported as closed so the reconnect this transport already owns picks it up. The
+            // socket is dropped by `next`, which is what stops a half-open connection from
+            // holding the only path three workspaces have to this daemon.
+            Err(_) => {
+                tracing::warn!(
+                    event = "gateway_transport_silent",
+                    transport = %self.name,
+                    phase = "read"
+                );
+                return Err(TransportError::Closed);
+            }
         };
         let frame =
             serde_json::from_str::<Value>(&frame).map_err(TransportError::MalformedResponse)?;
@@ -396,6 +419,36 @@ impl SlackTransport {
         let jitter = u64::from(std::process::id() % 250);
         capped.saturating_add(Duration::from_millis(jitter))
     }
+}
+
+/// Negotiates one Socket Mode connection and waits for Slack's `hello`.
+///
+/// Free rather than a method so the caller can put one deadline around the whole thing. Slack
+/// always greets before it delivers, so waiting for it here means a socket that negotiated but is
+/// not actually usable fails inside `open`, where the backoff lives, rather than looking like an
+/// empty conversation.
+async fn open_socket(url: &str) -> Result<Socket, TransportError> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|source| TransportError::Request(Box::new(source)))?;
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame = serde_json::from_str::<Value>(&text)
+                    .map_err(TransportError::MalformedResponse)?;
+                if frame["type"] == "hello" {
+                    break;
+                }
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
+            Some(Ok(Message::Close(_) | Message::Frame(_))) => {
+                return Err(TransportError::Closed);
+            }
+            None => return Err(TransportError::Closed),
+            Some(Err(source)) => return Err(TransportError::Request(Box::new(source))),
+        }
+    }
+    Ok(socket)
 }
 
 impl ChatTransport for SlackTransport {

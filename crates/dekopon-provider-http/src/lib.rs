@@ -168,6 +168,38 @@ pub enum HttpErrorCode {
     Internal,
 }
 
+impl HttpErrorCode {
+    /// Returns the WIT enum name for this class.
+    ///
+    /// These are the stable machine-readable identifiers of the `dekopon:http@1.0.0` contract and
+    /// the spelling `docs/broker-http.md` uses. The Rust variant name is not part of any contract,
+    /// so anything a provider stringifies must use this instead.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidMethod => "invalid-method",
+            Self::InvalidUri => "invalid-uri",
+            Self::InvalidHeader => "invalid-header",
+            Self::RequestTooLarge => "request-too-large",
+            Self::Denied => "denied",
+            Self::HostCallLimit => "host-call-limit",
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::ResponseTooLarge => "response-too-large",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl fmt::Display for HttpErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A bounded failure returned across the HTTP component boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpError {
@@ -179,7 +211,7 @@ pub struct HttpError {
 
 impl fmt::Display for HttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.code, self.message)
+        write!(formatter, "{}: {}", self.code.as_str(), self.message)
     }
 }
 
@@ -302,7 +334,23 @@ fn is_field_value(value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HTTP_WIT, Header, Request, method};
+    use super::{HTTP_WIT, Header, HttpError, HttpErrorCode, Request, method};
+
+    const ALL_CODES: [HttpErrorCode; 13] = [
+        HttpErrorCode::InvalidMethod,
+        HttpErrorCode::InvalidUri,
+        HttpErrorCode::InvalidHeader,
+        HttpErrorCode::RequestTooLarge,
+        HttpErrorCode::Denied,
+        HttpErrorCode::HostCallLimit,
+        HttpErrorCode::Dns,
+        HttpErrorCode::Connect,
+        HttpErrorCode::Tls,
+        HttpErrorCode::Timeout,
+        HttpErrorCode::Protocol,
+        HttpErrorCode::ResponseTooLarge,
+        HttpErrorCode::Internal,
+    ];
 
     #[test]
     fn generated_bindings_identify_the_versioned_http_contract() {
@@ -324,5 +372,47 @@ mod tests {
     #[test]
     fn rejects_header_line_injection() {
         assert!(Header::text("x-example", "safe\r\ninjected: value").is_err());
+    }
+
+    /// The rendered code is the WIT enum name, read out of the contract itself.
+    ///
+    /// A provider that stringifies an error emits an identifier that flows into `ProviderError`
+    /// messages, `InvocationResult`, and payload-carrying telemetry. Rendering the Rust variant
+    /// spelling there would match neither `dekopon:http@1.0.0` nor `docs/broker-http.md`.
+    #[test]
+    fn error_codes_render_the_wit_names() {
+        let block = HTTP_WIT
+            .split_once("enum error-code {")
+            .expect("the contract declares error-code")
+            .1
+            .split_once('}')
+            .expect("the enum is closed")
+            .0;
+        let declared = block
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_suffix(','))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            declared,
+            ALL_CODES
+                .iter()
+                .map(|code| code.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        for code in ALL_CODES {
+            assert_eq!(code.to_string(), code.as_str());
+        }
+
+        let error = HttpError {
+            code: HttpErrorCode::ResponseTooLarge,
+            message: "body exceeded the authorized bound".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "response-too-large: body exceeded the authorized bound"
+        );
     }
 }

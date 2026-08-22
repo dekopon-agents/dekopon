@@ -40,6 +40,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 dekopon-policy.workspace = true
 tempfile.workspace = true
+# `start_paused` lets the shutdown-drain tests assert a 120 s grace without waiting for one.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

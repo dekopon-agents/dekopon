@@ -12,6 +12,13 @@ metadata:
     # `helm uninstall` deleting this volume would either destroy evidence or wedge the next
     # install. Delete it deliberately or not at all.
     helm.sh/resource-policy: keep
+    # That annotation is a Helm-uninstall protection and a GitOps controller does not read it. Argo
+    # CD syncing with prune deletes any live object the rendered desired state stops containing —
+    # set state.existingClaim, or leave the chart source briefly unresolvable, and the audit chain,
+    # the checkpoint and the live ChatGPT credential go with it, which by this chart's own recovery
+    # rules is an undetectable rollback. Prune=false covers the sync, Delete=false covers the
+    # Application itself being deleted. Argo reads both off the live object.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
     {{- end }}
 spec:
   accessModes:

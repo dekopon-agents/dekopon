@@ -21,7 +21,6 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
-    "crates/dekopon-testkit",
     "crates/dekopon-webui",
     "crates/dekopond",
 ]
@@ -50,14 +49,20 @@ hmac = "0.13.0"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 jaq-core = "3.1.0"
-jaq-json = "2.0.1"
+jaq-json = { version = "2.0.1", features = ["serde"] }
 jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+# `internal-logs` is the SDK's only runtime failure channel since the global error handler was
+# removed: without it every export failure — expired token, missing header, receiver down — is
+# discarded in silence. Each exporting binary filters the `opentelemetry` target off its own OTLP
+# layer, so these records reach stdout/stderr only and cannot feed export failures back into export.
+opentelemetry = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-http = { version = "0.32.0", default-features = false }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs", "trace"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+# `tls-webpki-roots` gives the tonic channel a TLS connector, matching the webpki-only stance the
+# rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 schemars = { version = "1.2.2", features = ["derive"] }
@@ -76,7 +81,7 @@ tonic = { version = "0.14.1", default-features = false }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
-wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "36.0.13", default-features = false, features = ["cache", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
 dekopon-agent = { version = "0.9.0", path = "crates/dekopon-agent" }
@@ -84,9 +89,9 @@ dekopon-broker = { version = "0.9.0", path = "crates/dekopon-broker" }
 dekopon-broker-host = { version = "0.9.0", path = "crates/dekopon-broker-host" }
 dekopon-broker-protocol = { version = "0.9.0", path = "crates/dekopon-broker-protocol" }
 dekopon-brokerd = { version = "0.9.0", path = "crates/dekopon-brokerd" }
-dekopon-capability = { version = "0.9.0", path = "crates/dekopon-capability" }
+dekopon-capability = { version = "0.9.0", path = "crates/dekopon-capability", default-features = false }
 dekopon-config = { version = "0.9.0", path = "crates/dekopon-config" }
-dekopon-core = { version = "0.9.0", path = "crates/dekopon-core" }
+dekopon-core = { version = "0.9.0", path = "crates/dekopon-core", default-features = false }
 dekopon-http-host = { version = "0.9.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.9.0", path = "crates/dekopon-model" }
 dekopon-policy = { version = "0.9.0", path = "crates/dekopon-policy" }
@@ -98,7 +103,6 @@ dekopon-protocol = { version = "0.9.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.9.0", path = "crates/dekopon-shell" }
 dekopon-storage-host = { version = "0.9.0", path = "crates/dekopon-storage-host" }
 dekopon-telemetry = { version = "0.9.0", path = "crates/dekopon-telemetry" }
-dekopon-testkit = { version = "0.9.0", path = "crates/dekopon-testkit" }
 dekopon-webui = { version = "0.9.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.9.0", path = "crates/dekopond" }
 

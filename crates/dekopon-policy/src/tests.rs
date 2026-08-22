@@ -618,6 +618,54 @@ fn strict_construction_refuses_precisely_what_lenient_tolerates() {
     );
 }
 
+/// A literal outside the identifier grammar is a typo, not an anticipation.
+///
+/// `Dekopon::Action::"GH.Read"` can never become a loaded capability however many providers arrive
+/// later, so tolerating it is meaningless. It used to be pushed to `unresolved`, skipped by
+/// `with_phantoms` because it does not parse, and then rejected by Cedar's strict validator — so
+/// the tolerant default produced a raw `Validation` error carrying Cedar text while strict mode
+/// gave the clearer `UnknownAction` for the same input, and the `UnresolvedName` report was lost
+/// with the `Err`.
+#[test]
+fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
+    let action = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"GH.Read",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("a name outside the grammar refuses startup even when lenient");
+    assert!(
+        matches!(action, PolicyBuildError::UnknownAction { ref action, .. } if action == "GH.Read"),
+        "{action:?}"
+    );
+
+    let provider = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"Not A Provider");"#,
+        &world(),
+    )
+    .expect_err("a provider name outside the grammar refuses startup even when lenient");
+    assert!(
+        matches!(
+            provider,
+            PolicyBuildError::UnknownProvider { ref provider, .. } if provider == "Not A Provider"
+        ),
+        "{provider:?}"
+    );
+
+    // A well-formed name that is merely absent is still tolerated.
+    let (_, unresolved) = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"gh.pull-request.approve",
+                  resource == Dekopon::Provider::"gh");"#,
+        &world(),
+    )
+    .expect("a well-formed absent name is still tolerated");
+    assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+}
+
 /// Principals come from owner-authored identities, never from a loaded component, so an undeclared
 /// one is a typo in any mode. Leniency must not turn a misspelled principal into a silent no-match.
 #[test]

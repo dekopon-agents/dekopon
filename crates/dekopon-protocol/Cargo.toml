@@ -13,10 +13,15 @@ keywords = ["agents", "api", "capabilities", "protocol"]
 categories = ["data-structures", "encoding"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[features]
+default = ["schemars"]
+# `JsonSchema` derives for every public type, including the types they embed.
+schemars = ["dep:schemars", "dekopon-capability/schemars", "dekopon-core/schemars"]
+
 [dependencies]
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
-schemars.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 
 [dev-dependencies]

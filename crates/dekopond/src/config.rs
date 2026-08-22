@@ -1097,6 +1097,7 @@ pub(crate) fn resolve(
                     telemetry.transport,
                     &telemetry.service_name,
                     "dekopond",
+                    env!("CARGO_PKG_VERSION"),
                     Duration::from_millis(telemetry.export_timeout_ms),
                 )
                 .map_err(|source| ConfigError::Telemetry { source })?,

@@ -9,7 +9,7 @@ use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
     ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
 };
-use dekopon_broker_host::BrokerHostLimits;
+use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions};
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
@@ -55,6 +55,14 @@ pub struct BrokerdConfig {
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
+    /// Optional broker-owned directory for Wasmtime's persistent compilation cache.
+    ///
+    /// Absent means Cranelift recompiles every provider at every start, inside whatever startup
+    /// budget the deployment allows. Present means compiled code is read back from this directory,
+    /// so it must be broker-owned and writable by nobody else — a deployment points it at durable
+    /// state such as `/var/lib/dekopon/compile-cache`.
+    #[serde(default)]
+    pub compile_cache_path: Option<PathBuf>,
     /// Whether configuration naming something no loaded provider offers refuses startup.
     ///
     /// Defaults to `false`, which warns and continues so a deployment can ship policy and
@@ -148,6 +156,7 @@ impl TelemetryConfig {
             self.transport,
             &self.service_name,
             "dekopon-brokerd",
+            env!("CARGO_PKG_VERSION"),
             Duration::from_millis(self.export_timeout_ms),
         )
         .map_err(|source| ConfigError::Telemetry { source })
@@ -198,6 +207,16 @@ pub struct HostLimitsConfig {
     pub max_http_header_bytes: usize,
     pub fuel: u64,
     pub max_timeout_ms: u64,
+    /// Aggregate guest linear memory reservable across concurrently live provider stores.
+    ///
+    /// `maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once unless this is
+    /// set, so the worst case is `serverLimits.maxConnections` times `maxMemoryBytes` — well past
+    /// a small container's limit at the defaults. Setting it turns an OOM kill into a refusal.
+    ///
+    /// Deliberately absent from the authority commitment: it is a concurrency budget, not a
+    /// ceiling an authorization could narrow, and changing it must not rotate stored authority.
+    #[serde(default)]
+    pub max_total_memory_bytes: Option<usize>,
 }
 
 impl Default for HostLimitsConfig {
@@ -218,6 +237,7 @@ impl Default for HostLimitsConfig {
             max_http_header_bytes: defaults.max_http_header_bytes,
             fuel: defaults.fuel,
             max_timeout_ms: u64::try_from(defaults.max_timeout.as_millis()).unwrap_or(u64::MAX),
+            max_total_memory_bytes: None,
         }
     }
 }
@@ -301,6 +321,9 @@ pub struct ResolvedConfig {
     pub policies: String,
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     pub host_limits: BrokerHostLimits,
+    pub host_options: BrokerHostOptions,
+    /// Worst-case concurrent guest memory: `maxConnections` times `maxMemoryBytes`.
+    pub worst_case_guest_memory_bytes: usize,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
     pub storage: Option<StorageConfig>,
@@ -526,6 +549,12 @@ fn resolve(
     };
     let credentials_path = canonical(config.credentials_path)?;
     let policies_path = canonical(config.policies_path)?;
+    // Wasmtime creates the cache directory itself and requires an absolute path, so this resolves
+    // the parent rather than requiring the directory to already exist.
+    let compile_cache_path = config
+        .compile_cache_path
+        .map(|path| resolve_future_path(resolve_path(path)))
+        .transpose()?;
     let storage = config
         .storage
         .map(|mut storage| {
@@ -677,6 +706,21 @@ fn resolve(
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
     }
+    // Per-store limits bound one invocation; the connection ceiling decides how many of those can
+    // exist at once. Naming the product here is what makes an operator budget it against the
+    // container limit instead of discovering it as an OOM kill.
+    let worst_case_guest_memory_bytes = config
+        .server_limits
+        .max_connections
+        .checked_mul(host_limits.max_memory_bytes)
+        .ok_or(ConfigError::InvalidHostLimits)?;
+    if config
+        .host_limits
+        .max_total_memory_bytes
+        .is_some_and(|maximum| maximum < host_limits.max_memory_bytes)
+    {
+        return Err(ConfigError::InvalidHostLimits);
+    }
     let maximum_response = host_limits
         .max_output_bytes
         .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
@@ -752,6 +796,11 @@ fn resolve(
         policies: String::new(),
         constraint_sets: config.constraint_sets,
         host_limits,
+        host_options: BrokerHostOptions {
+            compile_cache_dir: compile_cache_path,
+            max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
+        },
+        worst_case_guest_memory_bytes,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
         storage,
