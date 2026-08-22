@@ -116,7 +116,7 @@ The tap is [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/hom
 
 Not Intel Macs. `0.3.0` did ship an `x86_64-apple-darwin` archive, but [#74](https://github.com/dekopon-agents/dekopon/pull/74) removed that target from the release matrix, so `0.4.0` onward has none. Offering the `0.3.0` archive would install cleanly on an Intel Mac and then dead-end at the next `brew upgrade`, which is worse than being plainly unsupported. Download the [v0.3.0 archive](https://github.com/dekopon-agents/dekopon/releases/tag/v0.3.0) directly or build from a checkout instead.
 
-From there, [`examples/pr-summarizer-linter`](examples/pr-summarizer-linter/README.md) is the next step: it is the only walkthrough that puts the gateway, broker, policy, and a credential-holding provider to work together.
+From there, [`examples/conditional-write`](examples/conditional-write/README.md) is the next step: it is the only walkthrough that puts the gateway, broker, policy, and a credential-holding provider to work together.
 
 ### Prebuilt archives
 
@@ -181,7 +181,9 @@ For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons a
 
 ## Run the flagship example
 
-[`examples/pr-summarizer-linter`](examples/pr-summarizer-linter/README.md) is the whole system in one deployment: a maintainer asks in Slack for a pull-request summary and lint review, the gateway attests to the sender and decides nothing, and the broker authorizes six narrow GitHub capabilities before posting one head-pinned `COMMENT` review. Approval, request-changes, and merge are absent. The broker injects a token bound to `api.github.com` and hash-links audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and hash-links audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+
+The GitHub reviewer that used to live here moved out with its provider; it is [`examples/pr-summarizer-linter`](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) in `dekopon-provider-gh`.
 
 ## Run the catalog example
 

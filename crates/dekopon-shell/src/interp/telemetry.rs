@@ -241,7 +241,7 @@ impl CommandKind {
             | Self::ProviderCommand => true,
             // `NotGranted` is the interesting one. Its *namespace* comes from the session's granted
             // set and is exported; the word itself is still whatever the script typed, so it is
-            // still withheld. Knowing the model reached into `gh` and missed is the trend worth
+            // still withheld. Knowing the model reached into a provider and missed is the trend worth
             // having, and it costs no channel to record.
             Self::Function | Self::NotFound | Self::NotGranted => false,
         }

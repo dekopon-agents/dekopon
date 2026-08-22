@@ -1465,14 +1465,13 @@ in to work on it.
 4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
 tripping one ends the script with a message naming it.
 
-Builtins: `jq`, `curl`, `gh`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
-`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Three of them \
+Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
+`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them \
 depend on session configuration and report their exact missing prerequisite otherwise: `curl`, \
 which opens no socket of its own but assembles a request for whichever HTTP capability the session \
-was given; `gh`, which maps GitHub-CLI subcommands (`gh pr view 7 -R owner/repo`, `gh pr review 7 \
--R owner/repo --approve`) onto the correspondingly named granted `gh.*` capabilities; and `date`, \
-which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may contribute \
-further command words; any this session has are listed at the end of this description.
+was given; and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A \
+provider may contribute further command words, which behave the same way and are authorized \
+identically; any this session has are listed at the end of this description.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
 and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \

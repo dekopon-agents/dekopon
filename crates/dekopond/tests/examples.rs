@@ -1,4 +1,4 @@
-//! The gateway half of `examples/pr-summarizer-linter/`, held to the daemon's strict decoder.
+//! The gateway half of `examples/conditional-write/`, held to the daemon's strict decoder.
 //!
 //! `dekopond.yaml` and `broker.yaml` are two files a reader edits separately, and the one thing
 //! that must agree between them is the socket: a gateway pointed at a path no broker binds fails
@@ -18,7 +18,7 @@ use dekopond::{
 fn example(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("examples/pr-summarizer-linter")
+        .join("examples/conditional-write")
         .join(name)
 }
 

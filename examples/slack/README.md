@@ -1,7 +1,7 @@
 # Slack setup
 
 This directory contains the Slack app profiles used by the
-[PR summarizer and linter](../pr-summarizer-linter/README.md). Both receive direct messages and
+[conditional writer](../conditional-write/README.md). Both receive direct messages and
 explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
 best-effort in-flight activity. The Agent profile additionally receives channel history so one
 freshly authorized sender can continue in that exact owned thread without repeating the mention;
