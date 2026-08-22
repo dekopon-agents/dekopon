@@ -53,8 +53,25 @@ All notable changes to Dekopon are documented here. The format is based on
 - Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
   checkpoint recovery is reachable from `docs/` instead of only from a crate README.
 
+### Added
+
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
 ### Changed
 
+- A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
+  service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
+  significant failed.
 - The `--http-bind` web UI now serves at most sixteen concurrent connections, refusing rather than
   queuing further ones, and drops any connection that exceeds a thirty-second budget from accept to
   close; both ceilings are configurable through `dekopon_webui::serve_with_limits`.

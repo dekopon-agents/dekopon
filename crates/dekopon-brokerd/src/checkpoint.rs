@@ -233,6 +233,14 @@ impl AuditLog for CheckpointedAuditLog {
             .write(records, Some(&record.record_hash))
             .await
         {
+            // Poisoning is terminal for this process: every later append refuses until restart.
+            // The audit record it wraps is already durable, so this line is the only account of
+            // why the broker stopped being able to authorize anything.
+            tracing::error!(
+                event = "broker_checkpoint_poisoned",
+                audit_records = records,
+                error = %crate::error_chain(&error)
+            );
             state.poisoned = true;
             return Err(AuditError::Io {
                 source: io::Error::other(error),

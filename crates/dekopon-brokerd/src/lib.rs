@@ -377,7 +377,17 @@ where
         }
     }
 
-    socket_guard.cleanup()?;
+    // The socket must not outlive its listener, so cleanup still runs here — but its result is
+    // held rather than returned. A stale socket path is a smaller problem than the failure that
+    // ended service, and returning it first would replace the real cause and skip the final
+    // checkpoint and `broker_stopped` entirely.
+    let cleanup = socket_guard.cleanup();
+    if let Err(error) = &cleanup {
+        tracing::warn!(
+            event = "broker_socket_cleanup_failed",
+            error = %error_chain(error)
+        );
+    }
     broker_result.ok_or(BrokerdError::Server(ServerError::ConnectionTask))??;
     if web_shutdown_timed_out {
         return Err(BrokerdError::WebUiShutdownTimeout);
@@ -392,7 +402,24 @@ where
         audit_records = records,
         audit_head = head.as_deref().unwrap_or("none")
     );
+    cleanup?;
     Ok(AuditCheckpoint { records, head })
+}
+
+/// Renders an error and its sources as one `a: b: c` line.
+///
+/// Every failure this service logs is a wrapper whose own message names the layer rather than the
+/// cause: `ConnectionError::Broker` says "broker failed", and the errno that says why is two
+/// levels down. The chain is the diagnosable part.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
 }
 
 async fn storage_gc_loop(
