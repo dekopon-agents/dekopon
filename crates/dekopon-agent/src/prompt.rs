@@ -1445,7 +1445,8 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `{ ...; }` groups — all usable as \
+`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` groups \
+— the compound ones all usable as \
 pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
 because nothing here forks — `break`/`continue`, functions \
 with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, `${#NAME}`, \
@@ -1481,7 +1482,8 @@ provider may contribute further command words, which behave the same way and are
 identically; any this session has are listed at the end of this description.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
-a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, and a `case` pattern too, where `*)` remains the \
+a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand of `==` inside `[[ ]]`, and a \
+`case` pattern too, where `*)` remains the \
 default branch but `*.json)` is an error rather than a silent mismatch. `${#NAME}` counts \
 characters of a string but elements of an array and keys of an object, because values here are \
 real JSON. Use `jq` for real matching. A here-document's body arrives as one JSON \
