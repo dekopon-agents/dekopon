@@ -9,6 +9,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Accepted `[[ ... ]]` in the sandboxed shell. It runs the same tests `[` and `test` run — one
+  function, so the two spellings cannot disagree — and adds bash's connective grammar (`&&`, `||`,
+  `!`, parentheses, short-circuiting) plus the promise that an unquoted expansion is one operand.
+  The right operand of `==` is a glob in bash; every pattern here is literal text, so a
+  metacharacter there is refused by name rather than compared literally, and `=~` is refused
+  outright. Grammar keywords are now mirrored into `dekopon_core::RESERVED_COMMAND_WORDS`, closing
+  a hole where a provider could declare a command word like `do` or `then`, load successfully, and
+  never be reachable because the parser consumed the word first.
+
 - Made compound commands — `if`, `for`, `while`, `until`, `case`, and the newly accepted `{ ...; }`
   group — usable as pipeline stages, so `cmd | while read-shaped loop` and
   `cmd || { echo failed; exit 1; }` parse, and a compound stage carries its own redirections. A

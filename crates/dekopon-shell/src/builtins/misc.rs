@@ -218,7 +218,7 @@ impl Builtin for TestBracket {
 ///
 /// File tests (`-f`, `-d`, `-e`, `-r`, `-w`, `-x`) are absent: there is no filesystem, so accepting
 /// them would answer a question this shell cannot ask.
-fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
+pub(crate) fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
     // Leading `!`s are counted in a loop rather than peeled off by recursion. argv length here is
     // attacker-controlled — an unquoted expansion of a JSON array spreads element by element — so
     // one frame per `!` let a three-line script build a 20,000-deep stack and abort the process.

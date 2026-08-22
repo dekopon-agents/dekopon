@@ -11,7 +11,8 @@ use thiserror::Error;
 use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
-        CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Index, Modifier,
+        CasePattern, CaseStatement, Conditional, ConditionalTest, ForLoop, FunctionDefinition,
+        IfStatement, Index, Modifier,
         Parameter, Pattern, Pipeline,
         Command, Program, Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop,
         Word, WordPart,
@@ -87,15 +88,16 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
         "set",
         "`set` is excluded: this shell has no shell options, so `set -e`/`set -u`/`set -o pipefail` would change nothing while looking like they had; check each command's status with `$?`, `&&`, `||`, or `exit`",
     ),
-    (
-        "[[",
-        "`[[ ... ]]` is not part of this shell; use `[ ... ]` or `test`, which support -z, -n, =, !=, <, >, and -eq/-ne/-lt/-le/-gt/-ge",
-    ),
 ];
 
-const RESERVED_WORDS: &[&str] = &[
+/// Words the grammar owns, which therefore cannot be a command word or a function name.
+///
+/// Mirrored into `dekopon_core::RESERVED_COMMAND_WORDS` and pinned in both directions by
+/// [`crate::dispatch::reserved`], so a provider can never declare one of these and then find that
+/// the parser consumed the word before dispatch ever saw it.
+pub(crate) const RESERVED_WORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "case", "esac",
-    "until", "select", "function",
+    "until", "select", "function", "[[", "]]",
 ];
 
 /// A parse failure. These map to exit code `2`.
@@ -328,7 +330,7 @@ impl Parser {
         match self.peek_reserved() {
             // Compound commands are parsed as pipeline stages even at statement level, so
             // `while ...; done | wc -l` and a bare `while` reach the same production.
-            Some("if" | "for" | "while" | "until" | "case") => {
+            Some("if" | "for" | "while" | "until" | "case" | "[[") => {
                 return self.parse_and_or_list().map(Statement::List);
             }
             Some("esac") => {
@@ -678,6 +680,9 @@ impl Parser {
         };
         let compound = match compound {
             Some(statement) => Some(statement),
+            None if self.peek_literal_word("[[") => {
+                Some(Statement::Conditional(self.parse_conditional()?))
+            }
             // A `{` opens a group only where a command may start, so `a{b}` stays one literal word
             // and a function body is still parsed by `try_parse_function`.
             None if matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) => {
@@ -693,6 +698,162 @@ impl Parser {
             statement: Box::new(statement),
             redirects,
         })
+    }
+
+    /// Reports whether the next token is exactly the given literal word.
+    fn peek_literal_word(&self, expected: &str) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Word(word)) if word.as_literal() == Some(expected))
+    }
+
+    /// Parses `[[ ... ]]`.
+    fn parse_conditional(&mut self) -> Result<Conditional, ParseError> {
+        let line = self.line();
+        self.position += 1;
+        self.enter("a `[[ ... ]]` conditional")?;
+        let expression = self.parse_conditional_or()?;
+        self.leave();
+        if !self.peek_literal_word("]]") {
+            let found = self
+                .peek_kind()
+                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
+            return Err(ParseError::syntax(
+                line,
+                format!("expected `]]` to close a `[[ ... ]]` conditional, found {found}"),
+            ));
+        }
+        self.position += 1;
+        Ok(expression)
+    }
+
+    fn parse_conditional_or(&mut self) -> Result<Conditional, ParseError> {
+        let mut left = self.parse_conditional_and()?;
+        while matches!(self.peek_kind(), Some(TokenKind::OrOr)) {
+            self.position += 1;
+            let right = self.parse_conditional_and()?;
+            left = Conditional::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_conditional_and(&mut self) -> Result<Conditional, ParseError> {
+        let mut left = self.parse_conditional_unary()?;
+        while matches!(self.peek_kind(), Some(TokenKind::AndAnd)) {
+            self.position += 1;
+            let right = self.parse_conditional_unary()?;
+            left = Conditional::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_conditional_unary(&mut self) -> Result<Conditional, ParseError> {
+        if self.peek_literal_word("!") {
+            self.position += 1;
+            self.enter("a `!` inside `[[ ... ]]`")?;
+            let inner = self.parse_conditional_unary()?;
+            self.leave();
+            return Ok(Conditional::Not(Box::new(inner)));
+        }
+        if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
+            let line = self.line();
+            self.position += 1;
+            self.enter("a group inside `[[ ... ]]`")?;
+            let inner = self.parse_conditional_or()?;
+            self.leave();
+            if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
+                return Err(ParseError::syntax(
+                    line,
+                    "expected `)` to close a group inside `[[ ... ]]`",
+                ));
+            }
+            self.position += 1;
+            return Ok(inner);
+        }
+        self.parse_conditional_test()
+    }
+
+    /// Collects one primary's operands and validates its operator.
+    fn parse_conditional_test(&mut self) -> Result<Conditional, ParseError> {
+        let line = self.line();
+        let depth = self.depth;
+        let mut raws = Vec::new();
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Word(word)) if word.as_literal() == Some("]]") => break,
+                Some(TokenKind::Word(word)) => {
+                    let word = word.clone();
+                    self.position += 1;
+                    raws.push(word);
+                }
+                // Inside `[[ ]]` these are comparison operators, not redirections. The lexer has
+                // no way to know that, so they are translated back into operand words here.
+                Some(TokenKind::Less) => {
+                    self.position += 1;
+                    raws.push(RawWord {
+                        parts: vec![RawPart::SingleQuoted("<".to_owned())],
+                    });
+                }
+                Some(TokenKind::Redirect {
+                    source: Stream::Stdout,
+                    append: false,
+                }) => {
+                    self.position += 1;
+                    raws.push(RawWord {
+                        parts: vec![RawPart::SingleQuoted(">".to_owned())],
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        if raws.is_empty() {
+            let found = self
+                .peek_kind()
+                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
+            return Err(ParseError::syntax(
+                line,
+                format!("expected a condition inside `[[ ... ]]`, found {found}"),
+            ));
+        }
+        if raws.len() > 3 {
+            return Err(ParseError::syntax(
+                line,
+                "a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses",
+            ));
+        }
+
+        let mut check_right_pattern = false;
+        if let [_, operator, right] = raws.as_slice() {
+            let operator = operator.as_literal().unwrap_or_default().to_owned();
+            if operator == "=~" {
+                return Err(ParseError::syntax(
+                    line,
+                    "`=~` regex matching is not supported: every pattern in this shell is literal                      text; compare with `==`, or match structurally with `jq`",
+                ));
+            }
+            if matches!(operator.as_str(), "=" | "==" | "!=") {
+                // In bash this operand is a glob. Comparing it literally would answer
+                // `[[ $f == *.json ]]` wrongly and silently.
+                if word_is_constant(right) {
+                    if let Some((character, meaning)) = literal_pattern_metacharacter(right) {
+                        return Err(ParseError::syntax(
+                            line,
+                            unsupported_conditional_pattern(character, meaning),
+                        ));
+                    }
+                } else {
+                    check_right_pattern = true;
+                }
+            }
+        }
+
+        let words = raws
+            .iter()
+            .map(|raw| convert_word(raw, line, depth))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Conditional::Test(ConditionalTest {
+            words,
+            check_right_pattern,
+        }))
     }
 
     /// Parses `{ ...; }` as a group of statements run in the current scope.
@@ -991,6 +1152,20 @@ pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String
 pub(crate) fn unsupported_parameter_pattern(character: char, meaning: &str) -> String {
     format!(
         "a `${{NAME}}` expansion pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the text out, or slice the value with `jq` instead"
+    )
+}
+
+/// Composes the rejection for a `[[ x == PATTERN ]]` operand this shell cannot honor.
+pub(crate) fn unsupported_conditional_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "the right operand of `==` inside `[[ ... ]]` is a glob in bash, and every pattern here is literal text, so `{character}` — which would match {meaning} — is not supported; quote it as `'{character}'` to compare the character itself, or match structurally with `jq`"
+    )
+}
+
+/// Composes the rejection for a `[[ ]]` operand that only exists once a script has run.
+pub(crate) fn expanded_conditional_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `[[ ... ]]` comparison expanded to text containing `{character}`, which bash would match as {meaning}; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — compare without `{character}`, or match structurally with `jq`"
     )
 }
 

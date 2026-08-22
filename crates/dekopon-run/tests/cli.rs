@@ -1208,7 +1208,8 @@ fn shell_rejects_every_loudly_dropped_grammar_feature_rather_than_ignoring_it() 
         ("echo `echo pwned`", "backtick", "pwned"),
         ("set -euo pipefail\necho pwned", "shell options", "pwned"),
         ("echo pwned 3>/dev/null", "only descriptors 1", "pwned"),
-        ("[[ -n x ]] && echo pwned", "[[ ... ]]", "pwned"),
+        ("[[ abc =~ a.c ]] && echo pwned", "regex matching", "pwned"),
+        ("f=a.json\n[[ $f == *.json ]] && echo pwned", "glob in bash", "pwned"),
     ] {
         let (stdout, code) = shell(script, &[]);
         assert_eq!(code, 2, "{script}: {stdout}");
