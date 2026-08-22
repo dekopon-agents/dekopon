@@ -60,7 +60,11 @@ struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
     /// The value piped into the call, offered to the first command of each pipeline in the body.
-    stdin: Option<Value>,
+    ///
+    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
+    /// be deep-copied once per statement — including for the statements that never read input —
+    /// and all but the last copy dropped. See [`own`].
+    stdin: Option<Rc<Value>>,
 }
 
 /// Parses and evaluates one script, returning its outcome.
@@ -95,16 +99,24 @@ pub(crate) fn run(
         captures: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
         allow_clock: limits.allow_clock,
+        counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
     };
 
-    let exit_code = match evaluator.execute_program(&program) {
-        Ok(Flow::Exit(code)) => code,
-        Ok(Flow::Return(code)) => code,
-        Ok(_) => evaluator.last_status,
-        Err(fatal) => evaluator.report_fatal(&fatal),
+    // One span for the whole run, so the totals have a home that costs the same whether a script
+    // ran three commands or thirty thousand. Every `shell.command` span nests inside it.
+    let script = telemetry::script_span();
+    let exit_code = {
+        let _entered = script.enter();
+        match evaluator.execute_program(&program) {
+            Ok(Flow::Exit(code)) => code,
+            Ok(Flow::Return(code)) => code,
+            Ok(_) => evaluator.last_status,
+            Err(fatal) => evaluator.report_fatal(&fatal),
+        }
     };
+    evaluator.counters.record_on(&script);
 
     evaluator.output.finish();
     ScriptOutcome {
@@ -135,6 +147,8 @@ struct Evaluator<'a> {
     curl_capability: Option<String>,
     /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
     allow_clock: bool,
+    /// Per-script command totals, and the cap on how many command spans reach INFO.
+    counters: telemetry::ScriptCounters,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
 }
@@ -182,12 +196,21 @@ impl Evaluator<'_> {
         self.output.push_block(line);
     }
 
+    /// Writes what one pipeline produced, to the capture that is collecting it or to the output.
+    ///
+    /// A command that produced no value writes nothing, and that has to be decided *before* the
+    /// capture branch rather than after it. `$(true; echo a)` is `a` in bash; retaining `true`'s
+    /// null in the capture made it a second element, and [`reduce_captured`] joins elements with a
+    /// newline — so the substitution silently gained a leading blank line, or a trailing one for
+    /// `$(echo a; true)`, depending on where the command that produced nothing happened to sit.
+    /// The status such a command reported is unaffected: it travels through `last_status`, not
+    /// through the capture.
     fn emit(&mut self, result: CommandResult) {
-        if let Some(capture) = self.captures.last_mut() {
-            capture.push(result);
+        if result.value.is_null() {
             return;
         }
-        if result.value.is_null() {
+        if let Some(capture) = self.captures.last_mut() {
+            capture.push(result);
             return;
         }
         let text = display(&result.value);
@@ -503,14 +526,10 @@ impl Evaluator<'_> {
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step()?;
         // A function body inherits the value piped into the call, offered to the first command of
-        // each pipeline in the body. It is cloned rather than consumed: consuming it would let a
+        // each pipeline in the body. It is shared rather than consumed: consuming it would let a
         // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
         // before `cat` could see it, which is the same class of silent data loss as dropping it.
-        let mut input: Option<Value> = self
-            .frames
-            .last()
-            .and_then(|frame| frame.stdin.as_ref())
-            .cloned();
+        let mut input: Option<Rc<Value>> = self.frames.last().and_then(|frame| frame.stdin.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
 
@@ -520,9 +539,15 @@ impl Evaluator<'_> {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
                     if piped {
-                        input = Some(result.value.clone());
+                        // Only the terminal command's result is ever read, and the terminal
+                        // command is by construction never piped — so an intermediate value moves
+                        // into the next stage instead of being copied into it and then dropped.
+                        // Without this `cap big | jq . | grep x` deep-copies the payload per stage.
+                        last = CommandResult::status(result.status);
+                        input = Some(Rc::new(result.value));
+                    } else {
+                        last = result;
                     }
-                    last = result;
                 }
             }
         }
@@ -543,7 +568,7 @@ impl Evaluator<'_> {
     fn execute_command(
         &mut self,
         command: &SimpleCommand,
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
@@ -612,7 +637,7 @@ impl Evaluator<'_> {
                         self.restore_all(restore);
                         return Err(limit.into());
                     }
-                    Some(value)
+                    Some(Rc::new(value))
                 }
                 Err(failure) => {
                     self.restore_all(restore);
@@ -695,11 +720,12 @@ impl Evaluator<'_> {
     /// them gets its own span nested inside the `xargs` one, which is exactly the syscall-by-
     /// syscall reading this instrumentation exists to give.
     ///
-    /// See [`telemetry`] for what these spans may and may not carry.
+    /// See [`telemetry`] for what these spans may and may not carry, and for the per-script cap
+    /// that decides which of them are emitted at INFO.
     fn run_argv(
         &mut self,
         argv: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
@@ -716,15 +742,8 @@ impl Evaluator<'_> {
         };
         let name = telemetry::traceable_name(kind, command);
 
-        let span = tracing::info_span!(
-            "shell.command",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = arguments.len(),
-            shell.command.exit_code = tracing::field::Empty,
-            capability.namespace = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
+        let level = self.counters.charge(kind);
+        let span = telemetry::command_span(level, name, kind, arguments.len());
         // Recorded only for `not-granted`, where it comes from the session's own granted set rather
         // than from the script. See `telemetry::name_is_fixed_vocabulary`.
         if let Some(Resolution::NotGranted { namespace }) = resolution.as_ref() {
@@ -753,6 +772,7 @@ impl Evaluator<'_> {
         };
         span.record("shell.command.exit_code", status.get());
         span.record("outcome", outcome);
+        self.counters.record_status(status);
         executed
     }
 
@@ -762,7 +782,7 @@ impl Evaluator<'_> {
         command: &str,
         arguments: &[String],
         resolution: Option<Resolution>,
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
@@ -789,7 +809,11 @@ impl Evaluator<'_> {
                         curl_capability: self.curl_capability.as_deref(),
                         allow_clock: self.allow_clock,
                     };
-                    builtin.run(&mut context, arguments, input)
+                    // The one place a piped value has to become owned. A pipeline stage's own
+                    // output is held by nobody else and moves straight through; a function frame's
+                    // stdin is shared with the frame, so only that case copies — and only for the
+                    // commands that actually reach for input.
+                    builtin.run(&mut context, arguments, own(input))
                 };
                 match outcome {
                     Ok(result) => Ok(Executed::Result(result)),
@@ -986,7 +1010,7 @@ impl Evaluator<'_> {
         &mut self,
         name: &str,
         arguments: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(body) = self.functions.get(name).cloned() else {
@@ -1046,9 +1070,9 @@ impl Evaluator<'_> {
     fn run_xargs(
         &mut self,
         arguments: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
     ) -> Result<Executed, FatalError> {
-        let plan = match xargs::plan(arguments, input.as_ref()) {
+        let plan = match xargs::plan(arguments, input.as_deref()) {
             Ok(plan) => plan,
             Err(failure) => {
                 let status = self.absorb(failure)?;
@@ -1331,6 +1355,17 @@ impl Evaluator<'_> {
     }
 }
 
+/// Materializes a piped value for a command that consumes it by value.
+///
+/// Piped values travel as [`Rc`] so that offering one costs a refcount rather than a deep copy of
+/// whatever a capability returned. This is where that ends: a stage's own output is held by nobody
+/// else and moves through untouched, while a function frame's stdin is shared with the frame and
+/// every later pipeline in its body, so only that case copies — and only for a command that
+/// actually reaches for input.
+fn own(input: Option<Rc<Value>>) -> Option<Value> {
+    input.map(Rc::unwrap_or_clone)
+}
+
 /// Inverts a pipeline status for a leading `!`, collapsing every failure to plain success.
 fn invert(status: ExitCode) -> ExitCode {
     if status == ExitCode::SUCCESS {
@@ -1344,6 +1379,11 @@ fn invert(status: ExitCode) -> ExitCode {
 ///
 /// One result keeps its structure so `x=$(cap ... )` stays JSON; several are joined as text
 /// because that is what a caller reading multiple lines expects.
+///
+/// The join honors [`CommandResult::suppress_newline`] the same way [`Evaluator::emit`] does. A
+/// capture is still a stream of writes: `v=$(printf '%s' a; printf '%s' b)` is `ab` in bash, and
+/// inserting the newline the script explicitly suppressed silently corrupted every value a model
+/// assembled piecewise — a URL, a JSON fragment — with no diagnostic anywhere.
 fn reduce_captured(captured: Vec<CommandResult>) -> Value {
     match captured.len() {
         0 => Value::String(String::new()),
@@ -1351,13 +1391,20 @@ fn reduce_captured(captured: Vec<CommandResult>) -> Value {
             .into_iter()
             .next()
             .map_or(Value::Null, |result| result.value),
-        _ => Value::String(
-            captured
-                .iter()
-                .map(|result| display(&result.value))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        _ => {
+            let mut text = String::new();
+            // Seeded as if the (absent) result before the first one suppressed its terminator, so
+            // nothing is prefixed to the capture.
+            let mut previous_suppressed = true;
+            for result in &captured {
+                if !previous_suppressed {
+                    text.push('\n');
+                }
+                text.push_str(&display(&result.value));
+                previous_suppressed = result.suppress_newline;
+            }
+            Value::String(text)
+        }
     }
 }
 

@@ -2,13 +2,16 @@
 //!
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
-//! shell and safe on-demand meta tools, and replies with the answer.
+//! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
+//! image unless an optional owned-thread continuation deliberately declines.
 //!
 //! # Authority
 //!
 //! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
 //! question and to ask a model — and it never holds a provider credential, a policy, or an
-//! authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an *attested*
+//! authorization. Explicit route-scoped image generation is model inference inside this
+//! unprivileged boundary, with no provider or broker credential. Every provider effect a session
+//! drives is submitted to `dekopon-brokerd` as an *attested*
 //! proposal naming the sender's canonical subject, and the broker alone maps that subject to a
 //! principal, decides what it may do, and executes it. The daemon's dependency set excludes every
 //! privileged broker crate for the same reason `dekopon-run`'s does, and CI enforces it.
@@ -50,8 +53,9 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
     ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
-    NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry, SlackActivityConfig,
-    SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig, TransportConfig,
+    ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
+    SlackActivityConfig, SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig,
+    TransportConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;
@@ -61,11 +65,15 @@ use crate::{
     asset::AssetStore,
     conversation::ConversationStore,
     routes::RoutingTable,
-    session::{ConfiguredModels, STOPPED_REPLY, SessionGate, SessionRunner},
+    session::{
+        ConfiguredModels, ImageGeneratorStartupError, ModelCache, STOPPED_REPLY, SessionGate,
+        SessionRunner, configured_image_generators,
+    },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
+        discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
+        telegram::TelegramTransport, whatsapp::WhatsappTransport,
     },
 };
 
@@ -77,6 +85,13 @@ use crate::{
 const INBOUND_BUFFER: usize = 64;
 /// Informational model-usage deltas waiting to be coalesced for the broker-hosted web UI.
 const USAGE_REPORT_BUFFER: usize = 64;
+/// How often a transport that ended for good is announced again while the daemon keeps serving.
+///
+/// A transport whose reader stops is gone until the process restarts, and the deployment has no
+/// gateway probe: one error line at the moment it happened is a signal nobody is looking at an hour
+/// later. Re-stating it on an interval is what lets an alert fire on the condition rather than on
+/// catching the edge.
+const TRANSPORT_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 /// Informational reporting must not delay gateway startup, an answer, or shutdown.
 const STATUS_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Re-publishes static inventory so a restarted broker recovers its in-memory view.
@@ -129,6 +144,16 @@ where
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
+    // Resolve model credentials and construct the fixed-endpoint clients before a chat transport
+    // accepts work. A route naming image generation must not start as a tool that can only fail.
+    let referenced_image_generators = config
+        .routes
+        .iter()
+        .filter_map(|route| route.image_generator.clone())
+        .collect::<BTreeSet<_>>();
+    let image_generators =
+        configured_image_generators(&config.image_generators, &referenced_image_generators)
+            .map_err(DekopondError::ImageGenerator)?;
     let inventory = agent_inventory(&catalog);
     let heartbeat_inventory = inventory.clone();
 
@@ -148,14 +173,18 @@ where
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
     );
-    match timeout(
-        STATUS_REPORT_TIMEOUT,
-        broker_client.publish_agent_inventory(inventory),
-    )
-    .await
-    {
-        Ok(Ok(())) => tracing::info!(event = "gateway_agent_inventory_reported"),
-        Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_agent_inventory_report_failed"),
+    match report_failure(
+        timeout(
+            STATUS_REPORT_TIMEOUT,
+            broker_client.publish_agent_inventory(inventory),
+        )
+        .await,
+    ) {
+        None => tracing::info!(event = "gateway_agent_inventory_reported"),
+        Some(category) => tracing::warn!(
+            event = "gateway_agent_inventory_report_failed",
+            category = category
+        ),
     }
 
     let mut transports = Vec::with_capacity(config.transports.len());
@@ -163,6 +192,7 @@ where
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
+    let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -188,6 +218,9 @@ where
         if let Some(activity) = transport.activity() {
             activities.insert(spec.name().to_owned(), activity);
         }
+        if let Some(ownership) = transport.thread_ownership() {
+            thread_ownership.insert(spec.name().to_owned(), ownership);
+        }
         transports.push(transport);
     }
 
@@ -199,7 +232,7 @@ where
     ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
-        models: Arc::new(ConfiguredModels),
+        models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
@@ -210,17 +243,25 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
+        image_generators,
         activities,
+        thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
     });
 
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
+    let health = Arc::new(TransportHealth::new(transports.len()));
     let mut readers = JoinSet::new();
     for transport in transports {
-        readers.spawn(read_transport(transport, sender.clone()));
+        readers.spawn(read_transport(
+            transport,
+            sender.clone(),
+            Arc::clone(&health),
+        ));
     }
     drop(sender);
+    let health_reporter = tokio::spawn(report_transport_health(Arc::clone(&health)));
 
     tracing::info!(
         event = "gateway_started",
@@ -228,7 +269,7 @@ where
         route.count = routes.len()
     );
 
-    serve(
+    let outcome = serve(
         runner,
         routes,
         Arc::new(identities),
@@ -240,6 +281,8 @@ where
     .await;
     readers.abort_all();
     while readers.join_next().await.is_some() {}
+    health_reporter.abort();
+    let _ = health_reporter.await;
     if timeout(STATUS_REPORT_TIMEOUT, &mut usage_reporter)
         .await
         .is_err()
@@ -249,8 +292,19 @@ where
         tracing::warn!(event = "gateway_usage_reporter_abandoned");
     }
 
-    tracing::info!(event = "gateway_stopped");
-    Ok(())
+    match outcome {
+        ServeOutcome::Shutdown => {
+            tracing::info!(event = "gateway_stopped", reason = "shutdown");
+            Ok(())
+        }
+        // Nothing can wake the daemon again, and nobody asked it to stop. Exiting successfully
+        // here is what let a gateway that lost every workspace to a revoked token look like a
+        // clean run to whatever supervises it.
+        ServeOutcome::TransportsLost => {
+            tracing::error!(event = "gateway_stopped", reason = "transports-lost");
+            Err(DekopondError::TransportsLost)
+        }
+    }
 }
 
 fn agent_inventory(catalog: &LocalCatalog) -> AgentInventory {
@@ -372,14 +426,18 @@ async fn report_status(
                     broker.frame,
                 ) {
                     Ok(client) => client,
-                    Err(_) => {
-                        tracing::warn!(event = "gateway_usage_report_failed");
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "gateway_usage_report_failed",
+                            category = client_error_category(&error)
+                        );
                         continue;
                     }
                 };
-                match timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => tracing::warn!(event = "gateway_usage_report_failed"),
+                if let Some(category) = report_failure(
+                    timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await,
+                ) {
+                    tracing::warn!(event = "gateway_usage_report_failed", category = category);
                 }
             }
             _ = heartbeat.tick() => {
@@ -389,22 +447,68 @@ async fn report_status(
                     broker.frame,
                 ) {
                     Ok(client) => client,
-                    Err(_) => {
-                        tracing::warn!(event = "gateway_agent_inventory_report_failed");
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "gateway_agent_inventory_report_failed",
+                            category = client_error_category(&error)
+                        );
                         continue;
                     }
                 };
-                match timeout(
-                    STATUS_REPORT_TIMEOUT,
-                    client.publish_agent_inventory(inventory.clone()),
-                ).await {
-                    Ok(Ok(())) => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(event = "gateway_agent_inventory_report_failed")
-                    }
+                match report_failure(
+                    timeout(
+                        STATUS_REPORT_TIMEOUT,
+                        client.publish_agent_inventory(inventory.clone()),
+                    ).await,
+                ) {
+                    None => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
+                    Some(category) => tracing::warn!(
+                        event = "gateway_agent_inventory_report_failed",
+                        category = category
+                    ),
                 }
             }
         }
+    }
+}
+
+/// Why one bounded report attempt did not land, or [`None`] when it did.
+///
+/// Reporting is informational and never retried, so the log line is the whole record of it. Without
+/// a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
+/// gone", which is the triage the report exists for.
+fn report_failure(
+    result: Result<Result<(), dekopon_broker_protocol::ClientError>, tokio::time::error::Elapsed>,
+) -> Option<&'static str> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(client_error_category(&error)),
+        // Distinct from every client failure: the broker was reachable and simply did not answer
+        // inside [`STATUS_REPORT_TIMEOUT`], which is a busy broker rather than a missing one.
+        Err(_) => Some("timeout"),
+    }
+}
+
+/// Stable low-cardinality category for a broker client failure, never its message.
+///
+/// [`dekopon_broker_protocol::ClientError`] carries socket paths and bounded remote text, and
+/// `docs/observability.md` keeps both out of exported telemetry. Matched exhaustively so a new
+/// variant has to be given a name here rather than silently arriving as "other".
+fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'static str {
+    use dekopon_broker_protocol::ClientError;
+    match error {
+        ClientError::SocketMetadata { .. } => "socket-metadata",
+        ClientError::UnsafeSocket => "unsafe-socket",
+        ClientError::ConnectTimeout => "connect-timeout",
+        ClientError::Connect { .. } => "connect",
+        ClientError::PeerCredentials { .. } => "peer-credentials",
+        ClientError::ServerIdentity { .. } => "server-identity",
+        ClientError::Limits(_) => "limits",
+        // Flat rather than split by `ExchangePhase`: that distinction exists to decide whether work
+        // may be resubmitted, and these two reports are never retried.
+        ClientError::Protocol { .. } => "protocol",
+        ClientError::Remote { .. } => "remote",
+        ClientError::UnexpectedResponse => "unexpected-response",
     }
 }
 
@@ -463,6 +567,15 @@ fn merge_usage(total: &mut ModelUsageReport, next: ModelUsageReport) {
         .saturating_add(next.total_unreported_calls);
 }
 
+/// Why the routing loop stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServeOutcome {
+    /// Somebody asked the daemon to stop.
+    Shutdown,
+    /// Every transport reader ended, so no message can reach the daemon again.
+    TransportsLost,
+}
+
 /// The routing loop: one message in, at most one session task out.
 #[allow(clippy::too_many_arguments)]
 async fn serve<F>(
@@ -473,11 +586,13 @@ async fn serve<F>(
     mut receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
-) where
+) -> ServeOutcome
+where
     F: Future<Output = ()> + Send,
 {
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
+    let mut outcome = ServeOutcome::Shutdown;
 
     loop {
         // Reaped opportunistically rather than awaited: a finished session's task must not hold a
@@ -488,7 +603,10 @@ async fn serve<F>(
         tokio::select! {
             () = &mut shutdown => break,
             event = receiver.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    outcome = ServeOutcome::TransportsLost;
+                    break;
+                };
                 match event {
                     TransportEvent::Message(message) => {
                         dispatch(&runner, &routes, &identities, &repliers, &mut sessions, *message);
@@ -515,6 +633,7 @@ async fn serve<F>(
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
     }
+    outcome
 }
 
 /// Reports a session task that did not finish normally.
@@ -548,14 +667,23 @@ fn dispatch(
         );
         return;
     };
-    // A channel route that fired on every message would be noise and cost, so a shared
-    // conversation requires the bot to be addressed. A direct message is addressed by definition.
+    // A channel route that fired on every message would be noise and cost. Shared conversations
+    // therefore require an explicit address, except for one Slack Agent continuation that the
+    // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
+    // A direct message is addressed by definition.
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
             .is_some_and(|identity| identity.is_addressed(&message.text))
     });
-    if matches!(message.conversation, ConversationKind::Channel(_)) && !addressed {
+    let inherited_thread = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
+    if matches!(message.conversation, ConversationKind::Channel(_))
+        && !addressed
+        && !inherited_thread
+    {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -594,7 +722,7 @@ fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request
     sessions.spawn(async move {
         if let Err(error) = reply
             .replier
-            .reply(reply.target, STOPPED_REPLY.to_owned())
+            .reply(reply.target, OutboundReply::text(STOPPED_REPLY))
             .await
         {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
@@ -606,6 +734,7 @@ fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
     sender: mpsc::Sender<TransportEvent>,
+    health: Arc<TransportHealth>,
 ) {
     loop {
         match transport.next().await {
@@ -622,9 +751,68 @@ async fn read_transport(
                     transport = transport.name(),
                     category = error.category()
                 );
+                // Recorded rather than only logged: this daemon keeps serving whatever is left,
+                // so the condition outlives the line that reported it.
+                health.mark_dead(transport.name());
                 return;
             }
         }
+    }
+}
+
+/// Which transports have ended for good, shared by the readers and the health reporter.
+#[derive(Debug)]
+struct TransportHealth {
+    configured: usize,
+    dead: std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl TransportHealth {
+    fn new(configured: usize) -> Self {
+        Self {
+            configured,
+            dead: std::sync::Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn mark_dead(&self, transport: &str) {
+        self.dead
+            .lock()
+            .expect("gateway transport health")
+            .insert(transport.to_owned());
+    }
+
+    /// The dead transports by name, sorted so one line means the same thing every time.
+    fn dead(&self) -> Vec<String> {
+        self.dead
+            .lock()
+            .expect("gateway transport health")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Re-states a degraded transport set on an interval for as long as it stays degraded.
+async fn report_transport_health(health: Arc<TransportHealth>) {
+    let mut interval = tokio::time::interval(TRANSPORT_HEALTH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately once, and nothing can be dead before the readers start.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let dead = health.dead();
+        if dead.is_empty() {
+            continue;
+        }
+        // Configured transport names, which an operator wrote and telemetry already carries per
+        // event. Nothing here comes from a chat service.
+        tracing::warn!(
+            event = "gateway_transports_degraded",
+            transport.dead = dead.len(),
+            transport.configured = health.configured,
+            transports = %dead.join(",")
+        );
     }
 }
 
@@ -662,6 +850,31 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                 transport::read_credential(bot_token_env)?,
                 activity.mode,
             )?),
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => Box::new(WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
+            )?),
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
@@ -698,6 +911,9 @@ pub enum DekopondError {
     /// A route could not be bound to a catalog agent and a configured model.
     #[error("gateway route cannot be satisfied")]
     Route(#[from] RouteError),
+    /// A named image generator could not resolve its model credential or client.
+    #[error("configured image generator is unavailable")]
+    ImageGenerator(#[source] ImageGeneratorStartupError),
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
@@ -709,6 +925,12 @@ pub enum DekopondError {
         #[source]
         source: TransportError,
     },
+    /// Every transport ended on its own, with no shutdown asked for.
+    ///
+    /// The daemon has no way left to hear a message, so it stops. Reporting it as a failure is the
+    /// difference between a supervisor restarting the gateway and a pod that stays green.
+    #[error("every chat transport ended; the gateway can no longer be reached")]
+    TransportsLost,
 }
 
 #[cfg(test)]

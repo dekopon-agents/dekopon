@@ -13,6 +13,7 @@
 //!     // Ordinary callers cannot use a struct literal to cross the authority boundary.
 //!     let _forged = AuthorizedInvocation {
 //!         proposal,
+//!         provider: todo!(),
 //!         receipt: todo!(),
 //!         constraints,
 //!     };
@@ -314,8 +315,8 @@ impl AuthorizationReceipt {
 /// Private fields prevent accidental conversion from an untrusted proposal. The selected provider
 /// is bound alongside the proposal and constraints. The value is not cloneable or deserializable:
 /// the broker-owned execution boundary creates and consumes it once. It is serializable as
-/// inert data for future broker-owned audit and evidence recording, but its serialized form
-/// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
+/// inert data for broker-owned audit and evidence recording, but its serialized form is not a
+/// transferable bearer grant and intentionally cannot be deserialized.
 #[derive(Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
