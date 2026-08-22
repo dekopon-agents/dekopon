@@ -32,7 +32,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Detect unused dependencies
+        run: |
+          cargo install cargo-machete --locked
+          cargo machete
       - name: Verify runner excludes privileged broker machinery
         shell: bash
         run: |
@@ -51,8 +55,37 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify emitted audit events are documented
+        shell: bash
+        run: |
+          set -euo pipefail
+          doc=docs/observability.md
+          emitted=()
+          while IFS= read -r event; do
+            emitted+=("$event")
+          done < <(
+            grep -rhoE 'audit\.event[[:space:]]*=[[:space:]]*"[a-z0-9_.]+"' --include='*.rs' crates \
+              | grep -oE '"[a-z0-9_.]+"' \
+              | tr -d '"' \
+              | sort -u
+          )
+          # An empty set means the emission shape changed and this gate stopped reading anything,
+          # which is the silent failure worth failing on.
+          if [ ${#emitted[@]} -eq 0 ]; then
+            echo 'no audit.event names found in crates/; the extraction pattern is stale' >&2
+            exit 1
+          fi
+          status=0
+          for event in "${emitted[@]}"; do
+            if ! grep -Fq -- "\`$event\`" "$doc"; then
+              echo "undocumented audit event: $event (add \`$event\` to $doc)" >&2
+              status=1
+            fi
+          done
+          printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
+          exit "$status"
       - name: Test workspace
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
@@ -161,6 +194,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test changelog validation
         run: python3 .github/scripts/test_verify_changelog.py
+      - name: Test release metadata validation
+        run: python3 .github/scripts/test_verify_release_metadata.py
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:

@@ -61,6 +61,8 @@ All notable changes to Dekopon are documented here. The format is based on
   `RecordDeliveredTurnForChat` recording.
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
+- Documented the nine refusal, error, and outcome audit events `docs/observability.md` had never
+  named, and made an emitted `audit.event` name absent from that file a CI failure.
 - Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
   restart reads compiled provider code back instead of running Cranelift again.
 - Added an optional `dekopon-run --compile-cache <DIRECTORY>` (`DEKOPON_RUN_COMPILE_CACHE`) backed by
@@ -303,6 +305,13 @@ All notable changes to Dekopon are documented here. The format is based on
   that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
   to source text.
 
+### Removed
+
+- A Cedar literal outside the Dekopon identifier grammar now returns `UnknownAction` or
+  `UnknownProvider` in tolerant startup mode instead of an opaque validation error, and a policy
+  that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
+  to source text.
+
 ### Security
 
 - Direct `dekopon-run` provider stores now bound table elements, tables, linear memories, and core
@@ -384,8 +393,6 @@ All notable changes to Dekopon are documented here. The format is based on
   protocol failure.
 - HTTP call evidence now records a status-less entry for a request the credential binding refuses,
   so evidence counts reconcile with the request budget the attempt consumed.
-- The Agent Slack manifest now requests public/private channel history events required to observe
-  continuations; ambient traffic is discarded inside the transport before routing or inference.
 - `docs/broker-http.md` now documents the `provider-error` failure code, the deliberately ungated
   `resolveCommand` operation, and a version-and-compatibility section stating that all four
   executables upgrade together; its startup-validation section no longer claims every entity literal
