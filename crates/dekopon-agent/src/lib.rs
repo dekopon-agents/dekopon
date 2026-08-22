@@ -6,7 +6,7 @@
 //! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
 //!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
 //!   bounded [`prompt::History`], [`prompt::SessionInputs`] optionally carrying cooperative
-//!   cancellation for transport-owned Stop controls, and
+//!   cancellation for transport-owned Stop controls or a request-scoped no-reply decision, and
 //!   [`prompt::run_prompt_with_history_and_options`] adding the request-scoped routing metadata a
 //!   caller uses to point one conversation's turns at one provider cache lane;
 //! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
@@ -527,6 +527,19 @@ impl CapabilityInvoker for BrokerLeg {
             Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
+            // The proposal reached the broker and its outcome is unknown here: a client-side read
+            // timeout cannot distinguish a `gh.issue.comment` that ran 29s against a 30s deadline
+            // from one that never ran, and `outcome-unaudited` says outright that the effect may
+            // have happened. `Failed` exits 1, which a model reads as "the call errored, try
+            // again" — and a retry carries a fresh invocation identifier, so replay rejection
+            // cannot catch the duplicate external effect. `Denied` (126) is the interpreter's only
+            // non-retryable status, so an unaudited outcome takes it and says why.
+            Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
+                reason: format!(
+                    "the broker did not record an outcome for this invocation and it may already \
+                     have taken effect; do not resubmit it ({error})"
+                ),
+            },
             // Every `ClientError` renders without the socket path, so a script cannot learn where
             // the broker lives — the interpreter refuses to read the process environment, and this
             // is the one path that could otherwise leak `DEKOPON_BROKER_SOCKET` back into it.

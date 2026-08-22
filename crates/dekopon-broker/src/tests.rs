@@ -8,14 +8,16 @@ use dekopon_capability::{
     EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
     StorageAccess, StorageConstraints, StorageInterface, StorageNamespace,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, TraceId};
+use dekopon_core::{
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TraceId,
+};
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeGrant,
-    ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
-    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
-    is_reserved_memory_route, verify_audit_chain,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeClaim,
+    ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog,
+    InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints, encode_host_limits,
+    encode_memory_config, encode_storage_limits, is_reserved_memory_route, verify_audit_chain,
 };
 
 /// A terminal execution event, for the record shapes a decision-only fixture never reaches.
@@ -689,6 +691,37 @@ fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     }
     .validate()
     .expect("signed Telegram service limits are accepted exactly");
+
+    AttestorGrant {
+        namespaces: vec!["whatsapp".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Whatsapp,
+            transport: "whatsapp".parse().expect("transport"),
+            channel: "123:456:16034700182".to_owned(),
+            conversation: "123:456:16034700182".to_owned(),
+            local_subject_service: None,
+        }],
+    }
+    .validate()
+    .expect("exact WhatsApp WABA, phone, and sender scope is accepted");
+
+    let scope = ChatScopeClaim {
+        transport: "whatsapp".parse().expect("transport"),
+        kind: ChatTransportKind::Whatsapp,
+        channel: "123:456:16034700182".to_owned(),
+        conversation: "123:456:16034700182".to_owned(),
+    };
+    assert!(canonical_chat_scope(
+        &ExternalSubject::whatsapp("16034700182").expect("subject"),
+        &scope,
+    ));
+    assert!(
+        !canonical_chat_scope(
+            &ExternalSubject::whatsapp("16034700999").expect("subject"),
+            &scope,
+        ),
+        "the signed sender in scope cannot be detached from the attested subject"
+    );
 }
 
 #[test]
