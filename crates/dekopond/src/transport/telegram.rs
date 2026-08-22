@@ -19,13 +19,17 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
     },
 };
 
 /// Ceiling on one attachment's file name.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
-/// Telegram's `sendMessage` text ceiling, measured conservatively as UTF-16 units.
+/// Telegram's `sendMessage` text ceiling, which the Bot API counts in UTF-16 code units.
+///
+/// Below the gateway's own 8 KiB outbound bound, so a normal long answer is two or three posts
+/// rather than a rejected one. Splitting is shared with Discord's 2,000-unit ceiling through
+/// [`crate::transport::split_message`], newline preference and all.
 const MAX_MESSAGE_CHARS: usize = 4_096;
 /// Telegram's `sendPhoto` caption ceiling.
 const MAX_PHOTO_CAPTION_CHARS: usize = 1_024;
@@ -183,6 +187,7 @@ impl TelegramTransport {
             conversation,
             // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
+            thread_continuation: None,
             reply: ReplyTarget::Telegram {
                 chat_id,
                 reply_to,
@@ -511,7 +516,10 @@ impl TelegramReplier {
     ) -> Result<DeliveryReceipt, TransportError> {
         let mut accepted = prior_accepted;
         let mut last_receipt = None;
-        for (index, chunk) in split_message(text).into_iter().enumerate() {
+        for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS)
+            .into_iter()
+            .enumerate()
+        {
             let first_text_reply = (!prior_accepted && index == 0)
                 .then_some(reply_to)
                 .flatten();
@@ -641,36 +649,6 @@ impl TelegramReplier {
         }
         Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
     }
-}
-
-/// Splits service-visible text without loss under Telegram's per-message ceiling.
-fn split_message(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let mut units = 0;
-        let mut end = text.len();
-        for (index, character) in text[start..].char_indices() {
-            let next = units + character.len_utf16();
-            if next > MAX_MESSAGE_CHARS {
-                end = start + index;
-                break;
-            }
-            units = next;
-        }
-        if end < text.len()
-            && let Some(newline) = text[start..end].rfind('\n')
-            && newline > 0
-        {
-            end = start + newline + 1;
-        }
-        chunks.push(text[start..end].to_owned());
-        start = end;
-    }
-    chunks
 }
 
 /// Decodes a Bot API response, turning `ok: false` into its stable description.

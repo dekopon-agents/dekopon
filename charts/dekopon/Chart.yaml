@@ -12,10 +12,13 @@ type: application
 # and this field agree, so the tree never disagrees with the registry about which version it is.
 version: 0.1.0
 
-# The first tag the container-image workflow runs for. v0.3.0 predates that workflow and has no
-# image at all; see README.md ("Image and appVersion"). The image tag is the Git tag, so the
-# rendered reference is v<appVersion>, not <appVersion>.
-appVersion: "0.4.0"
+# The application release this chart deploys. It is also what app.kubernetes.io/version reports on
+# every rendered object, so it has to track the image or the cluster answers `kubectl get pods -l
+# app.kubernetes.io/version` with a version nothing is running. Move it with the application, in
+# the release-prep commit; see README.md ("Two version numbers"). v0.3.0 and earlier predate the
+# container-image workflow and have no image. The image tag is the Git tag, so the rendered
+# reference is v<appVersion>, not <appVersion>.
+appVersion: "0.9.0"
 
 # The broker is a sidecar container (an initContainer with restartPolicy: Always) so it is
 # started and probed before dekopond runs, and torn down after it. Native sidecars are beta and

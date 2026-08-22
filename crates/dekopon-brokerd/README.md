@@ -309,7 +309,34 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata and each mapped capability response to fit the frame ceiling. Shutdown grace must cover one configured host deadline plus two complete frame deadlines.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required except the two optional entries described below. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through `capabilitiesFor`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain, the provider-storage GC drain, and the web-UI drain share a single deadline rather than taking one each.
+
+`maxReplayIds` should be at least `auditMaxRecords`. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
+
+### Compilation cache and the concurrent memory budget
+
+```yaml
+compileCachePath: /var/lib/dekopon/compile-cache
+hostLimits:
+  # …every other field…
+  maxTotalMemoryBytes: 268435456
+```
+
+`compileCachePath` is optional. Absent, Cranelift compiles every component at every start and the
+socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
+broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back
+instead. The directory holds code this privileged process executes, so its parent must be
+owner-only under the same rule as the socket and audit paths; the broker creates the directory
+itself. Components already compile concurrently rather than one at a time either way.
+
+`hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst
+case is `serverLimits.maxConnections` × `maxMemoryBytes` — 64 × 64 MiB = 4 GiB at the defaults,
+which no small container survives. The broker states that product in one startup line so it is
+budgeted rather than discovered. Optional `hostLimits.maxTotalMemoryBytes` enforces it: a store that
+cannot reserve its share is refused before it exists, turning an OOM kill into a failed invocation.
+It must be at least `maxMemoryBytes`, and it is deliberately absent from the authority commitment —
+it is a concurrency budget, not a ceiling an authorization could narrow, so changing it does not
+rotate stored authority.
 
 ```console
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
@@ -319,7 +346,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
+SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
 
 ## Read-only web UI
 
@@ -350,6 +377,7 @@ The backing filesystem must honor Unix no-follow opens, advisory exclusive locks
 ## Boundaries
 
 - The service accepts one strict bounded request per fresh Unix connection.
+- A transient `accept` failure — descriptor or kernel-buffer exhaustion, an aborted peer, a signal — is logged as `broker_accept_retried` and retried after a short backoff. Only a fault that says the listener itself is unusable ends the process, because ending it costs a container restart and a full provider recompile before the socket rebinds.
 - Peer UID mapping is trusted configuration; payload identity claims do not exist.
 - Authorization decisions come from the Cedar policy set; execution bounds come from
   `constraintSets` and are validated against loaded manifests, host ceilings, and the credential

@@ -1,0 +1,26 @@
+apiVersion: dekopon.dev/dekopond/v1alpha1
+catalogPath: /etc/dekopon/dekopon.yaml
+broker:
+  socketPath: /run/dekopon/broker.sock
+transports:
+  - name: support-whatsapp
+    kind: whatsappCloudApi
+    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    bind: 0.0.0.0:9080
+    callbackPath: /webhooks/whatsapp
+    wabaId: "REPLACE_WITH_CANONICAL_NUMERIC_WABA_ID"
+    phoneNumberId: "REPLACE_WITH_CANONICAL_NUMERIC_RECEIVING_PHONE_NUMBER_ID"
+    graphApiVersion: v23.0
+models:
+  - name: local
+    kind: openaiCompatible
+    endpoint: http://127.0.0.1:11434/v1
+    model: qwen3
+    timeoutMs: 120000
+    classes: [reasoning]
+routes:
+  - transport: support-whatsapp
+    match: { kind: directMessage }
+    agent: reviewer

@@ -7,13 +7,14 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
-    env, fs, io,
+    collections::{BTreeMap, BTreeSet},
+    env, fmt, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use dekopon_core::{AgentId, CapabilityId, IdentifierError, ProviderId};
-use dekopon_protocol::{Agent, ApiVersion, Capability, Kind, Provider};
+use dekopon_protocol::{Agent, ApiVersion, Capability, Provider};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use thiserror::Error;
@@ -78,119 +79,47 @@ impl LocalCatalog {
             return Err(ConfigError::Empty { path: source_name });
         }
 
-        let mut agents = BTreeMap::<AgentId, (String, Agent)>::new();
-        let mut capabilities = BTreeMap::<CapabilityId, (String, Capability)>::new();
-        let mut providers = BTreeMap::<ProviderId, (String, Provider)>::new();
+        let mut agents = ResourceSet::<Agent>::default();
+        let mut capabilities = ResourceSet::<Capability>::default();
+        let mut providers = ResourceSet::<Provider>::default();
+        let mut problems = Vec::new();
+        // A resource that never reached its set cannot be referenced by name, so reference
+        // checks below would blame the resources pointing at it as well. Report the real
+        // failure alone rather than twice.
+        let mut incomplete = false;
 
         for (origin, value) in resources {
-            let kind = resource_kind(&value).map(str::to_owned).ok_or_else(|| {
-                ConfigError::MissingKind {
-                    path: source.display().to_string(),
-                    origin: origin.clone(),
-                }
-            })?;
-
-            match kind.as_str() {
-                "Agent" => {
-                    let resource = decode::<Agent>(&source, &origin, &kind, value)?;
-                    validate_header(
-                        &source,
-                        &origin,
-                        Kind::Agent,
-                        resource.api_version,
-                        resource.kind.into(),
-                    )?;
-                    let id =
-                        parse_id::<AgentId>(&source, &origin, "Agent", &resource.metadata.name)?;
-                    if let Some((first, _)) = agents.get(&id) {
-                        return Err(ConfigError::DuplicateResource {
-                            path: source.display().to_string(),
-                            kind: "Agent",
-                            name: id.to_string(),
-                            first: first.clone(),
-                            duplicate: origin,
-                        });
-                    }
-                    agents.insert(id, (origin, resource));
-                }
-                "Capability" => {
-                    let resource = decode::<Capability>(&source, &origin, &kind, value)?;
-                    validate_header(
-                        &source,
-                        &origin,
-                        Kind::Capability,
-                        resource.api_version,
-                        resource.kind.into(),
-                    )?;
-                    let id = parse_id::<CapabilityId>(
-                        &source,
-                        &origin,
-                        "Capability",
-                        &resource.metadata.name,
-                    )?;
-                    if let Some((first, _)) = capabilities.get(&id) {
-                        return Err(ConfigError::DuplicateResource {
-                            path: source.display().to_string(),
-                            kind: "Capability",
-                            name: id.to_string(),
-                            first: first.clone(),
-                            duplicate: origin,
-                        });
-                    }
-                    capabilities.insert(id, (origin, resource));
-                }
-                "Provider" => {
-                    let resource = decode::<Provider>(&source, &origin, &kind, value)?;
-                    validate_header(
-                        &source,
-                        &origin,
-                        Kind::Provider,
-                        resource.api_version,
-                        resource.kind.into(),
-                    )?;
-                    let id = parse_id::<ProviderId>(
-                        &source,
-                        &origin,
-                        "Provider",
-                        &resource.metadata.name,
-                    )?;
-                    if let Some((first, _)) = providers.get(&id) {
-                        return Err(ConfigError::DuplicateResource {
-                            path: source.display().to_string(),
-                            kind: "Provider",
-                            name: id.to_string(),
-                            first: first.clone(),
-                            duplicate: origin,
-                        });
-                    }
-                    providers.insert(id, (origin, resource));
-                }
-                unsupported => {
-                    return Err(ConfigError::UnsupportedKind {
-                        path: source.display().to_string(),
-                        origin,
-                        kind: unsupported.to_owned(),
-                    });
-                }
+            let outcome = match string_field(&value, "kind").map(str::to_owned) {
+                Some(kind) => match kind.as_str() {
+                    Agent::KIND => agents.insert(&origin, value),
+                    Capability::KIND => capabilities.insert(&origin, value),
+                    Provider::KIND => providers.insert(&origin, value),
+                    _ => Err(CatalogProblem::UnsupportedKind { origin, kind }),
+                },
+                None => Err(CatalogProblem::MissingKind { origin }),
+            };
+            if let Err(problem) = outcome {
+                incomplete |= problem.drops_resource();
+                problems.push(problem);
             }
         }
 
-        validate_references(&source, &agents, &capabilities, &providers)?;
+        if !incomplete {
+            validate_references(&agents, &capabilities, &providers, &mut problems);
+        }
+
+        if !problems.is_empty() {
+            return Err(ConfigError::Invalid {
+                path: source_name,
+                problems,
+            });
+        }
 
         Ok(Self {
             source,
-            agents: agents
-                .into_iter()
-                .map(|(id, (_, resource))| (id, resource))
-                .collect(),
-            capabilities: capabilities
-                .into_iter()
-                .map(|(id, (_, resource))| (id, resource))
-                .collect(),
-            providers: providers
-                .into_iter()
-                .map(|(id, (_, resource))| (id, resource))
-                .collect(),
+            agents: agents.into_map(),
+            capabilities: capabilities.into_map(),
+            providers: providers.into_map(),
         })
     }
 
@@ -259,105 +188,201 @@ pub struct CatalogSnapshot {
     pub providers: Vec<Provider>,
 }
 
-fn resource_kind(value: &Value) -> Option<&str> {
-    let mapping = value.as_mapping()?;
-    mapping
-        .get(Value::String("kind".to_owned()))
+fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value
+        .as_mapping()?
+        .get(Value::String(field.to_owned()))
         .and_then(Value::as_str)
 }
 
-fn decode<T>(path: &Path, origin: &str, kind: &str, value: Value) -> Result<T, ConfigError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_yaml::from_value(value).map_err(|source| ConfigError::Decode {
-        path: path.display().to_string(),
-        origin: origin.to_owned(),
-        kind: kind.to_owned(),
-        source,
-    })
+/// One authored resource kind, decoded and keyed by its own identifier type.
+trait Resource: Sized + for<'de> Deserialize<'de> {
+    /// Validated identifier type this kind is stored under.
+    type Id: FromStr<Err = IdentifierError> + Ord + fmt::Display;
+
+    /// Authored `kind` discriminator.
+    const KIND: &'static str;
+
+    /// Authored metadata name, before identifier validation.
+    fn name(&self) -> &str;
 }
 
-fn parse_id<T>(path: &Path, origin: &str, kind: &'static str, name: &str) -> Result<T, ConfigError>
-where
-    T: std::str::FromStr<Err = IdentifierError>,
-{
-    name.parse().map_err(|source| ConfigError::InvalidName {
-        path: path.display().to_string(),
-        origin: origin.to_owned(),
-        kind,
-        name: name.to_owned(),
-        source: Box::new(source),
-    })
+impl Resource for Agent {
+    type Id = AgentId;
+    const KIND: &'static str = "Agent";
+
+    fn name(&self) -> &str {
+        &self.metadata.name
+    }
 }
 
-fn validate_header(
-    path: &Path,
-    origin: &str,
-    expected: Kind,
-    api_version: ApiVersion,
-    actual: Kind,
-) -> Result<(), ConfigError> {
-    if api_version != ApiVersion::V1Alpha1 {
-        return Err(ConfigError::UnsupportedApiVersion {
-            path: path.display().to_string(),
-            origin: origin.to_owned(),
-            version: api_version.to_string(),
-        });
+impl Resource for Capability {
+    type Id = CapabilityId;
+    const KIND: &'static str = "Capability";
+
+    fn name(&self) -> &str {
+        &self.metadata.name
     }
-    if actual != expected {
-        return Err(ConfigError::KindMismatch {
-            path: path.display().to_string(),
-            origin: origin.to_owned(),
-            expected,
-            actual,
-        });
+}
+
+impl Resource for Provider {
+    type Id = ProviderId;
+    const KIND: &'static str = "Provider";
+
+    fn name(&self) -> &str {
+        &self.metadata.name
     }
-    Ok(())
+}
+
+/// Resources of one kind, with the document each was declared in.
+struct ResourceSet<T: Resource> {
+    entries: BTreeMap<T::Id, (String, T)>,
+}
+
+impl<T: Resource> Default for ResourceSet<T> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Resource> ResourceSet<T> {
+    /// Decodes, validates, and admits one authored document, or reports why it cannot join.
+    fn insert(&mut self, origin: &str, value: Value) -> Result<(), CatalogProblem> {
+        // The typed decoder knows exactly one API version, so a future one would fail here as an
+        // unknown enum variant. Reading the authored string first is what keeps the dedicated
+        // message reachable.
+        if let Some(version) = string_field(&value, "apiVersion")
+            && version != ApiVersion::V1Alpha1.to_string()
+        {
+            return Err(CatalogProblem::UnsupportedApiVersion {
+                origin: origin.to_owned(),
+                version: version.to_owned(),
+            });
+        }
+
+        let resource =
+            serde_yaml::from_value::<T>(value).map_err(|source| CatalogProblem::Decode {
+                origin: origin.to_owned(),
+                kind: T::KIND,
+                source,
+            })?;
+        let id =
+            resource
+                .name()
+                .parse::<T::Id>()
+                .map_err(|source| CatalogProblem::InvalidName {
+                    origin: origin.to_owned(),
+                    kind: T::KIND,
+                    name: resource.name().to_owned(),
+                    source: Box::new(source),
+                })?;
+        if let Some((first, _)) = self.entries.get(&id) {
+            return Err(CatalogProblem::DuplicateResource {
+                kind: T::KIND,
+                name: id.to_string(),
+                first: first.clone(),
+                duplicate: origin.to_owned(),
+            });
+        }
+        self.entries.insert(id, (origin.to_owned(), resource));
+        Ok(())
+    }
+
+    fn contains(&self, id: &T::Id) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    fn get(&self, id: &T::Id) -> Option<&T> {
+        self.entries.get(id).map(|(_, resource)| resource)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&T::Id, &T)> {
+        self.entries
+            .iter()
+            .map(|(id, (_, resource))| (id, resource))
+    }
+
+    fn into_map(self) -> BTreeMap<T::Id, T> {
+        self.entries
+            .into_iter()
+            .map(|(id, (_, resource))| (id, resource))
+            .collect()
+    }
 }
 
 fn validate_references(
-    path: &Path,
-    agents: &BTreeMap<AgentId, (String, Agent)>,
-    capabilities: &BTreeMap<CapabilityId, (String, Capability)>,
-    providers: &BTreeMap<ProviderId, (String, Provider)>,
-) -> Result<(), ConfigError> {
-    let path = path.display().to_string();
-
-    for (agent_id, (_, agent)) in agents {
+    agents: &ResourceSet<Agent>,
+    capabilities: &ResourceSet<Capability>,
+    providers: &ResourceSet<Provider>,
+    problems: &mut Vec<CatalogProblem>,
+) {
+    for (agent_id, agent) in agents.iter() {
+        // Which provider each capability routes to, so the agent's own provider list can be held
+        // to the capabilities it actually declares rather than merely to existing names.
+        let mut required = BTreeMap::<&ProviderId, &CapabilityId>::new();
+        let mut every_capability_resolved = true;
         for capability in &agent.spec.capabilities {
-            if !capabilities.contains_key(capability) {
-                return Err(ConfigError::MissingCapability {
-                    path: path.clone(),
-                    agent: agent_id.to_string(),
-                    capability: capability.to_string(),
-                });
+            match capabilities.get(capability) {
+                Some(declared) => {
+                    required
+                        .entry(&declared.spec.provider)
+                        .or_insert(capability);
+                }
+                None => {
+                    every_capability_resolved = false;
+                    problems.push(CatalogProblem::MissingCapability {
+                        agent: agent_id.to_string(),
+                        capability: capability.to_string(),
+                    });
+                }
             }
         }
+
+        let listed = agent.spec.providers.iter().collect::<BTreeSet<_>>();
         for provider in &agent.spec.providers {
-            if !providers.contains_key(provider) {
-                return Err(ConfigError::MissingProvider {
-                    path: path.clone(),
+            if !providers.contains(provider) {
+                problems.push(CatalogProblem::MissingProvider {
                     resource_kind: "agent",
                     resource: agent_id.to_string(),
                     provider: provider.to_string(),
                 });
             }
         }
+        for (provider, capability) in &required {
+            if !listed.contains(provider) {
+                problems.push(CatalogProblem::UnlistedAgentProvider {
+                    agent: agent_id.to_string(),
+                    provider: provider.to_string(),
+                    capability: capability.to_string(),
+                });
+            }
+        }
+        // An unresolved capability hides the provider it would have required, so a listed
+        // provider cannot be called unreachable until every capability is known. A provider that
+        // is not in the catalog at all has already been reported once, by its real name.
+        if every_capability_resolved {
+            for provider in listed {
+                if !required.contains_key(provider) && providers.contains(provider) {
+                    problems.push(CatalogProblem::UnreachableAgentProvider {
+                        agent: agent_id.to_string(),
+                        provider: provider.to_string(),
+                    });
+                }
+            }
+        }
     }
 
-    for (capability_id, (_, capability)) in capabilities {
-        if !providers.contains_key(&capability.spec.provider) {
-            return Err(ConfigError::MissingProvider {
-                path: path.clone(),
+    for (capability_id, capability) in capabilities.iter() {
+        if !providers.contains(&capability.spec.provider) {
+            problems.push(CatalogProblem::MissingProvider {
                 resource_kind: "capability",
                 resource: capability_id.to_string(),
                 provider: capability.spec.provider.to_string(),
             });
         }
     }
-
-    Ok(())
 }
 
 /// Inputs used to resolve the configuration discovery precedence.
@@ -428,8 +453,22 @@ impl DiscoveryContext {
         }
         searched.push(self.current_directory.join("dekopon.yaml"));
 
-        if let Some(path) = searched.iter().find(|path| path.is_file()) {
-            return Ok(path.clone());
+        for path in &searched {
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => return Ok(path.clone()),
+                // A directory or device at a candidate path is not this location's config.
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // Anything else — a permission or traversal failure on the parent — means an
+                // existing higher-precedence config may be hidden. Falling through would load a
+                // lower-precedence file, so refuse instead of guessing.
+                Err(source) => {
+                    return Err(ConfigError::Candidate {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            }
         }
 
         Err(ConfigError::NotFound {
@@ -490,51 +529,90 @@ pub enum ConfigError {
         /// Display path.
         path: String,
     },
-    /// A resource omitted its discriminator.
-    #[error("{path}: {origin}: resource is missing string field `kind`")]
-    MissingKind {
+    /// The catalog parsed, and every semantic problem found in it is listed here.
+    #[error("{path}: {}", render_problems(.problems))]
+    Invalid {
         /// Display path.
         path: String,
+        /// Every problem found, in document then reference order.
+        problems: Vec<CatalogProblem>,
+    },
+    /// A default candidate path could not be examined.
+    #[error("failed to examine configuration candidate {path}: {source}")]
+    Candidate {
+        /// Display path.
+        path: String,
+        /// Underlying file-system error.
+        #[source]
+        source: io::Error,
+    },
+    /// No default candidate exists.
+    #[error("no Dekopon configuration found; searched: {searched}")]
+    NotFound {
+        /// Comma-separated paths in precedence order.
+        searched: String,
+    },
+    /// The process current directory was unavailable.
+    #[error("could not resolve the current directory: {0}")]
+    CurrentDirectory(#[source] io::Error),
+}
+
+fn render_problems(problems: &[CatalogProblem]) -> String {
+    let mut rendered = format!(
+        "{} validation problem{} found:",
+        problems.len(),
+        if problems.len() == 1 { "" } else { "s" }
+    );
+    for problem in problems {
+        rendered.push_str("\n  - ");
+        rendered.push_str(&problem.to_string());
+    }
+    rendered
+}
+
+/// One semantic problem in an otherwise parseable catalog.
+///
+/// A catalog is scanned to the end before it is refused, so an operator fixing three mistakes
+/// runs `dekopon validate` once rather than three times. Problems are reported through
+/// [`ConfigError::Invalid`], which owns the source path they all share.
+#[derive(Debug, Error)]
+pub enum CatalogProblem {
+    /// A resource omitted its discriminator.
+    #[error("{origin}: resource is missing string field `kind`")]
+    MissingKind {
         /// Document location.
         origin: String,
     },
     /// The authored resource kind is not implemented.
-    #[error("{path}: {origin}: unsupported resource kind {kind:?}")]
+    #[error("{origin}: unsupported resource kind {kind:?}")]
     UnsupportedKind {
-        /// Display path.
-        path: String,
         /// Document location.
         origin: String,
         /// Authored kind.
         kind: String,
     },
-    /// The resource decoder and its kind field disagreed.
-    #[error("{path}: {origin}: expected kind {expected}, found {actual}")]
-    KindMismatch {
-        /// Display path.
-        path: String,
-        /// Document location.
-        origin: String,
-        /// Decoder-selected kind.
-        expected: Kind,
-        /// Authored kind field.
-        actual: Kind,
-    },
-    /// A future API version reached semantic validation.
-    #[error("{path}: {origin}: unsupported API version {version}")]
+    /// The authored API version is not the one this crate implements.
+    #[error("{origin}: unsupported API version {version:?}")]
     UnsupportedApiVersion {
-        /// Display path.
-        path: String,
         /// Document location.
         origin: String,
         /// Authored API version.
         version: String,
     },
+    /// A typed resource could not be decoded.
+    #[error("{origin}: invalid {kind}: {source}")]
+    Decode {
+        /// Document location.
+        origin: String,
+        /// Authored kind.
+        kind: &'static str,
+        /// Typed decoder diagnostic.
+        #[source]
+        source: serde_yaml::Error,
+    },
     /// Resource metadata contained an invalid kind-specific identifier.
-    #[error("{path}: {origin}: invalid {kind} name {name:?}: {source}")]
+    #[error("{origin}: invalid {kind} name {name:?}: {source}")]
     InvalidName {
-        /// Display path.
-        path: String,
         /// Document location.
         origin: String,
         /// Resource kind.
@@ -546,10 +624,8 @@ pub enum ConfigError {
         source: Box<IdentifierError>,
     },
     /// Two resources of the same kind used one name.
-    #[error("{path}: duplicate {kind} {name:?} at {duplicate}; first declared at {first}")]
+    #[error("duplicate {kind} {name:?} at {duplicate}; first declared at {first}")]
     DuplicateResource {
-        /// Display path.
-        path: String,
         /// Resource kind.
         kind: &'static str,
         /// Duplicate name.
@@ -560,20 +636,16 @@ pub enum ConfigError {
         duplicate: String,
     },
     /// An agent referenced a capability not present in the catalog.
-    #[error("{path}: agent {agent:?} references missing capability {capability:?}")]
+    #[error("agent {agent:?} references missing capability {capability:?}")]
     MissingCapability {
-        /// Display path.
-        path: String,
         /// Agent name.
         agent: String,
         /// Missing capability name.
         capability: String,
     },
     /// An agent or capability referenced a provider not present in the catalog.
-    #[error("{path}: {resource_kind} {resource:?} references missing provider {provider:?}")]
+    #[error("{resource_kind} {resource:?} references missing provider {provider:?}")]
     MissingProvider {
-        /// Display path.
-        path: String,
         /// Referencing resource kind.
         resource_kind: &'static str,
         /// Referencing resource name.
@@ -581,15 +653,41 @@ pub enum ConfigError {
         /// Missing provider name.
         provider: String,
     },
-    /// No default candidate exists.
-    #[error("no Dekopon configuration found; searched: {searched}")]
-    NotFound {
-        /// Comma-separated paths in precedence order.
-        searched: String,
+    /// An agent omitted a provider its own capabilities route to.
+    #[error(
+        "agent {agent:?} omits provider {provider:?}, required by capability {capability:?}, \
+         from spec.providers"
+    )]
+    UnlistedAgentProvider {
+        /// Agent name.
+        agent: String,
+        /// Provider the capability routes to.
+        provider: String,
+        /// Capability requiring the provider.
+        capability: String,
     },
-    /// The process current directory was unavailable.
-    #[error("could not resolve the current directory: {0}")]
-    CurrentDirectory(#[source] io::Error),
+    /// An agent listed a provider none of its capabilities route to.
+    #[error("agent {agent:?} lists provider {provider:?}, which none of its capabilities route to")]
+    UnreachableAgentProvider {
+        /// Agent name.
+        agent: String,
+        /// Unreachable provider name.
+        provider: String,
+    },
+}
+
+impl CatalogProblem {
+    /// Whether the problem kept a resource out of the catalog.
+    const fn drops_resource(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingKind { .. }
+                | Self::UnsupportedKind { .. }
+                | Self::UnsupportedApiVersion { .. }
+                | Self::Decode { .. }
+                | Self::InvalidName { .. }
+        )
+    }
 }
 
 #[cfg(test)]
