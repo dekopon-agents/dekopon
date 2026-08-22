@@ -115,6 +115,9 @@ untrusted text that triggered it:
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
 | `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word and a stable `error.kind`, recorded when a provider's own rewrite fails rather than declines |
+| `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller still sees plain `policy-denied` |
+| `broker.leg.connected` | `dekopon-run` | the broker socket tier, the session trace identifier, and the granted-capability count — never the socket path |
+| `guest.invocation.summary` | `dekopon-run` | provider and capability ids with iteration count and total/mean durations for a `--repeat` run, replacing one record per iteration |
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
@@ -341,13 +344,10 @@ that a key and a canonical subject never share a record.
 
 | Span | Crate | Fields |
 |---|---|---|
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one |
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
 | `provider.resolve_command` | `dekopon-broker-host` | provider, `word` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
-| `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
