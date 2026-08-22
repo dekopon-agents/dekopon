@@ -652,6 +652,84 @@ fn exports_a_chrome_trace_with_runner_and_provider_spans() {
     assert!(names.contains(&"provider.invoke"));
 }
 
+/// `--repeat` is a benchmark, and a benchmark must not bill the sink for its iteration count.
+///
+/// The JSON report already aggregates the timings, so the log stream carries the first iteration
+/// and one summary instead of one record per loop pass — a difference of 9,998 records at
+/// `--repeat 10000`.
+#[test]
+fn repeat_emits_one_iteration_event_and_one_summary_rather_than_one_per_pass() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let trace = directory.path().join("trace.json");
+    let provider = provider_path();
+    let output = run(&[
+        "--trace",
+        trace.to_str().expect("UTF-8 trace path"),
+        "invoke",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "echo.echo",
+        "--input",
+        "{}",
+        "--repeat",
+        "5",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let events: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(trace).expect("trace file reads"))
+            .expect("trace is valid JSON");
+    let audit = events
+        .iter()
+        .filter_map(|event| event["args"]["audit.event"].as_str())
+        .map(|event| event.trim_matches('"').to_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        audit,
+        vec![
+            "guest.invocation.completed".to_owned(),
+            "guest.invocation.summary".to_owned()
+        ]
+    );
+    // The per-iteration spans stay: they are the timing record, and a span costs no log record.
+    let invocation_spans = events
+        .iter()
+        .filter(|event| event["name"] == "runner.provider_invocation" && event["ph"] == "B")
+        .count();
+    assert_eq!(invocation_spans, 5);
+}
+
+/// A local trace file is a sink like any other: the payload opt-in has to reach it, or the flag
+/// silently does nothing whenever no OTLP endpoint is configured.
+#[test]
+fn the_chrome_trace_honors_the_payload_opt_in_without_an_otlp_endpoint() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let trace = directory.path().join("trace.json");
+    let provider = provider_path();
+    let output = run(&[
+        "--trace",
+        trace.to_str().expect("UTF-8 trace path"),
+        "--otel-telemetry-payloads",
+        "true",
+        "shell",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "helper_MODEL_AUTHORED() { echo inner; }\nhelper_MODEL_AUTHORED",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let raw = std::fs::read_to_string(&trace).expect("trace file reads");
+    assert!(
+        raw.contains("helper_MODEL_AUTHORED"),
+        "the payload opt-in was dropped on the endpoint-free path"
+    );
+    assert!(
+        !raw.contains("<withheld>"),
+        "a payload-gated field stayed withheld with payloads enabled"
+    );
+}
+
 /// A configured endpoint is part of the command contract, so undelivered telemetry fails the run.
 ///
 /// Reporting success here would tell an operator that a guest execution was fully observed when
@@ -935,21 +1013,35 @@ fn prompt_scripts_never_read_the_real_process_environment() {
 #[test]
 fn prompt_refuses_broker_connection_flags_without_the_broker_opt_in() {
     // Silently ignoring `--socket` would let an operator believe the broker leg was live and read
-    // a "command not found" as a denial rather than as a broker that was never contacted.
+    // a "command not found" as a denial rather than as a broker that was never contacted. Every
+    // connection flag counts, including the two that used to carry clap defaults: a value that
+    // parses and then configures nothing is the exact failure this refusal exists to prevent.
     let provider = provider_path();
-    let output = run(&[
-        "prompt",
-        "--provider",
-        provider.to_str().expect("UTF-8 fixture path"),
-        "--socket",
-        "/run/dekopon/broker.sock",
-        "--model",
-        "test-model",
-        "Do something",
-    ]);
+    for flag in [
+        ["--socket", "/run/dekopon/broker.sock"],
+        ["--server-uid", "1000"],
+        ["--max-frame-bytes", "4096"],
+        ["--io-timeout-ms", "500"],
+    ] {
+        let output = run(&[
+            "prompt",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            flag[0],
+            flag[1],
+            "--model",
+            "test-model",
+            "Do something",
+        ]);
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("--broker"), "{}", stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{}", flag[0]);
+        assert!(
+            stderr(&output).contains("--broker"),
+            "{}: {}",
+            flag[0],
+            stderr(&output)
+        );
+    }
 }
 
 fn read_request(listener: &TcpListener) -> (Value, TcpStream) {

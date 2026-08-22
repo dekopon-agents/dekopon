@@ -7,14 +7,15 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
     error::Error as _,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
-use dekopon_capability::HttpConstraints;
+use dekopon_capability::{HttpConstraints, HttpConstraintsError};
 use dekopon_core::Redacted;
 use futures_util::StreamExt as _;
 use reqwest::{
@@ -25,6 +26,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
+use tracing::Instrument as _;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
@@ -161,9 +163,13 @@ pub enum ConfigurationError {
         /// Invalid field.
         field: &'static str,
     },
-    /// Grant omitted required authority or a positive bound.
-    #[error("HTTP authorization is incomplete or unbounded")]
-    InvalidGrant,
+    /// Grant omitted required authority, an exact entry, or a positive bound.
+    #[error("HTTP authorization is not exact: {source}")]
+    InvalidGrant {
+        /// Which entry-grammar or bound rule the grant violated.
+        #[source]
+        source: HttpConstraintsError,
+    },
     /// Grant attempted to exceed a native ceiling.
     #[error("HTTP authorization exceeds native host ceilings")]
     GrantExceedsCeiling,
@@ -303,6 +309,14 @@ fn is_destination_scope(value: &str) -> bool {
 }
 
 /// Sanitized metadata for one attempted native request.
+///
+/// An entry exists from the moment a request is dispatchable — method, destination authority, and
+/// accounted request bytes all known and authorized — so a call the credential binding then
+/// refuses still appears, status-less, rather than silently consuming a unit of the grant's request
+/// budget. A request rejected earlier than that (unauthorized method, denied destination, invalid
+/// header, failed resolution) has no sanitized authority to name and produces no entry, though it
+/// too consumes budget; its failure class reaches telemetry through the `http.request` span and the
+/// `accounting.http.request` record instead.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpCallEvidence {
@@ -345,6 +359,19 @@ pub struct BufferedHttpClient {
     attempted: bool,
     policy_violation: Option<&'static str>,
     evidence: Vec<HttpCallEvidence>,
+    resolved: HashMap<String, Vec<SocketAddr>>,
+    pinned_client: Option<PinnedClient>,
+}
+
+/// One built client together with the exact pin set it was built for.
+///
+/// Reuse is keyed by that pin set rather than by host, so `resolve_to_addrs` stays authoritative:
+/// a client is never reused for addresses it was not built to reach.
+#[derive(Debug)]
+struct PinnedClient {
+    host: String,
+    addresses: Vec<SocketAddr>,
+    client: reqwest::Client,
 }
 
 impl BufferedHttpClient {
@@ -400,6 +427,8 @@ impl BufferedHttpClient {
             attempted: false,
             policy_violation: None,
             evidence: Vec::new(),
+            resolved: HashMap::new(),
+            pinned_client: None,
         })
     }
 
@@ -425,13 +454,19 @@ impl BufferedHttpClient {
         // records, so it carries the same sanitized set and no more. URL paths and queries,
         // request and response headers, and both bodies are absent here for the same reason they
         // are absent from evidence — a trace backend is not an audit boundary.
+        // The byte fields are deliberately not the OTel `http.*.body.size` names: what this host
+        // accounts is a conservative envelope estimate — encoding overhead, method, URL, headers,
+        // and body — not a payload length, and publishing it under the semconv name would make
+        // every dashboard reading transfer volume wrong by the size of the headers.
         let span = tracing::info_span!(
             "http.request",
             "http.request.method" = tracing::field::Empty,
             "server.address" = tracing::field::Empty,
             "http.response.status_code" = tracing::field::Empty,
-            "http.request.body.size" = tracing::field::Empty,
-            "http.response.body.size" = tracing::field::Empty,
+            "dekopon.http.request.accounted_bytes" = tracing::field::Empty,
+            "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
+            "error.code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
             "url.full" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
@@ -440,57 +475,77 @@ impl BufferedHttpClient {
         if dekopon_core::telemetry_payloads() {
             span.record("url.full", request.uri.as_str());
         }
-        let _entered = span.enter();
 
         let evidence_index = self.evidence.len();
         self.attempted = true;
-        let result = self.send_checked(request).await;
+        // `instrument`, never `enter`: this future awaits resolution, connection, and the whole
+        // response body. A guard held across those awaits would leave `http.request` current on
+        // the worker thread while it polls unrelated tasks, re-parenting their events onto this
+        // request and exiting the span on whichever thread happened to drop the guard.
+        let result = self.send_checked(request).instrument(span.clone()).await;
 
-        // `prepare` is what learns the method and authority, so the evidence entry it pushed is
-        // the only sanitized source for them; a request rejected before that point simply has
-        // nothing safe to report beyond its outcome.
-        if let Some(evidence) = self.evidence.get(evidence_index) {
-            span.record("http.request.method", evidence.method.as_str());
-            span.record("server.address", evidence.authority.as_str());
-            span.record("http.request.body.size", evidence.request_bytes);
-            span.record("http.response.body.size", evidence.response_bytes);
-            if let Some(status) = evidence.status {
-                span.record("http.response.status_code", status);
+        let outcome = outcome_label(&result);
+        let failure = result.as_ref().err();
+        span.in_scope(|| {
+            // `prepare` is what learns the method and authority, so the evidence entry it pushed
+            // is the only sanitized source for them; a request rejected before that point has
+            // nothing safe to report beyond its outcome and failure class.
+            let evidence = self.evidence.get(evidence_index);
+            if let Some(evidence) = evidence {
+                span.record("http.request.method", evidence.method.as_str());
+                span.record("server.address", evidence.authority.as_str());
+                span.record(
+                    "dekopon.http.request.accounted_bytes",
+                    evidence.request_bytes,
+                );
+                span.record(
+                    "dekopon.http.response.accounted_bytes",
+                    evidence.response_bytes,
+                );
+                if let Some(status) = evidence.status {
+                    span.record("http.response.status_code", status);
+                }
             }
-        }
-        span.record("outcome", outcome_label(&result));
+            if let Some(error) = failure {
+                // Six failure classes otherwise collapse into `outcome = "failed"`, which cannot
+                // separate a webpki root problem from a DNS blip from a deadline. Recording the
+                // reason is safe by construction rather than by review: every message this crate
+                // produces is a static, pre-sanitized `&str`, and that is the property to keep.
+                span.record("error.code", tracing::field::debug(error.code));
+                span.record("error.message", error.message.as_str());
+            }
+            span.record("outcome", outcome);
 
-        // Accounting rather than lifecycle: the `http.request` span above already carries these
-        // fields and its own duration. This record exists to outlive trace retention and survive
-        // sampling, because an external request is a billed and rate-limited call, and "how many,
-        // to where, how big" is asked long after the trace has expired. Same sanitized set — no
-        // path, query, header, or body — for the same reason.
-        if let Some(evidence) = self.evidence.get(evidence_index) {
+            // Accounting rather than lifecycle: the `http.request` span above already carries
+            // these fields and its own duration. This record exists to outlive trace retention and
+            // survive sampling, because an external request is a billed and rate-limited call, and
+            // "how many, to where, how big" is asked long after the trace has expired. Same
+            // sanitized set — no path, query, header, or body — for the same reason.
+            //
+            // It fires even when nothing reached `prepare`, because that attempt still consumed a
+            // unit of the grant's request budget; the fields such a record cannot know are absent
+            // rather than zero, so a query grouping by status never sees a phantom status 0.
             tracing::info!(
                 target: "dekopon_http_host::audit",
                 {
                     audit.event = "accounting.http.request",
-                    "http.request.method" = evidence.method.as_str(),
-                    "server.address" = evidence.authority.as_str(),
-                    "http.response.status_code" = evidence.status.unwrap_or_default(),
-                    "http.request.body.size" = evidence.request_bytes,
-                    "http.response.body.size" = evidence.response_bytes,
-                    outcome = outcome_label(&result),
+                    "http.request.method" = evidence.map(|evidence| evidence.method.as_str()),
+                    "server.address" = evidence.map(|evidence| evidence.authority.as_str()),
+                    "http.response.status_code" = evidence.and_then(|evidence| evidence.status),
+                    "dekopon.http.request.accounted_bytes" =
+                        evidence.map(|evidence| evidence.request_bytes),
+                    "dekopon.http.response.accounted_bytes" =
+                        evidence.map(|evidence| evidence.response_bytes),
+                    "error.code" = failure.map(|error| tracing::field::debug(error.code)),
+                    "error.message" = failure.map(|error| error.message.as_str()),
+                    outcome = outcome,
                 },
                 "external HTTP request accounted"
             );
-        }
+        });
 
-        if let Err(error) = &result {
-            self.policy_violation = match &error.code {
-                ErrorCode::Denied => Some("denied"),
-                ErrorCode::HostCallLimit => Some("host-call-limit"),
-                ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
-                    Some("invalid-http-request")
-                }
-                ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => Some("byte-limit"),
-                _ => self.policy_violation,
-            };
+        if let Some(error) = failure {
+            self.policy_violation = violation_label(error.code).or(self.policy_violation);
         }
         result
     }
@@ -517,21 +572,24 @@ impl BufferedHttpClient {
         // and fails closed — a credentialed context refuses to send an unauthenticated request to
         // an allowed-but-unbound destination, because "quietly missing auth" reads as an outage
         // at best and an unauthenticated write at worst.
-        let mut credential_injected = false;
-        if let Some(credential) = &self.credential {
+        let credential_header = self.credential.as_ref().map(|credential| {
             let port = prepared
                 .url
                 .port_or_known_default()
                 .unwrap_or(DEFAULT_HTTPS_PORT);
-            if !credential.matches(&prepared.host, port, prepared.url.scheme()) {
-                return Err(http_error(
+            if credential.matches(&prepared.host, port, prepared.url.scheme()) {
+                credential.render()
+            } else {
+                Err(http_error(
                     ErrorCode::Denied,
                     "destination is outside this credential's binding",
-                ));
+                ))
             }
-            prepared.headers.insert(AUTHORIZATION, credential.render()?);
-            credential_injected = true;
-        }
+        });
+
+        // Evidence is pushed before the credential decision, not after it: this call has already
+        // consumed a unit of the grant's exact request budget, so a binding refusal must leave a
+        // status-less record rather than a gap an auditor has to infer.
         let evidence_index = self.evidence.len();
         self.evidence.push(HttpCallEvidence {
             method: prepared.method.as_str().to_owned(),
@@ -539,8 +597,12 @@ impl BufferedHttpClient {
             status: None,
             request_bytes: prepared.request_bytes,
             response_bytes: 0,
-            credential_injected,
+            credential_injected: false,
         });
+        if let Some(header) = credential_header {
+            prepared.headers.insert(AUTHORIZATION, header?);
+            self.evidence[evidence_index].credential_injected = true;
+        }
 
         let result = self.execute(prepared, &grant).await;
         if let Ok((response, response_bytes)) = &result {
@@ -552,7 +614,7 @@ impl BufferedHttpClient {
     }
 
     async fn prepare(
-        &self,
+        &mut self,
         request: Request,
         grant: &HttpConstraints,
     ) -> Result<PreparedRequest, HttpError> {
@@ -587,10 +649,14 @@ impl BufferedHttpClient {
                 "URI user information and fragments are prohibited",
             ));
         }
-        let host = url
-            .host_str()
-            .ok_or_else(|| http_error(ErrorCode::InvalidUri, "URI has no host"))?
-            .to_ascii_lowercase();
+        // `host_str` renders an IPv6 literal in URL form (`[::1]`). Everything downstream — the
+        // resolver, the pin set, the credential binding — wants the bare address; brackets are
+        // added back only where an authority is rendered.
+        let host = unbracketed_host(
+            url.host_str()
+                .ok_or_else(|| http_error(ErrorCode::InvalidUri, "URI has no host"))?,
+        )
+        .to_ascii_lowercase();
         let port = url.port_or_known_default().ok_or_else(|| {
             http_error(
                 ErrorCode::InvalidUri,
@@ -677,10 +743,21 @@ impl BufferedHttpClient {
             ));
         }
 
-        let remaining = self.remaining()?;
-        let addresses = timeout(remaining, resolve_destination(&host, port))
-            .await
-            .map_err(|_| http_error(ErrorCode::Timeout, "destination resolution timed out"))??;
+        // Resolution is cached for the lifetime of this execution context, which the invocation
+        // deadline already bounds; every retained address is still validated below on every call,
+        // so the cache shortens the path without widening what may be reached.
+        let addresses = if let Some(addresses) = self.resolved.get(&authority) {
+            addresses.clone()
+        } else {
+            let remaining = self.remaining()?;
+            let addresses = timeout(remaining, resolve_destination(&host, port))
+                .await
+                .map_err(|_| {
+                    http_error(ErrorCode::Timeout, "destination resolution timed out")
+                })??;
+            self.resolved.insert(authority.clone(), addresses.clone());
+            addresses
+        };
         let all_loopback = addresses.iter().all(|address| address.ip().is_loopback());
         if url.scheme() == "http" && !all_loopback {
             return Err(http_error(
@@ -712,19 +789,12 @@ impl BufferedHttpClient {
     }
 
     async fn execute(
-        &self,
+        &mut self,
         request: PreparedRequest,
         grant: &HttpConstraints,
     ) -> Result<(Response, u64), HttpError> {
         let remaining = self.remaining()?;
-        let client = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(remaining)
-            .timeout(remaining)
-            .resolve_to_addrs(&request.host, &request.addresses)
-            .build()
-            .map_err(|error| map_reqwest_error(&error))?;
+        let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
 
         let response = timeout(
             remaining,
@@ -806,6 +876,43 @@ impl BufferedHttpClient {
         ))
     }
 
+    /// Returns a client pinned to exactly these addresses, rebuilding only when the pin set moved.
+    ///
+    /// A capability with a two-call budget otherwise pays two resolutions and two TCP+TLS
+    /// handshakes inside one deadline. Reuse keeps the connection pool warm without touching the
+    /// pinning contract: the cache key is the full `(host, addresses)` pair, so a client is never
+    /// reused for a destination whose resolved address set differs from the one it was built for.
+    fn pinned_client(
+        &mut self,
+        host: &str,
+        addresses: &[SocketAddr],
+        budget: Duration,
+    ) -> Result<reqwest::Client, HttpError> {
+        if let Some(pinned) = &self.pinned_client
+            && pinned.host == host
+            && pinned.addresses == addresses
+        {
+            return Ok(pinned.client.clone());
+        }
+        // The client-level deadlines are the remaining budget at build time rather than this
+        // call's share, because a reused client cannot re-arm them. Every await in `execute` is
+        // already wrapped in a `timeout` against the same deadline, which stays authoritative.
+        let client = reqwest::Client::builder()
+            .redirect(redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(budget)
+            .timeout(budget)
+            .resolve_to_addrs(host, addresses)
+            .build()
+            .map_err(|error| map_reqwest_error(&error))?;
+        self.pinned_client = Some(PinnedClient {
+            host: host.to_owned(),
+            addresses: addresses.to_vec(),
+            client: client.clone(),
+        });
+        Ok(client)
+    }
+
     fn remaining(&self) -> Result<Duration, HttpError> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -837,14 +944,11 @@ fn validate_configuration(
         return Err(ConfigurationError::ZeroTimeout);
     }
     if let Some(grant) = grant {
-        if grant.allowed_hosts.is_empty()
-            || grant.allowed_methods.is_empty()
-            || grant.max_requests == 0
-            || grant.max_request_bytes == 0
-            || grant.max_response_bytes == 0
-        {
-            return Err(ConfigurationError::InvalidGrant);
-        }
+        // One shared definition of an exact grant, so this host cannot accept a scope the
+        // broker that issued it would have refused.
+        grant
+            .validate()
+            .map_err(|source| ConfigurationError::InvalidGrant { source })?;
         if grant.max_requests > ceilings.max_requests
             || grant.max_request_bytes > ceilings.max_request_bytes
             || grant.max_response_bytes > ceilings.max_response_bytes
@@ -874,18 +978,22 @@ async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, H
     bounded_addresses(addresses)
 }
 
+/// Collapses a resolver answer into a bounded pin set of distinct addresses.
+///
+/// The bound is a resource ceiling on the pin set, not an admission test on the answer: a
+/// dual-stack resolver returns A and AAAA records together, so refusing the whole request at the
+/// seventeenth raw record would make a large round-robin destination permanently unreachable and a
+/// growing one fail intermittently. Duplicates collapse first and the remainder is truncated; every
+/// retained address is still validated and pinned by the caller.
 fn bounded_addresses(
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<Vec<SocketAddr>, HttpError> {
     let mut unique = BTreeSet::new();
-    for (index, address) in addresses.into_iter().enumerate() {
-        if index >= MAX_RESOLVED_ADDRESSES {
-            return Err(http_error(
-                ErrorCode::Dns,
-                "destination resolved to too many addresses",
-            ));
-        }
+    for address in addresses {
         unique.insert(address);
+        if unique.len() == MAX_RESOLVED_ADDRESSES {
+            break;
+        }
     }
     if unique.is_empty() {
         return Err(http_error(
@@ -896,18 +1004,32 @@ fn bounded_addresses(
     Ok(unique.into_iter().collect())
 }
 
-fn canonical_authority(host: &str, port: u16) -> String {
+/// Strips the brackets `Url::host_str` puts around an IPv6 literal.
+fn unbracketed_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Renders a bare host in URL authority form: an IPv6 literal is bracketed, anything else is not.
+fn canonical_host(host: &str) -> Cow<'_, str> {
     if host.contains(':') {
-        format!("[{host}]:{port}")
+        Cow::Owned(format!("[{host}]"))
     } else {
-        format!("{host}:{port}")
+        Cow::Borrowed(host)
     }
+}
+
+fn canonical_authority(host: &str, port: u16) -> String {
+    format!("{}:{port}", canonical_host(host))
 }
 
 fn authority_matches(allowed: &str, host: &str, port: u16, scheme: &str) -> bool {
     let allowed = allowed.trim().to_ascii_lowercase();
     allowed == canonical_authority(host, port)
-        || (scheme == "https" && allowed == host && port == DEFAULT_HTTPS_PORT)
+        || (scheme == "https"
+            && allowed == canonical_host(host).as_ref()
+            && port == DEFAULT_HTTPS_PORT)
 }
 
 fn is_forbidden_request_header(name: &HeaderName) -> bool {
@@ -1000,6 +1122,12 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 fn map_reqwest_error(error: &reqwest::Error) -> HttpError {
+    // A builder failure means nothing was ever put on a wire, so classifying it as a protocol
+    // failure would name the wrong layer to a guest and to the broker host's WIT mapping. This is
+    // the native setup failure `Internal` is documented for.
+    if error.is_builder() {
+        return http_error(ErrorCode::Internal, "native HTTP client setup failed");
+    }
     let code = if error.is_timeout() {
         ErrorCode::Timeout
     } else if error.is_connect() {
@@ -1048,19 +1176,35 @@ fn bounded_message(message: &str) -> String {
     output
 }
 
+/// The single enforcement vocabulary, shared by the broker-facing `policy_violation`, the span,
+/// and the accounting record, so the three cannot disagree about the same call.
+///
+/// `None` means the failure was not an enforcement decision — a transport or setup failure, which
+/// the broker must not report as a policy violation. The match is exhaustive on purpose: a new
+/// [`ErrorCode`] has to be classified here rather than falling through a catch-all in one site and
+/// not the other.
+fn violation_label(code: ErrorCode) -> Option<&'static str> {
+    match code {
+        ErrorCode::Denied => Some("denied"),
+        ErrorCode::HostCallLimit => Some("host-call-limit"),
+        ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
+            Some("invalid-http-request")
+        }
+        ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => Some("byte-limit"),
+        ErrorCode::Dns
+        | ErrorCode::Connect
+        | ErrorCode::Tls
+        | ErrorCode::Timeout
+        | ErrorCode::Protocol
+        | ErrorCode::Internal => None,
+    }
+}
+
 /// One outcome vocabulary for the span and the accounting record, so they cannot disagree.
 fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
     match result {
         Ok(_) => "succeeded",
-        Err(error) => match &error.code {
-            ErrorCode::Denied => "denied",
-            ErrorCode::HostCallLimit => "host-call-limit",
-            ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
-                "invalid-http-request"
-            }
-            ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => "byte-limit",
-            _ => "failed",
-        },
+        Err(error) => violation_label(error.code).unwrap_or("failed"),
     }
 }
 
@@ -1074,13 +1218,13 @@ mod tests {
         time::Duration,
     };
 
-    use dekopon_capability::HttpConstraints;
+    use dekopon_capability::{HttpConstraints, HttpConstraintsError};
     use dekopon_core::Redacted;
 
     use super::{
         BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
-        HttpCallEvidence, HttpHostCeilings, Request, authority_matches, bounded_addresses,
-        bounded_message, is_forbidden_public_destination,
+        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, Request, authority_matches,
+        bounded_addresses, bounded_message, is_forbidden_public_destination, map_reqwest_error,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -1095,8 +1239,17 @@ mod tests {
     }
 
     fn mock_http(response: &[u8]) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+        mock_http_on("127.0.0.1:0", response).expect("bind loopback fixture")
+    }
+
+    /// Serves one request on one connection. Returns `None` when the fixture address family is
+    /// unavailable on this host, which is the only reason binding a loopback port can fail.
+    fn mock_http_on(
+        bind: &str,
+        response: &[u8],
+    ) -> Option<(String, Receiver<Vec<u8>>, thread::JoinHandle<()>)> {
         let response = response.to_vec();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+        let listener = TcpListener::bind(bind).ok()?;
         let address = listener.local_addr().expect("fixture address");
         let (sender, receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
@@ -1130,7 +1283,39 @@ mod tests {
             stream.write_all(&response).expect("write fixture response");
             stream.flush().expect("flush fixture response");
         });
-        (format!("127.0.0.1:{}", address.port()), receiver, handle)
+        // `SocketAddr`'s rendering is the authority grammar the grant uses, brackets included.
+        Some((address.to_string(), receiver, handle))
+    }
+
+    /// Accepts exactly one connection and serves `count` requests on it. A client that rebuilt
+    /// itself per call would open a second connection this fixture never accepts.
+    fn mock_http_pooled(count: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set fixture timeout");
+            let mut pending = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            for _ in 0..count {
+                let end = loop {
+                    if let Some(end) = pending.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    let read = stream.read(&mut buffer).expect("read fixture request");
+                    assert!(read > 0, "fixture connection closed early");
+                    pending.extend_from_slice(&buffer[..read]);
+                };
+                pending.drain(..end);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("write fixture response");
+                stream.flush().expect("flush fixture response");
+            }
+        });
+        (address.to_string(), handle)
     }
 
     fn content_length(headers: &[u8]) -> usize {
@@ -1167,6 +1352,21 @@ mod tests {
         ));
         assert!(!authority_matches("127.0.0.1", "127.0.0.1", 80, "http"));
         assert!(authority_matches("127.0.0.1:80", "127.0.0.1", 80, "http"));
+    }
+
+    #[test]
+    fn renders_ipv6_literal_authorities_with_exactly_one_pair_of_brackets() {
+        // The bare host is what resolution and credential binding see; brackets belong to the
+        // rendered authority only, and a doubled pair matches no grant that can be authored.
+        assert!(authority_matches("[::1]:8080", "::1", 8080, "http"));
+        assert!(authority_matches(
+            "[2606:4700:4700::1111]",
+            "2606:4700:4700::1111",
+            443,
+            "https"
+        ));
+        assert!(!authority_matches("[[::1]]:8080", "::1", 8080, "http"));
+        assert!(!authority_matches("::1:8080", "::1", 8080, "http"));
     }
 
     #[test]
@@ -1226,11 +1426,70 @@ mod tests {
         assert_eq!(error, ConfigurationError::TimeoutOverflow);
     }
 
+    /// An entry this host cannot match is a grant it must refuse, not one it accepts and then
+    /// denies on every call. The rule set is shared with the broker that issues the grant.
     #[test]
-    fn bounds_resolver_results_before_client_construction() {
+    fn rejects_grant_entries_no_authority_can_match() {
+        for host in [" api.example.test", "*", "a/b", ""] {
+            let error = BufferedHttpClient::authorized(
+                grant(host.to_owned(), "GET"),
+                HttpHostCeilings::default(),
+                Duration::from_secs(1),
+            )
+            .expect_err("an inexact host must not configure a client");
+            assert_eq!(
+                error,
+                ConfigurationError::InvalidGrant {
+                    source: HttpConstraintsError::InvalidHost {
+                        value: host.to_owned()
+                    }
+                }
+            );
+        }
+
+        let error = BufferedHttpClient::authorized(
+            grant("api.example.test".to_owned(), "GET POST"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect_err("an inexact method must not configure a client");
+        assert_eq!(
+            error,
+            ConfigurationError::InvalidGrant {
+                source: HttpConstraintsError::InvalidMethod {
+                    value: "GET POST".to_owned()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn truncates_resolver_fan_out_instead_of_refusing_it() {
         let addresses = (1..=17).map(|last| SocketAddr::from(([192, 0, 2, last], 443)));
-        let error = bounded_addresses(addresses).expect_err("resolver fan-out must be bounded");
+        let bounded =
+            bounded_addresses(addresses).expect("a large fan-out is truncated, not refused");
+        assert_eq!(bounded.len(), MAX_RESOLVED_ADDRESSES);
+
+        // A dual-stack answer repeats the same address across records; counting raw answers made
+        // a ten-A/ten-AAAA destination permanently unreachable.
+        let duplicated = (1..=20).map(|_| SocketAddr::from(([192, 0, 2, 1], 443)));
+        let bounded = bounded_addresses(duplicated).expect("duplicates collapse before the bound");
+        assert_eq!(bounded.len(), 1);
+
+        let error = bounded_addresses(Vec::new()).expect_err("an empty answer is still a failure");
         assert_eq!(error.code, ErrorCode::Dns);
+    }
+
+    #[test]
+    fn client_builder_failures_are_setup_failures_not_protocol_failures() {
+        // Nothing reached a wire, so `Protocol` would name the wrong layer — and `Internal`, the
+        // class documented for native setup failures, was otherwise unreachable.
+        let error = reqwest::Client::new()
+            .get("not an absolute url")
+            .build()
+            .expect_err("the builder rejects a non-absolute URL");
+        assert!(error.is_builder());
+        assert_eq!(map_reqwest_error(&error).code, ErrorCode::Internal);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1480,7 +1739,13 @@ mod tests {
             .expect_err("unbound destinations are refused, not sent unauthenticated");
         assert_eq!(error.code, ErrorCode::Denied);
         assert_eq!(client.policy_violation(), Some("denied"));
-        assert!(client.into_evidence().is_empty());
+        // The refusal consumed a unit of the request budget, so evidence reconciles with it: one
+        // status-less entry naming the destination, and no credential recorded as injected.
+        let evidence = client.into_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].authority, "127.0.0.1:9");
+        assert_eq!(evidence[0].status, None);
+        assert!(!evidence[0].credential_injected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1580,6 +1845,117 @@ mod tests {
         assert_eq!(response.status, 302);
         assert_eq!(client.into_evidence().len(), 1);
         server.join().expect("fixture server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reaches_ipv6_literal_loopback_destinations() {
+        let Some((authority, recorded, server)) = mock_http_on(
+            "[::1]:0",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ) else {
+            // A host without an IPv6 loopback cannot exercise this path.
+            return;
+        };
+        assert!(authority.starts_with("[::1]:"), "{authority}");
+
+        let mut client = BufferedHttpClient::authorized(
+            grant(authority.clone(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        let response = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}/items"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect("an IPv6 literal loopback destination is reachable");
+
+        assert_eq!(response.status, 200);
+        let request = recorded.recv().expect("request recorded");
+        assert!(request.starts_with(b"GET /items HTTP/1.1\r\n"));
+        let evidence = client.into_evidence();
+        assert_eq!(evidence[0].authority, authority);
+        server.join().expect("fixture server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reuses_one_pinned_client_across_calls_to_the_same_authority() {
+        // The fixture accepts a single connection, so a second handshake would never be answered
+        // and the second call would end at the deadline rather than with a status.
+        let (authority, server) = mock_http_pooled(2);
+        let mut client = BufferedHttpClient::authorized(
+            grant(authority.clone(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        for _ in 0..2 {
+            let response = client
+                .send(Request {
+                    method: "GET".to_owned(),
+                    uri: format!("http://{authority}/items"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect("both calls share one pooled connection");
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(client.into_evidence().len(), 2);
+        server.join().expect("fixture server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_pin_set_builds_a_new_client() {
+        // Reuse is keyed by the resolved address set, not by host: two authorities inside one
+        // context must each be reached through a client pinned to their own addresses.
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let (first, first_recorded, first_server) = mock_http(response);
+        let (second, second_recorded, second_server) = mock_http(response);
+
+        let mut grant = grant(first.clone(), "GET");
+        grant.allowed_hosts.push(second.clone());
+        let mut client = BufferedHttpClient::authorized(
+            grant,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        for (authority, path) in [(&first, "/first"), (&second, "/second")] {
+            let response = client
+                .send(Request {
+                    method: "GET".to_owned(),
+                    uri: format!("http://{authority}{path}"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect("each destination is reachable");
+            assert_eq!(response.status, 200);
+        }
+
+        assert!(
+            first_recorded
+                .recv()
+                .expect("first request recorded")
+                .starts_with(b"GET /first HTTP/1.1\r\n")
+        );
+        assert!(
+            second_recorded
+                .recv()
+                .expect("second request recorded")
+                .starts_with(b"GET /second HTTP/1.1\r\n")
+        );
+        let evidence = client.into_evidence();
+        assert_eq!(evidence[0].authority, first);
+        assert_eq!(evidence[1].authority, second);
+        first_server.join().expect("first fixture exits");
+        second_server.join().expect("second fixture exits");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use dekopon_agent::{
     meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
     prompt::{
         CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
-        SessionInputs, run_prompt_session,
+        ReplyDisposition, SessionInputs, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -46,7 +46,7 @@ use crate::{
     routes::BoundRoute,
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
-        ReplyTarget, SessionStop, bound_inbound, bound_outbound,
+        ReplyTarget, SessionStop, ThreadOwnership, bound_inbound, bound_outbound,
     },
 };
 
@@ -63,6 +63,8 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 /// or a transport diagnostic, and chat is the last place any of those belong: the operator reads
 /// the category from telemetry, and the sender reads a sentence.
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
+/// Fixed warning when capability work may have happened but the model produced no report.
+pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
 /// Confirmation sent when Slack's authenticated Agent-session Stop event wins the completion race.
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
 /// One transport-independent normalization for a successful empty model answer.
@@ -70,7 +72,7 @@ pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const SESSION_RUNNING: u8 = 0;
 const SESSION_CANCELLED: u8 = 1;
-const SESSION_ANSWERING: u8 = 2;
+const SESSION_COMPLETING: u8 = 2;
 
 /// One conversation, for in-flight serialization only.
 ///
@@ -79,12 +81,15 @@ const SESSION_ANSWERING: u8 = 2;
 /// [`crate::conversation`] is the other question and carries the sender.
 type AdmissionKey = (String, String, Option<String>);
 
+/// One model client, shared by every session that routes to the same configured model.
+pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
+
 /// Builds the model client one route selected.
 ///
 /// A seam rather than a direct call because the alternative is a test suite that cannot exercise
 /// routing, admission, or authorization without a live model endpoint.
 pub(crate) trait ModelFactory: Send + Sync {
-    fn build(&self, model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError>;
+    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError>;
 }
 
 /// The real factory: whatever `models:` configured, constructed exactly as `dekopon-run` does.
@@ -131,7 +136,7 @@ pub(crate) fn configured_image_generators(
 }
 
 impl ModelFactory for ConfiguredModels {
-    fn build(&self, model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
         match model {
             ModelConfig::OpenaiCompatible {
                 endpoint,
@@ -143,7 +148,7 @@ impl ModelFactory for ConfiguredModels {
                 let bearer_token = api_key_env
                     .as_deref()
                     .and_then(|name| std::env::var(name).ok());
-                Ok(Box::new(OpenAiChatModel::new(
+                Ok(Arc::new(OpenAiChatModel::new(
                     endpoint,
                     model,
                     bearer_token,
@@ -155,12 +160,62 @@ impl ModelFactory for ConfiguredModels {
                 auth_file,
                 timeout_ms,
                 ..
-            } => Ok(Box::new(ChatGptCodexModel::new(
+            } => Ok(Arc::new(ChatGptCodexModel::new(
                 model,
                 auth_file.as_deref(),
                 std::time::Duration::from_millis(*timeout_ms),
             )?)),
         }
+    }
+}
+
+/// One client per configured model, built on first use and shared by every session after it.
+///
+/// A model client owns an HTTP agent and its connection pool, so rebuilding one per message paid a
+/// fresh TCP and TLS handshake before the first token of every answer — on a Pi talking to a remote
+/// endpoint, more added latency than the routing and authorization ahead of it cost together.
+/// Everything that legitimately varies per message — the prompt cache key, the completion options —
+/// is request-scoped and stays that way.
+///
+/// Keyed by the configured model name, which the loader has already proved unique, so two routes
+/// naming one endpoint share its pool and two endpoints never share a client.
+///
+/// A build failure is not cached: an absent credential file or an unset key is the kind of thing an
+/// operator repairs while the daemon runs, and the next message should find it repaired.
+pub(crate) struct ModelCache {
+    factory: Arc<dyn ModelFactory>,
+    clients: Mutex<HashMap<String, SharedModel>>,
+}
+
+impl ModelCache {
+    pub(crate) fn new(factory: Arc<dyn ModelFactory>) -> Self {
+        Self {
+            factory,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The client for one configured model, building it if this is the first message to need it.
+    pub(crate) fn client(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        if let Some(client) = self
+            .clients
+            .lock()
+            .expect("gateway model clients")
+            .get(model.name())
+        {
+            return Ok(Arc::clone(client));
+        }
+        // Built outside the lock: two sessions racing on the first message to one endpoint should
+        // not serialize, and whichever finishes second discards its client rather than replacing a
+        // pool another session is already using.
+        let built = self.factory.build(model)?;
+        Ok(Arc::clone(
+            self.clients
+                .lock()
+                .expect("gateway model clients")
+                .entry(model.name().to_owned())
+                .or_insert(built),
+        ))
     }
 }
 
@@ -222,11 +277,11 @@ impl SessionCancellation {
         Self(Arc::new(AtomicU8::new(SESSION_RUNNING)))
     }
 
-    fn claim_answer(&self) -> bool {
+    fn claim_completion(&self) -> bool {
         self.0
             .compare_exchange(
                 SESSION_RUNNING,
-                SESSION_ANSWERING,
+                SESSION_COMPLETING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -278,8 +333,18 @@ impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
         self.inner.is_granted(capability)
     }
 
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.inner.grants_namespace(namespace)
+    }
+
     fn command_words(&self) -> Vec<String> {
         self.inner.command_words()
+    }
+
+    // Forwarded rather than left to the default, which would answer this session's every command
+    // word by materializing both legs' command-word lists first.
+    fn has_command_word(&self, word: &str) -> bool {
+        self.inner.has_command_word(word)
     }
 
     fn resolve_command(
@@ -413,7 +478,7 @@ impl Drop for ActiveRegistration {
 /// Everything shared by every session this daemon runs.
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
-    pub models: Arc<dyn ModelFactory>,
+    pub models: Arc<ModelCache>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
@@ -427,6 +492,8 @@ pub(crate) struct SessionRunner {
     pub image_generators: HashMap<String, Arc<dyn ImageGenerator>>,
     /// Optional service-native in-flight activity, by transport name.
     pub activities: HashMap<String, Arc<dyn ChatActivity>>,
+    /// Bounded transport-owned Slack Agent thread claims, by transport name.
+    pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     /// Native Agent sessions that can receive authenticated Stop events.
     pub active_sessions: ActiveSessions,
     /// Best-effort informational usage deltas for the broker-hosted web UI.
@@ -494,7 +561,7 @@ fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
     }
 }
 
-/// Runs one routed message end to end, answering in chat whatever happens.
+/// Runs one routed message end to end, answering unless an optional continuation declines.
 pub(crate) async fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
@@ -577,6 +644,7 @@ async fn session(
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
+            revoke_thread_ownership(runner, message);
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
@@ -606,6 +674,7 @@ async fn session(
     // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
     // holding exactly the text the revocation was about.
     if granted.is_empty() {
+        revoke_thread_ownership(runner, message);
         runner
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
@@ -613,6 +682,10 @@ async fn session(
         answer(replier, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
+    // An Agent thread becomes a continuation surface only after this exact sender's fresh broker
+    // grant succeeded. Merely mentioning the bot, or putting coordinates in model text, cannot
+    // claim one.
+    claim_thread_ownership(runner, message);
     let agent_config = agent_config_view(
         route.agent.as_str(),
         &route.description,
@@ -717,10 +790,9 @@ async fn session(
         max_capability_calls: limits.max_capability_calls,
         ..ShellLimits::default()
     };
-    // Request-scoped and built here rather than handed to `ModelFactory::build`. The client is
-    // rebuilt per message today and the obvious optimization is to share one across sessions, at
-    // which point a key captured in a constructor would describe the first conversation forever
-    // while quietly mislabeling every later one.
+    // Request-scoped and built here rather than handed to `ModelFactory::build`, which is what lets
+    // `ModelCache` share one client across sessions: a key captured in a constructor would describe
+    // the first conversation forever while quietly mislabeling every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
 
     // Activity is armed only after the fresh authorization gate and immediately before the costly
@@ -749,11 +821,16 @@ async fn session(
     let usage = Arc::new(UsageAccumulator::default());
     let observed_usage = Arc::clone(&usage);
     let prompt_cancellation = cancellation.clone();
+    let reply_optional = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
-        // Built before the accumulator exists, so a model client that cannot be constructed
-        // returns without a turn: nothing was asked, so there is no exchange to remember.
-        let model = match models.build(&model_config) {
+        // Resolved before the accumulator exists, so a model client that cannot be constructed
+        // returns without a turn: nothing was asked, so there is no exchange to remember. Only the
+        // first message to reach a given endpoint actually builds one.
+        let model = match models.client(&model_config) {
             Ok(model) => model,
             Err(error) => return (Err(error), None, None),
         };
@@ -778,6 +855,9 @@ async fn session(
             .with_cancellation(&prompt_cancellation);
         if let Some(generator) = image_generator.as_deref() {
             inputs = inputs.with_image_generation(generator, &generated_image);
+        }
+        if reply_optional {
+            inputs = inputs.with_optional_reply();
         }
         let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
             .map_err(SessionError::from);
@@ -808,7 +888,7 @@ async fn session(
     let (outcome, turn, generated_image) = match result {
         Ok(session) => session,
         Err(_) => {
-            if !cancellation.claim_answer() {
+            if !cancellation.claim_completion() {
                 tracing::info!(event = "gateway_session_cancelled");
                 activity.finish_in_background();
                 return "cancelled";
@@ -824,15 +904,16 @@ async fn session(
 
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
         || cancellation.is_cancelled()
-        || !cancellation.claim_answer()
+        || !cancellation.claim_completion()
     {
         tracing::info!(event = "gateway_session_cancelled");
         activity.finish_in_background();
         return "cancelled";
     }
 
-    // Seal renewal before terminal delivery, but do no remote cleanup on this latency-sensitive
-    // path. Slack's explicit `active` and reaction removal run only after the durable answer.
+    // Seal renewal before terminal delivery or deliberate silence, but do no remote cleanup on
+    // this latency-sensitive path. Slack's explicit `active` and reaction removal run only after
+    // the completion decision is durable in gateway state.
     activity.seal();
 
     // The exchange when the session answered, and the bare question when it did not. The fixed
@@ -847,9 +928,28 @@ async fn session(
             .commit(&key, &granted, window, turn, &cache_key, Instant::now());
     }
 
+    if matches!(
+        &outcome,
+        Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
+    ) {
+        // No reply call means no acceptance receipt and therefore no durable recording. Native
+        // activity still returns to its inactive state through the separate cosmetic surface. The
+        // unanswered in-process turn was committed above so a later continuation still sees what
+        // the person said. Activity cleanup remains best effort and cannot create a chat message.
+        activity.finish_in_background();
+        return "declined";
+    }
+
     let (answer_text, completed_outcome, recordable) = match outcome {
         Ok(outcome) if outcome.answer.is_empty() => (EMPTY_REPLY.to_owned(), "answered", true),
         Ok(outcome) => (outcome.answer, "answered", true),
+        Err(SessionError::Prompt(PromptError::UnreportedCapabilityWork)) => {
+            tracing::error!(
+                event = "gateway_session_failed",
+                category = "unreported-capability-work"
+            );
+            (UNREPORTED_WORK_REPLY.to_owned(), "failed", false)
+        }
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
@@ -876,6 +976,24 @@ async fn session(
             completed_outcome
         }
         Some(_) | None => "reply-failed",
+    }
+}
+
+fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.claim(continuation.claim.clone());
+    }
+}
+
+fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.revoke(&continuation.claim);
     }
 }
 
@@ -1016,7 +1134,7 @@ async fn record_delivered_turn(
     }
 }
 
-fn delivery_identity(
+pub(crate) fn delivery_identity(
     message: &InboundMessage,
     claim: &ChatSessionClaim,
 ) -> Option<DeliveryIdentity> {
@@ -1038,6 +1156,20 @@ fn delivery_identity(
             Some(DeliveryIdentity::Telegram {
                 chat: claim.scope.channel.clone(),
                 topic,
+                message: message.message_id.clone(),
+            })
+        }
+        dekopon_broker_protocol::ChatTransportKind::Whatsapp => {
+            let mut parts = claim.scope.channel.split(':');
+            let waba = parts.next()?.to_owned();
+            let phone_number = parts.next()?.to_owned();
+            let _sender = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(DeliveryIdentity::Whatsapp {
+                waba,
+                phone_number,
                 message: message.message_id.clone(),
             })
         }
@@ -1108,6 +1240,9 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
         })) if code == ERROR_STORAGE_IO => ERROR_STORAGE_IO,
         MemoryRecordFailure::Broker(BrokerLegError::Client(_)) => "broker",
         MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(_)) => "identifier",
+        MemoryRecordFailure::Broker(BrokerLegError::DuplicateCapabilities { .. }) => {
+            "duplicate-capability"
+        }
         MemoryRecordFailure::Outcome(category) => category,
     }
 }

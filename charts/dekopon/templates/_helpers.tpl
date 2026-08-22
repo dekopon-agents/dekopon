@@ -238,6 +238,19 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- end -}}
 
+{{- if and .Values.gateway.service.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.service.enabled requires gateway.enabled; the broker has no TCP listener" -}}
+{{- end -}}
+{{- if .Values.gateway.service.enabled -}}
+{{- $servicePort := .Values.gateway.service.port | int -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail (printf "gateway.service.port must be an integer from 1 through 65535, got %v" .Values.gateway.service.port) -}}
+{{- end -}}
+{{- if not (kindIs "map" .Values.gateway.service.annotations) -}}
+{{- fail "gateway.service.annotations must be a map" -}}
+{{- end -}}
+{{- end -}}
+
 {{- if include "dekopon.chatgptEnabled" . -}}
 {{- if and .Values.gateway.chatgpt.inline .Values.gateway.chatgpt.existingSecret -}}
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}

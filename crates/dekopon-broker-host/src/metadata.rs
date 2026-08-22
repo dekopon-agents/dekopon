@@ -1,15 +1,14 @@
-use std::{
-    fmt::Write as _,
-    fs::File,
-    io::{self, Read as _},
-    path::{Path, PathBuf},
-};
+use std::{fmt::Write as _, path::PathBuf};
 
 use sha2::{Digest as _, Sha256};
+use wasmtime::Engine;
 use wasmtime::component::types::{ComponentFunc, ComponentItem};
-use wasmtime::{Engine, component::Component};
+use wasmtime::component::{Component, Type};
 
 use crate::ProviderManifest;
+
+/// Optional export a provider component uses to rewrite one command word's argv.
+pub(crate) const RESOLVE_COMMAND_EXPORT: &str = "resolve-command";
 
 /// Maximum component type entries retained for one provider's informational view.
 ///
@@ -25,9 +24,9 @@ const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 pub struct LoadedProviderMetadata {
     /// Local source file compiled by Wasmtime.
     pub source: PathBuf,
-    /// Source file length observed while hashing it at startup.
+    /// Length of the buffer that was compiled.
     pub artifact_bytes: u64,
-    /// Lowercase SHA-256 of the source file observed at startup.
+    /// Lowercase SHA-256 of the exact bytes that were compiled.
     pub artifact_sha256: String,
     /// Validated manifest returned by the component.
     pub manifest: ProviderManifest,
@@ -58,24 +57,69 @@ pub(crate) struct ArtifactIdentity {
     pub(crate) sha256: String,
 }
 
-pub(crate) fn identify_artifact(path: &Path) -> Result<ArtifactIdentity, io::Error> {
-    let mut file = File::open(path)?;
-    let bytes = file.metadata()?.len();
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    let digest = digest.finalize();
+/// Identifies the exact buffer a caller is about to hand to Wasmtime.
+///
+/// Taking bytes rather than a path is the point: a digest computed from a second read cannot prove
+/// it describes what Cranelift compiled, and the recorded `artifact_sha256` is published metadata.
+pub(crate) fn identify_bytes(bytes: &[u8]) -> ArtifactIdentity {
+    let digest = Sha256::digest(bytes);
     let mut sha256 = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut sha256, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    Ok(ArtifactIdentity { bytes, sha256 })
+    ArtifactIdentity {
+        bytes: bytes.len() as u64,
+        sha256,
+    }
+}
+
+/// What a compiled component offers under the optional `resolve-command` export name.
+///
+/// Absent and wrong-typed are different operator problems with different fixes, and neither is
+/// worth an instantiation to discover: the component's own type answers both.
+pub(crate) enum ResolveCommandExport {
+    /// Exported as `func(argv: list<string>) -> string`, which is what the host calls.
+    Present,
+    /// Not exported: the component was built against the base `dekopon:provider` world.
+    Absent,
+    /// Exported under that name as something the host cannot call.
+    Mismatched {
+        /// Bounded description of what the component actually exports.
+        found: String,
+    },
+}
+
+pub(crate) fn resolve_command_export(
+    engine: &Engine,
+    component: &Component,
+) -> ResolveCommandExport {
+    let component_type = component.component_type();
+    let Some((_, item)) = component_type
+        .exports(engine)
+        .find(|(name, _)| *name == RESOLVE_COMMAND_EXPORT)
+    else {
+        return ResolveCommandExport::Absent;
+    };
+    let ComponentItem::ComponentFunc(function) = item else {
+        return ResolveCommandExport::Mismatched {
+            found: item_kind(&item).to_owned(),
+        };
+    };
+    if resolves_commands(&function) {
+        ResolveCommandExport::Present
+    } else {
+        ResolveCommandExport::Mismatched {
+            found: component_function_signature(&function),
+        }
+    }
+}
+
+fn resolves_commands(function: &ComponentFunc) -> bool {
+    let mut params = function.params();
+    let argv_is_strings = params.len() == 1
+        && matches!(params.next(), Some((_, Type::List(list))) if list.ty() == Type::String);
+    let mut results = function.results();
+    argv_is_strings && results.len() == 1 && results.next() == Some(Type::String)
 }
 
 pub(crate) fn component_interface(

@@ -73,9 +73,11 @@ Paths are considered in this exact order:
 4. `$HOME/.config/dekopon/config.yaml`
 5. `./dekopon.yaml`
 
-An explicit or environment path is authoritative: if it cannot be read, the command fails rather than falling back. For default locations, the first existing regular file wins. An empty environment variable is ignored. If no default exists, the error lists all searched paths.
+An explicit or environment path is authoritative: if it cannot be read, the command fails rather than falling back. For default locations, the first existing regular file wins; a candidate that exists but cannot be examined is an error naming that path, not a silent fall-through to the next location. An empty environment variable is ignored. If no default exists, the error lists all searched paths.
 
-The loader accepts JSON, a single YAML resource, a YAML sequence, or multiple YAML documents. It parses the file once and rejects unknown fields, malformed IDs, duplicate names, missing capability references, and missing provider references.
+The loader accepts JSON, a single YAML resource, a YAML sequence, or multiple YAML documents. It parses the file once and rejects unknown fields, malformed IDs, unsupported API versions, duplicate names, missing capability references, missing provider references, and an `agent.spec.providers` list that disagrees with the providers the agent's own capabilities route to.
+
+Semantic problems are accumulated: the whole catalog is scanned and every problem is reported in one list, so a file with several mistakes takes one `dekopon validate` run to diagnose. Only a failure that makes continuing impossible — an unreadable file or invalid YAML — stops at the first error.
 
 ## Output behavior
 
@@ -90,7 +92,7 @@ List output is sorted by validated identifier. `name` output uses qualified name
 | `2` | Command-line usage error (emitted by Clap) |
 | `3` | Requested resource not found |
 
-These codes are stable for the `0.1.x` CLI.
+These codes are stable across `0.x` releases and are tied to the `dekopon.dev/v1alpha1` resource API rather than to a package version. `3` is distinguished from `1` deliberately so a script can tell "this resource does not exist" from "the catalog would not load"; a future API version is the only thing that would renumber them.
 
 ## Examples
 

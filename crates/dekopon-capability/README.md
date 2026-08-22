@@ -6,4 +6,6 @@ The API distinguishes model-proposed invocations from broker-authorized invocati
 
 `ExecutionConstraints` can carry an optional deny-by-default buffered HTTP grant with exact hosts and methods plus positive request-count and byte limits. Its absence permits no HTTP host calls. The broker host applies those values beneath independent process ceilings.
 
+`HttpConstraints::validate` owns the entry grammar those fields promise — exact authorities, exact HTTP method tokens, and the per-list entry cap — and the gate applies it. `dekopon-broker` and `dekopon-http-host` call the same check, so no construction path accepts a grant the enforcing host would refuse.
+
 Private authorization fields, single-use ownership, and the intentional absence of deserialization provide defense in depth. Constructing an `AuthorizationGate` is an explicit API transition for trusted broker adapters, not proof that a caller was authenticated or policy was evaluated. They do not replace broker process isolation, authenticated messages, replay protection, policy enforcement, or binding authorization to execution.
