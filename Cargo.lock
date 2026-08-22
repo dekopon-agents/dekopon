@@ -1016,6 +1016,7 @@ dependencies = [
  "dekopon-provider-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "wasmtime",
@@ -2418,6 +2419,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -3764,11 +3766,13 @@ dependencies = [
  "pin-project",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

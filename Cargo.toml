@@ -53,11 +53,17 @@ jaq-core = "3.1.0"
 jaq-json = { version = "2.0.1", features = ["serde"] }
 jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+# `internal-logs` is the SDK's only runtime failure channel since the global error handler was
+# removed: without it every export failure — expired token, missing header, receiver down — is
+# discarded in silence. Each exporting binary filters the `opentelemetry` target off its own OTLP
+# layer, so these records reach stdout/stderr only and cannot feed export failures back into export.
+opentelemetry = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-http = { version = "0.32.0", default-features = false }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "logs", "trace"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
+# `tls-webpki-roots` gives the tonic channel a TLS connector, matching the webpki-only stance the
+# rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 schemars = { version = "1.2.2", features = ["derive"] }

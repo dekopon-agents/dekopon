@@ -188,14 +188,59 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use clap::CommandFactory as _;
     use dekopond::cli::Cli;
+    use tracing_subscriber::{
+        EnvFilter, Layer as _, layer::Context, layer::SubscriberExt as _, registry,
+    };
+
+    use super::OTEL_TRACE_FILTER;
 
     #[test]
     fn cli_definition_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// Records the target of every event a layer is actually asked to handle.
+    #[derive(Clone, Default)]
+    struct RecordTargets(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordTargets {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            self.0
+                .lock()
+                .expect("target log")
+                .push(event.metadata().target().to_owned());
+        }
+    }
+
+    /// The OTLP layer must never see the exporter's own diagnostics. `internal-logs` is enabled
+    /// workspace-wide, so a layer that accepted them would export the failures of its own export.
+    /// The SDK crates log under their package names, hyphens and all, which is why the directive
+    /// has to be the `opentelemetry` prefix rather than an exact target.
+    #[test]
+    fn the_otlp_layer_never_sees_the_exporters_own_records() {
+        let recorded = RecordTargets::default();
+        let subscriber = registry().with(
+            recorded
+                .clone()
+                .with_filter(EnvFilter::new(OTEL_TRACE_FILTER)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "opentelemetry", "api diagnostic");
+            tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
+            tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
+            tracing::info!(target: "dekopond", "gateway event");
+        });
+
+        assert_eq!(
+            *recorded.0.lock().expect("target log"),
+            vec!["dekopond".to_owned()]
+        );
     }
 
     #[test]

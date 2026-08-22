@@ -11,9 +11,17 @@ which CI rejects.
 
 `Transport::Grpc` and `Transport::Http` are both first-class. gRPC method paths are fixed by the
 OTLP protobuf service definition, which suits a receiver reached through a path-routing reverse
-proxy; HTTP appends `/v1/traces` and `/v1/logs` to the configured base endpoint. The HTTP client is
-the workspace's own reqwest build with redirects disabled, so an authorization header cannot be
-forwarded to a receiver-selected destination.
+proxy; HTTP appends `/v1/traces` and `/v1/logs` to the configured base endpoint. Both reach an
+`https://` endpoint using WebPKI roots. The HTTP client is the workspace's own reqwest build with
+redirects disabled, so an authorization header cannot be forwarded to a receiver-selected
+destination, and one client serves both signals rather than one per signal.
+
+## Export failures
+
+The OpenTelemetry SDK reports its own export failures through its `internal-logs` feature, which
+this crate enables. Those records use the `opentelemetry*` `tracing` targets; every Dekopon binary
+filters that target off its OTLP layers, so an export failure reaches stdout or stderr and can
+never be re-exported through the exporter that produced it.
 
 ## Authority
 

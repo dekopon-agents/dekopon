@@ -156,6 +156,7 @@ impl TelemetryConfig {
             self.transport,
             &self.service_name,
             "dekopon-brokerd",
+            env!("CARGO_PKG_VERSION"),
             Duration::from_millis(self.export_timeout_ms),
         )
         .map_err(|source| ConfigError::Telemetry { source })

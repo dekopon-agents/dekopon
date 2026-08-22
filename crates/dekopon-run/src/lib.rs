@@ -22,9 +22,7 @@ use dekopon_agent::{
     prompt::{PromptError, PromptLimits, format_script_outcome, run_prompt},
 };
 #[cfg(unix)]
-use dekopon_broker_protocol::{
-    BrokerClient, ClientError, FrameLimits, InvocationOutcome, InvocationRequest,
-};
+use dekopon_broker_protocol::{BrokerClient, ClientError, InvocationOutcome, InvocationRequest};
 #[cfg(unix)]
 use dekopon_core::IdentifierError;
 use dekopon_core::{CapabilityId, ExternalSubject, ProviderId};
@@ -79,9 +77,10 @@ pub async fn run(cli: Cli) -> i32 {
         command.name = command_name,
         otel.kind = "internal"
     );
-    let exit_code = {
-        let _entered = command_span.enter();
-
+    // Instrumented rather than entered: an `Entered` guard held across an `.await` stays on the
+    // thread that parked the future, so any future refactor that polls `run` on a worker would
+    // silently mis-parent every event emitted there.
+    let exit_code = async {
         match evaluate(&cli).await {
             Ok(output) => match write_output(&output.text) {
                 Ok(()) => output.exit_code,
@@ -114,7 +113,9 @@ pub async fn run(cli: Cli) -> i32 {
                 1
             }
         }
-    };
+    }
+    .instrument(command_span.clone())
+    .await;
 
     // Close the root span before flushing short-lived OTLP exporters.
     drop(command_span);
@@ -202,18 +203,25 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                     Ok(output) => {
                         let elapsed = start.elapsed();
                         samples.record(elapsed);
-                        tracing::info!(
-                            target: "dekopon_run::audit",
-                            {
-                                audit.event = "guest.invocation.completed",
-                                provider.id = %output.provider,
-                                capability.id = %output.capability,
-                                invocation.iteration = iteration,
-                                duration_ms = milliseconds(elapsed),
-                                outcome = "succeeded",
-                            },
-                            "guest provider invocation completed"
-                        );
+                        // A benchmarking loop must not bill the sink for its own iteration count:
+                        // `--repeat 10000` would otherwise ship 10,000 records saying the same
+                        // thing. The first iteration names the provider and proves the loop ran;
+                        // the summary below carries the aggregate, and failures still report
+                        // individually because each one is a distinct fact.
+                        if iteration == 1 {
+                            tracing::info!(
+                                target: "dekopon_run::audit",
+                                {
+                                    audit.event = "guest.invocation.completed",
+                                    provider.id = %output.provider,
+                                    capability.id = %output.capability,
+                                    invocation.iteration = iteration,
+                                    duration_ms = milliseconds(elapsed),
+                                    outcome = "succeeded",
+                                },
+                                "guest provider invocation completed"
+                            );
+                        }
                         last = Some(output);
                     }
                     Err(error) => {
@@ -242,6 +250,21 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 &samples,
                 output.output,
             );
+            if repeat.get() > 1 {
+                tracing::info!(
+                    target: "dekopon_run::audit",
+                    {
+                        audit.event = "guest.invocation.summary",
+                        provider.id = %report.provider,
+                        capability.id = %report.capability,
+                        invocation.count = report.iterations,
+                        duration_ms = report.timing.total_ms,
+                        mean_duration_ms = report.timing.mean_ms,
+                        outcome = "succeeded",
+                    },
+                    "guest provider invocation loop completed"
+                );
+            }
             serde_json::to_string_pretty(&report)
                 .map(CommandOutput::success)
                 .map_err(AppError::Serialize)
@@ -416,7 +439,7 @@ async fn evaluate_prompt(
     // Connection flags that silently do nothing are worse than a refusal: an operator who passes
     // `--socket` believes the broker leg is live, and would read a "command not found" as the
     // broker denying a capability rather than as never having been asked.
-    if !broker && (connection.socket.is_some() || connection.server_uid.is_some()) {
+    if !broker && connection.any_flag_supplied() {
         return Err(AppError::BrokerFlagsWithoutOptIn);
     }
 
@@ -563,16 +586,7 @@ async fn connect_prompt_broker(
     if !enabled {
         return Ok(None);
     }
-    let socket = BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
-    let server_uid = resolve_broker_server_uid(connection.server_uid);
-    let client = BrokerClient::new(
-        &socket,
-        server_uid,
-        FrameLimits {
-            max_frame_bytes: connection.max_frame_bytes,
-            io_timeout: Duration::from_millis(connection.io_timeout_ms),
-        },
-    )?;
+    let (client, socket_tier) = broker_client(connection)?;
     let leg = BrokerLeg::connect(client, "dekopon-run-prompt")
         .await
         .map_err(|error| match error {
@@ -582,15 +596,37 @@ async fn connect_prompt_broker(
                 AppError::BrokerDuplicateCapabilities { capabilities }
             }
         })?;
+    // The socket tier and the session trace are what a "this session saw zero capabilities"
+    // investigation asks for first: which broker was reached, and which audit records are this
+    // session's. The socket path itself stays out, as it does everywhere else in telemetry.
     tracing::info!(
         target: "dekopon_run::audit",
         {
+            audit.event = "broker.leg.connected",
+            broker.socket.tier = socket_tier,
+            session.trace = %leg.session_trace(),
             capability.count = leg.granted().len(),
         },
         "broker leg connected for prompt session"
     );
 
     Ok(Some(Box::new(leg)))
+}
+
+/// Builds one authenticated broker client from the shared connection flags.
+///
+/// Every broker-reaching command resolves the socket, the trusted server UID, and the frame limits
+/// the same way; one copy means a new discovery tier or limit floor lands everywhere at once.
+/// Returns the resolved socket tier alongside the client so callers can report which one answered
+/// without repeating the precedence rules.
+#[cfg(unix)]
+fn broker_client(
+    connection: &BrokerConnectionArgs,
+) -> Result<(BrokerClient, &'static str), AppError> {
+    let socket = BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
+    let server_uid = resolve_broker_server_uid(connection.server_uid);
+    let client = BrokerClient::new(&socket.path, server_uid, connection.frame_limits())?;
+    Ok((client, socket.tier))
 }
 
 #[cfg(not(unix))]
@@ -637,17 +673,7 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
     match command {
         BrokerCommand::Capabilities { connection } => {
             async {
-                let socket =
-                    BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
-                let server_uid = resolve_broker_server_uid(connection.server_uid);
-                let client = BrokerClient::new(
-                    &socket,
-                    server_uid,
-                    FrameLimits {
-                        max_frame_bytes: connection.max_frame_bytes,
-                        io_timeout: Duration::from_millis(connection.io_timeout_ms),
-                    },
-                )?;
+                let (client, _tier) = broker_client(connection)?;
                 let capabilities = client.capabilities().await?;
                 serde_json::to_string_pretty(&capabilities)
                     .map(CommandOutput::success)
@@ -665,21 +691,12 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
             input_file,
         } => {
             async {
-                let socket =
-                    BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
-                let server_uid = resolve_broker_server_uid(connection.server_uid);
-                let client = BrokerClient::new(
-                    &socket,
-                    server_uid,
-                    FrameLimits {
-                        max_frame_bytes: connection.max_frame_bytes,
-                        io_timeout: Duration::from_millis(connection.io_timeout_ms),
-                    },
-                )?;
+                let (client, _tier) = broker_client(connection)?;
                 let input = read_input(
                     input.as_deref(),
                     input_file.as_deref(),
                     connection
+                        .frame_limits()
                         .max_frame_bytes
                         .saturating_sub(ENVELOPE_RESERVE_BYTES),
                 )?;
@@ -768,21 +785,45 @@ impl BrokerSocketDiscovery {
         }
     }
 
-    /// Resolves the highest-precedence broker socket path.
-    fn resolve(&self) -> Result<PathBuf, AppError> {
+    /// Resolves the highest-precedence broker socket path and names the tier it came from.
+    fn resolve(&self) -> Result<ResolvedSocket, AppError> {
         if let Some(path) = &self.explicit {
-            return Ok(path.clone());
+            return Ok(ResolvedSocket::new(path.clone(), "explicit"));
         }
         if let Some(path) = &self.environment {
-            return Ok(path.clone());
+            return Ok(ResolvedSocket::new(path.clone(), "environment"));
         }
         if let Some(root) = &self.xdg_runtime_dir {
-            return Ok(root.join("dekopon/broker.sock"));
+            return Ok(ResolvedSocket::new(
+                root.join("dekopon/broker.sock"),
+                "xdg-runtime-dir",
+            ));
         }
         if let Some(home) = &self.home {
-            return Ok(home.join(".local/run/dekopon/broker.sock"));
+            return Ok(ResolvedSocket::new(
+                home.join(".local/run/dekopon/broker.sock"),
+                "home",
+            ));
         }
         Err(AppError::BrokerSocketUnresolved)
+    }
+}
+
+/// One resolved broker socket and the discovery tier that produced it.
+///
+/// The tier is telemetry-safe where the path is not: a socket path is excluded from every signal,
+/// but "which tier answered" is exactly what a connection investigation needs.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedSocket {
+    path: PathBuf,
+    tier: &'static str,
+}
+
+#[cfg(unix)]
+impl ResolvedSocket {
+    const fn new(path: PathBuf, tier: &'static str) -> Self {
+        Self { path, tier }
     }
 }
 
@@ -1136,10 +1177,9 @@ mod tests {
             Some(PathBuf::from("/home/dekopon")),
         );
 
-        assert_eq!(
-            discovery.resolve().expect("explicit socket"),
-            PathBuf::from("/explicit/broker.sock")
-        );
+        let resolved = discovery.resolve().expect("explicit socket");
+        assert_eq!(resolved.path, PathBuf::from("/explicit/broker.sock"));
+        assert_eq!(resolved.tier, "explicit");
     }
 
     #[cfg(unix)]
@@ -1152,10 +1192,9 @@ mod tests {
             Some(PathBuf::from("/home/dekopon")),
         );
 
-        assert_eq!(
-            discovery.resolve().expect("environment socket"),
-            PathBuf::from("/environment/broker.sock")
-        );
+        let resolved = discovery.resolve().expect("environment socket");
+        assert_eq!(resolved.path, PathBuf::from("/environment/broker.sock"));
+        assert_eq!(resolved.tier, "environment");
     }
 
     #[cfg(unix)]
@@ -1168,10 +1207,12 @@ mod tests {
             Some(PathBuf::from("/home/dekopon")),
         );
 
+        let resolved = discovery.resolve().expect("runtime socket");
         assert_eq!(
-            discovery.resolve().expect("runtime socket"),
+            resolved.path,
             PathBuf::from("/run/user/1000/dekopon/broker.sock")
         );
+        assert_eq!(resolved.tier, "xdg-runtime-dir");
     }
 
     #[cfg(unix)]
@@ -1180,10 +1221,12 @@ mod tests {
         let discovery =
             BrokerSocketDiscovery::new(None, None, None, Some(PathBuf::from("/home/dekopon")));
 
+        let resolved = discovery.resolve().expect("home socket");
         assert_eq!(
-            discovery.resolve().expect("home socket"),
+            resolved.path,
             PathBuf::from("/home/dekopon/.local/run/dekopon/broker.sock")
         );
+        assert_eq!(resolved.tier, "home");
     }
 
     #[cfg(unix)]

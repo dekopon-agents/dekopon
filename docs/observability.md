@@ -138,12 +138,20 @@ The example header set works unchanged on both transports. On OpenObserve (obser
 identically regardless of transport. The organization is the one asymmetry: HTTP reads it from the
 endpoint path (`/api/default`) and ignores the header, while gRPC has no path to carry it and
 requires the `organization` header — without it the receiver rejects every export with gRPC status
-`InvalidArgument`. The runner surfaces that only as a flush error on exit, and the broker silences
-transport crates entirely, so a missing organization looks like telemetry that simply never
-arrives. Keep `organization=<org>` in the header set unconditionally; over HTTP it is redundant,
-never harmful.
+`InvalidArgument`. Keep `organization=<org>` in the header set unconditionally; over HTTP it is
+redundant, never harmful.
 
-Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals. HTTPS endpoints use WebPKI roots, and redirects are disabled so a receiver cannot forward an authorization header to another destination. Plain HTTP is suitable only for a loopback development receiver or an otherwise trusted isolated network because headers and telemetry are unencrypted.
+Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals, alongside a `service.version` carrying the exporting executable's own version. HTTPS endpoints use WebPKI roots on both transports, and redirects are disabled so a receiver cannot forward an authorization header to another destination. Plain HTTP is suitable only for a loopback development receiver or an otherwise trusted isolated network because headers and telemetry are unencrypted.
+
+## Export failures
+
+The OpenTelemetry SDK has no error handler to install; its `internal-logs` feature is the only
+runtime channel it reports export failures through, and the workspace enables that feature for the
+API, the SDK, and the OTLP exporter. Rejected tokens, a missing `organization` header, and a
+receiver that is down therefore say so: the runner prints them on stderr at warn/error, and both
+daemons emit them as structured JSON on stdout. Every binary filters the `opentelemetry` target off
+its own OTLP layers, so those records reach the local stream only and an export failure can never
+be re-exported through the exporter that failed.
 
 ## Broker export
 
@@ -163,8 +171,8 @@ There is deliberately no credential field. The broker reads `OTEL_EXPORTER_OTLP_
 runner does, so a token never enters the configuration file the broker parses, its command line, or
 any span attribute — the same rule that keeps provider credentials out of prompts and audit fields.
 With `transport: grpc` the endpoint is an authority that names no organization, so the header set
-must carry `organization=<org>` — the receiver otherwise rejects every export, invisibly, because
-the broker's log filter silences transport crates.
+must carry `organization=<org>` — the receiver otherwise rejects every export, and says so through
+the SDK's own diagnostics on stdout.
 
 The web UI renders the endpoint, transport, service name, timeout, and payload setting from this section. It reports only whether standard OTLP header/resource-attribute variables are present; their values are never retained or rendered.
 
@@ -430,6 +438,10 @@ observation rather than a hard native-operation deadline.
 Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope
 for the data a process handles can opt in to payload-bearing fields — `--otel-telemetry-payloads true`
 on `dekopon-run`, `DEKOPON_OTEL_TELEMETRY_PAYLOADS`, or `telemetry.telemetryPayloads: true` in `broker.yaml`.
+
+The opt-in is process state, not an OTLP setting: it applies to every sink the process writes,
+including a local `--trace` file, and it applies whether or not an OTLP endpoint is configured. A
+`--trace` run without the flag stays metadata-only.
 
 | Span | Field added |
 |---|---|

@@ -181,6 +181,30 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- The Agent Slack manifest now requests public/private channel history events required to observe
+  continuations; ambient traffic is discarded inside the transport before routing or inference.
+- `dekopon-run invoke --repeat N` emits one lifecycle log record for the first iteration plus one
+  summary rather than one per iteration; failures still report individually and the JSON report is
+  unchanged.
+- OTLP over HTTP builds one blocking HTTP client per process instead of one per signal.
+
+### Fixed
+
+- OTLP export failures now report themselves. The OpenTelemetry `internal-logs` feature is enabled,
+  so a rejected token, a missing `organization` header, or an unreachable receiver reaches the
+  runner's stderr and the daemons' stdout instead of being discarded in silence; every binary keeps
+  the `opentelemetry` target off its own OTLP layers so a failure can never be re-exported.
+- `grpc` transport reaches an `https://` endpoint. The OTLP exporter now enables WebPKI roots for
+  tonic, matching the workspace's TLS stance and the documented promise that both transports are
+  first-class.
+- The `service.version` resource attribute now carries the exporting executable's own version
+  rather than `dekopon-telemetry`'s.
+- `--otel-telemetry-payloads` is honored with no OTLP endpoint configured, so the flag can no
+  longer be silently ignored; a `--trace` file is a sink like any other and follows the opt-in.
+- `dekopon-run --max-frame-bytes` and `--io-timeout-ms` are now refused without `--broker`, like
+  every other broker connection flag, instead of parsing and configuring nothing.
+- The runner's broker-leg connect record carries `audit.event = "broker.leg.connected"`, the
+  resolved socket tier, and the session trace, so it is queryable like every sibling audit event.
 - Payload telemetry now emits `agent.model.prompt` whole on a session's first model turn and only
   the messages appended since the previous turn thereafter, ending the quadratic re-ship of one
   conversation's transcript.

@@ -377,6 +377,15 @@ impl BrokerLeg {
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
     }
+
+    /// This session's trace identifier, which every invocation it makes extends.
+    ///
+    /// It is the join key between an embedding surface's own telemetry and the broker's audit
+    /// records for the same session.
+    #[must_use]
+    pub fn session_trace(&self) -> &TraceId {
+        self.identifiers.trace()
+    }
 }
 
 /// Returns the provider namespace one capability identifier belongs to.
