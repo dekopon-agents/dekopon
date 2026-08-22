@@ -509,6 +509,40 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         "every Telegram identifier representable by the gateway remains canonical"
     );
 
+    let whatsapp = ChatScopeClaim {
+        transport: "support-whatsapp".parse().expect("transport"),
+        kind: ChatTransportKind::Whatsapp,
+        channel: "123:456:16034700182".to_owned(),
+        conversation: "123:456:16034700182".to_owned(),
+    };
+    let whatsapp_delivery = DeliveryIdentity::Whatsapp {
+        waba: "123".to_owned(),
+        phone_number: "456".to_owned(),
+        message: "wamid.delivery/a+b=".to_owned(),
+    };
+    assert!(whatsapp_delivery.is_canonical_for(&whatsapp));
+    let wire = serde_json::to_value(&whatsapp_delivery).expect("serialize WhatsApp delivery");
+    assert_eq!(
+        serde_json::from_value::<DeliveryIdentity>(wire).expect("deserialize WhatsApp delivery"),
+        whatsapp_delivery
+    );
+    for (waba, phone_number, message) in [
+        ("0123", "456", "wamid.delivery"),
+        ("123", "0456", "wamid.delivery"),
+        ("999", "456", "wamid.delivery"),
+        ("123", "999", "wamid.delivery"),
+        ("123", "456", ""),
+    ] {
+        assert!(
+            !DeliveryIdentity::Whatsapp {
+                waba: waba.to_owned(),
+                phone_number: phone_number.to_owned(),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&whatsapp)
+        );
+    }
+
     let local = ChatScopeClaim {
         transport: "dev".parse().expect("transport"),
         kind: ChatTransportKind::Local,
