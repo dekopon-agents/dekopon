@@ -886,8 +886,8 @@ async fn capabilities_for_over_the_socket() {
     }));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let capabilities = client
-        .capabilities_for(subject(), agent("chat-agent"))
+    let (capabilities, _) = client
+        .session_surface_for(subject(), agent("chat-agent"))
         .await
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
@@ -925,7 +925,7 @@ async fn capabilities_for_over_the_socket() {
 
     let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
     let refused = client
-        .capabilities_for(subject(), agent("chat-agent"))
+        .session_surface_for(subject(), agent("chat-agent"))
         .await
         .expect_err("a peer without attestor authority is refused");
     let ClientError::Remote { code, .. } = refused else {

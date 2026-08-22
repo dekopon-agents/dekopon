@@ -305,7 +305,10 @@ where
                     ERROR_UNAUTHENTICATED,
                     "informational reports require a mapped gateway attestor",
                 )
-            } else if !inventory.is_valid() {
+            } else if let Err(error) = inventory.validate() {
+                // The wire message stays generic; the specific bound and agent are an operator
+                // diagnostic, and `InventoryError` carries only identifiers and byte counts.
+                tracing::warn!(event = "broker_agent_inventory_rejected", reason = %error);
                 ResponseEnvelope::error(ERROR_INVALID_REQUEST, "agent inventory is invalid")
             } else {
                 let count = inventory.agents.len();
@@ -323,7 +326,8 @@ where
                     ERROR_UNAUTHENTICATED,
                     "informational reports require a mapped gateway attestor",
                 )
-            } else if !usage.is_valid() {
+            } else if let Err(error) = usage.validate() {
+                tracing::warn!(event = "broker_model_usage_rejected", reason = %error);
                 ResponseEnvelope::error(ERROR_INVALID_REQUEST, "model usage report is invalid")
             } else {
                 status.record_usage(usage);
