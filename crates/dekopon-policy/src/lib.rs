@@ -205,6 +205,9 @@ impl PolicyWorld {
     /// A phantom can never authorize an execution. It routes to no provider, the broker refuses any
     /// constraint set naming an unrouted capability, and an invocation naming one is denied
     /// `unconstrained-capability` before Cedar is consulted at all.
+    ///
+    /// Every reported name parses: `classify_policies` refuses a literal outside the identifier
+    /// grammar in both modes, so nothing silently fails to register here.
     #[must_use]
     fn with_phantoms(&self, unresolved: &[UnresolvedName]) -> Self {
         let mut world = self.clone();
@@ -531,8 +534,11 @@ impl PolicyEngine {
     /// # Errors
     ///
     /// The same failures as [`PolicyEngine::new`], minus [`PolicyBuildError::UnknownAction`] and
-    /// [`PolicyBuildError::UnknownProvider`]. An undeclared *principal* remains an error here:
-    /// principals come from owner-authored configuration, not from a loaded component.
+    /// [`PolicyBuildError::UnknownProvider`] for a name that is a well-formed identifier. An
+    /// undeclared *principal* remains an error here: principals come from owner-authored
+    /// configuration, not from a loaded component. So does a literal outside the identifier
+    /// grammar — `Dekopon::Action::"GH.Read"` can never become a loaded capability however many
+    /// providers arrive later, so it gets the same specific error strict mode gives it.
     pub fn new_lenient(
         policy_text: &str,
         world: &PolicyWorld,
@@ -591,7 +597,7 @@ impl PolicyEngine {
         }
 
         let entities = build_entities(&effective, &schema)?;
-        let digest = policy_digest(&policies, world, &unresolved);
+        let digest = policy_digest(&policies, world, &unresolved)?;
 
         Ok((
             Self {
@@ -814,50 +820,57 @@ fn classify_policies(
                     }
                 }
                 PROVIDER_TYPE => {
-                    let declared = value
-                        .parse::<ProviderId>()
-                        .is_ok_and(|provider| world.providers.contains(&provider));
+                    let parsed = value.parse::<ProviderId>().ok();
+                    let declared = parsed
+                        .as_ref()
+                        .is_some_and(|provider| world.providers.contains(provider));
                     if !declared {
-                        match handling {
-                            Handling::Refuse => {
-                                return Err(PolicyBuildError::UnknownProvider {
-                                    policy: id.clone(),
-                                    provider: value,
-                                });
-                            }
-                            Handling::Tolerate => unresolved.push(UnresolvedName {
+                        // A literal outside the identifier grammar can never become a loaded
+                        // provider, so it is a typo like a misspelled principal rather than an
+                        // anticipated one, and gets the specific error in both modes. Tolerating
+                        // it would drop it from the phantom set and surface later as a raw Cedar
+                        // validation failure with the `UnresolvedName` report lost.
+                        if parsed.is_none() || handling == Handling::Refuse {
+                            return Err(PolicyBuildError::UnknownProvider {
                                 policy: id.clone(),
-                                name: value,
-                                kind: UnresolvedKind::Provider,
-                            }),
+                                provider: value,
+                            });
                         }
+                        unresolved.push(UnresolvedName {
+                            policy: id.clone(),
+                            name: value,
+                            kind: UnresolvedKind::Provider,
+                        });
                     }
                 }
                 ACTION_TYPE => {
                     if value == AGENT_PROMPT_ACTION {
                         continue;
                     }
-                    match value
-                        .parse::<CapabilityId>()
-                        .ok()
+                    let parsed = value.parse::<CapabilityId>().ok();
+                    match parsed
+                        .clone()
                         .filter(|capability| world.capabilities.contains_key(capability))
                     {
                         Some(capability) => {
                             referenced_capabilities.insert(capability);
                         }
-                        None => match handling {
-                            Handling::Refuse => {
+                        // Same rule as a provider literal: a name outside the identifier grammar
+                        // can never become a loaded capability, so it is a typo rather than an
+                        // anticipation and stays fatal even under `Tolerate`.
+                        None => {
+                            if parsed.is_none() || handling == Handling::Refuse {
                                 return Err(PolicyBuildError::UnknownAction {
                                     policy: id.clone(),
                                     action: value,
                                 });
                             }
-                            Handling::Tolerate => unresolved.push(UnresolvedName {
+                            unresolved.push(UnresolvedName {
                                 policy: id.clone(),
                                 name: value,
                                 kind: UnresolvedKind::Capability,
-                            }),
-                        },
+                            });
+                        }
                     }
                 }
                 // The schema already rejects an unknown entity type, and `Agent` instances are
@@ -920,21 +933,26 @@ fn policy_digest(
     policies: &PolicySet,
     world: &PolicyWorld,
     unresolved: &[UnresolvedName],
-) -> String {
+) -> Result<String, PolicyBuildError> {
     // Cedar's structural JSON rather than the source text: two spellings of one policy must
     // fingerprint identically, so reformatting a policy file does not look like a policy change.
-    // `Display` and `to_cedar` both round-trip the original bytes and would not do that.
+    // `Display` and `to_cedar` both round-trip the original bytes and would not do that, so a
+    // fallback to either would quietly abandon the property — two brokers loading semantically
+    // identical files would report different digests in every audit record with nothing saying
+    // why. The digest is computed once at startup, so failing closed here is cheap.
     let canonical = policies
         .policies()
         .map(|policy| {
-            (
-                policy.id().to_string(),
-                policy
-                    .to_json()
-                    .map_or_else(|_| policy.to_string(), |json| json.to_string()),
-            )
+            let json = policy
+                .to_json()
+                .map_err(|source| PolicyBuildError::Digest {
+                    policy: policy.id().to_string(),
+                    message: source.to_string(),
+                })?
+                .to_string();
+            Ok((policy.id().to_string(), json))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, PolicyBuildError>>()?;
 
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
@@ -990,7 +1008,7 @@ fn policy_digest(
         hex.push(char::from(HEX[usize::from(byte >> 4)]));
         hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    hex
+    Ok(hex)
 }
 
 /// Failure to build a coherent, validated policy engine.
@@ -1100,6 +1118,18 @@ pub enum PolicyBuildError {
     #[error("policy entity store could not be built: {message}")]
     Entities {
         /// Entity diagnostics.
+        message: String,
+    },
+    /// A policy could not be rendered as the structural JSON the digest fingerprints.
+    ///
+    /// The digest deliberately hashes Cedar's structural JSON so two spellings of one policy
+    /// fingerprint identically. Degrading to the source text would abandon that property silently,
+    /// so construction refuses instead; the digest is computed once at startup.
+    #[error("policy {policy} could not be canonicalized for the policy digest: {message}")]
+    Digest {
+        /// Policy identifier.
+        policy: String,
+        /// Canonicalization diagnostics.
         message: String,
     },
 }

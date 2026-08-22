@@ -73,6 +73,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- `dekopon-protocol` resources now carry a per-resource single-variant `kind`, so a document whose
+  `kind` names another resource fails to decode in the crate itself rather than only in
+  `dekopon-config`. `model_class`, `policy_profile`, `credential_ref`, `CapabilityStatus`, and
+  `ProviderStatus` documentation now matches what 0.9.0 actually does with them.
+- `JsonSchema` derives in `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` moved behind
+  a default-on `schemars` feature, and `dekopon-provider-sdk` no longer enables it, so a wasm
+  provider build drops `schemars`, `schemars_derive`, and `syn`.
 - Broker provider components now compile concurrently through Wasmtime's parallel Cranelift backend
   instead of one at a time on a single core, while conflict reporting and the first reported
   failure stay in configured order.
@@ -275,6 +282,26 @@ All notable changes to Dekopon are documented here. The format is based on
 - A provider exporting `resolve-command` with the wrong signature is now reported as a type
   mismatch instead of as an absent export, and the export is proven from the component's own type
   rather than by instantiating it once at startup.
+
+### Removed
+
+- Removed `dekopon-testkit`, which no workspace crate depended on, the `dekopon-capability`
+  dependency of `dekopon`, `thiserror` from `dekopon-provider-sdk`, four unreferenced dependencies
+  of `dekopon-run`, and three of `dekopon-telemetry`.
+- Removed `CapabilityDescriptor` and `ProposedInvocation`'s unused `Deserialize` derive from
+  `dekopon-capability`, `ResourceReader` from `dekopon`, and the single-implementation `Provider`
+  trait from `dekopon-provider-host`, whose methods are now inherent on `WasmProvider`.
+
+### Fixed
+
+- A provider whose manifest cannot be serialized now describes itself with the serialization error
+  instead of an empty description a host misdiagnoses.
+- `HttpError` renders the `dekopon:http@1.0.0` kebab-case error names instead of Rust variant
+  spelling.
+- A Cedar literal outside the Dekopon identifier grammar now returns `UnknownAction` or
+  `UnknownProvider` in tolerant startup mode instead of an opaque validation error, and a policy
+  that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
+  to source text.
 
 ### Security
 

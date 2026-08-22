@@ -52,18 +52,14 @@
 
 use std::fmt;
 
-use dekopon_core::{
-    Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
-};
-use schemars::JsonSchema;
+use dekopon_core::{Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, TraceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 /// Whether invoking a capability can cause an externally observable effect.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
     /// Reads data without intentionally mutating local or external state.
@@ -86,9 +82,8 @@ impl fmt::Display for EffectKind {
 }
 
 /// Declared retry behavior for an invocation.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Idempotency {
     /// Repeating an identical invocation has no additional effect.
@@ -111,9 +106,8 @@ impl fmt::Display for Idempotency {
 }
 
 /// A provider permission needed to execute a capability.
-#[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Permission {
     /// Provider-specific operation, such as `pull_requests:read`.
@@ -123,31 +117,16 @@ pub struct Permission {
     pub resource: Option<String>,
 }
 
-/// Human- and policy-readable metadata for a capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CapabilityDescriptor {
-    /// Stable capability identifier.
-    pub id: CapabilityId,
-    /// Provider that implements this capability.
-    pub provider: ProviderId,
-    /// Concise operator-facing description.
-    pub description: String,
-    /// External-effect class.
-    pub effect: EffectKind,
-    /// Coarse policy risk input.
-    pub risk: RiskLevel,
-    /// Retry behavior.
-    pub idempotency: Idempotency,
-    /// Least-privilege provider permissions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permissions: Vec<Permission>,
-}
-
 /// An invocation proposed by a model, agent, or human.
 ///
 /// This type carries intent but no authority to execute an external effect.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+///
+/// Deliberately not [`Deserialize`]: the wire type a broker decodes is
+/// `dekopon_broker_protocol::InvocationRequest`, which the broker converts here after
+/// authenticating the envelope. Deriving `Deserialize` would offer a decoding path that no caller
+/// should take.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
     /// Unique invocation identifier.
@@ -183,7 +162,8 @@ impl ProposedInvocation {
 }
 
 /// Broker-enforced buffered HTTP limits attached to one authorization.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConstraints {
     /// Exact DNS names or IP authorities the invocation may contact.
@@ -332,9 +312,8 @@ pub enum HttpConstraintsError {
 }
 
 /// Exact component storage interface selected for one capability.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageInterface {
     /// Curated invocation-transactional JSONL operations.
@@ -344,9 +323,8 @@ pub enum StorageInterface {
 }
 
 /// Storage mutation authority selected for one capability.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageAccess {
     /// Reads only; every mutating host call is terminally denied.
@@ -356,9 +334,8 @@ pub enum StorageAccess {
 }
 
 /// Broker-owned logical namespace class.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageNamespace {
     /// Owner-private chat memory, scoped from trusted chat attestation.
@@ -366,7 +343,8 @@ pub enum StorageNamespace {
 }
 
 /// Exact namespace-bound storage authority attached to one capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConstraints {
     /// The only storage interface this invocation may call.
@@ -378,7 +356,8 @@ pub struct StorageConstraints {
 }
 
 /// Broker-enforced execution limits attached to an authorization.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
     /// Maximum wall-clock duration allowed for provider execution.
@@ -408,7 +387,12 @@ impl Default for ExecutionConstraints {
 ///
 /// Receipts are emitted by the broker transition and cannot be assembled with a public
 /// struct literal.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+///
+/// The accessors below exist for evidence and audit inspection inside the broker boundary.
+/// Receipt data reaches every other consumer by [`Serialize`] into the evidence digest, not by
+/// being read field by field.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationReceipt {
     decision_id: String,
@@ -443,7 +427,8 @@ impl AuthorizationReceipt {
 /// the broker-owned execution boundary creates and consumes it once. It is serializable as
 /// inert data for broker-owned audit and evidence recording, but its serialized form is not a
 /// transferable bearer grant and intentionally cannot be deserialized.
-#[derive(Debug, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
     proposal: ProposedInvocation,
@@ -482,7 +467,8 @@ impl AuthorizedInvocation {
 ///
 /// Unlike [`AuthorizationReceipt`], this value is deserializable because it carries no execution
 /// authority and cannot be converted into an [`AuthorizedInvocation`].
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DecisionReference {
     /// Stable broker decision identifier.
@@ -494,7 +480,8 @@ pub struct DecisionReference {
 }
 
 /// A piece of evidence produced during authorization or execution.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Evidence {
     /// Evidence category, such as `provider-response` or `policy-decision`.
@@ -509,7 +496,8 @@ pub struct Evidence {
 }
 
 /// Terminal state of an attempted invocation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum InvocationOutcome {
     /// Provider execution completed successfully.
@@ -521,7 +509,8 @@ pub enum InvocationOutcome {
 }
 
 /// Serializable result and evidence for an invocation.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationResult {
     /// Invocation identifier.
@@ -648,8 +637,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthorizationError, ExecutionConstraints, HttpConstraints, HttpConstraintsError,
-        MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
+        AuthorizationError, EffectKind, ExecutionConstraints, HttpConstraints,
+        HttpConstraintsError, Idempotency, MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
     };
 
     fn proposal() -> ProposedInvocation {
@@ -664,6 +653,34 @@ mod tests {
             "trace-1".parse::<TraceId>().expect("valid fixture"),
             json!({"body": "Looks good"}),
         )
+    }
+
+    /// `Display` feeds the web UI and operator errors; serde feeds manifests and constraint-set
+    /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
+    /// variant from rendering one string to an operator and a different one to the audit record.
+    #[test]
+    fn display_matches_the_serde_rendering_for_every_variant() {
+        for effect in [
+            EffectKind::ReadOnly,
+            EffectKind::LocalWrite,
+            EffectKind::ExternalWrite,
+        ] {
+            assert_eq!(
+                serde_json::to_value(effect).expect("effect serializes"),
+                json!(effect.to_string()),
+            );
+        }
+
+        for idempotency in [
+            Idempotency::Idempotent,
+            Idempotency::Conditional,
+            Idempotency::NonIdempotent,
+        ] {
+            assert_eq!(
+                serde_json::to_value(idempotency).expect("idempotency serializes"),
+                json!(idempotency.to_string()),
+            );
+        }
     }
 
     #[test]

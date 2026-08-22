@@ -21,7 +21,6 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
-    "crates/dekopon-testkit",
     "crates/dekopon-webui",
     "crates/dekopond",
 ]
@@ -90,9 +89,9 @@ dekopon-broker = { version = "0.9.0", path = "crates/dekopon-broker" }
 dekopon-broker-host = { version = "0.9.0", path = "crates/dekopon-broker-host" }
 dekopon-broker-protocol = { version = "0.9.0", path = "crates/dekopon-broker-protocol" }
 dekopon-brokerd = { version = "0.9.0", path = "crates/dekopon-brokerd" }
-dekopon-capability = { version = "0.9.0", path = "crates/dekopon-capability" }
+dekopon-capability = { version = "0.9.0", path = "crates/dekopon-capability", default-features = false }
 dekopon-config = { version = "0.9.0", path = "crates/dekopon-config" }
-dekopon-core = { version = "0.9.0", path = "crates/dekopon-core" }
+dekopon-core = { version = "0.9.0", path = "crates/dekopon-core", default-features = false }
 dekopon-http-host = { version = "0.9.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.9.0", path = "crates/dekopon-model" }
 dekopon-policy = { version = "0.9.0", path = "crates/dekopon-policy" }
@@ -104,7 +103,6 @@ dekopon-protocol = { version = "0.9.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.9.0", path = "crates/dekopon-shell" }
 dekopon-storage-host = { version = "0.9.0", path = "crates/dekopon-storage-host" }
 dekopon-telemetry = { version = "0.9.0", path = "crates/dekopon-telemetry" }
-dekopon-testkit = { version = "0.9.0", path = "crates/dekopon-testkit" }
 dekopon-webui = { version = "0.9.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.9.0", path = "crates/dekopond" }
 

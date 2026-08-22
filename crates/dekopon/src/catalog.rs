@@ -18,23 +18,7 @@ pub enum CatalogError {
     },
 }
 
-/// Read-only resource interface shared by local config and a future daemon client.
-pub trait ResourceReader {
-    /// Lists all agents in deterministic order.
-    fn list_agents(&self) -> Result<Vec<Agent>, CatalogError>;
-    /// Gets one agent by name.
-    fn get_agent(&self, name: &AgentId) -> Result<Agent, CatalogError>;
-    /// Lists all capabilities in deterministic order.
-    fn list_capabilities(&self) -> Result<Vec<Capability>, CatalogError>;
-    /// Gets one capability by name.
-    fn get_capability(&self, name: &CapabilityId) -> Result<Capability, CatalogError>;
-    /// Lists all providers in deterministic order.
-    fn list_providers(&self) -> Result<Vec<Provider>, CatalogError>;
-    /// Gets one provider by name.
-    fn get_provider(&self, name: &ProviderId) -> Result<Provider, CatalogError>;
-}
-
-/// [`ResourceReader`] backed by one parsed local catalog.
+/// Read-only resource access backed by one parsed local catalog.
 #[derive(Clone, Debug)]
 pub struct LocalConfigReader {
     catalog: LocalCatalog,
@@ -58,14 +42,19 @@ impl LocalConfigReader {
     pub fn source_display(&self) -> String {
         self.catalog.source().display().to_string()
     }
-}
 
-impl ResourceReader for LocalConfigReader {
-    fn list_agents(&self) -> Result<Vec<Agent>, CatalogError> {
-        Ok(self.catalog.agents().cloned().collect())
+    /// Lists all agents in deterministic order.
+    #[must_use]
+    pub fn list_agents(&self) -> Vec<Agent> {
+        self.catalog.agents().cloned().collect()
     }
 
-    fn get_agent(&self, name: &AgentId) -> Result<Agent, CatalogError> {
+    /// Gets one agent by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::NotFound`] when the validated catalog declares no such agent.
+    pub fn get_agent(&self, name: &AgentId) -> Result<Agent, CatalogError> {
         self.catalog
             .agent(name)
             .cloned()
@@ -75,11 +64,18 @@ impl ResourceReader for LocalConfigReader {
             })
     }
 
-    fn list_capabilities(&self) -> Result<Vec<Capability>, CatalogError> {
-        Ok(self.catalog.capabilities().cloned().collect())
+    /// Lists all capabilities in deterministic order.
+    #[must_use]
+    pub fn list_capabilities(&self) -> Vec<Capability> {
+        self.catalog.capabilities().cloned().collect()
     }
 
-    fn get_capability(&self, name: &CapabilityId) -> Result<Capability, CatalogError> {
+    /// Gets one capability by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::NotFound`] when the validated catalog declares no such capability.
+    pub fn get_capability(&self, name: &CapabilityId) -> Result<Capability, CatalogError> {
         self.catalog
             .capability(name)
             .cloned()
@@ -89,11 +85,18 @@ impl ResourceReader for LocalConfigReader {
             })
     }
 
-    fn list_providers(&self) -> Result<Vec<Provider>, CatalogError> {
-        Ok(self.catalog.providers().cloned().collect())
+    /// Lists all providers in deterministic order.
+    #[must_use]
+    pub fn list_providers(&self) -> Vec<Provider> {
+        self.catalog.providers().cloned().collect()
     }
 
-    fn get_provider(&self, name: &ProviderId) -> Result<Provider, CatalogError> {
+    /// Gets one provider by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::NotFound`] when the validated catalog declares no such provider.
+    pub fn get_provider(&self, name: &ProviderId) -> Result<Provider, CatalogError> {
         self.catalog
             .provider(name)
             .cloned()

@@ -143,11 +143,11 @@ parse dekopon CLI
   -> resolve one config source
   -> parse YAML/JSON once
   -> validate a typed catalog
-  -> execute through ResourceReader
+  -> execute through LocalConfigReader
   -> render a typed result
 ```
 
-Command handlers do not manipulate YAML. `LocalConfigReader` implements `ResourceReader`; a future daemon client may implement the same read boundary. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
+Command handlers do not manipulate YAML. `LocalConfigReader` is the one reader; a read abstraction returns when a second implementation exists rather than in anticipation of one. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
 
 Model-account lifecycle is a separate operator path that does not resolve or parse the catalog:
 
@@ -306,7 +306,6 @@ See [`cli.md`](cli.md) for the current command contract.
 | Strict decoding | Misspelled security-relevant fields must not be ignored. |
 | `BTreeMap`-backed catalogs | Deterministic reads and output simplify review, testing, and automation. |
 | Private authorization fields plus compile-fail tests | Prevent accidental in-process authority fabrication while acknowledging that process isolation remains necessary. |
-| Private testkit | Shared fixtures are useful internally but are not part of the public product API. |
 | Import-free immediate providers | Provider traits, component ABI, routing, limits, prompt tools, timings, and traces can stabilize without prematurely granting host authority. |
 | Broker-owned buffered HTTP | Privileged providers import a project-owned high-level HTTP contract, while only the separate broker implements networking, applies authorization constraints, and records evidence. |
 | No native runtime plugins | Broker host services are statically linked; untrusted imports never trigger Rust library or package downloads. |

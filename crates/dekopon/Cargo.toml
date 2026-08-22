@@ -17,7 +17,6 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 [dependencies]
 base64.workspace = true
 clap.workspace = true
-dekopon-capability.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
