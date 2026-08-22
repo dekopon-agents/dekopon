@@ -25,18 +25,20 @@ use std::{
     },
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, InboundMessage, ReplyTarget, TransportError,
-    TransportEvent, TransportIdentity, bound_inbound,
+    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
+    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
 };
 
 /// Longest line the development transport accepts, matching the inbound text bound plus envelope.
@@ -66,6 +68,7 @@ pub(crate) struct LocalTransport {
     sender: mpsc::UnboundedSender<InboundMessage>,
     replier: Arc<LocalReplier>,
     connections: AtomicU64,
+    boot_nonce: Option<String>,
 }
 
 impl LocalTransport {
@@ -80,16 +83,18 @@ impl LocalTransport {
             sender,
             replier: Arc::new(LocalReplier::default()),
             connections: AtomicU64::new(1),
+            boot_nonce: None,
         }
     }
 
     /// Serves one connection: JSON lines in, JSON lines out, until the caller hangs up.
     fn serve(&self, stream: UnixStream) {
         let connection = self.connections.fetch_add(1, Ordering::Relaxed);
-        let (outbound_send, mut outbound_receive) = mpsc::unbounded_channel::<String>();
+        let (outbound_send, mut outbound_receive) = mpsc::unbounded_channel::<LocalWrite>();
         self.replier.register(connection, outbound_send);
 
         let name = self.name.clone();
+        let boot_nonce = self.boot_nonce.clone().unwrap_or_default();
         let inbound = self.sender.clone();
         let replier = Arc::clone(&self.replier);
         tokio::spawn(async move {
@@ -100,13 +105,16 @@ impl LocalTransport {
             let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES);
             let writes = tokio::spawn(async move {
                 while let Some(reply) = outbound_receive.recv().await {
-                    let line = format!("{reply}\n");
-                    if writer.write_all(line.as_bytes()).await.is_err() {
+                    let line = format!("{}\n", reply.line);
+                    let accepted = writer.write_all(line.as_bytes()).await.is_ok()
+                        && writer.flush().await.is_ok();
+                    let _ = reply.ack.send(accepted);
+                    if !accepted {
                         break;
                     }
-                    let _ = writer.flush().await;
                 }
             });
+            let mut sequence = 0_u64;
             loop {
                 let mut line = Vec::new();
                 reader.set_limit(MAX_LINE_BYTES);
@@ -137,8 +145,10 @@ impl LocalTransport {
                     );
                     continue;
                 };
+                sequence += 1;
                 let message = InboundMessage {
                     transport: name.clone(),
+                    transport_kind: ChatTransportKind::Local,
                     subject: request.subject,
                     channel: request.channel.clone(),
                     thread: None,
@@ -147,6 +157,7 @@ impl LocalTransport {
                     // has no threads, and the connection number would restart the conversation
                     // every time a developer reconnected.
                     conversation_id: request.channel,
+                    message_id: format!("{boot_nonce}-{connection}-{sequence}"),
                     text: bound_inbound(&request.text),
                     // The development transport speaks line-delimited JSON and carries no files.
                     assets: Vec::new(),
@@ -155,6 +166,7 @@ impl LocalTransport {
                     // require. Channel routes are a chat-service concept.
                     conversation: ConversationKind::DirectMessage,
                     addressed: Some(true),
+                    thread_continuation: None,
                     reply: ReplyTarget::Local { connection },
                     activity: None,
                 };
@@ -175,6 +187,10 @@ impl ChatTransport for LocalTransport {
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
+            let mut nonce = [0_u8; 16];
+            getrandom::fill(&mut nonce)
+                .map_err(|source| TransportError::Io(std::io::Error::other(source)))?;
+            self.boot_nonce = Some(nonce.iter().map(|byte| format!("{byte:02x}")).collect());
             let (listener, guard) = bind(&self.socket_path)?;
             self.listener = Some(listener);
             self.guard = Some(guard);
@@ -211,11 +227,16 @@ impl ChatTransport for LocalTransport {
 /// Routes an answer back to the connection its request arrived on.
 #[derive(Default)]
 pub(crate) struct LocalReplier {
-    connections: Mutex<BTreeMap<u64, mpsc::UnboundedSender<String>>>,
+    connections: Mutex<BTreeMap<u64, mpsc::UnboundedSender<LocalWrite>>>,
+}
+
+struct LocalWrite {
+    line: String,
+    ack: oneshot::Sender<bool>,
 }
 
 impl LocalReplier {
-    fn register(&self, connection: u64, sender: mpsc::UnboundedSender<String>) {
+    fn register(&self, connection: u64, sender: mpsc::UnboundedSender<LocalWrite>) {
         self.connections
             .lock()
             .expect("local connection registry")
@@ -234,13 +255,22 @@ impl ChatReplier for LocalReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Local { connection } = target else {
                 return Err(TransportError::Response);
             };
-            let line = serde_json::json!({ "reply": text }).to_string();
+            let OutboundReply { text, image } = reply;
+            let mut response = serde_json::json!({ "reply": text });
+            if let Some(image) = image {
+                response["images"] = serde_json::json!([{
+                    "filename": image.filename(),
+                    "mediaType": image.media_type(),
+                    "data": STANDARD.encode(image.bytes()),
+                }]);
+            }
+            let line = response.to_string();
             let sender = self
                 .connections
                 .lock()
@@ -250,7 +280,17 @@ impl ChatReplier for LocalReplier {
             // A caller that hung up mid-session is not an error worth failing a session over: the
             // answer simply has nowhere to go.
             match sender {
-                Some(sender) => sender.send(line).map_err(|_| TransportError::Closed),
+                Some(sender) => {
+                    let (ack, received) = oneshot::channel();
+                    sender
+                        .send(LocalWrite { line, ack })
+                        .map_err(|_| TransportError::Closed)?;
+                    if received.await.map_err(|_| TransportError::Closed)? {
+                        Ok(DeliveryReceipt::new(format!("local:{connection}")))
+                    } else {
+                        Err(TransportError::Closed)
+                    }
+                }
                 None => Err(TransportError::Closed),
             }
         })

@@ -33,7 +33,7 @@ pub struct ProviderManifest {
     pub id: ProviderId,
     /// Concise operator-facing description.
     pub description: String,
-    /// Read-only capabilities implemented by this component.
+    /// Capabilities implemented by this component.
     pub capabilities: Vec<ProviderCapability>,
     /// Command words this provider contributes to the sandboxed shell.
     ///
@@ -73,15 +73,16 @@ pub trait Provider {
 
     /// Executes one capability against syntactically decoded, otherwise untrusted JSON input.
     ///
-    /// The immediate host supplies no ambient I/O. This function should be deterministic unless
-    /// an eventual host interface explicitly provides a bounded source of nondeterminism.
+    /// The immediate host supplies no ambient I/O. A provider-owned world may declare imports
+    /// such as buffered HTTP; the broker host supplies and links them, then gates calls through
+    /// authorization.
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError>;
 
     /// Rewrites one argv into a capability proposal.
     ///
     /// This is where a provider implements the ergonomic spelling of its own capabilities —
-    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. `argv[0]`
-    /// is the command word the model typed, which is always one this provider declared.
+    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. The command
+    /// word is selected before this call; `argv` contains only the arguments after it.
     ///
     /// It is a **pure rewrite and grants nothing**. What it returns is a proposal, authorized on
     /// exactly the path a direct `cap <id> {…}` call takes: constraint-set lookup, Cedar

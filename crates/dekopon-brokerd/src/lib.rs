@@ -19,6 +19,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use dekopon_broker::{
@@ -33,7 +34,7 @@ pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOIN
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
     IdentityMapping, PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig,
-    TelemetryConfig,
+    StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
@@ -147,14 +148,35 @@ where
     checkpoint::reconcile(&file_audit, &checkpoint_store, stored_checkpoint.as_ref())
         .await
         .map_err(BrokerdError::Checkpoint)?;
-    let replay_ids = file_audit.replay_ids().await;
+    let replay_ids = file_audit.take_replay_ids().await;
     let audit = Arc::new(checkpoint::CheckpointedAuditLog::new(
         file_audit,
         checkpoint_store,
     ));
-    let registry = BrokerProviderRegistry::load(config.providers, config.host_limits)
-        .await
-        .map_err(BrokerdError::Host)?;
+    let storage_host = config
+        .storage
+        .as_ref()
+        .map(|storage| {
+            dekopon_storage_host::StorageHost::open(
+                &storage.root_path,
+                &storage.namespace_key_path,
+                storage.limits.clone(),
+            )
+        })
+        .transpose()
+        .map_err(BrokerdError::Storage)?;
+    let storage_gc = storage_host.clone();
+    let storage_gc_interval = config
+        .storage
+        .as_ref()
+        .map(|storage| Duration::from_millis(storage.limits.gc_interval_ms));
+    let registry = BrokerProviderRegistry::load_with_storage(
+        config.providers,
+        config.host_limits,
+        storage_host,
+    )
+    .await
+    .map_err(BrokerdError::Host)?;
     let host_metrics = registry.metrics();
     let provider_metadata = registry.loaded_provider_metadata().collect::<Vec<_>>();
     validate_manifest_metadata(
@@ -238,6 +260,12 @@ where
         replay_ids,
     )
     .map_err(BrokerdError::Broker)?;
+    let broker = match config.chat_memory {
+        Some(memory) => broker
+            .with_chat_memory(memory)
+            .map_err(BrokerdError::Broker)?,
+        None => broker,
+    };
     for warning in &warnings {
         tracing::warn!(
             target: "dekopon_brokerd::audit",
@@ -267,7 +295,7 @@ where
         shutdown_grace: config.server_limits.shutdown_grace(),
     };
     let service_status = dekopon_webui::ServiceStatus::default();
-    let web_shutdown_grace = limits.shutdown_grace;
+    let shutdown_grace = limits.shutdown_grace;
     let server = BrokerServer::new_with_status(broker, identities, limits, service_status.clone())?;
     let dashboard = dekopon_webui::Dashboard::new(
         env!("CARGO_PKG_VERSION"),
@@ -308,6 +336,8 @@ where
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let broker_serve = server.serve(listener, wait_for_shutdown(shutdown_receiver.clone()));
+    let storage_gc_serve =
+        storage_gc_loop(storage_gc, storage_gc_interval, shutdown_receiver.clone());
     let web_serve = async move {
         match web_listener {
             Some(listener) => {
@@ -318,6 +348,7 @@ where
         }
     };
     tokio::pin!(broker_serve);
+    tokio::pin!(storage_gc_serve);
     tokio::pin!(web_serve);
     tokio::pin!(shutdown);
 
@@ -329,20 +360,37 @@ where
         result = &mut web_serve => web_result = Some(result),
     }
     let _ = shutdown_sender.send(true);
-    if broker_result.is_none() {
-        broker_result = Some(broker_serve.await);
-    }
-    let mut web_shutdown_timed_out = false;
-    if web_enabled && web_result.is_none() {
-        match tokio::time::timeout(web_shutdown_grace, &mut web_serve).await {
-            Ok(result) => web_result = Some(result),
-            Err(_) => web_shutdown_timed_out = true,
-        }
-    }
 
-    socket_guard.cleanup()?;
-    broker_result.ok_or(BrokerdError::Server(ServerError::ConnectionTask))??;
-    if web_shutdown_timed_out {
+    let drained = drain_services(
+        tokio::time::Instant::now() + shutdown_grace,
+        async {
+            match broker_result {
+                Some(result) => result,
+                None => broker_serve.await,
+            }
+        },
+        &mut storage_gc_serve,
+        (web_enabled && web_result.is_none()).then_some(&mut web_serve),
+    )
+    .await;
+    let web_result = drained.web.or(web_result);
+
+    // The socket must not outlive its listener, so cleanup still runs here — but its result is
+    // held rather than returned. A stale socket path is a smaller problem than the failure that
+    // ended service, and returning it first would replace the real cause and skip the final
+    // checkpoint and `broker_stopped` entirely.
+    let cleanup = socket_guard.cleanup();
+    if let Err(error) = &cleanup {
+        tracing::warn!(
+            event = "broker_socket_cleanup_failed",
+            error = %error_chain(error)
+        );
+    }
+    if drained.storage_gc_timed_out {
+        return Err(BrokerdError::StorageGcShutdownTimeout);
+    }
+    drained.broker?;
+    if drained.web_timed_out {
         return Err(BrokerdError::WebUiShutdownTimeout);
     }
     if let Some(result) = web_result {
@@ -355,7 +403,106 @@ where
         audit_records = records,
         audit_head = head.as_deref().unwrap_or("none")
     );
+    cleanup?;
     Ok(AuditCheckpoint { records, head })
+}
+
+/// What one bounded shutdown produced.
+struct DrainReport {
+    /// The Unix listener's own verdict, including its internally bounded drain.
+    broker: Result<(), ServerError>,
+    /// Whether a started blocking provider-storage GC pass outlived the grace.
+    storage_gc_timed_out: bool,
+    /// The informational HTTP server's verdict, absent when it was not draining here.
+    web: Option<Result<(), dekopon_webui::WebUiError>>,
+    /// Whether open informational HTTP connections outlived the grace.
+    web_timed_out: bool,
+}
+
+/// Drains every stopped listener concurrently against one shared deadline.
+///
+/// The deadline is shared rather than restarted per drain, and that is the whole point. Both
+/// listeners have already stopped accepting and no drain waits on another, so draining them in
+/// sequence — each under its own full `shutdownGrace` — let the process take two or three graces
+/// to exit, while the pod's `terminationGracePeriodSeconds` and this service's own configuration
+/// rule ("shutdown grace must cover one host deadline plus two frame deadlines") each describe
+/// exactly one. Overshooting that budget is a SIGKILL, and the broker takes it mid-drain.
+async fn drain_services<B, G, W>(
+    deadline: tokio::time::Instant,
+    broker: B,
+    storage_gc: G,
+    web: Option<W>,
+) -> DrainReport
+where
+    B: Future<Output = Result<(), ServerError>>,
+    G: Future<Output = ()>,
+    W: Future<Output = Result<(), dekopon_webui::WebUiError>>,
+{
+    let web = async {
+        match web {
+            Some(web) => Some(tokio::time::timeout_at(deadline, web).await),
+            None => None,
+        }
+    };
+    let (broker, storage_gc, web) =
+        tokio::join!(broker, tokio::time::timeout_at(deadline, storage_gc), web);
+    DrainReport {
+        broker,
+        storage_gc_timed_out: storage_gc.is_err(),
+        web_timed_out: matches!(web, Some(Err(_))),
+        web: match web {
+            Some(Ok(result)) => Some(result),
+            Some(Err(_)) | None => None,
+        },
+    }
+}
+
+/// Renders an error and its sources as one `a: b: c` line.
+///
+/// Every failure this service logs is a wrapper whose own message names the layer rather than the
+/// cause: `ConnectionError::Broker` says "broker failed", and the errno that says why is two
+/// levels down. The chain is the diagnosable part.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
+}
+
+async fn storage_gc_loop(
+    host: Option<dekopon_storage_host::StorageHost>,
+    interval: Option<Duration>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let (Some(host), Some(interval)) = (host, interval) else {
+        wait_for_shutdown(shutdown).await;
+        return;
+    };
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {
+                let host = host.clone();
+                match tokio::task::spawn_blocking(move || host.gc_once()).await {
+                    Ok(Ok(report)) => tracing::debug!(
+                        event = "broker_storage_gc_completed",
+                        namespace.count = report.namespaces_removed,
+                        storage.byte_bucket = if report.bytes_removed == 0 { 0 } else { 64 - report.bytes_removed.leading_zeros() },
+                    ),
+                    Ok(Err(_)) | Err(_) => tracing::warn!(
+                        event = "broker_storage_gc_failed",
+                        category = "storage",
+                    ),
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
@@ -400,18 +547,41 @@ fn validate_capability_responses<A: AuditLog>(
         // Command words ride in this response, so they count toward the frame bound. Leaving them
         // out would let a provider directory with a large vocabulary pass startup and then fail to
         // serve the very first session.
-        let response = ResponseEnvelope::capabilities(
-            broker.capabilities(&peer.context),
-            broker.command_words(&peer.context),
-        );
-        let length = serde_json::to_vec(&response)
-            .map_err(|source| BrokerdError::CapabilityResponse { source })?
-            .len();
+        let (capabilities, command_words) = broker.capability_view(&peer.context);
+        let response = ResponseEnvelope::capabilities(capabilities, command_words);
+        let length = encoded_capability_response(&response)?;
         if length > maximum {
             return Err(BrokerdError::CapabilityResponseTooLarge { length, maximum });
         }
     }
+    // The peers above are the *direct* callers, and in a gateway deployment they are the ones
+    // granted almost nothing. Every chat session is answered through `capabilitiesFor` or
+    // `capabilitiesForChat` under an attested context built from an identity mapping, whose Cedar
+    // grants are the real, larger capability sets — so checking peers alone checks the one path
+    // that never carries the big response, and the oversized one still fails `write_frame` on
+    // every session open. That is exactly the failure this check exists to move to startup.
+    //
+    // Those contexts cannot be enumerated here: the agent catalog belongs to the gateway and
+    // production policy conditions on `context.agent`, so a representative agent would measure a
+    // surface no session receives. The broker bounds them instead, and a ceiling that fits proves
+    // every session's answer fits.
+    let (capabilities, command_words) = broker.capability_ceiling();
+    let response = ResponseEnvelope::chat_capabilities(
+        capabilities,
+        command_words,
+        broker.chat_memory_ceiling(),
+    );
+    let length = encoded_capability_response(&response)?;
+    if length > maximum {
+        return Err(BrokerdError::CapabilityCeilingTooLarge { length, maximum });
+    }
     Ok(())
+}
+
+fn encoded_capability_response(response: &ResponseEnvelope) -> Result<usize, BrokerdError> {
+    Ok(serde_json::to_vec(response)
+        .map_err(|source| BrokerdError::CapabilityResponse { source })?
+        .len())
 }
 
 fn validate_manifest_metadata(
@@ -454,6 +624,12 @@ pub enum BrokerdError {
     /// Durable checkpoint could not be locked, verified, reconciled, or synchronized.
     #[error("broker audit checkpoint is unavailable")]
     Checkpoint(#[source] CheckpointError),
+    /// Provider storage root/key/recovery could not start.
+    #[error("broker provider storage could not start")]
+    Storage(#[source] dekopon_storage_host::StorageHostError),
+    /// A blocking provider-storage GC pass did not drain inside shutdown grace.
+    #[error("broker provider storage GC did not stop inside shutdown grace")]
+    StorageGcShutdownTimeout,
     /// Provider components could not be validated and compiled.
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),
@@ -483,6 +659,16 @@ pub enum BrokerdError {
     #[error("broker capability response is {length} bytes; frame maximum is {maximum}")]
     CapabilityResponseTooLarge {
         /// Encoded response length.
+        length: usize,
+        /// Configured frame maximum.
+        maximum: usize,
+    },
+    /// The widest capability response an attested session could receive exceeded the frame.
+    #[error(
+        "broker could answer a session with a {length}-byte capability response; frame maximum is {maximum}"
+    )]
+    CapabilityCeilingTooLarge {
+        /// Encoded length of the widest possible response.
         length: usize,
         /// Configured frame maximum.
         maximum: usize,

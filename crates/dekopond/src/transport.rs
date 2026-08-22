@@ -7,7 +7,9 @@
 
 use std::{sync::Arc, time::Duration};
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
+use dekopon_model::image::GeneratedImage;
 
 use crate::asset::{AssetSourceRef, PendingAsset};
 use futures_util::future::BoxFuture;
@@ -17,6 +19,7 @@ pub(crate) mod discord;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod whatsapp;
 
 /// Inbound chat text is bounded before prompting, because a chat service's own message ceiling is
 /// not a bound this daemon chose.
@@ -29,12 +32,15 @@ pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 ///
 /// Redelivery is already rejected before one of these is built, inside the transport that knows what
 /// a redelivery looks like: Slack's `Dedup` ring keyed on `channel:ts`, Discord's on the message
-/// snowflake, and Telegram's advancing `offset`, which is the acknowledgment. Nothing downstream
-/// carries a service-native message identifier, because nothing downstream decides that question.
+/// snowflake, WhatsApp's bounded claim set on the `wamid`, and Telegram's advancing `offset`, which
+/// is the acknowledgment. [`Self::message_id`] therefore exists for the delivered-turn attestation
+/// rather than for that question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InboundMessage {
     /// The configured transport name this arrived on.
     pub transport: String,
+    /// Transport family that authenticated this message.
+    pub transport_kind: ChatTransportKind,
     /// The sender, taken from the authenticated transport payload and nowhere else.
     pub subject: ExternalSubject,
     /// Service-native conversation identifier.
@@ -57,6 +63,14 @@ pub(crate) struct InboundMessage {
     /// `(transport, channel, thread)` and is unchanged; this identity exists for per-conversation
     /// state that has to survive across turns.
     pub conversation_id: String,
+    /// Service-native message identifier of the turn being answered.
+    ///
+    /// Read by [`crate::session::delivery_identity`], which is the only downstream consumer: it
+    /// turns this into the typed [`dekopon_broker_protocol::DeliveryIdentity`] the broker checks
+    /// against the separately attested chat scope, so a Slack timestamp cannot be replayed as a
+    /// Discord snowflake. Redelivery rejection is *not* what this is for — each transport does that
+    /// itself, before building the message.
+    pub message_id: String,
     /// Untrusted message text, already bounded to [`MAX_INBOUND_TEXT_BYTES`].
     ///
     /// The sender's own words only. The reference lines naming attachments are appended by the
@@ -70,10 +84,18 @@ pub(crate) struct InboundMessage {
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
-    /// text cannot override the authenticated structure. Other transports use `None` and the
-    /// routing loop applies their identifier/handle syntax through
+    /// text cannot override the authenticated structure. Slack supplies the authenticated
+    /// `app_mention` event type (with mention syntax as a defensive fallback). Other transports
+    /// use `None` and the routing loop applies their identifier/handle syntax through
     /// [`TransportIdentity::is_addressed`]. Direct messages ignore this field.
     pub addressed: Option<bool>,
+    /// Slack Agent thread ownership carried from authenticated transport state.
+    ///
+    /// An explicitly addressed message proposes a claim that the session records only after fresh
+    /// broker authorization. `inherited` is true only when the same authenticated sender later
+    /// speaks in that exact claimed thread without mentioning the bot. No model text can create or
+    /// select this state.
+    pub thread_continuation: Option<ThreadContinuation>,
     /// Whatever the transport needs to answer this message.
     pub reply: ReplyTarget,
     /// Authenticated service-native coordinates for best-effort in-flight activity.
@@ -98,6 +120,25 @@ pub(crate) struct SessionStop {
     pub transport: String,
     pub conversation_id: String,
     pub subject: ExternalSubject,
+}
+
+/// One authenticated service-native thread claim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ThreadClaim {
+    Slack {
+        team_id: String,
+        channel_id: String,
+        thread_ts: String,
+        user_id: String,
+    },
+}
+
+/// How one Slack Agent channel message entered routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadContinuation {
+    pub claim: ThreadClaim,
+    /// `true` only when a prior freshly authorized message claimed this exact sender/thread.
+    pub inherited: bool,
 }
 
 /// Service-native destination for transient in-flight activity.
@@ -143,8 +184,13 @@ pub(crate) enum ReplyTarget {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
     },
+    WhatsApp {
+        recipient: String,
+    },
     /// The development transport answers on the connection the request arrived on.
-    Local { connection: u64 },
+    Local {
+        connection: u64,
+    },
 }
 
 /// Who the bot is on one service, resolved at connect time for self-filtering and @-mentions.
@@ -221,6 +267,24 @@ pub(crate) trait ChatTransport: Send {
     fn activity(&self) -> Option<Arc<dyn ChatActivity>> {
         None
     }
+
+    /// Bounded transport-owned registry for authenticated thread continuation.
+    ///
+    /// Defaulted to absent because only Slack's Agent experience currently owns threaded channel
+    /// sessions. A claim is made by the session after fresh authorization, never by the transport
+    /// reader merely seeing an event.
+    fn thread_ownership(&self) -> Option<Arc<dyn ThreadOwnership>> {
+        None
+    }
+}
+
+/// Transport-owned, authorization-fed thread continuation state.
+///
+/// The transport reader consults this state to distinguish one sender's claimed Agent thread from
+/// ambient channel history. The session mutates it only after a fresh broker answer.
+pub(crate) trait ThreadOwnership: Send + Sync {
+    fn claim(&self, claim: ThreadClaim);
+    fn revoke(&self, claim: &ThreadClaim);
 }
 
 /// Transport-owned renderer for the service's native in-flight activity.
@@ -242,10 +306,65 @@ pub(crate) trait ChatActivity: Send + Sync {
     fn refresh_interval(&self) -> Option<Duration>;
 }
 
+/// One complete terminal chat reply.
+///
+/// Text and generated bytes travel as separate typed fields. The image's own `Debug` is
+/// metadata-only, so formatting this value cannot place PNG bytes in a log.
+#[derive(Debug)]
+pub(crate) struct OutboundReply {
+    pub text: String,
+    pub image: Option<GeneratedImage>,
+}
+
+impl OutboundReply {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            image: None,
+        }
+    }
+
+    pub(crate) fn with_image(text: impl Into<String>, image: GeneratedImage) -> Self {
+        Self {
+            text: text.into(),
+            image: Some(image),
+        }
+    }
+}
+
 /// The answering half of a transport, shared by every in-flight session on it.
 pub(crate) trait ChatReplier: Send + Sync {
-    fn reply(&self, target: ReplyTarget, text: String)
-    -> BoxFuture<'_, Result<(), TransportError>>;
+    fn reply(
+        &self,
+        target: ReplyTarget,
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>>;
+}
+
+/// Opaque proof that one complete bounded answer reached service/kernel transport acceptance.
+///
+/// It is intentionally non-serializable and fully redacted. It does not claim human receipt.
+pub(crate) struct DeliveryReceipt {
+    acceptance: String,
+}
+
+impl DeliveryReceipt {
+    pub(crate) fn new(acceptance: impl Into<String>) -> Self {
+        Self {
+            acceptance: acceptance.into(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn accepted(&self) -> bool {
+        !self.acceptance.is_empty()
+    }
+}
+
+impl std::fmt::Debug for DeliveryReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeliveryReceipt([REDACTED])")
+    }
 }
 
 /// Resolves an attachment reference back into the bytes a model can look at.
@@ -273,6 +392,8 @@ pub(crate) trait AssetFetcher: Send + Sync {
 pub enum TransportError {
     #[error("transport credential environment variable {name} is not set")]
     MissingCredential { name: String },
+    #[error("transport credential environment variable {name} is set to an empty value")]
+    EmptyCredential { name: String },
     #[error("transport credential environment variable {name} is not UTF-8")]
     NonUtf8Credential { name: String },
     #[error("chat service request failed")]
@@ -281,6 +402,8 @@ pub enum TransportError {
     Service { code: String },
     #[error("chat service response was not the expected shape")]
     Response,
+    #[error("chat service accepted only part of a split answer")]
+    PartialDelivery,
     #[error("chat socket closed")]
     Closed,
     #[error("transport input/output failed")]
@@ -296,10 +419,12 @@ impl TransportError {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::MissingCredential { .. } => "missing-credential",
+            Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::Response => "response",
+            Self::PartialDelivery => "partial-delivery",
             Self::Closed => "closed",
             Self::Io(_) => "io",
             Self::InsecureSocket { .. } => "insecure-socket",
@@ -313,11 +438,27 @@ pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
     let value = std::env::var_os(name).ok_or_else(|| TransportError::MissingCredential {
         name: name.to_owned(),
     })?;
-    value
+    let value = value
         .into_string()
         .map_err(|_| TransportError::NonUtf8Credential {
             name: name.to_owned(),
-        })
+        })?;
+    credential_value(name, value)
+}
+
+/// Rejects an exported-but-empty credential, which is a misconfiguration rather than a secret.
+///
+/// A blank value is not a weak token, it is the absence of one presented as presence: an empty HMAC
+/// key verifies signatures anybody can compute, and an empty bearer token is still sent as a header.
+/// One definition here rather than per transport, because every transport reads its credentials
+/// through [`read_credential`].
+pub(crate) fn credential_value(name: &str, value: String) -> Result<String, TransportError> {
+    if value.trim().is_empty() {
+        return Err(TransportError::EmptyCredential {
+            name: name.to_owned(),
+        });
+    }
+    Ok(value)
 }
 
 /// Bounds untrusted inbound text, keeping the head and saying so.

@@ -19,7 +19,7 @@ set -euo pipefail
 chart_dir=$(cd "$(dirname "$0")/.." && pwd)
 values="$chart_dir/values-pr-summarizer-linter.yaml"
 work=$(mktemp -d)
-trap 'rm -rf "$work"; docker volume rm -f dkv-src dkv-etc dkv-run dkv-state >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf "$work"; docker volume rm -f dkv-src dkv-etc dkv-run dkv-state dkv-storage dkv-storage-key >/dev/null 2>&1 || true' EXIT
 
 platform=${PLATFORM:-linux/arm64}
 busybox=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
@@ -54,7 +54,9 @@ run_init() {
   docker run --rm --platform "$platform" \
     --user 0:0 --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER \
     --security-opt=no-new-privileges --read-only \
-    -v dkv-src:/dekopon-source:ro -v dkv-etc:/etc/dekopon -v dkv-run:/run/dekopon -v dkv-state:/var/lib/dekopon \
+    -v dkv-src:/dekopon-source:ro -v dkv-src:/dekopon-storage-key-source:ro \
+    -v dkv-etc:/etc/dekopon -v dkv-run:/run/dekopon -v dkv-state:/var/lib/dekopon \
+    -v dkv-storage:/var/lib/dekopon-provider-storage -v dkv-storage-key:/etc/dekopon-storage-key \
     "$busybox" /bin/sh -c "$(cat "$1")"
 }
 
@@ -65,8 +67,9 @@ on_state() {
 }
 
 reset_mounts() {
-  docker run --rm --platform "$platform" -v dkv-etc:/a -v dkv-run:/b -v dkv-state:/c "$busybox" \
-    sh -c 'chmod 0777 /a /b /c; chown 0:0 /a /b /c'
+  docker run --rm --platform "$platform" -v dkv-etc:/a -v dkv-run:/b -v dkv-state:/c \
+    -v dkv-storage:/d -v dkv-storage-key:/e "$busybox" \
+    sh -c 'chmod 0777 /a /b /c /d /e; chown 0:0 /a /b /c /d /e'
 }
 
 credential_digest() {
@@ -84,7 +87,7 @@ assert_eq() {
   fi
 }
 
-for v in dkv-src dkv-etc dkv-run dkv-state; do
+for v in dkv-src dkv-etc dkv-run dkv-state dkv-storage dkv-storage-key; do
   docker volume rm -f "$v" >/dev/null 2>&1 || true
   docker volume create "$v" >/dev/null
 done
@@ -100,9 +103,10 @@ printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.ceda
 printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
 printf 'apiVersion: dekopon.dev/dekopond/v1alpha1\n' > "$stamp/dekopond.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
+printf 'apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$stamp/storage-key.yaml"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json; do
+for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json storage-key.yaml; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -289,4 +293,109 @@ assert_eq "reseed=true discarded the live credential and restored the seed" \
   "$after_reseed" "$source_digest"
 
 echo
-echo "OK: every tier satisfied by the rendered init container, and the credential is seeded once."
+echo "==> (h) provider storage: retained separate claim and broker-only copied key"
+render_init "$work/init-storage.sh" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key
+reset_mounts
+run_init "$work/init-storage.sh"
+key_perms=$(docker run --rm --platform "$platform" -v dkv-storage-key:/k "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%h:%F' /k/storage-key.yaml")
+assert_eq "provider namespace key permissions" "$key_perms" "65532:65532:600:1:regular file"
+root_perms=$(docker run --rm --platform "$platform" -v dkv-storage:/s "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%F' /s")
+assert_eq "provider storage root permissions" "$root_perms" "65532:65532:700:directory"
+# The same key survives a restart copy with identical bytes; provider data is never cleared.
+key_before=$(docker run --rm --platform "$platform" -v dkv-storage-key:/k "$busybox" \
+  sh -c 'sha256sum /k/storage-key.yaml | cut -d" " -f1')
+run_init "$work/init-storage.sh"
+key_after=$(docker run --rm --platform "$platform" -v dkv-storage-key:/k "$busybox" \
+  sh -c 'sha256sum /k/storage-key.yaml | cut -d" " -f1')
+assert_eq "provider namespace key restart copy is stable" "$key_after" "$key_before"
+
+# Valid gateway render must mount neither privileged storage volume.
+helm template dekopon "$chart_dir" -f "$values" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key > "$work/storage-render.yaml"
+python_check='import yaml,sys
+for d in yaml.safe_load_all(sys.stdin):
+  if not d or d.get("kind") != "Deployment": continue
+  containers=d["spec"]["template"]["spec"].get("containers",[])
+  gateway=next(c for c in containers if c["name"]=="gateway")
+  names={m["name"] for m in gateway.get("volumeMounts",[])}
+  assert "provider-storage" not in names and "provider-storage-key" not in names, names'
+if python3 -c 'import yaml' 2>/dev/null; then
+  python3 -c "$python_check" < "$work/storage-render.yaml"
+else
+  docker run --rm -i -e PROG="$python_check" "$python_image" \
+    sh -c 'pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1; exec python3 -c "$PROG"' \
+    < "$work/storage-render.yaml"
+fi
+echo "PASS gateway mounts neither provider storage nor namespace key"
+
+if helm template collision "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.existingClaim=shared \
+  --set state.existingClaim=shared >/dev/null 2>&1; then
+  echo "FAIL exact audit/provider storage claim collision rendered" >&2
+  exit 1
+fi
+echo "PASS exact audit/provider storage claim collision is rejected"
+
+if helm template overlap "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.keyDir=/etc/dekopon >/dev/null 2>&1; then
+  echo "FAIL provider namespace-key mount shadowed the copied configuration mount" >&2
+  exit 1
+fi
+echo "PASS provider storage mount paths cannot shadow chart-owned mounts"
+
+if helm template overlap-source "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.rootPath=/dekopon-source >/dev/null 2>&1; then
+  echo "FAIL provider storage root shadowed the projected configuration source" >&2
+  exit 1
+fi
+echo "PASS provider storage paths cannot shadow projected init sources"
+
+if helm template normalized-collision "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set-string 'paths.configDir=/etc//dekopon-storage-key' >/dev/null 2>&1; then
+  echo "FAIL a non-canonical chart path bypassed provider-storage mount collision checks" >&2
+  exit 1
+fi
+echo "PASS all chart paths reject repeated-slash aliases before collision comparison"
+
+if helm template packaged-provider-collision "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.rootPath=/opt/dekopon/optional-providers >/dev/null 2>&1; then
+  echo "FAIL provider storage shadowed the packaged optional memory provider" >&2
+  exit 1
+fi
+echo "PASS provider storage cannot shadow image-owned provider directories"
+
+if helm template dot-key "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set providerStorage.keyFileName=.. >/dev/null 2>&1; then
+  echo "FAIL provider namespace-key destination accepted a parent segment" >&2
+  exit 1
+fi
+echo "PASS provider storage key names reject dot segments"
+
+if helm template unsafe-storage-path "$chart_dir" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.existingKeySecret=dekopon-storage-key \
+  --set-string 'providerStorage.rootPath=/var/lib/bad;touch-bad' >/dev/null 2>&1; then
+  echo "FAIL provider storage root accepted shell-active path text" >&2
+  exit 1
+fi
+echo "PASS provider storage paths are safe shell and mount segments"
+
+echo
+echo "OK: every tier satisfied; ChatGPT is seed-once; provider storage/key are retained, separate, and broker-only."

@@ -6,7 +6,8 @@
 //!
 //! Patterns here are **literal strings with optional `^` and `$` anchors**, not regular
 //! expressions. That is a deliberate Phase 1 boundary: a regex engine is a large dependency and a
-//! large attack surface.
+//! large attack surface. An anchor escapes like anything else: `grep 'price\$'` searches for a
+//! literal dollar sign at the end of a token, not for lines ending in `price`.
 //!
 //! Because basic regexes need no flag, the most common regex a model writes — `grep "[0-9]"`,
 //! `sed "s/^ *//"` — is exactly the one a literal matcher would answer wrongly and silently. So the
@@ -17,6 +18,8 @@
 //! `.` is the documented exception: it is left literal rather than rejected, because a dot is far
 //! more often part of a hostname, filename, or JSON path than a wildcard, and reading it literally
 //! can only ever match *less* than the regex would — never something the script did not ask for.
+
+use std::borrow::Cow;
 
 use crate::builtins::CommandFailure;
 
@@ -73,6 +76,25 @@ pub(crate) fn literal_pattern(command: &str, pattern: &str) -> Result<String, Co
     Ok(literal)
 }
 
+/// Reports whether a trailing `$` is an end anchor rather than an escaped dollar sign.
+///
+/// Anchors are stripped before [`literal_pattern`] processes escapes, so this has to read the
+/// escape itself. `grep 'price\$'` — the standard way to search for a literal dollar at the end of
+/// a token — otherwise loses its `$` to the anchor and keeps the now-dangling `\` as literal text,
+/// silently matching lines ending in `price\`. An odd run of backslashes escapes the `$`; an even
+/// one leaves it as the anchor it looks like, with the backslashes escaping each other.
+pub(crate) fn ends_with_anchor(pattern: &str) -> bool {
+    if !pattern.ends_with('$') {
+        return false;
+    }
+    let escapes = pattern[..pattern.len() - 1]
+        .chars()
+        .rev()
+        .take_while(|character| *character == '\\')
+        .count();
+    escapes % 2 == 0
+}
+
 /// A literal pattern with optional `^`/`$` anchors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Pattern {
@@ -94,7 +116,7 @@ impl Pattern {
         if anchored_start {
             needle = &needle[1..];
         }
-        let anchored_end = needle.len() > 1 && needle.ends_with('$');
+        let anchored_end = needle.len() > 1 && ends_with_anchor(needle);
         if anchored_end {
             needle = &needle[..needle.len() - 1];
         }
@@ -112,12 +134,17 @@ impl Pattern {
     }
 
     /// Reports whether one line matches.
+    ///
+    /// The common path borrows. Only `-i` needs a new string, because only case folding changes the
+    /// bytes being compared; copying every line for the other three quarters of the matrix bought
+    /// nothing and made `grep` allocate once per line of its input.
     pub(crate) fn matches(&self, line: &str) -> bool {
         let candidate = if self.ignore_case {
-            line.to_lowercase()
+            Cow::Owned(line.to_lowercase())
         } else {
-            line.to_owned()
+            Cow::Borrowed(line)
         };
+        let candidate: &str = &candidate;
         match (self.anchored_start, self.anchored_end) {
             (true, true) => candidate == self.needle,
             (true, false) => candidate.starts_with(&self.needle),
@@ -162,6 +189,22 @@ mod tests {
     fn a_lone_dollar_stays_literal() {
         // `$` alone is a plausible literal search term, so it is not treated as an empty anchor.
         assert!(compile("$", false).matches("cost: $5"));
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_a_literal_rather_than_an_anchor() {
+        // `grep 'price\$'` is how a script searches for a literal dollar sign. Reading the `$` as
+        // an anchor left the dangling `\` as literal text, so the pattern matched lines ending in
+        // `price\` — a silently wrong match, which is the one thing this module promises cannot
+        // happen.
+        let pattern = compile(r"price\$", false);
+        assert!(pattern.matches("total price$ here"));
+        assert!(!pattern.matches(r"total price\"));
+
+        // An even run of backslashes escapes itself, so the `$` stays the anchor it looks like.
+        let anchored = compile(r"price\\$", false);
+        assert!(anchored.matches(r"total price\"));
+        assert!(!anchored.matches("total price$ here"));
     }
 
     #[test]

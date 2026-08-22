@@ -233,6 +233,14 @@ impl AuditLog for CheckpointedAuditLog {
             .write(records, Some(&record.record_hash))
             .await
         {
+            // Poisoning is terminal for this process: every later append refuses until restart.
+            // The audit record it wraps is already durable, so this line is the only account of
+            // why the broker stopped being able to authorize anything.
+            tracing::error!(
+                event = "broker_checkpoint_poisoned",
+                audit_records = records,
+                error = %crate::error_chain(&error)
+            );
             state.poisoned = true;
             return Err(AuditError::Io {
                 source: io::Error::other(error),
@@ -253,16 +261,23 @@ pub async fn reconcile(
         None => return Err(CheckpointError::MissingForNonEmptyAudit),
         Some(stored) => {
             let records = stored.records()?;
+            // The size of the gap is classified before the hash is compared. An audit log can be
+            // at most one append ahead of its checkpoint, and it retains exactly that window, so
+            // a checkpoint further behind is a gap rather than a prefix anything could confirm —
+            // and an operator needs to be told which of the two it is.
+            if records != current.0 && records.checked_add(1) != Some(current.0) {
+                if records > current.0 {
+                    return Err(CheckpointError::AuditMismatch);
+                }
+                return Err(CheckpointError::AuditAheadByMultiple {
+                    checkpoint_records: records,
+                    audit_records: current.0,
+                });
+            }
             if !audit.contains_checkpoint(records, stored.head()).await {
                 return Err(CheckpointError::AuditMismatch);
             }
             if records != current.0 || stored.head() != current.1.as_deref() {
-                if records.checked_add(1) != Some(current.0) {
-                    return Err(CheckpointError::AuditAheadByMultiple {
-                        checkpoint_records: records,
-                        audit_records: current.0,
-                    });
-                }
                 store.write(current.0, current.1.as_deref()).await?;
             }
         }
@@ -430,30 +445,36 @@ mod tests {
             trace: "trace-checkpoint"
                 .parse::<TraceId>()
                 .expect("valid trace fixture"),
-            principal: "caller"
-                .parse::<PrincipalId>()
-                .expect("valid principal fixture"),
-            actor: Actor::Agent {
+            principal: Some(
+                "caller"
+                    .parse::<PrincipalId>()
+                    .expect("valid principal fixture"),
+            ),
+            actor: Some(Actor::Agent {
                 agent: "checkpoint-test"
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
-            },
+            }),
             via: None,
             attested_subject: None,
             capability: "echo.echo"
                 .parse::<CapabilityId>()
                 .expect("valid capability fixture"),
             provider: None,
-            authorized_by: "broker"
-                .parse::<PrincipalId>()
-                .expect("valid principal fixture"),
+            authorized_by: Some(
+                "broker"
+                    .parse::<PrincipalId>()
+                    .expect("valid principal fixture"),
+            ),
             decision_id: format!("decision-{invocation}"),
-            policy_revision: "policy-checkpoint".to_owned(),
+            policy_revision: Some("policy-checkpoint".to_owned()),
             policy_ids: Vec::new(),
             policy_digest: None,
             allowed: false,
             reason: Some("policy-denied".to_owned()),
             decision_digest: format!("sha256:{}", "a".repeat(64)),
+            storage_scope_commitment: None,
+            storage: None,
         }
     }
 
@@ -687,6 +708,15 @@ mod tests {
                 checkpoint_records: 0,
                 audit_records: 2
             })
+        ));
+
+        // A checkpoint claiming more records than the audit holds is the other direction: the
+        // audit lost records, which is a mismatch rather than a checkpoint that fell behind.
+        let ahead = StoredCheckpoint::new(5, Some(&format!("sha256:{}", "c".repeat(64))))
+            .expect("well-formed ahead checkpoint");
+        assert!(matches!(
+            reconcile(&audit, &gap_store, Some(&ahead)).await,
+            Err(CheckpointError::AuditMismatch)
         ));
     }
 

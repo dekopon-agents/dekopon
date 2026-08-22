@@ -13,7 +13,9 @@ use std::{
     time::Duration,
 };
 
+use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
@@ -24,8 +26,8 @@ use crate::{
     config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        InboundMessage, ReplyTarget, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, floor_boundary, split_message,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
     },
 };
 
@@ -514,14 +516,17 @@ impl DiscordTransport {
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
+            transport_kind: ChatTransportKind::Discord,
             subject: ExternalSubject::discord(user_id).map_err(TransportError::Subject)?,
             channel: channel_id.to_owned(),
             thread: None,
             conversation_id: channel_id.to_owned(),
+            message_id: message_id.to_owned(),
             text,
             assets,
             conversation,
             addressed: Some(addressed),
+            thread_continuation: None,
             reply: ReplyTarget::Discord {
                 channel_id: channel_id.to_owned(),
                 reply_to: (!direct).then(|| message_id.to_owned()),
@@ -645,8 +650,8 @@ impl ChatReplier for DiscordReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        reply: OutboundReply,
+    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Discord {
                 channel_id,
@@ -659,6 +664,9 @@ impl ChatReplier for DiscordReplier {
             {
                 return Err(TransportError::Response);
             }
+            let OutboundReply { text, mut image } = reply;
+            let mut accepted = 0_usize;
+            let mut last_id = None;
             // The REST lock is taken per request rather than per reply. One answer's chunks still
             // arrive in order because this loop awaits each one, and no second answer can be
             // posting into the same conversation at the same time — admission control serializes a
@@ -685,9 +693,25 @@ impl ChatReplier for DiscordReplier {
                         "fail_if_not_exists": false,
                     });
                 }
-                self.create_message(&channel_id, &body).await?;
+                let result = match image.take() {
+                    Some(image) => {
+                        self.create_message_with_image(&channel_id, &body, image)
+                            .await
+                    }
+                    None => self.create_message(&channel_id, &body).await,
+                };
+                match result {
+                    Ok(id) => {
+                        accepted += 1;
+                        last_id = Some(id);
+                    }
+                    Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                    Err(error) => return Err(error),
+                }
             }
-            Ok(())
+            Ok(DeliveryReceipt::new(
+                last_id.ok_or(TransportError::Response)?,
+            ))
         })
     }
 }
@@ -772,7 +796,11 @@ impl ChatActivity for DiscordReplier {
 }
 
 impl DiscordReplier {
-    async fn create_message(&self, channel_id: &str, body: &Value) -> Result<(), TransportError> {
+    async fn create_message(
+        &self,
+        channel_id: &str,
+        body: &Value,
+    ) -> Result<String, TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
@@ -801,28 +829,129 @@ impl DiscordReplier {
                     });
                 }
                 // The wait itself happens in `post_message`, outside the REST lock.
-                *self
-                    .rest_cooldown_until
-                    .lock()
-                    .expect("Discord REST cooldown") =
-                    Some(Instant::now() + Duration::from_secs_f64(seconds));
+                self.publish_rest_cooldown(seconds);
                 retried = true;
                 continue;
             }
-            decode(response).await.map(|_| ())?;
-            return Ok(());
+            let response = decode(response).await?;
+            let response_id = response["id"].as_str().ok_or(TransportError::Response)?;
+            let response_channel = response["channel_id"]
+                .as_str()
+                .ok_or(TransportError::Response)?;
+            if !is_snowflake(response_id) || response_channel != channel_id {
+                return Err(TransportError::Response);
+            }
+            return Ok(response_id.to_owned());
         }
     }
 
-    /// Sends one Create Message, serialized against this transport's other REST calls.
-    ///
-    /// The lock covers the request and nothing else. Any rate-limit wait is served *before* it is
-    /// taken, so a throttled reply holds up neither another session's answer nor a mid-prompt
-    /// attachment refresh.
+    async fn create_message_with_image(
+        &self,
+        channel_id: &str,
+        body: &Value,
+        image: GeneratedImage,
+    ) -> Result<String, TransportError> {
+        let url = format!(
+            "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
+            self.endpoint
+        );
+        let filename = image.filename().to_owned();
+        let media_type = image.media_type().to_owned();
+        let bytes = image.into_bytes();
+        let mut payload = body.clone();
+        payload["attachments"] = json!([{
+            "id": 0,
+            "filename": filename,
+            "description": "Generated image",
+        }]);
+        let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
+        let mut retried = false;
+        loop {
+            let part = reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name(filename.clone())
+                .mime_str(&media_type)
+                .map_err(|_| TransportError::Response)?;
+            let form = reqwest::multipart::Form::new()
+                .text("payload_json", payload.clone())
+                .part("files[0]", part);
+            // An attachment goes out through the same lock discipline as a text chunk: it is one
+            // more Create Message against the same route, and a reply that posts an image is
+            // exactly the reply most worth not holding a shared lock through.
+            let response = self
+                .send_rest(
+                    self.http
+                        .post(&url)
+                        .header("authorization", format!("Bot {}", self.token.expose()))
+                        .multipart(form),
+                )
+                .await?;
+            if response.status().as_u16() == 429 {
+                let response_bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                let body = serde_json::from_slice::<Value>(&response_bytes)
+                    .map_err(|_| TransportError::Response)?;
+                let seconds = body["retry_after"]
+                    .as_f64()
+                    .ok_or(TransportError::Response)?;
+                if retried
+                    || !seconds.is_finite()
+                    || seconds < 0.0
+                    || seconds > MAX_RATE_LIMIT_WAIT.as_secs_f64()
+                {
+                    return Err(TransportError::Service {
+                        code: "http-429".to_owned(),
+                    });
+                }
+                // The wait itself happens in `send_rest`, outside the REST lock.
+                self.publish_rest_cooldown(seconds);
+                retried = true;
+                continue;
+            }
+            let response = decode(response).await?;
+            let response_id = response["id"].as_str().ok_or(TransportError::Response)?;
+            let response_channel = response["channel_id"]
+                .as_str()
+                .ok_or(TransportError::Response)?;
+            let accepted_image = response["attachments"]
+                .as_array()
+                .is_some_and(|attachments| {
+                    attachments.len() == 1
+                        && attachments[0]["id"].as_str().is_some_and(is_snowflake)
+                        && attachments[0]["filename"].as_str() == Some(filename.as_str())
+                });
+            if !is_snowflake(response_id) || response_channel != channel_id || !accepted_image {
+                return Err(TransportError::Response);
+            }
+            return Ok(response_id.to_owned());
+        }
+    }
+
+    /// Sends one JSON Create Message, serialized against this transport's other REST calls.
     async fn post_message(
         &self,
         url: &str,
         encoded: &[u8],
+    ) -> Result<reqwest::Response, TransportError> {
+        self.send_rest(
+            self.http
+                .post(url)
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .header("content-type", "application/json")
+                .body(encoded.to_vec()),
+        )
+        .await
+    }
+
+    /// Sends one prepared REST request, serialized against this transport's other REST calls.
+    ///
+    /// The lock covers the request and nothing else. Any rate-limit wait is served *before* it is
+    /// taken, so a throttled reply holds up neither another session's answer nor a mid-prompt
+    /// attachment refresh.
+    async fn send_rest(
+        &self,
+        request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, TransportError> {
         // Bounded rather than a wait loop: at most one deadline is outstanding when the call
         // arrives, and at most one more can be published while it queues on the lock. Past that it
@@ -835,14 +964,19 @@ impl DiscordReplier {
             tokio::time::sleep(wait).await;
         }
         let _guard = self.rest_lock.lock().await;
-        self.http
-            .post(url)
-            .header("authorization", format!("Bot {}", self.token.expose()))
-            .header("content-type", "application/json")
-            .body(encoded.to_vec())
+        request
             .send()
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))
+    }
+
+    /// Publishes Discord's own retry deadline so every later request waits it out before the lock.
+    fn publish_rest_cooldown(&self, seconds: f64) {
+        *self
+            .rest_cooldown_until
+            .lock()
+            .expect("Discord REST cooldown") =
+            Some(Instant::now() + Duration::from_secs_f64(seconds));
     }
 
     /// How long Discord's last 429 still asks Create Message to wait, if at all.

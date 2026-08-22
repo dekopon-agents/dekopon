@@ -5,7 +5,7 @@ use dekopon_broker_host::{
 };
 use dekopon_broker_protocol::{Permission, ReportedAgent, ReportedAgentCapability};
 
-use crate::{Dashboard, OtelSummary};
+use crate::{Dashboard, OtelSummary, ProviderPage};
 
 const CSS: &str = r#"
 :root{color-scheme:light dark;--bg:#f7f7f8;--panel:#fff;--text:#202124;--muted:#62676f;--border:#d8dce2;--link:#0969da;--code:#f1f3f5;--accent:#6f42c1;--good:#1a7f37;--warn:#9a6700}
@@ -17,7 +17,9 @@ pub(crate) fn dashboard(dashboard: &Dashboard) -> String {
     let (inventory, inventory_reports) = dashboard.service_status.agents();
     let tokens = dashboard.service_status.tokens();
     let host = dashboard.host_metrics.snapshot();
-    let mut content = String::new();
+    // Sections are written straight into the finished page rather than into a second buffer the
+    // page then copies: this body is the largest allocation the crate makes per request.
+    let mut content = begin_page(&dashboard.version, "Dekopon service", dashboard_nav());
     write!(
         content,
         "<h1>Dekopon service</h1><p class=muted>Live, read-only broker view. Counters reset when this broker process restarts.</p>"
@@ -78,7 +80,7 @@ pub(crate) fn dashboard(dashboard: &Dashboard) -> String {
 
     content.push_str("<section id=providers><h2>Providers</h2><p class=muted>Validated manifests returned by components compiled into this broker.</p>");
     content.push_str("<div class=table-wrap><table><thead><tr><th>Provider</th><th>Description</th><th>Capabilities</th><th>Artifact</th></tr></thead><tbody>");
-    for provider in dashboard.providers.iter() {
+    for provider in dashboard.providers.iter().map(ProviderPage::metadata) {
         write!(
             content,
             "<tr><td><a class=mono href=\"/ui/providers/{}\">{}</a></td><td>{}</td><td>{}</td><td><span class=mono>{}</span><br><span class=muted>{}</span></td></tr>",
@@ -95,11 +97,33 @@ pub(crate) fn dashboard(dashboard: &Dashboard) -> String {
 
     render_wasmtime(&mut content, &host);
     render_otel(&mut content, dashboard.otel.as_ref());
-    page(dashboard, "Dekopon service", &content, dashboard_nav())
+    finish_page(&mut content);
+    content
 }
 
-pub(crate) fn provider(dashboard: &Dashboard, provider: &LoadedProviderMetadata) -> String {
-    let mut content = String::new();
+/// Renders one provider's complete page.
+///
+/// Every input is fixed at broker startup, so `Dashboard::new` calls this once per provider and
+/// serves the bytes afterwards; nothing on this page is live.
+pub(crate) fn provider_page(version: &str, provider: &LoadedProviderMetadata) -> String {
+    let mut nav = String::from(
+        "<h3>Provider</h3><a href=#artifact>Artifact</a><a href=#interface>Component interface</a><a href=#capabilities>Capabilities</a><a href=#manifest>Complete manifest</a><h3>Capabilities</h3>",
+    );
+    for capability in &provider.manifest.capabilities {
+        write!(
+            nav,
+            "<a href=\"#cap-{}\"><code>{}</code></a>",
+            escape(capability.id.as_str()),
+            escape(capability.id.as_str())
+        )
+        .expect("writing to a String cannot fail");
+    }
+
+    let mut content = begin_page(
+        version,
+        &format!("{} · Dekopon", provider.manifest.id),
+        &nav,
+    );
     write!(
         content,
         "<p><a href=/ui>← Service overview</a></p><h1><span class=mono>{}</span></h1><p>{}</p>",
@@ -131,7 +155,9 @@ pub(crate) fn provider(dashboard: &Dashboard, provider: &LoadedProviderMetadata)
     definition(
         &mut content,
         "Manifest API",
-        &format!("<code>{:?}</code>", provider.manifest.api_version),
+        // The serde spelling, not the Rust variant name: the complete manifest lower on this same
+        // page prints the wire value, and two identifiers for one field is an operator trap.
+        &format!("<code>{}</code>", escape(&api_version(provider))),
     );
     definition(
         &mut content,
@@ -162,32 +188,27 @@ pub(crate) fn provider(dashboard: &Dashboard, provider: &LoadedProviderMetadata)
     content.push_str(&escape(&manifest));
     content.push_str("</code></pre></section>");
 
-    let mut nav = String::from(
-        "<h3>Provider</h3><a href=#artifact>Artifact</a><a href=#interface>Component interface</a><a href=#capabilities>Capabilities</a><a href=#manifest>Complete manifest</a><h3>Capabilities</h3>",
-    );
-    for capability in &provider.manifest.capabilities {
-        write!(
-            nav,
-            "<a href=\"#cap-{}\"><code>{}</code></a>",
-            escape(capability.id.as_str()),
-            escape(capability.id.as_str())
-        )
-        .expect("writing to a String cannot fail");
-    }
-    page(
-        dashboard,
-        &format!("{} · Dekopon", provider.manifest.id),
-        &content,
-        &nav,
-    )
+    finish_page(&mut content);
+    content
 }
 
 pub(crate) fn not_found(dashboard: &Dashboard, message: &str) -> String {
-    let content = format!(
+    let mut content = begin_page(&dashboard.version, message, dashboard_nav());
+    write!(
+        content,
         "<h1>{}</h1><p>The requested informational page does not exist.</p><p><a href=/ui>Return to the service overview</a></p>",
         escape(message)
-    );
-    page(dashboard, message, &content, dashboard_nav())
+    )
+    .expect("writing to a String cannot fail");
+    finish_page(&mut content);
+    content
+}
+
+fn api_version(provider: &LoadedProviderMetadata) -> String {
+    serde_json::to_value(provider.manifest.api_version)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "<unknown manifest API version>".to_owned())
 }
 
 fn render_agent_row(output: &mut String, dashboard: &Dashboard, agent: &ReportedAgent) {
@@ -230,14 +251,19 @@ fn render_agent_capability(
         escape(capability.provider.as_str())
     )
     .expect("writing to a String cannot fail");
-    if !dashboard.providers.iter().any(|provider| {
-        provider.manifest.id == capability.provider
-            && provider
-                .manifest
-                .capabilities
-                .iter()
-                .any(|loaded| loaded.id == capability.id)
-    }) {
+    if !dashboard
+        .providers
+        .iter()
+        .map(ProviderPage::metadata)
+        .any(|provider| {
+            provider.manifest.id == capability.provider
+                && provider
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .any(|loaded| loaded.id == capability.id)
+        })
+    {
         output.push_str(" <span class=\"badge warn\">not loaded</span>");
     }
     if !capability.permissions.is_empty() {
@@ -260,6 +286,7 @@ fn agent_provider_badges(dashboard: &Dashboard, agent: &ReportedAgent) -> String
         let loaded = dashboard
             .providers
             .iter()
+            .map(ProviderPage::metadata)
             .any(|loaded| loaded.manifest.id == *provider);
         write!(
             output,
@@ -335,6 +362,16 @@ fn render_wasmtime(output: &mut String, stats: &BrokerHostStats) {
                 bytes(stats.http_response_bytes)
             ),
         ),
+        (
+            "Storage operations",
+            stats.storage_operations,
+            format!(
+                "{} invocations · {} syncs · {} quota denials",
+                number(stats.storage_invocations),
+                number(stats.storage_syncs),
+                number(stats.storage_quota_denials)
+            ),
+        ),
     ] {
         output.push_str(&metric_card(label, value, detail));
     }
@@ -350,8 +387,22 @@ fn render_wasmtime(output: &mut String, stats: &BrokerHostStats) {
         ("Invocations succeeded", stats.invocations_succeeded),
         ("Invocations failed", stats.invocations_failed),
         ("Invocations timed out", stats.invocations_timed_out),
-        ("Provider input bytes", stats.provider_input_bytes),
-        ("Provider output bytes", stats.provider_output_bytes),
+        (
+            "Provider input bytes (non-storage)",
+            stats.provider_input_bytes,
+        ),
+        (
+            "Provider output bytes (non-storage)",
+            stats.provider_output_bytes,
+        ),
+        (
+            "Storage read byte bucket max",
+            stats.storage_read_bucket_max,
+        ),
+        (
+            "Storage write byte bucket max",
+            stats.storage_write_bucket_max,
+        ),
         ("Memory growth requests", stats.memory_growth_requests),
         ("Memory growth denied", stats.memory_growth_denied),
         ("Memory growth failed", stats.memory_growth_failed),
@@ -381,7 +432,10 @@ fn render_wasmtime(output: &mut String, stats: &BrokerHostStats) {
         ("Async support", "enabled".to_owned()),
         ("Fuel consumption", "enabled".to_owned()),
         ("Fuel per store", number(stats.limits.fuel)),
-        ("Fuel yield interval", number(stats.limits.fuel.min(10_000))),
+        (
+            "Fuel yield interval",
+            number(stats.limits.fuel_yield_interval()),
+        ),
         (
             "Max memory per linear memory",
             bytes(u64::try_from(stats.limits.max_memory_bytes).unwrap_or(u64::MAX)),
@@ -569,6 +623,7 @@ fn provider_capability_count(dashboard: &Dashboard) -> u64 {
     dashboard
         .providers
         .iter()
+        .map(ProviderPage::metadata)
         .map(|provider| u64::try_from(provider.manifest.capabilities.len()).unwrap_or(u64::MAX))
         .fold(0, u64::saturating_add)
 }
@@ -597,14 +652,19 @@ fn dashboard_nav() -> &'static str {
     "<h3>Service</h3><a href=#agents>Agents</a><a href=#providers>Providers</a><a href=#wasmtime>Wasmtime</a><a href=#otel>OpenTelemetry</a>"
 }
 
-fn page(dashboard: &Dashboard, title: &str, content: &str, nav: &str) -> String {
+fn begin_page(version: &str, title: &str, nav: &str) -> String {
     format!(
-        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{CSS}</style></head><body><header><div class=top><a class=brand href=/ui>Dekopon</a><span class=version>brokerd {}</span></div></header><div class=layout><nav class=nav aria-label=Sections>{}</nav><main class=content>{}</main></div><footer>Unauthenticated informational view · no mutation or authorization endpoints · counters are process-local</footer></body></html>",
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{CSS}</style></head><body><header><div class=top><a class=brand href=/ui>Dekopon</a><span class=version>brokerd {}</span></div></header><div class=layout><nav class=nav aria-label=Sections>{}</nav><main class=content>",
         escape(title),
-        escape(&dashboard.version),
-        nav,
-        content
+        escape(version),
+        nav
     )
+}
+
+fn finish_page(output: &mut String) {
+    output.push_str(
+        "</main></div><footer>Unauthenticated informational view · no mutation or authorization endpoints · counters are process-local</footer></body></html>",
+    );
 }
 
 fn escape(value: &str) -> String {

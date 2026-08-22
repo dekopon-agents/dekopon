@@ -1,0 +1,21 @@
+{{- if and .Values.providerStorage.enabled (not .Values.providerStorage.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dekopon.providerStorageClaimName" . }}
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+  annotations:
+    # Durable provider data is unusable without its separately operator-managed namespace key and
+    # is never silently deleted with a Helm release.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.providerStorage.accessModes | nindent 4 }}
+  {{- with .Values.providerStorage.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.providerStorage.size | quote }}
+{{- end }}

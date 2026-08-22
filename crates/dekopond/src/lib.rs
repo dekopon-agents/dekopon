@@ -2,13 +2,16 @@
 //!
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
-//! shell and safe on-demand meta tools, and replies with the answer.
+//! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
+//! image unless an optional owned-thread continuation deliberately declines.
 //!
 //! # Authority
 //!
 //! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
 //! question and to ask a model — and it never holds a provider credential, a policy, or an
-//! authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an *attested*
+//! authorization. Explicit route-scoped image generation is model inference inside this
+//! unprivileged boundary, with no provider or broker credential. Every provider effect a session
+//! drives is submitted to `dekopon-brokerd` as an *attested*
 //! proposal naming the sender's canonical subject, and the broker alone maps that subject to a
 //! principal, decides what it may do, and executes it. The daemon's dependency set excludes every
 //! privileged broker crate for the same reason `dekopon-run`'s does, and CI enforces it.
@@ -50,8 +53,9 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
     ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
-    NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry, SlackActivityConfig,
-    SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig, TransportConfig,
+    ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
+    SlackActivityConfig, SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig,
+    TransportConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;
@@ -61,11 +65,15 @@ use crate::{
     asset::AssetStore,
     conversation::ConversationStore,
     routes::RoutingTable,
-    session::{ConfiguredModels, ModelCache, STOPPED_REPLY, SessionGate, SessionRunner},
+    session::{
+        ConfiguredModels, ImageGeneratorStartupError, ModelCache, STOPPED_REPLY, SessionGate,
+        SessionRunner, configured_image_generators,
+    },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
+        discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
+        telegram::TelegramTransport, whatsapp::WhatsappTransport,
     },
 };
 
@@ -136,6 +144,16 @@ where
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
+    // Resolve model credentials and construct the fixed-endpoint clients before a chat transport
+    // accepts work. A route naming image generation must not start as a tool that can only fail.
+    let referenced_image_generators = config
+        .routes
+        .iter()
+        .filter_map(|route| route.image_generator.clone())
+        .collect::<BTreeSet<_>>();
+    let image_generators =
+        configured_image_generators(&config.image_generators, &referenced_image_generators)
+            .map_err(DekopondError::ImageGenerator)?;
     let inventory = agent_inventory(&catalog);
     let heartbeat_inventory = inventory.clone();
 
@@ -174,6 +192,7 @@ where
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
+    let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -199,6 +218,9 @@ where
         if let Some(activity) = transport.activity() {
             activities.insert(spec.name().to_owned(), activity);
         }
+        if let Some(ownership) = transport.thread_ownership() {
+            thread_ownership.insert(spec.name().to_owned(), ownership);
+        }
         transports.push(transport);
     }
 
@@ -221,7 +243,9 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
+        image_generators,
         activities,
+        thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
     });
@@ -479,7 +503,10 @@ fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'stat
         ClientError::Connect { .. } => "connect",
         ClientError::PeerCredentials { .. } => "peer-credentials",
         ClientError::ServerIdentity { .. } => "server-identity",
-        ClientError::Protocol(_) => "protocol",
+        ClientError::Limits(_) => "limits",
+        // Flat rather than split by `ExchangePhase`: that distinction exists to decide whether work
+        // may be resubmitted, and these two reports are never retried.
+        ClientError::Protocol { .. } => "protocol",
         ClientError::Remote { .. } => "remote",
         ClientError::UnexpectedResponse => "unexpected-response",
     }
@@ -640,14 +667,23 @@ fn dispatch(
         );
         return;
     };
-    // A channel route that fired on every message would be noise and cost, so a shared
-    // conversation requires the bot to be addressed. A direct message is addressed by definition.
+    // A channel route that fired on every message would be noise and cost. Shared conversations
+    // therefore require an explicit address, except for one Slack Agent continuation that the
+    // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
+    // A direct message is addressed by definition.
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
             .is_some_and(|identity| identity.is_addressed(&message.text))
     });
-    if matches!(message.conversation, ConversationKind::Channel(_)) && !addressed {
+    let inherited_thread = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
+    if matches!(message.conversation, ConversationKind::Channel(_))
+        && !addressed
+        && !inherited_thread
+    {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -686,7 +722,7 @@ fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request
     sessions.spawn(async move {
         if let Err(error) = reply
             .replier
-            .reply(reply.target, STOPPED_REPLY.to_owned())
+            .reply(reply.target, OutboundReply::text(STOPPED_REPLY))
             .await
         {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
@@ -814,6 +850,31 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                 transport::read_credential(bot_token_env)?,
                 activity.mode,
             )?),
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => Box::new(WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
+            )?),
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
@@ -850,6 +911,9 @@ pub enum DekopondError {
     /// A route could not be bound to a catalog agent and a configured model.
     #[error("gateway route cannot be satisfied")]
     Route(#[from] RouteError),
+    /// A named image generator could not resolve its model credential or client.
+    #[error("configured image generator is unavailable")]
+    ImageGenerator(#[source] ImageGeneratorStartupError),
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),

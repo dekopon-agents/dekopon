@@ -106,6 +106,7 @@ fn attested(via: Option<&str>, agent: Option<&str>) -> PolicyContext {
         via: via.map(str::to_owned),
         subject: Some("slack.t0123abcd.u0123abcd".to_owned()),
         agent: agent.map(str::to_owned),
+        ..PolicyContext::default()
     }
 }
 

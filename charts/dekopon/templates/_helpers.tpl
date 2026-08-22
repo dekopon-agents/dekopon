@@ -78,6 +78,14 @@ Object names.
 {{- end -}}
 {{- end -}}
 
+{{- define "dekopon.providerStorageClaimName" -}}
+{{- if .Values.providerStorage.existingClaim -}}
+{{- .Values.providerStorage.existingClaim -}}
+{{- else -}}
+{{- printf "%s-provider-storage" (include "dekopon.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Whether each optional file has a source at all.
 */}}
@@ -200,6 +208,19 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- end -}}
 
+{{- if and .Values.gateway.service.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.service.enabled requires gateway.enabled; the broker has no TCP listener" -}}
+{{- end -}}
+{{- if .Values.gateway.service.enabled -}}
+{{- $servicePort := .Values.gateway.service.port | int -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail (printf "gateway.service.port must be an integer from 1 through 65535, got %v" .Values.gateway.service.port) -}}
+{{- end -}}
+{{- if not (kindIs "map" .Values.gateway.service.annotations) -}}
+{{- fail "gateway.service.annotations must be a map" -}}
+{{- end -}}
+{{- end -}}
+
 {{- if include "dekopon.chatgptEnabled" . -}}
 {{- if and .Values.gateway.chatgpt.inline .Values.gateway.chatgpt.existingSecret -}}
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
@@ -221,13 +242,67 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
 {{- end -}}
 
-{{- range $key, $path := .Values.paths -}}
-{{- if not (regexMatch "^/[^/].*[^/]$|^/[^/]$" $path) -}}
-{{- fail (printf "paths.%s must be an absolute path with at least one segment and no trailing slash, got %q" $key $path) -}}
+{{- $chartPaths := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
+{{- range $name, $path := $chartPaths -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $path)) (ne (clean $path) $path) -}}
+{{- fail (printf "%s must be a canonical absolute path of safe non-dot segments with no repeated or trailing slash, got %q" $name $path) -}}
+{{- end -}}
+{{- range $segment := splitList "/" $path -}}
+{{- if or (eq $segment ".") (eq $segment "..") -}}
+{{- fail (printf "%s must not contain . or .. segments, got %q" $name $path) -}}
 {{- end -}}
 {{- end -}}
-{{- if or (hasPrefix (printf "%s/" .Values.paths.configDir) .Values.paths.catalogDir) (eq .Values.paths.configDir .Values.paths.catalogDir) -}}
-{{- fail "paths.catalogDir must not be inside paths.configDir: the catalog is a separate ConfigMap mount and would shadow the copied configuration directory" -}}
+{{- end -}}
+{{- range $leftName, $leftPath := $chartPaths -}}
+{{- range $rightName, $rightPath := $chartPaths -}}
+{{- if and (ne $leftName $rightName) (or (eq (clean $leftPath) (clean $rightPath)) (hasPrefix (printf "%s/" (clean $leftPath)) (clean $rightPath)) (hasPrefix (printf "%s/" (clean $rightPath)) (clean $leftPath))) -}}
+{{- fail (printf "%s (%s) and %s (%s) must not overlap; separate volume mounts would shadow files" $leftName $leftPath $rightName $rightPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- if .Values.providerStorage.enabled -}}
+{{- if not .Values.providerStorage.existingKeySecret -}}
+{{- fail "providerStorage.enabled requires operator-managed providerStorage.existingKeySecret; the chart never owns or deletes the namespace key" -}}
+{{- end -}}
+{{- if eq (include "dekopon.providerStorageClaimName" .) (include "dekopon.stateClaimName" .) -}}
+{{- fail "provider storage and audit state must use distinct PersistentVolumeClaims" -}}
+{{- end -}}
+{{- range $name, $value := dict "providerStorage.keyFileName" .Values.providerStorage.keyFileName "providerStorage.existingKeySecretKey" .Values.providerStorage.existingKeySecretKey -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $value)) (eq $value ".") (eq $value "..") -}}
+{{- fail (printf "%s must be one non-dot path segment" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $path := dict "providerStorage.rootPath" .Values.providerStorage.rootPath "providerStorage.keyDir" .Values.providerStorage.keyDir -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $path)) (ne (clean $path) $path) -}}
+{{- fail (printf "%s must be a canonical absolute path of safe non-empty segments with no repeated or trailing slash, got %q" $name $path) -}}
+{{- end -}}
+{{- range $segment := splitList "/" $path -}}
+{{- if or (eq $segment ".") (eq $segment "..") -}}
+{{- fail (printf "%s must not contain . or .. segments, got %q" $name $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $storageMounts := dict "providerStorage.rootPath" (clean .Values.providerStorage.rootPath) "providerStorage.keyDir" (clean .Values.providerStorage.keyDir) -}}
+{{- $ownedMounts := dict "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "projected storage-key source" "/dekopon-storage-key-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- range $storageName, $storagePath := $storageMounts -}}
+{{- range $ownedName, $ownedPath := $ownedMounts -}}
+{{- if or (eq $storagePath $ownedPath) (hasPrefix (printf "%s/" $storagePath) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) $storagePath) -}}
+{{- fail (printf "%s (%s) must not equal, contain, or be contained by chart-owned %s (%s); overlapping volume mounts shadow files" $storageName $storagePath $ownedName $ownedPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq (clean .Values.providerStorage.rootPath) (clean .Values.providerStorage.keyDir)) (hasPrefix (printf "%s/" (clean .Values.providerStorage.rootPath)) (clean .Values.providerStorage.keyDir)) (hasPrefix (printf "%s/" (clean .Values.providerStorage.keyDir)) (clean .Values.providerStorage.rootPath)) -}}
+{{- fail "providerStorage.rootPath and providerStorage.keyDir must not overlap" -}}
+{{- end -}}
+{{- end -}}
+
+{{- range $pathName, $path := $chartPaths -}}
+{{- range $ownedName, $ownedPath := dict "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "projected storage-key source" "/dekopon-storage-key-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- if or (eq (clean $path) $ownedPath) (hasPrefix (printf "%s/" (clean $path)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $path)) -}}
+{{- fail (printf "%s (%s) must not overlap chart/image-owned %s (%s)" $pathName $path $ownedName $ownedPath) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -283,6 +358,13 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ $.Values.paths.runtimeDir }}
     - name: state
       mountPath: {{ $.Values.paths.stateDir }}
+{{- if $.Values.providerStorage.enabled }}
+    - name: provider-storage
+      mountPath: {{ $.Values.providerStorage.rootPath }}
+    - name: provider-storage-key
+      mountPath: {{ $.Values.providerStorage.keyDir }}
+      readOnly: true
+{{- end }}
     - name: tmp
       mountPath: /tmp
 {{- end -}}

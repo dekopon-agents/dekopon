@@ -5,7 +5,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
 
-use super::{config, current_uid, socket};
+use super::{config, current_uid, server, socket};
 
 /// The attested workflow policy: `cpetersen` may drive `chat-agent` and reach `echo.echo`, but
 /// only through the gateway that vouched for them.
@@ -208,6 +208,39 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
         assert!(
             matches!(error, config::ConfigError::Attestor { .. }),
             "namespaces {namespaces} produced {error}"
+        );
+    }
+
+    for scope in [
+        json!({
+            "breadth": "exactConversation", "kind": "slack", "transport": "slack",
+            "channel": "c0123abc", "conversation": "c0123abc:01712345678.1"
+        }),
+        json!({
+            "breadth": "exactChannel", "kind": "discord", "transport": "discord",
+            "channel": "00123"
+        }),
+        json!({
+            "breadth": "exactConversation", "kind": "telegram", "transport": "telegram",
+            "channel": "-1001", "conversation": "-1001:topic:00"
+        }),
+        json!({
+            "breadth": "transportWide", "kind": "local", "transport": "dev"
+        }),
+        json!({
+            "breadth": "exactChannel", "kind": "slack", "transport": "slack",
+            "channel": format!("c{}", "x".repeat(256))
+        }),
+    ] {
+        let mut invalid = document.clone();
+        invalid["identities"][1]["attestor"]["chatScopes"] = json!([scope.clone()]);
+        write_config(&path, &invalid);
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("noncanonical exact chat scope must fail at startup");
+        assert!(
+            matches!(error, config::ConfigError::Attestor { .. }),
+            "scope {scope} produced {error}"
         );
     }
 }
@@ -630,4 +663,436 @@ async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
         matches!(error, config::ConfigError::TooManyProviders { .. }),
         "{error:?}"
     );
+}
+
+#[test]
+fn generic_durable_storage_outer_spans_have_no_identity_or_capability_fields() {
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        let span = server::storage_invocation_span(
+            &"generic-durable-sentinel".parse().expect("invocation"),
+            &"generic-durable-trace".parse().expect("trace"),
+        );
+        let fields = span
+            .metadata()
+            .expect("storage span metadata")
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["invocation", "trace"]);
+        for forbidden in ["capability", "provider", "subject", "agent"] {
+            assert!(!fields.contains(&forbidden));
+        }
+    });
+}
+
+#[tokio::test]
+async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
+
+    let mut document = attested_document(uid);
+    document["socketPath"] = json!("provider-storage/broker.sock");
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::StorageStateCollision)
+    ));
+
+    write_owner_only(
+        &directory.path().join("provider-storage/inside.wasm"),
+        b"component fixture",
+    );
+    let mut document = attested_document(uid);
+    document["providers"] = json!(["provider-storage/inside.wasm"]);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::StorageStateCollision)
+    ));
+}
+
+#[tokio::test]
+async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    let actual = directory.path().join("actual-storage-parent");
+    fs::create_dir(&actual).expect("actual parent");
+    fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).expect("parent mode");
+    std::os::unix::fs::symlink(&actual, directory.path().join("storage-parent"))
+        .expect("ancestor symlink");
+
+    let mut document = attested_document(uid);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        (
+            "rootPath".to_owned(),
+            json!("storage-parent/provider-storage"),
+        ),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidStorage)
+    ));
+    assert!(!actual.join("provider-storage").exists());
+}
+
+#[tokio::test]
+async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
+
+    let mut document = attested_document(uid);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    document["chatMemory"] = serde_json::to_value(dekopon_broker::ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        enabled_agents: vec!["reviewer".parse().expect("agent")],
+        max_lookback_turns: 200,
+        max_recent_turns: 20,
+        max_search_results: 20,
+        max_query_bytes: 256,
+        max_result_bytes: 65_536,
+        max_turn_bytes: 32_768,
+        max_dedup_records: 16_000,
+        max_dedup_bytes: 4_194_304,
+        compaction_target_bytes: 8_388_608,
+        compaction_threshold_bytes: 12_582_912,
+    })
+    .expect("memory config serializes");
+    let host = dekopon_broker_host::BrokerHostLimits::default();
+    document["hostLimits"] = json!({
+        "maxMemoryBytes": host.max_memory_bytes,
+        "maxTableElements": host.max_table_elements,
+        "maxInstances": host.max_instances,
+        "maxTables": host.max_tables,
+        "maxMemories": host.max_memories,
+        "maxInputBytes": host.max_input_bytes,
+        "maxOutputBytes": host.max_output_bytes,
+        "maxHttpRequests": host.max_http_requests,
+        "maxHttpRequestBytes": host.max_http_request_bytes,
+        "maxHttpResponseBytes": host.max_http_response_bytes,
+        "maxHttpHeaders": host.max_http_headers,
+        "maxHttpHeaderBytes": host.max_http_header_bytes,
+        "fuel": host.fuel,
+        "maxTimeoutMs": u64::try_from(host.max_timeout.as_millis()).expect("timeout")
+    });
+    write_config(&path, &document);
+    config::load(&path, uid)
+        .await
+        .expect("documented defaults compose before component loading");
+
+    document["hostLimits"]["fuel"] = json!(10_000_000);
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidChatMemory)
+    ));
+}
+
+#[test]
+fn storage_section_is_optional_all_or_nothing_and_strict() {
+    let uid = current_uid();
+    let mut document = attested_document(uid);
+    assert!(serde_json::from_value::<config::BrokerdConfig>(document.clone()).is_ok());
+
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    let object = storage.as_object_mut().expect("limits object");
+    object.insert(
+        "rootPath".to_owned(),
+        json!("/var/lib/dekopon-provider-storage"),
+    );
+    object.insert(
+        "namespaceKeyPath".to_owned(),
+        json!("/etc/dekopon-storage-key/storage-key.yaml"),
+    );
+    document["storage"] = storage.clone();
+    let decoded = serde_json::from_value::<config::BrokerdConfig>(document.clone())
+        .expect("complete strict storage section decodes");
+    assert_eq!(
+        decoded.storage.expect("storage").limits.max_root_bytes,
+        2 * 1024 * 1024 * 1024
+    );
+
+    document["storage"]
+        .as_object_mut()
+        .expect("storage object")
+        .remove("maxRootBytes");
+    assert!(
+        serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
+        "presence requires every storage field"
+    );
+}
+
+/// One transient `accept` failure used to end the privileged daemon, and ending it is the most
+/// expensive answer available: the container restarts, every provider recompiles under Cranelift
+/// before the socket rebinds, and durable audit state waits through all of it. Descriptor
+/// exhaustion — which the unauthenticated `--http-bind` listener can cause on its own — is not a
+/// broken listener.
+#[test]
+fn transient_accept_failures_are_survivable_and_the_rest_are_not() {
+    for (errno, kind) in [
+        (libc::EMFILE, "process-descriptor-limit"),
+        (libc::ENFILE, "system-descriptor-limit"),
+        (libc::ENOBUFS, "kernel-memory"),
+        (libc::ENOMEM, "kernel-memory"),
+        (libc::ECONNABORTED, "connection-aborted"),
+        (libc::ECONNRESET, "connection-reset"),
+        (libc::EINTR, "interrupted"),
+    ] {
+        assert_eq!(
+            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
+            Some(kind),
+            "errno {errno} must not exit the daemon"
+        );
+    }
+
+    // A listener that is gone, unbound, or not a socket is a real fault: retrying it forever would
+    // turn a startup mistake into a silent hang.
+    for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+        assert_eq!(
+            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
+            None,
+            "errno {errno} must stay fatal"
+        );
+    }
+    // Not every `io::Error` carries an errno.
+    assert_eq!(
+        server::retryable_accept_error(&std::io::Error::other("no errno")),
+        None
+    );
+}
+
+/// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
+/// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
+/// storage GC and the web UI a fresh full grace each — that is how a 120 s `shutdownGraceMs`
+/// became a 360 s exit against a 180 s `terminationGracePeriodSeconds`.
+#[tokio::test(start_paused = true)]
+async fn every_drain_shares_one_grace() {
+    let grace = std::time::Duration::from_secs(120);
+    let started = tokio::time::Instant::now();
+    let report = super::drain_services(
+        started + grace,
+        async {
+            tokio::time::sleep(grace).await;
+            Ok(())
+        },
+        tokio::time::sleep(grace * 3 / 4),
+        Some(async {
+            tokio::time::sleep(grace * 3 / 4).await;
+            Ok(())
+        }),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < grace * 2,
+        "three drains that each fit one grace must not take three: {elapsed:?}"
+    );
+    assert!(report.broker.is_ok());
+    assert!(!report.storage_gc_timed_out);
+    assert!(!report.web_timed_out);
+    assert!(matches!(report.web, Some(Ok(()))));
+}
+
+/// And the deadline is shared rather than restarted, so a drain that outlives it is reported
+/// instead of being given the grace over again.
+#[tokio::test(start_paused = true)]
+async fn a_drain_past_the_shared_deadline_times_out() {
+    let grace = std::time::Duration::from_secs(120);
+    let started = tokio::time::Instant::now();
+    let report = super::drain_services(
+        started + grace,
+        async {
+            tokio::time::sleep(grace / 2).await;
+            Ok(())
+        },
+        tokio::time::sleep(grace * 4),
+        Some(async {
+            tokio::time::sleep(grace * 4).await;
+            Ok(())
+        }),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < grace * 2, "{elapsed:?}");
+    assert!(report.storage_gc_timed_out);
+    assert!(report.web_timed_out);
+    assert!(report.web.is_none());
+}
+
+/// The startup frame check exists so an oversized capability response fails here rather than on
+/// the first session. It used to measure only the direct peers, and in the deployment it is written
+/// for the direct peer is the gateway — granted almost nothing. The capability sets that actually
+/// reach the wire belong to the attested principals the identity mappings name, on the
+/// `capabilitiesFor` path the check skipped, so the oversized response passed startup and then
+/// failed `write_frame` on every session open.
+#[tokio::test]
+async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
+    use std::sync::Arc;
+
+    use dekopon_broker::{
+        AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, CredentialStore,
+        IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    };
+    use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+    use dekopon_broker_protocol::ResponseEnvelope;
+    use dekopon_core::{Actor, AgentId, CapabilityId, PrincipalId};
+
+    use super::{BrokerdError, MappedPeer, validate_capability_responses};
+
+    let echo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/echo-provider.wasm");
+    let registry = BrokerProviderRegistry::load([echo], BrokerHostLimits::default())
+        .await
+        .expect("load echo fixture");
+    let capability = "echo.echo"
+        .parse::<CapabilityId>()
+        .expect("valid capability fixture");
+    let world = PolicyWorld::new(
+        ["gateway", "cpetersen"].map(|name| name.parse::<PrincipalId>().expect("valid principal")),
+        [(
+            capability.clone(),
+            "echo".parse().expect("valid provider fixture"),
+        )],
+    )
+    .expect("declared world builds");
+    let catalog = ConstraintCatalog::new([(
+        capability,
+        serde_json::from_value(constraint_set()).expect("constraint set decodes"),
+    )])
+    .expect("one capability builds a catalog");
+    let broker = Broker::new(
+        registry,
+        "broker-test".parse().expect("valid broker principal"),
+        "policy-test".to_owned(),
+        PolicyEngine::new(POLICIES, &world).expect("fixture policy validates"),
+        catalog,
+        CredentialStore::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+            "cpetersen".parse::<PrincipalId>().expect("valid principal"),
+        )])
+        .expect("one mapping builds a directory"),
+        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        BrokerLimits::default(),
+    )
+    .expect("broker starts");
+
+    // The gateway peer itself: it may attest for others and holds no capability of its own, so its
+    // own answer is empty and fits anything.
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().expect("valid principal"),
+        Actor::Service {
+            principal: "gateway".parse().expect("valid principal"),
+        },
+    )
+    .expect("trusted context binds");
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        current_uid(),
+        MappedPeer {
+            context: gateway.clone(),
+            attestor: None,
+        },
+    );
+    let peer_bytes = serde_json::to_vec(&ResponseEnvelope::capabilities(
+        broker.capabilities(&gateway),
+        broker.command_words(&gateway),
+    ))
+    .expect("peer response encodes")
+    .len();
+
+    // A session's answer under `chat-agent` carries the real capability, so it is strictly larger.
+    let (capabilities, words) = broker.capability_ceiling();
+    assert!(
+        !capabilities.is_empty(),
+        "the ceiling must see what policy grants an attested principal"
+    );
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway,
+                Some(&dekopon_broker::AttestorGrant {
+                    namespaces: vec!["slack.t0123abc".to_owned()],
+                    chat_scopes: Vec::new(),
+                }),
+                &"slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                &"chat-agent".parse::<AgentId>().expect("valid agent"),
+            )
+            .expect("the mapped subject is attestable")
+            .0
+            .len()
+            <= capabilities.len(),
+        "the ceiling must bound what a real session receives"
+    );
+
+    let ceiling_bytes = serde_json::to_vec(&ResponseEnvelope::chat_capabilities(
+        capabilities,
+        words,
+        broker.chat_memory_ceiling(),
+    ))
+    .expect("ceiling response encodes")
+    .len();
+    assert!(ceiling_bytes > peer_bytes);
+
+    // A frame that fits every direct peer and nothing else used to pass startup.
+    let error = validate_capability_responses(&broker, &identities, peer_bytes)
+        .expect_err("a frame that cannot carry a session's answer must refuse to start");
+    assert!(
+        matches!(error, BrokerdError::CapabilityCeilingTooLarge { length, maximum }
+            if length == ceiling_bytes && maximum == peer_bytes),
+        "{error}"
+    );
+    validate_capability_responses(&broker, &identities, ceiling_bytes)
+        .expect("a frame that carries the widest answer starts");
 }

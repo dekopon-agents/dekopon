@@ -15,13 +15,24 @@ use std::{
 };
 
 use dekopon_capability::HttpConstraints;
-use dekopon_http_host::{BufferedHttpClient, Header, HttpHostCeilings, Request};
+use dekopon_http_host::{BufferedHttpClient, ErrorCode, Header, HttpHostCeilings, Request};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<String>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+    /// Only this workspace's callsites. An unfiltered layer over a registry also captures every
+    /// transport callsite, which both drowns the assertions and makes them depend on a dependency's
+    /// logging.
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        metadata.target().starts_with("dekopon")
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
@@ -41,6 +52,16 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
     ) {
         let mut sink = self.0.lock().expect("capture sink");
         values.record(&mut Visitor(&mut sink));
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut sink = self.0.lock().expect("capture sink");
+        sink.push_str(event.metadata().target());
+        event.record(&mut Visitor(&mut sink));
     }
 }
 
@@ -177,6 +198,64 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
         assert!(
             !verbose_recorded.contains(sentinel),
             "{sentinel} leaked even though only URLs were opted into: {verbose_recorded}"
+        );
+    }
+
+    refusals_carry_their_failure_class_and_are_still_accounted(&captured).await;
+}
+
+/// A refusal that never reaches `prepare` has no method or authority to report, and used to reach
+/// telemetry as a bare `outcome` with no reason and no accounting record at all — six failure
+/// classes flattened into one word. Recording the class and its message is safe because every
+/// message this crate produces is a static, pre-sanitized `&str`, which this phase also pins: the
+/// refused URL's path must not appear anywhere.
+///
+/// This runs inside the one test that owns the global subscriber, for the reason the module
+/// comment gives.
+async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &Captured) {
+    captured.0.lock().expect("capture sink").clear();
+
+    let mut client = BufferedHttpClient::authorized(
+        HttpConstraints {
+            allowed_hosts: vec!["127.0.0.1:9".to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+        },
+        HttpHostCeilings::default(),
+        Duration::from_secs(5),
+    )
+    .expect("authorized fixture client");
+
+    let error = client
+        .send(Request {
+            method: "GET".to_owned(),
+            uri: "http://127.0.0.1:10/REFUSED_PATH?REFUSED_QUERY=1".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .expect_err("an unauthorized destination is refused");
+    assert_eq!(error.code, ErrorCode::Denied);
+
+    let recorded = captured.0.lock().expect("capture sink").clone();
+    assert!(recorded.contains("Denied"), "{recorded}");
+    assert!(
+        recorded.contains("HTTP destination is not authorized for this invocation"),
+        "{recorded}"
+    );
+    assert!(recorded.contains("denied"), "{recorded}");
+    // The attempt consumed a unit of the request budget, so it is accounted even though nothing
+    // reached the wire — with the fields it cannot know absent rather than zero.
+    assert!(recorded.contains("accounting.http.request"), "{recorded}");
+    assert!(!recorded.contains("status_code"), "{recorded}");
+
+    for sentinel in ["REFUSED_PATH", "REFUSED_QUERY"] {
+        assert!(
+            !recorded.contains(sentinel),
+            "{sentinel} leaked into failure telemetry: {recorded}"
         );
     }
 }

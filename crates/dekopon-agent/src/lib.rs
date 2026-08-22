@@ -6,7 +6,7 @@
 //! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
 //!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
 //!   bounded [`prompt::History`], [`prompt::SessionInputs`] optionally carrying cooperative
-//!   cancellation for transport-owned Stop controls, and
+//!   cancellation for transport-owned Stop controls or a request-scoped no-reply decision, and
 //!   [`prompt::run_prompt_with_history_and_options`] adding the request-scoped routing metadata a
 //!   caller uses to point one conversation's turns at one provider cache lane;
 //! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
@@ -27,8 +27,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use std::{
-    collections::BTreeMap,
     collections::hash_map::RandomState,
+    collections::{BTreeMap, BTreeSet},
     hash::{BuildHasher as _, Hasher as _},
     sync::atomic::{AtomicU32, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -37,7 +37,8 @@ use std::{
 use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
-    BrokerClient, ClientError, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
+    BrokerClient, ChatMemorySurface, ChatScopeClaim, ChatSessionClaim, ClientError,
+    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
 };
 #[cfg(unix)]
 use dekopon_core::{
@@ -120,6 +121,25 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
                 .is_some_and(|broker| broker.is_granted(capability))
     }
 
+    // Both membership queries ask each leg rather than merging the legs' lists and searching the
+    // merge. Dispatch asks them per command word, so building, extending, sorting, and deduping
+    // two `Vec<String>` here made a loop of a thousand commands do it a thousand times.
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.direct.grants_namespace(namespace)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.grants_namespace(namespace))
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.direct.has_command_word(word)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.has_command_word(word))
+    }
+
     fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
         self.direct.describe(capability).or_else(|| {
             self.broker
@@ -196,6 +216,7 @@ pub enum BrokerLegError {
 struct Attestation {
     subject: ExternalSubject,
     agent: AgentId,
+    scope: Option<ChatScopeClaim>,
 }
 
 /// The broker half of a session's capability dispatch.
@@ -216,11 +237,21 @@ pub struct BrokerLeg {
     ///
     /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
     /// command word a script runs, and a round trip per word would make the interpreter's cost
-    /// depend on the network rather than on the script.
-    command_words: Vec<String>,
+    /// depend on the network rather than on the script. A set rather than a list for the same
+    /// reason again: that consultation is a membership test, and a script running thousands of
+    /// commands asks it thousands of times.
+    command_words: BTreeSet<String>,
+    /// Provider namespaces this leg holds a grant in, derived from the capability set.
+    ///
+    /// Only [`CapabilityInvoker::grants_namespace`] reads it, on the path where a word was refused
+    /// — the answer that separates "the model typed nonsense" from "the model keeps reaching for
+    /// something we never granted".
+    namespaces: BTreeSet<String>,
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
+    /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
+    chat_memory: Option<ChatMemorySurface>,
 }
 
 #[cfg(unix)]
@@ -237,7 +268,14 @@ impl BrokerLeg {
     /// session made is recoverable from the broker's audit log by prefix.
     pub async fn connect(client: BrokerClient, trace_prefix: &str) -> Result<Self, BrokerLegError> {
         let (capabilities, command_words) = client.session_surface().await?;
-        Self::build(client, trace_prefix, capabilities, command_words, None)
+        Self::build(
+            client,
+            trace_prefix,
+            capabilities,
+            command_words,
+            None,
+            None,
+        )
     }
 
     /// Connects a leg that proposes on behalf of one transport-authenticated external subject.
@@ -264,7 +302,34 @@ impl BrokerLeg {
             trace_prefix,
             capabilities,
             command_words,
-            Some(Attestation { subject, agent }),
+            Some(Attestation {
+                subject,
+                agent,
+                scope: None,
+            }),
+            None,
+        )
+    }
+
+    /// Connects a bounded chat-scoped leg. This is the only leg that can see durable memory.
+    pub async fn connect_chat(
+        client: BrokerClient,
+        trace_prefix: &str,
+        claim: ChatSessionClaim,
+    ) -> Result<Self, BrokerLegError> {
+        let (capabilities, command_words, chat_memory) =
+            client.session_surface_for_chat(claim.clone()).await?;
+        Self::build(
+            client,
+            trace_prefix,
+            capabilities,
+            command_words,
+            Some(Attestation {
+                subject: claim.subject,
+                agent: claim.agent,
+                scope: Some(claim.scope),
+            }),
+            chat_memory,
         )
     }
 
@@ -274,17 +339,21 @@ impl BrokerLeg {
         available: Vec<dekopon_broker_protocol::AvailableCapability>,
         command_words: Vec<String>,
         attestation: Option<Attestation>,
+        chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, effective_capabilities) = snapshot(available);
+        let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
             effective_capabilities,
-            command_words,
+            command_words: command_words.into_iter().collect(),
+            namespaces,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
+            chat_memory,
         })
     }
 
@@ -296,6 +365,23 @@ impl BrokerLeg {
     pub fn effective_capabilities(&self) -> Vec<EffectiveCapabilityView> {
         self.effective_capabilities.clone()
     }
+
+    /// Returns the broker-derived memory note and lookback only when all three grants are effective.
+    #[must_use]
+    pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
+        self.chat_memory.as_ref()
+    }
+}
+
+/// Returns the provider namespace one capability identifier belongs to.
+///
+/// A separator-free identifier is its own namespace, which is how the interpreter reads one too.
+#[cfg(unix)]
+fn namespace_of(capability: &str) -> String {
+    capability
+        .split_once('.')
+        .map_or(capability, |(namespace, _)| namespace)
+        .to_owned()
 }
 
 /// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
@@ -346,7 +432,15 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn command_words(&self) -> Vec<String> {
-        self.command_words.clone()
+        self.command_words.iter().cloned().collect()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.command_words.contains(word)
+    }
+
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
     }
 
     fn resolve_command(
@@ -356,13 +450,36 @@ impl CapabilityInvoker for BrokerLeg {
     ) -> Option<Result<(String, Value), String>> {
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
-        if !self.command_words.iter().any(|candidate| candidate == word) {
+        if !self.command_words.contains(word) {
             return None;
         }
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
-        let resolved = self
-            .runtime
-            .block_on(self.client.resolve_command(word.to_owned(), argv.to_vec()));
+        let resolved = self.runtime.block_on(async {
+            match &self.attestation {
+                Some(Attestation {
+                    subject,
+                    agent,
+                    scope: Some(scope),
+                }) => {
+                    self.client
+                        .resolve_command_for_chat(
+                            ChatSessionClaim {
+                                subject: subject.clone(),
+                                agent: agent.clone(),
+                                scope: scope.clone(),
+                            },
+                            word.to_owned(),
+                            argv.to_vec(),
+                        )
+                        .await
+                }
+                _ => {
+                    self.client
+                        .resolve_command(word.to_owned(), argv.to_vec())
+                        .await
+                }
+            }
+        });
         match resolved {
             Ok(Ok((capability, input))) => Some(Ok((capability.to_string(), input))),
             Ok(Err(message)) => Some(Err(message)),
@@ -404,6 +521,22 @@ impl CapabilityInvoker for BrokerLeg {
         // blocking pool it is the ordinary bridge back into async code.
         let submitted = self.runtime.block_on(async {
             match &self.attestation {
+                Some(Attestation {
+                    subject,
+                    agent,
+                    scope: Some(scope),
+                }) => {
+                    self.client
+                        .invoke_for_chat(
+                            request,
+                            ChatSessionClaim {
+                                subject: subject.clone(),
+                                agent: agent.clone(),
+                                scope: scope.clone(),
+                            },
+                        )
+                        .await
+                }
                 Some(attestation) => {
                     self.client
                         .invoke_for(
@@ -442,6 +575,19 @@ impl CapabilityInvoker for BrokerLeg {
             Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
+            // The proposal reached the broker and its outcome is unknown here: a client-side read
+            // timeout cannot distinguish a `gh.issue.comment` that ran 29s against a 30s deadline
+            // from one that never ran, and `outcome-unaudited` says outright that the effect may
+            // have happened. `Failed` exits 1, which a model reads as "the call errored, try
+            // again" — and a retry carries a fresh invocation identifier, so replay rejection
+            // cannot catch the duplicate external effect. `Denied` (126) is the interpreter's only
+            // non-retryable status, so an unaudited outcome takes it and says why.
+            Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
+                reason: format!(
+                    "the broker did not record an outcome for this invocation and it may already \
+                     have taken effect; do not resubmit it ({error})"
+                ),
+            },
             // Every `ClientError` renders without the socket path, so a script cannot learn where
             // the broker lives — the interpreter refuses to read the process environment, and this
             // is the one path that could otherwise leak `DEKOPON_BROKER_SOCKET` back into it.
@@ -604,6 +750,30 @@ mod tests {
     }
 
     #[test]
+    fn membership_queries_agree_with_the_lists_they_replace() {
+        // Dispatch asks these per command word rather than merging both legs' lists and searching
+        // the merge. They have to answer what searching the merge would have answered, from either
+        // leg, including for a leg that overrides neither and is scanned by the default.
+        let invoker = SessionInvoker {
+            direct: FakeLeg::new("echo.echo", "direct"),
+            broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
+        };
+
+        for granted in invoker.granted() {
+            let namespace = granted.split('.').next().expect("a namespace");
+            assert!(invoker.grants_namespace(namespace), "{granted}");
+        }
+        assert!(invoker.grants_namespace("echo"));
+        assert!(invoker.grants_namespace("http-probe"));
+        assert!(!invoker.grants_namespace("gh"));
+        assert!(!invoker.grants_namespace("ech"));
+
+        // Neither `FakeLeg` contributes command words, so nothing is one.
+        assert!(invoker.command_words().is_empty());
+        assert!(!invoker.has_command_word("gh"));
+    }
+
+    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         // Omitting the broker leg has to leave a session behaving as direct mode always did, so a
         // local demo or a CI run with no daemon is unaffected.
@@ -622,7 +792,11 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
-        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, path::Path};
+        use std::{
+            collections::{BTreeMap, BTreeSet},
+            os::unix::fs::PermissionsExt as _,
+            path::Path,
+        };
 
         use dekopon_broker_protocol::{
             BrokerClient, BrokerRequest, ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome,
@@ -713,6 +887,7 @@ mod tests {
                 agent: "chat-agent"
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
+                scope: None,
             }
         }
 
@@ -726,6 +901,10 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                 },
             );
+            let namespaces = capabilities
+                .keys()
+                .map(|id| crate::namespace_of(id))
+                .collect();
             BrokerLeg {
                 client: BrokerClient::new(socket, server_uid(), FrameLimits::default())
                     .expect("stub broker client"),
@@ -739,9 +918,11 @@ mod tests {
                     risk: "Low".to_owned(),
                     idempotency: "idempotent".to_owned(),
                 }],
-                command_words: Vec::new(),
+                command_words: BTreeSet::new(),
+                namespaces,
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
+                chat_memory: None,
             }
         }
 
