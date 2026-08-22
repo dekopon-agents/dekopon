@@ -27,8 +27,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use std::{
-    collections::BTreeMap,
     collections::hash_map::RandomState,
+    collections::{BTreeMap, BTreeSet},
     hash::{BuildHasher as _, Hasher as _},
     sync::atomic::{AtomicU32, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -119,6 +119,25 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
                 .broker
                 .as_ref()
                 .is_some_and(|broker| broker.is_granted(capability))
+    }
+
+    // Both membership queries ask each leg rather than merging the legs' lists and searching the
+    // merge. Dispatch asks them per command word, so building, extending, sorting, and deduping
+    // two `Vec<String>` here made a loop of a thousand commands do it a thousand times.
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.direct.grants_namespace(namespace)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.grants_namespace(namespace))
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.direct.has_command_word(word)
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.has_command_word(word))
     }
 
     fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
@@ -218,8 +237,16 @@ pub struct BrokerLeg {
     ///
     /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
     /// command word a script runs, and a round trip per word would make the interpreter's cost
-    /// depend on the network rather than on the script.
-    command_words: Vec<String>,
+    /// depend on the network rather than on the script. A set rather than a list for the same
+    /// reason again: that consultation is a membership test, and a script running thousands of
+    /// commands asks it thousands of times.
+    command_words: BTreeSet<String>,
+    /// Provider namespaces this leg holds a grant in, derived from the capability set.
+    ///
+    /// Only [`CapabilityInvoker::grants_namespace`] reads it, on the path where a word was refused
+    /// — the answer that separates "the model typed nonsense" from "the model keeps reaching for
+    /// something we never granted".
+    namespaces: BTreeSet<String>,
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
@@ -315,12 +342,14 @@ impl BrokerLeg {
         chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, effective_capabilities) = snapshot(available);
+        let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
             effective_capabilities,
-            command_words,
+            command_words: command_words.into_iter().collect(),
+            namespaces,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
@@ -342,6 +371,17 @@ impl BrokerLeg {
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
     }
+}
+
+/// Returns the provider namespace one capability identifier belongs to.
+///
+/// A separator-free identifier is its own namespace, which is how the interpreter reads one too.
+#[cfg(unix)]
+fn namespace_of(capability: &str) -> String {
+    capability
+        .split_once('.')
+        .map_or(capability, |(namespace, _)| namespace)
+        .to_owned()
 }
 
 /// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
@@ -392,7 +432,15 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn command_words(&self) -> Vec<String> {
-        self.command_words.clone()
+        self.command_words.iter().cloned().collect()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.command_words.contains(word)
+    }
+
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
     }
 
     fn resolve_command(
@@ -402,7 +450,7 @@ impl CapabilityInvoker for BrokerLeg {
     ) -> Option<Result<(String, Value), String>> {
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
-        if !self.command_words.iter().any(|candidate| candidate == word) {
+        if !self.command_words.contains(word) {
             return None;
         }
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
@@ -702,6 +750,30 @@ mod tests {
     }
 
     #[test]
+    fn membership_queries_agree_with_the_lists_they_replace() {
+        // Dispatch asks these per command word rather than merging both legs' lists and searching
+        // the merge. They have to answer what searching the merge would have answered, from either
+        // leg, including for a leg that overrides neither and is scanned by the default.
+        let invoker = SessionInvoker {
+            direct: FakeLeg::new("echo.echo", "direct"),
+            broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
+        };
+
+        for granted in invoker.granted() {
+            let namespace = granted.split('.').next().expect("a namespace");
+            assert!(invoker.grants_namespace(namespace), "{granted}");
+        }
+        assert!(invoker.grants_namespace("echo"));
+        assert!(invoker.grants_namespace("http-probe"));
+        assert!(!invoker.grants_namespace("gh"));
+        assert!(!invoker.grants_namespace("ech"));
+
+        // Neither `FakeLeg` contributes command words, so nothing is one.
+        assert!(invoker.command_words().is_empty());
+        assert!(!invoker.has_command_word("gh"));
+    }
+
+    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         // Omitting the broker leg has to leave a session behaving as direct mode always did, so a
         // local demo or a CI run with no daemon is unaffected.
@@ -720,7 +792,11 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
-        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, path::Path};
+        use std::{
+            collections::{BTreeMap, BTreeSet},
+            os::unix::fs::PermissionsExt as _,
+            path::Path,
+        };
 
         use dekopon_broker_protocol::{
             BrokerClient, BrokerRequest, ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome,
@@ -825,6 +901,10 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                 },
             );
+            let namespaces = capabilities
+                .keys()
+                .map(|id| crate::namespace_of(id))
+                .collect();
             BrokerLeg {
                 client: BrokerClient::new(socket, server_uid(), FrameLimits::default())
                     .expect("stub broker client"),
@@ -838,7 +918,8 @@ mod tests {
                     risk: "Low".to_owned(),
                     idempotency: "idempotent".to_owned(),
                 }],
-                command_words: Vec::new(),
+                command_words: BTreeSet::new(),
+                namespaces,
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
                 chat_memory: None,

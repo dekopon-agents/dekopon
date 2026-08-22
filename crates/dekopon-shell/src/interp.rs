@@ -60,7 +60,11 @@ struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
     /// The value piped into the call, offered to the first command of each pipeline in the body.
-    stdin: Option<Value>,
+    ///
+    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
+    /// be deep-copied once per statement — including for the statements that never read input —
+    /// and all but the last copy dropped. See [`own`].
+    stdin: Option<Rc<Value>>,
 }
 
 /// Parses and evaluates one script, returning its outcome.
@@ -192,12 +196,21 @@ impl Evaluator<'_> {
         self.output.push_block(line);
     }
 
+    /// Writes what one pipeline produced, to the capture that is collecting it or to the output.
+    ///
+    /// A command that produced no value writes nothing, and that has to be decided *before* the
+    /// capture branch rather than after it. `$(true; echo a)` is `a` in bash; retaining `true`'s
+    /// null in the capture made it a second element, and [`reduce_captured`] joins elements with a
+    /// newline — so the substitution silently gained a leading blank line, or a trailing one for
+    /// `$(echo a; true)`, depending on where the command that produced nothing happened to sit.
+    /// The status such a command reported is unaffected: it travels through `last_status`, not
+    /// through the capture.
     fn emit(&mut self, result: CommandResult) {
-        if let Some(capture) = self.captures.last_mut() {
-            capture.push(result);
+        if result.value.is_null() {
             return;
         }
-        if result.value.is_null() {
+        if let Some(capture) = self.captures.last_mut() {
+            capture.push(result);
             return;
         }
         let text = display(&result.value);
@@ -513,14 +526,10 @@ impl Evaluator<'_> {
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step()?;
         // A function body inherits the value piped into the call, offered to the first command of
-        // each pipeline in the body. It is cloned rather than consumed: consuming it would let a
+        // each pipeline in the body. It is shared rather than consumed: consuming it would let a
         // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
         // before `cat` could see it, which is the same class of silent data loss as dropping it.
-        let mut input: Option<Value> = self
-            .frames
-            .last()
-            .and_then(|frame| frame.stdin.as_ref())
-            .cloned();
+        let mut input: Option<Rc<Value>> = self.frames.last().and_then(|frame| frame.stdin.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
 
@@ -530,9 +539,15 @@ impl Evaluator<'_> {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
                     if piped {
-                        input = Some(result.value.clone());
+                        // Only the terminal command's result is ever read, and the terminal
+                        // command is by construction never piped — so an intermediate value moves
+                        // into the next stage instead of being copied into it and then dropped.
+                        // Without this `cap big | jq . | grep x` deep-copies the payload per stage.
+                        last = CommandResult::status(result.status);
+                        input = Some(Rc::new(result.value));
+                    } else {
+                        last = result;
                     }
-                    last = result;
                 }
             }
         }
@@ -553,7 +568,7 @@ impl Evaluator<'_> {
     fn execute_command(
         &mut self,
         command: &SimpleCommand,
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
@@ -622,7 +637,7 @@ impl Evaluator<'_> {
                         self.restore_all(restore);
                         return Err(limit.into());
                     }
-                    Some(value)
+                    Some(Rc::new(value))
                 }
                 Err(failure) => {
                     self.restore_all(restore);
@@ -710,7 +725,7 @@ impl Evaluator<'_> {
     fn run_argv(
         &mut self,
         argv: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
@@ -767,7 +782,7 @@ impl Evaluator<'_> {
         command: &str,
         arguments: &[String],
         resolution: Option<Resolution>,
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
@@ -794,7 +809,11 @@ impl Evaluator<'_> {
                         curl_capability: self.curl_capability.as_deref(),
                         allow_clock: self.allow_clock,
                     };
-                    builtin.run(&mut context, arguments, input)
+                    // The one place a piped value has to become owned. A pipeline stage's own
+                    // output is held by nobody else and moves straight through; a function frame's
+                    // stdin is shared with the frame, so only that case copies — and only for the
+                    // commands that actually reach for input.
+                    builtin.run(&mut context, arguments, own(input))
                 };
                 match outcome {
                     Ok(result) => Ok(Executed::Result(result)),
@@ -991,7 +1010,7 @@ impl Evaluator<'_> {
         &mut self,
         name: &str,
         arguments: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(body) = self.functions.get(name).cloned() else {
@@ -1051,9 +1070,9 @@ impl Evaluator<'_> {
     fn run_xargs(
         &mut self,
         arguments: &[String],
-        input: Option<Value>,
+        input: Option<Rc<Value>>,
     ) -> Result<Executed, FatalError> {
-        let plan = match xargs::plan(arguments, input.as_ref()) {
+        let plan = match xargs::plan(arguments, input.as_deref()) {
             Ok(plan) => plan,
             Err(failure) => {
                 let status = self.absorb(failure)?;
@@ -1334,6 +1353,17 @@ impl Evaluator<'_> {
             }
         })
     }
+}
+
+/// Materializes a piped value for a command that consumes it by value.
+///
+/// Piped values travel as [`Rc`] so that offering one costs a refcount rather than a deep copy of
+/// whatever a capability returned. This is where that ends: a stage's own output is held by nobody
+/// else and moves through untouched, while a function frame's stdin is shared with the frame and
+/// every later pipeline in its body, so only that case copies — and only for a command that
+/// actually reaches for input.
+fn own(input: Option<Rc<Value>>) -> Option<Value> {
+    input.map(Rc::unwrap_or_clone)
 }
 
 /// Inverts a pipeline status for a leading `!`, collapsing every failure to plain success.

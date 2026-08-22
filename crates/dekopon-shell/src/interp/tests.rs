@@ -208,6 +208,28 @@ fn functions_participate_in_pipelines_in_both_directions() {
 }
 
 #[test]
+fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
+    // The frame's stdin is shared, not consumed, so each pipeline in a body is offered the same
+    // value however many statements precede it and whether or not they read it.
+    assert_eq!(
+        output("g() { cat; cat; }\necho payload | g"),
+        "payload\npayload"
+    );
+    assert_eq!(
+        output("g() { true; echo first; cat; }\necho payload | g"),
+        "first\npayload"
+    );
+    // Structure survives being handed from stage to stage rather than copied into each one.
+    assert_eq!(output(r#"echo.echo --a 1 --b two | jq '.b' | cat"#), "two");
+    assert_eq!(
+        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; echo.echo --a 1 --b 2 | g"#),
+        "1\n2"
+    );
+    // A here-document still replaces whatever a pipe would have supplied.
+    assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
+}
+
+#[test]
 fn prefix_assignments_are_transient_and_applied_after_expansion() {
     // `x=new echo "[$x]"` must print the *old* value and must not outlive the command.
     assert_eq!(
@@ -281,6 +303,25 @@ fn diagnostics_inside_a_substitution_still_reach_the_output() {
         "{}",
         outcome.output
     );
+}
+
+#[test]
+fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
+    // Outside a capture, a command that produced no value writes nothing. Inside one it used to
+    // become an element of the captured stream, and a capture joins its elements with a newline —
+    // so `true` contributed a blank line whose position depended only on where it sat. bash prints
+    // `a` for both of these.
+    assert_eq!(output(r#"x=$(true; echo a); echo "[$x]""#), "[a]");
+    assert_eq!(output(r#"x=$(echo a; true); echo "[$x]""#), "[a]");
+    // A command that selected nothing is the same case: `grep` with no match produces no value.
+    assert_eq!(
+        output(r#"x=$(echo hi | grep zz; echo a); echo "[$x]""#),
+        "[a]"
+    );
+    // Real output is still joined line by line, and the status a null-valued command reported
+    // still reaches `$?`, because it travels through `last_status` rather than the capture.
+    assert_eq!(output(r#"x=$(echo a; echo b); echo "[$x]""#), "[a\nb]");
+    assert_eq!(output("x=$(echo a; false); echo $?"), "1");
 }
 
 #[test]

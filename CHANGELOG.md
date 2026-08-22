@@ -169,6 +169,18 @@ All notable changes to Dekopon are documented here. The format is based on
 - Script traces now open one `shell.script` span per run carrying the whole run's command totals,
   and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
   one span per step.
+- A piped value now moves from one pipeline stage to the next and is shared with a function body's
+  statements rather than deep-copied for each of them, and `grep` no longer copies every input line
+  it tests.
+- Command-word and namespace resolution now ask `CapabilityInvoker` membership questions
+  (`has_command_word`, `grants_namespace`) instead of materializing, sorting, and deduplicating both
+  session legs' capability and command-word lists for every command a script runs. Resolution order
+  is unchanged.
+- `jq` reuses one filter worker per thread instead of spawning and joining a thread per call, and
+  values cross that boundary directly rather than through JSON text on each side. A filter output
+  JSON cannot represent — `nan`, `infinite`, a byte string, a non-string object key, or nesting
+  past 128 containers — is still refused, now by name rather than as a parse error, and a float no
+  longer loses its last bit to the round trip.
 
 ### Fixed
 
@@ -181,6 +193,9 @@ All notable changes to Dekopon are documented here. The format is based on
   being read as an end anchor plus a stray backslash.
 - A command substitution now honors a suppressed trailing newline, so `v=$(printf '%s' a; printf
   '%s' b)` is `ab` rather than `a\nb`.
+- A command that produces no value no longer contributes a blank line to a command substitution, so
+  `$(true; echo a)` and `$(echo a; true)` are both `a` rather than gaining a leading or trailing
+  newline.
 - A capabilities answer now costs one Cedar pass instead of two. The capability listing and the
   command words are derived from a single authorized constraint-set filter, `capability_view`, used
   by the readiness probe's `capabilities`, `capabilitiesFor`, `capabilitiesForChat`, and the startup

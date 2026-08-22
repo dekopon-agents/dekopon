@@ -153,12 +153,39 @@ pub trait CapabilityInvoker {
         self.granted().iter().any(|granted| granted == capability)
     }
 
+    /// Reports whether this session holds any capability in one provider namespace.
+    ///
+    /// Asked only about a word that is *not* granted, to tell "the model typed nonsense" from "the
+    /// model keeps reaching for something we never granted". The default scans
+    /// [`CapabilityInvoker::granted`]; override it when a cheaper lookup exists.
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.granted().iter().any(|granted| {
+            granted
+                .split('.')
+                .next()
+                .is_some_and(|candidate| candidate == namespace)
+        })
+    }
+
     /// Returns the command words loaded providers contribute, for dispatch and the prompt.
     ///
     /// Filtered by the embedder to providers this session already holds a grant on, so a principal
     /// with no `gh.*` grant never sees the word and never reaches its rewrite.
     fn command_words(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Reports whether one word is a command word a loaded provider contributed.
+    ///
+    /// This is the membership test [`CapabilityInvoker::is_granted`] already provides for
+    /// capabilities, and it is asked of *every* command word a script executes — a loop running
+    /// thousands of commands asks it thousands of times. The default builds and scans
+    /// [`CapabilityInvoker::command_words`]; override it when a cheaper lookup exists, because
+    /// materializing that list per command is what this exists to avoid.
+    fn has_command_word(&self, word: &str) -> bool {
+        self.command_words()
+            .iter()
+            .any(|candidate| candidate == word)
     }
 
     /// Rewrites one provider command word's argv into a capability proposal.
@@ -325,11 +352,15 @@ pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
 /// Returns how many abandoned `jq` filter workers are still running in this process.
 ///
 /// jaq offers no interruption point, so a filter that produces no output at all — `jq 'def f: f;
-/// f'` — cannot be stopped when its script's deadline passes. Its thread is abandoned and spins
+/// f'` — cannot be stopped when its script's deadline passes. Its worker is abandoned and spins
 /// until the process exits. A filter that produces output stops at its next one, so this counter
 /// falls back to zero on its own; what stays is the non-terminating kind, and each one is a core
 /// this process will never get back. `jq` refuses to start new filters once too many have
 /// accumulated.
+///
+/// Only abandoned workers are counted, and only they are threads this process cannot reclaim. An
+/// ordinary filter is served by the worker its thread already has, which is reused for the next
+/// one and released when that thread exits.
 ///
 /// A long-lived embedder should surface this as a gauge. A one-shot runner can ignore it: the
 /// process is about to exit anyway.

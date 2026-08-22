@@ -19,6 +19,8 @@
 //! more often part of a hostname, filename, or JSON path than a wildcard, and reading it literally
 //! can only ever match *less* than the regex would — never something the script did not ask for.
 
+use std::borrow::Cow;
+
 use crate::builtins::CommandFailure;
 
 pub(crate) mod cut;
@@ -132,12 +134,17 @@ impl Pattern {
     }
 
     /// Reports whether one line matches.
+    ///
+    /// The common path borrows. Only `-i` needs a new string, because only case folding changes the
+    /// bytes being compared; copying every line for the other three quarters of the matrix bought
+    /// nothing and made `grep` allocate once per line of its input.
     pub(crate) fn matches(&self, line: &str) -> bool {
         let candidate = if self.ignore_case {
-            line.to_lowercase()
+            Cow::Owned(line.to_lowercase())
         } else {
-            line.to_owned()
+            Cow::Borrowed(line)
         };
+        let candidate: &str = &candidate;
         match (self.anchored_start, self.anchored_end) {
             (true, true) => candidate == self.needle,
             (true, false) => candidate.starts_with(&self.needle),

@@ -50,7 +50,7 @@ hmac = "0.13.0"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 jaq-core = "3.1.0"
-jaq-json = "2.0.1"
+jaq-json = { version = "2.0.1", features = ["serde"] }
 jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
