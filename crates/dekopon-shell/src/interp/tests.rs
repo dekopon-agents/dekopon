@@ -603,7 +603,6 @@ fn ambient_authority_commands_are_rejected_by_name() {
 fn subshells_here_strings_and_process_substitution_are_rejected() {
     for (script, expected) in [
         ("(echo hi)", "subshells"),
-        ("{ echo hi; }", "brace command groups"),
         ("cat <<<\"$x\"", "here-string"),
         ("diff <(echo a) b", "process substitution"),
         ("cat < file", "input redirection"),
@@ -852,6 +851,82 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#
         ),
         "[one two]"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Compound commands as pipeline stages
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_compound_command_can_be_a_pipeline_stage() {
+    // The shape this whole change exists for. `cat` inside the loop body reads the value piped
+    // into the loop, which is the same rule a function body already followed.
+    assert_eq!(
+        output(r#"echo.echo --a 1 | while [ -n "$(cat | jq -r .a)" ]; do echo saw; break; done"#),
+        "saw"
+    );
+    assert_eq!(
+        output("echo.echo --a 1 | if [ $(cat | jq -r .a) -eq 1 ]; then echo yes; else echo no; fi"),
+        "yes"
+    );
+    assert_eq!(
+        output(
+            "echo.echo --a 1 --b 2 | case $(cat | jq -r .a) in 1) echo one ;; *) echo other ;; esac"
+        ),
+        "one"
+    );
+}
+
+#[test]
+fn a_piped_compound_stage_keeps_the_variables_it_assigns() {
+    // bash runs this in a subshell and throws the assignment away, which is the single most
+    // notorious trap in the language. There are no subshells here, so it simply works — and a
+    // model writing the obvious thing gets the obvious result.
+    assert_eq!(
+        output(
+            r#"total=0
+echo.echo --a 7 | while [ $total -eq 0 ]; do total=$(cat | jq -r .a); done
+echo $total"#
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn a_compound_stage_feeding_a_pipe_collects_everything_it_emitted() {
+    // Each statement inside emits separately, so without collecting them the next stage would see
+    // only the last one.
+    assert_eq!(output("{ echo a; echo b; } | wc -l"), "2");
+    assert_eq!(output("for x in 1 2 3; do echo $x; done | wc -l"), "3");
+    assert_eq!(output("{ echo a; echo b; } > buf\ncat buf | wc -l"), "2");
+}
+
+#[test]
+fn a_brace_group_runs_in_the_current_scope_and_is_one_branch() {
+    // The idiom braces exist for.
+    let outcome = run("nosuchcmd.here || { echo handled; exit 3; }\necho unreachable");
+    assert_eq!(outcome.exit_code.get(), 3);
+    assert!(outcome.output.contains("handled"), "{outcome:?}");
+    assert!(!outcome.output.contains("unreachable"), "{outcome:?}");
+
+    // No subshell, so an assignment inside is still an assignment outside.
+    assert_eq!(output("{ x=inside; }\necho $x"), "inside");
+    // A group reports the status of its last command, like bash.
+    assert_eq!(output("{ true; false; } && echo yes || echo no"), "no");
+}
+
+#[test]
+fn an_empty_or_unterminated_group_is_a_parse_error_naming_itself() {
+    assert!(run("{ }").output.contains("empty `{ }` group"));
+    assert!(run("{ echo hi").output.contains("expected `}`"));
+}
+
+#[test]
+fn a_compound_stage_carries_its_own_redirections() {
+    let outcome = run("{ nosuchcmd.one; nosuchcmd.two; } 2> log\necho ---\ncat log | wc -l");
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert_eq!(after.trim(), "2");
 }
 
 // ---------------------------------------------------------------------------

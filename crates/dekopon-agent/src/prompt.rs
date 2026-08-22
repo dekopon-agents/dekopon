@@ -1445,7 +1445,9 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
+`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `{ ...; }` groups — all usable as \
+pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
+because nothing here forks — `break`/`continue`, functions \
 with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, `${#NAME}`, \
 `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
