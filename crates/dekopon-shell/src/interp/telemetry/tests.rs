@@ -23,7 +23,7 @@ use tracing_subscriber::{
 
 use crate::{Interpreter, Limits, ScriptOutcome, interp::tests::Fixture};
 
-use super::{CONTROL_WORDS, WITHHELD};
+use super::{CONTROL_WORDS, MAX_TRACED_COMMANDS, SCRIPT_SPAN, WITHHELD};
 
 /// Serializes the tests whose expectations depend on the process-global payload switch.
 ///
@@ -439,7 +439,71 @@ fn command_spans_nest_under_the_callers_active_span() {
         .iter()
         .find(|span| span.span.as_deref() == Some("shell.command"))
         .expect("a command span");
-    assert_eq!(span.parents, vec!["caller.enclosing".to_owned()]);
+    // The script's own span sits between the command and the caller's: the totals need a home that
+    // costs the same whatever the script did, and the caller's span is not this crate's to write to.
+    assert_eq!(
+        span.parents,
+        vec![SCRIPT_SPAN.to_owned(), "caller.enclosing".to_owned()]
+    );
+}
+
+#[test]
+fn one_script_span_carries_the_totals_for_the_whole_run() {
+    let _serialized = serialized();
+    let telemetry = capture("greet() { echo hi; }\ngreet\nnosuchcommand\necho.echo --message two");
+
+    let script = telemetry
+        .spans
+        .iter()
+        .find(|span| span.span.as_deref() == Some(SCRIPT_SPAN))
+        .expect("one script span");
+    // `greet`, the `echo` inside it, `nosuchcommand`, and the capability call.
+    assert_eq!(script.field("shell.script.commands"), Some("4"));
+    assert_eq!(script.field("shell.script.commands_traced"), Some("4"));
+    assert_eq!(script.field("shell.script.capability_commands"), Some("1"));
+    assert_eq!(script.field("shell.script.failed_commands"), Some("1"));
+
+    let scripts = telemetry
+        .spans
+        .iter()
+        .filter(|span| span.span.as_deref() == Some(SCRIPT_SPAN))
+        .count();
+    assert_eq!(scripts, 1, "one span per run, not one per statement");
+}
+
+#[test]
+fn a_loop_heavy_script_stops_exporting_a_span_per_command() {
+    let _serialized = serialized();
+    // A model-authored `while` loop is bounded only by the step budget, so a span per command word
+    // is tens of thousands of exported spans from a single tool call. Past the cap the spans drop
+    // to DEBUG — the capture layer here is level-agnostic, so what it proves is the accounting: the
+    // script span still reports every command, and only the first `MAX_TRACED_COMMANDS` are traced.
+    let commands = MAX_TRACED_COMMANDS + 40;
+    let telemetry = capture(&format!(
+        "i=0\nwhile [ $i -lt {commands} ]; do echo x; i=$(( i + 1 )); done"
+    ));
+
+    let script = telemetry
+        .spans
+        .iter()
+        .find(|span| span.span.as_deref() == Some(SCRIPT_SPAN))
+        .expect("one script span");
+    assert_eq!(
+        script.field("shell.script.commands_traced"),
+        Some(MAX_TRACED_COMMANDS.to_string().as_str())
+    );
+    let total = script
+        .field("shell.script.commands")
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("a command total");
+    assert!(
+        total > MAX_TRACED_COMMANDS,
+        "the loop must outrun the cap for this to prove anything: {total}"
+    );
+    // The totals survive the cap; the per-command detail past it does not have to. The one failure
+    // is the `[` that finally reports false and ends the loop, counted like any other non-zero
+    // status — the counters describe the whole run, including the part with no spans left.
+    assert_eq!(script.field("shell.script.failed_commands"), Some("1"));
 }
 
 #[test]

@@ -9,6 +9,10 @@ metadata:
     # Durable provider data is unusable without its separately operator-managed namespace key and
     # is never silently deleted with a Helm release.
     helm.sh/resource-policy: keep
+    # Helm's annotation says nothing to a GitOps controller. Argo CD syncing with prune deletes any
+    # live object the rendered desired state stops containing, so the same retention has to be
+    # spelled in its vocabulary: Prune=false for the sync, Delete=false for the Application itself.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
 spec:
   accessModes:
     {{- toYaml .Values.providerStorage.accessModes | nindent 4 }}

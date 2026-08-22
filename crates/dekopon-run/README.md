@@ -11,7 +11,7 @@ One-shot direct execution for read-only Dekopon WebAssembly providers plus an ex
 - `dekopon-run chat` holds a conversation with a running [`dekopond`](../dekopond/README.md) over its local development socket. It loads no component and runs no model or tool loop of its own: unlike `prompt`, which runs that loop in process, `chat` sends one JSON line per message and prints the daemon's reply.
 - `dekopon auth chatgpt` manages Dekopon's isolated subscription login.
 - `--provider` takes a component file or a directory of them; a directory loads every `*.wasm` directly inside it, in filename order. Load order decides route-table construction, so the sort is what keeps repeated runs over one directory identical. Unlike `dekopon-brokerd`, the runner applies no ownership check: it loads components the invoking user already owns, under their own authority.
-- `--trace <PATH>` exports Chrome/Perfetto-compatible spans without inputs or outputs.
+- `--trace <PATH>` exports Chrome/Perfetto-compatible spans without inputs or outputs, unless `--otel-telemetry-payloads true` opts that file in like any other sink.
 - `--otlp-endpoint <URL>` exports correlated OTLP/HTTP protobuf traces and audit-safe lifecycle logs; standard OTLP header environment variables carry receiver authentication and routing.
 
 Every **direct** provider call uses a fresh bounded Wasmtime store with no WASI or custom imports. The checked-in component is generated from the Rust [`Provider`](../dekopon-provider-sdk/README.md) implementation at [`../../examples/providers/echo/src/lib.rs`](../../examples/providers/echo/src/lib.rs):

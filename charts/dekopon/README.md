@@ -3,13 +3,19 @@
 A Helm chart that runs `dekopon-brokerd` and `dekopond` as one pod on a single-node arm64 k3s
 cluster.
 
-**Status: current, but unapplied and unpublished.** Every claim below about rendered YAML, file
-ownership, and file modes was verified locally. Nothing in this chart has been installed on a
-cluster; no released container image exists for it to pull yet, and no chart has been pushed to
-GHCR — see [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+**Status: published, but never applied to a cluster.** Those are two separate claims and only one of
+them limits you.
 
-The chart is published to GHCR over OCI on `dekopon-chart-*` tags and is consumed from ArgoCD by
-registry path, not by Git path. Both GHCR packages are public.
+*Published* is settled. `dekopon-chart-0.1.0` shipped the chart to
+`oci://ghcr.io/dekopon-agents/charts/dekopon:0.1.0`, and application tags from `v0.4.0` onward
+publish the container image it pulls, so `helm install` from the registry has everything it needs.
+The chart is consumed from ArgoCD by registry path, not by Git path, and both GHCR packages are
+public. See [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+
+*Never applied* is the real caveat. Every claim below about rendered YAML, file ownership, and file
+modes was verified against `helm template` and the CI render checks, not against a running cluster.
+Nothing here has been installed on a live Kubernetes API server, so treat the manifests as reviewed
+rather than as field-proven.
 
 Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/dekopon/blob/main/crates/dekopon-brokerd/README.md) and
 [`docs/dekopond.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/dekopond.md) first. The chart places files and sets
@@ -18,8 +24,9 @@ is the only description of what goes in them.
 
 ## What it deploys
 
-One `Deployment`, `replicas: 1`, `strategy: Recreate`, no `Service` and no `Ingress` — neither
-daemon serves HTTP or binds a TCP port, so there is nothing to expose.
+One `Deployment`, `replicas: 1`, `strategy: Recreate`, and no chart-owned `Ingress`. An opt-in
+ClusterIP `Service` exposes only a configured gateway webhook port for operator-owned exact-path
+routing; it is disabled by default. The broker never receives a TCP surface.
 
 | Container | Kind | Runs |
 |---|---|---|
@@ -38,9 +45,10 @@ both directions. `dekopond` probes the broker once at startup and exits non-zero
 does not answer, so a plain second container would crash-loop its way to a working state; a sidecar
 with a startup probe means Kubernetes does not start `dekopond` at all until the broker answers a
 real request. Termination runs the other way — the gateway drains first, the broker second — which
-is the order the audit chain wants. This needs Kubernetes 1.29 or newer, and `Chart.yaml` declares
-`kubeVersion: ">=1.29.0-0"` so an older cluster refuses the install instead of deadlocking on an
-init container that never exits.
+is the order the audit chain wants, and the reason the pod's grace is a sum rather than a maximum;
+see [Draining takes both graces, in sequence](#draining-takes-both-graces-in-sequence). This needs
+Kubernetes 1.29 or newer, and `Chart.yaml` declares `kubeVersion: ">=1.29.0-0"` so an older cluster
+refuses the install instead of deadlocking on an init container that never exits.
 
 ## Why an init container, and not a volume mount
 
@@ -146,22 +154,62 @@ policy exposes to this peer. It is evaluated from the constraint catalog and the
 appends **no audit record**, so probing does not consume the audit log's bounded record budget.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
-  component through Cranelift at every start and there is no compilation cache, and it binds the
-  socket only after that work is done, so "the socket answers" is exactly "fully started". The
+  component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
+  started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
+  a restart read compiled code back from disk instead of recompiling, but the cold path is still
+  Cranelift and the probe budget still has to cover it. The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
   against durable audit state is the worst thing this chart can produce.
-- **`readinessProbe`**, 30 s period. It gates nothing — there is no Service — but it is free and it
-  is the difference between `kubectl get pod` saying `1/1` and saying something true.
-- **No `livenessProbe`.** Nothing routes traffic here, so a restart fixes nothing a human would not
-  fix better, and it would kill a broker mid-invocation.
-- **No gateway probes.** `dekopond` binds nothing and already probes the broker once at startup,
-  exiting non-zero when it does not answer. "Is it healthy" and "is the process running" are the
-  same question.
+- **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
+  webhook Service is enabled, prevents traffic while the broker is unavailable.
+- **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
+  on the configured webhook port. It fails closed when `dekopond.yaml` binds loopback, names a
+  different port, or does not configure an inbound listener.
+- **No `livenessProbe`.** An automatic restart could kill a broker mid-invocation or lose an
+  acknowledged in-memory webhook delivery. Process failure and readiness already remain visible.
 
 One consequence worth knowing: the probe runs `dekopon-run`, which reads
 `OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
 container, or every probe exports a trace. `OTEL_EXPORTER_OTLP_HEADERS` is safe and is what the
 broker's own telemetry block needs.
+
+## Draining takes both graces, in sequence
+
+The sidecar ordering that makes startup work also makes shutdown serial. The kubelet stops the
+gateway's container first and only starts stopping the broker sidecar once that container is gone,
+so the pod's `terminationGracePeriodSeconds` has to cover **both** drains added together — not the
+larger of the two. `dekopond` drains in-flight sessions for its own `shutdownGraceMs`,
+`dekopon-brokerd` then drains connections for `serverLimits.shutdownGraceMs`, and both default to
+`120000`.
+
+Whatever is still draining when the pod's grace expires is `SIGKILL`ed. For the gateway that
+abandons a model turn somebody is waiting on; for the broker it lands mid-invocation and
+mid-audit-append, which is the one place this chart cannot promise a clean failure.
+
+`terminationGracePeriodSeconds` therefore defaults to **270** — 120 + 120 +
+`drainBudget.bufferSeconds` — and the chart asserts the arithmetic at template time. A grace shorter
+than the two configured graces plus the buffer is a refused `helm template` naming both numbers, not
+a kill nobody notices until a record is torn:
+
+```console
+$ helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml \
+    --set terminationGracePeriodSeconds=180
+Error: ... terminationGracePeriodSeconds is 180, but the containers stop in sequence: dekopond
+drains for 120000 ms and then dekopon-brokerd drains for 120000 ms ... That needs 270 seconds.
+```
+
+The buffer — 30 s by default — is everything the two graces do not name: `SIGTERM` delivery and the
+kubelet's per-container bookkeeping, and each daemon's telemetry flush, since an OTLP exporter can
+burn its whole `exportTimeoutMs` against a collector that is itself restarting.
+
+The chart reads `shutdownGraceMs` out of an **inline** config. An `existingSecret` is opaque to it,
+and an inline config may leave the key out and take the daemon's default, so
+`drainBudget.assumedBrokerShutdownGraceMs` and `drainBudget.assumedGatewayShutdownGraceMs` are what
+the assertion believes in those cases. They configure nothing. If your Secret says something other
+than `120000`, correct them there or the arithmetic is guarding a number you are not running.
+
+None of this makes shutdown grace-window-dependent: a longer window is not a durability mechanism,
+and every append, checkpoint and rename still has to be crash-safe on its own.
 
 ## The ChatGPT credential is seeded once
 
@@ -298,6 +346,23 @@ refusal and `ENOSPC` in the middle of an append is not. If you raise `auditMaxLi
 
 `serverLimits` is all-or-nothing: when the section is present every field is required.
 
+### Size `maxReplayIds` with it
+
+`auditMaxRecords` is not the only bound that ends in a permanent refusal, and it is not the first
+one a busy deployment reaches. The broker's replay ledger holds `brokerLimits.maxReplayIds`
+invocation identifiers (stock **100 000**), never evicts, and is restored from durable history at
+startup — one entry per Decision event — so it is cumulative across restarts exactly like the audit
+file. A *denial* costs one audit record and one full ledger slot, while an executed invocation costs
+two audit records and one slot, so with the stock ledger against `auditMaxRecords: 200000` a
+denial-heavy history exhausts the ledger at half the audit budget, before the designed
+`AuditError::Full` refusal ever fires.
+
+Either bound reached answers every client `capacity-exhausted` and logs
+`broker_capacity_exhausted`. Neither is recoverable by retry or by restart. Set `maxReplayIds` to at
+least `auditMaxRecords`. The ledger holds one bounded identifier string per entry, so matching
+200 000 costs tens of MiB of resident memory — cheaper than a broker that refuses every invocation
+until someone edits a values file and rolls the pod.
+
 ## Storage, uninstall, and recovery
 
 The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it. This is not
@@ -306,6 +371,13 @@ of the verified chain, makes `dekopon-brokerd` fail closed and demand explicit o
 deleting one of the two files to dodge that is precisely the thing the design refuses, and deleting
 both together is a rollback local state cannot detect. Move the volume deliberately, with both files,
 or not at all.
+
+It carries `argocd.argoproj.io/sync-options: Prune=false,Delete=false` for the same reason, because
+Helm's annotation means nothing to a GitOps controller. Argo CD syncing with `prune: true` deletes
+any live object the rendered desired state stops containing, and this claim stops being rendered the
+moment somebody sets `state.existingClaim` or the chart source fails to resolve. `Prune=false`
+covers the sync, `Delete=false` covers the `Application` itself being deleted, and Argo reads both
+off the live object. Both annotations follow `state.keepOnUninstall`.
 
 `state.existingClaim` points the pod at a claim you manage. The init container still takes its root
 to `65532:0700`.
@@ -339,15 +411,19 @@ They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1`
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
 force an application release, and an application release should not republish an unchanged chart.
 
-`appVersion` is `0.4.0`, the **first release the container-image workflow runs for**. `v0.3.0`
-predates that workflow and no image was ever published for it, so setting `appVersion: 0.3.0` would
-ship a chart whose default pulls nothing.
+`appVersion` is `0.9.0`, the current application release. It is not decorative: `dekopon.labels`
+renders it as `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a
+cluster answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running,
+and every dashboard and alert built on that label reporting the same wrong number. It has to move in
+the application's release-prep commit, alongside the workspace version. The floor is `v0.4.0`:
+`v0.3.0` and earlier predate the container-image workflow and have no image at all, so an
+`appVersion` below that would ship a chart whose default pulls nothing.
 
 The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.4.0
+ghcr.io/dekopon-agents/dekopon:v0.9.0
 ```
 
 There is no `latest`. Prefer `image.digest` once a release exists; it pins across the
@@ -379,9 +455,10 @@ The published coordinates are:
 oci://ghcr.io/dekopon-agents/charts/dekopon
 ```
 
-**Nothing has been published yet.** Like the container image, this path is unproven until the first
-`dekopon-chart-*` tag exists. The packaging half is proven — CI packages the chart on every run and
-diffs the archive's rendered output against the source tree's — but no push to GHCR has happened.
+Chart `0.1.0` is published there. The packaging half is checked on every CI run, which packages the
+chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.1.0`
+tag ran the push. What remains unproven is the *pull*: no cluster has installed the published chart,
+so a first install should be treated as the first exercise of this path.
 
 ### Both GHCR packages are public, and that is a manual step
 
@@ -455,6 +532,11 @@ stringData:
 
 No credential fields: the package is public and the pull is anonymous.
 
+One more thing this chart does for you: the retained claims carry
+`argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so `syncPolicy.automated.prune: true`
+cannot take the audit chain when the claim stops being rendered. See
+[Storage, uninstall, and recovery](#storage-uninstall-and-recovery).
+
 ## Configuration values
 
 Each of the four operator-supplied files is either inline, in which case the chart writes a Secret,
@@ -475,7 +557,8 @@ Use `existingSecret` for credentials. An inline value is stored in the release, 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, or `constraintSets` with no corresponding value supplied;
-or `paths.catalogDir` is inside `paths.configDir`. When provider storage is enabled, its root and
+`paths.catalogDir` is inside `paths.configDir`; or `terminationGracePeriodSeconds` is shorter than
+the two drains it has to cover in sequence. When provider storage is enabled, its root and
 key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with
 every chart-owned mount (`config`, runtime, audit state, catalog, `/tmp`, and both projected
 configuration/key sources); a nested mount would otherwise shadow or destructively replace those
@@ -489,9 +572,15 @@ there so you can install the chart and watch a broker become ready before you gi
 matters. Replace it. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
 model endpoint, and an agent catalog, and the chart can invent none of them.
 
+`gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
+The chart intentionally does not create an Ingress: the operator must route only the configured
+callback path and terminate public TLS outside the pod. A Kubernetes Service cannot reach loopback,
+so the corresponding transport must bind `0.0.0.0:<gateway.service.port>`. The TCP readiness probe
+keeps the Service endpoint unavailable when the configuration and chart port disagree.
+
 ## Install
 
-From the registry, once a `dekopon-chart-*` tag has been published and the package made public:
+From the registry:
 
 ```console
 helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.1.0
@@ -524,13 +613,24 @@ own volume. It may post one review comment and has no approval, request-changes,
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout, but no
   `kubectl apply` has happened.
-- No image exists to pull yet. The daemons have never been started from this configuration.
-- **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
-  `chart-publish.yml` has never run and nothing exists at
-  `oci://ghcr.io/dekopon-agents/charts/dekopon`. What *is* proven is packaging: CI packages the
-  chart, lints the archive, and diffs the archive's rendered output against the source tree's for
-  both value sets, so the tarball that would be pushed is known to be complete and to render
-  identically.
+- The daemons have never been started from this configuration. The image an empty `image.tag`
+  resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every release from
+  `v0.4.0` — but nothing here has watched one boot.
+- `dekopon-chart-0.1.0` is published at `oci://ghcr.io/dekopon-agents/charts/dekopon` and that
+  version is now immutable, so the working tree is ahead of the registry: `appVersion` and every
+  chart change since sit under `[Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md) until a human
+  cuts the next `dekopon-chart-*` tag. Packaging itself is proven on every CI run — the chart is
+  packaged, the archive linted, and the archive's rendered output diffed against the source tree's
+  for both value sets.
+- The daemons have never been started from this configuration. The images exist — application tags
+  from `v0.4.0` onward publish `ghcr.io/dekopon-agents/dekopon:v<VERSION>` — but no pod has run one
+  from these manifests.
+- **The pull path is unproven.** `dekopon-chart-0.1.0` ran `chart-publish.yml` and chart `0.1.0`
+  exists at `oci://ghcr.io/dekopon-agents/charts/dekopon`, and packaging is checked continuously:
+  CI packages the chart, lints the archive, and diffs the archive's rendered output against the
+  source tree's for both value sets, so the pushed tarball is known to be complete and to render
+  identically. What has not happened is an anonymous `helm pull` or an ArgoCD sync against that
+  registry path.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a
   separate rpi-homelab change.
@@ -547,8 +647,9 @@ own volume. It may post one review comment and has no approval, request-changes,
 
 `providerStorage.enabled` creates (or mounts) a claim physically separate from `state`, mounted only
 into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
-`helm.sh/resource-policy: keep`; an existing claim remains operator-owned. Rendering fails when the
-resolved audit and provider-storage claim names are equal.
+`helm.sh/resource-policy: keep` and `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so
+neither an uninstall nor a GitOps prune takes durable provider data; an existing claim remains
+operator-owned. Rendering fails when the resolved audit and provider-storage claim names are equal.
 
 The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
 operator-managed, so uninstall cannot delete the key for retained data. The init container alone

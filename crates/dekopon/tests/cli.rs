@@ -396,18 +396,27 @@ fn chatgpt_export_refuses_to_be_quiet() {
 
 /// A name the API server would reject must fail before the credential is read, not after it has
 /// been printed and piped somewhere.
+///
+/// The dotted cases are the ones a whole-string character filter lets through: DNS-1123 applies
+/// its start/end rule to every label, not just to the first and last character of the name.
 #[test]
 fn chatgpt_export_rejects_an_invalid_secret_name() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
 
+    for name in ["Not_A_Name", "a.-b.c", "a-.b", "a..b", "-a", "a-"] {
+        let output = export(&auth_file, &["--expose-credential", "--secret-name", name]);
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(stdout(&output).is_empty(), "{name}");
+    }
+
     let output = export(
         &auth_file,
-        &["--expose-credential", "--secret-name", "Not_A_Name"],
+        &["--expose-credential", "--secret-name", "a-b.c9.d"],
     );
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stdout(&output).is_empty());
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).contains("a-b.c9.d"));
 }
 
 /// The command's own help must say that it prints credential material.

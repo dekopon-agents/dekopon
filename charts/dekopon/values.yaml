@@ -7,9 +7,9 @@
 
 image:
   repository: ghcr.io/dekopon-agents/dekopon
-  # Empty means "v" + .Chart.AppVersion. The published tag is the Git tag, so it carries the v.
-  # There is no `latest` and there is no image for v0.3.0 — the image workflow landed after that
-  # release. v0.4.0 is the first release it runs for, which is what appVersion names.
+  # Empty means "v" + .Chart.AppVersion, which names the application release this chart deploys.
+  # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
+  # image for v0.3.0 or earlier — the image workflow landed after that release.
   tag: ""
   # Prefer a digest once one exists; it pins across the arm64/amd64 index.
   digest: ""
@@ -303,6 +303,15 @@ gateway:
       value: info
   envFrom: []
 
+  # Optional ClusterIP target for an inbound webhook listener such as WhatsApp Cloud API. This
+  # exposes only a pod port inside the cluster; put an exact-path Traefik route and public TLS
+  # boundary in a separate operator-owned manifest. dekopond.yaml must bind 0.0.0.0 at this same
+  # port—a loopback bind is unreachable from a Kubernetes Service. No Ingress is chart-created.
+  service:
+    enabled: false
+    port: 9080
+    annotations: {}
+
 # ---------------------------------------------------------------------------------------------
 # Audit state
 # ---------------------------------------------------------------------------------------------
@@ -348,9 +357,32 @@ volumeSizes:
   runtime: 1Mi
   tmp: 16Mi
 
-# dekopond's own shutdownGraceMs defaults to 120000 and the containers terminate in order —
-# gateway first, then the broker sidecar — so this has to cover both drains end to end.
-terminationGracePeriodSeconds: 180
+# ---------------------------------------------------------------------------------------------
+# Termination
+# ---------------------------------------------------------------------------------------------
+# The containers stop in SEQUENCE — the gateway's container first, then the broker sidecar — so
+# this is the SUM of both drains, not the larger of the two. dekopond drains in-flight sessions
+# for its own shutdownGraceMs and dekopon-brokerd only then drains connections for its
+# serverLimits.shutdownGraceMs; both default to 120000, so the default here is 120 + 120 +
+# drainBudget.bufferSeconds. Whichever daemon is still draining when this expires is SIGKILLed,
+# which for the broker is mid-invocation and mid-audit-append.
+#
+# The chart asserts this at template time, so lowering it without lowering a shutdownGraceMs is a
+# refused render rather than a kill nobody sees until an audit record is torn.
+terminationGracePeriodSeconds: 270
+
+drainBudget:
+  # Seconds on top of the two drains: the kubelet's SIGTERM delivery and per-container bookkeeping,
+  # each daemon's telemetry flush (an OTLP exporter can burn its whole exportTimeoutMs against a
+  # restarting collector), and the sidecar stop that only begins once the gateway's container is
+  # gone.
+  bufferSeconds: 30
+  # What the assertion assumes when it cannot read the real value: an existingSecret is opaque to
+  # the chart, and an inline config may leave shutdownGraceMs out, in which case the daemon's own
+  # default applies. Both daemons default to 120000. These configure nothing — they are what the
+  # arithmetic believes, so correct them when your Secret says something else.
+  assumedBrokerShutdownGraceMs: 120000
+  assumedGatewayShutdownGraceMs: 120000
 
 nodeSelector: {}
 tolerations: []
@@ -359,5 +391,5 @@ podAnnotations: {}
 podLabels: {}
 priorityClassName: ""
 
-# No Service and no Ingress, deliberately. Neither daemon serves HTTP or listens on a TCP port;
-# the only endpoint in this chart is a Unix socket inside the pod.
+# No Ingress is chart-owned. gateway.service optionally creates only a cluster-local webhook
+# Service; the broker remains reachable solely through the Unix socket inside the pod.

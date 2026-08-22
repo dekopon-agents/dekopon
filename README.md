@@ -24,6 +24,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
   a classic/free `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat
   actions. Activity failure never changes the answer, and Stop is cooperative rather than rollback.
+- Unreleased: Slack Agent channel threads become owned per authenticated sender only after fresh
+  authorization. That sender can continue without repeating the mention, while the optional
+  `decline_chat_reply` decision lets the agent post nothing when a response would only take the
+  last word. Ambient channel history never reaches routing or inference.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
 - Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
@@ -32,6 +36,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
   durable chat memory. Memory is model-queryable only under an effective all-three grant and is
   recorded once after gateway-attested complete transport acceptance; it is never automatically
   replayed into a prompt.
+- Unreleased: a text-only Meta WhatsApp Cloud API transport with exact raw-body HMAC verification,
+  bounded process-local message-ID deduplication, `whatsapp.<wa_id>` subjects, one-attempt pinned
+  Graph API replies, and an opt-in chart ClusterIP port for exact-path Traefik routing. It adds no
+  broker authority and exposes no operational UI.
 
 New in 0.9.0 — native chat activity without moving authority:
 
@@ -156,7 +164,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.9.0` through the chart's `image.tag` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Published chart `0.1.0` retains `appVersion: 0.4.0` and is immutable; the working tree now declares `appVersion: 0.9.0`, so the next `dekopon-chart-*` release deploys `v0.9.0` by default. Until then, or to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
 
 ## Run the flagship example
 

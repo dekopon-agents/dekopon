@@ -450,10 +450,35 @@ pub struct PolicyEngine {
     policies: PolicySet,
     schema: Schema,
     entities: Entities,
+    entity_types: EntityTypes,
     authorizer: Authorizer,
     referenced_capabilities: BTreeSet<CapabilityId>,
     policy_count: usize,
     digest: String,
+}
+
+/// The constant Cedar entity type names, parsed once at construction.
+///
+/// Every request names a principal, an action, and a resource by type. `EntityTypeName::from_str`
+/// runs Cedar's full name parser, so parsing these per request would contradict this crate's
+/// startup-fixed contract for the sake of four values that never change.
+#[derive(Debug)]
+struct EntityTypes {
+    principal: EntityTypeName,
+    action: EntityTypeName,
+    provider: EntityTypeName,
+    agent: EntityTypeName,
+}
+
+impl EntityTypes {
+    fn parse() -> Result<Self, PolicyBuildError> {
+        Ok(Self {
+            principal: entity_type_name(PRINCIPAL_TYPE)?,
+            action: entity_type_name(ACTION_TYPE)?,
+            provider: entity_type_name(PROVIDER_TYPE)?,
+            agent: entity_type_name(AGENT_TYPE)?,
+        })
+    }
 }
 
 // Written by hand rather than derived: `PolicySet`'s own `Debug` renders policy source, and this
@@ -580,6 +605,7 @@ impl PolicyEngine {
                 policies,
                 schema,
                 entities,
+                entity_types: EntityTypes::parse()?,
                 authorizer: Authorizer::new(),
                 referenced_capabilities,
                 digest,
@@ -591,7 +617,7 @@ impl PolicyEngine {
     /// Decides one request; every failure path denies.
     #[must_use]
     pub fn authorize(&self, request: PolicyRequest) -> PolicyDecision {
-        let Ok(cedar_request) = self.build_request(&request) else {
+        let Ok(cedar_request) = self.build_request(request) else {
             return PolicyDecision::refused();
         };
         let response =
@@ -638,10 +664,15 @@ impl PolicyEngine {
         &self.digest
     }
 
-    fn build_request(&self, request: &PolicyRequest) -> Result<cedar_policy::Request, ()> {
-        let principal = entity_uid(PRINCIPAL_TYPE, request.principal.as_str())?;
-        let action = entity_uid(ACTION_TYPE, request.target.action())?;
-        let (resource, mut pairs) = match &request.target {
+    fn build_request(&self, request: PolicyRequest) -> Result<cedar_policy::Request, ()> {
+        let PolicyRequest {
+            principal,
+            target,
+            context,
+        } = request;
+        let action = entity_uid(&self.entity_types.action, target.action());
+        let principal = entity_uid(&self.entity_types.principal, principal.as_str());
+        let (resource, mut pairs) = match target {
             PolicyTarget::Capability {
                 provider,
                 effect,
@@ -649,7 +680,7 @@ impl PolicyEngine {
                 idempotency,
                 ..
             } => (
-                entity_uid(PROVIDER_TYPE, provider.as_str())?,
+                entity_uid(&self.entity_types.provider, provider.as_str()),
                 vec![
                     (
                         "effect".to_owned(),
@@ -665,24 +696,23 @@ impl PolicyEngine {
                     ),
                 ],
             ),
-            PolicyTarget::AgentPrompt { agent } => {
-                (entity_uid(AGENT_TYPE, agent.as_str())?, Vec::new())
-            }
+            PolicyTarget::AgentPrompt { agent } => (
+                entity_uid(&self.entity_types.agent, agent.as_str()),
+                Vec::new(),
+            ),
         };
+        // Moved, not cloned: `authorize` owns the request and nothing reads it afterwards.
         for (name, value) in [
-            ("via", request.context.via.as_ref()),
-            ("subject", request.context.subject.as_ref()),
-            ("agent", request.context.agent.as_ref()),
-            ("transportKind", request.context.transport_kind.as_ref()),
-            ("transport", request.context.transport.as_ref()),
-            ("channel", request.context.channel.as_ref()),
-            ("conversation", request.context.conversation.as_ref()),
+            ("via", context.via),
+            ("subject", context.subject),
+            ("agent", context.agent),
+            ("transportKind", context.transport_kind),
+            ("transport", context.transport),
+            ("channel", context.channel),
+            ("conversation", context.conversation),
         ] {
             if let Some(value) = value {
-                pairs.push((
-                    name.to_owned(),
-                    RestrictedExpression::new_string(value.clone()),
-                ));
+                pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
             }
         }
         let context = Context::from_pairs(pairs).map_err(|_| ())?;
@@ -732,23 +762,16 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
     Ok(renamed)
 }
 
-fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
-    let type_name = EntityTypeName::from_str(type_name).map_err(|_| ())?;
-    Ok(EntityUid::from_type_name_and_id(
-        type_name,
-        EntityId::new(id),
-    ))
+fn entity_type_name(type_name: &str) -> Result<EntityTypeName, PolicyBuildError> {
+    EntityTypeName::from_str(type_name).map_err(|source| PolicyBuildError::Entities {
+        message: format!("could not parse entity type {type_name}: {source}"),
+    })
 }
 
-/// Proves every entity a policy names is one the world declares.
-///
-/// Cedar's validator checks types, not instances: `principal == Dekopon::Principal::"typo"` is
-/// perfectly well typed and simply never matches. That is exactly the failure mode the old exact
-/// engine caught with its reachability check, so it is caught here instead — a policy naming an
-/// undeclared principal or provider refuses startup rather than becoming latent dead policy.
-///
-/// Agents are the deliberate exception: the agent catalog belongs to the gateway, so the broker
-/// declares the type and matches instances by UID without enumerating them.
+fn entity_uid(type_name: &EntityTypeName, id: &str) -> EntityUid {
+    EntityUid::from_type_name_and_id(type_name.clone(), EntityId::new(id))
+}
+
 /// Classifies every policy's entity literals against the declared world.
 ///
 /// Returns the capabilities the policy set references, plus every provider-derived name the world
@@ -762,6 +785,10 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
 /// - **Actions and providers** are derived from loaded provider manifests. An undeclared one means
 ///   that provider is not loaded, which is a legitimate state for a deployment whose policy
 ///   anticipates it. Under [`Handling::Tolerate`] it is reported and registered as a phantom.
+///
+/// **Agents are checked by neither class.** The agent catalog belongs to the gateway, so the broker
+/// declares the type and matches instances by UID without enumerating them: `Dekopon::Agent::"typo"`
+/// validates, starts cleanly, and then matches nothing, denying every session `agent-denied`.
 ///
 /// An entity type outside the Dekopon namespace is a grammar error, not an absence, and is fatal
 /// in both modes.
@@ -882,11 +909,12 @@ fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, Poli
                 .collect::<Vec<_>>(),
         ),
     ] {
+        let type_name = entity_type_name(type_name)?;
         for id in ids {
-            let uid = entity_uid(type_name, id).map_err(|()| PolicyBuildError::Entities {
-                message: format!("could not build entity {type_name}::{id:?}"),
-            })?;
-            entities.push(Entity::new_no_attrs(uid, HashSet::new()));
+            entities.push(Entity::new_no_attrs(
+                entity_uid(&type_name, id),
+                HashSet::new(),
+            ));
         }
     }
     let actions = schema
