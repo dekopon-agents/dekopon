@@ -17,24 +17,39 @@ it yet.
 ## What the credential actually is
 
 Dekopon's credential file is a single JSON document holding an access token, a refresh token, an
-expiry, and the ChatGPT account ID. Four properties of it decide the whole deployment shape.
+expiry, and the ChatGPT account ID. Five properties of it decide the whole deployment shape.
 
 **The refresh token rotates.** `refresh_credentials` posts `grant_type=refresh_token`, and
 `request_token` rejects a response that omits either token, then builds a complete replacement
 record. There is no path that keeps the old refresh token. Each refresh therefore invalidates its
 predecessor, and any copy of the file taken before that refresh is dead.
 
-**The rotated value must be persisted, or the turn fails.** `refresh_if_needed` refreshes when the
-access token is inside sixty seconds of expiry, assigns the new record, and *returns*
-`save_credentials`. A write failure is not a lost optimization that the next request retries; it is
-an error that propagates out of the model call and fails the turn. A credential the process cannot
-write back is a credential that stops working the first time its access token approaches expiry.
+**A refresh is serialized across processes.** `refresh_if_needed` takes an exclusive advisory lock
+on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
+adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
+defence against the rotation trap: `dekopond` builds a client per message, so two sessions arriving
+near the refresh margin would otherwise both present the same refresh token, and OAuth reuse
+detection can revoke the entire token family rather than just failing the second call. The same
+adoption runs before the forced refresh a `401` triggers. If the lock cannot be taken at all — a
+read-only directory, a filesystem without advisory locking — the refresh proceeds uncoordinated and
+logs `chatgpt_credential_lock_unavailable`, because no turn at all is worse than an uncoordinated
+one.
+
+**The rotated value should be persisted, and the turn continues either way.** The refresh assigns
+the new record and then writes it. A write failure logs `chatgpt_credential_save_failed` at error
+level and the turn proceeds on the in-memory token: the provider has already invalidated the
+predecessor, so the record in memory is the only credential that still works and returning the write
+error would discard it. Disk then holds a dead token, which is a credential that stops working at
+the next process start — the error log is the thing to alert on.
 
 **Writing needs a writable directory, not a writable file.** `save_credentials` creates a sibling
 temporary file in the credential file's own directory — `chatgpt-auth.tmp-<pid>` for the default
-name — opens it `create_new` at mode `0600`, writes, `sync_all`s, and renames it over the target.
-A `subPath` mount of a single file satisfies none of that: the rename needs a writable parent
-directory, not merely a writable inode.
+name — opens it `create_new` at mode `0600`, writes, `sync_all`s, renames it over the target, and
+`fsync`s the parent directory so the rename itself survives a power failure. A `subPath` mount of a
+single file satisfies none of that: the rename needs a writable parent directory, not merely a
+writable inode. Every save and every `dekopon auth chatgpt logout` also sweeps abandoned
+`chatgpt-auth.tmp-*` siblings, which a `SIGKILL` between create and rename leaves behind holding the
+same plaintext access and refresh tokens as the credential itself.
 
 **Reading is unchecked.** `load_credentials` opens the path with a plain `File::open`. There is no
 `O_NOFOLLOW`, no owner comparison, no mode check — deliberately unlike `dekopon-brokerd`, which
@@ -128,10 +143,12 @@ protection.
    init container to overwrite once is the right escape hatch, and it must document that using it
    against a running deployment discards a token fresher than the one in the vault.
 
-6. **One writer only.** `ChatGptCodexModel` serializes refreshes behind a mutex within a process; it
-   cannot coordinate across processes. Two pods sharing one credential file would race, and the loser
-   would be left holding an invalidated refresh token. A deployment using this model kind must run
-   exactly one replica, and must replace rather than overlap them on an update.
+6. **One writer only.** `ChatGptCodexModel` serializes refreshes behind an advisory lock on a
+   sibling `.lock` file, and a client that loses the race adopts the record the winner wrote. That
+   holds within a host and across processes sharing one filesystem; it does not survive an NFS-style
+   volume where advisory locking is unreliable, and it says nothing about two pods on separate
+   copies of the credential. A deployment using this model kind must still run exactly one replica,
+   and must replace rather than overlap them on an update.
 
 ## The exported copy drifts, and that is expected
 

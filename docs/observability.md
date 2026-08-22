@@ -415,7 +415,10 @@ A short-lived runner uses batch exporters and explicitly shuts down both provide
 One generated OpenTelemetry trace links the command to spans such as:
 
 - `runner.command`, `runner.prompt`, `runner.shell`, and `prompt.session`;
-- `prompt.model_turn` and `model.complete`;
+- `prompt.model_turn` and `model.complete`, with `chatgpt.refresh` nested inside the latter whenever
+  a ChatGPT subscription credential is rotated or adopted — it carries `forced`, `outcome`
+  (`adopted`, `rotated`, `rotated-unsaved`, or `failed`), `duration_ms`, and the new
+  `credential.expires_at`, and never any token material;
 - `prompt.script` and `shell.command`; and
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
 
