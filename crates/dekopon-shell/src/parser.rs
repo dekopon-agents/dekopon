@@ -11,11 +11,14 @@ use thiserror::Error;
 use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
-        CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Parameter, Pipeline,
+        CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Index, Modifier,
+        Parameter, Pattern, Pipeline,
         Program, Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word,
         WordPart,
     },
-    lexer::{LexError, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize},
+    lexer::{
+        LexError, RawIndex, RawModifier, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize,
+    },
 };
 
 /// How deeply the grammar may nest before parsing stops.
@@ -884,6 +887,20 @@ pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String
     )
 }
 
+/// Composes the rejection for a `${NAME#pattern}`-family pattern this shell cannot honor.
+pub(crate) fn unsupported_parameter_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "a `${{NAME}}` expansion pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the text out, or slice the value with `jq` instead"
+    )
+}
+
+/// Composes the rejection for a `${NAME}` expansion pattern that only exists once a script has run.
+pub(crate) fn expanded_parameter_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `${{NAME}}` expansion pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or slice the value with `jq` instead"
+    )
+}
+
 /// Composes the rejection for a `case` pattern that only exists once the script has run.
 pub(crate) fn expanded_case_pattern(character: char, meaning: &str) -> String {
     format!(
@@ -980,18 +997,91 @@ fn convert_part(raw: &RawPart, line: usize, depth: u32) -> Result<WordPart, Pars
 
 fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Parameter, ParseError> {
     Ok(match raw {
-        RawParameter::Named { name, indices } => Parameter::Named {
+        RawParameter::Named {
+            name,
+            indices,
+            modifier,
+            length,
+        } => Parameter::Named {
             name: name.clone(),
             indices: indices
                 .iter()
-                .map(|index| convert_word(index, line, depth))
+                .map(|index| convert_index(index, line, depth))
                 .collect::<Result<Vec<_>, _>>()?,
+            modifier: convert_modifier(modifier, line, depth)?,
+            length: *length,
         },
         RawParameter::Positional(position) => Parameter::Positional(*position),
         RawParameter::AllPositional => Parameter::AllPositional,
         RawParameter::AllPositionalJoined => Parameter::AllPositionalJoined,
         RawParameter::PositionalCount => Parameter::PositionalCount,
         RawParameter::LastStatus => Parameter::LastStatus,
+    })
+}
+
+/// Converts one `${NAME#pattern}`-family pattern, checking it here when it is constant.
+///
+/// Quoting is the escape hatch, and it only works while the parser can still see it: `${p#'*'}`
+/// strips a literal asterisk, while `${p#*}` names the metacharacter and what it would have meant.
+fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, ParseError> {
+    let word = convert_word(raw, line, depth)?;
+    if word_is_constant(raw) {
+        if let Some((character, meaning)) = literal_pattern_metacharacter(raw) {
+            return Err(ParseError::syntax(
+                line,
+                unsupported_parameter_pattern(character, meaning),
+            ));
+        }
+        return Ok(Pattern::Literal(word));
+    }
+    Ok(Pattern::Expanded(word))
+}
+
+fn convert_index(raw: &RawIndex, line: usize, depth: u32) -> Result<Index, ParseError> {
+    Ok(match raw {
+        RawIndex::At(word) => Index::At(convert_word(word, line, depth)?),
+        RawIndex::All => Index::All,
+        RawIndex::AllJoined => Index::AllJoined,
+    })
+}
+
+fn convert_modifier(raw: &RawModifier, line: usize, depth: u32) -> Result<Modifier, ParseError> {
+    Ok(match raw {
+        RawModifier::None => Modifier::None,
+        RawModifier::Default { colon, word } => Modifier::Default {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::Assign { colon, word } => Modifier::Assign {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::Require { colon, word } => Modifier::Require {
+            colon: *colon,
+            word: word
+                .as_ref()
+                .map(|word| convert_word(word, line, depth))
+                .transpose()?,
+        },
+        RawModifier::Alternate { colon, word } => Modifier::Alternate {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::StripPrefix(pattern) => {
+            Modifier::StripPrefix(convert_pattern(pattern, line, depth)?)
+        }
+        RawModifier::StripSuffix(pattern) => {
+            Modifier::StripSuffix(convert_pattern(pattern, line, depth)?)
+        }
+        RawModifier::Replace {
+            all,
+            pattern,
+            replacement,
+        } => Modifier::Replace {
+            all: *all,
+            pattern: convert_pattern(pattern, line, depth)?,
+            replacement: convert_word(replacement, line, depth)?,
+        },
     })
 }
 

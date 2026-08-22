@@ -282,6 +282,8 @@ pub(crate) fn fatal_exit_code(fatal: &FatalError) -> ExitCode {
     match fatal {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => ExitCode::TIMEOUT,
         FatalError::Limit(_) | FatalError::Unsupported(_) => ExitCode::SYNTAX,
+        // Matches bash, which exits 1 when `${NAME:?}` fires in a script.
+        FatalError::Assertion(_) => ExitCode::FAILURE,
     }
 }
 
@@ -295,6 +297,7 @@ pub(crate) fn fatal_outcome(fatal: &FatalError) -> &'static str {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => "timed-out",
         FatalError::Limit(_) => "limit-exceeded",
         FatalError::Unsupported(_) => "rejected",
+        FatalError::Assertion(_) => "assertion-failed",
     }
 }
 

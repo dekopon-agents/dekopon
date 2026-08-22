@@ -820,10 +820,155 @@ fn the_clock_builtin_cannot_reach_the_process_environment() {
 }
 
 #[test]
-fn bash_array_emulation_is_rejected_in_favor_of_json() {
-    let outcome = run("echo ${arr[@]}");
+fn array_expansion_is_backed_by_real_json() {
+    // `${NAME[@]}` is not bash's sparse-array emulation; it selects the elements of a real JSON
+    // array, which is what an unquoted `$NAME` holding one already spreads into.
+    assert_eq!(
+        output(r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+for item in "${arr[@]}"; do echo "[$item]"; done"#),
+        "[x]\n[y]"
+    );
+    assert_eq!(
+        output(r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+echo "${arr[*]}""#),
+        "x y"
+    );
+    assert_eq!(
+        output(r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+echo ${#arr[@]}"#),
+        "2"
+    );
+    // A quoted `"${NAME[@]}"` holding one element stays one word, spaces and all.
+    assert_eq!(
+        output(r#"arr=$(echo.echo --a "one two" | jq '[.a]')
+for item in "${arr[@]}"; do echo "[$item]"; done"#),
+        "[one two]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parameter expansion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_and_alternate_expansions_follow_bash_including_the_colon() {
+    assert_eq!(output("echo ${missing:-fallback}"), "fallback");
+    assert_eq!(output("x=set\necho ${x:-fallback}"), "set");
+    // The colon is the whole distinction: `:-` also substitutes for a name holding nothing,
+    // `-` only for a name nothing ever assigned.
+    assert_eq!(output("x=\necho ${x:-fallback}"), "fallback");
+    assert_eq!(output("x=\necho \"[${x-fallback}]\""), "[]");
+
+    assert_eq!(output("x=set\necho ${x:+present}"), "present");
+    assert_eq!(output("echo \"[${missing:+present}]\""), "[]");
+
+    // A default may itself be an expansion, and a bare substitution keeps its structure.
+    assert_eq!(output("y=inner\necho ${x:-$y}"), "inner");
+    assert_eq!(
+        output("v=${x:-$(echo.echo --a 1)}\necho ${v[a]}"),
+        "1",
+        "a bare substitution default keeps its structure"
+    );
+}
+
+#[test]
+fn a_whole_right_hand_side_expansion_keeps_the_value_it_names() {
+    // `copy=$obj` has to keep the object, or the very indexing this value model exists for stops
+    // surviving one assignment.
+    assert_eq!(
+        output("obj=$(echo.echo --a 1)\ncopy=$obj\necho ${copy[a]}"),
+        "1"
+    );
+    // Glued to anything else it is text again, as it must be.
+    assert_eq!(
+        output("obj=$(echo.echo --a 1)\njoined=x$obj\necho $joined"),
+        r#"x{"a":1}"#
+    );
+}
+
+#[test]
+fn assign_expansion_binds_the_name_it_substituted_for() {
+    assert_eq!(output("echo ${x:=first}\necho $x"), "first\nfirst");
+    assert_eq!(output("x=kept\necho ${x:=other}\necho $x"), "kept\nkept");
+    // Assigning *through* an index has nowhere to write, so it says so rather than dropping the
+    // write on the floor.
+    let outcome = run("obj=$(echo.echo --a 1)\necho ${obj[b]:=x}");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(outcome.output.contains("JSON array"), "{}", outcome.output);
+    assert!(outcome.output.contains("cannot assign through an index"));
+}
+
+#[test]
+fn a_required_expansion_ends_the_script_rather_than_carrying_on_empty() {
+    // The point of `${x:?}` is to stop. Reporting a status and continuing with an empty string
+    // would leave a script believing it had the value it just asserted it needed.
+    let outcome = run("echo ${token:?no credential in scope}\necho after");
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+    assert!(
+        outcome.output.contains("token: no credential in scope"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+
+    assert_eq!(output("token=ok\necho ${token:?missing}"), "ok");
+    // Without a message of its own it still names the parameter.
+    assert!(run("echo ${token:?}").output.contains("token: parameter is not set"));
+}
+
+#[test]
+fn length_counts_what_the_value_actually_is() {
+    assert_eq!(output("x=hello\necho ${#x}"), "5");
+    assert_eq!(output("echo ${#missing}"), "0");
+    // Real JSON, so an array counts elements and an object counts keys — a string's character
+    // count would be an answer about its JSON text rather than about the value.
+    assert_eq!(
+        output("obj=$(echo.echo --a 1 --b 2)\necho ${#obj}"),
+        "2"
+    );
+    // Characters, not bytes.
+    assert_eq!(output("x=héllo\necho ${#x}"), "5");
+}
+
+#[test]
+fn prefix_suffix_and_replacement_operate_on_literal_text() {
+    assert_eq!(output("p=owner/repo\necho ${p#owner/}"), "repo");
+    assert_eq!(output("p=owner/repo\necho ${p%/repo}"), "owner");
+    // A pattern that does not match leaves the value alone, as bash does.
+    assert_eq!(output("p=owner/repo\necho ${p#nope}"), "owner/repo");
+    // The doubled forms are the same request: a literal pattern matches in exactly one way.
+    assert_eq!(output("p=owner/repo\necho ${p##owner/}"), "repo");
+    assert_eq!(output("p=owner/repo\necho ${p%%/repo}"), "owner");
+
+    assert_eq!(output("p=a-b-c\necho ${p/-/+}"), "a+b-c");
+    assert_eq!(output("p=a-b-c\necho ${p//-/+}"), "a+b+c");
+    assert_eq!(output("p=a-b\necho ${p//-}"), "ab");
+}
+
+#[test]
+fn a_metacharacter_in_an_expansion_pattern_is_rejected_rather_than_matched_literally() {
+    // Same rule as a `grep`, `sed`, or `case` pattern, and for the same reason: a partial
+    // wildcard is exactly what a literal matcher answers wrongly and silently.
+    for script in ["p=a/b\necho ${p##*/}", "p=a.json\necho ${p%.*}"] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(outcome.output.contains("literal text"), "{script}");
+    }
+    // One assembled at run time is caught when it expands, where quoting can no longer help.
+    let outcome = run("star='*'\np=a.json\necho ${p%$star}");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("quoting cannot exempt"),
+        "{outcome:?}"
+    );
+    // Quoting is the way through, as everywhere else.
+    assert_eq!(output("p='*.json'\necho ${p#'*'}"), ".json");
+}
+
+#[test]
+fn nested_parameter_expansions_have_a_ceiling_rather_than_a_stack_overflow() {
+    let deep = format!("echo {}x{}", "${a:-".repeat(200), "}".repeat(200));
+    let outcome = run(&deep);
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("nested deeper"), "{outcome:?}");
 }
 
 // ---------------------------------------------------------------------------
