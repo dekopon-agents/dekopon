@@ -1176,12 +1176,17 @@ fn is_reserved_memory_route(capability: &CapabilityId, set: Option<&ConstraintSe
 }
 
 fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-    let subject_matches = matches!(
-        (scope.kind, subject.service()),
+    let subject_matches = match (scope.kind, subject.service()) {
         (ChatTransportKind::Slack, SubjectService::Slack)
-            | (ChatTransportKind::Discord, SubjectService::Discord)
-            | (ChatTransportKind::Telegram, SubjectService::Telegram)
-    ) || scope.kind == ChatTransportKind::Local;
+        | (ChatTransportKind::Discord, SubjectService::Discord)
+        | (ChatTransportKind::Telegram, SubjectService::Telegram) => true,
+        (ChatTransportKind::Whatsapp, SubjectService::Whatsapp) => scope
+            .channel
+            .rsplit_once(':')
+            .is_some_and(|(_, sender)| sender == subject.subject()),
+        (ChatTransportKind::Local, _) => true,
+        _ => false,
+    };
     subject_matches && canonical_chat_scope_shape(scope)
 }
 
@@ -1213,6 +1218,14 @@ fn canonical_chat_scope_shape(scope: &ChatScopeClaim) -> bool {
                         .conversation
                         .strip_prefix(&format!("{}:topic:", scope.channel))
                         .is_some_and(canonical_positive_service_decimal))
+        }
+        ChatTransportKind::Whatsapp => {
+            let mut parts = scope.channel.split(':');
+            let canonical = parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_none();
+            canonical && scope.conversation == scope.channel
         }
         ChatTransportKind::Local => {
             lowercase_scope_value(&scope.channel) && lowercase_scope_value(&scope.conversation)
@@ -1250,6 +1263,13 @@ fn canonical_unsigned_decimal(value: &str) -> bool {
     value
         .parse::<u64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_meta_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn canonical_positive_service_decimal(value: &str) -> bool {
@@ -2501,10 +2521,6 @@ where
         })
     }
 
-    /// Returns only capabilities policy allows for this exact authenticated context.
-    ///
-    /// The listing and the invocation decision come from the same evaluation, so a capability can
-    /// never appear here and then refuse — or be hidden here and then succeed.
     /// Returns the command words this context may use.
     ///
     /// A word appears only when policy allows this context at least one capability of the provider
@@ -2606,6 +2622,11 @@ where
         Ok(resolution)
     }
 
+    /// Returns only capabilities policy allows for this exact authenticated context.
+    ///
+    /// The listing and the invocation decision come from the same evaluation, so a capability can
+    /// never appear here and then refuse — or be hidden here and then succeed.
+    #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
         let mut capabilities = self
             .constraints

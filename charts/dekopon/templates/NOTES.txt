@@ -30,6 +30,15 @@ roll the pod:
 The gateway is disabled, so this is a broker with no caller. Set gateway.enabled=true with a
 dekopond.yaml and an agent catalog to give it one.
 {{- end }}
+{{- if .Values.gateway.service.enabled }}
+
+The cluster-local webhook Service is enabled on port {{ .Values.gateway.service.port }}:
+
+  kubectl -n {{ .Release.Namespace }} get service {{ include "dekopon.fullname" . }}
+
+Ensure the inbound transport in dekopond.yaml binds 0.0.0.0:{{ .Values.gateway.service.port }}. This
+chart creates no Ingress or public TLS route.
+{{- end }}
 {{- if include "dekopon.chatgptEnabled" . }}
 
 The ChatGPT credential is seeded ONCE into {{ include "dekopon.chatgptDir" . }}/{{ .Values.gateway.chatgpt.fileName }}

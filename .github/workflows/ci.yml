@@ -333,6 +333,9 @@ jobs:
           helm template dekopon charts/dekopon \
             --set providerStorage.enabled=true \
             --set providerStorage.existingKeySecret=dekopon-storage-key > "$RUNNER_TEMP/provider-storage.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
+            --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
       - name: Validate rendered manifests against Kubernetes schemas
         run: |
           docker run --rm -i \
@@ -351,6 +354,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/provider-storage.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/gateway-service.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a
@@ -363,7 +370,9 @@ jobs:
           helm package charts/dekopon --destination "$RUNNER_TEMP"
           tarball="$RUNNER_TEMP/dekopon-$version.tgz"
           helm lint "$tarball"
-          for args in "" "-f charts/dekopon/values-pr-summarizer-linter.yaml"; do
+          for args in "" \
+            "-f charts/dekopon/values-pr-summarizer-linter.yaml" \
+            "-f charts/dekopon/values-pr-summarizer-linter.yaml --set gateway.service.enabled=true"; do
             # shellcheck disable=SC2086
             helm template dekopon charts/dekopon $args > "$RUNNER_TEMP/from-source.yaml"
             # shellcheck disable=SC2086
@@ -371,9 +380,11 @@ jobs:
             diff -u "$RUNNER_TEMP/from-source.yaml" "$RUNNER_TEMP/from-package.yaml"
           done
           # The README and the example values are documentation a consumer only has if they are
-          # inside the archive.
-          tar -tzf "$tarball" | grep -qx 'dekopon/README.md'
-          tar -tzf "$tarball" | grep -qx 'dekopon/values-pr-summarizer-linter.yaml'
+          # inside the archive. Materialize the listing before grep: with pipefail, grep -q can
+          # otherwise close a successful tar early and turn its SIGPIPE into a false CI failure.
+          tar -tzf "$tarball" > "$RUNNER_TEMP/chart-contents.txt"
+          grep -Fxq 'dekopon/README.md' "$RUNNER_TEMP/chart-contents.txt"
+          grep -Fxq 'dekopon/values-pr-summarizer-linter.yaml' "$RUNNER_TEMP/chart-contents.txt"
       # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
       # and mode check. This runs the init container's real command in a real container and
       # asserts every permission tier dekopon-brokerd enforces, then seeds a ChatGPT credential,
