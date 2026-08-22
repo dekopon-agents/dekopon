@@ -2,7 +2,9 @@
 
 A minimal Rust provider that composes `dekopon:provider@0.2.0` with the `dekopon:http/client@1.0.0` import. It validates caller-generated provider worlds, the direct runner's fail-closed import boundary, and the broker component host's authorized path.
 
-The single `http-probe.fetch` capability sends its required `uri` plus an optional arbitrary method token, ordered text headers, and buffered text body. Its test-only `catchError` input demonstrates that guest code cannot mask a policy rejection. Broker-host tests authorize only an ephemeral loopback mock server; they never contact the public internet. Direct `dekopon-run` loading fails during component instantiation because its linker remains empty.
+`http-probe.fetch` sends its required `uri` plus an optional arbitrary method token, ordered text headers, and buffered text body. Its test-only `catchError` input demonstrates that guest code cannot mask a policy rejection.
+
+`http-probe.conditional-write` is the two-call capability: it reads the resource, then writes only if the etag it observed is still current, refusing in between. It exists so the broker host has an in-tree capability that makes *two* authorized calls in one invocation, which is what exercises `maxRequests`, per-call evidence, and the host-call limit — the shape `gh.pull-request.approve` used to cover before the GitHub provider moved to its own repository. `http-probe.purge` deletes one resource, and exists so the manifest exposes something [`../../conditional-write/`](../../conditional-write/README.md) deliberately grants nowhere. Broker-host tests authorize only an ephemeral loopback mock server; they never contact the public internet. Direct `dekopon-run` loading fails during component instantiation because its linker remains empty.
 
 Run native checks:
 

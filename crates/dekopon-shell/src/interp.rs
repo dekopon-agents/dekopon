@@ -841,6 +841,18 @@ impl Evaluator<'_> {
                         return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
                     }
                 };
+                // The provider proposes a capability without knowing what this session was
+                // granted — it holds no session state and could not consult a grant if it wanted
+                // to. Naming the missing capability here is what keeps "not configured" from
+                // reading as "does not exist", which is the message the `gh` builtin used to give
+                // before this layer moved into the component.
+                if !self.invoker.is_granted(&capability) {
+                    self.write_line(&format!(
+                        "dekopon-shell: {command}: requires capability {capability}, which is not \
+                         granted in this session"
+                    ));
+                    return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
+                }
                 let outcome = {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,

@@ -46,10 +46,10 @@ models:
 routes:
   - transport: workspace-slack
     match: { kind: directMessage }
-    agent: pr-summarizer-linter
+    agent: xaviers-conditional-writer
     limits:
-      # One review is a handful of steps: inspect metadata, files, diff, checks, optional source
-      # context, then post one comment and answer. Too little budget cannot finish; too much loops.
+      # One review is a handful of steps: view the pull request, read the files, approve, answer.
+      # A budget that cannot finish the job is a bug; a budget that can loop is a bill.
       maxSteps: 8
       maxCapabilityCalls: 16
     conversation:

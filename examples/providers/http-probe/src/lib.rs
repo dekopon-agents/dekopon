@@ -32,42 +32,85 @@ impl Provider for HttpProbe {
             id: "http-probe".parse().expect("static provider ID is valid"),
             description: "Exercises the versioned broker HTTP import".to_owned(),
             command_words: Vec::new(),
-            capabilities: vec![ProviderCapability {
-                id: "http-probe.fetch"
-                    .parse()
-                    .expect("static capability ID is valid"),
-                description: "Fetches one broker-authorized URI".to_owned(),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "uri": {"type": "string"},
-                        "method": {"type": "string"},
-                        "headers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "value": {"type": "string"}
-                                },
-                                "required": ["name", "value"],
-                                "additionalProperties": false
-                            }
+            capabilities: vec![
+                ProviderCapability {
+                    id: "http-probe.fetch"
+                        .parse()
+                        .expect("static capability ID is valid"),
+                    description: "Fetches one broker-authorized URI".to_owned(),
+                    effect: EffectKind::ReadOnly,
+                    risk: RiskLevel::Low,
+                    idempotency: Idempotency::Idempotent,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "uri": {"type": "string"},
+                            "method": {"type": "string"},
+                            "headers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "value": {"type": "string"}
+                                    },
+                                    "required": ["name", "value"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "body": {"type": "string"},
+                            "catchError": {"type": "boolean"}
                         },
-                        "body": {"type": "string"},
-                        "catchError": {"type": "boolean"}
-                    },
-                    "required": ["uri"],
-                    "additionalProperties": false
-                }),
-            }],
+                        "required": ["uri"],
+                        "additionalProperties": false
+                    }),
+                },
+                ProviderCapability {
+                    id: "http-probe.conditional-write"
+                        .parse()
+                        .expect("static capability ID is valid"),
+                    description:
+                        "Reads a resource, then writes only if its observed etag still matches"
+                            .to_owned(),
+                    effect: EffectKind::ExternalWrite,
+                    risk: RiskLevel::High,
+                    idempotency: Idempotency::Conditional,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "uri": {"type": "string"},
+                            "expectedEtag": {"type": "string"}
+                        },
+                        "required": ["uri"],
+                        "additionalProperties": false
+                    }),
+                },
+                ProviderCapability {
+                    id: "http-probe.purge"
+                        .parse()
+                        .expect("static capability ID is valid"),
+                    description: "Deletes one broker-authorized resource".to_owned(),
+                    effect: EffectKind::ExternalWrite,
+                    risk: RiskLevel::High,
+                    idempotency: Idempotency::Idempotent,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"uri": {"type": "string"}},
+                        "required": ["uri"],
+                        "additionalProperties": false
+                    }),
+                },
+            ],
         }
     }
 
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError> {
+        if capability.as_str() == "http-probe.conditional-write" {
+            return conditional_write(&input);
+        }
+        if capability.as_str() == "http-probe.purge" {
+            return purge(&input);
+        }
         if capability.as_str() != "http-probe.fetch" {
             return Err(ProviderError::new(
                 "unknown-capability",
@@ -171,22 +214,124 @@ fn bounded_prefix(body: &[u8]) -> &[u8] {
 
 dekopon_provider_sdk::export_provider_with_bindings!(HttpProbe, bindings);
 
+/// Reads a resource and writes only if what it observed is still current.
+///
+/// The pre-read is the point. It exists so the broker host has an in-tree capability that makes
+/// *two* authorized calls in one invocation and refuses between them, which is what exercises
+/// `maxRequests`, per-call evidence, and the host-call limit. Until the GitHub provider moved to
+/// its own repository, `gh.pull-request.approve` was the only capability shaped like this, and host
+/// coverage of that shape should not depend on a provider that is no longer in this tree.
+fn conditional_write(input: &Value) -> Result<Value, ProviderError> {
+    let uri = input
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::new("invalid-input", "uri is required"))?;
+
+    let read = dekopon_provider_http::send(
+        Request::new(method::GET, uri)
+            .map_err(|error| ProviderError::new("invalid-request", error.to_string()))?,
+    )
+    .map_err(|error| ProviderError::new("http-failed", error.to_string()))?;
+
+    let observed = read
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("etag"))
+        .map(|header| String::from_utf8_lossy(&header.value).into_owned())
+        .unwrap_or_default();
+
+    // Refusing here is what makes the capability `conditional` rather than idempotent, and it must
+    // happen before the write rather than being reported after it.
+    if let Some(expected) = input.get("expectedEtag").and_then(Value::as_str)
+        && expected != observed
+    {
+        return Err(ProviderError::new(
+            "precondition-failed",
+            format!("resource moved: expected {expected:?}, observed {observed:?}"),
+        ));
+    }
+
+    let write = dekopon_provider_http::send(
+        Request::new(method::POST, uri)
+            .map_err(|error| ProviderError::new("invalid-request", error.to_string()))?
+            .with_header(
+                Header::new("if-match", observed.clone().into_bytes())
+                    .map_err(|error| ProviderError::new("invalid-request", error.to_string()))?,
+            )
+            .with_body(b"{}".to_vec()),
+    )
+    .map_err(|error| ProviderError::new("http-failed", error.to_string()))?;
+
+    Ok(json!({
+        "observedEtag": observed,
+        "readStatus": read.status,
+        "writeStatus": write.status,
+    }))
+}
+
+/// Deletes one resource.
+///
+/// Exists so the manifest exposes more than any one deployment grants, which is the realistic
+/// shape: `examples/conditional-write/` deliberately leaves this out of both its policy and its
+/// constraint sets, and the example tests assert that an ungranted capability is refused twice
+/// over — by Cedar, and by the missing constraint set before Cedar is consulted.
+fn purge(input: &Value) -> Result<Value, ProviderError> {
+    let uri = input
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::new("invalid-input", "uri is required"))?;
+    let response = dekopon_provider_http::send(
+        Request::new(method::DELETE, uri)
+            .map_err(|error| ProviderError::new("invalid-request", error.to_string()))?,
+    )
+    .map_err(|error| ProviderError::new("http-failed", error.to_string()))?;
+    Ok(json!({"status": response.status}))
+}
+
 #[cfg(test)]
 mod tests {
     use dekopon_provider_sdk::Provider;
     use serde_json::json;
 
+    use dekopon_provider_sdk::{EffectKind, Idempotency};
+
     use super::{HttpProbe, MAX_RETURNED_BODY_BYTES, describe_response};
 
     #[test]
-    fn manifest_declares_one_read_only_probe() {
+    fn manifest_declares_a_read_a_conditional_write_and_a_delete() {
         let manifest = HttpProbe::manifest();
         assert_eq!(manifest.id.as_str(), "http-probe");
-        assert_eq!(manifest.capabilities.len(), 1);
+        let declared = manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            manifest.capabilities[0].input_schema["required"],
-            json!(["uri"])
+            declared,
+            vec![
+                "http-probe.fetch",
+                "http-probe.conditional-write",
+                "http-probe.purge",
+            ]
         );
+        // Every capability takes a `uri` and nothing else is required of any of them.
+        for capability in &manifest.capabilities {
+            assert_eq!(
+                capability.input_schema["required"],
+                json!(["uri"]),
+                "{}",
+                capability.id
+            );
+        }
+        // The delete exists so a deployment can expose less than the manifest does; nothing in
+        // this repository grants it, which examples/conditional-write/ asserts from the other side.
+        let purge = manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.id.as_str() == "http-probe.purge")
+            .expect("the manifest declares a delete");
+        assert_eq!(purge.effect, EffectKind::ExternalWrite);
+        assert_eq!(purge.idempotency, Idempotency::Idempotent);
     }
 
     #[test]

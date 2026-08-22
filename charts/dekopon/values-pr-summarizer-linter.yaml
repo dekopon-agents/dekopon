@@ -1,6 +1,11 @@
-# A realistic override set: the deployment from examples/pr-summarizer-linter/, moved onto the
-# chart's paths. Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token,
-# and a durable audit chain.
+# A realistic override set: the pr-summarizer-linter deployment, moved onto the chart's paths.
+# Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token, and a durable
+# audit chain.
+#
+# The walkthrough itself lives with the provider it exercises, in dekopon-agents/dekopon-provider-gh.
+# This file stays here because it is a test of *this* chart against the component the image ships:
+# ci/stage-image-context.sh fetches gh-provider.wasm at a pinned tag, verifies its digest and build
+# provenance, and stages it to the path referenced below.
 #
 # Every real secret is a reference. Nothing here holds a token.
 #

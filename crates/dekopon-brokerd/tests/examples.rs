@@ -1,11 +1,11 @@
-//! The `examples/pr-summarizer-linter/` walkthrough, held against the real machinery it documents.
+//! The `examples/conditional-write/` walkthrough, held against the real machinery it documents.
 //!
-//! The example is a configuration a reader copies and runs, and its claim is that six narrow
-//! GitHub capabilities are reachable by one person, through one gateway, driving one agent — and
-//! that approval, change-request, merge, and everything else are not. Prose cannot keep that true.
-//! These tests load the checked-in `gh`
-//! component, build the same declared world `dekopon-brokerd` builds at startup, compile the
-//! example's Cedar file against it, and assert the decision table both directions.
+//! The example is a configuration a reader copies and runs, and its claim is that one bounded read
+//! and one etag-pinned write are reachable by one person, through one gateway, driving one agent —
+//! and that the delete the same component exposes is not. Prose cannot keep that true. These tests
+//! load the checked-in `http-probe` component, build the same declared world `dekopon-brokerd`
+//! builds at startup, compile the example's Cedar file against it, and assert the decision table
+//! both directions.
 //!
 //! The configuration half is checked with the broker's own `BrokerdConfig` decoder rather than a
 //! hand-written struct, so a renamed or newly required field breaks here too. What is deliberately
@@ -27,24 +27,13 @@ use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
 use serde::Deserialize;
 
-/// The six capabilities the example grants, in the order its files list them.
-const GRANTED: [&str; 6] = [
-    "gh.content.read",
-    "gh.pull-request.read",
-    "gh.pull-request.files",
-    "gh.pull-request.diff",
-    "gh.pull-request.status",
-    "gh.pull-request.comment",
-];
-/// Verdict and merge capabilities the `gh` manifest exposes and this example omits.
-const UNGRANTED: [&str; 3] = [
-    "gh.pull-request.approve",
-    "gh.pull-request.request-changes",
-    "gh.pull-request.merge",
-];
-const PRINCIPAL: &str = "maintainer";
+/// The two capabilities the example grants, in the order its files list them.
+const GRANTED: [&str; 2] = ["http-probe.conditional-write", "http-probe.fetch"];
+/// The destructive capability the `http-probe` manifest exposes and this example omits.
+const UNGRANTED: [&str; 1] = ["http-probe.purge"];
+const PRINCIPAL: &str = "cpetersen";
 const GATEWAY: &str = "dekopond-gateway";
-const AGENT: &str = "pr-summarizer-linter";
+const AGENT: &str = "xaviers-conditional-writer";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -52,7 +41,7 @@ fn repository_root() -> PathBuf {
 
 fn example(name: &str) -> PathBuf {
     repository_root()
-        .join("examples/pr-summarizer-linter")
+        .join("examples/conditional-write")
         .join(name)
 }
 
@@ -67,13 +56,13 @@ fn config() -> BrokerdConfig {
         .expect("the example broker configuration decodes under the broker's own strict decoder")
 }
 
-async fn gh_registry() -> BrokerProviderRegistry {
+async fn probe_registry() -> BrokerProviderRegistry {
     BrokerProviderRegistry::load(
-        [repository_root().join("examples/providers/gh-provider.wasm")],
+        [repository_root().join("examples/providers/http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("the checked-in gh component loads")
+    .expect("the checked-in http-probe component loads")
 }
 
 /// Builds the world exactly as `dekopon-brokerd::run` does: principals from the configuration's
@@ -144,9 +133,9 @@ fn prompt_request(agent: &str, context: PolicyContext) -> PolicyRequest {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_example_policy_compiles_against_the_checked_in_gh_provider() {
+async fn the_example_policy_compiles_against_the_checked_in_probe_provider() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let world = world(&config, &registry);
 
     let policy = PolicyEngine::new(&read("policies.cedar"), &world)
@@ -174,19 +163,19 @@ async fn the_example_policy_compiles_against_the_checked_in_gh_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
+async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let world = world(&config, &registry);
     let policy = PolicyEngine::new(&read("policies.cedar"), &world).expect("example policy loads");
     let sets = &config.constraint_sets;
 
     // Allowed: the whole workflow, under the attested context the gateway actually renders.
     let session = policy.authorize(prompt_request(AGENT, attested(Some(GATEWAY), Some(AGENT))));
-    assert!(session.allowed, "the maintainer may drive the agent");
+    assert!(session.allowed, "the mapped sender may drive the agent");
     assert_eq!(
         session.determining_policy_ids,
-        vec!["maintainer-may-prompt-pr-summarizer-linter".to_owned()],
+        vec!["boss-may-prompt-conditional-writer".to_owned()],
         "the audit record names the rule a reader can find in policies.cedar"
     );
 
@@ -199,7 +188,7 @@ async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
         assert!(decision.allowed, "{name} is granted");
         assert_eq!(
             decision.determining_policy_ids,
-            vec!["pr-summarizer-linter-gh-surface".to_owned()],
+            vec!["conditional-writer-surface".to_owned()],
             "{name}"
         );
         assert!(!decision.errors_present, "{name}");
@@ -243,8 +232,7 @@ async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
         assert!(!decision.allowed, "agent.prompt must be denied with {case}");
     }
 
-    // The provider exposes these verdict and merge capabilities, but this workflow never grants
-    // or constrains them. Cedar denies each even with every context condition satisfied; the broker
+    // The provider exposes this delete, but this workflow never grants or constrains it. Cedar denies each even with every context condition satisfied; the broker
     // would deny it as `unconstrained-capability` before reaching Cedar at all.
     for name in UNGRANTED {
         let id = capability(name);
@@ -256,14 +244,10 @@ async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
             principal: PRINCIPAL.parse::<PrincipalId>().expect("valid principal"),
             target: PolicyTarget::Capability {
                 capability: id,
-                provider: "gh".parse::<ProviderId>().expect("valid provider"),
+                provider: "http-probe".parse::<ProviderId>().expect("valid provider"),
                 effect: EffectKind::ExternalWrite,
-                risk: if name == "gh.pull-request.approve" || name == "gh.pull-request.merge" {
-                    RiskLevel::High
-                } else {
-                    RiskLevel::Medium
-                },
-                idempotency: Idempotency::Conditional,
+                risk: RiskLevel::High,
+                idempotency: Idempotency::Idempotent,
             },
             context: attested(Some(GATEWAY), Some(AGENT)),
         });
@@ -274,7 +258,7 @@ async fn the_maintainer_may_review_through_the_gateway_and_nothing_else_may() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_against() {
     let config = config();
-    let registry = gh_registry().await;
+    let registry = probe_registry().await;
     let manifest = registry
         .capabilities()
         .map(|(provider, capability)| (capability.id.clone(), (provider.clone(), capability)))
@@ -292,13 +276,13 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             expected.sort_unstable();
             expected
         },
-        "the example declares exactly the summarize-and-lint review slice"
+        "the example declares exactly the read-and-conditional-write slice"
     );
 
     for (id, set) in &config.constraint_sets {
         let (provider, capability) = manifest
             .get(id)
-            .unwrap_or_else(|| panic!("{id} exists in the loaded gh manifest"));
+            .unwrap_or_else(|| panic!("{id} exists in the loaded http-probe manifest"));
         // These three are what `Broker::new` compares byte for byte against the manifest; a
         // mismatch is a startup refusal, so an example carrying one would never run.
         assert_eq!(set.effect, capability.effect, "{id} effect");
@@ -313,21 +297,22 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             .unwrap_or_else(|| panic!("{id} grants HTTP authority"));
         assert_eq!(
             http.allowed_hosts,
-            vec!["api.github.com".to_owned()],
+            vec!["api.example.com".to_owned()],
             "{id}"
         );
-        assert!(!http.allow_plaintext_loopback, "{id} talks to GitHub only");
+        assert!(
+            !http.allow_plaintext_loopback,
+            "{id} talks to the upstream API only"
+        );
         assert_eq!(
             set.credential.as_deref(),
-            Some("github-pat"),
-            "{id} presents the broker-held credential; private repositories need it even to read"
+            Some("api-token"),
+            "{id} presents the broker-held credential; the upstream needs it even to read"
         );
-        // The comment pre-reads its pull request before the POST. Status also performs two GETs:
-        // one for the pull request's head SHA and one for check runs. Every other read is one GET.
+        // The conditional write pre-reads the resource before the POST, which is the whole reason
+        // it gets two calls and two methods. The plain fetch is one GET.
         let (methods, requests) = if capability.effect == EffectKind::ExternalWrite {
             (vec!["GET".to_owned(), "POST".to_owned()], 2)
-        } else if id.as_str() == "gh.pull-request.status" {
-            (vec!["GET".to_owned()], 2)
         } else {
             (vec!["GET".to_owned()], 1)
         };
@@ -341,7 +326,7 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
 ///
 /// The real file is `broker-credentials.yaml`, which is deliberately absent from the repository —
 /// it is the one file holding a secret. The `.example` beside it is what a reader edits, so it is
-/// the one worth pinning: if it stops naming `github-pat`, or stops binding `api.github.com`,
+/// the one worth pinning: if it stops naming `api-token`, or stops binding `api.example.com`,
 /// following the walkthrough produces a broker that refuses to start.
 #[test]
 fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
@@ -366,7 +351,7 @@ fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     let entry = file
         .credentials
         .iter()
-        .find(|entry| entry.name == "github-pat")
+        .find(|entry| entry.name == "api-token")
         .expect("the example names the credential every constraint set binds");
     assert_eq!(entry.kind, "bearerToken");
     assert_eq!(entry.scheme, "Bearer");
@@ -387,7 +372,7 @@ fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     // A placeholder, and unmistakably one. A checked-in file that could be mistaken for a live
     // token is a leak waiting for a copy-paste.
     assert!(
-        entry.secret.starts_with("github_pat_X") && entry.secret.contains("XXXXXXXX"),
+        entry.secret.starts_with("replace-me_X") && entry.secret.contains("XXXXXXXX"),
         "the checked-in secret must stay an obvious placeholder"
     );
 }
@@ -402,7 +387,7 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
     let config = config();
     assert_eq!(
         config.providers,
-        vec![PathBuf::from("../providers/gh-provider.wasm")]
+        vec![PathBuf::from("../providers/http-probe-provider.wasm")]
     );
     assert_eq!(
         config.policies_path,

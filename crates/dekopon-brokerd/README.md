@@ -246,22 +246,18 @@ constraintSets:
 // person drive this agent at all, and through which gateway. The second is what that session may
 // then reach. Neither implies the other.
 
-@id("maintainer-may-prompt-pr-summarizer-linter")
-permit(principal == Dekopon::Principal::"maintainer",
+@id("boss-may-prompt-conditional-writer")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"pr-summarizer-linter")
+       resource == Dekopon::Agent::"xaviers-conditional-writer")
 when { context has via && context.via == "dekopond-gateway" };
 
-@id("pr-summarizer-linter-gh-surface")
-permit(principal == Dekopon::Principal::"maintainer",
-       action in [Dekopon::Action::"gh.content.read",
-                  Dekopon::Action::"gh.pull-request.read",
-                  Dekopon::Action::"gh.pull-request.files",
-                  Dekopon::Action::"gh.pull-request.diff",
-                  Dekopon::Action::"gh.pull-request.status",
-                  Dekopon::Action::"gh.pull-request.comment"],
-       resource == Dekopon::Provider::"gh")
-when { context has agent && context.agent == "pr-summarizer-linter"
+@id("conditional-writer-surface")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action in [Dekopon::Action::"http-probe.fetch",
+                  Dekopon::Action::"http-probe.conditional-write"],
+       resource == Dekopon::Provider::"http-probe")
+when { context has agent && context.agent == "xaviers-conditional-writer"
     && context has via && context.via == "dekopond-gateway" };
 ```
 

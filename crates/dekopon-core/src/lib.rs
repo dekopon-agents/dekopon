@@ -41,7 +41,7 @@ pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 /// there fails the build until this list agrees.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
     ".", ":", "[", "[[", "base64", "bg", "break", "cap", "cat", "continue", "curl", "cut", "date",
-    "declare", "echo", "eval", "exec", "exit", "export", "false", "fg", "gh", "grep", "jobs", "jq",
+    "declare", "echo", "eval", "exec", "exit", "export", "false", "fg", "grep", "jobs", "jq",
     "kill", "local", "printf", "return", "sed", "set", "shift", "sleep", "sort", "source", "test",
     "trap", "true", "uniq", "unset", "wait", "wc", "xargs",
 ];
@@ -503,17 +503,14 @@ mod command_word_tests {
         );
     }
 
-    /// `gh` is reserved *today* because the shell still carries a `gh` builtin.
+    /// A provider may claim `gh`, which is the point of having deleted the builtin.
     ///
-    /// This is the ordering dependency between moving the GitHub provider out of tree and deleting
-    /// that builtin, enforced rather than remembered: until the builtin goes, a `gh` provider
-    /// cannot claim its own name, and this test will start failing the moment it does — which is
-    /// the signal to drop `gh` from the reserved list.
+    /// This test replaces `gh_is_reserved_until_its_builtin_is_deleted`, which existed to fail at
+    /// exactly this moment. Keeping its successor pointed at the same word is what stops `gh`
+    /// quietly returning to the reserved list and stranding the out-of-tree provider.
     #[test]
-    fn gh_is_reserved_until_its_builtin_is_deleted() {
-        let conflicts = command_word_conflicts(&declared(&[("gh", &["gh"])]));
-        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-        assert_eq!(conflicts[0].kind, CommandWordConflictKind::Reserved);
+    fn a_provider_may_claim_gh_now_that_no_builtin_owns_it() {
+        assert!(command_word_conflicts(&declared(&[("gh", &["gh"])])).is_empty());
     }
 
     #[test]
