@@ -15,6 +15,13 @@ All notable changes to Dekopon are documented here. The format is based on
   `AuthorizationGate`, and defaults its per-invocation ceilings from the host limits in force
   rather than restating them. Storage grants are minted per invocation from constant scope
   material, so successive calls reach one durable namespace.
+- Gave the sandboxed shell real parameter expansion: `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`,
+  `${NAME:+w}` and their colon-free forms, `${#NAME}`, `${NAME[@]}`/`${NAME[*]}`, and the literal
+  `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`. Two answer differently than bash because values are real
+  JSON: `${#NAME}` counts elements of an array and keys of an object, and `${NAME[@]}` selects the
+  elements of a JSON array rather than emulating a bash array. `${NAME:?w}` ends the script, which
+  is what the construct is for. Expansion patterns are literal text like every other pattern here,
+  with quoting as the escape hatch while the parser can still see it.
 - Gave the sandboxed shell two script-addressable streams. `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2`,
   and `> /dev/null` now redirect a command's diagnostics or its value into a named in-memory
   buffer, and a command may carry more than one redirection. The stdout/stderr split already
@@ -25,6 +32,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- A whole right-hand side keeps its value rather than collapsing to text for a bare `$NAME` as well
+  as a bare `$(cmd)`, so `copy=$obj` followed by `${copy[key]}` works. Previously only the
+  substitution spelling survived, and `copy=$obj` silently flattened the object into its JSON text.
 - The shell no longer rejects file-descriptor redirection wholesale. Descriptors other than 1 and 2
   (`3>`, `<&`) are still refused by name, as is `2>&1` written *before* the redirection it copies:
   bash duplicates the file description there and leaves stderr on the terminal, this interpreter

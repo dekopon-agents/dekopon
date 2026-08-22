@@ -268,12 +268,16 @@ pub enum WordPart {
 /// A parameter reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Parameter {
-    /// `$NAME`, `${NAME}`, `${NAME[index]}`.
+    /// `$NAME`, `${NAME}`, `${NAME[index]}`, and the `${NAME...}` forms that transform it.
     Named {
         /// Variable name.
         name: String,
-        /// Index words applied left to right; array offsets and object keys are backed by real JSON.
-        indices: Vec<Word>,
+        /// Indices applied left to right; array offsets and object keys are backed by real JSON.
+        indices: Vec<Index>,
+        /// The transformation applied to whatever the indices selected.
+        modifier: Modifier,
+        /// `${#NAME}`: produce the length of the selection rather than the selection.
+        length: bool,
     },
     /// `$1` .. `${N}`.
     Positional(usize),
@@ -285,6 +289,86 @@ pub enum Parameter {
     PositionalCount,
     /// `$?`.
     LastStatus,
+}
+
+/// What one `[...]` in a parameter reference selects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Index {
+    /// `${NAME[expr]}` — one element or field.
+    At(Word),
+    /// `${NAME[@]}` — every element, one word each even inside double quotes, like `"$@"`.
+    All,
+    /// `${NAME[*]}` — every element joined by a space into one word, like `$*`.
+    AllJoined,
+}
+
+/// The transformation a `${NAME...}` expansion applies to the value it selected.
+///
+/// Every pattern here is **literal text**, the same rule `grep`, `sed`, and `case` patterns follow.
+/// A literal pattern matches in exactly one way, which is why bash's shortest/longest pairs
+/// (`#`/`##`, `%`/`%%`) are accepted as spellings of the same thing rather than as two behaviors:
+/// there is only one prefix to strip. A metacharacter in one of these patterns is rejected by name,
+/// because a partial wildcard is exactly the pattern a literal matcher answers wrongly and
+/// silently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Modifier {
+    /// No transformation.
+    None,
+    /// `${NAME:-word}` and `${NAME-word}`.
+    Default {
+        /// `true` for the `:` forms, which also treat an empty value as absent.
+        colon: bool,
+        /// The substitute.
+        word: Word,
+    },
+    /// `${NAME:=word}` and `${NAME=word}`, which also bind the substitute to the name.
+    Assign {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// The substitute, also assigned.
+        word: Word,
+    },
+    /// `${NAME:?word}` and `${NAME?word}`, which end the script when the value is absent.
+    Require {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// The message, or `None` for the built-in one.
+        word: Option<Word>,
+    },
+    /// `${NAME:+word}` and `${NAME+word}`.
+    Alternate {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// What to produce when the value is present.
+        word: Word,
+    },
+    /// `${NAME#pattern}` and `${NAME##pattern}`.
+    StripPrefix(Pattern),
+    /// `${NAME%pattern}` and `${NAME%%pattern}`.
+    StripSuffix(Pattern),
+    /// `${NAME/pattern/replacement}` and `${NAME//pattern/replacement}`.
+    Replace {
+        /// `true` for the `//` form.
+        all: bool,
+        /// The literal text to find.
+        pattern: Pattern,
+        /// What to put in its place.
+        replacement: Word,
+    },
+}
+
+/// One literal pattern, split by when its metacharacters can be checked.
+///
+/// The same split [`CasePattern`] draws, for the same reason: a pattern the parser can read whole
+/// is checked there, where quoting is still visible and `'*'` is the way to mean an asterisk. One
+/// assembled at run time is checked when it is expanded, because that is the first moment its text
+/// exists — and quoting cannot exempt it, since its quotes are already gone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Pattern {
+    /// Constant in the source; already checked by the parser.
+    Literal(Word),
+    /// Contains an expansion; checked when it is expanded.
+    Expanded(Word),
 }
 
 /// An arithmetic expression inside `$(( ... ))`.

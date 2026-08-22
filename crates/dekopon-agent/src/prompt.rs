@@ -1446,7 +1446,8 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
 `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
-with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, \
+with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, `${#NAME}`, \
+`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
 redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
 named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
@@ -1478,8 +1479,10 @@ provider may contribute further command words, which behave the same way and are
 identically; any this session has are listed at the end of this description.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
-and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
-than a silent mismatch. Use `jq` for real matching. A here-document's body arrives as one JSON \
+a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, and a `case` pattern too, where `*)` remains the \
+default branch but `*.json)` is an error rather than a silent mismatch. `${#NAME}` counts \
+characters of a string but elements of an array and keys of an object, because values here are \
+real JSON. Use `jq` for real matching. A here-document's body arrives as one JSON \
 string, so pipe it through `jq` when you want structure out of it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
