@@ -40,10 +40,12 @@ pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 /// this mirrors and pins the two together with a bidirectional test, so a builtin added or removed
 /// there fails the build until this list agrees.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
-    ".", ":", "[", "[[", "base64", "bg", "break", "cap", "cat", "continue", "curl", "cut", "date",
-    "declare", "echo", "eval", "exec", "exit", "export", "false", "fg", "grep", "jobs", "jq",
-    "kill", "local", "printf", "return", "sed", "set", "shift", "sleep", "sort", "source", "test",
-    "trap", "true", "uniq", "unset", "wait", "wc", "xargs",
+    ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "curl",
+    "cut", "date", "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit",
+    "export", "false", "fg", "fi", "for", "function", "grep", "if", "in", "jobs", "jq", "kill",
+    "local", "printf", "return", "sed", "select", "set", "shift", "sleep", "sort", "source",
+    "test", "then", "trap", "true", "uniq", "unset", "until", "wait", "wc",
+    "while", "xargs",
 ];
 
 /// The reason a Dekopon identifier could not be parsed.

@@ -471,7 +471,11 @@ mod tests {
 mod reserved {
     use std::collections::BTreeSet;
 
-    use crate::{builtins, interp::telemetry::CONTROL_WORDS, parser::REJECTED_COMMANDS};
+    use crate::{
+        builtins,
+        interp::telemetry::CONTROL_WORDS,
+        parser::{REJECTED_COMMANDS, RESERVED_WORDS},
+    };
 
     /// `dekopon_core::RESERVED_COMMAND_WORDS` and this crate's live tables must agree exactly.
     ///
@@ -489,6 +493,10 @@ mod reserved {
             .into_iter()
             .chain(CONTROL_WORDS.iter().copied())
             .chain(REJECTED_COMMANDS.iter().map(|(word, _)| *word))
+            // Grammar keywords belong here for the same reason: the parser consumes them before
+            // dispatch ever runs, so a provider declaring `do` as a command word would load
+            // successfully and then never be reachable — a manifest that is a lie.
+            .chain(RESERVED_WORDS.iter().copied())
             .collect::<BTreeSet<_>>();
         let declared = dekopon_core::RESERVED_COMMAND_WORDS
             .iter()

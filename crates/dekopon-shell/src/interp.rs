@@ -24,14 +24,18 @@ use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        Command, DEV_NULL, ForLoop, IfStatement, Index, Modifier, Parameter, Pipeline, Program, Redirect,
+        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
+        Parameter, Pipeline, Program, Redirect,
         Pattern, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
-    builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
+    builtins::{
+        self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
+    },
     dispatch::{self, Resolution, arguments_to_input},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
     parser::{
-        expanded_case_pattern, expanded_parameter_pattern, parse, pattern_metacharacter,
+        expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
+        pattern_metacharacter,
     },
     value::{self, display},
 };
@@ -422,6 +426,14 @@ impl Evaluator<'_> {
             // A group runs its statements in the current scope; it exists to make several of them
             // one command, not to open a subshell this evaluator does not have.
             Statement::Group(body) => self.execute_program(body),
+            Statement::Conditional(expression) => {
+                let status = match self.evaluate_conditional(expression) {
+                    Ok(status) => status,
+                    Err(failure) => self.absorb(failure)?,
+                };
+                self.last_status = status;
+                Ok(Flow::Normal)
+            }
             Statement::Function(definition) => {
                 self.function_names.insert(definition.name.clone());
                 self.functions
@@ -1760,6 +1772,60 @@ impl Evaluator<'_> {
                 Ok(text)
             }
         }
+    }
+
+    /// Evaluates one `[[ ... ]]` expression.
+    ///
+    /// `&&` and `||` short-circuit, exactly as they do between commands, so
+    /// `[[ -n $x && $x == ok ]]` never evaluates the comparison for an unset `x`.
+    fn evaluate_conditional(
+        &mut self,
+        expression: &Conditional,
+    ) -> Result<ExitCode, CommandFailure> {
+        self.budget.charge_step()?;
+        match expression {
+            Conditional::Test(test) => self.evaluate_conditional_test(test),
+            Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
+            Conditional::And(left, right) => {
+                let status = self.evaluate_conditional(left)?;
+                if status == ExitCode::SUCCESS {
+                    return self.evaluate_conditional(right);
+                }
+                Ok(status)
+            }
+            Conditional::Or(left, right) => {
+                let status = self.evaluate_conditional(left)?;
+                if status == ExitCode::SUCCESS {
+                    return Ok(status);
+                }
+                self.evaluate_conditional(right)
+            }
+        }
+    }
+
+    /// Evaluates one `[[ ]]` primary.
+    ///
+    /// Each operand expands to exactly one word — that is the promise `[[ ]]` makes over `[ ]`, and
+    /// it is why `[[ -n $x ]]` holds for a value with spaces where `[ -n $x ]` falls apart. The
+    /// test itself is [`builtins::misc::evaluate_test`], the same code `test` and `[` run, so the
+    /// two spellings can never disagree about what `-z` or `-lt` mean.
+    fn evaluate_conditional_test(
+        &mut self,
+        test: &ConditionalTest,
+    ) -> Result<ExitCode, CommandFailure> {
+        let mut operands = Vec::with_capacity(test.words.len());
+        for word in &test.words {
+            operands.push(self.expand_quoted(&word.parts)?);
+        }
+        if test.check_right_pattern
+            && let [_, _, right] = operands.as_slice()
+            && let Some((character, meaning)) = pattern_metacharacter(right)
+        {
+            return Err(CommandFailure::usage(expanded_conditional_pattern(
+                character, meaning,
+            )));
+        }
+        Ok(builtins::misc::evaluate_test("[[", &operands)?.status)
     }
 
     /// Runs a command substitution, capturing what its pipelines produced.

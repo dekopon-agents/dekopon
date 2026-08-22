@@ -29,6 +29,8 @@ pub enum Statement {
     /// Not a subshell — this shell forks nothing. The group exists so a list of statements can be
     /// one pipeline stage, one redirection target, or one `||` branch.
     Group(Program),
+    /// `[[ ... ]]`.
+    Conditional(Conditional),
     /// `name() { ... }`.
     Function(FunctionDefinition),
 }
@@ -380,6 +382,40 @@ pub enum Modifier {
         /// What to put in its place.
         replacement: Word,
     },
+}
+
+/// A `[[ ... ]]` expression.
+///
+/// The operand tests are evaluated by the same code `test` and `[` use, so the two spellings cannot
+/// disagree about what `-z` or `-lt` mean. What `[[ ]]` adds is the connective grammar bash gives
+/// it — `&&`, `||`, `!`, and parentheses inside the brackets — plus the promise that an unquoted
+/// expansion is one word, so `[[ -n $x ]]` holds for a value with spaces in it where `[ -n $x ]`
+/// would fall apart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Conditional {
+    /// One primary: `[[ WORD ]]`, `[[ -n WORD ]]`, or `[[ WORD op WORD ]]`.
+    Test(ConditionalTest),
+    /// `! EXPR`.
+    Not(Box<Conditional>),
+    /// `EXPR && EXPR`.
+    And(Box<Conditional>, Box<Conditional>),
+    /// `EXPR || EXPR`.
+    Or(Box<Conditional>, Box<Conditional>),
+}
+
+/// One `[[ ]]` primary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalTest {
+    /// Operand words in source order; one, two, or three of them.
+    pub words: Vec<Word>,
+    /// Whether the right operand of `=`/`==`/`!=` still needs its metacharacter check.
+    ///
+    /// In bash that operand is a *glob*, not a string. Comparing it literally would answer
+    /// `[[ $f == *.json ]]` wrongly and silently, so a metacharacter is rejected by name — by the
+    /// parser when the operand is constant, where quoting is still the way out, and at expansion
+    /// otherwise. This flag says which of the two applies, so a quoted `'*'` is not re-checked
+    /// after its quotes are gone.
+    pub check_right_pattern: bool,
 }
 
 /// One literal pattern, split by when its metacharacters can be checked.

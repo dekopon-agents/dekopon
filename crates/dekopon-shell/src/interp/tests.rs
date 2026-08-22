@@ -846,6 +846,86 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#),
 }
 
 // ---------------------------------------------------------------------------
+// `[[ ... ]]`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_brackets_run_the_same_tests_single_ones_do() {
+    // Same code underneath, so the two spellings can never disagree about an operator.
+    for (double, single) in [
+        ("[[ -n x ]]", "[ -n x ]"),
+        ("[[ -z \"\" ]]", "[ -z \"\" ]"),
+        ("[[ a = a ]]", "[ a = a ]"),
+        ("[[ a != b ]]", "[ a != b ]"),
+        ("[[ 2 -lt 10 ]]", "[ 2 -lt 10 ]"),
+        ("[[ ! -n \"\" ]]", "[ ! -n \"\" ]"),
+    ] {
+        assert_eq!(code(double), code(single), "{double} vs {single}");
+        assert_eq!(code(double), 0, "{double}");
+    }
+    assert_eq!(code("[[ -n \"\" ]]"), 1);
+}
+
+#[test]
+fn double_brackets_add_the_connectives_single_ones_lack() {
+    assert_eq!(output("[[ -n a && -n b ]] && echo both"), "both");
+    assert_eq!(output("[[ -z a || -n b ]] && echo either"), "either");
+    assert_eq!(output("[[ ! ( -n a && -z b ) ]] && echo grouped"), "grouped");
+    assert_eq!(output("x=5\n[[ $x -gt 1 && $x -lt 10 ]] && echo between"), "between");
+    // `&&` short-circuits, so the right side is never evaluated for an unset name.
+    assert_eq!(output("[[ -n \"$missing\" && $missing -eq 1 ]] || echo skipped"), "skipped");
+    // And it composes into the constructs that take a condition.
+    assert_eq!(output("if [[ -n x ]]; then echo yes; fi"), "yes");
+    assert_eq!(
+        output("i=0\nwhile [[ $i -lt 2 ]]; do echo $i; i=$(( i + 1 )); done"),
+        "0\n1"
+    );
+}
+
+#[test]
+fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
+    // The promise `[[ ]]` makes over `[ ]`: a value that spreads into several words elsewhere is
+    // still one operand here.
+    assert_eq!(
+        output(r#"v=$(echo.echo --a "one two" | jq '[.a]')
+[[ -n $v ]] && echo held"#),
+        "held"
+    );
+}
+
+#[test]
+fn comparison_operands_inside_double_brackets_stay_literal() {
+    // In bash the right operand of `==` is a glob. Comparing it literally would answer this
+    // wrongly and silently, so the metacharacter is named instead.
+    let outcome = run("f=report.json\n[[ $f == *.json ]] && echo matched");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("glob in bash"), "{outcome:?}");
+    assert!(!outcome.output.contains("matched"), "{outcome:?}");
+
+    // Quoting is the way through while the parser can still see it.
+    assert_eq!(output("f='*'\n[[ $f == '*' ]] && echo literal"), "literal");
+    // One assembled at run time is caught when it expands.
+    let outcome = run("p='*.json'\nf=report.json\n[[ $f == $p ]] && echo matched");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("quoting cannot exempt"), "{outcome:?}");
+
+    // Regex matching names itself rather than being read as a string comparison.
+    let outcome = run("[[ abc =~ a.c ]]");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("regex matching"), "{outcome:?}");
+}
+
+#[test]
+fn a_malformed_double_bracket_condition_names_what_is_wrong() {
+    assert!(run("[[ -n x ").output.contains("expected `]]`"));
+    assert!(run("[[ ]]").output.contains("expected a condition"));
+    assert!(run("[[ a b c d ]]").output.contains("at most three operands"));
+    assert!(run("[[ ( -n x ]]").output.contains("expected `)`"));
+    // File tests stay refused, with the same message `test` gives.
+    assert!(run("[[ -f x ]]").output.contains("no filesystem"));
+}
+
+// ---------------------------------------------------------------------------
 // Compound commands as pipeline stages
 // ---------------------------------------------------------------------------
 
@@ -1166,7 +1246,6 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
         // Shell options: `set -e` changing nothing while looking like it had is the exact
         // failure this design forbids.
         ("set -euo pipefail\necho after", "no shell options"),
-        ("[[ -n \"x\" ]] && echo yes", "[[ ... ]]"),
         // Paren-shaped constructs are four different features, not one subshell.
         ("i=0; ((i++))", "arithmetic command"),
         ("arr=(a b c)", "bash array literals"),
