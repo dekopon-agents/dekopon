@@ -21,7 +21,7 @@
 # This file expects a staged context and is not buildable from the repository root. The context is
 # constructed by `ci/stage-image-context.sh` rather than filtered out of a checkout: it contains
 # the Dockerfile, `dist/<arch>/` with the four executables from each release archive, `providers/`
-# with the checked-in components, and the two licences — nothing else, because nothing else was
+# plus `optional-providers/` with checked-in components, and the two licences — nothing else, because nothing else was
 # put there. A `.dockerignore` denylist would have to keep excluding the rest of the repository
 # correctly forever; an allowlist is true by construction.
 #
@@ -50,7 +50,8 @@ COPY --chmod=0755 \
 
 # Provider components come from the tagged checkout rather than the archive: they are checked-in
 # artifacts, not build outputs, and the archive ships only `jsonplaceholder`. They are copied
-# verbatim and never regenerated.
+# verbatim and never regenerated. Durable memory is copied separately under `optional-providers`;
+# it never joins the default scan path.
 #
 # `dekopon-brokerd` refuses to load a provider whose file is not owned by its own euid, is group-
 # or world-writable, or has more than one link, and it stats with `symlink_metadata`, so a symlink
@@ -65,6 +66,10 @@ COPY --chown=65532:65532 \
      providers/http-probe-provider.wasm \
      providers/jsonplaceholder-provider.wasm \
      /opt/dekopon/providers/
+
+COPY --chown=65532:65532 \
+     optional-providers/memory-chat-provider.wasm \
+     /opt/dekopon/optional-providers/
 
 COPY LICENSE-APACHE LICENSE-MIT /usr/share/doc/dekopon/
 

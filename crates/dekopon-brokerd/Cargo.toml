@@ -21,6 +21,7 @@ dekopon-http-host.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
+dekopon-storage-host.workspace = true
 dekopon-telemetry.workspace = true
 dekopon-webui.workspace = true
 opentelemetry.workspace = true
@@ -39,6 +40,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 dekopon-policy.workspace = true
 tempfile.workspace = true
+# `start_paused` lets the shutdown-drain tests assert a 120 s grace without waiting for one.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

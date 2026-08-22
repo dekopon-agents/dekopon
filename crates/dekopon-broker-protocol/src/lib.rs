@@ -15,7 +15,9 @@ use std::{
 };
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
-use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId};
+use dekopon_core::{
+    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId, TransportId,
+};
 use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -71,6 +73,23 @@ pub const ERROR_PROVIDER: &str = "provider-error";
 /// The external effect may have taken place. The request must **not** be resubmitted under any
 /// identifier; the durable audit is the only record of what happened.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
+/// Stable pre-execution storage failure codes. No provider work began, so a corrected request may
+/// use a fresh invocation identifier.
+pub const ERROR_STORAGE_QUOTA: &str = "storage-quota";
+pub const ERROR_STORAGE_BUSY: &str = "storage-busy";
+pub const ERROR_STORAGE_TIMEOUT: &str = "storage-timeout";
+pub const ERROR_STORAGE_CORRUPT: &str = "storage-corrupt";
+pub const ERROR_STORAGE_IO: &str = "storage-io";
+
+/// Stable failure code: a bounded broker resource is exhausted and nothing executed.
+///
+/// Distinct from [`ERROR_BROKER_UNAVAILABLE`] because the exhaustion is permanent rather than
+/// momentary: the replay ledger never evicts and is restored from durable history on restart, and
+/// the audit log does not rotate. Resubmission under a fresh invocation identifier is *safe* — no
+/// provider work began — and it is also futile, because it fails identically until an operator
+/// raises `maxReplayIds` / `auditMaxRecords` or moves the audit file aside. A client must not
+/// retry this.
+pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 /// Exact protocol version carried by every envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -258,6 +277,451 @@ pub struct InvocationRequest {
     pub input: Value,
 }
 
+/// Transport family that authenticated one chat scope.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatTransportKind {
+    Slack,
+    Discord,
+    Telegram,
+    Whatsapp,
+    Local,
+}
+
+impl fmt::Display for ChatTransportKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Whatsapp => "whatsapp",
+            Self::Local => "local",
+        })
+    }
+}
+
+/// Bounded transport-derived channel and conversation scope.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatScopeClaim {
+    pub transport: TransportId,
+    pub kind: ChatTransportKind,
+    #[serde(deserialize_with = "deserialize_scope_part")]
+    pub channel: String,
+    #[serde(deserialize_with = "deserialize_scope_part")]
+    pub conversation: String,
+}
+
+impl fmt::Debug for ChatScopeClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatScopeClaim([REDACTED])")
+    }
+}
+
+impl ChatScopeClaim {
+    /// Defensive wire bounds common to every service-specific canonical form.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        bounded_scope_part(&self.channel) && bounded_scope_part(&self.conversation)
+    }
+}
+
+fn bounded_scope_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && !value.contains(['/', '\\'])
+}
+
+fn deserialize_scope_part<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    bounded_scope_part(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("chat scope part is not canonical"))
+}
+
+fn deserialize_bounded_string<'de, D, const MAXIMUM: usize>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor<const MAXIMUM: usize>;
+
+    impl<'de, const MAXIMUM: usize> serde::de::Visitor<'de> for Visitor<MAXIMUM> {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a string no longer than {MAXIMUM} bytes")
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAXIMUM {
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAXIMUM {
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_string(Visitor::<MAXIMUM>)
+}
+
+/// Subject, agent, and transport scope claimed for a chat session.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatSessionClaim {
+    pub subject: ExternalSubject,
+    pub agent: AgentId,
+    pub scope: ChatScopeClaim,
+}
+
+impl fmt::Debug for ChatSessionClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatSessionClaim([REDACTED])")
+    }
+}
+
+/// Invocation-bound chat attestation. The broker validates it against owner-authored scope grants.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatAttestation {
+    pub subject: ExternalSubject,
+    pub agent: AgentId,
+    pub scope: ChatScopeClaim,
+    pub invocation: InvocationId,
+}
+
+impl fmt::Debug for ChatAttestation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatAttestation([REDACTED])")
+    }
+}
+
+/// Service-specific identity of the inbound delivery whose answer was accepted.
+///
+/// The tagged shape prevents a Slack timestamp, Discord snowflake, Telegram message, WhatsApp
+/// message ID, or local nonce from being replayed under another transport kind. Scope fields are checked
+/// against the separately attested chat scope before any namespace is derived.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DeliveryIdentity {
+    Slack {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        channel: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        timestamp: String,
+    },
+    Discord {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        channel: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        message: String,
+    },
+    Telegram {
+        #[serde(deserialize_with = "deserialize_signed_service_decimal")]
+        chat: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_positive_service_decimal"
+        )]
+        topic: Option<String>,
+        #[serde(deserialize_with = "deserialize_positive_service_decimal")]
+        message: String,
+    },
+    Whatsapp {
+        #[serde(deserialize_with = "deserialize_meta_decimal")]
+        waba: String,
+        #[serde(deserialize_with = "deserialize_meta_decimal")]
+        phone_number: String,
+        #[serde(deserialize_with = "deserialize_whatsapp_message_id")]
+        message: String,
+    },
+    Local {
+        transport: TransportId,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        conversation: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        boot_nonce: String,
+        connection: u64,
+        sequence: u64,
+    },
+}
+
+impl fmt::Debug for DeliveryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeliveryIdentity([REDACTED])")
+    }
+}
+
+impl DeliveryIdentity {
+    #[must_use]
+    pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
+        match (self, scope.kind) {
+            (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
+                channel == &scope.channel && canonical_slack_timestamp(timestamp)
+            }
+            (Self::Discord { channel, message }, ChatTransportKind::Discord) => {
+                channel == &scope.channel
+                    && canonical_unsigned_decimal(channel)
+                    && canonical_unsigned_decimal(message)
+            }
+            (
+                Self::Telegram {
+                    chat,
+                    topic,
+                    message,
+                },
+                ChatTransportKind::Telegram,
+            ) => {
+                let expected_topic = scope
+                    .conversation
+                    .strip_prefix(&format!("{}:topic:", scope.channel));
+                chat == &scope.channel
+                    && canonical_signed_decimal(chat)
+                    && topic.as_deref() == expected_topic
+                    && topic
+                        .as_deref()
+                        .is_none_or(canonical_positive_service_decimal)
+                    && canonical_positive_service_decimal(message)
+            }
+            (
+                Self::Whatsapp {
+                    waba,
+                    phone_number,
+                    message,
+                },
+                ChatTransportKind::Whatsapp,
+            ) => {
+                let mut parts = scope.channel.split(':');
+                let canonical = parts.next() == Some(waba.as_str())
+                    && parts.next() == Some(phone_number.as_str())
+                    && parts.next().is_some_and(canonical_meta_decimal)
+                    && parts.next().is_none();
+                canonical
+                    && scope.conversation == scope.channel
+                    && canonical_meta_decimal(waba)
+                    && canonical_meta_decimal(phone_number)
+                    && canonical_whatsapp_message_id(message)
+            }
+            (
+                Self::Local {
+                    transport,
+                    conversation,
+                    boot_nonce,
+                    connection,
+                    sequence,
+                },
+                ChatTransportKind::Local,
+            ) => {
+                transport == &scope.transport
+                    && conversation == &scope.conversation
+                    && boot_nonce.len() == 32
+                    && boot_nonce
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && *connection > 0
+                    && *sequence > 0
+            }
+            _ => false,
+        }
+    }
+}
+
+fn deserialize_whatsapp_message_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_whatsapp_message_id(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("WhatsApp message ID is not canonical"))
+}
+
+fn canonical_whatsapp_message_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn deserialize_meta_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 64>(deserializer)?;
+    canonical_meta_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is not a canonical Meta decimal"))
+}
+
+fn canonical_meta_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn deserialize_positive_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_positive_service_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is outside the positive service range"))
+}
+
+fn deserialize_signed_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_signed_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is outside the signed service range"))
+}
+
+fn deserialize_optional_positive_service_decimal<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalServiceDecimal;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalServiceDecimal {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("null or a canonical positive signed-service identifier")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<Inner>(self, deserializer: Inner) -> Result<Self::Value, Inner::Error>
+        where
+            Inner: serde::Deserializer<'de>,
+        {
+            deserialize_positive_service_decimal(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalServiceDecimal)
+}
+
+fn canonical_slack_timestamp(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, fraction)| {
+        seconds.len() == 10
+            && fraction.len() == 6
+            && !seconds.starts_with('0')
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn canonical_unsigned_decimal(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_positive_service_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number > 0 && number.to_string() == value)
+}
+
+fn canonical_signed_decimal(value: &str) -> bool {
+    value
+        .parse::<i64>()
+        .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+/// Exact turn accepted by a transport and proposed once for model-hidden recording.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DeliveredTurnRequest {
+    pub id: InvocationId,
+    pub trace: TraceId,
+    pub trace_parent: Option<TraceParent>,
+    pub delivery: DeliveryIdentity,
+    #[serde(deserialize_with = "deserialize_turn_text")]
+    pub user: String,
+    #[serde(deserialize_with = "deserialize_turn_text")]
+    pub assistant: String,
+}
+
+impl fmt::Debug for DeliveredTurnRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeliveredTurnRequest([REDACTED])")
+    }
+}
+
+impl DeliveredTurnRequest {
+    /// Validates the complete text bound. Delivery canonicalization additionally needs the
+    /// separately attested scope and is checked by the broker.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.user
+            .len()
+            .checked_add(self.assistant.len())
+            .is_some_and(|bytes| bytes <= 64 * 1024)
+    }
+}
+
+fn deserialize_turn_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, { 64 * 1024 }>(deserializer)
+}
+
+/// Broker-derived optional memory surface for one freshly authorized chat scope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatMemorySurface {
+    pub max_lookback_turns: u32,
+    pub prompt_note: String,
+}
+
 /// One capability visible to an authenticated broker client.
 ///
 /// Routing and effect metadata are overwritten from trusted exact policy. Description and input
@@ -319,38 +783,212 @@ impl AgentInventory {
     /// Checks defensive cardinality, text, and duplicate bounds before retaining a report.
     #[must_use]
     pub fn is_valid(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    /// Checks the same bounds as [`AgentInventory::is_valid`], naming the first one violated.
+    ///
+    /// A server keeps the wire message generic and logs this locally, so an operator whose web UI
+    /// inventory went stale can learn which agent and which bound was at fault instead of reading
+    /// one fixed string on both ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`InventoryError`] describing the first violated bound. The error names
+    /// validated identifiers and byte counts only; no operator-authored text reaches it.
+    pub fn validate(&self) -> Result<(), InventoryError> {
         if self.agents.len() > MAX_REPORTED_AGENTS {
-            return false;
+            return Err(InventoryError::TooManyAgents {
+                count: self.agents.len(),
+                maximum: MAX_REPORTED_AGENTS,
+            });
         }
-        let mut agents = BTreeSet::new();
-        self.agents.iter().all(|agent| {
-            agents.insert(agent.id.clone())
-                && agent.description.len() <= MAX_REPORTED_TEXT_BYTES
-                && agent
-                    .model_class
-                    .as_ref()
-                    .is_none_or(|value| value.len() <= MAX_REPORTED_TEXT_BYTES)
-                && agent.providers.len() <= MAX_REPORTED_AGENT_PROVIDERS
-                && agent.capabilities.len() <= MAX_REPORTED_AGENT_CAPABILITIES
-                && unique(agent.providers.iter())
-                && unique(agent.capabilities.iter().map(|capability| &capability.id))
-                && agent.capabilities.iter().all(|capability| {
-                    agent.providers.contains(&capability.provider)
-                        && capability.permissions.len() <= MAX_REPORTED_PERMISSIONS
-                        && capability.permissions.iter().all(|permission| {
-                            permission.operation.len() <= MAX_REPORTED_TEXT_BYTES
-                                && permission.resource.as_ref().is_none_or(|resource| {
-                                    resource.len() <= MAX_REPORTED_TEXT_BYTES
-                                })
-                        })
-                })
-        })
+        let mut reported = BTreeSet::new();
+        for agent in &self.agents {
+            if !reported.insert(agent.id.clone()) {
+                return Err(InventoryError::DuplicateAgent {
+                    agent: agent.id.clone(),
+                });
+            }
+            agent.validate()?;
+        }
+        Ok(())
     }
 }
 
-fn unique<'a, T: 'a + Ord>(values: impl IntoIterator<Item = &'a T>) -> bool {
+impl ReportedAgent {
+    fn validate(&self) -> Result<(), InventoryError> {
+        self.check_text("description", self.description.len())?;
+        if let Some(model_class) = &self.model_class {
+            self.check_text("model class", model_class.len())?;
+        }
+        self.check_count(
+            "providers",
+            self.providers.len(),
+            MAX_REPORTED_AGENT_PROVIDERS,
+        )?;
+        self.check_count(
+            "capabilities",
+            self.capabilities.len(),
+            MAX_REPORTED_AGENT_CAPABILITIES,
+        )?;
+        if let Some(provider) = duplicate(self.providers.iter()) {
+            return Err(InventoryError::DuplicateProvider {
+                agent: self.id.clone(),
+                provider: provider.clone(),
+            });
+        }
+        if let Some(capability) = duplicate(self.capabilities.iter().map(|entry| &entry.id)) {
+            return Err(InventoryError::DuplicateCapability {
+                agent: self.id.clone(),
+                capability: capability.clone(),
+            });
+        }
+        for capability in &self.capabilities {
+            if !self.providers.contains(&capability.provider) {
+                return Err(InventoryError::UndeclaredProvider {
+                    agent: self.id.clone(),
+                    capability: capability.id.clone(),
+                    provider: capability.provider.clone(),
+                });
+            }
+            if capability.permissions.len() > MAX_REPORTED_PERMISSIONS {
+                return Err(InventoryError::TooManyPermissions {
+                    agent: self.id.clone(),
+                    capability: capability.id.clone(),
+                    count: capability.permissions.len(),
+                    maximum: MAX_REPORTED_PERMISSIONS,
+                });
+            }
+            for permission in &capability.permissions {
+                self.check_text("permission operation", permission.operation.len())?;
+                if let Some(resource) = &permission.resource {
+                    self.check_text("permission resource", resource.len())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_text(&self, field: &'static str, bytes: usize) -> Result<(), InventoryError> {
+        if bytes > MAX_REPORTED_TEXT_BYTES {
+            return Err(InventoryError::TextTooLong {
+                agent: self.id.clone(),
+                field,
+                bytes,
+                maximum: MAX_REPORTED_TEXT_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_count(
+        &self,
+        collection: &'static str,
+        count: usize,
+        maximum: usize,
+    ) -> Result<(), InventoryError> {
+        if count > maximum {
+            return Err(InventoryError::TooMany {
+                agent: self.id.clone(),
+                collection,
+                count,
+                maximum,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn duplicate<'a, T: 'a + Ord>(values: impl IntoIterator<Item = &'a T>) -> Option<&'a T> {
     let mut seen = BTreeSet::new();
-    values.into_iter().all(|value| seen.insert(value))
+    values.into_iter().find(|value| !seen.insert(*value))
+}
+
+/// The first defensive bound one informational agent inventory violated.
+///
+/// Every field is a validated identifier or a byte count, never operator-authored text, so a
+/// server may log this without moving catalog prose or prompt content into its logs.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InventoryError {
+    /// More agents than [`MAX_REPORTED_AGENTS`].
+    #[error("inventory reports {count} agents; maximum is {maximum}")]
+    TooManyAgents {
+        /// Reported agents.
+        count: usize,
+        /// Accepted maximum.
+        maximum: usize,
+    },
+    /// One agent identifier appeared more than once.
+    #[error("inventory reports agent `{agent}` more than once")]
+    DuplicateAgent {
+        /// Repeated agent.
+        agent: AgentId,
+    },
+    /// One operator-authored string exceeded [`MAX_REPORTED_TEXT_BYTES`].
+    #[error("agent `{agent}` {field} is {bytes} bytes; maximum is {maximum}")]
+    TextTooLong {
+        /// Offending agent.
+        agent: AgentId,
+        /// Which string exceeded the bound.
+        field: &'static str,
+        /// Reported byte length.
+        bytes: usize,
+        /// Accepted maximum.
+        maximum: usize,
+    },
+    /// One agent collection exceeded its cardinality bound.
+    #[error("agent `{agent}` reports {count} {collection}; maximum is {maximum}")]
+    TooMany {
+        /// Offending agent.
+        agent: AgentId,
+        /// Which collection exceeded its bound.
+        collection: &'static str,
+        /// Reported entries.
+        count: usize,
+        /// Accepted maximum.
+        maximum: usize,
+    },
+    /// One agent listed the same provider twice.
+    #[error("agent `{agent}` reports provider `{provider}` more than once")]
+    DuplicateProvider {
+        /// Offending agent.
+        agent: AgentId,
+        /// Repeated provider.
+        provider: ProviderId,
+    },
+    /// One agent listed the same capability twice.
+    #[error("agent `{agent}` reports capability `{capability}` more than once")]
+    DuplicateCapability {
+        /// Offending agent.
+        agent: AgentId,
+        /// Repeated capability.
+        capability: CapabilityId,
+    },
+    /// One capability named a provider its agent does not declare.
+    #[error("agent `{agent}` capability `{capability}` names undeclared provider `{provider}`")]
+    UndeclaredProvider {
+        /// Offending agent.
+        agent: AgentId,
+        /// Offending capability.
+        capability: CapabilityId,
+        /// Provider missing from the agent's own list.
+        provider: ProviderId,
+    },
+    /// One capability exceeded [`MAX_REPORTED_PERMISSIONS`].
+    #[error(
+        "agent `{agent}` capability `{capability}` reports {count} permissions; maximum is {maximum}"
+    )]
+    TooManyPermissions {
+        /// Offending agent.
+        agent: AgentId,
+        /// Offending capability.
+        capability: CapabilityId,
+        /// Reported permissions.
+        count: usize,
+        /// Accepted maximum.
+        maximum: usize,
+    },
 }
 
 /// Provider-reported token accounting accumulated by an unprivileged model process.
@@ -388,27 +1026,87 @@ impl ModelUsageReport {
     /// Validates one bounded accounting delta before it reaches a live counter.
     #[must_use]
     pub fn is_valid(self) -> bool {
-        self.model_calls > 0
-            && self.model_calls <= MAX_REPORTED_MODEL_CALLS
-            && [
-                self.input_unreported_calls,
-                self.cached_input_unreported_calls,
-                self.output_unreported_calls,
-                self.reasoning_unreported_calls,
-                self.total_unreported_calls,
-            ]
-            .into_iter()
-            .all(|missing| missing <= self.model_calls)
-            && [
-                self.input_tokens,
-                self.cached_input_tokens,
-                self.output_tokens,
-                self.reasoning_output_tokens,
-                self.total_tokens,
-            ]
-            .into_iter()
-            .all(|tokens| tokens <= MAX_REPORTED_TOKENS)
+        self.validate().is_ok()
     }
+
+    /// Checks the same bounds as [`ModelUsageReport::is_valid`], naming the first one violated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`UsageReportError`] describing the first violated bound. Every field is a
+    /// count, so a server may log it without moving any model or prompt content into its logs.
+    pub fn validate(self) -> Result<(), UsageReportError> {
+        if self.model_calls == 0 || self.model_calls > MAX_REPORTED_MODEL_CALLS {
+            return Err(UsageReportError::ModelCalls {
+                count: self.model_calls,
+                maximum: MAX_REPORTED_MODEL_CALLS,
+            });
+        }
+        for (field, count) in [
+            ("input", self.input_unreported_calls),
+            ("cached input", self.cached_input_unreported_calls),
+            ("output", self.output_unreported_calls),
+            ("reasoning", self.reasoning_unreported_calls),
+            ("total", self.total_unreported_calls),
+        ] {
+            if count > self.model_calls {
+                return Err(UsageReportError::UnreportedCalls {
+                    field,
+                    count,
+                    calls: self.model_calls,
+                });
+            }
+        }
+        for (field, count) in [
+            ("input", self.input_tokens),
+            ("cached input", self.cached_input_tokens),
+            ("output", self.output_tokens),
+            ("reasoning output", self.reasoning_output_tokens),
+            ("total", self.total_tokens),
+        ] {
+            if count > MAX_REPORTED_TOKENS {
+                return Err(UsageReportError::Tokens {
+                    field,
+                    count,
+                    maximum: MAX_REPORTED_TOKENS,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The first defensive bound one model-usage accounting delta violated.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum UsageReportError {
+    /// The delta represented no calls, or more than [`MAX_REPORTED_MODEL_CALLS`].
+    #[error("report covers {count} model calls; expected 1 to {maximum}")]
+    ModelCalls {
+        /// Reported calls.
+        count: u64,
+        /// Accepted maximum.
+        maximum: u64,
+    },
+    /// More calls omitted one accounting field than the delta has calls.
+    #[error("report omits {field} accounting for {count} of its {calls} model calls")]
+    UnreportedCalls {
+        /// Which accounting field.
+        field: &'static str,
+        /// Calls reported as missing that field.
+        count: u64,
+        /// Calls the delta represents.
+        calls: u64,
+    },
+    /// One token count exceeded [`MAX_REPORTED_TOKENS`].
+    #[error("report counts {count} {field} tokens; maximum is {maximum}")]
+    Tokens {
+        /// Which token field.
+        field: &'static str,
+        /// Reported tokens.
+        count: u64,
+        /// Accepted maximum.
+        maximum: u64,
+    },
 }
 
 /// One attested on-behalf-of claim accompanying a gateway's proposal.
@@ -496,6 +1194,55 @@ impl RequestEnvelope {
         }
     }
 
+    /// Creates a bounded chat-scoped capability request.
+    #[must_use]
+    pub const fn capabilities_for_chat(claim: ChatSessionClaim) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::CapabilitiesForChat { claim },
+        }
+    }
+
+    /// Creates a bounded chat-scoped command rewrite request.
+    #[must_use]
+    pub const fn resolve_command_for_chat(
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::ResolveCommandForChat { claim, word, argv },
+        }
+    }
+
+    /// Creates a bounded chat-scoped generic proposal.
+    #[must_use]
+    pub const fn invoke_for_chat(
+        invocation: InvocationRequest,
+        attestation: ChatAttestation,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::InvokeForChat {
+                invocation,
+                attestation,
+            },
+        }
+    }
+
+    /// Creates the dedicated model-hidden post-acceptance record proposal.
+    #[must_use]
+    pub const fn record_delivered_turn_for_chat(
+        turn: DeliveredTurnRequest,
+        attestation: ChatAttestation,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            request: BrokerRequest::RecordDeliveredTurnForChat { turn, attestation },
+        }
+    }
+
     /// Creates an informational gateway catalog report.
     #[must_use]
     pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
@@ -545,6 +1292,24 @@ pub enum BrokerRequest {
         /// The gateway's on-behalf-of claim, honored only under an attestor grant.
         attestation: SubjectAttestation,
     },
+    /// Lists the chat surface after invocation-bound scope authority is validated.
+    CapabilitiesForChat { claim: ChatSessionClaim },
+    /// Rewrites a command only inside a freshly authorized chat scope.
+    ResolveCommandForChat {
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    },
+    /// Submits a recent/search proposal under invocation-bound chat attestation.
+    InvokeForChat {
+        invocation: InvocationRequest,
+        attestation: ChatAttestation,
+    },
+    /// Dedicated model-hidden recording operation after transport acceptance.
+    RecordDeliveredTurnForChat {
+        turn: DeliveredTurnRequest,
+        attestation: ChatAttestation,
+    },
     /// Rewrites one command word's arguments into a capability proposal.
     ///
     /// Deliberately not gated on the caller's grants. The rewrite is a pure function inside the
@@ -555,7 +1320,11 @@ pub enum BrokerRequest {
     ResolveCommand {
         /// The command word, which must belong to a loaded provider.
         word: String,
-        /// Arguments as the script supplied them, `argv[0]` being the word itself.
+        /// Arguments as the script supplied them, **without** the word itself.
+        ///
+        /// The word travels in its own field because the broker selects the declaring provider by
+        /// it before the guest runs, so repeating it here would give the guest a second, editable
+        /// copy of a routing decision already made.
         argv: Vec<String>,
     },
     /// Replaces the broker's in-memory informational view of the gateway catalog.
@@ -595,6 +1364,24 @@ impl ResponseEnvelope {
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                chat_memory: None,
+            },
+        }
+    }
+
+    /// Creates a successful freshly authorized chat capability response.
+    #[must_use]
+    pub const fn chat_capabilities(
+        capabilities: Vec<AvailableCapability>,
+        command_words: Vec<String>,
+        chat_memory: Option<ChatMemorySurface>,
+    ) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha1,
+            response: BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+                chat_memory,
             },
         }
     }
@@ -674,6 +1461,9 @@ pub enum BrokerResponse {
         /// Defaulted so a client of this version reads a broker that predates it.
         #[serde(default)]
         command_words: Vec<String>,
+        /// Present only for an effective all-three chat-memory surface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_memory: Option<ChatMemorySurface>,
     },
     /// Terminal invocation result.
     Invocation {
@@ -736,7 +1526,16 @@ impl FrameLimits {
     }
 }
 
+/// Length prefix carried at the head of every frame.
+const FRAME_PREFIX_BYTES: usize = 4;
+/// Payload bytes allocated up front, however large the peer's prefix claims the frame is.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Reads and strictly decodes one complete length-delimited JSON frame.
+///
+/// Allocation follows the bytes that actually arrive rather than the length the peer claims: a
+/// connected peer that sends only a prefix and then stalls holds one chunk until the deadline, not
+/// a whole frame's worth of zeroed memory per connection.
 pub async fn read_frame<R, T>(reader: &mut R, limits: FrameLimits) -> Result<T, ProtocolError>
 where
     R: AsyncRead + Unpin,
@@ -744,7 +1543,7 @@ where
 {
     let limits = limits.validate()?;
     let bytes = timeout(limits.io_timeout, async {
-        let mut prefix = [0_u8; 4];
+        let mut prefix = [0_u8; FRAME_PREFIX_BYTES];
         reader.read_exact(&mut prefix).await?;
         let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap_or(usize::MAX);
         if length == 0 {
@@ -753,8 +1552,19 @@ where
         if length > limits.max_frame_bytes {
             return Err(ReadFrameError::TooLarge { length });
         }
-        let mut bytes = vec![0_u8; length];
-        reader.read_exact(&mut bytes).await?;
+        let mut bytes = Vec::with_capacity(length.min(READ_CHUNK_BYTES));
+        (&mut *reader)
+            .take(length as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        // `read_to_end` stops at end of stream as well as at the limit, so a peer that announces
+        // more than it sends must still fail rather than decoding a short frame.
+        if bytes.len() != length {
+            return Err(ReadFrameError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "broker frame ended before its declared length",
+            )));
+        }
         Ok(bytes)
     })
     .await
@@ -784,6 +1594,9 @@ impl From<io::Error> for ReadFrameError {
 }
 
 /// Strictly serializes and writes one complete length-delimited JSON frame.
+///
+/// The prefix is patched into space the serialization buffer already reserved, so one frame is one
+/// `write_all` rather than a prefix syscall followed by a payload syscall on an unbuffered socket.
 pub async fn write_frame<W, T>(
     writer: &mut W,
     value: &T,
@@ -804,13 +1617,14 @@ where
         }
         return Err(ProtocolError::Serialize { source });
     }
-    let length = u32::try_from(buffer.bytes.len()).map_err(|_| ProtocolError::FrameTooLarge {
-        length: buffer.bytes.len(),
+    let payload = buffer.payload_len();
+    let length = u32::try_from(payload).map_err(|_| ProtocolError::FrameTooLarge {
+        length: payload,
         maximum: limits.max_frame_bytes,
     })?;
+    buffer.frame[..FRAME_PREFIX_BYTES].copy_from_slice(&length.to_be_bytes());
     timeout(limits.io_timeout, async {
-        writer.write_all(&length.to_be_bytes()).await?;
-        writer.write_all(&buffer.bytes).await?;
+        writer.write_all(&buffer.frame).await?;
         writer.flush().await
     })
     .await
@@ -818,25 +1632,33 @@ where
     .map_err(|source| ProtocolError::Io { source })
 }
 
+/// Serialization target holding the complete frame: a reserved length prefix, then the payload.
 struct BoundedJsonBuffer {
-    bytes: Vec<u8>,
+    frame: Vec<u8>,
     maximum: usize,
     exceeded: bool,
 }
 
 impl BoundedJsonBuffer {
     fn new(maximum: usize) -> Self {
+        let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + maximum.min(8 * 1024));
+        frame.extend_from_slice(&[0_u8; FRAME_PREFIX_BYTES]);
         Self {
-            bytes: Vec::with_capacity(maximum.min(8 * 1024)),
+            frame,
             maximum,
             exceeded: false,
         }
+    }
+
+    /// Serialized bytes so far, excluding the reserved prefix the bound does not count.
+    fn payload_len(&self) -> usize {
+        self.frame.len() - FRAME_PREFIX_BYTES
     }
 }
 
 impl io::Write for BoundedJsonBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let Some(length) = self.bytes.len().checked_add(bytes.len()) else {
+        let Some(length) = self.payload_len().checked_add(bytes.len()) else {
             self.exceeded = true;
             return Err(io::Error::other("bounded JSON frame overflowed"));
         };
@@ -844,7 +1666,7 @@ impl io::Write for BoundedJsonBuffer {
             self.exceeded = true;
             return Err(io::Error::other("bounded JSON frame exceeded its limit"));
         }
-        self.bytes.extend_from_slice(bytes);
+        self.frame.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -922,7 +1744,7 @@ impl BrokerClient {
         Ok(Self {
             socket: socket.into(),
             expected_server_uid,
-            limits: limits.validate().map_err(ClientError::Protocol)?,
+            limits: limits.validate().map_err(ClientError::Limits)?,
         })
     }
 
@@ -962,6 +1784,7 @@ impl BrokerClient {
             BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                ..
             } => Ok((capabilities, command_words)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             _ => Err(ClientError::UnexpectedResponse),
@@ -969,6 +1792,10 @@ impl BrokerClient {
     }
 
     /// Returns capabilities and command words for one attested on-behalf-of context.
+    ///
+    /// The claim is honored only when this client's peer identity carries a matching attestor
+    /// grant in the broker's owner-controlled configuration; otherwise the broker refuses with a
+    /// stable code and no capability information.
     pub async fn session_surface_for(
         &self,
         subject: ExternalSubject,
@@ -981,21 +1808,71 @@ impl BrokerClient {
             BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                ..
             } => Ok((capabilities, command_words)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
-    /// Returns capabilities exact policy makes visible to this authenticated peer.
-    pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
-        match self.exchange(RequestEnvelope::capabilities()).await? {
-            BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
+    /// Returns the freshly authorized capability, command, and optional memory chat surface.
+    pub async fn session_surface_for_chat(
+        &self,
+        claim: ChatSessionClaim,
+    ) -> Result<
+        (
+            Vec<AvailableCapability>,
+            Vec<String>,
+            Option<ChatMemorySurface>,
+        ),
+        ClientError,
+    > {
+        match self
+            .exchange(RequestEnvelope::capabilities_for_chat(claim))
+            .await?
+        {
+            BrokerResponse::Capabilities {
+                capabilities,
+                command_words,
+                chat_memory,
+            } => Ok((capabilities, command_words, chat_memory)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Rewrites one command under the same bounded chat scope used for later invocation.
+    pub async fn resolve_command_for_chat(
+        &self,
+        claim: ChatSessionClaim,
+        word: String,
+        argv: Vec<String>,
+    ) -> Result<Result<(CapabilityId, serde_json::Value), String>, ClientError> {
+        match self
+            .exchange(RequestEnvelope::resolve_command_for_chat(claim, word, argv))
+            .await?
+        {
+            BrokerResponse::CommandResolution {
+                capability: Some(capability),
+                input: Some(input),
+                ..
+            } => Ok(Ok((capability, input))),
+            BrokerResponse::CommandResolution {
+                message: Some(message),
+                ..
+            } => Ok(Err(message)),
+            BrokerResponse::CommandResolution { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Returns capabilities exact policy makes visible to this authenticated peer.
+    ///
+    /// The same `capabilities` exchange as [`BrokerClient::session_surface`], for a caller with no
+    /// use for command words.
+    pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
+        Ok(self.session_surface().await?.0)
     }
 
     /// Submits untrusted invocation fields without any identity or authority claim.
@@ -1012,25 +1889,50 @@ impl BrokerClient {
         }
     }
 
-    /// Returns capabilities visible to one attested on-behalf-of context.
-    ///
-    /// The claim is honored only when this client's peer identity carries a matching attestor
-    /// grant in the broker's owner-controlled configuration; otherwise the broker refuses with a
-    /// stable code and no capability information.
-    pub async fn capabilities_for(
+    /// Submits recent/search under invocation-bound chat attestation.
+    pub async fn invoke_for_chat(
         &self,
-        subject: ExternalSubject,
-        agent: AgentId,
-    ) -> Result<Vec<AvailableCapability>, ClientError> {
+        request: InvocationRequest,
+        claim: ChatSessionClaim,
+    ) -> Result<InvocationResult, ClientError> {
+        let attestation = ChatAttestation {
+            subject: claim.subject,
+            agent: claim.agent,
+            scope: claim.scope,
+            invocation: request.id.clone(),
+        };
         match self
-            .exchange(RequestEnvelope::capabilities_for(subject, agent))
+            .exchange(RequestEnvelope::invoke_for_chat(request, attestation))
             .await?
         {
-            BrokerResponse::Capabilities { capabilities, .. } => Ok(capabilities),
+            BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Invocation { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Submits exactly one model-hidden post-acceptance record request.
+    pub async fn record_delivered_turn_for_chat(
+        &self,
+        turn: DeliveredTurnRequest,
+        claim: ChatSessionClaim,
+    ) -> Result<InvocationResult, ClientError> {
+        let attestation = ChatAttestation {
+            subject: claim.subject,
+            agent: claim.agent,
+            scope: claim.scope,
+            invocation: turn.id.clone(),
+        };
+        match self
+            .exchange(RequestEnvelope::record_delivered_turn_for_chat(
+                turn,
+                attestation,
+            ))
+            .await?
+        {
+            BrokerResponse::Invocation { result } => Ok(result),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1106,12 +2008,21 @@ impl BrokerClient {
                 actual: credentials.uid(),
             });
         }
+        // The phase is the whole point: everything up to and including this write leaves the
+        // broker with no request to act on, and everything after it leaves this client unable to
+        // say whether the request was acted on.
         write_frame(&mut stream, &request, self.limits)
             .await
-            .map_err(ClientError::Protocol)?;
+            .map_err(|source| ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source,
+            })?;
         let response = read_frame::<_, ResponseEnvelope>(&mut stream, self.limits)
             .await
-            .map_err(ClientError::Protocol)?;
+            .map_err(|source| ClientError::Protocol {
+                phase: ExchangePhase::Response,
+                source,
+            })?;
         Ok(response.response)
     }
 }
@@ -1170,9 +2081,21 @@ pub enum ClientError {
         /// Actual peer UID.
         actual: u32,
     },
-    /// Bounded framing failed.
-    #[error("broker protocol failed")]
-    Protocol(#[source] ProtocolError),
+    /// Configured frame bounds were rejected before any connection was attempted.
+    #[error("broker client limits are invalid: {0}")]
+    Limits(#[source] ProtocolError),
+    /// Bounded framing failed during one half of an exchange.
+    ///
+    /// `phase` carries the resubmission-safety distinction: see [`ExchangePhase`] and
+    /// [`ClientError::may_have_executed`] before retrying anything that writes.
+    #[error("broker {phase} framing failed: {source}")]
+    Protocol {
+        /// Which half of the exchange failed.
+        phase: ExchangePhase,
+        /// Bounded framing failure. Its message names no path and carries no payload content.
+        #[source]
+        source: ProtocolError,
+    },
     /// Broker returned a stable public infrastructure failure.
     #[error("broker returned {code}: {message}")]
     Remote {
@@ -1186,9 +2109,69 @@ pub enum ClientError {
     UnexpectedResponse,
 }
 
+/// Which half of one broker exchange a bounded framing failure belongs to.
+///
+/// This is the client-local twin of the wire's [`ERROR_BROKER_UNAVAILABLE`] /
+/// [`ERROR_OUTCOME_UNAUDITED`] split. Nothing ties a client's `io_timeout` to the broker's own
+/// execution deadlines, so a proposal that ran just under the client deadline is delivered,
+/// possibly complete, and unreadable — indistinguishable at the socket from one that never left.
+/// Collapsing both into one error is what lets a caller resubmit an external write it already made.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangePhase {
+    /// Serializing or writing the request failed, so no complete request frame was delivered.
+    ///
+    /// Nothing executed. The same work may be resubmitted under a fresh invocation identifier,
+    /// matching [`ERROR_BROKER_UNAVAILABLE`].
+    Request,
+    /// The complete request frame was delivered and reading its response failed.
+    ///
+    /// The broker may have executed the request. Treat this exactly like
+    /// [`ERROR_OUTCOME_UNAUDITED`]: the work must **not** be resubmitted under any identifier,
+    /// because replay rejection keys on the invocation identifier and a fresh one duplicates a
+    /// non-idempotent external effect. The broker's audit log is the only record of what happened.
+    Response,
+}
+
+#[cfg(unix)]
+impl fmt::Display for ExchangePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ClientError {
+    /// Reports whether the broker may have executed the request this failure ended.
+    ///
+    /// `true` means the complete request frame was delivered and this client could not establish
+    /// the outcome. For an operation that writes — `invoke`, `invokeFor`, `invokeForChat`,
+    /// `recordDeliveredTurnForChat` — the external effect may already have taken place, so the
+    /// caller must surface a non-retryable failure rather than resubmit under a fresh identifier.
+    /// For a read-only operation it is informational and re-asking is harmless.
+    #[must_use]
+    pub fn may_have_executed(&self) -> bool {
+        match self {
+            Self::Protocol { phase, .. } => *phase == ExchangePhase::Response,
+            Self::Remote { code, .. } => code == ERROR_OUTCOME_UNAUDITED,
+            // The request was delivered in full and the broker answered something this client
+            // cannot interpret, which is exactly "delivered, outcome unknown".
+            Self::UnexpectedResponse => true,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for ProtocolVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(PROTOCOL_VERSION)
+        // Matched rather than written from the constant so a second variant cannot silently
+        // inherit the first one's identifier while serializing correctly.
+        formatter.write_str(match self {
+            Self::V1Alpha1 => PROTOCOL_VERSION,
+        })
     }
 }
 

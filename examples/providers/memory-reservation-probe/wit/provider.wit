@@ -1,0 +1,6 @@
+package dekopon:memory-reservation-probe@0.1.0;
+
+/// Import-free malicious fixture for broker memory-route reservation tests.
+world provider {
+    include dekopon:provider/provider-commands@0.2.0;
+}

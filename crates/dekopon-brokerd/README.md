@@ -212,6 +212,10 @@ identities:
       principal: dekopond-gateway
     attestor:
       namespaces: [slack.t0123abc]     # segment-boundary prefixes, service name first
+      chatScopes:                      # required by chat-scoped gateway operations
+        - breadth: transportWide
+          kind: slack
+          transport: scientist-slack
 identityMappings:
   - subject: slack.t0123abc.u9xyz      # canonical: lowercase dotted segments
     principal: maintainer              # the only place a subject becomes a principal
@@ -305,7 +309,9 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata and each mapped capability response to fit the frame ceiling. Shutdown grace must cover one configured host deadline plus two complete frame deadlines.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. When a section is present, every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through `capabilitiesFor`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain, the provider-storage GC drain, and the web-UI drain share a single deadline rather than taking one each.
+
+`maxReplayIds` should be at least `auditMaxRecords`. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
 
 ```console
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
@@ -315,7 +321,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
+SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
 
 ## Read-only web UI
 
@@ -346,6 +352,7 @@ The backing filesystem must honor Unix no-follow opens, advisory exclusive locks
 ## Boundaries
 
 - The service accepts one strict bounded request per fresh Unix connection.
+- A transient `accept` failure — descriptor or kernel-buffer exhaustion, an aborted peer, a signal — is logged as `broker_accept_retried` and retried after a short backoff. Only a fault that says the listener itself is unusable ends the process, because ending it costs a container restart and a full provider recompile before the socket rebinds.
 - Peer UID mapping is trusted configuration; payload identity claims do not exist.
 - Authorization decisions come from the Cedar policy set; execution bounds come from
   `constraintSets` and are validated against loaded manifests, host ceilings, and the credential
@@ -356,3 +363,91 @@ The backing filesystem must honor Unix no-follow opens, advisory exclusive locks
 - The durable JSONL chain is mutation-evident and replay-restoring. The separate atomic checkpoint makes the retained head externally inspectable, but is not signed, remote, append-only, or a transparency service by itself.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
 - Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
+
+## Optional provider storage and chat memory
+
+Presence of `storage` requires every field; absence links storage imports only to a disabled sticky
+context. `rootPath` is disjoint from every broker-owned file/provider path and
+`namespaceKeyPath` is one no-follow, server-owned `0600`, single-link, ≤4 KiB document under safe
+ancestors. A deployment with retained data and a missing or changed key fails closed.
+
+```yaml
+storage:
+  rootPath: /var/lib/dekopon-provider-storage
+  namespaceKeyPath: /etc/dekopon-storage-key/storage-key.yaml
+  maxRootBytes: 2147483648
+  maxNamespaces: 4096
+  maxNamespaceBytes: 67108864
+  maxFilesPerNamespace: 64
+  maxFileBytes: 16777216
+  maxOpenHandles: 256
+  maxHandlesPerInvocation: 32
+  maxHostCallsPerInvocation: 4096
+  maxReadBytesPerCall: 262144
+  maxReadBytesPerInvocation: 16777216
+  maxWriteBytesPerCall: 16777216
+  maxWriteBytesPerInvocation: 16777216
+  maxEntropyBytesPerCall: 256
+  maxEntropyBytesPerInvocation: 4096
+  lockTimeoutMs: 5000
+  finalizationBudgetMs: 5000
+  maxPendingTransactions: 64
+  startupMaxEntries: 100000
+  startupMaxTransactions: 1024
+  maxQuarantinedNamespaces: 128
+  retiredGenerationGraceMs: 86400000
+  retiredGenerationTtlMs: 604800000
+  inactiveNamespaceTtlMs: 31536000000
+  gcIntervalMs: 3600000
+  gcMaxNamespacesPerPass: 64
+  gcMaxBytesPerPass: 67108864
+
+chatMemory:
+  continuityPolicy: authority-bound # safe default; stable must be explicit
+  enabledAgents: [reviewer]
+  maxLookbackTurns: 200
+  maxRecentTurns: 20
+  maxSearchResults: 20
+  maxQueryBytes: 256
+  maxResultBytes: 65536
+  maxTurnBytes: 32768 # complete canonical turn JSONL line, including LF
+  maxDedupRecords: 16000
+  maxDedupBytes: 4194304
+  compactionTargetBytes: 8388608
+  compactionThresholdBytes: 12582912
+```
+
+Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
+`chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
+headroom. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
+invocation and host-call budgets, requires both logical files, and reserves the post-append old file,
+staged replacement, permanent dedup copies, and transaction metadata. Startup accounts the
+worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files
+plus canonical-ABI compaction copies and fixed allocator headroom fit the independent Wasm
+linear-memory ceiling.
+
+The gateway peer's attestor additionally needs `chatScopes`. Breadth is an explicit tagged value:
+`transportWide`, `exactChannel`, or `exactConversation`; each names transport kind and configured
+transport ID, and narrower forms name canonical channel/conversation. A local transport must also
+name `localSubjectService`. Subject namespace authority remains independently required. Scope
+fields enter Cedar as optional `transportKind`, `transport`, `channel`, and `conversation`.
+
+Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The
+lease and reservation remain held while a started blocking job drains, and shutdown grace must
+cover host timeout + lock timeout + finalization budget + two frame deadlines; a failed kernel or
+filesystem may still exceed it. Hostile same-UID mutation remains out of scope.
+
+```yaml
+identities:
+  - uid: 65532
+    principal: dekopond-gateway
+    actor: { type: service, principal: dekopond-gateway }
+    attestor:
+      namespaces: [slack.t0123abc]
+      chatScopes:
+        - breadth: exactConversation
+          kind: slack
+          transport: scientist-slack
+          channel: c0123abc
+          conversation: c0123abc:1712345678.000100
+```

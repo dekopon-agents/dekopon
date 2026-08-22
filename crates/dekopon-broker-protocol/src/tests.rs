@@ -5,10 +5,12 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    AgentInventory, BrokerRequest, FrameLimits, InvocationRequest, MAX_REPORTED_MODEL_CALLS,
-    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, Permission, ProtocolError,
-    ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, TraceParent,
-    TraceParentError, read_frame, write_frame,
+    AgentInventory, BrokerRequest, ChatAttestation, ChatScopeClaim, ChatSessionClaim,
+    ChatTransportKind, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InventoryError,
+    InvocationRequest, MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS,
+    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission,
+    ProtocolError, ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
+    ResponseEnvelope, TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
 };
 
 fn invocation() -> InvocationRequest {
@@ -158,6 +160,134 @@ async fn rejects_oversized_prefix_before_reading_a_body() {
             maximum: 16
         }
     ));
+}
+
+/// A prefix is a claim, not a measurement.
+///
+/// An in-bound length is accepted, so it decides nothing about allocation: the reader must follow
+/// the bytes that actually arrive and refuse a frame that ends early rather than decoding a prefix
+/// of it. This is what keeps 64 connected peers that each announce a 2 MiB frame and then send
+/// nothing from pinning 128 MiB of zeroed buffers until the deadline.
+#[tokio::test]
+async fn in_bound_prefix_that_over_promises_fails_instead_of_decoding_a_short_frame() {
+    let limits = FrameLimits {
+        max_frame_bytes: 8 * 1024 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let (mut writer, mut reader) = duplex(1024);
+    let payload = br#"{"apiVersion":"#;
+    writer
+        .write_all(&(8_u32 * 1024 * 1024).to_be_bytes())
+        .await
+        .expect("write in-bound prefix");
+    writer
+        .write_all(payload)
+        .await
+        .expect("write short payload");
+    drop(writer);
+
+    let error = read_frame::<_, RequestEnvelope>(&mut reader, limits)
+        .await
+        .expect_err("a frame shorter than its prefix must fail");
+    assert!(
+        matches!(&error, ProtocolError::Io { source } if source.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected an unexpected-EOF failure, got {error}"
+    );
+}
+
+/// A peer that sends only a prefix holds the connection, never a frame's worth of memory.
+#[tokio::test]
+async fn prefix_only_peer_times_out_rather_than_completing_a_frame() {
+    let limits = FrameLimits {
+        max_frame_bytes: 2 * 1024 * 1024,
+        io_timeout: Duration::from_millis(50),
+    };
+    let (mut writer, mut reader) = duplex(1024);
+    writer
+        .write_all(&(2_u32 * 1024 * 1024).to_be_bytes())
+        .await
+        .expect("write in-bound prefix");
+
+    let error = read_frame::<_, RequestEnvelope>(&mut reader, limits)
+        .await
+        .expect_err("an idle peer must hit the deadline");
+    assert!(matches!(error, ProtocolError::Timeout));
+    drop(writer);
+}
+
+/// One frame is one write: the length prefix is patched into space the buffer already reserved.
+#[tokio::test]
+async fn one_frame_reaches_the_socket_in_one_write() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let request = RequestEnvelope::invoke(invocation());
+    let mut writer = CountingWriter::default();
+    write_frame(&mut writer, &request, limits)
+        .await
+        .expect("frame writes");
+
+    assert_eq!(writer.writes, 1, "one frame must be one write syscall");
+    let expected = serde_json::to_vec(&request).expect("request serializes");
+    let length = u32::try_from(expected.len()).expect("bounded frame length");
+    assert_eq!(&writer.bytes[..4], &length.to_be_bytes());
+    assert_eq!(&writer.bytes[4..], &expected[..]);
+
+    // The reserved prefix is not payload, so the bound still counts exactly the JSON bytes.
+    let mut exact = CountingWriter::default();
+    let value = json!({"v": "x".repeat(26)});
+    let encoded = serde_json::to_vec(&value).expect("value serializes");
+    write_frame(
+        &mut exact,
+        &value,
+        FrameLimits {
+            max_frame_bytes: encoded.len(),
+            io_timeout: Duration::from_secs(1),
+        },
+    )
+    .await
+    .expect("a frame exactly at the bound is accepted");
+    assert_eq!(exact.bytes.len(), encoded.len() + 4);
 }
 
 #[tokio::test]
@@ -347,4 +477,513 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
     let wrong_uid = uid.wrapping_add(1);
     let client = BrokerClient::new(&socket, wrong_uid, limits).expect("valid client limits");
     assert!(client.capabilities().await.is_err());
+}
+
+/// The executed-or-not distinction the wire codes carry must survive a client-local failure.
+///
+/// A request that never left is safe to resubmit under a fresh invocation identifier; a request
+/// whose response was lost is not, because the broker may have finished a non-idempotent external
+/// effect and replay rejection keys on the identifier a retry would replace.
+#[cfg(unix)]
+#[tokio::test]
+async fn framing_failures_keep_the_executed_or_not_distinction() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use tokio::net::UnixListener;
+
+    use super::{
+        BrokerClient, ClientError, ERROR_BROKER_UNAVAILABLE, ERROR_OUTCOME_UNAUDITED, ExchangePhase,
+    };
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+
+    // A broker that reads the complete proposal and then dies before answering is exactly the
+    // shape of the hazard: the work may have run, and nothing on this side can tell.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client fixture");
+        read_frame::<_, RequestEnvelope>(&mut stream, limits)
+            .await
+            .expect("server decodes the proposal");
+    });
+    let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
+    let lost = client
+        .invoke(invocation())
+        .await
+        .expect_err("a lost response must fail");
+    server.await.expect("server fixture exits");
+    assert!(
+        matches!(
+            &lost,
+            ClientError::Protocol {
+                phase: ExchangePhase::Response,
+                ..
+            }
+        ),
+        "expected a response-phase failure, got {lost}"
+    );
+    assert!(lost.may_have_executed());
+
+    // Serialization stops at the bound, so nothing was delivered and nothing ran.
+    let listener = UnixListener::bind(directory.path().join("unread.sock")).expect("bind fixture");
+    let unread = directory.path().join("unread.sock");
+    std::fs::set_permissions(&unread, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+    let tight = FrameLimits {
+        max_frame_bytes: 64,
+        io_timeout: Duration::from_secs(1),
+    };
+    let client = BrokerClient::new(&unread, uid, tight).expect("valid client limits");
+    let oversized = client
+        .invoke(invocation())
+        .await
+        .expect_err("an oversized proposal must fail");
+    drop(listener);
+    assert!(
+        matches!(
+            &oversized,
+            ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                ..
+            }
+        ),
+        "expected a request-phase failure, got {oversized}"
+    );
+    assert!(!oversized.may_have_executed());
+    // The bounded framing detail reaches Display, where a model and an operator both read it. It
+    // names byte counts and never the socket path.
+    let rendered = oversized.to_string();
+    assert!(rendered.contains("maximum is 64"), "rendered {rendered}");
+    assert!(!rendered.contains("unread.sock"), "rendered {rendered}");
+
+    // The same distinction the broker spends two stable wire codes on.
+    assert!(
+        ClientError::Remote {
+            code: ERROR_OUTCOME_UNAUDITED.to_owned(),
+            message: "audit append failed after execution".to_owned(),
+        }
+        .may_have_executed()
+    );
+    assert!(
+        !ClientError::Remote {
+            code: ERROR_BROKER_UNAVAILABLE.to_owned(),
+            message: "nothing executed".to_owned(),
+        }
+        .may_have_executed()
+    );
+    assert!(!ClientError::ConnectTimeout.may_have_executed());
+}
+
+/// A rejected inventory must name the agent and the bound, not just fail.
+#[test]
+fn inventory_and_usage_validation_name_the_offending_agent_and_bound() {
+    let inventory = AgentInventory {
+        agents: vec![ReportedAgent {
+            id: "reviewer".parse().expect("valid agent"),
+            description: "Reviews pull requests".to_owned(),
+            enabled: true,
+            model_class: None,
+            providers: vec!["gh".parse().expect("valid provider")],
+            capabilities: vec![ReportedAgentCapability {
+                id: "gh.pull-request.read".parse().expect("valid capability"),
+                provider: "gh".parse().expect("valid provider"),
+                permissions: Vec::new(),
+            }],
+        }],
+        truncated: false,
+    };
+    assert_eq!(inventory.validate(), Ok(()));
+
+    let mut oversized = inventory.clone();
+    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
+    let error = oversized
+        .validate()
+        .expect_err("an oversized description is rejected");
+    assert_eq!(
+        error,
+        InventoryError::TextTooLong {
+            agent: "reviewer".parse().expect("valid agent"),
+            field: "description",
+            bytes: MAX_REPORTED_TEXT_BYTES + 1,
+            maximum: MAX_REPORTED_TEXT_BYTES,
+        }
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("reviewer"), "rendered {rendered}");
+    assert!(
+        rendered.contains(&MAX_REPORTED_TEXT_BYTES.to_string()),
+        "rendered {rendered}"
+    );
+    // The bound is named, the operator-authored text that broke it is not.
+    assert!(!rendered.contains("xxxx"), "rendered {rendered}");
+
+    let mut undeclared = inventory.clone();
+    undeclared.agents[0].capabilities[0].provider = "slack".parse().expect("valid provider");
+    assert_eq!(
+        undeclared
+            .validate()
+            .expect_err("a capability may not name an undeclared provider"),
+        InventoryError::UndeclaredProvider {
+            agent: "reviewer".parse().expect("valid agent"),
+            capability: "gh.pull-request.read".parse().expect("valid capability"),
+            provider: "slack".parse().expect("valid provider"),
+        }
+    );
+
+    let mut duplicated = inventory.clone();
+    duplicated.agents.push(inventory.agents[0].clone());
+    assert_eq!(
+        duplicated.validate().expect_err("duplicate agents fail"),
+        InventoryError::DuplicateAgent {
+            agent: "reviewer".parse().expect("valid agent"),
+        }
+    );
+
+    let mut providers = inventory;
+    providers.agents[0].providers = (0..=MAX_REPORTED_AGENT_PROVIDERS)
+        .map(|index| {
+            format!("gh{index}")
+                .parse()
+                .expect("generated provider identifier")
+        })
+        .collect();
+    assert_eq!(
+        providers
+            .validate()
+            .expect_err("a provider list past its bound fails"),
+        InventoryError::TooMany {
+            agent: "reviewer".parse().expect("valid agent"),
+            collection: "providers",
+            count: MAX_REPORTED_AGENT_PROVIDERS + 1,
+            maximum: MAX_REPORTED_AGENT_PROVIDERS,
+        }
+    );
+
+    assert_eq!(
+        ModelUsageReport::default()
+            .validate()
+            .expect_err("an empty delta fails"),
+        UsageReportError::ModelCalls {
+            count: 0,
+            maximum: MAX_REPORTED_MODEL_CALLS,
+        }
+    );
+    assert_eq!(
+        ModelUsageReport {
+            model_calls: 1,
+            output_unreported_calls: 2,
+            ..ModelUsageReport::default()
+        }
+        .validate()
+        .expect_err("more missing calls than calls fails"),
+        UsageReportError::UnreportedCalls {
+            field: "output",
+            count: 2,
+            calls: 1,
+        }
+    );
+    assert_eq!(
+        ModelUsageReport {
+            model_calls: 1,
+            input_tokens: MAX_REPORTED_TOKENS + 1,
+            ..ModelUsageReport::default()
+        }
+        .validate()
+        .expect_err("an oversized token count fails"),
+        UsageReportError::Tokens {
+            field: "input",
+            count: MAX_REPORTED_TOKENS + 1,
+            maximum: MAX_REPORTED_TOKENS,
+        }
+    );
+}
+
+/// One version identifier, three renderings, nothing keeping them equal but this.
+#[test]
+fn protocol_version_constant_wire_form_and_display_agree() {
+    assert_eq!(
+        serde_json::to_value(ProtocolVersion::V1Alpha1).expect("version serializes"),
+        json!(PROTOCOL_VERSION)
+    );
+    assert_eq!(ProtocolVersion::V1Alpha1.to_string(), PROTOCOL_VERSION);
+    assert_eq!(
+        serde_json::from_value::<ProtocolVersion>(json!(PROTOCOL_VERSION))
+            .expect("version decodes"),
+        ProtocolVersion::V1Alpha1
+    );
+    assert_eq!(
+        serde_json::to_value(RequestEnvelope::capabilities())
+            .expect("envelope serializes")
+            .get("apiVersion"),
+        Some(&json!(PROTOCOL_VERSION))
+    );
+}
+
+#[test]
+fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
+    let scope = ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("transport"),
+        kind: ChatTransportKind::Slack,
+        channel: "c0123abc".to_owned(),
+        conversation: "c0123abc:1712345678.000100".to_owned(),
+    };
+    let session = ChatSessionClaim {
+        subject: "slack.t0123abc.u9xyz".parse().expect("subject"),
+        agent: "reviewer".parse().expect("agent"),
+        scope: scope.clone(),
+    };
+    let attestation = ChatAttestation {
+        subject: session.subject.clone(),
+        agent: session.agent.clone(),
+        scope: scope.clone(),
+        invocation: "invoke-chat".parse().expect("invocation"),
+    };
+    let turn = DeliveredTurnRequest {
+        id: "invoke-chat".parse().expect("invocation"),
+        trace: "trace-chat".parse().expect("trace"),
+        trace_parent: None,
+        delivery: DeliveryIdentity::Slack {
+            channel: "c0123abc".to_owned(),
+            timestamp: "1712345678.000100".to_owned(),
+        },
+        user: "private user sentinel".to_owned(),
+        assistant: "private assistant sentinel".to_owned(),
+    };
+    assert!(scope.is_bounded() && turn.is_bounded());
+    for rendered in [
+        format!("{scope:?}"),
+        format!("{session:?}"),
+        format!("{attestation:?}"),
+        format!("{turn:?}"),
+    ] {
+        assert_eq!(rendered.matches("[REDACTED]").count(), 1);
+        for sentinel in ["c0123abc", "u9xyz", "reviewer", "private"] {
+            assert!(!rendered.contains(sentinel));
+        }
+    }
+
+    let oversized = ChatScopeClaim {
+        channel: "x".repeat(257),
+        ..scope
+    };
+    assert!(!oversized.is_bounded());
+    let oversized_turn = DeliveredTurnRequest {
+        user: "x".repeat(64 * 1024),
+        assistant: "y".to_owned(),
+        ..turn
+    };
+    assert!(!oversized_turn.is_bounded());
+}
+
+#[test]
+fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
+    let slack = ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("transport"),
+        kind: ChatTransportKind::Slack,
+        channel: "c0123abc".to_owned(),
+        conversation: "c0123abc:1712345678.000100".to_owned(),
+    };
+    assert!(
+        DeliveryIdentity::Slack {
+            channel: "c0123abc".to_owned(),
+            timestamp: "1712345678.000101".to_owned(),
+        }
+        .is_canonical_for(&slack)
+    );
+    for timestamp in ["01712345678.000101", "1712345678.1", "171234567.000101"] {
+        assert!(
+            !DeliveryIdentity::Slack {
+                channel: "c0123abc".to_owned(),
+                timestamp: timestamp.to_owned(),
+            }
+            .is_canonical_for(&slack)
+        );
+    }
+    assert!(
+        !DeliveryIdentity::Discord {
+            channel: "123".to_owned(),
+            message: "456".to_owned(),
+        }
+        .is_canonical_for(&slack)
+    );
+
+    let discord = ChatScopeClaim {
+        transport: "discord".parse().expect("transport"),
+        kind: ChatTransportKind::Discord,
+        channel: "123".to_owned(),
+        conversation: "123".to_owned(),
+    };
+    for (channel, message) in [("0123", "456"), ("123", "0"), ("123", "0456")] {
+        assert!(
+            !DeliveryIdentity::Discord {
+                channel: channel.to_owned(),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&discord)
+        );
+    }
+
+    let telegram = ChatScopeClaim {
+        transport: "tg".parse().expect("transport"),
+        kind: ChatTransportKind::Telegram,
+        channel: "-1001".to_owned(),
+        conversation: "-1001:topic:42".to_owned(),
+    };
+    assert!(
+        DeliveryIdentity::Telegram {
+            chat: "-1001".to_owned(),
+            topic: Some("42".to_owned()),
+            message: "7".to_owned(),
+        }
+        .is_canonical_for(&telegram)
+    );
+    assert!(
+        !DeliveryIdentity::Telegram {
+            chat: "-1001".to_owned(),
+            topic: None,
+            message: "7".to_owned(),
+        }
+        .is_canonical_for(&telegram)
+    );
+    for (chat, topic, message) in [
+        ("-01001", Some("42"), "7"),
+        ("-1001", Some("042"), "7"),
+        ("-1001", Some("42"), "07"),
+        ("-1001", Some("9223372036854775808"), "7"),
+        ("-1001", Some("42"), "9223372036854775808"),
+    ] {
+        assert!(
+            !DeliveryIdentity::Telegram {
+                chat: chat.to_owned(),
+                topic: topic.map(str::to_owned),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&telegram)
+        );
+    }
+
+    let telegram_max = ChatScopeClaim {
+        transport: "tg".parse().expect("transport"),
+        kind: ChatTransportKind::Telegram,
+        channel: i64::MIN.to_string(),
+        conversation: format!("{}:topic:{}", i64::MIN, i64::MAX),
+    };
+    assert!(
+        DeliveryIdentity::Telegram {
+            chat: i64::MIN.to_string(),
+            topic: Some(i64::MAX.to_string()),
+            message: i64::MAX.to_string(),
+        }
+        .is_canonical_for(&telegram_max),
+        "every Telegram identifier representable by the gateway remains canonical"
+    );
+
+    let whatsapp = ChatScopeClaim {
+        transport: "support-whatsapp".parse().expect("transport"),
+        kind: ChatTransportKind::Whatsapp,
+        channel: "123:456:16034700182".to_owned(),
+        conversation: "123:456:16034700182".to_owned(),
+    };
+    let whatsapp_delivery = DeliveryIdentity::Whatsapp {
+        waba: "123".to_owned(),
+        phone_number: "456".to_owned(),
+        message: "wamid.delivery/a+b=".to_owned(),
+    };
+    assert!(whatsapp_delivery.is_canonical_for(&whatsapp));
+    let wire = serde_json::to_value(&whatsapp_delivery).expect("serialize WhatsApp delivery");
+    assert_eq!(
+        serde_json::from_value::<DeliveryIdentity>(wire).expect("deserialize WhatsApp delivery"),
+        whatsapp_delivery
+    );
+    for (waba, phone_number, message) in [
+        ("0123", "456", "wamid.delivery"),
+        ("123", "0456", "wamid.delivery"),
+        ("999", "456", "wamid.delivery"),
+        ("123", "999", "wamid.delivery"),
+        ("123", "456", ""),
+    ] {
+        assert!(
+            !DeliveryIdentity::Whatsapp {
+                waba: waba.to_owned(),
+                phone_number: phone_number.to_owned(),
+                message: message.to_owned(),
+            }
+            .is_canonical_for(&whatsapp)
+        );
+    }
+
+    let local = ChatScopeClaim {
+        transport: "dev".parse().expect("transport"),
+        kind: ChatTransportKind::Local,
+        channel: "conversation".to_owned(),
+        conversation: "conversation".to_owned(),
+    };
+    let local_identity = |boot_nonce: &str, connection, sequence| DeliveryIdentity::Local {
+        transport: "dev".parse().expect("transport"),
+        conversation: "conversation".to_owned(),
+        boot_nonce: boot_nonce.to_owned(),
+        connection,
+        sequence,
+    };
+    assert!(local_identity("0123456789abcdef0123456789abcdef", 1, 1).is_canonical_for(&local));
+    for identity in [
+        local_identity("0123456789abcdef0123456789abcdeg", 1, 1),
+        local_identity("0123456789abcdef0123456789abcdef", 0, 1),
+        local_identity("0123456789abcdef0123456789abcdef", 1, 0),
+    ] {
+        assert!(!identity.is_canonical_for(&local));
+    }
+}
+
+#[test]
+fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bound() {
+    let document = serde_json::json!({
+        "id": "turn-bound",
+        "trace": "trace-bound",
+        "traceParent": null,
+        "delivery": {
+            "kind": "slack",
+            "channel": "c0123abc",
+            "timestamp": "1712345678.000100"
+        },
+        "user": "x".repeat(64 * 1024 + 1),
+        "assistant": "answer"
+    });
+    assert!(serde_json::from_value::<DeliveredTurnRequest>(document).is_err());
+
+    let scope = serde_json::json!({
+        "transport": "scientist-slack",
+        "kind": "slack",
+        "channel": "c0123abc",
+        "conversation": "x".repeat(257)
+    });
+    assert!(serde_json::from_value::<ChatScopeClaim>(scope).is_err());
+
+    let delivery = serde_json::json!({
+        "kind": "telegram",
+        "chat": "-1001",
+        "topic": "7".repeat(257),
+        "message": "9"
+    });
+    assert!(serde_json::from_value::<DeliveryIdentity>(delivery).is_err());
+    for (topic, message) in [("9223372036854775808", "9"), ("7", "9223372036854775808")] {
+        assert!(
+            serde_json::from_value::<DeliveryIdentity>(serde_json::json!({
+                "kind": "telegram",
+                "chat": "-1001",
+                "topic": topic,
+                "message": message
+            }))
+            .is_err(),
+            "Telegram max+1 must fail during wire decoding"
+        );
+    }
 }

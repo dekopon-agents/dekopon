@@ -442,6 +442,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -682,6 +688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctutils"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -800,6 +815,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-policy",
+ "dekopon-storage-host",
  "fs2",
  "libc",
  "serde",
@@ -809,6 +825,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -819,9 +836,11 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
+ "dekopon-storage-host",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -854,6 +873,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-policy",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-webui",
  "fs2",
@@ -994,6 +1014,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-provider-storage"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.44.0",
+]
+
+[[package]]
 name = "dekopon-run"
 version = "0.9.0"
 dependencies = [
@@ -1044,6 +1071,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-storage-host"
+version = "0.9.0"
+dependencies = [
+ "dekopon-capability",
+ "dekopon-core",
+ "fs2",
+ "getrandom 0.4.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dekopon-telemetry"
 version = "0.9.0"
 dependencies = [
@@ -1085,12 +1129,16 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "dekopond"
 version = "0.9.0"
 dependencies = [
+ "axum",
+ "base64 0.23.1",
  "clap",
  "dekopon-agent",
  "dekopon-broker-protocol",
@@ -1100,8 +1148,13 @@ dependencies = [
  "dekopon-model",
  "dekopon-protocol",
  "dekopon-shell",
+ "dekopon-storage-host",
  "dekopon-telemetry",
  "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "hyper",
+ "hyper-util",
  "libc",
  "opentelemetry",
  "reqwest",
@@ -1109,6 +1162,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1146,6 +1200,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -1505,6 +1560,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "242402749acf71e6f32f5857598b7002c4058a4e3c3b22b4c7d51cab9aea754e"
 
 [[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1858,6 +1922,7 @@ dependencies = [
  "num-traits",
  "ryu",
  "self_cell",
+ "serde_core",
 ]
 
 [[package]]
@@ -2162,6 +2227,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "mio"
@@ -2811,6 +2886,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3715,6 +3791,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

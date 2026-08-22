@@ -2,8 +2,8 @@
 //!
 //! The current immediate host intentionally has an empty linker. This crate is the privileged
 //! counterpart intended only for a separately deployed broker: it accepts an
-//! [`AuthorizedInvocation`], links the project-owned buffered HTTP interface, and applies the
-//! invocation's exact host-call constraints in a fresh store.
+//! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
+//! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +21,7 @@ pub use dekopon_provider_sdk::{
     CommandResolution, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
     ProviderManifest,
 };
+use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -32,6 +33,7 @@ use wasmtime::{Config, Engine, Store, StoreLimitsBuilder};
 mod http;
 mod metadata;
 mod metrics;
+mod storage;
 pub use http::{BoundCredential, HttpCallEvidence};
 use http::{HttpCeilings, HttpState};
 pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
@@ -45,6 +47,9 @@ pub(crate) mod bindings {
         world: "provider",
         imports: { default: async | trappable },
         exports: { default: async },
+        with: {
+            "dekopon:storage/durable-files/file": crate::storage::FileResource,
+        },
     });
 }
 
@@ -52,6 +57,8 @@ pub(crate) mod bindings {
 pub const PROVIDER_WIT: &str = include_str!("../wit/deps/provider.wit");
 /// Buffered HTTP package mirrored into the broker host bindings.
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
+/// Namespace-bound storage package mirrored into the broker host bindings.
+pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
 /// Default maximum linear memory per provider call (64 MiB).
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -78,7 +85,12 @@ pub const DEFAULT_MAX_HTTP_HEADERS: usize = 128;
 /// Default maximum aggregate HTTP header bytes in either direction (64 KiB).
 pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 /// Default Wasm instruction fuel supplied to each store.
-pub const DEFAULT_FUEL: u64 = 10_000_000;
+///
+/// Durable-memory compaction parses the bounded near-threshold turn and dedup files and emits one
+/// multi-megabyte replacement inside the guest. The independent wall-clock deadline still bounds
+/// execution; this ceiling keeps the default valid memory limits from deterministically trapping
+/// on their first full compaction.
+pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 /// Host ceiling for one provider description or invocation.
 pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -136,6 +148,28 @@ impl Default for BrokerHostLimits {
     }
 }
 
+/// Upper bound on the fuel a store may burn between async yields.
+///
+/// A store holding billions of units of fuel must still hand the executor back often enough for the
+/// wall-clock deadline to fire, so the interval is capped independently of the fuel ceiling. Kept
+/// private so the policy has exactly one definition: [`BrokerHostLimits::fuel_yield_interval`].
+const MAX_FUEL_YIELD_INTERVAL: u64 = 10_000;
+
+impl BrokerHostLimits {
+    /// Returns the fuel interval every store built from these limits actually yields on.
+    ///
+    /// An operational view that re-derived this from [`fuel`](Self::fuel) would keep displaying the
+    /// old formula after the policy changed, with no compile error and no failing test.
+    #[must_use]
+    pub const fn fuel_yield_interval(&self) -> u64 {
+        if self.fuel < MAX_FUEL_YIELD_INTERVAL {
+            self.fuel
+        } else {
+            MAX_FUEL_YIELD_INTERVAL
+        }
+    }
+}
+
 /// Failed broker-provider invocation and the evidence for calls that already executed.
 ///
 /// An invocation can fail after the guest has already dispatched authorized HTTP requests, so
@@ -144,16 +178,19 @@ impl Default for BrokerHostLimits {
 #[derive(Debug)]
 pub struct BrokerInvocationFailure {
     /// Host failure that ended the invocation.
-    pub error: BrokerHostError,
+    pub error: Box<BrokerHostError>,
     /// Sanitized metadata for every HTTP call dispatched before the failure.
     pub http_calls: Vec<HttpCallEvidence>,
+    /// Content-free storage evidence when a storage transaction began.
+    pub storage: Option<StorageEvidence>,
 }
 
 impl From<BrokerHostError> for BrokerInvocationFailure {
     fn from(error: BrokerHostError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             http_calls: Vec::new(),
+            storage: None,
         }
     }
 }
@@ -166,7 +203,7 @@ impl fmt::Display for BrokerInvocationFailure {
 
 impl std::error::Error for BrokerInvocationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+        Some(self.error.as_ref())
     }
 }
 
@@ -182,6 +219,9 @@ pub struct BrokerInvocationOutput {
     pub output: Value,
     /// Sanitized HTTP metadata emitted by the host.
     pub http_calls: Vec<HttpCallEvidence>,
+    /// Content-free storage evidence when this invocation used storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageEvidence>,
 }
 
 struct Runtime {
@@ -206,7 +246,11 @@ impl Runtime {
         })
     }
 
-    fn store(&self, http: HttpState) -> Result<Store<StoreState>, BrokerHostError> {
+    fn store(
+        &self,
+        http: HttpState,
+        storage: storage::StorageState,
+    ) -> Result<Store<StoreState>, BrokerHostError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
             .table_elements(self.limits.max_table_elements)
@@ -220,6 +264,8 @@ impl Runtime {
             StoreState {
                 limits: TrackingStoreLimits::new(limits, self.metrics.clone()),
                 http,
+                storage,
+                table: storage::new_table(),
                 fuel_recorded: false,
                 provider_output_bytes: 0,
                 _active: active,
@@ -230,7 +276,7 @@ impl Runtime {
             .set_fuel(self.limits.fuel)
             .map_err(|source| BrokerHostError::Store { source })?;
         store
-            .fuel_async_yield_interval(Some(self.limits.fuel.min(10_000)))
+            .fuel_async_yield_interval(Some(self.limits.fuel_yield_interval()))
             .map_err(|source| BrokerHostError::Store { source })?;
         Ok(store)
     }
@@ -267,6 +313,8 @@ impl Runtime {
 struct StoreState {
     limits: TrackingStoreLimits,
     http: HttpState,
+    storage: storage::StorageState,
+    table: wasmtime::component::ResourceTable,
     fuel_recorded: bool,
     provider_output_bytes: usize,
     _active: ActiveStore,
@@ -389,7 +437,9 @@ impl BrokerWasmProvider {
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-        let mut store = self.runtime.store(http)?;
+        let mut store = self
+            .runtime
+            .store(http, storage::StorageState::disabled())?;
         let linker = self.runtime.linker()?;
         let argv = argv.to_vec();
         let operation = async {
@@ -432,7 +482,7 @@ impl BrokerWasmProvider {
                 });
         self.runtime.record_fuel(&mut store);
         let output = output??;
-        if store.data().http.attempted() {
+        if store.data().http.attempted() || store.data().storage.attempted() {
             return Err(BrokerHostError::ResolveCommandUsedHostImport {
                 path: self.source.clone(),
             });
@@ -453,6 +503,7 @@ impl BrokerWasmProvider {
         input: &Value,
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
+        storage_transaction: Option<dekopon_storage_host::StorageTransaction>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
@@ -484,9 +535,10 @@ impl BrokerWasmProvider {
             .into());
         }
 
+        let storage_backed = storage_transaction.is_some();
         self.runtime
             .metrics
-            .record_invocation_started(input_json.len());
+            .record_invocation_started(if storage_backed { 0 } else { input_json.len() });
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
         let http = match HttpState::invoke(
             constraints.http.clone(),
@@ -498,23 +550,27 @@ impl BrokerWasmProvider {
             Err(source) => {
                 self.runtime
                     .metrics
-                    .record_invocation_finished(false, false, 0, &[]);
+                    .record_invocation_finished(false, false, 0, &[], None);
                 return Err(BrokerHostError::HttpConfiguration { source }.into());
             }
         };
-        let mut store = match self.runtime.store(http) {
+        let storage_state = storage_transaction.map_or_else(
+            storage::StorageState::disabled,
+            storage::StorageState::active,
+        );
+        let mut store = match self.runtime.store(http, storage_state) {
             Ok(store) => store,
             Err(error) => {
                 self.runtime
                     .metrics
-                    .record_invocation_finished(false, false, 0, &[]);
+                    .record_invocation_finished(false, false, 0, &[], None);
                 return Err(error.into());
             }
         };
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
-        let executed = self
+        let mut executed = self
             .execute_in_store(
                 &mut store,
                 capability,
@@ -523,15 +579,35 @@ impl BrokerWasmProvider {
                 operation_timeout,
             )
             .await;
+        let commit = executed.is_ok();
+        let storage_output = executed
+            .as_ref()
+            .ok()
+            .and_then(|output| serde_json::to_vec(output).ok());
+        if let Err(source) = store
+            .data_mut()
+            .storage
+            .finish(commit, storage_output)
+            .await
+        {
+            executed = Err(BrokerHostError::Storage { source });
+        }
         self.runtime.record_fuel(&mut store);
-        let output_bytes = store.data().provider_output_bytes;
+        let output_bytes = if storage_backed {
+            0
+        } else {
+            store.data().provider_output_bytes
+        };
         let timed_out = matches!(&executed, Err(BrokerHostError::Timeout { .. }));
-        let http_calls = store.into_data().http.into_evidence();
+        let mut data = store.into_data();
+        let storage = data.storage.take_evidence();
+        let http_calls = data.http.into_evidence();
         self.runtime.metrics.record_invocation_finished(
             executed.is_ok(),
             timed_out,
             output_bytes,
             &http_calls,
+            storage.as_ref(),
         );
         match executed {
             Ok(output) => Ok(BrokerInvocationOutput {
@@ -539,8 +615,13 @@ impl BrokerWasmProvider {
                 capability: capability.clone(),
                 output,
                 http_calls,
+                storage,
             }),
-            Err(error) => Err(BrokerInvocationFailure { error, http_calls }),
+            Err(error) => Err(BrokerInvocationFailure {
+                error: Box::new(error),
+                http_calls,
+                storage,
+            }),
         }
     }
 
@@ -572,13 +653,16 @@ impl BrokerWasmProvider {
                     source,
                 })
         };
-        let output_json = timeout(operation_timeout, operation).await.map_err(|_| {
-            BrokerHostError::Timeout {
-                operation: format!("invoke {capability}"),
-                timeout_ms: constraints.timeout_ms,
-            }
-        })??;
-        store.data_mut().provider_output_bytes = output_json.len();
+        let operation_result =
+            timeout(operation_timeout, operation)
+                .await
+                .map_err(|_| BrokerHostError::Timeout {
+                    operation: format!("invoke {capability}"),
+                    timeout_ms: constraints.timeout_ms,
+                })?;
+        // Sticky host authority wins even when the guest catches the typed error or a failing
+        // resource destructor turns it into a component trap. Inspect policy state before
+        // propagating the guest call result.
         if let Some(reason) = store.data().http.policy_violation() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
@@ -586,6 +670,15 @@ impl BrokerWasmProvider {
                 reason,
             });
         }
+        if let Some(reason) = store.data().storage.violation() {
+            return Err(BrokerHostError::StorageCallRejected {
+                provider: self.manifest.id.clone(),
+                capability: capability.clone(),
+                reason,
+            });
+        }
+        let output_json = operation_result?;
+        store.data_mut().provider_output_bytes = output_json.len();
 
         let maximum_output = usize::try_from(constraints.max_output_bytes)
             .unwrap_or(usize::MAX)
@@ -693,11 +786,25 @@ impl fmt::Display for ProviderConflicts {
 pub struct BrokerProviderRegistry {
     providers: Vec<BrokerWasmProvider>,
     routes: BTreeMap<CapabilityId, usize>,
+    storage_host: Option<StorageHost>,
 }
 
 impl BrokerProviderRegistry {
     /// Compiles and validates provider components using one shared asynchronous engine.
     pub async fn load<I, P>(sources: I, limits: BrokerHostLimits) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Self::load_with_storage(sources, limits, None).await
+    }
+
+    /// Compiles providers with an optional broker-owned storage engine.
+    pub async fn load_with_storage<I, P>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_host: Option<StorageHost>,
+    ) -> Result<Self, BrokerHostError>
     where
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
@@ -749,7 +856,11 @@ impl BrokerProviderRegistry {
                 }),
             });
         }
-        Ok(Self { providers, routes })
+        Ok(Self {
+            providers,
+            routes,
+            storage_host,
+        })
     }
 
     /// Returns each provider's command words, in load order.
@@ -837,6 +948,23 @@ impl BrokerProviderRegistry {
             })
     }
 
+    /// Returns the independent component-host ceilings used for authority commitments.
+    #[must_use]
+    pub fn host_limits(&self) -> &BrokerHostLimits {
+        &self
+            .providers
+            .first()
+            .expect("a registry is constructed with at least one provider")
+            .runtime
+            .limits
+    }
+
+    /// Returns the configured storage host handle, when storage is enabled.
+    #[must_use]
+    pub fn storage_host(&self) -> Option<StorageHost> {
+        self.storage_host.clone()
+    }
+
     /// Returns a cloneable handle to live Wasmtime host counters.
     #[must_use]
     pub fn metrics(&self) -> BrokerHostMetrics {
@@ -846,6 +974,25 @@ impl BrokerProviderRegistry {
             .runtime
             .metrics
             .clone()
+    }
+
+    /// Returns one routed capability and the provider declaring it, by identifier.
+    ///
+    /// Routes are already keyed by capability, so a caller filtering constraint sets does not have
+    /// to scan every route per set.
+    #[must_use]
+    pub fn capability(
+        &self,
+        capability: &CapabilityId,
+    ) -> Option<(&ProviderId, &ProviderCapability)> {
+        let provider = &self.providers[*self.routes.get(capability)?];
+        let capability = provider
+            .manifest
+            .capabilities
+            .iter()
+            .find(|candidate| &candidate.id == capability)
+            .expect("routes originate from validated provider manifests");
+        Some((&provider.manifest.id, capability))
     }
 
     /// Returns capabilities in deterministic identifier order.
@@ -867,6 +1014,9 @@ impl BrokerProviderRegistry {
         &self,
         constraints: &ExecutionConstraints,
     ) -> Result<(), BrokerHostError> {
+        if constraints.storage.is_some() && self.storage_host.is_none() {
+            return Err(BrokerHostError::StorageDisabled);
+        }
         let runtime = &self
             .providers
             .first()
@@ -886,6 +1036,17 @@ impl BrokerProviderRegistry {
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
+        self.invoke_with_storage(authorized, credential, None).await
+    }
+
+    /// Consumes an invocation plus its exact non-forgeable storage grant when storage is enabled.
+    pub async fn invoke_with_storage(
+        &self,
+        authorized: AuthorizedInvocation,
+        credential: Option<BoundCredential>,
+        storage_grant: Option<StorageGrant>,
+    ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
+        let storage_backed = authorized.constraints().storage.is_some();
         let proposal = authorized.proposal();
         let provider_index = self
             .routes
@@ -903,6 +1064,35 @@ impl BrokerProviderRegistry {
             }
             .into());
         }
+        let storage_transaction = match (&authorized.constraints().storage, storage_grant) {
+            (None, None) => None,
+            (None, Some(_)) => return Err(BrokerHostError::UnexpectedStorageGrant.into()),
+            (Some(_), None) => return Err(BrokerHostError::MissingStorageGrant.into()),
+            (Some(constraints), Some(grant)) => {
+                if grant.invocation() != &proposal.id
+                    || grant.capability() != &proposal.capability
+                    || grant.provider() != authorized.provider()
+                    || grant.interface() != constraints.interface
+                    || grant.access() != constraints.access
+                    || grant.namespace() != constraints.namespace
+                {
+                    return Err(BrokerHostError::StorageGrantMismatch.into());
+                }
+                let host = self
+                    .storage_host
+                    .as_ref()
+                    .ok_or(BrokerHostError::StorageDisabled)?
+                    .clone();
+                Some(
+                    tokio::task::spawn_blocking(move || host.begin(grant))
+                        .await
+                        .map_err(|_| BrokerHostError::Storage {
+                            source: dekopon_storage_host::StorageHostError::Io,
+                        })?
+                        .map_err(|source| BrokerHostError::Storage { source })?,
+                )
+            }
+        };
         // `proposal.input` is deliberately not a field here. It is the untrusted payload the whole
         // authority boundary exists to contain, and a span is not a safer place for it than an
         // audit record.
@@ -912,8 +1102,11 @@ impl BrokerProviderRegistry {
                 &proposal.input,
                 authorized.constraints(),
                 credential,
+                storage_transaction,
             )
-            .instrument({
+            .instrument(if storage_backed {
+                tracing::info_span!("provider.invoke", storage = true)
+            } else {
                 let span = tracing::info_span!(
                     "provider.invoke",
                     capability = %proposal.capability,
@@ -952,7 +1145,7 @@ async fn exports_resolve_command(
 ) -> Result<bool, BrokerHostError> {
     let http = HttpState::describe(runtime.http_ceilings(), runtime.limits.max_timeout)
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-    let mut store = runtime.store(http)?;
+    let mut store = runtime.store(http, storage::StorageState::disabled())?;
     let linker = runtime.linker()?;
     let instantiated = linker
         .instantiate_async(&mut store, component)
@@ -975,7 +1168,7 @@ async fn describe_component(
     let operation_timeout = runtime.limits.max_timeout;
     let http = HttpState::describe(runtime.http_ceilings(), operation_timeout)
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-    let mut store = runtime.store(http)?;
+    let mut store = runtime.store(http, storage::StorageState::disabled())?;
     let linker = runtime.linker()?;
     let operation = async {
         let bindings = bindings::Provider::instantiate_async(&mut store, component, &linker)
@@ -1003,7 +1196,7 @@ async fn describe_component(
     runtime.record_fuel(&mut store);
     let manifest = manifest??;
     runtime.metrics.record_description();
-    if store.data().http.attempted() {
+    if store.data().http.attempted() || store.data().storage.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });
@@ -1061,6 +1254,9 @@ fn validate_authorized_constraints(
         return Err(BrokerHostError::AuthorizationExceedsHostLimit {
             field: "max_output_bytes",
         });
+    }
+    if constraints.http.is_some() && constraints.storage.is_some() {
+        return Err(BrokerHostError::MixedHostAuthorization);
     }
     if let Some(http) = &constraints.http {
         if http.allowed_hosts.is_empty()
@@ -1152,6 +1348,27 @@ pub enum BrokerHostError {
     /// HTTP authorization was present but incomplete or unbounded.
     #[error("HTTP authorization must contain destinations, methods, and positive limits")]
     InvalidHttpAuthorization,
+    /// HTTP and storage authority were combined in one v1 capability.
+    #[error("HTTP and storage authority cannot coexist in one capability")]
+    MixedHostAuthorization,
+    /// Storage was constrained but no native storage engine is configured.
+    #[error("provider storage is disabled")]
+    StorageDisabled,
+    /// Storage authority was required but no grant reached the invocation boundary.
+    #[error("authorized storage invocation is missing its storage grant")]
+    MissingStorageGrant,
+    /// A storage grant accompanied an invocation with no storage constraint.
+    #[error("storage grant accompanied an invocation with no storage authority")]
+    UnexpectedStorageGrant,
+    /// The single-use storage grant did not match the authorized invocation.
+    #[error("storage grant does not match authorized invocation")]
+    StorageGrantMismatch,
+    /// Native storage setup, transaction, or finalization failed.
+    #[error("broker provider storage failed")]
+    Storage {
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
     /// The native HTTP execution context rejected its ceiling or grant configuration.
     #[error("could not initialize the bounded HTTP execution context")]
     HttpConfiguration {
@@ -1381,6 +1598,18 @@ pub enum BrokerHostError {
     /// Provider attempted a host call outside its authorization.
     #[error("broker rejected host call {reason} from provider {provider} capability {capability}")]
     HostCallRejected {
+        /// Provider ID.
+        provider: ProviderId,
+        /// Capability ID.
+        capability: CapabilityId,
+        /// Stable rejection class.
+        reason: &'static str,
+    },
+    /// Provider attempted a storage call outside its exact interface/access grant.
+    #[error(
+        "broker rejected storage call {reason} from provider {provider} capability {capability}"
+    )]
+    StorageCallRejected {
         /// Provider ID.
         provider: ProviderId,
         /// Capability ID.
