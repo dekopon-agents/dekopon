@@ -1,6 +1,8 @@
 name: Regen provider components
 
 on:
+  push:
+    branches: [chore/dead-surface]
   workflow_dispatch:
 
 permissions:
