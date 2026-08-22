@@ -7,8 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Serialized ChatGPT subscription refreshes across processes on an advisory lock beside the
+  credential file, adopting a record another process rotated instead of presenting a refresh token
+  the provider has already invalidated, and kept a turn alive on the freshly rotated in-memory
+  credential when persisting it fails.
+- Reported the endpoint's own error body on a failed chat completion, device authorization, or token
+  request instead of a bare `http status: <code>`, including the OAuth `error` code that
+  distinguishes an expired credential from a transient rejection.
+- Kept a device login polling through a transient network failure until its fifteen-minute deadline
+  rather than discarding the user code on one dropped packet.
+
+### Security
+
+- Swept abandoned `chatgpt-auth.tmp-*` staging files, which hold access and refresh tokens in the
+  clear, on every credential save and on `dekopon auth chatgpt logout`, and `fsync`ed the credential
+  directory after the rename so a rotated credential cannot be lost to a power failure.
 ### Added
 
+- Added a first text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook,
+  process-local message-ID deduplication, canonical `whatsapp.<wa_id>` subjects, and pinned Graph
+  API text replies.
+- Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
+  operator-owned exact-path webhook ingress.
+- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
+  Discord, Telegram, and the local development transport.
 - Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
   engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
 - Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
@@ -17,9 +41,120 @@ All notable changes to Dekopon are documented here. The format is based on
   `RecordDeliveredTurnForChat` recording.
 - Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
   memory provider.
+- Added Slack Agent owned-thread continuation: after one explicitly addressed message is freshly
+  authorized, that authenticated sender can continue in the exact thread without another mention.
+- Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
+  allowing the agent to post nothing instead of always taking the last word.
+- Added `docs/catalog.md`, the field-by-field `v1alpha1` resource reference, naming what consumes
+  each `AgentSpec`/`CapabilitySpec`/`ProviderSpec` field and stating that `policyProfile`,
+  `credentialRef`, `status`, and `labels` are read by nothing.
+- Added `docs/upgrading.md`, covering the 0.3.0 `rules` → `policiesPath`/`constraintSets` migration,
+  the 0.5.0 broker-protocol lockstep, later operator-visible changes, and the restart order.
+- Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
+  checkpoint recovery is reachable from `docs/` instead of only from a crate README.
+
+### Added
+
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
+### Added
+
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
+### Fixed
+
+- A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
+  `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
+  logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
+  accept failure stays fatal.
+- Broker shutdown now drains the Unix listener, the provider-storage GC, and the web UI concurrently
+  against one shared deadline. They previously ran in sequence, each under its own full
+  `shutdownGraceMs`, so a process with `--http-bind` could take two or three graces to exit against a
+  `terminationGracePeriodSeconds` that budgets one.
+- Startup frame validation now also bounds the capability response an attested session receives, not
+  only each direct peer's. In a gateway deployment the peer holds almost nothing while the mapped
+  principals hold the real capability sets, so an oversized response passed startup and then failed
+  `write_frame` on every session open — the exact failure the check exists to prevent.
+- A finished connection task is now observed as soon as it completes rather than on the next accept,
+  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+
+### Added
+
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
+### Fixed
+
+- A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
+  `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
+  logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
+  accept failure stays fatal.
+- Broker shutdown now drains the Unix listener, the provider-storage GC, and the web UI concurrently
+  against one shared deadline. They previously ran in sequence, each under its own full
+  `shutdownGraceMs`, so a process with `--http-bind` could take two or three graces to exit against a
+  `terminationGracePeriodSeconds` that budgets one.
+- Startup frame validation now also bounds the capability response an attested session receives, not
+  only each direct peer's. In a gateway deployment the peer holds almost nothing while the mapped
+  principals hold the real capability sets, so an oversized response passed startup and then failed
+  `write_frame` on every session open — the exact failure the check exists to prevent.
+- A finished connection task is now observed as soon as it completes rather than on the next accept,
+  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+- `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
+  suspended. The section awaits the replay ledger and, on every denial, a durable audit append that
+  fsyncs, so whatever the runtime polled next on that thread was exported as a child of another
+  request's authorization while that request's own later events lost it. The span instruments the
+  section instead of being held across the awaits; its fields and values are unchanged.
 
 ### Changed
 
+- An exhausted replay ledger or audit log now answers the new stable failure code
+  `capacity-exhausted` and logs `broker_capacity_exhausted`, instead of the retriable
+  `broker-unavailable`. Neither bound evicts, rotates, or clears on restart, so a client was being
+  invited to retry forever. `maxReplayIds` must be sized against `auditMaxRecords`, which is now
+  documented in `docs/broker-http.md` and the chart README.
+- A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
+  service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
+  significant failed.
+- The `--http-bind` web UI now serves at most sixteen concurrent connections, refusing rather than
+  queuing further ones, and drops any connection that exceeds a thirty-second budget from accept to
+  close; both ceilings are configurable through `dekopon_webui::serve_with_limits`.
+- The web UI emits one `debug` tracing event per request with method, path, status, and response
+  bytes, and no query string or body.
+- Web UI provider pages are rendered once at broker startup instead of per request, the dashboard's
+  agent inventory is shared by reference rather than deep-copied per render, and the provider page's
+  "Manifest API" row now shows the manifest's own `apiVersion` value instead of the Rust variant
+  name.
+- The web UI's "Fuel yield interval" row now reports the interval `dekopon-broker-host` actually
+  configures rather than re-deriving it.
+
+- A route that names an image generator on the text-only WhatsApp transport is now a startup
+  failure, rather than paying a model for a PNG that has no delivery path.
+- A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
+  sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
+  the first chunk reports `partial-delivery` and records no delivered turn.
+- A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
+  name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
@@ -61,13 +196,96 @@ All notable changes to Dekopon are documented here. The format is based on
 - A command that produces no value no longer contributes a blank line to a command substitution, so
   `$(true; echo a)` and `$(echo a; true)` are both `a` rather than gaining a leading or trailing
   newline.
+- A capabilities answer now costs one Cedar pass instead of two. The capability listing and the
+  command words are derived from a single authorized constraint-set filter, `capability_view`, used
+  by the readiness probe's `capabilities`, `capabilitiesFor`, `capabilitiesForChat`, and the startup
+  frame check. Both halves still come from the one evaluation an invocation would receive, so a
+  listing can no more disagree with a decision than before.
+- The durable audit log no longer retains every record hash and a second copy of every restored
+  invocation identifier for the life of the process — roughly 30 MB at the production caps, for
+  state read only at startup. It keeps the one-record reconcile window `contains_checkpoint`
+  actually needs, and `FileAuditLog::replay_ids` becomes the consuming `take_replay_ids`, because
+  the broker's own replay ledger owns those identifiers from then on. Records on disk are
+  byte-identical, and an audit file written by an earlier build still verifies.
+- Hot-path allocations are gone from the paths every chat message crosses: an audit event is
+  serialized once for both its hash material and its durable line, evidence digests stream into the
+  hasher instead of copying an entire provider response to prefix a label, `ExternalSubject`
+  namespace checks and identity resolution compare segments instead of building a canonical string,
+  identifier deserialization reuses its buffer, and `dekopon-policy` parses its constant Cedar
+  entity type names once at construction rather than three times per authorization.
+- `ClientError::Protocol` now carries the exchange phase and renders its bounded framing detail, and
+  `ClientError::may_have_executed` covers both a lost response and `outcome-unaudited`. A script
+  reaching that state receives `denied` (exit `126`) instead of a retryable failure. Invalid frame
+  bounds now surface as the separate `ClientError::Limits`, and `capabilities_for` is removed in
+  favor of `session_surface_for`.
+- Frame payloads are now read incrementally, so a peer-claimed in-bound length no longer allocates
+  before any payload byte arrives, and one frame is written with one `write_all` instead of two.
+- `AgentInventory::validate` and `ModelUsageReport::validate` name the offending agent and the exact
+  bound; `dekopon-brokerd` logs that reason server-side while the wire message stays generic.
+- Native HTTP telemetry now records the failure class and its static sanitized message, emits the
+  `accounting.http.request` record for every attempt including one refused before a destination was
+  resolved, omits status rather than reporting `0` when no response arrived, and publishes accounted
+  bytes under `dekopon.http.*.accounted_bytes` instead of the OTel payload-size names.
+- Broker-mediated HTTP now reuses one resolution and one pinned client per execution context while
+  the `(host, addresses)` pin set is unchanged, so a multi-call capability shares a warm connection
+  instead of paying a fresh lookup and TLS handshake per request.
+- Destinations resolving to more addresses than the native pin set holds are now deduplicated and
+  truncated, with every retained address still validated, instead of failing the whole request.
+
+### Fixed
+
+- Fixed `http.request` spans mis-parenting concurrent trace events: the span is now attached with
+  `Instrument` rather than an entered guard held across DNS, connection, and body awaits.
+- Fixed IPv6 literal destinations, which could never match a grant or be resolved because the URL
+  host was carried bracketed into the canonical authority and the resolver lookup.
+- Native HTTP client-builder failures are now reported as `internal` rather than as a wire-level
+  protocol failure.
+- HTTP call evidence now records a status-less entry for a request the credential binding refuses,
+  so evidence counts reconcile with the request budget the attempt consumed.
+- The Agent Slack manifest now requests public/private channel history events required to observe
+  continuations; ambient traffic is discarded inside the transport before routing or inference.
+- `docs/broker-http.md` now documents the `provider-error` failure code, the deliberately ungated
+  `resolveCommand` operation, and a version-and-compatibility section stating that all four
+  executables upgrade together; its startup-validation section no longer claims every entity literal
+  is proved, since agent names are the deliberate exception.
+- `docs/run.md` no longer describes the gateway chat client as stateless: `--subject` plus
+  `--conversation` selects a persistent history on a `persistent` route, including one a chat-service
+  sender created.
+- `charts/dekopon/README.md` separates "never installed on a cluster" from "not published"; chart
+  `0.1.0` and the container image it pulls are both published.
+- Corrected the `dekopon-model` attachment-rendering example, added `resolveCommand` to the
+  `dekopon-broker-protocol` README, fixed the `dekopon-provider-sdk` WIT-package description and
+  documented `export_provider_with_commands!`, dropped the stale `0.1.x` and `0.1.0` version pins
+  from `docs/cli.md` and `dekopon-capability`, and gave `Broker::capabilities` its own rustdoc.
 
 ### Security
 
+- WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender
+  come only from the signed envelope, transport secrets remain gateway-only, and outcome-unknown
+  Graph sends are never blindly retried.
+- Every refused WhatsApp webhook request now names its reason in telemetry, rate-limited to one
+  content-free line per reason per minute carrying the count it stands for, so a wrong app secret is
+  visible without letting an unauthenticated caller drive log volume.
+- A transport credential environment variable that is exported but blank is now a startup failure
+  naming the variable: an empty HMAC key verifies signatures anyone can compute, and an empty bearer
+  token is still sent as a header.
+- A failed WhatsApp `accept()` is now classified instead of ending the listener: a dead connection is
+  ignored and descriptor or buffer exhaustion is retried after a short pause, so one transient
+  failure can no longer silently take the only inbound transport off the air for the process's life.
+- Generated images use one fixed public model endpoint, one attempt and one 8 MiB PNG per session,
+  gateway-owned filenames and authenticated reply targets, and never enter prompts, conversation
+  memory, durable chat records, telemetry payloads, provider components, or broker protocol.
 - Direct `dekopon-run`, legacy broker operations, and generic chat invocation cannot discover or
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Every web UI response now carries the closed no-store/nosniff/no-referrer/CSP header set,
+  including the 405 axum produces for a mutating method, which previously left the router unprotected.
+- Bound Slack continuation ownership to an exact transport-authenticated workspace/channel/thread/
+  sender tuple, claimed only after fresh authorization, revoked on refusal, capped in memory, and
+  cleared on restart. A decline selected alongside work runs nothing, and capability work requires
+  a visible reply—or a fixed audit-before-retry warning when the turn budget is exhausted—rather
+  than permitting the model to hide an effect.
 
 ## [0.9.0] - 2026-08-20
 

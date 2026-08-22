@@ -1,0 +1,358 @@
+//! What the broker says about a session it refuses before anything is ever invoked.
+//!
+//! `capabilitiesFor` answers a refused caller with the same opaque nothing whatever went wrong —
+//! that is deliberate, because a distinguishable answer would tell an unauthorized gateway whether
+//! a subject is mapped. The cost was that the broker's own side of the socket recorded nothing
+//! either, so bootstrapping an `identityMapping` for a new Slack sender meant reading the sender's
+//! subject out of a payload-carrying gateway span. These tests hold the opaque wire answer and the
+//! named broker-side event together.
+//!
+//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
+//! global dispatcher, so a sibling test hitting these callsites with no subscriber installed can
+//! disable them for the whole process.
+
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use dekopon_broker::{
+    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatScopeClaim, ChatSessionClaim,
+    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
+    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, SubjectAttestation,
+};
+use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
+use dekopon_core::{
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
+    RiskLevel, TransportId,
+};
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
+const UNMAPPED_SUBJECT: &str = "slack.t0123abc.unobody";
+
+/// `cpetersen` may drive `some-agent` through the gateway and nothing else may drive anything.
+const POLICIES: &str = r#"
+@id("attested-reverse")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"echo.reverse",
+       resource == Dekopon::Provider::"echo")
+when { context has via && context.via == "gateway"
+    && context has agent && context.agent == "some-agent" };
+
+@id("prompt-gate")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"some-agent")
+when { context has via && context.via == "gateway" };
+
+@id("broken-gate")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"broken-agent")
+when { 9223372036854775807 + 1 == 0 };
+"#;
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<String>>);
+
+impl Captured {
+    fn take(&self) -> String {
+        let mut sink = self.0.lock().expect("capture sink");
+        std::mem::take(&mut sink)
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+    /// These tests compile a real component, and Wasmtime's own trace instrumentation would
+    /// otherwise be captured event by event. Only this project's events are the subject here.
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.target().starts_with("dekopon") {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    /// `Layer::enabled` is what actually turns a callsite off when the inner subscriber is a
+    /// registry, so the filter has to live here rather than only in `register_callsite`.
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        metadata.target().starts_with("dekopon")
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut sink = self.0.lock().expect("capture sink");
+        sink.push_str(event.metadata().level().as_str());
+        event.record(&mut Visitor(&mut sink));
+        sink.push('\n');
+    }
+}
+
+struct Visitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for Visitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(format!("examples/providers/{name}"))
+}
+
+fn principal(name: &str) -> PrincipalId {
+    name.parse().expect("valid principal fixture")
+}
+
+fn agent(name: &str) -> AgentId {
+    name.parse().expect("valid agent fixture")
+}
+
+fn subject(canonical: &str) -> ExternalSubject {
+    canonical.parse().expect("canonical subject fixture")
+}
+
+fn constraint_set() -> (CapabilityId, ConstraintSet) {
+    (
+        "echo.reverse".parse().expect("valid capability fixture"),
+        ConstraintSet {
+            provider: "echo"
+                .parse::<ProviderId>()
+                .expect("valid provider fixture"),
+            effect: EffectKind::ReadOnly,
+            risk: RiskLevel::Low,
+            idempotency: Idempotency::Idempotent,
+            credential: None,
+            credential_by_agent: BTreeMap::new(),
+            constraints: ExecutionConstraints::default(),
+        },
+    )
+}
+
+async fn broker() -> Broker<InMemoryAuditLog> {
+    let registry =
+        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("echo provider fixture loads");
+    let world = PolicyWorld::new(
+        [principal("cpetersen"), principal("gateway")],
+        [(
+            "echo.reverse".parse::<CapabilityId>().expect("capability"),
+            "echo".parse::<ProviderId>().expect("provider"),
+        )],
+    )
+    .expect("the refusal world builds");
+    Broker::new(
+        registry,
+        principal("broker-test"),
+        "refusal-logging".to_owned(),
+        PolicyEngine::new(POLICIES, &world).expect("the refusal policy set validates"),
+        ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
+        CredentialStore::empty(),
+        IdentityDirectory::new([(subject(MAPPED_SUBJECT), principal("cpetersen"))])
+            .expect("one mapping builds a directory"),
+        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        BrokerLimits::default(),
+    )
+    .expect("the broker starts")
+}
+
+fn gateway() -> AuthenticatedContext {
+    AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway context binds")
+}
+
+fn grant() -> AttestorGrant {
+    AttestorGrant {
+        namespaces: vec!["slack.t0123abc".to_owned()],
+        chat_scopes: Vec::new(),
+    }
+}
+
+fn chat_claim(canonical: &str, agent_id: &str) -> ChatSessionClaim {
+    ChatSessionClaim {
+        subject: subject(canonical),
+        agent: agent(agent_id),
+        scope: ChatScopeClaim {
+            transport: "scientist-slack"
+                .parse::<TransportId>()
+                .expect("valid transport fixture"),
+            kind: ChatTransportKind::Slack,
+            channel: "c0123abc".to_owned(),
+            conversation: "c0123abc:1712345678.000100".to_owned(),
+        },
+    }
+}
+
+/// Four refusals that answer identically on the wire must not be one refusal in the logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_inspection_refusal_names_its_class_and_its_subject() {
+    let captured = Captured::default();
+    tracing_subscriber::registry().with(captured.clone()).init();
+    let broker = broker().await;
+
+    // No attestor authority at all.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                None,
+                &subject(MAPPED_SUBJECT),
+                &agent("some-agent")
+            )
+            .is_none()
+    );
+    let ungranted = captured.take();
+    assert!(
+        ungranted.contains("broker_capabilities_refused"),
+        "{ungranted}"
+    );
+    assert!(ungranted.contains("attestation-denied"), "{ungranted}");
+    assert!(ungranted.contains(MAPPED_SUBJECT), "{ungranted}");
+    assert!(ungranted.contains("gateway"), "{ungranted}");
+
+    // A grant that does not reach this namespace is the same wire answer, a different class.
+    let narrow = AttestorGrant {
+        namespaces: vec!["slack.tother".to_owned()],
+        chat_scopes: Vec::new(),
+    };
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&narrow),
+                &subject(MAPPED_SUBJECT),
+                &agent("some-agent")
+            )
+            .is_none()
+    );
+    assert!(captured.take().contains("attestation-denied"));
+
+    // The bootstrap case: a sender no `identityMapping` names yet. The canonical subject in this
+    // event is the whole point — it is the value an operator has to copy into configuration.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&grant()),
+                &subject(UNMAPPED_SUBJECT),
+                &agent("some-agent")
+            )
+            .is_none()
+    );
+    let unmapped = captured.take();
+    assert!(unmapped.contains("unmapped-subject"), "{unmapped}");
+    assert!(unmapped.contains(UNMAPPED_SUBJECT), "{unmapped}");
+
+    // Mapped, attested, and still refused: policy does not let this principal drive that agent.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&grant()),
+                &subject(MAPPED_SUBJECT),
+                &agent("other-agent")
+            )
+            .is_none()
+    );
+    let denied = captured.take();
+    assert!(denied.contains("agent-denied"), "{denied}");
+    assert!(denied.contains("other-agent"), "{denied}");
+
+    // A policy that cannot be evaluated denies exactly like one that does not match. Cedar's
+    // strict validator cannot rule this out — the overflow above is well typed — so the refusal
+    // class is the only thing that separates a broken rule from a deliberate one.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&grant()),
+                &subject(MAPPED_SUBJECT),
+                &agent("broken-agent")
+            )
+            .is_none()
+    );
+    let erroring = captured.take();
+    assert!(erroring.contains("policy-error"), "{erroring}");
+    assert!(!erroring.contains("agent-denied"), "{erroring}");
+
+    // The same distinction reaches the durable decision record, where a denial that was really a
+    // broken policy used to be filed as an ordinary refusal.
+    let proposal = InvocationRequest {
+        id: "invoke-policy-error"
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        capability: "echo.reverse".parse().expect("valid capability fixture"),
+        trace: "trace-refusal".parse().expect("valid trace fixture"),
+        trace_parent: None,
+        input: serde_json::json!({"message": "refused"}),
+    };
+    let refused = broker
+        .invoke_for(
+            &gateway(),
+            Some(&grant()),
+            &SubjectAttestation {
+                subject: subject(MAPPED_SUBJECT),
+                agent: agent("broken-agent"),
+                invocation: proposal.id.clone(),
+            },
+            proposal,
+        )
+        .await
+        .expect("a refused agent is still an accounted decision");
+    assert_eq!(refused.outcome, InvocationOutcome::Denied);
+    assert_eq!(refused.error.as_deref(), Some("policy-error"));
+    let _ = captured.take();
+
+    // The chat surface the gateway actually opens takes the same path and reports the same way.
+    assert!(
+        broker
+            .capabilities_for_chat(
+                &gateway(),
+                Some(&grant()),
+                &chat_claim(UNMAPPED_SUBJECT, "some-agent")
+            )
+            .is_none()
+    );
+    let chat = captured.take();
+    assert!(chat.contains("broker_capabilities_refused"), "{chat}");
+    assert!(chat.contains("unmapped-subject"), "{chat}");
+    assert!(chat.contains(UNMAPPED_SUBJECT), "{chat}");
+
+    // An honored session stays silent: this event marks refusals, not traffic.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&grant()),
+                &subject(MAPPED_SUBJECT),
+                &agent("some-agent")
+            )
+            .is_some()
+    );
+    let allowed = captured.take();
+    assert!(
+        !allowed.contains("broker_capabilities_refused"),
+        "{allowed}"
+    );
+}
