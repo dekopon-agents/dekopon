@@ -296,10 +296,21 @@ gateway:
   #       valueFrom: { secretKeyRef: { name: dekopon-discord, key: botToken } }
   #     - name: OPENAI_API_KEY
   #       valueFrom: { secretKeyRef: { name: dekopon-model, key: apiKey } }
+  #     - name: OPENAI_IMAGE_API_KEY
+  #       valueFrom: { secretKeyRef: { name: dekopon-images, key: apiKey } }
   env:
     - name: RUST_LOG
       value: info
   envFrom: []
+
+  # Optional ClusterIP target for an inbound webhook listener such as WhatsApp Cloud API. This
+  # exposes only a pod port inside the cluster; put an exact-path Traefik route and public TLS
+  # boundary in a separate operator-owned manifest. dekopond.yaml must bind 0.0.0.0 at this same
+  # port—a loopback bind is unreachable from a Kubernetes Service. No Ingress is chart-created.
+  service:
+    enabled: false
+    port: 9080
+    annotations: {}
 
 # ---------------------------------------------------------------------------------------------
 # Audit state
@@ -357,5 +368,5 @@ podAnnotations: {}
 podLabels: {}
 priorityClassName: ""
 
-# No Service and no Ingress, deliberately. Neither daemon serves HTTP or listens on a TCP port;
-# the only endpoint in this chart is a Unix socket inside the pod.
+# No Ingress is chart-owned. gateway.service optionally creates only a cluster-local webhook
+# Service; the broker remains reachable solely through the Unix socket inside the pod.
