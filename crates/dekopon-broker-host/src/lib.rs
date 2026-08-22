@@ -11,7 +11,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -28,7 +31,7 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimitsBuilder};
+use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimitsBuilder};
 
 mod http;
 mod metadata;
@@ -37,7 +40,10 @@ mod storage;
 pub use http::{BoundCredential, HttpCallEvidence};
 use http::{HttpCeilings, HttpState};
 pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
-use metadata::{component_interface, identify_artifact};
+use metadata::{
+    RESOLVE_COMMAND_EXPORT, ResolveCommandExport, component_interface, identify_bytes,
+    resolve_command_export,
+};
 use metrics::{ActiveStore, TrackingStoreLimits};
 pub use metrics::{BrokerHostMetrics, BrokerHostStats};
 
@@ -148,6 +154,28 @@ impl Default for BrokerHostLimits {
     }
 }
 
+/// Operational broker-host settings that are deliberately not part of the authority surface.
+///
+/// Nothing here narrows or widens what an authorization may do, which is why it is separate from
+/// [`BrokerHostLimits`]: the broker commits its host ceilings into the effective-authority
+/// generation, and pointing a compilation cache at a different directory must not rotate that.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrokerHostOptions {
+    /// Absolute directory for Wasmtime's content-addressed compilation cache.
+    ///
+    /// `None` recompiles every provider with Cranelift at every start. A deployment whose pods roll
+    /// inside a startup-probe budget wants this pointed at durable broker-owned state; the
+    /// directory must be writable only by the broker, because its contents are compiled code.
+    pub compile_cache_dir: Option<PathBuf>,
+    /// Aggregate guest linear memory reservable across concurrently live stores.
+    ///
+    /// [`BrokerHostLimits::max_memory_bytes`] bounds one invocation; this bounds all of them at
+    /// once, so a daemon that accepts many connections refuses cleanly instead of being OOM-killed.
+    /// `None` leaves the aggregate unbounded, which is only safe when the connection ceiling
+    /// multiplied by the per-store ceiling still fits the container.
+    pub max_total_memory_bytes: Option<usize>,
+}
+
 /// Upper bound on the fuel a store may burn between async yields.
 ///
 /// A store holding billions of units of fuel must still hand the executor back often enough for the
@@ -224,25 +252,98 @@ pub struct BrokerInvocationOutput {
     pub storage: Option<StorageEvidence>,
 }
 
+/// Aggregate guest-memory reservation shared by every live store in one runtime.
+///
+/// Reservation is pessimistic — a store books its whole per-invocation ceiling whether or not the
+/// guest ever grows into it — because the point is to refuse before the allocation exists.
+#[derive(Debug)]
+struct MemoryBudget {
+    maximum: usize,
+    reserved: AtomicUsize,
+}
+
+impl MemoryBudget {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<MemoryReservation> {
+        self.reserved
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.maximum)
+            })
+            .ok()?;
+        Some(MemoryReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+/// Releases one store's reservation on every path a store can end on, including cancellation.
+struct MemoryReservation {
+    budget: Arc<MemoryBudget>,
+    bytes: usize,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.budget
+            .reserved
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 struct Runtime {
     engine: Engine,
+    // One linker for the whole process. Its contents are fixed by the generated bindings, so
+    // rebuilding it per call only re-registered the same host functions and forced every
+    // instantiation to resolve imports from scratch.
+    linker: Linker<StoreState>,
     limits: BrokerHostLimits,
     metrics: BrokerHostMetrics,
+    memory_budget: Option<Arc<MemoryBudget>>,
 }
 
 impl Runtime {
-    fn new(limits: BrokerHostLimits) -> Result<Self, BrokerHostError> {
+    fn new(limits: BrokerHostLimits, options: &BrokerHostOptions) -> Result<Self, BrokerHostError> {
         validate_limits(&limits)?;
+        if options
+            .max_total_memory_bytes
+            .is_some_and(|maximum| maximum < limits.max_memory_bytes)
+        {
+            return Err(BrokerHostError::InvalidLimit {
+                name: "max_total_memory_bytes",
+            });
+        }
         let metrics = BrokerHostMetrics::new(limits.clone());
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
         config.consume_fuel(true);
+        if let Some(directory) = &options.compile_cache_dir {
+            let mut cache = CacheConfig::new();
+            cache.with_directory(directory);
+            config.cache(Some(Cache::new(cache).map_err(|source| {
+                BrokerHostError::CompileCache {
+                    path: directory.clone(),
+                    source,
+                }
+            })?));
+        }
         let engine = Engine::new(&config).map_err(|source| BrokerHostError::Engine { source })?;
+        let mut linker = Linker::new(&engine);
+        bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(|source| BrokerHostError::Linker { source })?;
         Ok(Self {
             engine,
+            linker,
             limits,
             metrics,
+            memory_budget: options.max_total_memory_bytes.map(|maximum| {
+                Arc::new(MemoryBudget {
+                    maximum,
+                    reserved: AtomicUsize::new(0),
+                })
+            }),
         })
     }
 
@@ -251,6 +352,15 @@ impl Runtime {
         http: HttpState,
         storage: storage::StorageState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
+        let reserved = match &self.memory_budget {
+            Some(budget) => Some(budget.reserve(self.limits.max_memory_bytes).ok_or(
+                BrokerHostError::MemoryBudgetExhausted {
+                    requested: self.limits.max_memory_bytes,
+                    maximum: budget.maximum,
+                },
+            )?),
+            None => None,
+        };
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
             .table_elements(self.limits.max_table_elements)
@@ -269,6 +379,7 @@ impl Runtime {
                 fuel_recorded: false,
                 provider_output_bytes: 0,
                 _active: active,
+                _reserved: reserved,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -292,13 +403,6 @@ impl Runtime {
         }
     }
 
-    fn linker(&self) -> Result<Linker<StoreState>, BrokerHostError> {
-        let mut linker = Linker::new(&self.engine);
-        bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|source| BrokerHostError::Linker { source })?;
-        Ok(linker)
-    }
-
     fn http_ceilings(&self) -> HttpCeilings {
         HttpCeilings {
             max_requests: self.limits.max_http_requests,
@@ -318,6 +422,7 @@ struct StoreState {
     fuel_recorded: bool,
     provider_output_bytes: usize,
     _active: ActiveStore,
+    _reserved: Option<MemoryReservation>,
 }
 
 impl bindings::dekopon::http::client::Host for StoreState {
@@ -334,10 +439,26 @@ impl bindings::dekopon::http::client::Host for StoreState {
     }
 }
 
+/// One provider component after Cranelift, before it has described itself.
+struct CompiledComponent {
+    source: PathBuf,
+    artifact_bytes: u64,
+    artifact_sha256: String,
+    compile_ms: u64,
+    pre: bindings::ProviderPre<StoreState>,
+    imports: Vec<ComponentInterfaceItem>,
+    exports: Vec<ComponentInterfaceItem>,
+    interface_truncated: bool,
+    resolve_command: ResolveCommandExport,
+}
+
 /// One provider component compiled by the broker host.
 pub struct BrokerWasmProvider {
     runtime: Arc<Runtime>,
-    component: Component,
+    // Imports are resolved and type-checked once here rather than on every call. Wasmtime's own
+    // shape for repeated instantiation, and the difference between a link per chat-message
+    // capability call and none.
+    pre: bindings::ProviderPre<StoreState>,
     source: PathBuf,
     artifact_bytes: u64,
     artifact_sha256: String,
@@ -357,37 +478,81 @@ impl fmt::Debug for BrokerWasmProvider {
     }
 }
 
+/// Compiles one provider component, off the asynchronous runtime.
+///
+/// Everything here is CPU-bound Cranelift work with no `await` in it, which is why the registry
+/// hands it to the blocking pool: three providers on a four-core host should not compile one at a
+/// time while the socket stays unbound.
+fn compile_component(
+    runtime: &Runtime,
+    source: PathBuf,
+) -> Result<CompiledComponent, BrokerHostError> {
+    // Read once. A digest taken from a second read cannot prove it describes the bytes Cranelift
+    // consumed, and `artifact_sha256` is published as if it did.
+    let bytes = std::fs::read(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
+        path: source.clone(),
+        source: error,
+    })?;
+    let artifact = identify_bytes(&bytes);
+    // Compilation happens once per provider at startup rather than per invocation, so this span
+    // answers "why was the broker slow to become ready", not "why was that call slow".
+    let compile = tracing::info_span!(
+        "provider.compile",
+        path = %source.display(),
+        artifact_bytes = artifact.bytes,
+        elapsed_ms = tracing::field::Empty,
+    );
+    let started = Instant::now();
+    let component = compile
+        .in_scope(|| Component::new(&runtime.engine, &bytes))
+        .map_err(|error| BrokerHostError::Compile {
+            path: source.clone(),
+            source: error,
+        })?;
+    let elapsed = started.elapsed();
+    let compile_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    compile.record("elapsed_ms", compile_ms);
+    runtime.metrics.record_compilation(elapsed, artifact.bytes);
+    let (imports, exports, interface_truncated) = component_interface(&runtime.engine, &component);
+    let resolve_command = resolve_command_export(&runtime.engine, &component);
+    let pre = runtime
+        .linker
+        .instantiate_pre(&component)
+        .and_then(bindings::ProviderPre::new)
+        .map_err(|error| BrokerHostError::Instantiate {
+            path: source.clone(),
+            source: error,
+        })?;
+    Ok(CompiledComponent {
+        source,
+        artifact_bytes: artifact.bytes,
+        artifact_sha256: artifact.sha256,
+        compile_ms,
+        pre,
+        imports,
+        exports,
+        interface_truncated,
+        resolve_command,
+    })
+}
+
 impl BrokerWasmProvider {
-    async fn load(runtime: Arc<Runtime>, source: PathBuf) -> Result<Self, BrokerHostError> {
-        let artifact =
-            identify_artifact(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
-                path: source.clone(),
-                source: error,
-            })?;
-        // Compilation happens once per provider at startup rather than per invocation, so this
-        // span answers "why was the broker slow to become ready", not "why was that call slow".
-        let compile = tracing::info_span!("provider.compile");
-        let started = Instant::now();
-        let component = compile
-            .in_scope(|| Component::from_file(&runtime.engine, &source))
-            .map_err(|error| BrokerHostError::Compile {
-                path: source.clone(),
-                source: error,
-            })?;
-        runtime
-            .metrics
-            .record_compilation(started.elapsed(), artifact.bytes);
-        let after_compile =
-            identify_artifact(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
-                path: source.clone(),
-                source: error,
-            })?;
-        if after_compile != artifact {
-            return Err(BrokerHostError::ArtifactChanged { path: source });
-        }
-        let (imports, exports, interface_truncated) =
-            component_interface(&runtime.engine, &component);
-        let manifest_json = describe_component(&runtime, &component, &source).await?;
+    async fn load(
+        runtime: Arc<Runtime>,
+        compiled: CompiledComponent,
+    ) -> Result<Self, BrokerHostError> {
+        let CompiledComponent {
+            source,
+            artifact_bytes,
+            artifact_sha256,
+            compile_ms,
+            pre,
+            imports,
+            exports,
+            interface_truncated,
+            resolve_command,
+        } = compiled;
+        let manifest_json = describe_component(&runtime, &pre, &source).await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
             return Err(BrokerHostError::OutputTooLarge {
                 provider: source.display().to_string(),
@@ -404,22 +569,43 @@ impl BrokerWasmProvider {
             })?;
         validate_manifest(&manifest, &source)?;
         // A manifest that promises command words the component cannot rewrite would fail at the
-        // first `gh …` a model typed, in a session, hours later. Prove it at load instead.
-        if !manifest.command_words.is_empty()
-            && !exports_resolve_command(&runtime, &component, &source).await?
-        {
-            return Err(BrokerHostError::MissingResolveCommand {
-                provider: manifest.id.clone(),
-                path: source.clone(),
-            });
+        // first `gh …` a model typed, in a session, hours later. Prove it at load instead — from
+        // the component's own type, which distinguishes "no such export" from "wrong signature".
+        if !manifest.command_words.is_empty() {
+            match resolve_command {
+                ResolveCommandExport::Present => {}
+                ResolveCommandExport::Absent => {
+                    return Err(BrokerHostError::MissingResolveCommand {
+                        provider: manifest.id.clone(),
+                        path: source.clone(),
+                    });
+                }
+                ResolveCommandExport::Mismatched { found } => {
+                    return Err(BrokerHostError::ResolveCommandSignature {
+                        provider: manifest.id.clone(),
+                        path: source.clone(),
+                        found,
+                    });
+                }
+            }
         }
         runtime.metrics.record_provider_loaded();
+        tracing::info!(
+            provider = %manifest.id,
+            path = %source.display(),
+            artifact_bytes,
+            artifact_sha256 = &artifact_sha256[..artifact_sha256.len().min(12)],
+            compile_ms,
+            capabilities = manifest.capabilities.len(),
+            command_words = manifest.command_words.len(),
+            "loaded broker provider"
+        );
         Ok(Self {
             runtime,
-            component,
+            pre,
             source,
-            artifact_bytes: artifact.bytes,
-            artifact_sha256: artifact.sha256,
+            artifact_bytes,
+            artifact_sha256,
             imports,
             exports,
             interface_truncated,
@@ -440,23 +626,25 @@ impl BrokerWasmProvider {
         let mut store = self
             .runtime
             .store(http, storage::StorageState::disabled())?;
-        let linker = self.runtime.linker()?;
         let argv = argv.to_vec();
         let operation = async {
-            let instance = linker
-                .instantiate_async(&mut store, &self.component)
+            let instance = self
+                .pre
+                .instance_pre()
+                .instantiate_async(&mut store)
                 .await
                 .map_err(|source| BrokerHostError::Instantiate {
                     path: self.source.clone(),
                     source,
                 })?;
             self.runtime.metrics.record_instantiation();
-            let function = resolve_command_export(&mut store, &instance).ok_or_else(|| {
-                BrokerHostError::MissingResolveCommand {
+            let function = instance
+                .get_typed_func::<(Vec<String>,), (String,)>(&mut store, RESOLVE_COMMAND_EXPORT)
+                .map_err(|source| BrokerHostError::ResolveCommandSignature {
                     provider: self.manifest.id.clone(),
                     path: self.source.clone(),
-                }
-            })?;
+                    found: source.to_string(),
+                })?;
             let (output,) = function
                 .call_async(&mut store, (argv,))
                 .await
@@ -634,15 +822,15 @@ impl BrokerWasmProvider {
         constraints: &ExecutionConstraints,
         operation_timeout: Duration,
     ) -> Result<Value, BrokerHostError> {
-        let linker = self.runtime.linker()?;
         let operation = async {
-            let bindings =
-                bindings::Provider::instantiate_async(&mut *store, &self.component, &linker)
-                    .await
-                    .map_err(|source| BrokerHostError::Instantiate {
-                        path: self.source.clone(),
-                        source,
-                    })?;
+            let bindings = self
+                .pre
+                .instantiate_async(&mut *store)
+                .await
+                .map_err(|source| BrokerHostError::Instantiate {
+                    path: self.source.clone(),
+                    source,
+                })?;
             self.runtime.metrics.record_instantiation();
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
@@ -809,11 +997,37 @@ impl BrokerProviderRegistry {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
+        Self::load_with_options(sources, limits, storage_host, &BrokerHostOptions::default()).await
+    }
+
+    /// Compiles providers with operational settings the authority surface does not commit.
+    pub async fn load_with_options<I, P>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_host: Option<StorageHost>,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
         let sources = sources.into_iter().map(Into::into).collect::<Vec<_>>();
         if sources.is_empty() {
             return Err(BrokerHostError::NoProviders);
         }
-        let runtime = Arc::new(Runtime::new(limits)?);
+        let runtime = Arc::new(Runtime::new(limits, options)?);
+        // Cranelift is the whole of a cold start and it is pure CPU, so every provider is
+        // dispatched at once instead of one core compiling three components while the socket stays
+        // unbound. The results are consumed in source order below, so the conflict report and the
+        // first reported failure are exactly what the serial load produced.
+        let compiling = sources
+            .iter()
+            .map(|source| {
+                let runtime = Arc::clone(&runtime);
+                let source = source.clone();
+                tokio::task::spawn_blocking(move || compile_component(&runtime, source))
+            })
+            .collect::<Vec<_>>();
         let mut providers = Vec::with_capacity(sources.len());
         let mut routes = BTreeMap::new();
         // Every conflict, then one failure. Returning on the first would make fixing a provider
@@ -822,8 +1036,12 @@ impl BrokerProviderRegistry {
         let mut duplicate_capabilities = BTreeSet::new();
         let mut provider_ids = BTreeSet::new();
         let mut declared_words = Vec::new();
-        for source in sources {
-            let provider = BrokerWasmProvider::load(Arc::clone(&runtime), source).await?;
+        for (source, compiling) in sources.into_iter().zip(compiling) {
+            let compiled = compiling.await.map_err(|_| BrokerHostError::Compile {
+                path: source,
+                source: wasmtime::Error::msg("component compilation task did not complete"),
+            })??;
+            let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
             if !provider_ids.insert(provider.manifest.id.clone()) {
                 duplicate_providers.insert(provider.manifest.id.clone());
             }
@@ -917,7 +1135,17 @@ impl BrokerProviderRegistry {
             })?;
         // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
         // a daemon that never sees the raw string cannot accidentally forward it to a caller.
-        let json = provider.resolve_command(argv).await?;
+        //
+        // `argv` is deliberately not a span field for the same reason the invoke span omits input:
+        // it is model-authored text.
+        let json = provider
+            .resolve_command(argv)
+            .instrument(tracing::info_span!(
+                "provider.resolve_command",
+                provider = %provider.manifest.id,
+                word,
+            ))
+            .await?;
         serde_json::from_str::<CommandResolution>(&json).map_err(|source| {
             BrokerHostError::InvalidCommandResolution {
                 provider: provider.manifest.id.clone(),
@@ -1122,61 +1350,22 @@ impl BrokerProviderRegistry {
     }
 }
 
-/// Looks up the optional `resolve-command` export on an instantiated component.
-///
-/// Optional on purpose: `dekopon:provider@0.2.0` defines it in a separate `provider-commands`
-/// world so a component built against an earlier package version keeps loading, contributing no
-/// command words. Independent provider release cadence is the whole point of moving providers out
-/// of this repository, and it does not survive a contract that forces lockstep rebuilds.
-fn resolve_command_export(
-    store: &mut Store<StoreState>,
-    instance: &wasmtime::component::Instance,
-) -> Option<wasmtime::component::TypedFunc<(Vec<String>,), (String,)>> {
-    instance
-        .get_typed_func::<(Vec<String>,), (String,)>(&mut *store, "resolve-command")
-        .ok()
-}
-
-/// Reports whether a component exports `resolve-command`, by instantiating it once.
-async fn exports_resolve_command(
-    runtime: &Runtime,
-    component: &Component,
-    source: &Path,
-) -> Result<bool, BrokerHostError> {
-    let http = HttpState::describe(runtime.http_ceilings(), runtime.limits.max_timeout)
-        .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-    let mut store = runtime.store(http, storage::StorageState::disabled())?;
-    let linker = runtime.linker()?;
-    let instantiated = linker
-        .instantiate_async(&mut store, component)
-        .await
-        .map_err(|error| BrokerHostError::Instantiate {
-            path: source.to_path_buf(),
-            source: error,
-        });
-    runtime.record_fuel(&mut store);
-    let instance = instantiated?;
-    runtime.metrics.record_instantiation();
-    Ok(resolve_command_export(&mut store, &instance).is_some())
-}
-
 async fn describe_component(
     runtime: &Runtime,
-    component: &Component,
+    pre: &bindings::ProviderPre<StoreState>,
     source: &Path,
 ) -> Result<String, BrokerHostError> {
     let operation_timeout = runtime.limits.max_timeout;
     let http = HttpState::describe(runtime.http_ceilings(), operation_timeout)
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
     let mut store = runtime.store(http, storage::StorageState::disabled())?;
-    let linker = runtime.linker()?;
     let operation = async {
-        let bindings = bindings::Provider::instantiate_async(&mut store, component, &linker)
-            .await
-            .map_err(|error| BrokerHostError::Instantiate {
+        let bindings = pre.instantiate_async(&mut store).await.map_err(|error| {
+            BrokerHostError::Instantiate {
                 path: source.to_path_buf(),
                 source: error,
-            })?;
+            }
+        })?;
         runtime.metrics.record_instantiation();
         bindings
             .call_describe(&mut store)
@@ -1406,11 +1595,25 @@ pub enum BrokerHostError {
         #[source]
         source: std::io::Error,
     },
-    /// Provider source changed while startup was compiling it, so retained metadata would lie.
-    #[error("broker provider artifact changed while it was being compiled: {}", path.display())]
-    ArtifactChanged {
-        /// Component path.
+    /// The persistent compilation cache directory could not be prepared.
+    #[error("could not open the broker provider compilation cache at {}", path.display())]
+    CompileCache {
+        /// Configured cache directory.
         path: PathBuf,
+        /// Wasmtime error.
+        #[source]
+        source: wasmtime::Error,
+    },
+    /// Concurrently live stores already reserve the whole aggregate guest-memory ceiling.
+    #[error(
+        "broker provider stores already reserve the {maximum}-byte aggregate guest memory ceiling; \
+         another {requested} bytes cannot be admitted"
+    )]
+    MemoryBudgetExhausted {
+        /// Bytes one more store would reserve.
+        requested: usize,
+        /// Configured aggregate ceiling.
+        maximum: usize,
     },
     /// Component compilation failed.
     #[error("could not compile broker provider component {}", path.display())]
@@ -1469,6 +1672,20 @@ pub enum BrokerHostError {
         /// Component path.
         path: PathBuf,
     },
+    /// Provider exports `resolve-command` as something the host cannot call.
+    #[error(
+        "provider {provider} exports resolve-command from component {} as {found}, not \
+         func(argv: list<string>) -> string",
+        path.display()
+    )]
+    ResolveCommandSignature {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Component path.
+        path: PathBuf,
+        /// Bounded description of what the component actually exports.
+        found: String,
+    },
     /// Rewriting a command word failed inside the guest.
     #[error("provider {provider} failed while rewriting a command word")]
     ResolveCommand {
@@ -1515,18 +1732,6 @@ pub enum BrokerHostError {
         path: PathBuf,
         /// Validation detail.
         message: String,
-    },
-    /// Provider identity was duplicated.
-    #[error("broker provider {provider} is declared by more than one component")]
-    DuplicateProvider {
-        /// Provider ID.
-        provider: ProviderId,
-    },
-    /// Capability route was duplicated.
-    #[error("broker capability {capability} is declared by more than one provider")]
-    DuplicateCapability {
-        /// Capability ID.
-        capability: CapabilityId,
     },
     /// Authorized capability has no provider route.
     #[error("no broker provider implements authorized capability {capability}")]

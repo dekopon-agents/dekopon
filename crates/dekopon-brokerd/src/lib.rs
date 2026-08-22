@@ -119,6 +119,12 @@ where
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
     }
+    // A compilation cache holds compiled code the broker will execute. Anyone who can write into
+    // it can choose what the privileged process runs, so it lives under the same private-parent
+    // rule as the socket and the audit log.
+    if let Some(cache) = &config.host_options.compile_cache_dir {
+        socket::validate_private_parent(cache, uid)?;
+    }
     // Loaded before the policy is built so an unknown or unbindable credential is a startup
     // refusal, never a per-invocation surprise. Absent path ⇒ empty store ⇒ credentialed
     // constraint sets fail construction the same way.
@@ -170,10 +176,26 @@ where
         .storage
         .as_ref()
         .map(|storage| Duration::from_millis(storage.limits.gc_interval_ms));
-    let registry = BrokerProviderRegistry::load_with_storage(
+    // Stated once at startup because nothing else in the process can: per-store limits are visible
+    // in the host stats, but the product with the connection ceiling is what a container limit has
+    // to cover, and an unbounded aggregate is a deliberate operator choice rather than a default.
+    tracing::info!(
+        max_connections = config.server_limits.max_connections,
+        max_memory_bytes = config.host_limits.max_memory_bytes,
+        worst_case_guest_memory_bytes = config.worst_case_guest_memory_bytes,
+        aggregate_ceiling_bytes = config.host_options.max_total_memory_bytes,
+        compile_cache = config
+            .host_options
+            .compile_cache_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "broker provider guest-memory budget"
+    );
+    let registry = BrokerProviderRegistry::load_with_options(
         config.providers,
         config.host_limits,
         storage_host,
+        &config.host_options,
     )
     .await
     .map_err(BrokerdError::Host)?;

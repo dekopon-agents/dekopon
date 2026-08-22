@@ -297,6 +297,10 @@ that a key and a canonical subject never share a record.
 
 | Span | Crate | Fields |
 |---|---|---|
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one |
+| `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
+| `provider.resolve_command` | `dekopon-broker-host` | provider, `word` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
@@ -320,7 +324,13 @@ a connection, or a response body never re-parents whatever else the runtime poll
 thread.
 
 `provider.compile` covers startup component compilation rather than per-invocation work, so it
-answers "why was the broker slow to become ready" rather than "why was that call slow".
+answers "why was the broker slow to become ready" rather than "why was that call slow". Its fields
+attribute that time to one component, and each loaded provider also emits one info event carrying
+its identity, artifact digest prefix, artifact bytes, and compile milliseconds. Since components
+compile concurrently, their spans overlap; the compile times sum to more than the wall-clock start.
+
+`provider.resolve_command` carries the provider and the command word, never the argv. Model-authored
+argv is untrusted content for the same reason `provider.invoke` omits `input`.
 
 `broker.execute`'s `credential` is the owner-authored symbolic name from `broker.yaml`, never the
 secret and never the header. It exists because one capability can present a different credential per

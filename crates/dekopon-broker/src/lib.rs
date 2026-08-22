@@ -4530,7 +4530,9 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         // already survived them — but naming them keeps this match exhaustive by proof rather than
         // by a wildcard that would silently absorb a future variant into the wrong public reason.
         BrokerHostError::ConflictingProviders { .. }
-        | BrokerHostError::MissingResolveCommand { .. } => "provider-configuration",
+        | BrokerHostError::MissingResolveCommand { .. }
+        | BrokerHostError::ResolveCommandSignature { .. } => "provider-configuration",
+        BrokerHostError::MemoryBudgetExhausted { .. } => "host-memory-budget",
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
@@ -4593,15 +4595,13 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::Store { .. }
         | BrokerHostError::Linker { .. }
         | BrokerHostError::ArtifactMetadata { .. }
-        | BrokerHostError::ArtifactChanged { .. }
+        | BrokerHostError::CompileCache { .. }
         | BrokerHostError::Compile { .. }
         | BrokerHostError::Instantiate { .. }
         | BrokerHostError::DescribeUsedHostImport { .. }
         | BrokerHostError::Describe { .. }
         | BrokerHostError::InvalidManifest { .. }
-        | BrokerHostError::Manifest { .. }
-        | BrokerHostError::DuplicateProvider { .. }
-        | BrokerHostError::DuplicateCapability { .. } => "broker-host-failure",
+        | BrokerHostError::Manifest { .. } => "broker-host-failure",
     }
 }
 
