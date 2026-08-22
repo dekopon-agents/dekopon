@@ -15,6 +15,21 @@ All notable changes to Dekopon are documented here. The format is based on
   `AuthorizationGate`, and defaults its per-invocation ceilings from the host limits in force
   rather than restating them. Storage grants are minted per invocation from constant scope
   material, so successive calls reach one durable namespace.
+- Gave the sandboxed shell two script-addressable streams. `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2`,
+  and `> /dev/null` now redirect a command's diagnostics or its value into a named in-memory
+  buffer, and a command may carry more than one redirection. The stdout/stderr split already
+  governed behaviour — `$( )` captured the value while diagnostics escaped to the terminal — and
+  this makes it something a script can address. `x=$(cmd 2>&1)` therefore captures *why* a
+  capability failed rather than only that it did; a quiet command's value, and its type, are left
+  untouched. `ScriptOutcome::output` is still the one combined transcript a terminal would show.
+
+### Changed
+
+- The shell no longer rejects file-descriptor redirection wholesale. Descriptors other than 1 and 2
+  (`3>`, `<&`) are still refused by name, as is `2>&1` written *before* the redirection it copies:
+  bash duplicates the file description there and leaves stderr on the terminal, this interpreter
+  has destinations rather than descriptions, and that spelling is the one a script writes when it
+  believes it captured output that went elsewhere.
 
 ### Fixed
 

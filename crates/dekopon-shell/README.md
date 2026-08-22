@@ -23,13 +23,40 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 ## Grammar
 
-**Kept**: simple commands; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `$NAME`, `${NAME}`, `${NAME[index]}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and `>`/`>>` into named in-memory buffers read back by `cat`.
+**Kept**: simple commands; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `$NAME`, `${NAME}`, `${NAME[index]}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
-**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, `[[ ]]`, `set` and its options, file-descriptor redirection (`2>`, `>&2`, `2>&1`), here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, `${name:-default}`-style parameter expansions, regex metacharacters in a `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
+**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, `[[ ]]`, `set` and its options, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, `${name:-default}`-style parameter expansions, regex metacharacters in a `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
 That last one is where "rejected loudly" reaches inside a construct that was kept. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns already follow, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
+
+## The two streams
+
+A command produces a **value** on stdout and **text** on stderr, and that split was always there:
+`$( )` captures the value while diagnostics escape it to the terminal, exactly as a real shell
+sends command-substitution stderr past the capture. What is new is that a script can address the
+two halves. `2> log` collects a command's diagnostics into a buffer; `>&2` sends its value to the
+diagnostic stream, which is how `echo "problem" >&2` reports without polluting what the command
+returns; `&> all` sends both to one buffer; and `> /dev/null` discards, that one name being reserved
+rather than a path, because it is the spelling every shell shares and refusing it would be worse
+than admitting it.
+
+`2>&1` is the one place the value model shows through. Merging a text channel into a value channel
+has to mean something exact, so it means what every text-shaped builtin already means: the
+diagnostics become extra lines. A command that produced no diagnostics has nothing to merge and its
+value is left alone — including its type, so `posts.get 2>&1` still hands `jq` an object rather than
+that object's JSON text. The result is that `x=$(cmd 2>&1)` captures *why* something failed, which
+is the idiom the construct exists for.
+
+Redirections resolve left to right, so a duplication copies the destination its target holds at that
+point. The reversed spelling `2>&1 > buf` is a parse error naming itself: bash copies the file
+*description* there and leaves stderr pointing at the terminal, this interpreter has destinations
+rather than descriptions and cannot represent the difference, and that ordering is precisely the one
+a script writes when it believes it captured diagnostics that went somewhere else.
+
+`ScriptOutcome::output` stays one combined, interleaved stream. The streams are addressable from
+inside a script; what a caller receives is still the transcript a terminal would have shown.
 
 ## Builtins
 

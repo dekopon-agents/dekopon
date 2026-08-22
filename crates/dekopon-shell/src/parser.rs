@@ -12,7 +12,8 @@ use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
         CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Parameter, Pipeline,
-        Program, Redirect, SimpleCommand, Statement, WhileLoop, Word, WordPart,
+        Program, Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word,
+        WordPart,
     },
     lexer::{LexError, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize},
 };
@@ -135,6 +136,42 @@ fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
         return Err(ParseError::syntax(line, format!("unexpected {kind}")));
     }
     Ok(program)
+}
+
+/// Refuses a duplication whose target stream is redirected after it.
+///
+/// `cmd > buf 2>&1` sends both streams to `buf`; `cmd 2>&1 > buf` does not, because bash copies the
+/// file *description* stdout held at that moment and a later `> buf` leaves that copy pointing at
+/// the terminal. This interpreter has destinations rather than descriptions, so it cannot represent
+/// the difference — and the reversed spelling is precisely the one a script writes when it believes
+/// it captured diagnostics that in fact went somewhere else. It is named instead.
+fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), ParseError> {
+    for (index, redirect) in redirects.iter().enumerate() {
+        let RedirectTarget::Stream(copied) = redirect.target else {
+            continue;
+        };
+        let reassigned = redirects[index + 1..].iter().any(|later| {
+            matches!(later.target, RedirectTarget::Buffer { .. })
+                && (later.source == copied || later.source == Stream::Both)
+        });
+        if reassigned {
+            return Err(ParseError::syntax(
+                line,
+                format!(
+                    "`{}>&{}` must come after the redirection of stream {}, not before it: \
+                     write `> name {}>&{}` rather than `{}>&{} > name`",
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                    copied.descriptor(),
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reports the nesting ceiling as a syntax error a script can act on.
@@ -637,7 +674,7 @@ impl Parser {
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
-        let mut redirect: Option<Redirect> = None;
+        let mut redirects: Vec<Redirect> = Vec::new();
         let mut here_doc: Option<Word> = None;
         // `arr=(a b c)` lexes as an empty assignment followed by `(`; remembering that shape is
         // what lets the paren below name array literals instead of blaming subshells.
@@ -669,8 +706,8 @@ impl Parser {
                     after_empty_assignment = false;
                     words.push(convert_word(&raw, line, depth)?);
                 }
-                Some(TokenKind::Great | TokenKind::GreatGreat) => {
-                    let append = matches!(self.peek_kind(), Some(TokenKind::GreatGreat));
+                Some(TokenKind::Redirect { source, append }) => {
+                    let (source, append) = (*source, *append);
                     let line = self.line();
                     let depth = self.depth;
                     self.position += 1;
@@ -682,16 +719,36 @@ impl Parser {
                     };
                     let raw = raw.clone();
                     self.position += 1;
-                    if redirect.is_some() {
+                    after_empty_assignment = false;
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Buffer {
+                            append,
+                            target: convert_word(&raw, line, depth)?,
+                        },
+                    });
+                }
+                Some(TokenKind::Duplicate { source, target }) => {
+                    let (source, target) = (*source, *target);
+                    let line = self.line();
+                    self.position += 1;
+                    // `>&1` and `2>&2` ask for the stream a command already writes to. Bash makes
+                    // them no-ops; here they are a parse error, because a redirection that changes
+                    // nothing is a script believing it moved output that never moved.
+                    if source == target {
                         return Err(ParseError::syntax(
                             line,
-                            "a command accepts at most one buffer redirection",
+                            format!(
+                                "`{}>&{}` redirects a stream onto itself and would do nothing",
+                                source.descriptor(),
+                                target.descriptor()
+                            ),
                         ));
                     }
                     after_empty_assignment = false;
-                    redirect = Some(Redirect {
-                        append,
-                        target: convert_word(&raw, line, depth)?,
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Stream(target),
                     });
                 }
                 // Job control is dropped whole. A trailing `&` must never be silently discarded:
@@ -784,10 +841,11 @@ impl Parser {
             ));
         }
 
+        check_duplication_order(&redirects, self.line())?;
         Ok(SimpleCommand {
             assignments,
             words,
-            redirect,
+            redirects,
             here_doc,
         })
     }
@@ -1288,7 +1346,10 @@ impl ArithParser {
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::{ArithBinaryOp, ArithExpr, CasePattern, Statement, WordPart};
+    use crate::ast::{
+        ArithBinaryOp, ArithExpr, CasePattern, Redirect, RedirectTarget, Statement, Stream, Word,
+        WordPart,
+    };
 
     use super::{ParseError, parse};
 
@@ -1323,27 +1384,78 @@ mod tests {
         assert!(matches!(program.statements[3], Statement::If(_)));
     }
 
-    #[test]
-    fn parses_buffer_redirections() {
-        let program = parse("echo hi > buf\necho there >> buf").expect("valid script");
+    /// Returns the redirections of the only command in the only statement of `source`.
+    fn redirects_of(source: &str) -> Vec<Redirect> {
+        let program = parse(source).expect("valid script");
         let Statement::List(list) = &program.statements[0] else {
             panic!("expected a list");
         };
-        let redirect = list.first.commands[0]
-            .redirect
-            .as_ref()
-            .expect("a redirect");
-        assert!(!redirect.append);
-        let Statement::List(list) = &program.statements[1] else {
-            panic!("expected a list");
-        };
-        assert!(
-            list.first.commands[0]
-                .redirect
-                .as_ref()
-                .expect("a redirect")
-                .append
+        list.first.commands[0].redirects.clone()
+    }
+
+    #[test]
+    fn parses_buffer_redirections() {
+        assert_eq!(
+            redirects_of("echo hi > buf"),
+            vec![Redirect {
+                source: Stream::Stdout,
+                target: RedirectTarget::Buffer {
+                    append: false,
+                    target: Word {
+                        parts: vec![WordPart::Literal("buf".to_owned())]
+                    }
+                }
+            }]
         );
+        let appended = redirects_of("echo there >> buf");
+        assert!(matches!(
+            appended.as_slice(),
+            [Redirect {
+                target: RedirectTarget::Buffer { append: true, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn parses_each_stream_and_keeps_redirections_in_source_order() {
+        let redirects = redirects_of("cmd > out 2> err");
+        assert_eq!(redirects.len(), 2);
+        assert_eq!(redirects[0].source, Stream::Stdout);
+        assert_eq!(redirects[1].source, Stream::Stderr);
+
+        assert_eq!(
+            redirects_of("cmd > out 2>&1")[1],
+            Redirect {
+                source: Stream::Stderr,
+                target: RedirectTarget::Stream(Stream::Stdout)
+            }
+        );
+        assert_eq!(
+            redirects_of("echo oops >&2"),
+            vec![Redirect {
+                source: Stream::Stdout,
+                target: RedirectTarget::Stream(Stream::Stderr)
+            }]
+        );
+        let both = redirects_of("cmd &> all");
+        assert_eq!(both[0].source, Stream::Both);
+    }
+
+    #[test]
+    fn redirections_that_would_do_nothing_or_mislead_are_refused() {
+        // A stream redirected onto itself moves nothing.
+        for source in ["cmd >&1", "cmd 2>&2"] {
+            let error = parse(source).expect_err("self-duplication is refused");
+            assert!(format!("{error}").contains("onto itself"), "{source}");
+        }
+        // `2>&1 > buf` is the classic footgun: bash copies the *description*, so stderr keeps
+        // going to the terminal while stdout moves. Nothing here can represent that difference,
+        // so it is named rather than silently given the other meaning.
+        let error = parse("cmd 2>&1 > buf").expect_err("reversed duplication is refused");
+        assert!(format!("{error}").contains("before"), "{error}");
+        // The supported spelling still parses.
+        assert_eq!(redirects_of("cmd > buf 2>&1").len(), 2);
     }
 
     #[test]

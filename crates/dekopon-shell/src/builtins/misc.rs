@@ -5,7 +5,7 @@ use std::{thread, time::Duration};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::ExitCode;
+use crate::{ExitCode, ast::DEV_NULL};
 
 /// `echo [-neE] ARGS...`.
 pub(crate) struct Echo;
@@ -407,6 +407,13 @@ impl Builtin for Cat {
 
         let mut values = Vec::new();
         for name in arguments {
+            // `/dev/null` is the one name that never needs a prior write: it discards on the way in
+            // and reads empty on the way out, which is what makes `cmd > /dev/null` and
+            // `cat /dev/null` mean here what they mean everywhere else.
+            if name == DEV_NULL {
+                values.push(Value::Null);
+                continue;
+            }
             let Some(value) = context.buffers.get(name) else {
                 return Err(CommandFailure::failed(format!(
                     "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
