@@ -31,6 +31,8 @@ pub(crate) struct BoundRoute {
     /// The agent's standing orders, which are untrusted model text and grant nothing.
     pub instructions: Option<String>,
     pub model: Arc<ModelConfig>,
+    /// Explicit route-level image generator, already validated against the named registry.
+    pub image_generator: Option<String>,
     pub limits: PromptLimits,
     /// What this route remembers between messages.
     pub conversation: ConversationPolicy,
@@ -112,6 +114,7 @@ impl RoutingTable {
                 model_class: agent.spec.model_class.clone(),
                 instructions: agent.spec.instructions.clone(),
                 model: Arc::clone(model),
+                image_generator: route.image_generator.clone(),
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,

@@ -734,15 +734,6 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
     ))
 }
 
-/// Proves every entity a policy names is one the world declares.
-///
-/// Cedar's validator checks types, not instances: `principal == Dekopon::Principal::"typo"` is
-/// perfectly well typed and simply never matches. That is exactly the failure mode the old exact
-/// engine caught with its reachability check, so it is caught here instead — a policy naming an
-/// undeclared principal or provider refuses startup rather than becoming latent dead policy.
-///
-/// Agents are the deliberate exception: the agent catalog belongs to the gateway, so the broker
-/// declares the type and matches instances by UID without enumerating them.
 /// Classifies every policy's entity literals against the declared world.
 ///
 /// Returns the capabilities the policy set references, plus every provider-derived name the world
@@ -756,6 +747,10 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
 /// - **Actions and providers** are derived from loaded provider manifests. An undeclared one means
 ///   that provider is not loaded, which is a legitimate state for a deployment whose policy
 ///   anticipates it. Under [`Handling::Tolerate`] it is reported and registered as a phantom.
+///
+/// **Agents are checked by neither class.** The agent catalog belongs to the gateway, so the broker
+/// declares the type and matches instances by UID without enumerating them: `Dekopon::Agent::"typo"`
+/// validates, starts cleanly, and then matches nothing, denying every session `agent-denied`.
 ///
 /// An entity type outside the Dekopon namespace is a grammar error, not an absence, and is fatal
 /// in both modes.

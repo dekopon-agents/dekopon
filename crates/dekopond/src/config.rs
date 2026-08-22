@@ -11,6 +11,7 @@
 use std::{
     collections::BTreeSet,
     env, io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -55,6 +56,8 @@ pub const SLACK_ENDPOINT: &str = "https://slack.com";
 pub const DISCORD_ENDPOINT: &str = "https://discord.com";
 /// The only non-loopback Telegram origin this daemon will talk to.
 pub const TELEGRAM_ENDPOINT: &str = "https://api.telegram.org";
+/// The only non-loopback Meta Graph API origin this daemon will send WhatsApp replies to.
+pub const WHATSAPP_GRAPH_ENDPOINT: &str = "https://graph.facebook.com";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum ConfigApiVersion {
@@ -127,6 +130,9 @@ pub struct DekopondConfig {
     pub broker: BrokerConfig,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    /// Named image-generation backends. Empty unless a route explicitly opts in.
+    #[serde(default)]
+    pub image_generators: Vec<ImageGeneratorConfig>,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -190,6 +196,22 @@ pub enum TransportConfig {
         #[serde(default)]
         endpoint: Option<String>,
     },
+    /// Meta WhatsApp Cloud API: a signed public webhook receives text and Graph API sends replies.
+    WhatsappCloudApi {
+        name: String,
+        app_secret_env: String,
+        verify_token_env: String,
+        access_token_env: String,
+        /// Plain HTTP listener behind operator-owned TLS termination.
+        bind: SocketAddr,
+        callback_path: String,
+        waba_id: String,
+        phone_number_id: String,
+        graph_api_version: String,
+        /// Overridable only to the pinned production origin or literal loopback HTTP for tests.
+        #[serde(default)]
+        graph_endpoint: Option<String>,
+    },
     /// Telegram long polling: the poll is the wakeup and advancing the offset is the ack.
     TelegramLongPoll {
         name: String,
@@ -212,6 +234,7 @@ impl TransportConfig {
         match self {
             Self::SlackSocketMode { name, .. }
             | Self::DiscordGateway { name, .. }
+            | Self::WhatsappCloudApi { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
         }
@@ -223,6 +246,7 @@ impl TransportConfig {
         match self {
             Self::SlackSocketMode { .. } => "slackSocketMode",
             Self::DiscordGateway { .. } => "discordGateway",
+            Self::WhatsappCloudApi { .. } => "whatsappCloudApi",
             Self::TelegramLongPoll { .. } => "telegramLongPoll",
             Self::Local { .. } => "local",
         }
@@ -316,6 +340,62 @@ impl ModelConfig {
         match self {
             Self::OpenaiCompatible { timeout_ms, .. }
             | Self::ChatgptSubscription { timeout_ms, .. } => *timeout_ms,
+        }
+    }
+}
+
+/// One explicitly configured image-generation backend.
+///
+/// The production endpoint is fixed inside `dekopon-model`; authored configuration chooses only
+/// the model, credential variable, and deadline. This keeps model output from selecting where a
+/// credential or image prompt is sent.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ImageGeneratorConfig {
+    /// OpenAI's public Images API returning one inline PNG.
+    OpenaiImages {
+        name: String,
+        model: String,
+        api_key_env: String,
+        timeout_ms: u64,
+    },
+}
+
+impl ImageGeneratorConfig {
+    /// Operator-chosen name routes refer to.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::OpenaiImages { name, .. } => name,
+        }
+    }
+
+    /// Configured image model identifier.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        match self {
+            Self::OpenaiImages { model, .. } => model,
+        }
+    }
+
+    /// Environment variable containing the model credential.
+    #[must_use]
+    pub fn api_key_env(&self) -> &str {
+        match self {
+            Self::OpenaiImages { api_key_env, .. } => api_key_env,
+        }
+    }
+
+    /// Whole-request deadline in milliseconds.
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::OpenaiImages { timeout_ms, .. } => *timeout_ms,
         }
     }
 }
@@ -449,6 +529,9 @@ pub struct RouteConfig {
     /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
+    /// Explicitly enables the named image generator for this route.
+    #[serde(default)]
+    pub image_generator: Option<String>,
     #[serde(default)]
     pub limits: RouteLimits,
     /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
@@ -497,6 +580,8 @@ pub struct ResolvedRoute {
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
+    /// Named image generator, already proved to exist.
+    pub image_generator: Option<String>,
     pub limits: RouteLimits,
     pub conversation: ConversationPolicy,
 }
@@ -581,6 +666,7 @@ pub struct ResolvedConfig {
     pub broker: ResolvedBroker,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    pub image_generators: Vec<ImageGeneratorConfig>,
     pub routes: Vec<ResolvedRoute>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
@@ -790,6 +876,49 @@ pub(crate) fn resolve(
                     endpoint: Some(endpoint),
                 }
             }
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => {
+                validate_env_name(&app_secret_env)?;
+                validate_env_name(&verify_token_env)?;
+                validate_env_name(&access_token_env)?;
+                if !canonical_positive_decimal(&waba_id)
+                    || !canonical_positive_decimal(&phone_number_id)
+                {
+                    return Err(ConfigError::InvalidWhatsappScope { name });
+                }
+                if bind.port() == 0 {
+                    return Err(ConfigError::InvalidWhatsappBind { name });
+                }
+                if !valid_whatsapp_callback_path(&callback_path) {
+                    return Err(ConfigError::InvalidWhatsappCallback { name });
+                }
+                if !valid_graph_version(&graph_api_version) {
+                    return Err(ConfigError::InvalidWhatsappGraphVersion { name });
+                }
+                let graph_endpoint = validate_endpoint(graph_endpoint, WHATSAPP_GRAPH_ENDPOINT)?;
+                TransportConfig::WhatsappCloudApi {
+                    name,
+                    app_secret_env,
+                    verify_token_env,
+                    access_token_env,
+                    bind,
+                    callback_path,
+                    waba_id,
+                    phone_number_id,
+                    graph_api_version,
+                    graph_endpoint: Some(graph_endpoint),
+                }
+            }
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
@@ -833,6 +962,24 @@ pub(crate) fn resolve(
         }
     }
 
+    let mut image_generator_names = BTreeSet::new();
+    for generator in &config.image_generators {
+        let name = generator.name().to_owned();
+        if name.trim().is_empty() {
+            return Err(ConfigError::UnnamedImageGenerator);
+        }
+        if !image_generator_names.insert(name.clone()) {
+            return Err(ConfigError::DuplicateImageGenerator { name });
+        }
+        if generator.model().trim().is_empty() {
+            return Err(ConfigError::UnnamedImageModel { name });
+        }
+        if generator.timeout_ms() == 0 {
+            return Err(ConfigError::InvalidImageGeneratorTimeout { name });
+        }
+        validate_env_name(generator.api_key_env())?;
+    }
+
     let mut routes = Vec::with_capacity(config.routes.len());
     for route in config.routes {
         if !transport_names.contains(&route.transport) {
@@ -845,6 +992,25 @@ pub(crate) fn resolve(
         {
             return Err(ConfigError::UnknownRouteModel {
                 model: model.clone(),
+            });
+        }
+        if let Some(generator) = &route.image_generator
+            && !image_generator_names.contains(generator)
+        {
+            return Err(ConfigError::UnknownRouteImageGenerator {
+                generator: generator.clone(),
+            });
+        }
+        // A generated image on a text-only transport would be paid for, then dropped on the way
+        // out. Refusing the pair at startup is the only place that failure is legible.
+        if route.image_generator.is_some()
+            && transports.iter().any(|transport| {
+                transport.name() == route.transport
+                    && matches!(transport, TransportConfig::WhatsappCloudApi { .. })
+            })
+        {
+            return Err(ConfigError::UnsupportedRouteImageGenerator {
+                transport: route.transport.clone(),
             });
         }
         if route.limits.max_steps == 0 || route.limits.max_capability_calls == 0 {
@@ -881,6 +1047,7 @@ pub(crate) fn resolve(
             r#match: route.r#match,
             agent: route.agent,
             model: route.model,
+            image_generator: route.image_generator,
             limits: route.limits,
             conversation,
         });
@@ -944,6 +1111,7 @@ pub(crate) fn resolve(
         broker,
         transports,
         models: config.models,
+        image_generators: config.image_generators,
         routes,
         sessions: config.sessions,
         shutdown_grace,
@@ -997,6 +1165,41 @@ fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<Strin
     })
 }
 
+fn canonical_positive_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_whatsapp_callback_path(value: &str) -> bool {
+    value.len() <= 256
+        && value.starts_with('/')
+        && !value.ends_with('/')
+        && value.split('/').skip(1).all(|segment| {
+            !segment.is_empty()
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+        })
+}
+
+fn valid_graph_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix('v') else {
+        return false;
+    };
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    minor == "0"
+        && !major.is_empty()
+        && major.len() <= 3
+        && !major.starts_with('0')
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn is_loopback_authority(authority: &str) -> bool {
     // Anything before `@` is userinfo and anything after `/` is a path; neither is the host the
     // socket would connect to, and both are how a remote authority disguises itself as loopback.
@@ -1012,10 +1215,7 @@ fn is_loopback_authority(authority: &str) -> bool {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host),
     };
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "::1")
 }
 
 /// Strict configuration failure.
@@ -1063,14 +1263,34 @@ pub enum ConfigError {
     DuplicateModel { name: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
+    #[error("every image generator must have a name")]
+    UnnamedImageGenerator,
+    #[error("image generator name {name:?} is declared more than once")]
+    DuplicateImageGenerator { name: String },
+    #[error("image generator {name:?} must name a model")]
+    UnnamedImageModel { name: String },
+    #[error("image generator {name:?} must have a timeout greater than zero")]
+    InvalidImageGeneratorTimeout { name: String },
     #[error(
         "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
     )]
     InvalidSlackActivity { name: String },
+    #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
+    InvalidWhatsappBind { name: String },
+    #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
+    InvalidWhatsappScope { name: String },
+    #[error("WhatsApp transport {name:?} has an invalid callback path")]
+    InvalidWhatsappCallback { name: String },
+    #[error("WhatsApp transport {name:?} must pin a Graph API version such as v23.0")]
+    InvalidWhatsappGraphVersion { name: String },
     #[error("route names unknown transport {transport:?}")]
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
     UnknownRouteModel { model: String },
+    #[error("route names unknown image generator {generator:?}")]
+    UnknownRouteImageGenerator { generator: String },
+    #[error("transport {transport:?} is text-only and cannot deliver a generated image")]
+    UnsupportedRouteImageGenerator { transport: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
