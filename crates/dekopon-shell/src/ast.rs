@@ -58,15 +58,15 @@ pub struct Pipeline {
     pub negated: bool,
 }
 
-/// One command: optional assignment prefixes, argv words, and an optional buffer redirect.
+/// One command: optional assignment prefixes, argv words, and its redirections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleCommand {
     /// `NAME=value` prefixes. With no argv words these are plain assignments.
     pub assignments: Vec<Assignment>,
     /// Command word followed by arguments.
     pub words: Vec<Word>,
-    /// `>` or `>>` into a named in-memory buffer.
-    pub redirect: Option<Redirect>,
+    /// Redirections in source order, applied left to right the way bash applies them.
+    pub redirects: Vec<Redirect>,
     /// `<<DELIM` body, supplying this command's input in place of anything piped into it.
     pub here_doc: Option<Word>,
 }
@@ -80,16 +80,66 @@ pub struct Assignment {
     pub value: Word,
 }
 
-/// A write into the named in-memory buffer store.
+/// One of the two streams a command writes to.
 ///
-/// These are not files. The buffer store lives for exactly one script execution and is unreachable
-/// from any real path; `cat <name>` is the only reader.
+/// A command produces a *value* on stdout and *text* on stderr. That split already governed how
+/// this interpreter behaved — a command substitution captures the value and lets diagnostics
+/// through to the terminal, exactly as a real shell does — and these are the names a script uses to
+/// address the two halves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stream {
+    /// The value channel, written by `>`, `1>`, and read by `$( )`.
+    Stdout,
+    /// The diagnostic channel, written by `2>`.
+    Stderr,
+    /// Both at once, written by `&>`. Never a duplication *target*.
+    Both,
+}
+
+impl Stream {
+    /// Renders the descriptor prefix a script would have typed.
+    #[must_use]
+    pub const fn descriptor(self) -> &'static str {
+        match self {
+            Self::Stdout => "1",
+            Self::Stderr => "2",
+            Self::Both => "&",
+        }
+    }
+}
+
+/// Where a redirected stream goes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RedirectTarget {
+    /// A named in-memory buffer.
+    ///
+    /// These are not files. The buffer store lives for exactly one script execution and is
+    /// unreachable from any real path; `cat <name>` is the only reader. The one reserved name is
+    /// [`DEV_NULL`], which discards.
+    Buffer {
+        /// `true` for `>>` and `2>>`, `false` for `>` and `2>`.
+        append: bool,
+        /// Buffer name word.
+        target: Word,
+    },
+    /// The other stream, as in `2>&1` and `>&2`. Never [`Stream::Both`].
+    Stream(Stream),
+}
+
+/// The one buffer name that discards everything written to it.
+///
+/// There is no filesystem here, so this is a reserved name rather than a path. It exists because it
+/// is the one target a model will reach for to silence a command, and refusing the spelling every
+/// shell shares would be worse than admitting it.
+pub const DEV_NULL: &str = "/dev/null";
+
+/// One redirection: which stream, and where it goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Redirect {
-    /// `true` for `>>`, `false` for `>`.
-    pub append: bool,
-    /// Buffer name word.
-    pub target: Word,
+    /// The stream being redirected.
+    pub source: Stream,
+    /// Its destination.
+    pub target: RedirectTarget,
 }
 
 /// `if`/`elif`/`else`.
