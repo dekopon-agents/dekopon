@@ -115,6 +115,9 @@ untrusted text that triggered it:
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
 | `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word and a stable `error.kind`, recorded when a provider's own rewrite fails rather than declines |
+| `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller still sees plain `policy-denied` |
+| `broker.leg.connected` | `dekopon-run` | the broker socket tier, the session trace identifier, and the granted-capability count — never the socket path |
+| `guest.invocation.summary` | `dekopon-run` | provider and capability ids with iteration count and total/mean durations for a `--repeat` run, replacing one record per iteration |
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
@@ -242,9 +245,7 @@ attested context was derived.
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call".
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content.
+The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content. `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's `capabilitiesForChat` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
 
@@ -343,13 +344,10 @@ that a key and a canonical subject never share a record.
 
 | Span | Crate | Fields |
 |---|---|---|
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`); `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one |
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
 | `provider.resolve_command` | `dekopon-broker-host` | provider, `word` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
-| `provider.compile` | `dekopon-broker-host` | none; emitted once per provider at startup |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
