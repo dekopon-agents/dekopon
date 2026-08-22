@@ -13,6 +13,7 @@
 //!     // Ordinary callers cannot use a struct literal to cross the authority boundary.
 //!     let _forged = AuthorizedInvocation {
 //!         proposal,
+//!         provider: todo!(),
 //!         receipt: todo!(),
 //!         constraints,
 //!     };
@@ -204,6 +205,52 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Exact component storage interface selected for one capability.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageInterface {
+    /// Curated invocation-transactional JSONL operations.
+    Jsonl,
+    /// Engine-neutral positional durable-file operations.
+    DurableFiles,
+}
+
+/// Storage mutation authority selected for one capability.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageAccess {
+    /// Reads only; every mutating host call is terminally denied.
+    ReadOnly,
+    /// Reads and invocation-transactional writes.
+    ReadWrite,
+}
+
+/// Broker-owned logical namespace class.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageNamespace {
+    /// Owner-private chat memory, scoped from trusted chat attestation.
+    Chat,
+}
+
+/// Exact namespace-bound storage authority attached to one capability.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StorageConstraints {
+    /// The only storage interface this invocation may call.
+    pub interface: StorageInterface,
+    /// Whether mutation is permitted.
+    pub access: StorageAccess,
+    /// Broker-owned namespace class; guests never supply namespace material.
+    pub namespace: StorageNamespace,
+}
+
 /// Broker-enforced execution limits attached to an authorization.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -215,6 +262,9 @@ pub struct ExecutionConstraints {
     /// Optional buffered HTTP grant. Its absence permits no HTTP host calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpConstraints>,
+    /// Optional exact storage grant. HTTP and storage cannot coexist in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageConstraints>,
 }
 
 impl Default for ExecutionConstraints {
@@ -223,6 +273,7 @@ impl Default for ExecutionConstraints {
             timeout_ms: 30_000,
             max_output_bytes: 1_048_576,
             http: None,
+            storage: None,
         }
     }
 }
@@ -264,8 +315,8 @@ impl AuthorizationReceipt {
 /// Private fields prevent accidental conversion from an untrusted proposal. The selected provider
 /// is bound alongside the proposal and constraints. The value is not cloneable or deserializable:
 /// the broker-owned execution boundary creates and consumes it once. It is serializable as
-/// inert data for future broker-owned audit and evidence recording, but its serialized form
-/// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
+/// inert data for broker-owned audit and evidence recording, but its serialized form is not a
+/// transferable bearer grant and intentionally cannot be deserialized.
 #[derive(Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
@@ -388,6 +439,9 @@ pub enum AuthorizationError {
     /// HTTP was granted without positive call and byte limits.
     #[error("HTTP authorization limits must be greater than zero")]
     ZeroHttpLimit,
+    /// HTTP and storage authority were combined in one v1 capability.
+    #[error("HTTP and storage authority cannot coexist in one capability")]
+    MixedHttpAndStorage,
 }
 
 /// Broker-only authority transition.
@@ -446,6 +500,9 @@ pub mod broker {
             }
             if constraints.max_output_bytes == 0 {
                 return Err(AuthorizationError::ZeroOutputLimit);
+            }
+            if constraints.http.is_some() && constraints.storage.is_some() {
+                return Err(AuthorizationError::MixedHttpAndStorage);
             }
             if let Some(http) = &constraints.http {
                 if http.allowed_hosts.is_empty() {

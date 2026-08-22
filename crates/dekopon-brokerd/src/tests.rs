@@ -5,7 +5,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
 
-use super::{config, current_uid, socket};
+use super::{config, current_uid, server, socket};
 
 /// The attested workflow policy: `cpetersen` may drive `chat-agent` and reach `echo.echo`, but
 /// only through the gateway that vouched for them.
@@ -208,6 +208,39 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
         assert!(
             matches!(error, config::ConfigError::Attestor { .. }),
             "namespaces {namespaces} produced {error}"
+        );
+    }
+
+    for scope in [
+        json!({
+            "breadth": "exactConversation", "kind": "slack", "transport": "slack",
+            "channel": "c0123abc", "conversation": "c0123abc:01712345678.1"
+        }),
+        json!({
+            "breadth": "exactChannel", "kind": "discord", "transport": "discord",
+            "channel": "00123"
+        }),
+        json!({
+            "breadth": "exactConversation", "kind": "telegram", "transport": "telegram",
+            "channel": "-1001", "conversation": "-1001:topic:00"
+        }),
+        json!({
+            "breadth": "transportWide", "kind": "local", "transport": "dev"
+        }),
+        json!({
+            "breadth": "exactChannel", "kind": "slack", "transport": "slack",
+            "channel": format!("c{}", "x".repeat(256))
+        }),
+    ] {
+        let mut invalid = document.clone();
+        invalid["identities"][1]["attestor"]["chatScopes"] = json!([scope.clone()]);
+        write_config(&path, &invalid);
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("noncanonical exact chat scope must fail at startup");
+        assert!(
+            matches!(error, config::ConfigError::Attestor { .. }),
+            "scope {scope} produced {error}"
         );
     }
 }
@@ -629,5 +662,211 @@ async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
     assert!(
         matches!(error, config::ConfigError::TooManyProviders { .. }),
         "{error:?}"
+    );
+}
+
+#[test]
+fn generic_durable_storage_outer_spans_have_no_identity_or_capability_fields() {
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        let span = server::storage_invocation_span(
+            &"generic-durable-sentinel".parse().expect("invocation"),
+            &"generic-durable-trace".parse().expect("trace"),
+        );
+        let fields = span
+            .metadata()
+            .expect("storage span metadata")
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["invocation", "trace"]);
+        for forbidden in ["capability", "provider", "subject", "agent"] {
+            assert!(!fields.contains(&forbidden));
+        }
+    });
+}
+
+#[tokio::test]
+async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
+
+    let mut document = attested_document(uid);
+    document["socketPath"] = json!("provider-storage/broker.sock");
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::StorageStateCollision)
+    ));
+
+    write_owner_only(
+        &directory.path().join("provider-storage/inside.wasm"),
+        b"component fixture",
+    );
+    let mut document = attested_document(uid);
+    document["providers"] = json!(["provider-storage/inside.wasm"]);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::StorageStateCollision)
+    ));
+}
+
+#[tokio::test]
+async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    let actual = directory.path().join("actual-storage-parent");
+    fs::create_dir(&actual).expect("actual parent");
+    fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).expect("parent mode");
+    std::os::unix::fs::symlink(&actual, directory.path().join("storage-parent"))
+        .expect("ancestor symlink");
+
+    let mut document = attested_document(uid);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        (
+            "rootPath".to_owned(),
+            json!("storage-parent/provider-storage"),
+        ),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidStorage)
+    ));
+    assert!(!actual.join("provider-storage").exists());
+}
+
+#[tokio::test]
+async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
+    fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
+
+    let mut document = attested_document(uid);
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("storage object").extend([
+        ("rootPath".to_owned(), json!("provider-storage")),
+        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
+    ]);
+    document["storage"] = storage;
+    document["chatMemory"] = serde_json::to_value(dekopon_broker::ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        enabled_agents: vec!["reviewer".parse().expect("agent")],
+        max_lookback_turns: 200,
+        max_recent_turns: 20,
+        max_search_results: 20,
+        max_query_bytes: 256,
+        max_result_bytes: 65_536,
+        max_turn_bytes: 32_768,
+        max_dedup_records: 16_000,
+        max_dedup_bytes: 4_194_304,
+        compaction_target_bytes: 8_388_608,
+        compaction_threshold_bytes: 12_582_912,
+    })
+    .expect("memory config serializes");
+    let host = dekopon_broker_host::BrokerHostLimits::default();
+    document["hostLimits"] = json!({
+        "maxMemoryBytes": host.max_memory_bytes,
+        "maxTableElements": host.max_table_elements,
+        "maxInstances": host.max_instances,
+        "maxTables": host.max_tables,
+        "maxMemories": host.max_memories,
+        "maxInputBytes": host.max_input_bytes,
+        "maxOutputBytes": host.max_output_bytes,
+        "maxHttpRequests": host.max_http_requests,
+        "maxHttpRequestBytes": host.max_http_request_bytes,
+        "maxHttpResponseBytes": host.max_http_response_bytes,
+        "maxHttpHeaders": host.max_http_headers,
+        "maxHttpHeaderBytes": host.max_http_header_bytes,
+        "fuel": host.fuel,
+        "maxTimeoutMs": u64::try_from(host.max_timeout.as_millis()).expect("timeout")
+    });
+    write_config(&path, &document);
+    config::load(&path, uid)
+        .await
+        .expect("documented defaults compose before component loading");
+
+    document["hostLimits"]["fuel"] = json!(10_000_000);
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidChatMemory)
+    ));
+}
+
+#[test]
+fn storage_section_is_optional_all_or_nothing_and_strict() {
+    let uid = current_uid();
+    let mut document = attested_document(uid);
+    assert!(serde_json::from_value::<config::BrokerdConfig>(document.clone()).is_ok());
+
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    let object = storage.as_object_mut().expect("limits object");
+    object.insert(
+        "rootPath".to_owned(),
+        json!("/var/lib/dekopon-provider-storage"),
+    );
+    object.insert(
+        "namespaceKeyPath".to_owned(),
+        json!("/etc/dekopon-storage-key/storage-key.yaml"),
+    );
+    document["storage"] = storage.clone();
+    let decoded = serde_json::from_value::<config::BrokerdConfig>(document.clone())
+        .expect("complete strict storage section decodes");
+    assert_eq!(
+        decoded.storage.expect("storage").limits.max_root_bytes,
+        2 * 1024 * 1024 * 1024
+    );
+
+    document["storage"]
+        .as_object_mut()
+        .expect("storage object")
+        .remove("maxRootBytes");
+    assert!(
+        serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
+        "presence requires every storage field"
     );
 }

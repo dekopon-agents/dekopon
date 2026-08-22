@@ -29,6 +29,10 @@ broker:
             principal: dekopond-gateway
           attestor:
             namespaces: [slack.t0123abcd]
+            chatScopes:
+              - breadth: transportWide
+                kind: slack
+                transport: workspace-slack
       identityMappings:
         - subject: slack.t0123abcd.u0123abcd
           principal: maintainer

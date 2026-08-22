@@ -110,7 +110,8 @@ impl ActivityLease {
         }
     }
 
-    /// Queues service-specific cleanup after the durable reply without holding session admission.
+    /// Queues service-specific cleanup after terminal delivery or deliberate silence without
+    /// holding session admission.
     pub(crate) fn finish_in_background(&mut self) {
         if let Some(coordination) = self.coordination.take() {
             coordination.finish();

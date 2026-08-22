@@ -4,7 +4,7 @@ This document records the implemented privileged host, local Unix broker, creden
 
 ## Current foundation
 
-The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. The broker host compiles components once, creates fresh bounded stores, links only the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata.
+The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust guest facade, SDK support for caller-generated provider worlds, the statically linked `dekopon-http-host` native engine, and the async `dekopon-broker-host` component adapter are current. The checked-in HTTP probe proves both direct-host rejection and constrained broker-host execution against ephemeral loopback servers. For HTTP operations, the broker host compiles components once, creates fresh bounded stores, links the project-owned HTTP import, consumes `AuthorizedInvocation`, applies exact HTTP constraints, and emits sanitized call metadata. This tree additionally links the independent project-owned storage package only under the exact grant described below.
 
 `dekopon-broker` now binds a separately supplied authenticated context, asks a `dekopon-policy` Cedar engine whether it may act, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
@@ -71,12 +71,27 @@ The protocol exposes only the operations needed by a broker client:
 - submit one invocation proposal;
 - inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
 - submit one proposal attested on behalf of an external subject (`invokeFor`);
+- rewrite one provider-declared shell command word into a capability proposal (`resolveCommand`);
+- use invocation-bound chat operations (`capabilitiesForChat`, `resolveCommandForChat`, and
+  `invokeForChat`) only under a matching owner-authored `chatScopes` grant;
+- submit hidden post-acceptance recording only through `recordDeliveredTurnForChat` — never generic
+  invocation;
 - let a mapped attestor publish a bounded informational catalog inventory and model-token delta for the process-local web UI; and
 - receive a denied, succeeded, or failed result with bounded public evidence metadata.
 
 The informational operations are deliberately outside the authority flow. Their payloads contain no prompt, subject, principal, instruction, credential, policy, constraint, or authorization; they grant nothing, produce no provider effect, and are absent from durable authorization audit. A gateway can misreport dashboard state and cannot use that state to influence a decision.
 
 `AuthorizedInvocation` is never accepted from or returned to the client. It is created and consumed inside the broker process.
+
+### `resolveCommand` is deliberately ungated
+
+`resolveCommand` is the one operation that is **not** gated on the caller's grants, and the only one that runs guest code on request without an authorization decision first. A provider may declare command words in its manifest — `memory`, `gh` — so a model can write `memory recent --last 5` instead of assembling a capability input by hand. The broker selects the declaring provider by the word, calls that component's `resolve-command` export with the remaining arguments, and returns what it produces.
+
+The reasoning is that the export is a **pure rewrite** and what it returns is a *proposal*. It runs inside the declaring component with no imports, bounded by the same fuel and timeout as any other guest call, and the proposal it produces is authorized on exactly the path a directly written capability call takes: constraint-set lookup, Cedar evaluation, credential injection at the native HTTP boundary. Gating the rewrite would add a principal check to a function that grants nothing. A caller who rewrites a word for a capability they may not use receives a denial one step later, having learned nothing they could not learn by naming the capability directly — and the word list a session is shown is already filtered by policy, so an ungranted principal is not handed the vocabulary in the first place.
+
+Everything that is not a rewrite collapses into one opaque answer. A word no loaded provider declares, a guest that traps or reaches for a host import, and a resolution the broker cannot decode all return the stable `provider-error` code with a fixed message; the guest's own failure text is provider-controlled and never reaches a caller through this path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases apart from the audit stream that a caller deliberately cannot. A provider that simply *declines* the arguments is not a failure at all: that is a usage error, and the provider's own message travels back for the model to read.
+
+Reserved words are unreachable through this path regardless of the provider that declares them: the broker refuses `memory` and any word belonging to the trusted memory provider, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. `resolveCommandForChat` is the chat-scoped twin, which *is* bound to an attested claim.
 
 ### Attested on-behalf-of operations
 
@@ -88,6 +103,19 @@ The two refusals differ in kind. A refused attestation on `invokeFor` is a norma
 
 The `operation` tag is the compatibility seam for this addition. Requests are strict-decoded, so a broker built before these operations existed rejects an unknown tag as a clean `invalid-request` rather than misreading it as an operation it does know. A client can therefore probe for attestation support without risking a misinterpreted proposal.
 
+### Version and compatibility
+
+**Status: current.** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha1`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
+
+**`dekopond`, `dekopon-run`, and `dekopon-brokerd` must be upgraded together.** They are separately installable — Homebrew, crates.io, release archives, the container image, and the chart with its own `image.tag` — so a mixed set is a normal deployment mistake rather than a hypothetical one, and the alpha protocol has no compatibility promise across releases. 0.5.0 changed it for policy-filtered command words and command resolution and required exactly this lockstep. The chart and the container image ship all four executables from one release for the same reason.
+
+A mismatch fails in two different directions, and only one of them is loud:
+
+- **A newer client against an older broker** is refused per operation. Operations added later are unknown `operation` tags, which strict decoding rejects as `invalid-request` rather than misreading as an operation the broker does know. That is the seam working as designed, and it is why a client can probe for a feature safely.
+- **An older client against a newer broker** fails on the response instead. Response variants are `deny_unknown_fields`, so a field added to a response an old client already understands — `commandWords` on `Capabilities`, for instance — makes that response undecodable. Additive-looking changes are therefore breaking in this direction, which is the half a rolling upgrade is most likely to produce.
+
+Restart order follows from the gateway's startup probe rather than from the protocol: `dekopond` asks the broker for capabilities once before connecting any transport and exits non-zero if the broker does not answer. Start the broker first and stop it last. [`upgrading.md`](upgrading.md) records the per-release steps.
+
 ### Failure codes
 
 A failure response carries a stable code and a bounded message. The code is the contract; the message is human-facing and may change. Codes are exported as constants from `dekopon-broker-protocol` so clients need not hardcode strings.
@@ -97,7 +125,9 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
+| `provider-error` | A `resolveCommand` rewrite did not produce a resolution: no loaded provider declares the word, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word or its arguments; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
+| `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. | Yes under a fresh identifier after correcting or reconciling the storage condition. |
 
 `outcome-unaudited` is the durable-state signal that separates "nothing happened" from "something may have happened and nothing recorded it". It is emitted only for failures raised after execution began — a failed terminal audit append, or a failure to hash terminal evidence. A denied or failed *invocation* is not a failure response at all: it returns a normal result carrying its outcome and decision linkage.
 
@@ -191,11 +221,25 @@ and subject mappings name, and the providers and capabilities its loaded manifes
 policy set is validated against it in Cedar's strict mode. An unknown action, unknown entity type,
 or ill-typed expression refuses startup.
 
-Cedar's validator checks types, not instances, so the engine separately proves every entity literal
-against that world: `principal == Dekopon::Principal::"typo"` is well typed and would simply never
-match, and refusing it at startup is what the exact engine's reachability check used to buy.
-Templates are refused, source is capped at 1 MiB and 1024 policies, and empty policy text is valid
-and permits nothing.
+Cedar's validator checks types, not instances, so the engine separately classifies every *principal*,
+*provider*, and *action* literal against that world: `principal == Dekopon::Principal::"typo"` is
+well typed and would simply never match, and catching it at startup is what the exact engine's
+reachability check used to buy. An undeclared principal is always fatal; an undeclared provider or
+capability is fatal only under `strict: true`, and is otherwise reported and registered as a
+schema-only phantom, because it names a provider the deployment has not dropped in yet rather than a
+typo. Templates are refused, source is capped at 1 MiB and 1024 policies, and empty policy text is
+valid and permits nothing.
+
+**Agents are the deliberate exception, and it is the one place a typo survives startup.** The agent
+catalog belongs to `dekopond`, not to the broker, so the broker declares the `Dekopon::Agent` type
+and matches instances by UID without enumerating them. `resource == Dekopon::Agent::"revewer"`
+therefore validates, starts cleanly, and then matches nothing — every session that agent should have
+been permitted is denied `agent-denied` at runtime, which is exactly the latent-dead-policy failure
+mode the entity-literal check exists to prevent, in the one place the check does not apply. The
+gateway's own configuration is the check that remains: a route naming an agent the catalog does not
+contain is a `dekopond` startup failure. Cross-read the two files when a grant is written, and see
+the Cedar name table in
+[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#policy).
 
 ### Decisions
 
@@ -220,6 +264,27 @@ The credential's *name* is deliberately in that list and its value is deliberate
 The bounded in-memory implementation hash-links events for tests. `FileAuditLog` persists exclusively writer-locked owner-only bounded JSONL, verifies the complete existing chain before append, synchronizes every decision/outcome, rejects partial writes, reconstructs replay IDs on restart, and can verify an exact count/head prefix. `dekopon-brokerd` maintains that count/head in a separate strict owner-only checkpoint under its own writer lock. It writes audit first, then synchronizes and atomically replaces the checkpoint; startup fails if a non-empty audit has no checkpoint or the checkpoint is not an exact verified prefix. A valid checkpoint exactly one record behind the audit is the recoverable crash window and is advanced before listening; a larger gap fails closed.
 
 This detects valid-prefix truncation relative to the retained checkpoint and makes the head available to an external verifier. It is local integrity evidence, not tamper-proof storage against a compromised broker host: coordinated rollback or deletion of both files requires independent checkpoint retention to detect. Durable remote anchoring, key-backed signatures, tenancy, and incident-response machinery remain separate work.
+
+## Storage is a sibling privileged host interface
+
+**Status: current in this tree, unreleased.** `dekopon:storage@0.1.0` is independent of HTTP.
+Constraint sets select exactly `jsonl` or `durable-files`, read-only or read-write, and chat
+namespace; combining HTTP and storage is refused. The broker derives every opaque namespace from
+the authorized context, consumes a host-instance/invocation/capability/provider-bound grant, and
+commits only a valid `Succeeded` response. Stable public classes are `storage-quota`,
+`storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io`, and
+`outcome-unaudited`. The trusted memory provider additionally allowlists only
+`memory-corrupt`, `result-too-large`, `dedup-conflict`, and `dedup-capacity`; arbitrary provider
+messages remain `provider-failure`.
+
+Chat scope is not inferred from subject authority. The claim includes configured transport ID,
+transport kind, canonical channel, and canonical conversation; owner configuration grants explicit
+breadth and Cedar sees those four trusted optional context fields. Each swapped/malformed/overbound
+field denies before namespace creation.
+
+The gateway receipt proves complete transport acceptance (service acceptance for Slack, Telegram,
+and Discord; kernel acceptance for local), not human receipt. One dedicated record request follows,
+with no automatic retry after response loss or outcome-unknown.
 
 ## Version and implementation policy
 

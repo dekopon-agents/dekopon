@@ -282,15 +282,37 @@ A Kubernetes `Secret` mounted as a volume is not a directory of files. It is a s
 
 That third row is the one that catches people: `fsGroup` is the standard fix for "the container cannot read its mounted Secret", it makes the file group-readable, and group-readable is exactly what the credentials file refuses. The fix for the general problem is the cause of the specific one.
 
-**So no Kubernetes volume can present a file either daemon will read.** The answer is an init container that copies each projected file into a real owner-only regular file — an `install -m 0600` per file, owner-only directories, and a `stat` assertion afterwards — with the projected volume visible only to that init container and never to the daemons. The chart-side implementation of exactly that lives in the `feat/helm-chart` work ([#71](https://github.com/dekopon-agents/dekopon/pull/71)), which also carries the measured evidence behind the table above; it is not merged, so nothing in this repository ships it today.
+**So no Kubernetes volume can present a file either daemon will read.** The answer is an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards — with the projected source visible only to that init container and never to the daemons. The current [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential. ESO can create the source Secret; the chart still owns the separate file-hygiene step.
 
 **ESO solves provisioning, not file hygiene.** Adopting it removes the question of how a secret gets into the cluster and leaves the question of how it becomes a file entirely untouched.
+
+### The provider-storage namespace key is retained authority
+
+Optional provider storage adds a second non-rotating file with stricter lifecycle consequences:
+
+```yaml
+apiVersion: dekopon.dev/storage-key/v1alpha1
+key: <64 lowercase hex>
+```
+
+The chart requires an **existing operator-managed Secret** and never templates one. Its init
+container copies that projected key into a separate broker-only `0700` tmpfs directory as one
+server-owned `0600`, single-link regular file. The gateway mounts neither that directory nor the
+separate provider-storage PVC. The generated PVC carries `helm.sh/resource-policy: keep`, and the
+key Secret is external to the release, so uninstall deletes neither half by accident.
+
+Losing or replacing the key while retained data exists is fatal: opaque physical names,
+authority-generation pointers, manifests, audit scope, record IDs, and content commitments all use
+distinct HMAC domains under it. It is not an encryption key and Dekopon makes no encryption-at-rest
+claim. Store it as retained recovery authority, not as a routinely rotated application token.
+ESO can provision the Kubernetes Secret, but the same symlink/ownership argument above still
+requires the chart's broker-only copy step.
 
 ### The ChatGPT credential is a different problem again
 
 One credential does not fit the pattern at all. The `chatgptSubscription` model kind's credential file holds a refresh token that **rotates**: each refresh invalidates its predecessor and the replacement is written back through a same-directory temporary file and an atomic rename. That needs a writable *directory*, not a writable file, and it means a read-only projected Secret breaks at the first refresh and presents an already-invalidated token on the next restart.
 
-The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. That work — a `dekopon auth chatgpt export` command and the document describing the lifecycle — is on the `feat/auth-export` branch ([#72](https://github.com/dekopon-agents/dekopon/pull/72)) and is not merged. Treat it as the authority on that credential rather than reasoning about it from this document.
+The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopon auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
 
 ## Related documents
 

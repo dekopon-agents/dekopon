@@ -1,0 +1,9 @@
+package dekopon:provider-storage-bindings@0.1.0;
+
+world jsonl-client {
+    import dekopon:storage/jsonl@0.1.0;
+}
+
+world durable-files-client {
+    import dekopon:storage/durable-files@0.1.0;
+}

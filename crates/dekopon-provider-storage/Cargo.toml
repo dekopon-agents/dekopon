@@ -1,0 +1,25 @@
+[package]
+name = "dekopon-provider-storage"
+description = "Rust guest bindings for Dekopon's namespace-bound provider storage interfaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-storage"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "storage", "sdk"]
+categories = ["wasm", "api-bindings"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[features]
+default = []
+jsonl = ["dep:wit-bindgen"]
+durable-files = ["dep:wit-bindgen"]
+
+[dependencies]
+wit-bindgen = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "dekopon-memory-chat-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dekopon-provider-sdk = { path = "../../../crates/dekopon-provider-sdk" }
+dekopon-provider-storage = { path = "../../../crates/dekopon-provider-storage", default-features = false, features = ["jsonl"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }

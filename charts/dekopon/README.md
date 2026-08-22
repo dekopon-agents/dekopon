@@ -3,13 +3,19 @@
 A Helm chart that runs `dekopon-brokerd` and `dekopond` as one pod on a single-node arm64 k3s
 cluster.
 
-**Status: current, but unapplied and unpublished.** Every claim below about rendered YAML, file
-ownership, and file modes was verified locally. Nothing in this chart has been installed on a
-cluster; no released container image exists for it to pull yet, and no chart has been pushed to
-GHCR — see [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+**Status: published, but never applied to a cluster.** Those are two separate claims and only one of
+them limits you.
 
-The chart is published to GHCR over OCI on `dekopon-chart-*` tags and is consumed from ArgoCD by
-registry path, not by Git path. Both GHCR packages are public.
+*Published* is settled. `dekopon-chart-0.1.0` shipped the chart to
+`oci://ghcr.io/dekopon-agents/charts/dekopon:0.1.0`, and application tags from `v0.4.0` onward
+publish the container image it pulls, so `helm install` from the registry has everything it needs.
+The chart is consumed from ArgoCD by registry path, not by Git path, and both GHCR packages are
+public. See [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+
+*Never applied* is the real caveat. Every claim below about rendered YAML, file ownership, and file
+modes was verified against `helm template` and the CI render checks, not against a running cluster.
+Nothing here has been installed on a live Kubernetes API server, so treat the manifests as reviewed
+rather than as field-proven.
 
 Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/dekopon/blob/main/crates/dekopon-brokerd/README.md) and
 [`docs/dekopond.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/dekopond.md) first. The chart places files and sets
@@ -18,8 +24,9 @@ is the only description of what goes in them.
 
 ## What it deploys
 
-One `Deployment`, `replicas: 1`, `strategy: Recreate`, no `Service` and no `Ingress` — neither
-daemon serves HTTP or binds a TCP port, so there is nothing to expose.
+One `Deployment`, `replicas: 1`, `strategy: Recreate`, and no chart-owned `Ingress`. An opt-in
+ClusterIP `Service` exposes only a configured gateway webhook port for operator-owned exact-path
+routing; it is disabled by default. The broker never receives a TCP surface.
 
 | Container | Kind | Runs |
 |---|---|---|
@@ -91,7 +98,7 @@ failure naming that file rather than a broker that starts and then refuses to se
 
 ### What does not need any of this
 
-- **Chat-service and model credentials.** `dekopond.yaml` names environment variable *names*, never values,
+- **Chat-service, chat-model, and optional image-model credentials.** `dekopond.yaml` names environment variable *names*, never values,
   so those are ordinary `secretKeyRef` entries under `gateway.env` with no file hygiene at all.
 - **`OTEL_EXPORTER_OTLP_HEADERS`.** The broker's `telemetry` block has no credential field by
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters
@@ -150,13 +157,13 @@ appends **no audit record**, so probing does not consume the audit log's bounded
   socket only after that work is done, so "the socket answers" is exactly "fully started". The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
   against durable audit state is the worst thing this chart can produce.
-- **`readinessProbe`**, 30 s period. It gates nothing — there is no Service — but it is free and it
-  is the difference between `kubectl get pod` saying `1/1` and saying something true.
-- **No `livenessProbe`.** Nothing routes traffic here, so a restart fixes nothing a human would not
-  fix better, and it would kill a broker mid-invocation.
-- **No gateway probes.** `dekopond` binds nothing and already probes the broker once at startup,
-  exiting non-zero when it does not answer. "Is it healthy" and "is the process running" are the
-  same question.
+- **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
+  webhook Service is enabled, prevents traffic while the broker is unavailable.
+- **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
+  on the configured webhook port. It fails closed when `dekopond.yaml` binds loopback, names a
+  different port, or does not configure an inbound listener.
+- **No `livenessProbe`.** An automatic restart could kill a broker mid-invocation or lose an
+  acknowledged in-memory webhook delivery. Process failure and readiness already remain visible.
 
 One consequence worth knowing: the probe runs `dekopon-run`, which reads
 `OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
@@ -379,9 +386,10 @@ The published coordinates are:
 oci://ghcr.io/dekopon-agents/charts/dekopon
 ```
 
-**Nothing has been published yet.** Like the container image, this path is unproven until the first
-`dekopon-chart-*` tag exists. The packaging half is proven — CI packages the chart on every run and
-diffs the archive's rendered output against the source tree's — but no push to GHCR has happened.
+Chart `0.1.0` is published there. The packaging half is checked on every CI run, which packages the
+chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.1.0`
+tag ran the push. What remains unproven is the *pull*: no cluster has installed the published chart,
+so a first install should be treated as the first exercise of this path.
 
 ### Both GHCR packages are public, and that is a manual step
 
@@ -475,8 +483,12 @@ Use `existingSecret` for credentials. An inline value is stored in the release, 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, or `constraintSets` with no corresponding value supplied;
-or `paths.catalogDir` is inside `paths.configDir`. Every one of those is a mistake whose only other
-symptom is a pod that starts and never becomes ready.
+or `paths.catalogDir` is inside `paths.configDir`. When provider storage is enabled, its root and
+key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with
+every chart-owned mount (`config`, runtime, audit state, catalog, `/tmp`, and both projected
+configuration/key sources); a nested mount would otherwise shadow or destructively replace those
+files. Every one of
+those is a mistake whose only other symptom is a pod that starts and never becomes ready.
 
 The chart's default `broker.config.inline` is the echo example from the broker's own README, moved
 onto these paths: a real deny-by-default configuration that starts, loads the baked
@@ -484,6 +496,12 @@ onto these paths: a real deny-by-default configuration that starts, loads the ba
 there so you can install the chart and watch a broker become ready before you give it anything that
 matters. Replace it. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
 model endpoint, and an agent catalog, and the chart can invent none of them.
+
+`gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
+The chart intentionally does not create an Ingress: the operator must route only the configured
+callback path and terminate public TLS outside the pod. A Kubernetes Service cannot reach loopback,
+so the corresponding transport must bind `0.0.0.0:<gateway.service.port>`. The TCP readiness probe
+keeps the Service endpoint unavailable when the configuration and chart port disagree.
 
 ## Install
 
@@ -520,13 +538,15 @@ own volume. It may post one review comment and has no approval, request-changes,
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout, but no
   `kubectl apply` has happened.
-- No image exists to pull yet. The daemons have never been started from this configuration.
-- **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
-  `chart-publish.yml` has never run and nothing exists at
-  `oci://ghcr.io/dekopon-agents/charts/dekopon`. What *is* proven is packaging: CI packages the
-  chart, lints the archive, and diffs the archive's rendered output against the source tree's for
-  both value sets, so the tarball that would be pushed is known to be complete and to render
-  identically.
+- The daemons have never been started from this configuration. The images exist — application tags
+  from `v0.4.0` onward publish `ghcr.io/dekopon-agents/dekopon:v<VERSION>` — but no pod has run one
+  from these manifests.
+- **The pull path is unproven.** `dekopon-chart-0.1.0` ran `chart-publish.yml` and chart `0.1.0`
+  exists at `oci://ghcr.io/dekopon-agents/charts/dekopon`, and packaging is checked continuously:
+  CI packages the chart, lints the archive, and diffs the archive's rendered output against the
+  source tree's for both value sets, so the pushed tarball is known to be complete and to render
+  identically. What has not happened is an anonymous `helm pull` or an ArgoCD sync against that
+  registry path.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a
   separate rpi-homelab change.
@@ -538,3 +558,30 @@ own volume. It may post one review comment and has no approval, request-changes,
   a live refresh against OpenAI.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
+
+## Optional provider-storage claim and namespace key
+
+`providerStorage.enabled` creates (or mounts) a claim physically separate from `state`, mounted only
+into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
+`helm.sh/resource-policy: keep`; an existing claim remains operator-owned. Rendering fails when the
+resolved audit and provider-storage claim names are equal.
+
+The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
+operator-managed, so uninstall cannot delete the key for retained data. The init container alone
+mounts its projected symlink farm, copies the selected key into a separate broker-only tmpfs
+`0700` directory as one `0600`, UID-65532, single-link regular file, and verifies it. The gateway
+mounts neither key tmpfs nor provider-storage PVC. Every chart mount path must be a canonical
+absolute sequence of safe non-dot segments (no repeated slash). Storage root/key paths must not
+overlap each other, another chart mount, projected init sources, or baked image paths including
+`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`; key source/destination names must be
+non-dot path segments. Invalid combinations fail during `helm template` before a volume can shadow
+configuration, packaged providers, or init-script text. The `storage-probe` and malicious
+`memory-reservation-probe` fixtures are not present in the image; `memory-chat-provider.wasm` is
+baked only under `/opt/dekopon/optional-providers`, outside
+the default scan.
+
+The key is HMAC namespace/recovery authority, not encryption-at-rest. Losing or rotating it with
+retained data makes startup fail. The provider-storage filesystem must support retained
+directory-descriptor-relative no-follow opens, advisory locks, same-directory rename, and
+file/directory sync. A stuck native syscall may exceed
+the configured shutdown grace, and malicious same-UID filesystem mutation is outside the claim.

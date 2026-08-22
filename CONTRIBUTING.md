@@ -36,12 +36,12 @@ cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
-Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—each affected checked-in provider component. Runner OTLP, OpenObserve example, or observability CI changes require `examples/otel-traces/smoke-test.sh` against its disposable single-container stack. Exact commands are in [`docs/development.md`](docs/development.md).
+Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—each affected checked-in provider component. Storage work must additionally compare all five `wit/storage/storage.wit` mirrors and inspect generated imports: memory is JSONL-only, the probe is durable-files-only, and neither may import WASI. Runner OTLP, OpenObserve example, or observability CI changes require `examples/otel-traces/smoke-test.sh` against its disposable single-container stack. Exact commands are in [`docs/development.md`](docs/development.md).
 
 ## Change guidelines
 
 - Open an issue or draft pull request before a large architectural change.
-- Keep model proposals, broker authorization, and effect execution distinct in APIs and documentation.
+- Keep model proposals, broker authorization, storage grants, and effect execution distinct in APIs and documentation.
 - Do not commit credentials, real private endpoints, generated coverage data, or local configuration.
 - Reject unknown authored fields unless a documented compatibility need overrides that default.
 - Treat model tool arguments and provider responses as untrusted; providers validate their capability-specific input.

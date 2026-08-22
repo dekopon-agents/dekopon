@@ -234,6 +234,10 @@ impl PolicyWorld {
                 "via": { "type": "String", "required": false },
                 "subject": { "type": "String", "required": false },
                 "agent": { "type": "String", "required": false },
+                "transportKind": { "type": "String", "required": false },
+                "transport": { "type": "String", "required": false },
+                "channel": { "type": "String", "required": false },
+                "conversation": { "type": "String", "required": false },
                 "effect": { "type": "String" },
                 "risk": { "type": "String" },
                 "idempotency": { "type": "String" },
@@ -245,6 +249,10 @@ impl PolicyWorld {
                 "via": { "type": "String", "required": false },
                 "subject": { "type": "String", "required": false },
                 "agent": { "type": "String", "required": false },
+                "transportKind": { "type": "String", "required": false },
+                "transport": { "type": "String", "required": false },
+                "channel": { "type": "String", "required": false },
+                "conversation": { "type": "String", "required": false },
             }
         });
 
@@ -343,6 +351,14 @@ pub struct PolicyContext {
     pub subject: Option<String>,
     /// The agent identity of an agent actor.
     pub agent: Option<String>,
+    /// Chat transport family, absent for legacy operations.
+    pub transport_kind: Option<String>,
+    /// Owner-configured transport identifier, absent for legacy operations.
+    pub transport: Option<String>,
+    /// Canonical service channel, absent for legacy operations.
+    pub channel: Option<String>,
+    /// Canonical service conversation, absent for legacy operations.
+    pub conversation: Option<String>,
 }
 
 /// One authorization question.
@@ -651,6 +667,10 @@ impl PolicyEngine {
             ("via", request.context.via.as_ref()),
             ("subject", request.context.subject.as_ref()),
             ("agent", request.context.agent.as_ref()),
+            ("transportKind", request.context.transport_kind.as_ref()),
+            ("transport", request.context.transport.as_ref()),
+            ("channel", request.context.channel.as_ref()),
+            ("conversation", request.context.conversation.as_ref()),
         ] {
             if let Some(value) = value {
                 pairs.push((
@@ -714,15 +734,6 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
     ))
 }
 
-/// Proves every entity a policy names is one the world declares.
-///
-/// Cedar's validator checks types, not instances: `principal == Dekopon::Principal::"typo"` is
-/// perfectly well typed and simply never matches. That is exactly the failure mode the old exact
-/// engine caught with its reachability check, so it is caught here instead — a policy naming an
-/// undeclared principal or provider refuses startup rather than becoming latent dead policy.
-///
-/// Agents are the deliberate exception: the agent catalog belongs to the gateway, so the broker
-/// declares the type and matches instances by UID without enumerating them.
 /// Classifies every policy's entity literals against the declared world.
 ///
 /// Returns the capabilities the policy set references, plus every provider-derived name the world
@@ -736,6 +747,10 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, ()> {
 /// - **Actions and providers** are derived from loaded provider manifests. An undeclared one means
 ///   that provider is not loaded, which is a legitimate state for a deployment whose policy
 ///   anticipates it. Under [`Handling::Tolerate`] it is reported and registered as a phantom.
+///
+/// **Agents are checked by neither class.** The agent catalog belongs to the gateway, so the broker
+/// declares the type and matches instances by UID without enumerating them: `Dekopon::Agent::"typo"`
+/// validates, starts cleanly, and then matches nothing, denying every session `agent-denied`.
 ///
 /// An entity type outside the Dekopon namespace is a grammar error, not an absence, and is fatal
 /// in both modes.

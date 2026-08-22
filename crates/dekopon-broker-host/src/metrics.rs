@@ -7,6 +7,7 @@ use std::{
 };
 
 use dekopon_http_host::HttpCallEvidence;
+use dekopon_storage_host::StorageEvidence;
 use wasmtime::{Error, ResourceLimiter, StoreLimits};
 
 use crate::BrokerHostLimits;
@@ -86,6 +87,18 @@ pub struct BrokerHostStats {
     pub http_request_bytes: u64,
     /// HTTP response bytes accounted by the native host.
     pub http_response_bytes: u64,
+    /// Storage-backed invocations that produced content-free evidence.
+    pub storage_invocations: u64,
+    /// Aggregate storage host-call count.
+    pub storage_operations: u64,
+    /// Aggregate requested durability barriers.
+    pub storage_syncs: u64,
+    /// Aggregate quota denials.
+    pub storage_quota_denials: u64,
+    /// Largest observed powers-of-two read bucket (never exact bytes).
+    pub storage_read_bucket_max: u64,
+    /// Largest observed powers-of-two write bucket (never exact bytes).
+    pub storage_write_bucket_max: u64,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +133,12 @@ struct MetricsInner {
     http_requests: AtomicU64,
     http_request_bytes: AtomicU64,
     http_response_bytes: AtomicU64,
+    storage_invocations: AtomicU64,
+    storage_operations: AtomicU64,
+    storage_syncs: AtomicU64,
+    storage_quota_denials: AtomicU64,
+    storage_read_bucket_max: AtomicU64,
+    storage_write_bucket_max: AtomicU64,
 }
 
 impl BrokerHostMetrics {
@@ -166,6 +185,12 @@ impl BrokerHostMetrics {
             http_requests: load(&self.inner.http_requests),
             http_request_bytes: load(&self.inner.http_request_bytes),
             http_response_bytes: load(&self.inner.http_response_bytes),
+            storage_invocations: load(&self.inner.storage_invocations),
+            storage_operations: load(&self.inner.storage_operations),
+            storage_syncs: load(&self.inner.storage_syncs),
+            storage_quota_denials: load(&self.inner.storage_quota_denials),
+            storage_read_bucket_max: load(&self.inner.storage_read_bucket_max),
+            storage_write_bucket_max: load(&self.inner.storage_write_bucket_max),
         }
     }
 
@@ -227,6 +252,7 @@ impl BrokerHostMetrics {
         timed_out: bool,
         output_bytes: usize,
         http_calls: &[HttpCallEvidence],
+        storage: Option<&StorageEvidence>,
     ) {
         if succeeded {
             increment(&self.inner.invocations_succeeded);
@@ -247,6 +273,20 @@ impl BrokerHostMetrics {
         for call in http_calls {
             add(&self.inner.http_request_bytes, call.request_bytes);
             add(&self.inner.http_response_bytes, call.response_bytes);
+        }
+        if let Some(storage) = storage {
+            increment(&self.inner.storage_invocations);
+            add(&self.inner.storage_operations, storage.operations);
+            add(&self.inner.storage_syncs, storage.syncs);
+            add(&self.inner.storage_quota_denials, storage.quota_denials);
+            update_max(
+                &self.inner.storage_read_bucket_max,
+                u64::from(storage.read_byte_bucket),
+            );
+            update_max(
+                &self.inner.storage_write_bucket_max,
+                u64::from(storage.write_byte_bucket),
+            );
         }
     }
 
