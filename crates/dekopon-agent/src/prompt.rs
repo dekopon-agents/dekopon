@@ -1449,7 +1449,8 @@ The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `|
 — the compound ones all usable as \
 pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
 because nothing here forks — `break`/`continue`, functions \
-with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, `${#NAME}`, \
+with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, \
+`${#NAME}`, \
 `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, \
 `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
