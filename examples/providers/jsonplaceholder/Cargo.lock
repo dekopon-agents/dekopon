@@ -16,7 +16,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "dekopon-capability"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -45,14 +45,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-http"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",

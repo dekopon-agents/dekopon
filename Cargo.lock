@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-agent"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-broker-host",
  "dekopon-broker-protocol",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-brokerd"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "dekopon-broker",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-core",
  "schemars 1.2.2",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-http-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-policy"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "cedar-policy",
  "dekopon-capability",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1023,14 +1023,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-http"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "wit-bindgen 0.44.0",
 ]
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1041,14 +1041,14 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-storage"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "wit-bindgen 0.44.0",
 ]
 
 [[package]]
 name = "dekopon-run"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "dekopon-agent",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-shell"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-storage-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-telemetry"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-webui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "dekopon-broker-host",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "dekopond"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.23.1",

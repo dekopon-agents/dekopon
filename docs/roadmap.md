@@ -90,7 +90,9 @@ Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or e
 
 Version 0.9.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds only the transport credentials it already needed, derives every activity target from authenticated envelopes, and treats every status failure as cosmetic.
 
-## Unreleased — text-only Meta WhatsApp Cloud API transport
+## 0.10 — WhatsApp transport, image replies, provider storage, and a review hardening pass (released)
+
+Shipped as one release in two threads. The transport:
 
 - Strict environment-name-only app-secret, verification-token, and access-token configuration with
   explicit bind/callback, WABA, receiving phone-number, and Graph API version.
@@ -107,7 +109,7 @@ policy, authorization path, or effect authority. Media, templates, interactivity
 processing, business management, embedded signup, webhook multiplexing, and TLS termination remain
 out of scope.
 
-## Unreleased — generated image replies, provider storage, and durable on-demand chat memory
+### Generated image replies, provider storage, and durable on-demand chat memory
 
 - Explicit route-scoped OpenAI Images generators: one bounded prompt/attempt/PNG per session,
   native Slack/Discord/Telegram uploads, and a byte-free local/text-history/durable-memory contract.
@@ -124,6 +126,13 @@ out of scope.
   component path outside the default scan.
 - Pinned Turso 0.7.2 gate failed on forbidden JS/C/build paths and wasm compilation, so SQLite did
   not ship. Durable-files remains engine-neutral and makes no WAL/SHM claim.
+
+Version 0.10.0 adds one bounded inbound listener — the WhatsApp webhook, HMAC-authenticated
+before parsing and behind external TLS — and broker-owned provider storage behind explicit storage
+grants. Identity mapping and effect authorization remain solely the broker's, and the gateway holds
+only transport credentials. The same release lands a 145-finding deep-review hardening pass:
+diagnosable failure causes end to end, single-pass authorization and audit serialization on the hot
+path, and three recurring failure classes promoted to deny-by-default clippy lints.
 
 ## Next milestones
 
