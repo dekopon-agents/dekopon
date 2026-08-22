@@ -24,7 +24,7 @@ use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        DEV_NULL, ForLoop, IfStatement, Index, Modifier, Parameter, Pipeline, Program, Redirect,
+        Command, DEV_NULL, ForLoop, IfStatement, Index, Modifier, Parameter, Pipeline, Program, Redirect,
         Pattern, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
@@ -128,12 +128,6 @@ impl StderrCapture {
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
-    /// The value piped into the call, offered to the first command of each pipeline in the body.
-    ///
-    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
-    /// be deep-copied once per statement — including for the statements that never read input —
-    /// and all but the last copy dropped. See [`own`].
-    stdin: Option<Rc<Value>>,
 }
 
 /// Parses and evaluates one script, returning its outcome.
@@ -167,6 +161,7 @@ pub(crate) fn run(
         function_names: BTreeSet::new(),
         buffers: BTreeMap::new(),
         captures: Vec::new(),
+        stdin: Vec::new(),
         stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
         allow_clock: limits.allow_clock,
@@ -217,6 +212,17 @@ struct Evaluator<'a> {
     function_names: BTreeSet<String>,
     buffers: BTreeMap<String, Value>,
     captures: Vec<Vec<CommandResult>>,
+    /// The value piped into the enclosing call or compound stage, innermost last.
+    ///
+    /// Separate from [`Frame`] because the two nest differently: a shell function opens a variable
+    /// scope *and* receives input, while a compound pipeline stage receives input and deliberately
+    /// does not open a scope — `cmd | while read x; do total=$x; done` has to leave `total` set,
+    /// which is the opposite of bash's subshell and the whole reason the idiom is worth having.
+    ///
+    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
+    /// be deep-copied once per statement — including for the statements that never read input —
+    /// and all but the last copy dropped. See [`own`].
+    stdin: Vec<Option<Rc<Value>>>,
     /// Diagnostic capture stack, one frame per command whose stderr is redirected.
     ///
     /// A stack rather than a field because a redirection nests: a shell function called as
@@ -413,6 +419,9 @@ impl Evaluator<'_> {
             Statement::For(statement) => self.execute_for(statement),
             Statement::While(statement) => self.execute_while(statement),
             Statement::Case(statement) => self.execute_case(statement),
+            // A group runs its statements in the current scope; it exists to make several of them
+            // one command, not to open a subshell this evaluator does not have.
+            Statement::Group(body) => self.execute_program(body),
             Statement::Function(definition) => {
                 self.function_names.insert(definition.name.clone());
                 self.functions
@@ -618,7 +627,7 @@ impl Evaluator<'_> {
         // each pipeline in the body. It is shared rather than consumed: consuming it would let a
         // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
         // before `cat` could see it, which is the same class of silent data loss as dropping it.
-        let mut input: Option<Rc<Value>> = self.frames.last().and_then(|frame| frame.stdin.clone());
+        let mut input: Option<Rc<Value>> = self.stdin.last().cloned().flatten();
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
 
@@ -654,7 +663,106 @@ impl Evaluator<'_> {
     // Commands
     // -----------------------------------------------------------------------
 
+    /// Runs one pipeline stage.
     fn execute_command(
+        &mut self,
+        command: &Command,
+        input: Option<Rc<Value>>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
+        match command {
+            Command::Simple(command) => self.execute_simple_command(command, input, capture_output),
+            Command::Compound {
+                statement,
+                redirects,
+            } => self.execute_compound_command(statement, redirects, input, capture_output),
+        }
+    }
+
+    /// Runs a compound statement as one pipeline stage.
+    ///
+    /// The stage's emissions are collected into one value whenever anything downstream will read
+    /// them — a later pipe, a redirection, an enclosing `$( )`. Each statement inside emits
+    /// separately, so without that `{ echo a; echo b; } | wc -l` would hand `wc` only the last one.
+    fn execute_compound_command(
+        &mut self,
+        statement: &Statement,
+        redirects: &[Redirect],
+        input: Option<Rc<Value>>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
+        let (stdout, stderr) = match self.resolve_redirects(redirects) {
+            Ok(sinks) => sinks,
+            Err(failure) => {
+                let status = self.absorb(failure)?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
+        };
+        let collect = capture_output || stdout != Sink::Value;
+
+        let capturing = stderr != Sink::Diagnostics;
+        if capturing {
+            self.stderr_capture.push(StderrCapture::new(&self.limits));
+        }
+        self.stdin.push(input);
+        if collect {
+            self.captures.push(Vec::new());
+        }
+
+        let flow = self.execute_statement(statement);
+
+        let captured = if collect {
+            self.captures.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.stdin.pop();
+        let mut diagnostics = capturing
+            .then(|| self.stderr_capture.pop())
+            .flatten()
+            .map(StderrCapture::finish)
+            .unwrap_or_default();
+
+        let flow = flow?;
+        let value = if collect {
+            reduce_captured(captured)
+        } else {
+            Value::Null
+        };
+        let status = match flow {
+            Flow::Normal => self.last_status,
+            _ => {
+                self.route_diagnostics(diagnostics, &stderr)?;
+                return Ok(Executed::Flow(flow));
+            }
+        };
+
+        let mut result = CommandResult { value, status, suppress_newline: false };
+        if stderr == Sink::Value {
+            result.value = merge_diagnostics(result.value, diagnostics);
+            diagnostics = Vec::new();
+        }
+        self.open_buffers(&[&stdout, &stderr]);
+        self.route_diagnostics(diagnostics, &stderr)?;
+
+        match stdout {
+            Sink::Value => Ok(Executed::Result(result)),
+            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
+            Sink::Diagnostics => {
+                if !result.value.is_null() {
+                    let text = display(&result.value);
+                    self.write_line(&text);
+                }
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+            Sink::Buffer { name, .. } => {
+                self.append_buffer(&name, result.value)?;
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+        }
+    }
+
+    fn execute_simple_command(
         &mut self,
         command: &SimpleCommand,
         input: Option<Rc<Value>>,
@@ -1251,8 +1359,8 @@ impl Evaluator<'_> {
         self.frames.push(Frame {
             locals: BTreeMap::new(),
             positional,
-            stdin: input,
         });
+        self.stdin.push(input);
         if capture_output {
             self.captures.push(Vec::new());
         }
@@ -1263,6 +1371,7 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
+        self.stdin.pop();
         self.frames.pop();
         self.budget.leave_call();
 

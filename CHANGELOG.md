@@ -9,6 +9,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Made compound commands — `if`, `for`, `while`, `until`, `case`, and the newly accepted `{ ...; }`
+  group — usable as pipeline stages, so `cmd | while read-shaped loop` and
+  `cmd || { echo failed; exit 1; }` parse, and a compound stage carries its own redirections. A
+  piped compound runs in the current scope rather than a subshell, so a `while` loop feeding off a
+  pipe keeps the variables it assigns; bash discards them with the subshell, which is the single
+  most notorious trap in the language. A stage feeding a pipe or a redirection has its emissions
+  collected into one value, the same collection a command substitution already performed.
+
 - Gave the sandboxed shell real parameter expansion: `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`,
   `${NAME:+w}` and their colon-free forms, `${#NAME}`, `${NAME[@]}`/`${NAME[*]}`, and the literal
   `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`. Two answer differently than bash because values are real
