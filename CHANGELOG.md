@@ -186,6 +186,21 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Direct `dekopon-run` provider loads now report every duplicate provider, duplicate capability, and
+  command-word conflict in one failure instead of stopping at the first, and refuse the same
+  command-word conflicts `dekopon-brokerd` refuses at startup.
+- Immediate-mode `provider.invoke` spans now carry input/output byte counts and remaining fuel, and
+  a deadline, output-ceiling, or component failure emits a `WARN` naming the wall it hit.
+- One long-lived deadline worker per runtime now arms each direct provider call instead of a thread
+  spawned and joined per describe and invoke.
+- A direct provider call that completes at its deadline boundary now returns its output; only a
+  failed call is reported as a timeout, and it keeps the Wasmtime error as the timeout's source.
+
+### Security
+
+- Direct `dekopon-run` provider stores now bound table elements, tables, linear memories, and core
+  instances as well as linear-memory size, closing a `table.grow` path that could allocate far past
+  `--max-memory-bytes`.
 - Script traces now open one `shell.script` span per run carrying the whole run's command totals,
   and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
   one span per step.

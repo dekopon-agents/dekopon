@@ -481,6 +481,13 @@ One generated OpenTelemetry trace links the command to spans such as:
 - `prompt.script` and `shell.command`; and
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
 
+The runner's own `provider.invoke` — `dekopon-provider-host`, not the broker host — carries provider,
+capability, component path, `input.bytes`, `output.bytes`, and `fuel.remaining`. Counts and fuel
+only; the payloads themselves are governed by the span-payload opt-in below. A call that dies rather
+than returning also emits a `WARN` naming which wall it hit — the wall-clock deadline, the output
+ceiling and its configured bound, or a trap inside the component — because the runner's shell seam
+flattens errors to their message and would otherwise leave nothing in telemetry saying why.
+
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation.
 
 Inside it, the interpreter opens one `shell.script` span per run, and inside *that*, `shell.command` is one span per command word the script actually ran, in execution order — a builtin, a capability call, a shell function, a word this shell refuses, or a word that resolved to nothing. A trace therefore reads as the ordered list of commands a script executed rather than as one opaque entry, and the reading survives constructs where one script word drives several executions: `xargs` mapping a command over ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is already named in this file's trace and log filters, so they flow to every configured sink with no further wiring. Each command span carries:
