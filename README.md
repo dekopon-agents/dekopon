@@ -78,7 +78,9 @@ New in 0.5.0 — chat that can see what you sent it. One documented invariant wa
 ## What does not work yet
 
 Automatic memory replay, semantic/vector memory, cross-agent sharing, task memory, deletion/export UX,
-SQLite, and encryption-at-rest claims do not exist. Optional durable chat turns carry across broker
+and encryption-at-rest claims do not exist. SQL is available to providers as an optional component
+maintained [outside this tree](https://github.com/dekopon-agents/dekopon-provider-turso-sql), and is
+not used by any shipped memory path. Optional durable chat turns carry across broker
 and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope and
 are retrieved on demand with `memory recent` or `memory search`. JSONL deduplication is permanent
 but finite; recording stops with `dedup-capacity` while reads continue. `dekopond` also runs under
