@@ -826,6 +826,116 @@ fn bash_array_emulation_is_rejected_in_favor_of_json() {
     assert!(outcome.output.contains("JSON array"), "{}", outcome.output);
 }
 
+// ---------------------------------------------------------------------------
+// The two streams
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_redirected_stderr_leaves_the_combined_output() {
+    // The diagnostic is real — the exit code proves the command failed — but the script asked for
+    // it to go somewhere else, and it went there.
+    let outcome = run("nosuchcmd.here 2>/dev/null\necho done");
+    assert_eq!(outcome.output, "done");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+
+    assert_eq!(code("nosuchcmd.here 2>/dev/null"), 127);
+}
+
+#[test]
+fn stderr_redirects_into_a_named_buffer_that_cat_reads_back() {
+    let outcome = run("nosuchcmd.here 2> log\necho ---\ncat log");
+    assert!(!outcome.output.starts_with("dekopon-shell:"), "{outcome:?}");
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert!(after.contains("command not found"), "{after:?}");
+}
+
+#[test]
+fn a_value_sent_to_stderr_escapes_a_command_substitution() {
+    // `echo oops >&2` is how a script reports a problem without polluting what it returns. The
+    // line still reaches the reader; it just stops being the substitution's value.
+    let outcome = run(r#"x=$(echo oops >&2; echo kept)
+echo "[$x]""#);
+    assert!(outcome.output.contains("oops"), "{outcome:?}");
+    assert!(outcome.output.contains("[kept]"), "{outcome:?}");
+}
+
+#[test]
+fn two_to_one_merges_diagnostics_into_the_value_a_substitution_captures() {
+    // The idiom this exists for: capture *why* something failed, not just that it did.
+    let outcome = run(r#"x=$(nosuchcmd.here 2>&1)
+echo "[$x]""#);
+    assert!(
+        outcome.output.contains("command not found]"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn two_to_one_leaves_a_quiet_command_s_value_and_its_type_alone() {
+    // Merging is what a *diagnostic* forces; with none there is nothing to merge, and an object
+    // must not be flattened into its own JSON text just because `2>&1` was written.
+    assert_eq!(output("echo hi 2>&1"), "hi");
+    assert_eq!(
+        output("echo.echo --a 1 2>&1 | jq -r .a"),
+        "1",
+        "a quiet capability keeps its object"
+    );
+}
+
+#[test]
+fn both_streams_can_land_in_one_buffer() {
+    let outcome = run("nosuchcmd.here > out 2>&1\ncat out");
+    assert!(outcome.output.contains("command not found"), "{outcome:?}");
+
+    let outcome = run("echo hi &> all\ncat all");
+    assert_eq!(outcome.output, "hi");
+}
+
+#[test]
+fn dev_null_discards_on_write_and_reads_empty() {
+    assert_eq!(output("echo hi > /dev/null\necho after"), "after");
+    assert_eq!(output("cat /dev/null"), "");
+    // And it needs no prior write, unlike every other buffer name.
+    assert!(output("cat nosuchbuffer").contains("no such buffer"));
+}
+
+#[test]
+fn a_redirection_covers_the_whole_body_of_the_function_it_is_written_on() {
+    let outcome = run(
+        "noisy() { nosuchcmd.one; nosuchcmd.two; echo value; }\nnoisy 2> log\necho ---\ncat log | wc -l",
+    );
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert_eq!(after.trim(), "2", "both diagnostics were collected");
+}
+
+#[test]
+fn a_fatal_diagnostic_is_never_swallowed_by_a_redirection() {
+    // The script is ending and the capture is about to be abandoned. If `2>` could eat this line,
+    // a model would see an empty result with no explanation at all.
+    let outcome = run_with(
+        "loop() { loop; }\nloop 2>/dev/null",
+        Limits {
+            max_recursion_depth: 4,
+            ..Limits::default()
+        },
+    );
+    assert!(outcome.output.contains("nested deeper"), "{outcome:?}");
+}
+
+#[test]
+fn a_redirection_target_still_has_to_be_one_word() {
+    // An unquoted expansion holding a JSON array is what produces several words here; there is no
+    // IFS to split a string on.
+    let outcome = run("x=$(echo.echo --a one --b two | jq '[.a,.b]')\necho hi > $x");
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
+    assert!(
+        outcome.output.contains("exactly one buffer name"),
+        "{outcome:?}"
+    );
+}
+
 #[test]
 fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
     // Each of these used to succeed quietly, or fail while naming the wrong feature. The message
@@ -834,10 +944,9 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
         // Backticks: the second-most-common substitution form in real bash.
         ("echo `echo hi`", "backtick command substitution"),
         ("x=`date`", "backtick command substitution"),
-        // Numbered descriptors: this shell has one combined stream.
-        ("echo hi 2>/dev/null", "file-descriptor redirection"),
-        ("echo hi >&2", "file-descriptor redirection"),
-        ("echo hi 2>&1", "file-descriptor redirection"),
+        // Descriptors beyond the two streams that exist.
+        ("echo hi 3>/dev/null", "only descriptors 1"),
+        ("cat 0< buf", "input duplication"),
         // Shell options: `set -e` changing nothing while looking like it had is the exact
         // failure this design forbids.
         ("set -euo pipefail\necho after", "no shell options"),

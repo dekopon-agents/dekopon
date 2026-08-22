@@ -1448,9 +1448,10 @@ The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `|
 `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
 with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
-`>`/`>>` into named in-memory buffers all behave the way you expect. Everything outside that \
-curated set fails loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `2>&1`, \
-`<<<`, and `&` backgrounding are errors, never silent no-ops. If a script ran, it did what it said.
+redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
+named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
+loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `<<<`, and `&` backgrounding \
+are errors, never silent no-ops. If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
@@ -1461,7 +1462,10 @@ environment variables, and no network reachable except through a capability.
 `posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \"includeBody\": true}`. A repeated \
 flag becomes an array, and a single bare `{...}` argument is used as the input verbatim.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
-in to work on it.
+in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
+`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you capture \
+the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a quiet \
+command leaves its value, and its type, untouched.
 4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
 tripping one ends the script with a message naming it.
 

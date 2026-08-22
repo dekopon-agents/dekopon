@@ -12,6 +12,8 @@ use std::{fmt, iter::Peekable, str::CharIndices};
 
 use thiserror::Error;
 
+use crate::ast::Stream;
+
 /// One lexed token with the source line it started on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Token {
@@ -48,10 +50,20 @@ pub enum TokenKind {
     LeftBrace,
     /// `}` used as a reserved word.
     RightBrace,
-    /// `>`.
-    Great,
-    /// `>>`.
-    GreatGreat,
+    /// `>`, `>>`, `1>`, `1>>`, `2>`, `2>>`, `&>`, `&>>` — a stream into a named buffer.
+    Redirect {
+        /// The stream being redirected.
+        source: Stream,
+        /// `true` for the doubled `>>` forms.
+        append: bool,
+    },
+    /// `>&1`, `>&2`, `1>&2`, `2>&1` — one stream cross-wired onto the other.
+    Duplicate {
+        /// The stream being redirected.
+        source: Stream,
+        /// The stream it is redirected onto; never [`Stream::Both`].
+        target: Stream,
+    },
     /// `<`. Kept so the parser can explain that there are no files to read.
     Less,
     /// A `<<DELIM` here-document, with its body already collected off the following lines.
@@ -76,8 +88,22 @@ impl fmt::Display for TokenKind {
             Self::RightParen => ")",
             Self::LeftBrace => "{",
             Self::RightBrace => "}",
-            Self::Great => ">",
-            Self::GreatGreat => ">>",
+            Self::Redirect { source, append } => {
+                return write!(
+                    formatter,
+                    "{}{}",
+                    source.descriptor(),
+                    if *append { ">>" } else { ">" }
+                );
+            }
+            Self::Duplicate { source, target } => {
+                return write!(
+                    formatter,
+                    "{}>&{}",
+                    source.descriptor(),
+                    target.descriptor()
+                );
+            }
             Self::Less => "<",
             Self::LessParen => "<(",
         };
@@ -164,8 +190,20 @@ pub struct LexError {
 /// Why backtick command substitution is refused, in both quoting contexts.
 const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
 
-/// Why file-descriptor redirection is refused.
-const FD_REDIRECTION_REJECTION: &str = "file-descriptor redirection (`2>`, `>&2`, `2>&1`) is not supported: this shell has one combined output stream, not numbered descriptors; `>` and `>>` write named in-memory buffers";
+/// Why descriptors other than 1 and 2 are refused.
+///
+/// There are no numbered descriptors here to open; there are exactly two streams, and naming a
+/// third would be naming something that does not exist.
+const UNKNOWN_DESCRIPTOR_REJECTION: &str = "only descriptors 1 (the value stream) and 2 (the diagnostic stream) exist in this shell; there is nothing else to redirect";
+
+/// Why input duplication is refused.
+const INPUT_DUPLICATION_REJECTION: &str = "input duplication (`<&`) is not supported: there is no input descriptor to duplicate; pipe a value or `cat` a named buffer instead";
+
+/// Why `&>&` is refused.
+const BOTH_DUPLICATION_REJECTION: &str = "`&>&` is not a redirection: `&>` already sends both streams to one buffer, so there is no second stream left to duplicate";
+
+/// Why a duplication must name a stream rather than a buffer.
+const DUPLICATION_TARGET_REJECTION: &str = "a duplication must name a stream: write `>&1` or `>&2`; to write a buffer use `> name`, `2> name`, or `&> name`";
 
 /// Why the here-string `<<<` is refused.
 ///
@@ -932,22 +970,63 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Reads the stream name after a `>&`, having already consumed the `&`.
+    fn read_duplication(&mut self, source: Stream) -> Result<(), LexError> {
+        let target = match self.chars.peek().map(|(_, character)| *character) {
+            Some('1') => Stream::Stdout,
+            Some('2') => Stream::Stderr,
+            _ => return Err(LexError::new(self.line, DUPLICATION_TARGET_REJECTION)),
+        };
+        self.chars.next();
+        // `>&12` would otherwise read as `>&1` followed by the argument `2`, quietly redirecting
+        // somewhere the script did not ask for.
+        if self
+            .chars
+            .peek()
+            .is_some_and(|(_, character)| character.is_ascii_digit())
+        {
+            return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION));
+        }
+        self.push(TokenKind::Duplicate { source, target });
+        Ok(())
+    }
+
     fn read_operator(&mut self, character: char) -> Result<(), LexError> {
-        // `2>`, `2>&1`, and `>&2` all begin as a bare digit word glued to a redirection operator.
-        // Letting the digit finish as an ordinary word would append it to argv and divert the
-        // output into a buffer named `/dev/null`, so the whole shape is rejected by name instead.
-        if matches!(character, '<' | '>')
+        // `2>`, `2>>`, and `2>&1` are a bare descriptor glued to a redirection operator. The digit
+        // belongs to the operator, not to argv: letting it finish as an ordinary word would send
+        // `echo hi 2> log` the argument `2` and redirect its *value* into `log`.
+        let mut source = Stream::Stdout;
+        if character == '>'
             && self.word_started
             && self.parts.is_empty()
             && !self.literal.is_empty()
             && self.literal.chars().all(|digit| digit.is_ascii_digit())
         {
-            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+            source = match self.literal.as_str() {
+                "1" => Stream::Stdout,
+                "2" => Stream::Stderr,
+                _ => return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION)),
+            };
+            // Consumed as the operator's prefix, so it must not also become a word. Clearing the
+            // literal alone would leave `finish_word` pushing an empty word onto argv.
+            self.literal.clear();
+            self.word_started = false;
+        } else if character == '<'
+            && self.word_started
+            && self.parts.is_empty()
+            && !self.literal.is_empty()
+            && self.literal.chars().all(|digit| digit.is_ascii_digit())
+        {
+            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
         }
         self.finish_word();
         let next = self.chars.peek().map(|(_, character)| *character);
-        if matches!((character, next), ('<' | '>', Some('&'))) {
-            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+        if matches!((character, next), ('<', Some('&'))) {
+            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
+        }
+        if character == '>' && next == Some('&') {
+            self.chars.next();
+            return self.read_duplication(source);
         }
         let kind = match (character, next) {
             ('|', Some('|')) => {
@@ -958,6 +1037,22 @@ impl<'a> Lexer<'a> {
             ('&', Some('&')) => {
                 self.chars.next();
                 TokenKind::AndAnd
+            }
+            // `&>` and `&>>` send both streams to one buffer. Checked after `&&` so that a
+            // conjunction is never read as a redirection.
+            ('&', Some('>')) => {
+                self.chars.next();
+                if self.chars.peek().map(|(_, character)| *character) == Some('&') {
+                    return Err(LexError::new(self.line, BOTH_DUPLICATION_REJECTION));
+                }
+                let append = self.chars.peek().map(|(_, character)| *character) == Some('>');
+                if append {
+                    self.chars.next();
+                }
+                TokenKind::Redirect {
+                    source: Stream::Both,
+                    append,
+                }
             }
             ('&', _) => TokenKind::Ampersand,
             (';', Some(';')) => {
@@ -973,9 +1068,15 @@ impl<'a> Lexer<'a> {
             (';', _) => TokenKind::Semicolon,
             ('>', Some('>')) => {
                 self.chars.next();
-                TokenKind::GreatGreat
+                TokenKind::Redirect {
+                    source,
+                    append: true,
+                }
             }
-            ('>', _) => TokenKind::Great,
+            ('>', _) => TokenKind::Redirect {
+                source,
+                append: false,
+            },
             ('<', Some('<')) => {
                 self.chars.next();
                 return self.read_here_doc_header();
@@ -996,7 +1097,7 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawParameter, RawPart, TokenKind, tokenize};
+    use super::{RawParameter, RawPart, Stream, TokenKind, tokenize};
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         tokenize(source)
@@ -1180,16 +1281,69 @@ mod tests {
     }
 
     #[test]
-    fn file_descriptor_redirection_is_rejected_by_name() {
-        for source in ["echo hi 2>buf", "echo hi 2>&1", "echo hi >&2", "cmd 2>>buf"] {
-            let error = tokenize(source).expect_err("fd redirection is dropped");
-            assert!(
-                error.message.contains("file-descriptor redirection"),
-                "{source}: {error}"
-            );
+    fn file_descriptor_redirection_is_tokenized_per_stream() {
+        assert!(kinds("echo hi 2>buf").contains(&TokenKind::Redirect {
+            source: Stream::Stderr,
+            append: false
+        }));
+        assert!(kinds("cmd 2>>buf").contains(&TokenKind::Redirect {
+            source: Stream::Stderr,
+            append: true
+        }));
+        assert!(kinds("cmd 1> buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(kinds("cmd &> buf").contains(&TokenKind::Redirect {
+            source: Stream::Both,
+            append: false
+        }));
+        assert!(kinds("cmd &>> buf").contains(&TokenKind::Redirect {
+            source: Stream::Both,
+            append: true
+        }));
+        assert!(kinds("echo hi 2>&1").contains(&TokenKind::Duplicate {
+            source: Stream::Stderr,
+            target: Stream::Stdout
+        }));
+        assert!(kinds("echo hi >&2").contains(&TokenKind::Duplicate {
+            source: Stream::Stdout,
+            target: Stream::Stderr
+        }));
+
+        // A digit that is a plain argument, separated from the operator, still redirects the value
+        // stream and stays on argv.
+        let separated = kinds("echo 2 > buf");
+        assert!(separated.contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(separated.iter().any(|kind| matches!(
+            kind,
+            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+        )));
+
+        // A glued descriptor is consumed by the operator and must not also reach argv.
+        assert!(!kinds("echo hi 2> buf").iter().any(|kind| matches!(
+            kind,
+            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+        )));
+    }
+
+    #[test]
+    fn descriptors_this_shell_does_not_have_are_rejected_by_name() {
+        for (source, expected) in [
+            ("cmd 3> buf", "only descriptors 1"),
+            ("cmd 2>&3", "must name a stream"),
+            ("cmd >&12", "only descriptors 1"),
+            ("cmd 0< buf", "input duplication"),
+            ("cmd <& 1", "input duplication"),
+            ("cmd &>& buf", "`&>&` is not a redirection"),
+            ("cmd >& buf", "must name a stream"),
+        ] {
+            let error = tokenize(source).expect_err("rejected");
+            assert!(error.message.contains(expected), "{source}: {error}");
         }
-        // A digit that is a plain argument, separated from the operator, still redirects normally.
-        assert!(kinds("echo 2 > buf").contains(&TokenKind::Great));
     }
 
     #[test]
@@ -1364,8 +1518,14 @@ mod tests {
 
     #[test]
     fn redirection_and_backgrounding_operators_are_tokenized_not_dropped() {
-        assert!(kinds("echo hi > buf").contains(&TokenKind::Great));
-        assert!(kinds("echo hi >> buf").contains(&TokenKind::GreatGreat));
+        assert!(kinds("echo hi > buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(kinds("echo hi >> buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: true
+        }));
         assert!(kinds("sleep 1 &").contains(&TokenKind::Ampersand));
         assert!(kinds("cat < f").contains(&TokenKind::Less));
         assert!(kinds("diff <(a) b").contains(&TokenKind::LessParen));

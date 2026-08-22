@@ -24,8 +24,8 @@ use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        ForLoop, IfStatement, Parameter, Pipeline, Program, SimpleCommand, Statement, WhileLoop,
-        Word, WordPart,
+        DEV_NULL, ForLoop, IfStatement, Parameter, Pipeline, Program, Redirect, RedirectTarget,
+        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
     dispatch::{self, Resolution, arguments_to_input},
@@ -52,6 +52,73 @@ enum Flow {
 enum Executed {
     Result(CommandResult),
     Flow(Flow),
+}
+
+/// Where one of a command's two streams ends up.
+///
+/// [`Sink::Value`] and [`Sink::Diagnostics`] are the two defaults, and they are also what a
+/// duplication copies: `2>&1` gives stderr the sink stdout holds, and `>&2` the reverse. They are
+/// destinations in their own right rather than "unredirected", which is what makes
+/// `x=$(cmd 2>&1)` capture the diagnostics the way a real shell does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Sink {
+    /// The value channel: what the command produces, and what `$( )` captures.
+    Value,
+    /// The diagnostic channel: text lines that escape a capture, as a terminal's stderr does.
+    Diagnostics,
+    /// `/dev/null`.
+    Discard,
+    /// A named in-memory buffer.
+    Buffer {
+        /// Buffer name.
+        name: String,
+        /// `true` for the `>>` forms.
+        append: bool,
+    },
+}
+
+/// Diagnostics collected while one command's stderr is redirected.
+///
+/// Bounded by the same output ceilings the combined stream uses. A shell function called as
+/// `f 2> log` can run thousands of commands, so this must not be the one accumulator in the
+/// interpreter without a ceiling.
+#[derive(Debug)]
+struct StderrCapture {
+    lines: Vec<String>,
+    bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            lines: Vec::new(),
+            bytes: 0,
+            max_lines: limits.max_output_lines,
+            max_bytes: limits.max_output_bytes,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += line.len();
+        self.lines.push(line.to_owned());
+    }
+
+    /// Returns the captured lines, with a marker line when any were dropped.
+    fn finish(mut self) -> Vec<String> {
+        if self.truncated {
+            self.lines
+                .push("... redirected diagnostics truncated ...".to_owned());
+        }
+        self.lines
+    }
 }
 
 /// One shell-function activation.
@@ -90,6 +157,7 @@ pub(crate) fn run(
     let mut evaluator = Evaluator {
         invoker,
         budget: Budget::start(limits),
+        limits,
         output: OutputBuffer::new(&limits),
         globals: BTreeMap::new(),
         frames: Vec::new(),
@@ -97,6 +165,7 @@ pub(crate) fn run(
         function_names: BTreeSet::new(),
         buffers: BTreeMap::new(),
         captures: Vec::new(),
+        stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
         allow_clock: limits.allow_clock,
         counters: telemetry::ScriptCounters::default(),
@@ -137,6 +206,8 @@ pub(crate) fn run(
 struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
+    /// The configured bounds, kept for the ceilings a redirected stderr capture reuses.
+    limits: Limits,
     output: OutputBuffer,
     globals: BTreeMap<String, Value>,
     frames: Vec<Frame>,
@@ -144,6 +215,12 @@ struct Evaluator<'a> {
     function_names: BTreeSet<String>,
     buffers: BTreeMap<String, Value>,
     captures: Vec<Vec<CommandResult>>,
+    /// Diagnostic capture stack, one frame per command whose stderr is redirected.
+    ///
+    /// A stack rather than a field because a redirection nests: a shell function called as
+    /// `f 2> log` collects its whole body's diagnostics, while a command *inside* that body with
+    /// its own `2>` collects only its own and then restores the function's.
+    stderr_capture: Vec<StderrCapture>,
     curl_capability: Option<String>,
     /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
     allow_clock: bool,
@@ -182,17 +259,25 @@ impl Evaluator<'_> {
             ),
             FatalError::Unsupported(reason) => format!("dekopon-shell: {reason}"),
         };
-        self.write_line(&message);
+        // Straight to the combined output, never into a redirected stderr capture: the script is
+        // ending, the capture is about to be abandoned unrouted, and `cmd 2> log` must not be able
+        // to swallow the one line explaining why nothing else ran.
+        self.output.push_block(&message);
         telemetry::fatal_exit_code(fatal)
     }
 
-    /// Writes one diagnostic to the combined output.
+    /// Writes one diagnostic to the diagnostic stream.
     ///
     /// Diagnostics escape a `$( )` capture on purpose. Only the *value* of a substitution is being
     /// captured; suppressing its errors too would leave `v=$(nosuchcmd)` with an empty variable, no
     /// explanation, and only a numeric `$?` the script may never inspect. Real shells send command
-    /// substitution stderr to the terminal for exactly this reason.
+    /// substitution stderr to the terminal for exactly this reason. A script that *wants* them
+    /// captured says so with `2>&1`, which is what the capture stack consulted here implements.
     fn write_line(&mut self, line: &str) {
+        if let Some(capture) = self.stderr_capture.last_mut() {
+            capture.push(line);
+            return;
+        }
         self.output.push_block(line);
     }
 
@@ -647,32 +732,153 @@ impl Evaluator<'_> {
             },
         };
 
-        let executed = self.run_argv(&argv, input, capture_output);
-        self.restore_all(restore);
-        let executed = executed?;
-        let Executed::Result(result) = executed else {
-            return Ok(executed);
-        };
-
-        let Some(redirect) = &command.redirect else {
-            return Ok(Executed::Result(result));
-        };
-
-        let target = match self.expand_word(&redirect.target) {
-            Ok(expanded) => expanded,
+        // Redirections are resolved *before* the command runs, the way bash resolves them, because
+        // a redirected stderr has to be in place while the command is producing diagnostics rather
+        // than applied to a value afterwards.
+        let (stdout, stderr) = match self.resolve_redirects(&command.redirects) {
+            Ok(sinks) => sinks,
             Err(failure) => {
+                self.restore_all(restore);
                 let status = self.absorb(failure)?;
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
         };
-        let [name] = target.as_slice() else {
-            self.write_line(
-                "dekopon-shell: a redirection target must expand to exactly one buffer name",
-            );
-            return Ok(Executed::Result(CommandResult::status(ExitCode::SYNTAX)));
+
+        let capturing = stderr != Sink::Diagnostics;
+        if capturing {
+            self.stderr_capture.push(StderrCapture::new(&self.limits));
+        }
+        let executed = self.run_argv(&argv, input, capture_output);
+        // Popped before the `?` below: a fatal error must not leave a capture installed for the
+        // rest of the script, silently swallowing every later diagnostic.
+        let mut diagnostics = capturing
+            .then(|| self.stderr_capture.pop())
+            .flatten()
+            .map(StderrCapture::finish)
+            .unwrap_or_default();
+        self.restore_all(restore);
+        let executed = executed?;
+        let Executed::Result(mut result) = executed else {
+            self.route_diagnostics(diagnostics, &stderr)?;
+            return Ok(executed);
         };
-        self.write_buffer(name, redirect.append, result.value)?;
-        Ok(Executed::Result(CommandResult::status(result.status)))
+
+        if stderr == Sink::Value {
+            result.value = merge_diagnostics(result.value, diagnostics);
+            diagnostics = Vec::new();
+        }
+
+        // Truncation belongs to the redirection, not to each write, exactly as a real shell
+        // truncates once when it opens the file. Without this, `cmd > out 2>&1` would write the
+        // diagnostics and then have the value overwrite them, or the reverse depending on order.
+        self.open_buffers(&[&stdout, &stderr]);
+        self.route_diagnostics(diagnostics, &stderr)?;
+
+        match stdout {
+            Sink::Value => Ok(Executed::Result(result)),
+            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
+            Sink::Diagnostics => {
+                if !result.value.is_null() {
+                    let text = display(&result.value);
+                    self.write_line(&text);
+                }
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+            Sink::Buffer { name, .. } => {
+                self.append_buffer(&name, result.value)?;
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+        }
+    }
+
+    /// Truncates every buffer a non-appending redirection names, once, before anything is written.
+    ///
+    /// A truncated buffer is left holding `null` rather than removed, so `cmd > out` makes `out`
+    /// exist and readable even when the command produced nothing — the way redirecting into a file
+    /// creates an empty one.
+    fn open_buffers(&mut self, sinks: &[&Sink]) {
+        for sink in sinks {
+            if let Sink::Buffer {
+                name,
+                append: false,
+            } = sink
+            {
+                self.buffers.insert(name.clone(), Value::Null);
+            }
+        }
+    }
+
+    /// Resolves a command's redirections into one destination per stream.
+    ///
+    /// Walked left to right so a duplication copies the sink its target holds *at that point*,
+    /// which is how a real shell's `dup2` behaves. The parser refuses the one ordering where that
+    /// distinction is invisible and wrong — a duplication whose target is redirected afterwards.
+    fn resolve_redirects(
+        &mut self,
+        redirects: &[Redirect],
+    ) -> Result<(Sink, Sink), CommandFailure> {
+        let mut stdout = Sink::Value;
+        let mut stderr = Sink::Diagnostics;
+        for redirect in redirects {
+            let sink = match &redirect.target {
+                RedirectTarget::Stream(Stream::Stdout) => stdout.clone(),
+                RedirectTarget::Stream(Stream::Stderr) => stderr.clone(),
+                RedirectTarget::Stream(Stream::Both) => {
+                    unreachable!("the lexer never produces `&` as a duplication target")
+                }
+                RedirectTarget::Buffer { append, target } => {
+                    let expanded = self.expand_word(target)?;
+                    let [name] = expanded.as_slice() else {
+                        return Err(CommandFailure::usage(
+                            "dekopon-shell: a redirection target must expand to exactly one buffer name",
+                        ));
+                    };
+                    if name == DEV_NULL {
+                        Sink::Discard
+                    } else {
+                        Sink::Buffer {
+                            name: name.clone(),
+                            append: *append,
+                        }
+                    }
+                }
+            };
+            match redirect.source {
+                Stream::Stdout => stdout = sink,
+                Stream::Stderr => stderr = sink,
+                Stream::Both => {
+                    stdout = sink.clone();
+                    stderr = sink;
+                }
+            }
+        }
+        Ok((stdout, stderr))
+    }
+
+    /// Sends one command's collected diagnostics to their redirected destination.
+    fn route_diagnostics(
+        &mut self,
+        diagnostics: Vec<String>,
+        sink: &Sink,
+    ) -> Result<(), FatalError> {
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+        match sink {
+            Sink::Discard => {}
+            Sink::Diagnostics | Sink::Value => {
+                // `Value` reaches here only for a command that produced no result to merge into,
+                // which is a flow word; its diagnostics still belong somewhere visible.
+                for line in diagnostics {
+                    self.write_line(&line);
+                }
+            }
+            Sink::Buffer { name, .. } => {
+                let name = name.clone();
+                self.append_buffer(&name, value::from_lines(diagnostics))?;
+            }
+        }
+        Ok(())
     }
 
     /// Restores every binding a transient prefix assignment shadowed, in reverse order.
@@ -682,20 +888,19 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Stores a redirected value in the named in-memory buffer store.
-    fn write_buffer(
-        &mut self,
-        name: &str,
-        append: bool,
-        value: Value,
-    ) -> Result<(), LimitExceeded> {
-        self.budget.charge_value_bytes(value_bytes(&value))?;
-        if !append {
-            self.buffers.insert(name.to_owned(), value);
+    /// Adds one value to the named in-memory buffer store, folding repeats into an array.
+    fn append_buffer(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
+        // A command that produced nothing writes nothing, matching `emit`. Otherwise
+        // `nosuchcmd > out 2>&1` would leave a stray `null` sitting in front of the one line that
+        // explains what happened.
+        if value.is_null() {
             return Ok(());
         }
+        self.budget.charge_value_bytes(value_bytes(&value))?;
         match self.buffers.remove(name) {
-            None => {
+            // `null` is what an opened-and-truncated buffer holds, so it reads as empty rather
+            // than as a first element.
+            None | Some(Value::Null) => {
                 self.buffers.insert(name.to_owned(), value);
             }
             Some(Value::Array(mut existing)) => {
@@ -1365,6 +1570,21 @@ impl Evaluator<'_> {
             }
         })
     }
+}
+
+/// Folds a command's captured diagnostics into its value, for `2>&1`.
+///
+/// A command with nothing to say leaves its value untouched — including its type, so
+/// `posts.get 2>&1` still yields an object rather than that object's JSON text. Only when there
+/// *are* diagnostics do the two channels have to become one, and they become one the way every
+/// text-shaped builtin already crosses between a value and its lines.
+fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
+    if diagnostics.is_empty() {
+        return value;
+    }
+    let mut lines = value::to_lines(&value);
+    lines.extend(diagnostics);
+    value::from_lines(lines)
 }
 
 /// Materializes a piped value for a command that consumes it by value.

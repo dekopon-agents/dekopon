@@ -1207,7 +1207,7 @@ fn shell_rejects_every_loudly_dropped_grammar_feature_rather_than_ignoring_it() 
         ("eval 'echo pwned'", "eval", "pwned"),
         ("echo `echo pwned`", "backtick", "pwned"),
         ("set -euo pipefail\necho pwned", "shell options", "pwned"),
-        ("echo pwned 2>/dev/null", "file-descriptor", "pwned"),
+        ("echo pwned 3>/dev/null", "only descriptors 1", "pwned"),
         ("[[ -n x ]] && echo pwned", "[[ ... ]]", "pwned"),
     ] {
         let (stdout, code) = shell(script, &[]);
@@ -1215,6 +1215,14 @@ fn shell_rejects_every_loudly_dropped_grammar_feature_rather_than_ignoring_it() 
         assert!(stdout.contains(expected), "{script}: {stdout}");
         assert!(!stdout.contains(forbidden), "{script}: {stdout}");
     }
+
+    // The two streams a script *can* address end up in the one combined transcript a terminal
+    // would have shown, so an operator replaying a model's script sees what the model saw.
+    let (stdout, code) = shell("echo kept\necho noted >&2\nnosuchcmd.here 2>/dev/null", &[]);
+    assert_eq!(code, 127, "{stdout}");
+    assert!(stdout.contains("kept"), "{stdout}");
+    assert!(stdout.contains("noted"), "{stdout}");
+    assert!(!stdout.contains("command not found"), "{stdout}");
 }
 
 #[test]
