@@ -185,13 +185,33 @@ impl ExternalSubject {
     ///
     /// Matching is segment-boundary exact: `slack.t0123abc` covers `slack.t0123abc.u9xyz` but not
     /// `slack.t0123abcx.u9`. A scope equal to the whole canonical form also matches.
+    ///
+    /// Compared segment by segment rather than against a rendered canonical string: an attestor
+    /// grant asks this once per configured namespace on every attested request, and the answer
+    /// never needs the joined form.
     #[must_use]
     pub fn in_namespace(&self, scope: &str) -> bool {
-        let canonical = self.canonical();
-        canonical == scope
-            || (canonical.len() > scope.len()
-                && canonical.starts_with(scope)
-                && canonical.as_bytes()[scope.len()] == b'.')
+        let mut wanted = scope.split('.');
+        for segment in self.segments() {
+            match wanted.next() {
+                // The scope ran out exactly on a segment boundary, so it is a covering prefix.
+                None => return true,
+                Some(value) if value == segment => {}
+                Some(_) => return false,
+            }
+        }
+        wanted.next().is_none()
+    }
+
+    /// The canonical segments in order, without joining them.
+    fn segments(&self) -> impl Iterator<Item = &str> {
+        [
+            Some(self.service.as_str()),
+            self.tenant.as_deref(),
+            Some(self.subject.as_str()),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -448,5 +468,19 @@ mod tests {
         assert!(!subject.in_namespace("slack.t0123abcx"));
         assert!(!subject.in_namespace("slack.t0123ab"));
         assert!(!subject.in_namespace("tel"));
+        // A scope is never a partial segment, an empty string, or longer than the subject itself.
+        assert!(!subject.in_namespace(""));
+        assert!(!subject.in_namespace("slack."));
+        assert!(!subject.in_namespace("slack.t0123abc."));
+        assert!(!subject.in_namespace("slack.t0123abc.u9xyz.extra"));
+        assert!(!subject.in_namespace(".slack"));
+
+        let tenantless = "tel.16034700182"
+            .parse::<ExternalSubject>()
+            .expect("canonical form parses");
+        assert!(tenantless.in_namespace("tel"));
+        assert!(tenantless.in_namespace("tel.16034700182"));
+        assert!(!tenantless.in_namespace("tel.1603470018"));
+        assert!(!tenantless.in_namespace("tel.16034700182.extra"));
     }
 }

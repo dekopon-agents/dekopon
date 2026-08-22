@@ -32,6 +32,7 @@ use std::{
     fmt,
     future::Future,
     io::{self, SeekFrom},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -66,6 +67,7 @@ use dekopon_storage_host::{
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -963,7 +965,10 @@ impl AttestorGrant {
 /// resolve to nothing and fail closed; principals are never minted on demand.
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
-    mappings: BTreeMap<String, PrincipalId>,
+    // Keyed by the subject itself rather than its rendered canonical form: the canonical string is
+    // injective over the segments, so the two keys are equivalent, and a lookup on the attested
+    // path no longer allocates one just to throw it away.
+    mappings: BTreeMap<ExternalSubject, PrincipalId>,
 }
 
 impl IdentityDirectory {
@@ -979,10 +984,12 @@ impl IdentityDirectory {
     ) -> Result<Self, BrokerBuildError> {
         let mut mappings = BTreeMap::new();
         for (subject, principal) in entries {
-            let canonical = subject.canonical();
-            if mappings.insert(canonical.clone(), principal).is_some() {
-                return Err(BrokerBuildError::DuplicateSubjectMapping { subject: canonical });
+            if mappings.contains_key(&subject) {
+                return Err(BrokerBuildError::DuplicateSubjectMapping {
+                    subject: subject.canonical(),
+                });
             }
+            mappings.insert(subject, principal);
         }
         Ok(Self { mappings })
     }
@@ -990,7 +997,7 @@ impl IdentityDirectory {
     /// Resolves one canonical subject to its stable principal.
     #[must_use]
     pub fn resolve(&self, subject: &ExternalSubject) -> Option<&PrincipalId> {
-        self.mappings.get(&subject.canonical())
+        self.mappings.get(subject)
     }
 
     /// Iterates the mapped principals, for construction-time policy validation.
@@ -1696,8 +1703,12 @@ struct FileAuditState {
     file: File,
     count: usize,
     head: Option<String>,
-    record_hashes: Vec<String>,
-    replay_ids: BTreeSet<InvocationId>,
+    /// The hash before `head`: the whole reconcile window, since an audit log can be at most one
+    /// append ahead of its checkpoint. Retaining every verified hash instead would hold roughly
+    /// 20 MB at the production record cap for the process lifetime, for a startup-only check.
+    previous_head: Option<String>,
+    /// Decision identifiers restored at startup, until the broker's replay ledger takes them.
+    replay_ids: Option<BTreeSet<InvocationId>>,
     poisoned: bool,
 }
 
@@ -1743,7 +1754,7 @@ impl FileAuditLog {
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);
-        let (count, head, record_hashes, replay_ids) =
+        let (count, head, previous_head, replay_ids) =
             scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
         let mut file = reader.into_inner();
         file.seek(SeekFrom::End(0))
@@ -1757,8 +1768,8 @@ impl FileAuditLog {
                 file,
                 count,
                 head,
-                record_hashes,
-                replay_ids,
+                previous_head,
+                replay_ids: Some(replay_ids),
                 poisoned: false,
             }),
         })
@@ -1777,20 +1788,36 @@ impl FileAuditLog {
     }
 
     /// Reports whether a retained sequence/head pair is an exact verified chain prefix.
+    ///
+    /// Only the reconcile window is answered for: the current head, the record before it, and the
+    /// empty chain. A checkpoint further behind than one append is not a prefix this log will
+    /// confirm — reconciliation rejects that gap on its own, and confirming it would mean keeping
+    /// every verified hash resident forever.
     pub async fn contains_checkpoint(&self, count: usize, head: Option<&str>) -> bool {
         let state = self.state.lock().await;
         match count {
             0 => head.is_none(),
-            count if count <= state.record_hashes.len() => {
-                head == Some(state.record_hashes[count - 1].as_str())
+            count if count == state.count => head == state.head.as_deref(),
+            count if Some(count) == state.count.checked_sub(1) => {
+                head == state.previous_head.as_deref()
             }
             _ => false,
         }
     }
 
-    /// Returns invocation IDs reconstructed from verified decision records.
-    pub async fn replay_ids(&self) -> Vec<InvocationId> {
-        self.state.lock().await.replay_ids.iter().cloned().collect()
+    /// Returns invocation IDs reconstructed from verified decision records, once.
+    ///
+    /// Consuming on purpose. The only caller hands them straight to the broker's replay ledger,
+    /// which owns them from then on; keeping a second copy here would duplicate the ledger at
+    /// startup and then grow it forever on a path nothing reads again. A later call returns
+    /// nothing, and appends stop recording once they have been taken.
+    pub async fn take_replay_ids(&self) -> Vec<InvocationId> {
+        let mut state = self.state.lock().await;
+        state
+            .replay_ids
+            .take()
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1810,15 +1837,22 @@ impl AuditLog for FileAuditLog {
             .and_then(|value| value.checked_add(1))
             .ok_or(AuditError::SequenceOverflow)?;
         let previous_hash = state.head.clone();
-        let record_hash = audit_record_hash(sequence, previous_hash.as_deref(), &event)?;
+        let encoded = encode_audit_event(&event)?;
+        let record_hash = encoded_audit_record_hash(sequence, previous_hash.as_deref(), &encoded)?;
+        // The one serialization of the event covers both the hash material and the durable line.
+        let mut line = serde_json::to_vec(&AuditRecordLine {
+            sequence,
+            previous_hash: previous_hash.as_deref(),
+            event: &encoded,
+            record_hash: &record_hash,
+        })
+        .map_err(|source| AuditError::Serialize { source })?;
         let record = AuditRecord {
             sequence,
             previous_hash,
             event,
             record_hash,
         };
-        let mut line =
-            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
         if line.len() > self.maximum_line_bytes {
             return Err(AuditError::RecordTooLarge {
                 length: line.len(),
@@ -1838,10 +1872,11 @@ impl AuditLog for FileAuditLog {
             return Err(AuditError::Io { source });
         }
         state.count += 1;
-        state.head = Some(record.record_hash.clone());
-        state.record_hashes.push(record.record_hash.clone());
-        if let AuditEvent::Decision { invocation, .. } = &record.event {
-            state.replay_ids.insert(invocation.clone());
+        state.previous_head = state.head.replace(record.record_hash.clone());
+        if let Some(ids) = state.replay_ids.as_mut()
+            && let AuditEvent::Decision { invocation, .. } = &record.event
+        {
+            ids.insert(invocation.clone());
         }
         state.poisoned = false;
         Ok(record)
@@ -1852,14 +1887,22 @@ async fn scan_audit_file(
     reader: &mut BufReader<File>,
     maximum_records: usize,
     maximum_line_bytes: usize,
-) -> Result<(usize, Option<String>, Vec<String>, BTreeSet<InvocationId>), FileAuditError> {
+) -> Result<
+    (
+        usize,
+        Option<String>,
+        Option<String>,
+        BTreeSet<InvocationId>,
+    ),
+    FileAuditError,
+> {
     let mut count = 0_usize;
     let mut previous = None::<String>;
-    let mut record_hashes = Vec::new();
+    let mut before_previous = None::<String>;
     let mut replay_ids = BTreeSet::new();
     loop {
         let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
-            return Ok((count, previous, record_hashes, replay_ids));
+            return Ok((count, previous, before_previous, replay_ids));
         };
         if count >= maximum_records {
             return Err(FileAuditError::TooManyRecords {
@@ -1876,8 +1919,7 @@ async fn scan_audit_file(
         if let AuditEvent::Decision { invocation, .. } = &record.event {
             replay_ids.insert(invocation.clone());
         }
-        record_hashes.push(record.record_hash.clone());
-        previous = Some(record.record_hash);
+        before_previous = previous.replace(record.record_hash);
         count += 1;
     }
 }
@@ -2162,13 +2204,40 @@ pub fn verify_audit_chain(records: &[AuditRecord]) -> Result<(), AuditIntegrityE
 struct AuditHashMaterial<'a> {
     sequence: u64,
     previous_hash: Option<&'a str>,
-    event: &'a AuditEvent,
+    event: &'a RawValue,
+}
+
+/// The durable JSONL shape of [`AuditRecord`], over an already-serialized event.
+///
+/// Field names, order, and the absent-`previousHash` rule must stay identical to `AuditRecord`'s
+/// derived encoding: this is the same bytes on disk, written without serializing the event a
+/// second time. `durable_line_matches_the_record_encoding` fails if the two ever diverge.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditRecordLine<'a> {
+    sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_hash: Option<&'a str>,
+    event: &'a RawValue,
+    record_hash: &'a str,
+}
+
+fn encode_audit_event(event: &AuditEvent) -> Result<Box<RawValue>, AuditError> {
+    serde_json::value::to_raw_value(event).map_err(|source| AuditError::Serialize { source })
 }
 
 fn audit_record_hash(
     sequence: u64,
     previous_hash: Option<&str>,
     event: &AuditEvent,
+) -> Result<String, AuditError> {
+    encoded_audit_record_hash(sequence, previous_hash, &encode_audit_event(event)?)
+}
+
+fn encoded_audit_record_hash(
+    sequence: u64,
+    previous_hash: Option<&str>,
+    event: &RawValue,
 ) -> Result<String, AuditError> {
     let bytes = serde_json::to_vec(&AuditHashMaterial {
         sequence,
@@ -2540,6 +2609,24 @@ where
         })
     }
 
+    /// The constraint sets policy allows this exact context, one Cedar evaluation each.
+    ///
+    /// Every listing filters this same list. That is what makes a listing identical to the
+    /// decision an invocation would receive: there is only ever one evaluation to disagree with.
+    fn authorized_sets(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> Vec<(&CapabilityId, &ConstraintSet)> {
+        self.constraints
+            .iter()
+            .filter(|(capability, set)| {
+                !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && self.authorize_capability(context, capability, set).allowed
+            })
+            .collect()
+    }
+
     /// Returns the command words this context may use.
     ///
     /// A word appears only when policy allows this context at least one capability of the provider
@@ -2547,15 +2634,17 @@ where
     /// principal granted nothing sees an empty vocabulary rather than a map of the deployment.
     #[must_use]
     pub fn command_words(&self, context: &AuthenticatedContext) -> Vec<String> {
-        let reachable = self
-            .constraints
+        self.reachable_command_words(context, &self.authorized_sets(context))
+    }
+
+    fn reachable_command_words(
+        &self,
+        context: &AuthenticatedContext,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<String> {
+        let reachable = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
-            .map(|(_, set)| set.provider.clone())
+            .map(|(_, set)| &set.provider)
             .collect::<BTreeSet<_>>();
         let storage_providers = self
             .constraints
@@ -2579,7 +2668,7 @@ where
             .into_iter()
             .filter(|(provider, _)| {
                 !reserved_providers.contains(*provider)
-                    && reachable.contains(*provider)
+                    && reachable.contains(provider)
                     && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
             })
             .flat_map(|(_, words)| {
@@ -2647,19 +2736,36 @@ where
     /// never appear here and then refuse — or be hidden here and then succeed.
     #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
-        let mut capabilities = self
-            .constraints
+        self.available_capabilities(&self.authorized_sets(context))
+    }
+
+    /// Returns the capability listing and the command words from one authorization pass.
+    ///
+    /// Both halves of a capabilities answer are policy filters over the same constraint sets, and
+    /// a session opens with one. Computing them separately evaluates every set through Cedar
+    /// twice for identical inputs on the broker's most frequent request.
+    #[must_use]
+    pub fn capability_view(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> (Vec<AvailableCapability>, Vec<String>) {
+        let authorized = self.authorized_sets(context);
+        (
+            self.available_capabilities(&authorized),
+            self.reachable_command_words(context, &authorized),
+        )
+    }
+
+    fn available_capabilities(
+        &self,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<AvailableCapability> {
+        let mut capabilities = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
             .map(|(capability_id, set)| {
                 let (_, manifest_capability) = self
                     .registry
-                    .capabilities()
-                    .find(|(_, capability)| &capability.id == capability_id)
+                    .capability(capability_id)
                     .expect("constraint validation proves every capability route");
                 let mut capability = manifest_capability.clone();
                 capability.effect = set.effect;
@@ -2827,7 +2933,7 @@ where
             );
             return None;
         }
-        Some((self.capabilities(&context), self.command_words(&context)))
+        Some(self.capability_view(&context))
     }
 
     /// Returns a freshly authorized chat surface. Scope refusal reveals no mapping or namespace.
@@ -2849,8 +2955,7 @@ where
                 return None;
             }
         };
-        let mut capabilities = self.capabilities(&context);
-        let mut words = self.command_words(&context);
+        let (mut capabilities, mut words) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
             for identifier in [MEMORY_RECENT, MEMORY_SEARCH] {
@@ -3104,10 +3209,7 @@ where
 
     fn available_capability(&self, capability: &CapabilityId) -> Option<AvailableCapability> {
         let set = self.constraints.get(capability)?;
-        let (_, manifest) = self
-            .registry
-            .capabilities()
-            .find(|(_, candidate)| &candidate.id == capability)?;
+        let (_, manifest) = self.registry.capability(capability)?;
         let mut capability = manifest.clone();
         capability.effect = set.effect;
         capability.risk = set.risk;
@@ -3369,13 +3471,18 @@ where
         if !storage_candidate && dekopon_core::telemetry_payloads() {
             authorize.record("input", tracing::field::display(&request.input));
         }
-        let (set, policy_ids) = {
-            let _entered = authorize.enter();
+        // Instrumented rather than entered with a guard: this section awaits the replay ledger and,
+        // on every denial, a durable audit append that fsyncs. A guard held across those awaits
+        // stays entered on the worker thread while this task is suspended, so another connection's
+        // spans parent under this request's authorization and this request's own events lose it
+        // when the task resumes elsewhere.
+        let authorized = async {
             if !self.replay.reserve(&request.id).await? {
                 authorize.record("outcome", "replayed-invocation");
                 return self
                     .deny(context, &request, "replayed-invocation", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A refused attestation or agent gate still consumes its invocation identifier above:
             // the denial is a decision about this exact proposal, and letting the same identifier
@@ -3384,7 +3491,8 @@ where
                 authorize.record("outcome", refusal.reason);
                 return self
                     .deny(context, &request, refusal.reason, refusal.policy_ids)
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A missing constraint set means there is nothing to execute regardless of what policy
             // says. Under `Leniency::Strict` this is defense in depth behind the startup check;
@@ -3395,13 +3503,15 @@ where
                 authorize.record("outcome", "unconstrained-capability");
                 return self
                     .deny(context, &request, "unconstrained-capability", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             };
             if set.constraints.storage.is_some() && context.chat_scope().is_none() {
                 authorize.record("outcome", "chat-scope-required");
                 return self
                     .deny(context, &request, "chat-scope-required", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
             // A policy that errors at evaluation time denies exactly like a policy that does not
@@ -3423,10 +3533,20 @@ where
                 }
                 return self
                     .deny(context, &request, reason, decision.determining_policy_ids)
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             authorize.record("outcome", "allowed");
-            (set, decision.determining_policy_ids)
+            Ok(ControlFlow::Continue((
+                set,
+                decision.determining_policy_ids,
+            )))
+        }
+        .instrument(authorize.clone())
+        .await?;
+        let (set, policy_ids) = match authorized {
+            ControlFlow::Break(denied) => return Ok(denied),
+            ControlFlow::Continue(allowed) => allowed,
         };
         let provider = set.provider.clone();
         let execute = if set.constraints.storage.is_some() {
@@ -4358,18 +4478,24 @@ fn outcome_evidence_digest(
 }
 
 fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut material = Vec::with_capacity(label.len() + 1 + bytes.len());
-    material.extend_from_slice(label.as_bytes());
-    material.push(0);
-    material.extend_from_slice(&bytes);
-    Ok(domain_digest(EVIDENCE_HASH_DOMAIN, &material))
+    // Streamed rather than concatenated: the serialized value here is a whole provider response,
+    // up to the host output ceiling, and the joined buffer existed only to be hashed once.
+    Ok(digest_parts(
+        EVIDENCE_HASH_DOMAIN,
+        &[label.as_bytes(), &[0], &serde_json::to_vec(value)?],
+    ))
 }
 
 fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
+    digest_parts(domain, &[bytes])
+}
+
+fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(bytes);
+    for part in parts {
+        hasher.update(part);
+    }
     format!("sha256:{}", hex_bytes(&hasher.finalize()))
 }
 

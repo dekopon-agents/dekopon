@@ -509,7 +509,7 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
             .await
             .expect("verified audit reopens"),
     );
-    let replay_ids = audit.replay_ids().await;
+    let replay_ids = audit.take_replay_ids().await;
     let broker = Broker::new_with_replay_ids(
         echo_registry(BrokerHostLimits::default()).await,
         "broker-test"
@@ -2326,6 +2326,16 @@ async fn command_words_are_filtered_by_what_policy_allows() {
         broker.capabilities(&context("stranger")).is_empty(),
         "the ungranted context reaches nothing, which is what makes its empty vocabulary meaningful"
     );
+    for name in ["caller", "stranger"] {
+        assert_eq!(
+            broker.capability_view(&context(name)),
+            (
+                broker.capabilities(&context(name)),
+                broker.command_words(&context(name))
+            ),
+            "the combined view must be the same answer as the two listings it replaces"
+        );
+    }
 }
 
 /// A word no loaded provider declares is refused before any component runs.

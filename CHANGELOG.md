@@ -90,6 +90,42 @@ All notable changes to Dekopon are documented here. The format is based on
 - A finished connection task is now observed as soon as it completes rather than on the next accept,
   so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
 
+### Added
+
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+
+### Fixed
+
+- A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
+  `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
+  logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
+  accept failure stays fatal.
+- Broker shutdown now drains the Unix listener, the provider-storage GC, and the web UI concurrently
+  against one shared deadline. They previously ran in sequence, each under its own full
+  `shutdownGraceMs`, so a process with `--http-bind` could take two or three graces to exit against a
+  `terminationGracePeriodSeconds` that budgets one.
+- Startup frame validation now also bounds the capability response an attested session receives, not
+  only each direct peer's. In a gateway deployment the peer holds almost nothing while the mapped
+  principals hold the real capability sets, so an oversized response passed startup and then failed
+  `write_frame` on every session open — the exact failure the check exists to prevent.
+- A finished connection task is now observed as soon as it completes rather than on the next accept,
+  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+- `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
+  suspended. The section awaits the replay ledger and, on every denial, a durable audit append that
+  fsyncs, so whatever the runtime polled next on that thread was exported as a child of another
+  request's authorization while that request's own later events lost it. The span instruments the
+  section instead of being held across the awaits; its fields and values are unchanged.
+
 ### Changed
 
 - An exhausted replay ledger or audit log now answers the new stable failure code
@@ -130,6 +166,23 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- A capabilities answer now costs one Cedar pass instead of two. The capability listing and the
+  command words are derived from a single authorized constraint-set filter, `capability_view`, used
+  by the readiness probe's `capabilities`, `capabilitiesFor`, `capabilitiesForChat`, and the startup
+  frame check. Both halves still come from the one evaluation an invocation would receive, so a
+  listing can no more disagree with a decision than before.
+- The durable audit log no longer retains every record hash and a second copy of every restored
+  invocation identifier for the life of the process — roughly 30 MB at the production caps, for
+  state read only at startup. It keeps the one-record reconcile window `contains_checkpoint`
+  actually needs, and `FileAuditLog::replay_ids` becomes the consuming `take_replay_ids`, because
+  the broker's own replay ledger owns those identifiers from then on. Records on disk are
+  byte-identical, and an audit file written by an earlier build still verifies.
+- Hot-path allocations are gone from the paths every chat message crosses: an audit event is
+  serialized once for both its hash material and its durable line, evidence digests stream into the
+  hasher instead of copying an entire provider response to prefix a label, `ExternalSubject`
+  namespace checks and identity resolution compare segments instead of building a canonical string,
+  identifier deserialization reuses its buffer, and `dekopon-policy` parses its constant Cedar
+  entity type names once at construction rather than three times per authorization.
 - `ClientError::Protocol` now carries the exchange phase and renders its bounded framing detail, and
   `ClientError::may_have_executed` covers both a lost response and `outcome-unaudited`. A script
   reaching that state receives `denied` (exit `126`) instead of a retryable failure. Invalid frame

@@ -327,10 +327,10 @@ where
     };
     let context = &peer.context;
     let response = match request.request {
-        BrokerRequest::Capabilities => ResponseEnvelope::capabilities(
-            broker.capabilities(context),
-            broker.command_words(context),
-        ),
+        BrokerRequest::Capabilities => {
+            let (capabilities, command_words) = broker.capability_view(context);
+            ResponseEnvelope::capabilities(capabilities, command_words)
+        }
         BrokerRequest::CapabilitiesFor { subject, agent } => {
             match broker.capabilities_for(context, peer.attestor.as_ref(), &subject, &agent) {
                 Some((capabilities, command_words)) => {

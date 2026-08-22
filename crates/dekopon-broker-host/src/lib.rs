@@ -976,6 +976,25 @@ impl BrokerProviderRegistry {
             .clone()
     }
 
+    /// Returns one routed capability and the provider declaring it, by identifier.
+    ///
+    /// Routes are already keyed by capability, so a caller filtering constraint sets does not have
+    /// to scan every route per set.
+    #[must_use]
+    pub fn capability(
+        &self,
+        capability: &CapabilityId,
+    ) -> Option<(&ProviderId, &ProviderCapability)> {
+        let provider = &self.providers[*self.routes.get(capability)?];
+        let capability = provider
+            .manifest
+            .capabilities
+            .iter()
+            .find(|candidate| &candidate.id == capability)
+            .expect("routes originate from validated provider manifests");
+        Some((&provider.manifest.id, capability))
+    }
+
     /// Returns capabilities in deterministic identifier order.
     pub fn capabilities(&self) -> impl Iterator<Item = (&ProviderId, &ProviderCapability)> {
         self.routes.iter().map(|(capability_id, provider_index)| {
