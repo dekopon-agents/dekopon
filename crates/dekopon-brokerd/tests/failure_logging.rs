@@ -282,25 +282,24 @@ async fn framing_and_audit_failures_name_their_cause() {
         .invoke(request)
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
-    let appended = captured.take_after("broker_audit_append_failed").await;
-    assert!(appended.contains("\"full\""), "{appended}");
-    assert!(appended.contains("\"outcome\""), "{appended}");
-    assert!(appended.contains("invoke-unaudited"), "{appended}");
-
-    // The connection's own verdict is observed when its task is joined, which the accept loop does
-    // as it drains at shutdown.
-    shutdown_send.send(()).expect("signal clean shutdown");
-    let _ = task.await.expect("server task exits");
-    let unaudited = captured.take();
-
+    // The connection's own verdict is observed the moment its task finishes, with the server still
+    // accepting and no second client on the way. It used to wait inside the `JoinSet` for the next
+    // accept or for shutdown, so on a quiet broker the one failure an operator must act on was
+    // reported whenever the next connection happened to arrive.
+    let unaudited = captured.take_after("broker_outcome_unaudited").await;
     assert!(
-        unaudited.contains("broker_outcome_unaudited"),
+        unaudited.contains("broker_audit_append_failed"),
         "{unaudited}"
     );
+    assert!(unaudited.contains("\"full\""), "{unaudited}");
+    assert!(unaudited.contains("\"outcome\""), "{unaudited}");
     assert!(unaudited.contains("invoke-unaudited"), "{unaudited}");
     // The chain, not just the category: the bound the log used to omit entirely.
     assert!(
         unaudited.contains("audit log reached its 1-record bound"),
         "{unaudited}"
     );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    let _ = task.await.expect("server task exits");
 }

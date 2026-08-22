@@ -339,6 +339,8 @@ only place the cause exists. These events carry it:
 | `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `outcome`), `category` (`full`, `poisoned`, `record-too-large`, `sequence-overflow`, `serialize`, `io`), `invocation`, and the error's source chain |
 | `broker_request_frame_invalid` | warn | `dekopon-brokerd` | `error.kind` (`timeout`, `io`, `empty-frame`, `frame-too-large`, `deserialize`, …) and the bounded protocol message |
 | `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
+| `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
+| `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
 | `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
@@ -354,6 +356,14 @@ The source chain is the diagnosable half. `ConnectionError::Broker` renders as "
 filesystem shared with anything else — lives one or two levels down, and these events render the
 whole chain as one `a: b: c` line. Frame contents never join it: a decode failure names its kind, not
 the bytes that failed to decode.
+
+`broker_capacity_exhausted` and `broker_accept_retried` are the two events that report a condition
+outside any one request. The first says a bounded broker resource — the replay ledger or the audit
+log — is full; every caller now receives `capacity-exhausted`, no retry can clear it, and a restart
+does not either, because the ledger is restored from durable history. The second says the daemon
+survived an `accept` failure it used to exit on. A steady stream of it at
+`error.kind=process-descriptor-limit` is the descriptor leak the exit used to hide, and it is worth
+alerting on precisely because the service is no longer failing loudly.
 
 `broker_socket_cleanup_failed` is reported but does not preempt the shutdown result. A stale socket
 path is a smaller problem than the failure that ended service, so the serve error, the final audit
