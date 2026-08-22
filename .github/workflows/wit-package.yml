@@ -22,8 +22,6 @@ on:
       - "examples/providers/provider-v0-1-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
-      - "examples/providers/gh/**"
-      - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
@@ -54,8 +52,6 @@ on:
       - "examples/providers/provider-v0-1-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
-      - "examples/providers/gh/**"
-      - "examples/providers/gh-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
@@ -178,7 +174,7 @@ jobs:
 
             expected=''
             case "$provider" in
-              gh|http-probe|jsonplaceholder|skylight-private) expected='dekopon:http/client@1.0.0' ;;
+              http-probe|jsonplaceholder|skylight-private) expected='dekopon:http/client@1.0.0' ;;
               memory-chat) expected='dekopon:storage/jsonl@0.1.0' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
             esac
@@ -204,7 +200,6 @@ jobs:
             crates/dekopon-provider-host/wit/provider.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/provider.wit \
-            examples/providers/gh/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/jsonplaceholder/wit/deps/provider.wit \
             examples/providers/skylight-private/wit/deps/provider.wit \
@@ -219,7 +214,6 @@ jobs:
             crates/dekopon-provider-http/wit/deps/http.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/http.wit \
-            examples/providers/gh/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit \
             examples/providers/jsonplaceholder/wit/deps/http.wit \
             examples/providers/skylight-private/wit/deps/http.wit

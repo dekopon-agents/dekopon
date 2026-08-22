@@ -602,7 +602,7 @@ helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
 ```
 
 [`values-pr-summarizer-linter.yaml`](values-pr-summarizer-linter.yaml) is the
-[PR summarizer and linter](https://github.com/dekopon-agents/dekopon/blob/main/examples/pr-summarizer-linter/README.md) deployment expressed as chart values: Slack Agent sessions with tangerine reaction degradation, one
+[PR summarizer and linter](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) deployment expressed as chart values: Slack Agent sessions with tangerine reaction degradation, one
 agent, six narrow `gh` capabilities, a broker-injected token by reference, and the audit chain on its
 own volume. It may post one review comment and has no approval, request-changes, or merge capability.
 
