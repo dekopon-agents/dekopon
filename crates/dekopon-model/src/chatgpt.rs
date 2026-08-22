@@ -6,6 +6,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -19,11 +20,12 @@ use dekopon_core::Redacted;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use ureq::{Agent, http};
+use ureq::Agent;
 
 use crate::model::{
     AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelError, ModelFunctionCall,
-    ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url,
+    ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url, read_error_body,
+    sanitize_diagnostic,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -100,20 +102,93 @@ impl ChatGptCodexModel {
         })
     }
 
+    /// Reads the credentials this client last saw, without holding the lock across a request.
+    ///
+    /// The turn below runs against this snapshot. Holding the guard through the streaming request
+    /// instead would serialize every session on one 120-second model call the moment a caller
+    /// shares a client, which `CompletionOptions` already names as the obvious next optimization.
+    fn credentials_snapshot(&self) -> ChatGptCredentials {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Publishes a rotated credential for the next turn.
+    ///
+    /// A concurrent turn may already have installed a newer one, and the older of the two must not
+    /// win: its refresh token is the invalidated predecessor.
+    fn install_credentials(&self, credentials: &ChatGptCredentials) {
+        let mut stored = self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if credentials.expires_at >= stored.expires_at {
+            *stored = credentials.clone();
+        }
+    }
+
+    /// Brings `credentials` up to date, returning whether they changed.
+    ///
+    /// The refresh token rotates: the token endpoint mints a replacement and invalidates its
+    /// predecessor, and standard OAuth reuse detection can revoke the whole family when the
+    /// predecessor is presented again. Every process sharing this credential file therefore
+    /// serializes here on a sibling lock, and whoever loses the race adopts what the winner wrote
+    /// instead of spending a refresh token the provider has already retired.
     fn refresh_if_needed(
         &self,
         credentials: &mut ChatGptCredentials,
         force: bool,
-    ) -> Result<(), ChatGptError> {
-        let refresh_at = credentials
-            .expires_at
-            .saturating_sub(REFRESH_MARGIN.as_secs());
-        if !force && unix_time()? < refresh_at {
-            return Ok(());
+    ) -> Result<bool, ChatGptError> {
+        if !force && !needs_refresh(credentials)? {
+            return Ok(false);
         }
-        *credentials =
-            refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose())?;
-        save_credentials(&self.auth_path, credentials)
+        let span = tracing::info_span!(
+            "chatgpt.refresh",
+            forced = force,
+            outcome = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            credential.expires_at = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+
+        let _lock = CredentialLock::acquire(&self.auth_path);
+        let adopted = adopt_stored_credentials(&self.auth_path, credentials);
+        if adopted && !needs_refresh(credentials)? {
+            record_refresh(&span, "adopted", started, credentials.expires_at);
+            return Ok(true);
+        }
+
+        let refreshed =
+            match refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose()) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    span.record("outcome", "failed");
+                    span.record("duration_ms", elapsed_ms(started));
+                    return Err(error);
+                }
+            };
+        *credentials = refreshed;
+        // The provider has already rotated, so the only credential that still works is the one in
+        // memory. Failing the turn here would strand it and leave the invalidated predecessor on
+        // disk for the next process to spend, which is the reuse-detection trap this whole path
+        // exists to avoid.
+        let outcome = match save_credentials(&self.auth_path, credentials) {
+            Ok(()) => "rotated",
+            Err(error) => {
+                tracing::error!(
+                    event = "chatgpt_credential_save_failed",
+                    path = %self.auth_path.display(),
+                    error = %error,
+                    "ChatGPT credential rotated but could not be persisted; continuing this turn \
+                     with the in-memory token"
+                );
+                "rotated-unsaved"
+            }
+        };
+        record_refresh(&span, outcome, started, credentials.expires_at);
+        Ok(true)
     }
 
     fn request_turn(
@@ -179,18 +254,23 @@ impl ChatModel for ChatGptCodexModel {
             tool.count = tools.len()
         );
         let _entered = span.enter();
-        let mut credentials = self
-            .credentials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.refresh_if_needed(&mut credentials, false)
-            .map_err(|error| ModelError::Request(error.to_string()))?;
+        let mut credentials = self.credentials_snapshot();
+        if self
+            .refresh_if_needed(&mut credentials, false)
+            .map_err(|error| ModelError::Request(error.to_string()))?
+        {
+            self.install_credentials(&credentials);
+        }
 
         match self.request_turn(&credentials, messages, tools, options) {
             Ok(turn) => Ok(turn),
             Err(ChatGptRequestError::Unauthorized) => {
-                self.refresh_if_needed(&mut credentials, true)
-                    .map_err(|error| ModelError::Request(error.to_string()))?;
+                if self
+                    .refresh_if_needed(&mut credentials, true)
+                    .map_err(|error| ModelError::Request(error.to_string()))?
+                {
+                    self.install_credentials(&credentials);
+                }
                 self.request_turn(&credentials, messages, tools, options)
                     .map_err(|error| ModelError::Request(error.to_string()))
             }
@@ -260,9 +340,14 @@ pub fn status(auth_path: Option<&Path>) -> Result<ChatGptAuthStatus, ChatGptErro
     })
 }
 
-/// Deletes only Dekopon's ChatGPT credential file.
+/// Deletes only Dekopon's ChatGPT credential file and the staging files it may have left behind.
+///
+/// An abandoned `chatgpt-auth.tmp-<pid>` holds the same plaintext access and refresh tokens as the
+/// credential itself, so a logout that removed only the exact path would leave a live credential on
+/// disk under a different name.
 pub fn logout(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     let path = resolve_auth_path(auth_path)?;
+    sweep_stale_temporaries(&path, None);
     match fs::remove_file(&path) {
         Ok(()) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
@@ -407,7 +492,7 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatGptCredentials {
     version: u32,
@@ -431,8 +516,9 @@ fn start_device_login(
         .map_err(|error| ChatGptError::Request(error.to_string()))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
+        let detail = oauth_failure_detail(response);
         return Err(ChatGptError::Login(format!(
-            "device authorization returned HTTP {status}"
+            "device authorization returned HTTP {status}: {detail}"
         )));
     }
     let response = response
@@ -466,16 +552,35 @@ fn poll_device_login(
 ) -> Result<DeviceAuthorization, ChatGptError> {
     let started = Instant::now();
     let mut interval = device.interval;
+    // Set while the most recent poll failed below the HTTP layer, and cleared by any answer at all.
+    // It is what distinguishes "the human never authorized" from "the network was down when the
+    // deadline passed", which are the same `LoginTimeout` otherwise.
+    let mut transport_failure: Option<String> = None;
     while started.elapsed() < DEVICE_LOGIN_TIMEOUT {
         let remaining = DEVICE_LOGIN_TIMEOUT.saturating_sub(started.elapsed());
         thread::sleep(interval.min(remaining));
-        let response = agent
-            .post(&endpoints.device_token)
-            .send_json(json!({
-                "device_auth_id": device.device_auth_id,
-                "user_code": device.user_code,
-            }))
-            .map_err(|error| ChatGptError::Request(error.to_string()))?;
+        let response = match agent.post(&endpoints.device_token).send_json(json!({
+            "device_auth_id": device.device_auth_id,
+            "user_code": device.user_code,
+        })) {
+            Ok(response) => response,
+            Err(error) => {
+                // A quarter-hour of polling in front of a browser will see the odd dropped packet,
+                // DNS blip, or TLS reset. Aborting on one costs the operator the whole login and a
+                // fresh user code, so a transport failure is treated exactly like
+                // `authorization_pending`, with the `slow_down` backoff so a fast-failing endpoint
+                // is not hammered.
+                tracing::warn!(
+                    event = "chatgpt_device_login_poll_failed",
+                    error = %error,
+                    "device authorization poll failed; continuing to poll until the deadline"
+                );
+                transport_failure = Some(error.to_string());
+                interval = backed_off(interval);
+                continue;
+            }
+        };
+        transport_failure = None;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
             let mut response = response;
@@ -489,17 +594,7 @@ fn poll_device_login(
             });
         }
         let body = read_error_body(response);
-        let error_code = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|value| value.get("error").cloned())
-            .and_then(|error| match error {
-                Value::String(code) => Some(code),
-                Value::Object(object) => object
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                _ => None,
-            });
+        let error_code = oauth_error_code(&body);
         if status == 403
             || status == 404
             || error_code.as_deref() == Some("deviceauth_authorization_pending")
@@ -507,16 +602,24 @@ fn poll_device_login(
             continue;
         }
         if error_code.as_deref() == Some("slow_down") || status == 429 {
-            interval = interval
-                .saturating_add(Duration::from_secs(5))
-                .min(Duration::from_secs(30));
+            interval = backed_off(interval);
             continue;
         }
         return Err(ChatGptError::Login(format!(
-            "device authorization failed with HTTP {status}"
+            "device authorization failed with HTTP {status}: {}",
+            error_code.unwrap_or(body)
         )));
     }
-    Err(ChatGptError::LoginTimeout)
+    match transport_failure {
+        Some(error) => Err(ChatGptError::Request(error)),
+        None => Err(ChatGptError::LoginTimeout),
+    }
+}
+
+fn backed_off(interval: Duration) -> Duration {
+    interval
+        .saturating_add(Duration::from_secs(5))
+        .min(Duration::from_secs(30))
 }
 
 fn exchange_authorization(
@@ -564,8 +667,11 @@ fn request_token<'a, const N: usize>(
         .map_err(|error| ChatGptError::Request(error.to_string()))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
+        // The OAuth `error` code is the whole diagnostic here: `invalid_grant` says the refresh
+        // token is gone and a human has to log in again, while a bare 400 could be anything.
+        let detail = oauth_failure_detail(response);
         return Err(ChatGptError::Login(format!(
-            "token endpoint returned HTTP {status}"
+            "token endpoint returned HTTP {status}: {detail}"
         )));
     }
     let token = response
@@ -592,11 +698,12 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .split('.')
         .nth(1)
         .ok_or_else(|| ChatGptError::Protocol("access token is not a JWT".to_owned()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| ChatGptError::Protocol("access token has invalid JWT encoding".to_owned()))?;
-    let payload = serde_json::from_slice::<Value>(&bytes)
-        .map_err(|_| ChatGptError::Protocol("access token has invalid JWT JSON".to_owned()))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|source| {
+        ChatGptError::Protocol(format!("access token has invalid JWT encoding: {source}"))
+    })?;
+    let payload = serde_json::from_slice::<Value>(&bytes).map_err(|source| {
+        ChatGptError::Protocol(format!("access token has invalid JWT JSON: {source}"))
+    })?;
     payload
         .get(JWT_AUTH_CLAIM)
         .and_then(|claim| claim.get("chatgpt_account_id"))
@@ -789,8 +896,11 @@ fn parse_sse(reader: impl Read) -> Result<AssistantTurn, ChatGptError> {
     let mut state = StreamState::default();
     let mut event_data = String::new();
     let mut bytes_read = 0_u64;
+    // One buffer for the whole stream. A long answer is thousands of small `data:` lines, one per
+    // output-text delta, and a fresh `String` per line is a heap allocation per token.
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         let length = reader
             .read_line(&mut line)
             .map_err(|source| ChatGptError::Stream { source })?;
@@ -1032,18 +1142,42 @@ fn format_provider_error(event: &Value) -> String {
     )
 }
 
-fn read_error_body(response: http::Response<ureq::Body>) -> String {
-    let mut body = response.into_parts().1.into_reader().take(16 * 1024);
-    let mut text = String::new();
-    let _ = body.read_to_string(&mut text);
-    sanitize_diagnostic(&text)
+/// Renders a failed OAuth response as a diagnostic, preferring its `error` code.
+///
+/// A token or device-authorization failure answers with `{"error": "...", "error_description":
+/// "..."}`. Neither field carries credential material — the whole point of the response is that no
+/// credential was issued — and the code is the part that names the failure.
+fn oauth_failure_detail(response: ureq::http::Response<ureq::Body>) -> String {
+    let body = read_error_body(response);
+    let Some(code) = oauth_error_code(&body) else {
+        return body;
+    };
+    match oauth_error_description(&body) {
+        Some(description) => format!("{code}: {description}"),
+        None => code,
+    }
 }
 
-fn sanitize_diagnostic(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-        .collect()
+/// Extracts the OAuth `error` code, accepting both the bare string and the nested-object spelling
+/// the device-authorization endpoint uses.
+fn oauth_error_code(body: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(body).ok()?.get("error")? {
+        Value::String(code) => Some(code.clone()),
+        Value::Object(object) => object
+            .get("code")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn oauth_error_description(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("error_description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.trim().is_empty())
+        .map(sanitize_diagnostic)
 }
 
 fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
@@ -1072,6 +1206,108 @@ fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     Err(ChatGptError::Configuration(
         "could not determine credential path; set DEKOPON_CHATGPT_AUTH_FILE".to_owned(),
     ))
+}
+
+/// Whether the access token is inside the refresh margin.
+fn needs_refresh(credentials: &ChatGptCredentials) -> Result<bool, ChatGptError> {
+    let refresh_at = credentials
+        .expires_at
+        .saturating_sub(REFRESH_MARGIN.as_secs());
+    Ok(unix_time()? >= refresh_at)
+}
+
+/// Replaces `credentials` with the stored copy when that copy is newer, reporting whether it did.
+///
+/// Called only while the refresh lock is held. A later `expiresAt` means another process completed
+/// a refresh: its record carries the live refresh token and ours carries the invalidated
+/// predecessor, so adopting is both the correct and the only safe move. A file that has gone
+/// missing or unreadable is left to the refresh itself to fail on, with the error that names it.
+fn adopt_stored_credentials(path: &Path, credentials: &mut ChatGptCredentials) -> bool {
+    let Ok(stored) = load_credentials(path) else {
+        return false;
+    };
+    if stored.expires_at <= credentials.expires_at {
+        return false;
+    }
+    *credentials = stored;
+    true
+}
+
+fn record_refresh(span: &tracing::Span, outcome: &str, started: Instant, expires_at: u64) {
+    span.record("outcome", outcome);
+    span.record("duration_ms", elapsed_ms(started));
+    span.record("credential.expires_at", expires_at);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Cross-process exclusive hold on one credential file's refresh.
+///
+/// The lock lives on a sibling `.lock` file rather than on the credential itself: the credential is
+/// replaced by rename on every refresh, so two processes locking "the credential file" would end up
+/// locking two different inodes and coordinate nothing. The sibling is created once and never
+/// renamed, which is what makes it a rendezvous.
+struct CredentialLock {
+    file: File,
+}
+
+impl CredentialLock {
+    /// Blocks until this process holds the lock, or gives up and returns `None`.
+    ///
+    /// Failing to lock is not made fatal. A read-only directory or a filesystem without advisory
+    /// locking would otherwise turn a recoverable single-writer deployment into one that cannot
+    /// refresh at all; an uncoordinated refresh is worse than a coordinated one and better than no
+    /// turn. The warning is what an operator sees when the coordination is not actually in force.
+    fn acquire(auth_path: &Path) -> Option<Self> {
+        let path = credential_lock_path(auth_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        set_private_file_mode(&mut options);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(source) => {
+                tracing::warn!(
+                    event = "chatgpt_credential_lock_unavailable",
+                    path = %path.display(),
+                    error = %source,
+                    "could not open the ChatGPT credential lock; refreshing without cross-process \
+                     coordination"
+                );
+                return None;
+            }
+        };
+        if let Err(source) = file.lock() {
+            tracing::warn!(
+                event = "chatgpt_credential_lock_unavailable",
+                path = %path.display(),
+                error = %source,
+                "could not lock the ChatGPT credential lock; refreshing without cross-process \
+                 coordination"
+            );
+            return None;
+        }
+        Some(Self { file })
+    }
+}
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a destructor has no caller to report to, and closing the file releases the \
+                      lock regardless of what an explicit unlock answers"
+        )]
+        let _ = self.file.unlock();
+    }
+}
+
+fn credential_lock_path(auth_path: &Path) -> Option<PathBuf> {
+    let name = auth_path.file_name()?;
+    let mut lock_name = OsString::from(name);
+    lock_name.push(".lock");
+    Some(auth_path.with_file_name(lock_name))
 }
 
 fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
@@ -1120,6 +1356,11 @@ fn save_credentials(path: &Path, credentials: &ChatGptCredentials) -> Result<(),
     })?;
 
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A SIGKILL between create and rename leaves a full plaintext access and refresh document
+    // behind, and the cleanup below only runs for this call's own failure. Sweeping first is what
+    // stops those accumulating on a persistent volume forever, and it also clears a leftover whose
+    // process ID this process has since been assigned.
+    sweep_stale_temporaries(path, Some(&temporary));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     set_private_file_mode(&mut options);
@@ -1145,12 +1386,81 @@ fn save_credentials(path: &Path, credentials: &ChatGptCredentials) -> Result<(),
         replace_file(&temporary, path).map_err(|source| ChatGptError::WriteAuth {
             path: path.to_path_buf(),
             source,
+        })?;
+        // Without this the rename itself can be lost on power failure while the provider has
+        // already rotated, leaving the volume holding the invalidated predecessor.
+        sync_directory(parent).map_err(|source| ChatGptError::WriteAuth {
+            path: parent.to_path_buf(),
+            source,
         })
     })();
     if result.is_err() {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of a temporary the write already failed on; the caller is being \
+                      given that write error, and a leftover 0600 temporary is not worth \
+                      replacing it with a cleanup error"
+        )]
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Removes abandoned `<stem>.tmp-*` siblings, which hold credentials in the clear.
+///
+/// `keep` is this call's own staging path, when it has one. Refreshes serialize on
+/// [`CredentialLock`] and a login is a human at a browser, so anything else matching the pattern
+/// belongs to a process that died before its rename.
+fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) {
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return;
+    };
+    let mut prefix = OsString::from(stem);
+    prefix.push(".tmp-");
+    let Some(prefix) = prefix.to_str().map(ToOwned::to_owned) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.path();
+        if Some(stale.as_path()) == keep {
+            continue;
+        }
+        let Some(name) = stale.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&stale) {
+            tracing::warn!(
+                event = "chatgpt_credential_temporary_orphaned",
+                path = %stale.display(),
+                error = %error,
+                "could not remove an abandoned ChatGPT credential temporary file"
+            );
+        } else {
+            tracing::warn!(
+                event = "chatgpt_credential_temporary_swept",
+                path = %stale.display(),
+                "removed an abandoned ChatGPT credential temporary file"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: &Path) -> io::Result<()> {
+    // Windows cannot open a directory as a file, and its rename is not the same durability
+    // contract; the file's own `sync_all` above is what that platform gets.
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1177,6 +1487,12 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "SystemTimeError carries only how far the clock sits before the epoch, which is the \
+              same fact the message already states; the operator's fix is to set the clock either \
+              way"
+)]
 fn unix_time() -> Result<u64, ChatGptError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1283,15 +1599,7 @@ pub enum ChatGptError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        io::{BufRead as _, BufReader, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
-        path::Path,
-        sync::{Arc, Mutex},
-        thread,
-        time::Duration,
-    };
+    use std::{fs, path::Path, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::{Value, json};
@@ -1301,10 +1609,13 @@ mod tests {
 
     use super::{
         AUTH_VERSION, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints, build_request_body,
-        export_credentials, extract_account_id, load_credentials, login_with_endpoints, logout,
-        parse_sse, save_credentials, status,
+        credential_lock_path, export_credentials, extract_account_id, load_credentials,
+        login_with_endpoints, logout, parse_sse, save_credentials, status,
     };
-    use crate::model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool};
+    use crate::{
+        mock::{MockResponse, MockServer},
+        model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool},
+    };
 
     fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
@@ -1321,6 +1632,34 @@ mod tests {
         assert_eq!(
             extract_account_id(&fake_access("acct-test")).expect("valid fixture"),
             "acct-test"
+        );
+    }
+
+    /// A rejected login is the one moment an operator has to tell a truncated token apart from a
+    /// token whose payload is not JSON at all, and the two used to render identically bar four
+    /// words. Neither decoder echoes token content: base64 reports the byte that cannot be part of
+    /// the token, and `serde_json` reports a position.
+    #[test]
+    fn a_malformed_access_token_reports_which_decode_failed_and_where() {
+        let bad_base64 = extract_account_id("header.not base64!.signature")
+            .expect_err("a non-base64 payload segment is rejected")
+            .to_string();
+        assert!(bad_base64.contains("invalid JWT encoding"), "{bad_base64}");
+        assert!(
+            bad_base64.len()
+                > "invalid ChatGPT authentication response: access token has invalid JWT encoding"
+                    .len(),
+            "the decoder's own diagnosis is threaded through: {bad_base64}"
+        );
+
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"not\": ");
+        let bad_json = extract_account_id(&format!("header.{payload}.signature"))
+            .expect_err("a payload that is not JSON is rejected")
+            .to_string();
+        assert!(bad_json.contains("invalid JWT JSON"), "{bad_json}");
+        assert!(
+            bad_json.contains("column"),
+            "serde_json's position survives: {bad_json}"
         );
     }
 
@@ -2001,6 +2340,303 @@ mod tests {
         assert!(requests[1].contains("chatgpt-account-id: acct-refreshed"));
     }
 
+    /// One stored credential record, so the tests below differ only in the values that matter.
+    fn credential_fixture(account: &str, refresh: &str, expires_at: u64) -> ChatGptCredentials {
+        ChatGptCredentials {
+            version: AUTH_VERSION,
+            access: Redacted::new(fake_access(account)),
+            refresh: Redacted::new(refresh.to_owned()),
+            expires_at,
+            account_id: account.to_owned(),
+        }
+    }
+
+    fn completion_stream(text: &str) -> String {
+        format!(
+            concat!(
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"}}}}\n\n"
+            ),
+            text
+        )
+    }
+
+    /// The credential-bricking race, from the losing side.
+    ///
+    /// `dekopond` builds one client per message, so two sessions near the refresh margin both hold
+    /// the same stored refresh token. The token endpoint invalidates a predecessor on every
+    /// rotation and reuse detection can revoke the whole family, so the second client must adopt
+    /// what the first wrote rather than spend a token the provider has already retired. The mock
+    /// endpoint scripts exactly one response: a client that refreshes anyway consumes it with a
+    /// token request and fails the turn.
+    #[test]
+    fn a_credential_another_process_rotated_is_adopted_rather_than_refreshed_again() {
+        let server = MockServer::start(vec![MockResponse::sse(&completion_stream("adopted"))]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+        save_credentials(
+            &path,
+            &credential_fixture("acct-fresh", "refresh-fresh", u64::MAX),
+        )
+        .expect("another process completes its refresh");
+
+        let turn = model
+            .complete(&[ModelMessage::user("hello")], &[])
+            .expect("the adopted credential must serve the turn");
+
+        assert_eq!(turn.content.as_deref(), Some("adopted"));
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the client spent a refresh token another process had already retired"
+        );
+        assert!(requests[0].contains("chatgpt-account-id: acct-fresh"));
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-fresh",
+            "the adopted credential was overwritten with the stale one"
+        );
+        assert!(
+            credential_lock_path(&path)
+                .expect("lock path")
+                .try_exists()
+                .unwrap_or(false),
+            "no lock was taken around the refresh"
+        );
+    }
+
+    /// The same adoption on the forced path: a 401 must not become a second rotation either.
+    #[test]
+    fn an_unauthorized_turn_adopts_a_newer_stored_credential_before_retrying() {
+        let server = MockServer::start(vec![
+            MockResponse::failure(401, json!({"error": {"code": "expired"}})),
+            MockResponse::sse(&completion_stream("retried")),
+        ]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        // Not inside the refresh margin, so only the 401 can trigger a refresh.
+        save_credentials(
+            &path,
+            &credential_fixture("acct-old", "refresh-old", u64::MAX - 1),
+        )
+        .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+        save_credentials(
+            &path,
+            &credential_fixture("acct-fresh", "refresh-fresh", u64::MAX),
+        )
+        .expect("another process completes its refresh");
+
+        let turn = model
+            .complete(&[ModelMessage::user("hello")], &[])
+            .expect("the retry must use the adopted credential");
+
+        assert_eq!(turn.content.as_deref(), Some("retried"));
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the forced refresh spent a retired refresh token"
+        );
+        assert!(requests[1].contains("chatgpt-account-id: acct-fresh"));
+    }
+
+    /// A rotation that reaches the provider but not the disk still has to serve the turn: the
+    /// server has already invalidated the predecessor, so the in-memory copy is the only credential
+    /// that works, and returning the write error would drop it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_credential_completes_the_turn_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = MockServer::start(vec![
+            MockResponse::json(json!({
+                "access_token": fake_access("acct-refreshed"),
+                "refresh_token": "refresh-new",
+                "expires_in": 3600
+            })),
+            MockResponse::sse(&completion_stream("rotated")),
+        ]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
+            .expect("make the credential directory unwritable");
+        let turn = model.complete(&[ModelMessage::user("hello")], &[]);
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("restore the credential directory");
+
+        let turn = turn.expect("a rotated credential must still serve the turn");
+        assert_eq!(turn.content.as_deref(), Some("rotated"));
+        assert!(server.requests()[1].contains("chatgpt-account-id: acct-refreshed"));
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-old",
+            "the write was supposed to have failed"
+        );
+    }
+
+    /// A `SIGKILL` between `create_new` and `rename` leaves a full plaintext access and refresh
+    /// document under the staging name. On a persistent volume those accumulate forever, so every
+    /// save clears the ones it finds.
+    #[test]
+    fn saving_sweeps_abandoned_credential_temporaries() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        let abandoned = temp.path().join("auth.tmp-424242");
+        let unrelated = temp.path().join("other-client.tmp-424242");
+        fs::write(&abandoned, "abandoned credential").expect("write abandoned fixture");
+        fs::write(&unrelated, "untouched").expect("write unrelated fixture");
+
+        save_credentials(&path, &credential_fixture("acct-test", "refresh-secret", 0))
+            .expect("save credentials");
+
+        assert!(
+            !abandoned.exists(),
+            "a plaintext credential temporary survived a save"
+        );
+        assert_eq!(
+            fs::read_to_string(unrelated).expect("unrelated file remains"),
+            "untouched"
+        );
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-secret"
+        );
+    }
+
+    #[test]
+    fn logout_removes_abandoned_credential_temporaries_too() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        let abandoned = temp.path().join("auth.tmp-424242");
+        let unrelated = temp.path().join("other-client.json");
+        save_credentials(&path, &credential_fixture("acct-test", "refresh-secret", 0))
+            .expect("save credentials");
+        fs::write(&abandoned, "abandoned credential").expect("write abandoned fixture");
+        fs::write(&unrelated, "untouched").expect("write unrelated fixture");
+
+        logout(Some(&path)).expect("logout succeeds");
+
+        assert!(!path.exists());
+        assert!(
+            !abandoned.exists(),
+            "logout left a plaintext credential behind under the staging name"
+        );
+        assert_eq!(
+            fs::read_to_string(unrelated).expect("unrelated file remains"),
+            "untouched"
+        );
+    }
+
+    /// `invalid_grant` means a human has to log in again; a bare `HTTP 400` could be anything.
+    #[test]
+    fn a_rejected_refresh_reports_the_oauth_error_code() {
+        let server = MockServer::start(vec![MockResponse::failure(
+            400,
+            json!({"error": "invalid_grant", "error_description": "refresh token is expired"}),
+        )]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+
+        let error = model
+            .complete(&[ModelMessage::user("hello")], &[])
+            .expect_err("a rejected refresh must fail the turn");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid_grant"), "{message}");
+        assert!(message.contains("refresh token is expired"), "{message}");
+        assert!(
+            !message.contains("refresh-old"),
+            "the credential reached the error message: {message}"
+        );
+    }
+
+    /// A quarter-hour of polling in front of a browser will see the odd dropped connection.
+    /// Aborting on one costs the operator the whole login and a fresh user code.
+    #[test]
+    fn one_dropped_poll_does_not_abort_the_device_login() {
+        let server = MockServer::start(vec![
+            MockResponse::json(json!({
+                "device_auth_id": "device-1",
+                "user_code": "CODE-1234",
+                "interval": 0
+            })),
+            MockResponse::hang_up(),
+            MockResponse::json(json!({
+                "authorization_code": "authorization-1",
+                "code_verifier": "verifier-1"
+            })),
+            MockResponse::json(json!({
+                "access_token": fake_access("acct-login"),
+                "refresh_token": "refresh-1",
+                "expires_in": 3600
+            })),
+        ]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        let mut output = Vec::new();
+
+        login_with_endpoints(
+            Some(&path),
+            ChatGptEndpoints::local(&server.base_url()),
+            &mut output,
+        )
+        .expect("a dropped poll must not end the login");
+
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-1"
+        );
+        assert_eq!(server.requests().len(), 4);
+    }
+
     #[test]
     fn subscription_model_sends_required_headers_and_decodes_text() {
         let server = MockServer::start(vec![MockResponse::sse(concat!(
@@ -2040,102 +2676,6 @@ mod tests {
         assert!(request.contains("authorization: Bearer header."));
         assert!(request.contains("chatgpt-account-id: acct-test"));
         assert!(request.contains("originator: dekopon"));
-    }
-
-    struct MockResponse {
-        status: u16,
-        content_type: &'static str,
-        body: String,
-    }
-
-    impl MockResponse {
-        fn json(body: Value) -> Self {
-            Self {
-                status: 200,
-                content_type: "application/json",
-                body: body.to_string(),
-            }
-        }
-
-        fn sse(body: &str) -> Self {
-            Self {
-                status: 200,
-                content_type: "text/event-stream",
-                body: body.to_owned(),
-            }
-        }
-    }
-
-    struct MockServer {
-        address: String,
-        requests: Arc<Mutex<Vec<String>>>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl MockServer {
-        fn start(responses: Vec<MockResponse>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
-            let address = listener
-                .local_addr()
-                .expect("mock endpoint address")
-                .to_string();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let thread_requests = Arc::clone(&requests);
-            let handle = thread::spawn(move || {
-                for response in responses {
-                    let (mut stream, _) = listener.accept().expect("accept request");
-                    let request = read_request(&mut stream);
-                    thread_requests.lock().expect("request lock").push(request);
-                    write!(
-                        stream,
-                        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response.status,
-                        response.content_type,
-                        response.body.len(),
-                        response.body
-                    )
-                    .expect("write response");
-                }
-            });
-            Self {
-                address,
-                requests,
-                handle: Some(handle),
-            }
-        }
-
-        fn base_url(&self) -> String {
-            format!("http://{}", self.address)
-        }
-    }
-
-    impl Drop for MockServer {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("mock server thread");
-            }
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
-        let mut request = String::new();
-        let mut content_length = 0_usize;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read request line");
-            request.push_str(&line);
-            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = value.trim().parse().expect("content length");
-            }
-            if line == "\r\n" {
-                break;
-            }
-        }
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body).expect("read request body");
-        request.push_str(&String::from_utf8(body).expect("UTF-8 request"));
-        request
     }
 
     fn export_fixture(path: &Path) {

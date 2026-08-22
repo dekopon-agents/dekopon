@@ -9,5 +9,7 @@
 pub mod chatgpt;
 /// Bounded generated-image clients and output types.
 pub mod image;
+#[cfg(test)]
+mod mock;
 /// Generic chat-model contract and OpenAI-compatible transport.
 pub mod model;

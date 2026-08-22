@@ -13,8 +13,14 @@ keywords = ["agents", "capabilities", "security", "types"]
 categories = ["data-structures"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[features]
+default = ["schemars"]
+# `JsonSchema` derives for every public type. Default-on for crates.io consumers; the workspace
+# dependency entry turns it off so a wasm guest build drops schemars, schemars_derive, and syn.
+schemars = ["dep:schemars"]
+
 [dependencies]
-schemars.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 

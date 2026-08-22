@@ -53,6 +53,12 @@ impl Builtin for Date {
 
         // A clock before 1970 is not a time this shell can render, and it is not a time any host
         // running this is plausibly reporting; saying so is better than rendering a negative epoch.
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "SystemTimeError carries only how far the clock sits before the epoch, and \
+                      the message already states that fact; the exact offset would also be a \
+                      host clock reading this session was not granted"
+        )]
         let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
             CommandFailure::failed("date: the host clock is set before 1970 and cannot be rendered")
         })?;

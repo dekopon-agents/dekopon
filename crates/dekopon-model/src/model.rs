@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, io::Read as _, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_core::Redacted;
@@ -395,6 +395,10 @@ impl OpenAiChatModel {
         let config = Agent::config_builder()
             .timeout_global(Some(timeout))
             .max_redirects(0)
+            // A non-2xx must stay a response rather than becoming `Error::StatusCode`, whose
+            // Display is only `http status: 429`. The endpoint's own JSON — model not found,
+            // context length, which rate limit — is the entire diagnostic and is otherwise dropped.
+            .http_status_as_error(false)
             .build();
         let agent = config.into();
         let bearer_token = bearer_token.and_then(|token| {
@@ -467,6 +471,11 @@ impl ChatModel for OpenAiChatModel {
         let mut response = request
             .send_json(&request_body)
             .map_err(|error| ModelError::Request(error.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let detail = read_error_body(response);
+            return Err(ModelError::Request(format!("HTTP {status}: {detail}")));
+        }
         let response = response
             .body_mut()
             .read_json::<ChatResponse>()
@@ -771,6 +780,46 @@ pub fn assistant_message(turn: &AssistantTurn) -> ModelMessage {
     ModelMessage::assistant(turn)
 }
 
+/// Bound on how much of a failed response is kept as a diagnostic.
+///
+/// Large enough for an OpenAI-shaped error object, small enough that an endpoint answering with an
+/// HTML error page cannot push a megabyte into a log line.
+const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
+
+/// Reads the body of a non-2xx response as a bounded, log-safe diagnostic.
+///
+/// Every transport in this crate sets `http_status_as_error(false)` precisely so this is reachable:
+/// `ureq`'s own status error renders as `http status: 429` and discards the one part of the
+/// response that says what went wrong.
+pub(crate) fn read_error_body(response: http::Response<ureq::Body>) -> String {
+    let mut body = response
+        .into_parts()
+        .1
+        .into_reader()
+        .take(MAX_ERROR_BODY_BYTES);
+    let mut text = String::new();
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "best-effort diagnostic read on a path that has already failed; a short or \
+                  interrupted body leaves whatever arrived in `text`, and reporting the read \
+                  error instead of the service's own message would lose the useful half"
+    )]
+    let _ = body.read_to_string(&mut text);
+    let text = sanitize_diagnostic(&text);
+    if text.trim().is_empty() {
+        return "no response body".to_owned();
+    }
+    text
+}
+
+/// Strips control characters so endpoint-supplied text cannot forge log structure.
+pub(crate) fn sanitize_diagnostic(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -785,6 +834,32 @@ mod tests {
         OpenAiChatModel, OpenAiTool, WireFunctionCall, WireMessage, WireToolCall,
         assistant_message, completion_url,
     };
+    use crate::mock::{MockResponse, MockServer};
+
+    /// `ureq`'s own status error renders as `http status: 429` and discards the body, which is the
+    /// only part of a failure that says whether the model name is wrong, the context is too long,
+    /// or which rate limit was hit.
+    #[test]
+    fn a_failed_completion_reports_the_endpoints_own_error_body() {
+        let server = MockServer::start(vec![MockResponse::failure(
+            429,
+            json!({"error": {"message": "Rate limit reached for gpt-test", "type": "rate_limit"}}),
+        )]);
+        let model =
+            OpenAiChatModel::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
+                .expect("model client");
+
+        let error = model
+            .complete(&[ModelMessage::user("hello")], &[])
+            .expect_err("a 429 must fail the turn");
+
+        let message = error.to_string();
+        assert!(message.contains("429"), "{message}");
+        assert!(
+            message.contains("Rate limit reached for gpt-test"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn appends_chat_completions_to_api_bases() {

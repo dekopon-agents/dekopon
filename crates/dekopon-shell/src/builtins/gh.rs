@@ -52,29 +52,26 @@ impl Builtin for Gh {
         let options = Options::parse(rest)?;
 
         let call = build_call(area, verb, options)?;
-        let missing = call
-            .requires
-            .iter()
-            .find(|capability| !context.invoker.is_granted(capability));
-        if let Some(capability) = missing {
+        if !context.invoker.is_granted(call.capability) {
             // The same exit code an unknown command word gets, but with the exact capability an
             // operator must grant, so "not configured" is never mistaken for "does not exist".
             return Err(CommandFailure::Status {
                 message: format!(
-                    "gh: {area} {verb} requires capability {capability}, which is not granted in \
-                     this session"
+                    "gh: {area} {verb} requires capability {}, which is not granted in \
+                     this session",
+                    call.capability
                 ),
                 status: crate::ExitCode::NOT_FOUND,
             });
         }
-        context.invoke_capability(call.requires[0], Value::Object(call.input))
+        context.invoke_capability(call.capability, Value::Object(call.input))
     }
 }
 
 /// One resolved subcommand: the capability it invokes and the input it assembled.
 struct Call {
-    /// The capability this subcommand dispatches to; index 0 is invoked.
-    requires: &'static [&'static str],
+    /// The capability this subcommand dispatches to.
+    capability: &'static str,
     input: Map<String, Value>,
 }
 
@@ -261,7 +258,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_optional_text(&mut input, "author", options.author.take());
             insert_paging(&mut input, &mut options);
             Call {
-                requires: &["gh.pull-request.list"],
+                capability: "gh.pull-request.list",
                 input,
             }
         }
@@ -271,7 +268,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.pull-request.read"],
+                capability: "gh.pull-request.read",
                 input,
             }
         }
@@ -286,7 +283,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
                 input.insert("includePatch".to_owned(), Value::Bool(false));
             }
             Call {
-                requires: &["gh.pull-request.files"],
+                capability: "gh.pull-request.files",
                 input,
             }
         }
@@ -296,7 +293,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.pull-request.diff"],
+                capability: "gh.pull-request.diff",
                 input,
             }
         }
@@ -308,7 +305,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.pull-request.status"],
+                capability: "gh.pull-request.status",
                 input,
             }
         }
@@ -318,7 +315,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.pull-request.reviews"],
+                capability: "gh.pull-request.reviews",
                 input,
             }
         }
@@ -341,30 +338,27 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
                 "expectedHeadSha",
                 options.expected_head_sha.take(),
             );
-            let capability: &'static [&'static str] = match event {
+            let capability = match event {
                 ReviewEvent::Approve => {
                     insert_optional_text(&mut input, "body", options.body.take());
-                    &["gh.pull-request.approve"]
+                    "gh.pull-request.approve"
                 }
                 ReviewEvent::Comment => {
                     input.insert(
                         "body".to_owned(),
                         Value::String(require_body(&mut options, "--comment")?),
                     );
-                    &["gh.pull-request.comment"]
+                    "gh.pull-request.comment"
                 }
                 ReviewEvent::RequestChanges => {
                     input.insert(
                         "body".to_owned(),
                         Value::String(require_body(&mut options, "--request-changes")?),
                     );
-                    &["gh.pull-request.request-changes"]
+                    "gh.pull-request.request-changes"
                 }
             };
-            Call {
-                requires: capability,
-                input,
-            }
+            Call { capability, input }
         }
         ("pr", "merge") => {
             let number = require_number(&mut options, &command)?;
@@ -380,7 +374,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
                 options.expected_head_sha.take(),
             );
             Call {
-                requires: &["gh.pull-request.merge"],
+                capability: "gh.pull-request.merge",
                 input,
             }
         }
@@ -394,7 +388,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             };
             insert_repo(&mut input, owner, repo);
             Call {
-                requires: &["gh.repo.read"],
+                capability: "gh.repo.read",
                 input,
             }
         }
@@ -405,7 +399,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             input.insert("path".to_owned(), Value::String(path));
             insert_optional_text(&mut input, "ref", options.git_ref.take());
             Call {
-                requires: &["gh.content.read"],
+                capability: "gh.content.read",
                 input,
             }
         }
@@ -415,7 +409,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.issue.read"],
+                capability: "gh.issue.read",
                 input,
             }
         }
@@ -426,7 +420,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_optional_text(&mut input, "state", options.state.take());
             insert_paging(&mut input, &mut options);
             Call {
-                requires: &["gh.issue.list"],
+                capability: "gh.issue.list",
                 input,
             }
         }
@@ -436,7 +430,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("number".to_owned(), Value::from(number));
             Call {
-                requires: &["gh.issue-comments.read"],
+                capability: "gh.issue-comments.read",
                 input,
             }
         }
@@ -450,7 +444,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
                 Value::String(require_body(&mut options, "issue comment")?),
             );
             Call {
-                requires: &["gh.issue.comment"],
+                capability: "gh.issue.comment",
                 input,
             }
         }
@@ -460,7 +454,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("branch".to_owned(), Value::String(branch));
             Call {
-                requires: &["gh.branch.read"],
+                capability: "gh.branch.read",
                 input,
             }
         }
@@ -470,7 +464,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             insert_repo(&mut input, owner, repo);
             input.insert("ref".to_owned(), Value::String(reference));
             Call {
-                requires: &["gh.commit.read"],
+                capability: "gh.commit.read",
                 input,
             }
         }
@@ -478,7 +472,7 @@ fn build_call(area: &str, verb: &str, mut options: Options) -> Result<Call, Comm
             let login = options.require_positional(&command, "login")?;
             input.insert("login".to_owned(), Value::String(login));
             Call {
-                requires: &["gh.user.read"],
+                capability: "gh.user.read",
                 input,
             }
         }
@@ -544,6 +538,12 @@ fn insert_paging(input: &mut Map<String, Value>, options: &mut Options) {
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for an operand the \
+              message quotes back in full; the writer of `gh pr view abc` is better served by \
+              seeing \"abc\" than by \"invalid digit found in string\""
+)]
 fn require_number(options: &mut Options, command: &str) -> Result<u64, CommandFailure> {
     let positional = options.require_positional(command, "number")?;
     let number = positional.parse::<u64>().map_err(|_| {
@@ -593,6 +593,11 @@ fn take_value(
     Ok(value.clone())
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for a flag value the \
+              message quotes back in full alongside the flag that wanted a number"
+)]
 fn take_number(arguments: &[String], index: &mut usize, flag: &str) -> Result<u64, CommandFailure> {
     let value = take_value(arguments, index, flag)?;
     value.parse::<u64>().map_err(|_| {

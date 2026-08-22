@@ -14,9 +14,10 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    AgentInventory, BrokerClient, BrokerResponse, ClientError, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ReportedAgent, ReportedAgentCapability,
-    RequestEnvelope, ResponseEnvelope, SubjectAttestation, read_frame, write_frame,
+    AgentInventory, BrokerClient, BrokerResponse, ClientError, ERROR_BROKER_UNAVAILABLE,
+    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED, FrameLimits,
+    ModelUsageReport, ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope,
+    SubjectAttestation, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
@@ -156,6 +157,34 @@ async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     broker_with_audit_bound(8).await
 }
 
+/// A broker whose replay ledger holds `maximum` identifiers and whose audit is roomy, so the
+/// ledger is the only bound that can be reached.
+async fn broker_with_replay_bound(maximum: usize) -> Arc<Broker<InMemoryAuditLog>> {
+    let registry =
+        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("load echo fixture");
+    Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-test".to_owned(),
+            echo_engine(DIRECT_POLICY, ["caller"]),
+            echo_catalog(),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
+            Arc::new(InMemoryAuditLog::new(64).expect("valid audit bound")),
+            BrokerLimits {
+                max_replay_ids: maximum,
+                ..BrokerLimits::default()
+            },
+        )
+        .expect("broker starts"),
+    )
+}
+
 async fn broker_with_audit_bound(
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
@@ -270,6 +299,10 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -315,6 +348,10 @@ async fn mapped_attestor_can_publish_informational_ui_state_without_touching_aud
         .expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
@@ -374,6 +411,10 @@ async fn unmapped_peer_receives_no_capability_information() {
     let server = BrokerServer::new(broker, BTreeMap::new(), limits).expect("server starts");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
@@ -426,6 +467,10 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let first_config = config_path.clone();
     let mut first = tokio::spawn(async move {
         run(first_config, async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+            )]
             let _ = stopped.await;
         })
         .await
@@ -449,6 +494,10 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let second_config = config_path.clone();
     let mut second = tokio::spawn(async move {
         run(second_config, async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+            )]
             let _ = stopped.await;
         })
         .await
@@ -532,6 +581,10 @@ async fn full_service_serves_the_explicit_read_only_http_listener() {
     let started_config = config_path.clone();
     let mut service = tokio::spawn(async move {
         run_with_http(started_config, Some(http_address), async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+            )]
             let _ = stopped.await;
         })
         .await
@@ -655,6 +708,10 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -679,18 +736,92 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         .await
         .expect_err("a full audit cannot authorize");
     let ClientError::Remote {
-        code: unran_code, ..
+        code: unran_code,
+        message: unran_message,
     } = never_ran
     else {
         panic!("expected a remote broker failure, got {never_ran}");
     };
-    assert_eq!(unran_code, "broker-unavailable");
+    // Nothing executed, so this is safe to resubmit — and futile. The audit log does not rotate,
+    // so every fresh invocation identifier fails on the same append until an operator raises
+    // `auditMaxRecords` or moves the file, which is why it is not the retriable class.
+    assert_eq!(unran_code, ERROR_CAPACITY_EXHAUSTED);
+    assert!(
+        unran_message.contains("operator action"),
+        "a permanent exhaustion must not read as a transient outage: {unran_message}"
+    );
     assert_ne!(
         unran_code, code,
         "a client must distinguish an effect that may have run from one that never began"
     );
 
     shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// The other permanent exhaustion, and the one a restart cannot clear: the replay ledger restores
+/// every Decision identifier from durable history, so a bound reached once is reached again on the
+/// next boot. Reporting it as `broker-unavailable` invited a client to retry forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let broker = broker_with_replay_bound(1).await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "this future's only job is to resolve; a signal and a dropped sender both \
+                      mean stop, and serve treats them identically"
+        )]
+        let _ = shutdown_receive.await;
+    }));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let first = client
+        .invoke(request("invoke-fills-the-ledger"))
+        .await
+        .expect("the first invocation reserves the only slot");
+    assert_eq!(first.outcome, InvocationOutcome::Succeeded);
+
+    let full = client
+        .invoke(request("invoke-past-the-ledger"))
+        .await
+        .expect_err("a full replay ledger cannot reserve");
+    let ClientError::Remote { code, message } = full else {
+        panic!("expected a remote broker failure, got {full}");
+    };
+    assert_eq!(code, ERROR_CAPACITY_EXHAUSTED);
+    assert_ne!(
+        code, ERROR_BROKER_UNAVAILABLE,
+        "a permanently capped broker must not be reported as briefly unavailable"
+    );
+    assert!(
+        message.contains("operator action"),
+        "the message must name what has to change: {message}"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the expect above is the assertion that the task joined; serve's own Result is \
+                  the shutdown it was just asked for, and every behavior under test was already \
+                  asserted through the client"
+    )]
     let _ = task.await.expect("server task exits");
 }
 
@@ -716,6 +847,10 @@ async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -769,6 +904,10 @@ async fn invoke_for_from_a_peer_without_a_grant_is_denied_not_erred() {
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -822,6 +961,10 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -882,12 +1025,16 @@ async fn capabilities_for_over_the_socket() {
     let granted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (granted_stop, granted_stopped) = oneshot::channel::<()>();
     let granted_task = tokio::spawn(granted.serve(granted_listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = granted_stopped.await;
     }));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let capabilities = client
-        .capabilities_for(subject(), agent("chat-agent"))
+    let (capabilities, _) = client
+        .session_surface_for(subject(), agent("chat-agent"))
         .await
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
@@ -920,12 +1067,16 @@ async fn capabilities_for_over_the_socket() {
     let ungranted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (ungranted_stop, ungranted_stopped) = oneshot::channel::<()>();
     let ungranted_task = tokio::spawn(ungranted.serve(ungranted_listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
+        )]
         let _ = ungranted_stopped.await;
     }));
 
     let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
     let refused = client
-        .capabilities_for(subject(), agent("chat-agent"))
+        .session_surface_for(subject(), agent("chat-agent"))
         .await
         .expect_err("a peer without attestor authority is refused");
     let ClientError::Remote { code, .. } = refused else {

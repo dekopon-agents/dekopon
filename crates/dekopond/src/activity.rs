@@ -28,6 +28,13 @@ struct Coordination {
 
 impl Coordination {
     fn seal(&self) {
+        // Sealing a lease that already reached SEALED or FINISHED is the no-op it looks like: a
+        // native Stop and the session's own completion race, and the later one must not reopen.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the Err payload is the current state, and every state that loses this \
+                      compare_exchange is one that already stops renewal"
+        )]
         let _ = self
             .state
             .compare_exchange(RUNNING, SEALED, Ordering::AcqRel, Ordering::Acquire);

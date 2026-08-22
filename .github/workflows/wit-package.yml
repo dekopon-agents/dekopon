@@ -131,10 +131,22 @@ jobs:
           rustup toolchain install "$PROVIDER_RUST_TOOLCHAIN" --profile minimal
           rustup override set "$PROVIDER_RUST_TOOLCHAIN"
           mkdir -p "$RUNNER_TEMP/checked-components" target/wit-package/provider-inspection
-          providers=(
-            echo gh http-probe jsonplaceholder skylight-private memory-chat
-            memory-reservation-probe provider-v0-1-compat storage-probe
-          )
+          # Derived from the tree, never a list: a provider added without touching this workflow
+          # still has its checked-in component rebuilt and compared.
+          shopt -s nullglob
+          providers=()
+          for script in examples/providers/*/build.sh; do
+            providers+=("$(basename "$(dirname "$script")")")
+          done
+          if [ ${#providers[@]} -eq 0 ]; then
+            echo 'no provider workspaces matched examples/providers/*/build.sh' >&2
+            exit 1
+          fi
+          # Every checked-in component must come from one of those workspaces, so a component whose
+          # source was deleted cannot survive as an unrebuilt binary.
+          expected=$(printf 'examples/providers/%s-provider.wasm\n' "${providers[@]}" | sort)
+          present=$(printf '%s\n' examples/providers/*-provider.wasm | sort)
+          diff <(printf '%s\n' "$expected") <(printf '%s\n' "$present")
           for provider in "${providers[@]}"; do
             artifact="examples/providers/$provider-provider.wasm"
             cp "$artifact" "$RUNNER_TEMP/checked-components/$provider.wasm"
@@ -191,6 +203,7 @@ jobs:
             crates/dekopon-provider-sdk/wit/provider.wit \
             crates/dekopon-provider-host/wit/provider.wit
           for mirror in \
+            crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/gh/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/jsonplaceholder/wit/deps/provider.wit \
@@ -205,6 +218,7 @@ jobs:
             wit/http/http.wit \
             crates/dekopon-provider-http/wit/deps/http.wit
           for mirror in \
+            crates/dekopon-broker-host/wit/deps/http.wit \
             examples/providers/gh/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit \
             examples/providers/jsonplaceholder/wit/deps/http.wit \

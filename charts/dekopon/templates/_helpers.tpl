@@ -157,6 +157,36 @@ cannot drift apart.
 {{- end -}}
 
 {{/*
+Each daemon's shutdown grace, in milliseconds. The chart reads the real value out of an inline
+config; an existingSecret is opaque here, and an inline config may leave the key out, so
+drainBudget.assumed*ShutdownGraceMs stands in for both cases. Both daemons default to 120000.
+*/}}
+{{- define "dekopon.brokerShutdownGraceMs" -}}
+{{- $parsed := dict -}}
+{{- if .Values.broker.config.inline -}}
+{{- $parsed = .Values.broker.config.inline | fromYaml -}}
+{{- end -}}
+{{- $limits := get $parsed "serverLimits" -}}
+{{- if and (kindIs "map" $limits) (hasKey $limits "shutdownGraceMs") -}}
+{{- get $limits "shutdownGraceMs" | int64 -}}
+{{- else -}}
+{{- .Values.drainBudget.assumedBrokerShutdownGraceMs | int64 -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dekopon.gatewayShutdownGraceMs" -}}
+{{- $parsed := dict -}}
+{{- if .Values.gateway.config.inline -}}
+{{- $parsed = .Values.gateway.config.inline | fromYaml -}}
+{{- end -}}
+{{- if hasKey $parsed "shutdownGraceMs" -}}
+{{- get $parsed "shutdownGraceMs" | int64 -}}
+{{- else -}}
+{{- .Values.drainBudget.assumedGatewayShutdownGraceMs | int64 -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Startup guards. Every one of these is a configuration mistake whose only other symptom is a pod
 that starts and then refuses to serve, which is much harder to read than a template error.
 */}}
@@ -208,6 +238,19 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- end -}}
 
+{{- if and .Values.gateway.service.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.service.enabled requires gateway.enabled; the broker has no TCP listener" -}}
+{{- end -}}
+{{- if .Values.gateway.service.enabled -}}
+{{- $servicePort := .Values.gateway.service.port | int -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail (printf "gateway.service.port must be an integer from 1 through 65535, got %v" .Values.gateway.service.port) -}}
+{{- end -}}
+{{- if not (kindIs "map" .Values.gateway.service.annotations) -}}
+{{- fail "gateway.service.annotations must be a map" -}}
+{{- end -}}
+{{- end -}}
+
 {{- if include "dekopon.chatgptEnabled" . -}}
 {{- if and .Values.gateway.chatgpt.inline .Values.gateway.chatgpt.existingSecret -}}
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
@@ -227,6 +270,26 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- if and .Values.gateway.chatgpt.enabled (not .Values.gateway.enabled) -}}
 {{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
+{{- end -}}
+
+{{/* The containers stop in SEQUENCE, so the pod's grace is the sum of both drains, not the larger
+of the two. Whichever daemon is still draining when the grace expires is SIGKILLed, and for the
+broker that lands mid-invocation and mid-audit-append. */}}
+{{- $brokerGraceMs := include "dekopon.brokerShutdownGraceMs" . | int64 -}}
+{{- $gatewayGraceMs := int64 0 -}}
+{{- if .Values.gateway.enabled -}}
+{{- $gatewayGraceMs = include "dekopon.gatewayShutdownGraceMs" . | int64 -}}
+{{- end -}}
+{{- $bufferSeconds := .Values.drainBudget.bufferSeconds | int64 -}}
+{{- $requiredMs := add $brokerGraceMs $gatewayGraceMs (mul $bufferSeconds 1000) -}}
+{{- $requiredSeconds := div (add $requiredMs 999) 1000 -}}
+{{- $budgetSeconds := .Values.terminationGracePeriodSeconds | int64 -}}
+{{- if lt (mul $budgetSeconds 1000) $requiredMs -}}
+{{- $drains := printf "dekopon-brokerd drains for %d ms" $brokerGraceMs -}}
+{{- if .Values.gateway.enabled -}}
+{{- $drains = printf "dekopond drains for %d ms and then %s" $gatewayGraceMs $drains -}}
+{{- end -}}
+{{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation and mid-audit-append. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
 
 {{- $chartPaths := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}

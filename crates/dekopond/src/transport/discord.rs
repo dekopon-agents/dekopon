@@ -27,7 +27,7 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
     },
 };
 
@@ -52,6 +52,8 @@ const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_ACTIVITY_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
+/// How many published rate-limit deadlines one Create Message waits out before sending anyway.
+const MAX_REST_COOLDOWN_WAITS: u8 = 2;
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 const FATAL_GATEWAY_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
@@ -116,6 +118,7 @@ impl DiscordTransport {
                 http,
                 production,
                 rest_lock: Mutex::new(()),
+                rest_cooldown_until: std::sync::Mutex::new(None),
                 activity_cooldown_until: std::sync::Mutex::new(None),
             }),
             gateway_url: None,
@@ -334,7 +337,7 @@ impl DiscordTransport {
             match frame {
                 Some(Ok(Message::Text(text))) => {
                     return serde_json::from_str::<Value>(&text)
-                        .map_err(|_| TransportError::Response);
+                        .map_err(TransportError::MalformedResponse);
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     self.socket
@@ -451,6 +454,11 @@ impl DiscordTransport {
     }
 
     async fn send(&mut self, value: Value) -> Result<(), TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let encoded = serde_json::to_string(&value).map_err(|_| TransportError::Response)?;
         self.socket
             .as_mut()
@@ -627,8 +635,17 @@ pub(crate) struct DiscordReplier {
     token: Redacted<String>,
     http: reqwest::Client,
     production: bool,
-    /// Serializes Create Message calls so reactive rate-limit waits cannot race each other.
+    /// Serializes REST requests so reactive rate-limit waits cannot race each other.
+    ///
+    /// Held across one request and nothing else. Sleeping under it made one throttled or multi-chunk
+    /// reply block every other session's answer, and a model waiting on `fetch_chat_asset`, for as
+    /// long as [`MAX_RATE_LIMIT_WAIT`].
     rest_lock: Mutex<()>,
+    /// When Discord's last 429 said Create Message may be tried again.
+    ///
+    /// Published rather than only slept on, so a second reply waits out the same deadline instead of
+    /// spending its own single retry rediscovering it.
+    rest_cooldown_until: std::sync::Mutex<Option<Instant>>,
     /// Typing is cosmetic: a 429 suppresses later pulses until Discord's own retry deadline rather
     /// than sleeping under the final-reply lock or delaying the answer.
     activity_cooldown_until: std::sync::Mutex<Option<Instant>>,
@@ -653,10 +670,17 @@ impl ChatReplier for DiscordReplier {
                 return Err(TransportError::Response);
             }
             let OutboundReply { text, mut image } = reply;
-            let _guard = self.rest_lock.lock().await;
             let mut accepted = 0_usize;
             let mut last_id = None;
-            for (index, chunk) in split_message(&text).into_iter().enumerate() {
+            // The REST lock is taken per request rather than per reply. One answer's chunks still
+            // arrive in order because this loop awaits each one, and no second answer can be
+            // posting into the same conversation at the same time — admission control serializes a
+            // conversation against itself. What the reply-wide lock did add was making every other
+            // session, and every attachment refresh, wait out this reply's rate limit.
+            for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS)
+                .into_iter()
+                .enumerate()
+            {
                 let mut body = json!({
                     "content": chunk,
                     "allowed_mentions": {
@@ -732,7 +756,7 @@ impl ChatActivity for DiscordReplier {
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
@@ -786,25 +810,22 @@ impl DiscordReplier {
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let encoded = serde_json::to_vec(body).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
-            let response = self
-                .http
-                .post(&url)
-                .header("authorization", format!("Bot {}", self.token.expose()))
-                .header("content-type", "application/json")
-                .body(encoded.clone())
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            let response = self.post_message(&url, &encoded).await?;
             if response.status().as_u16() == 429 {
                 let bytes = response
                     .bytes()
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .ok_or(TransportError::Response)?;
@@ -817,8 +838,8 @@ impl DiscordReplier {
                         code: "http-429".to_owned(),
                     });
                 }
-                let wait = Duration::from_secs_f64(seconds);
-                tokio::time::sleep(wait).await;
+                // The wait itself happens in `post_message`, outside the REST lock.
+                self.publish_rest_cooldown(seconds);
                 retried = true;
                 continue;
             }
@@ -853,9 +874,19 @@ impl DiscordReplier {
             "filename": filename,
             "description": "Generated image",
         }]);
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "mime_str only rejects strings that are not a media type, and \
+                          GeneratedImage::media_type returns a fixed IANA type"
+            )]
             let part = reqwest::multipart::Part::bytes(bytes.clone())
                 .file_name(filename.clone())
                 .mime_str(&media_type)
@@ -863,21 +894,24 @@ impl DiscordReplier {
             let form = reqwest::multipart::Form::new()
                 .text("payload_json", payload.clone())
                 .part("files[0]", part);
+            // An attachment goes out through the same lock discipline as a text chunk: it is one
+            // more Create Message against the same route, and a reply that posts an image is
+            // exactly the reply most worth not holding a shared lock through.
             let response = self
-                .http
-                .post(&url)
-                .header("authorization", format!("Bot {}", self.token.expose()))
-                .multipart(form)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+                .send_rest(
+                    self.http
+                        .post(&url)
+                        .header("authorization", format!("Bot {}", self.token.expose()))
+                        .multipart(form),
+                )
+                .await?;
             if response.status().as_u16() == 429 {
                 let response_bytes = response
                     .bytes()
                     .await
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&response_bytes)
-                    .map_err(|_| TransportError::Response)?;
+                    .map_err(TransportError::MalformedResponse)?;
                 let seconds = body["retry_after"]
                     .as_f64()
                     .ok_or(TransportError::Response)?;
@@ -890,7 +924,8 @@ impl DiscordReplier {
                         code: "http-429".to_owned(),
                     });
                 }
-                tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+                // The wait itself happens in `send_rest`, outside the REST lock.
+                self.publish_rest_cooldown(seconds);
                 retried = true;
                 continue;
             }
@@ -911,6 +946,66 @@ impl DiscordReplier {
             }
             return Ok(response_id.to_owned());
         }
+    }
+
+    /// Sends one JSON Create Message, serialized against this transport's other REST calls.
+    async fn post_message(
+        &self,
+        url: &str,
+        encoded: &[u8],
+    ) -> Result<reqwest::Response, TransportError> {
+        self.send_rest(
+            self.http
+                .post(url)
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .header("content-type", "application/json")
+                .body(encoded.to_vec()),
+        )
+        .await
+    }
+
+    /// Sends one prepared REST request, serialized against this transport's other REST calls.
+    ///
+    /// The lock covers the request and nothing else. Any rate-limit wait is served *before* it is
+    /// taken, so a throttled reply holds up neither another session's answer nor a mid-prompt
+    /// attachment refresh.
+    async fn send_rest(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, TransportError> {
+        // Bounded rather than a wait loop: at most one deadline is outstanding when the call
+        // arrives, and at most one more can be published while it queues on the lock. Past that it
+        // sends and lets Discord answer, because a reply parked forever is not an improvement on a
+        // reply that is refused.
+        for _ in 0..MAX_REST_COOLDOWN_WAITS {
+            let Some(wait) = self.rest_cooldown() else {
+                break;
+            };
+            tokio::time::sleep(wait).await;
+        }
+        let _guard = self.rest_lock.lock().await;
+        request
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))
+    }
+
+    /// Publishes Discord's own retry deadline so every later request waits it out before the lock.
+    fn publish_rest_cooldown(&self, seconds: f64) {
+        *self
+            .rest_cooldown_until
+            .lock()
+            .expect("Discord REST cooldown") =
+            Some(Instant::now() + Duration::from_secs_f64(seconds));
+    }
+
+    /// How long Discord's last 429 still asks Create Message to wait, if at all.
+    fn rest_cooldown(&self) -> Option<Duration> {
+        let until = (*self
+            .rest_cooldown_until
+            .lock()
+            .expect("Discord REST cooldown"))?;
+        until.checked_duration_since(Instant::now())
     }
 
     fn allows_asset_url(&self, raw: &str) -> bool {
@@ -998,17 +1093,20 @@ impl DiscordReplier {
         if !is_snowflake(channel_id) || !is_snowflake(message_id) || !is_snowflake(attachment_id) {
             return Err(TransportError::Response);
         }
-        let _guard = self.rest_lock.lock().await;
-        let response = self
-            .http
-            .get(format!(
-                "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}",
-                self.endpoint
-            ))
-            .header("authorization", format!("Bot {}", self.token.expose()))
-            .send()
-            .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        // Serialized with the reply path, but only for the request: reading the body back is this
+        // session's own business and no other caller's rate limit.
+        let response = {
+            let _guard = self.rest_lock.lock().await;
+            self.http
+                .get(format!(
+                    "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}",
+                    self.endpoint
+                ))
+                .header("authorization", format!("Bot {}", self.token.expose()))
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?
+        };
         let body = decode(response).await?;
         let url = body["attachments"]
             .as_array()
@@ -1068,39 +1166,6 @@ fn pending_assets(
         .collect()
 }
 
-fn split_message(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let rest = &text[start..];
-        // Discord enforces this in its UTF-16 implementation. Counting scalar values would let a
-        // chunk of 2,000 astral emoji through as 4,000 UTF-16 code units and get the whole answer
-        // rejected.
-        let mut units = 0;
-        let mut end = text.len();
-        for (index, character) in rest.char_indices() {
-            let next = units + character.len_utf16();
-            if next > MAX_MESSAGE_CHARS {
-                end = start + index;
-                break;
-            }
-            units = next;
-        }
-        if end < text.len()
-            && let Some(newline) = text[start..end].rfind('\n')
-            && newline > 0
-        {
-            end = start + newline + 1;
-        }
-        chunks.push(text[start..end].to_owned());
-        start = end;
-    }
-    chunks
-}
-
 fn is_snowflake(value: &str) -> bool {
     value
         .parse::<u64>()
@@ -1133,6 +1198,13 @@ fn is_fatal(error: &TransportError) -> bool {
 /// Adds the fixed v10 JSON query after proving the service-selected URL cannot receive the token
 /// outside Discord (or the explicit loopback test boundary).
 fn gateway_url(raw: &str, production: bool) -> Result<String, TransportError> {
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "url::ParseError names a syntax rule in a fixed string, and the three checks \
+                  below reject a well-formed but unacceptable gateway URL as the same \
+                  TransportError::Response; the distinction an operator acts on is whether \
+                  Discord's URL was refused at all"
+    )]
     let mut url = reqwest::Url::parse(raw).map_err(|_| TransportError::Response)?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(TransportError::Response);
@@ -1231,7 +1303,8 @@ async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
-    let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
+    let body =
+        serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() {
         return Ok(body);
     }
@@ -1247,7 +1320,8 @@ mod unit_tests {
     use std::time::Duration;
 
     use super::{
-        DiscordTransport, SessionStarts, allowed_asset_url, gateway_url, is_fatal, split_message,
+        DiscordTransport, MAX_MESSAGE_CHARS, SessionStarts, allowed_asset_url, gateway_url,
+        is_fatal, split_message,
     };
     use crate::{config::ActivityMode, transport::TransportError};
     use tokio::time::Instant;
@@ -1315,7 +1389,7 @@ mod unit_tests {
     #[test]
     fn long_answers_split_without_losing_text() {
         let answer = format!("{}\n{}", "a".repeat(1_999), "🦀".repeat(2_001));
-        let chunks = split_message(&answer);
+        let chunks = split_message(&answer, MAX_MESSAGE_CHARS);
         assert!(
             chunks
                 .iter()

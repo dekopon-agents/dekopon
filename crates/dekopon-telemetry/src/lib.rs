@@ -1,9 +1,9 @@
 //! Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 //!
-//! Both the unprivileged runner and the privileged broker export their own spans, so exporter
-//! construction lives here rather than in either binary. The crate deliberately depends on no
-//! Dekopon crate: it must remain linkable from the runner without dragging broker code into the
-//! runner's dependency tree, which CI rejects.
+//! Every exporting Dekopon process — the unprivileged runner, the privileged broker, and the chat
+//! gateway — exports its own spans, so exporter construction lives here rather than in any one
+//! binary. The crate deliberately depends on no Dekopon crate: it must remain linkable from the
+//! runner without dragging broker code into the runner's dependency tree, which CI rejects.
 //!
 //! # Authority
 //!
@@ -12,7 +12,7 @@
 //! so a token is never accepted as a command-line argument, never written to a configuration file
 //! this crate parses, and never attached to a span attribute or log field.
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
 
 use async_trait::async_trait;
 use opentelemetry::{
@@ -30,9 +30,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 /// Wire transport used to reach an OTLP receiver.
 ///
-/// Both are first-class. A receiver reached through a path-routing reverse proxy generally wants
-/// `Grpc`, whose method paths are fixed by the protobuf service definition; a receiver behind a
-/// plain HTTP route wants `Http`, whose signal paths are appended to the configured base.
+/// Both are first-class, and both reach an `https://` endpoint through WebPKI roots. A receiver
+/// reached through a path-routing reverse proxy generally wants `Grpc`, whose method paths are
+/// fixed by the protobuf service definition; a receiver behind a plain HTTP route wants `Http`,
+/// whose signal paths are appended to the configured base.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
@@ -81,11 +82,19 @@ pub struct ExporterSettings {
     transport: Transport,
     service_name: String,
     executable_name: String,
+    service_version: String,
     timeout: Duration,
+    /// Built on first use and shared by both signals: every `reqwest::blocking::Client` owns a
+    /// private runtime thread and connection pool, and one process needs one, not one per signal.
+    http_client: OnceLock<OtlpHttpClient>,
 }
 
 impl ExporterSettings {
     /// Validates raw settings before any exporter is constructed.
+    ///
+    /// `service_version` becomes the `service.version` resource attribute; it is the *calling*
+    /// executable's version, normally `env!("CARGO_PKG_VERSION")` at the call site. A blank value
+    /// falls back to this crate's own version, which is correct only inside this workspace.
     ///
     /// # Errors
     ///
@@ -96,6 +105,7 @@ impl ExporterSettings {
         transport: Transport,
         service_name: &str,
         executable_name: &str,
+        service_version: &str,
         timeout: Duration,
     ) -> Result<Self, TelemetryError> {
         let endpoint = endpoint.trim();
@@ -139,12 +149,18 @@ impl ExporterSettings {
                 "OTLP export timeout must be greater than zero".to_owned(),
             ));
         }
+        let service_version = match service_version.trim() {
+            "" => env!("CARGO_PKG_VERSION"),
+            version => version,
+        };
         Ok(Self {
             endpoint: endpoint.to_owned(),
             transport,
             service_name: service_name.to_owned(),
             executable_name: executable_name.to_owned(),
+            service_version: service_version.to_owned(),
             timeout,
+            http_client: OnceLock::new(),
         })
     }
 
@@ -160,7 +176,10 @@ impl ExporterSettings {
         &self.service_name
     }
 
-    /// Export timeout applied to each batch and to the final shutdown flush.
+    /// Export timeout applied to each batch, and intended for the final shutdown flush.
+    ///
+    /// The batch half is enforced here; the flush half depends on the caller passing this value to
+    /// `shutdown_with_timeout` rather than the SDK's own default.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
@@ -176,10 +195,19 @@ impl ExporterSettings {
         Resource::builder()
             .with_service_name(self.service_name.clone())
             .with_attributes([
-                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                KeyValue::new("service.version", self.service_version.clone()),
                 KeyValue::new("process.executable.name", self.executable_name.clone()),
             ])
             .build()
+    }
+
+    /// Returns the process's single OTLP HTTP client, building it on first use.
+    fn http_client(&self) -> Result<OtlpHttpClient, TelemetryError> {
+        if let Some(client) = self.http_client.get() {
+            return Ok(client.clone());
+        }
+        let client = OtlpHttpClient::new(self.timeout)?;
+        Ok(self.http_client.get_or_init(|| client).clone())
     }
 
     /// Builds the batching tracer provider for this process.
@@ -198,7 +226,7 @@ impl ExporterSettings {
                 .build(),
             Transport::Http => builder
                 .with_http()
-                .with_http_client(OtlpHttpClient::new(self.timeout)?)
+                .with_http_client(self.http_client()?)
                 .with_protocol(Protocol::HttpBinary)
                 .with_endpoint(signal_endpoint(&self.endpoint, "traces"))
                 .with_timeout(self.timeout)
@@ -230,7 +258,7 @@ impl ExporterSettings {
                 .build(),
             Transport::Http => builder
                 .with_http()
-                .with_http_client(OtlpHttpClient::new(self.timeout)?)
+                .with_http_client(self.http_client()?)
                 .with_protocol(Protocol::HttpBinary)
                 .with_endpoint(signal_endpoint(&self.endpoint, "logs"))
                 .with_timeout(self.timeout)
@@ -277,10 +305,27 @@ impl OtlpHttpClient {
             })
             .map_err(TelemetryError::HttpClientThread)?
             .join()
-            .map_err(|_| TelemetryError::HttpClientThreadPanicked)?
+            .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
+                message: panic_message(&*payload),
+            })?
             .map_err(TelemetryError::HttpClient)?;
         Ok(Self(client))
     }
+}
+
+/// Recovers the printable message from a panic payload.
+///
+/// A panic payload is the one failure a `Result` cannot carry, so the message has to be lifted
+/// out here or it is lost with the box. `std::panic` stores a literal message as `&'static str`
+/// and a formatted one as `String`; anything else came from `panic_any` and has no text at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "no panic message".to_owned()
 }
 
 #[async_trait]
@@ -362,8 +407,11 @@ pub enum TelemetryError {
     #[error("could not start OTLP HTTP client builder")]
     HttpClientThread(#[source] std::io::Error),
     /// The dedicated HTTP client thread panicked.
-    #[error("OTLP HTTP client builder panicked")]
-    HttpClientThreadPanicked,
+    #[error("OTLP HTTP client builder panicked: {message}")]
+    HttpClientThreadPanicked {
+        /// The panic's own message; a bare "the builder panicked" names no cause to act on.
+        message: String,
+    },
     /// The reqwest client could not be constructed.
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
@@ -380,9 +428,35 @@ pub enum TelemetryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExporterSettings, TraceContextParts, Transport, remote_context, signal_endpoint};
+    use super::{
+        ExporterSettings, TelemetryError, TraceContextParts, Transport, panic_message,
+        remote_context, signal_endpoint,
+    };
     use opentelemetry::trace::TraceContextExt as _;
     use std::time::Duration;
+
+    /// The panic payload is the only account of why the client thread died, and it is the whole
+    /// reason the failure is reachable: a builder that panics says what it could not build —
+    /// a runtime it could not spawn, a TLS root store it could not load. Reporting "the builder
+    /// panicked" and nothing else leaves an operator with the fact of a dead thread and no cause.
+    #[test]
+    fn a_client_thread_panic_keeps_its_message() {
+        let literal = std::panic::catch_unwind(|| panic!("failed to create tokio runtime"))
+            .expect_err("the closure panics");
+        assert_eq!(panic_message(&*literal), "failed to create tokio runtime");
+
+        let formatted = std::panic::catch_unwind(|| panic!("{} roots missing", 3))
+            .expect_err("the closure panics");
+        assert_eq!(panic_message(&*formatted), "3 roots missing");
+
+        assert_eq!(
+            TelemetryError::HttpClientThreadPanicked {
+                message: panic_message(&*literal),
+            }
+            .to_string(),
+            "OTLP HTTP client builder panicked: failed to create tokio runtime"
+        );
+    }
 
     #[test]
     fn generic_otlp_http_endpoint_gets_signal_paths() {
@@ -418,9 +492,12 @@ mod tests {
     #[test]
     fn settings_reject_blank_and_zero_values() {
         let timeout = Duration::from_secs(5);
-        assert!(ExporterSettings::new("  ", Transport::Http, "svc", "exe", timeout).is_err());
         assert!(
-            ExporterSettings::new("http://host", Transport::Http, " ", "exe", timeout).is_err()
+            ExporterSettings::new("  ", Transport::Http, "svc", "exe", "1.2.3", timeout).is_err()
+        );
+        assert!(
+            ExporterSettings::new("http://host", Transport::Http, " ", "exe", "1.2.3", timeout)
+                .is_err()
         );
         assert!(
             ExporterSettings::new(
@@ -428,12 +505,21 @@ mod tests {
                 Transport::Http,
                 "svc",
                 "exe",
+                "1.2.3",
                 Duration::from_millis(0)
             )
             .is_err()
         );
         assert!(
-            ExporterSettings::new("http://host", Transport::Grpc, "svc", "exe", timeout).is_ok()
+            ExporterSettings::new(
+                "http://host",
+                Transport::Grpc,
+                "svc",
+                "exe",
+                "1.2.3",
+                timeout
+            )
+            .is_ok()
         );
     }
 
@@ -446,7 +532,8 @@ mod tests {
         for transport in [Transport::Grpc, Transport::Http] {
             for endpoint in ["http://host/api/default?org=x", "http://host/api/default#f"] {
                 assert!(
-                    ExporterSettings::new(endpoint, transport, "svc", "exe", timeout).is_err(),
+                    ExporterSettings::new(endpoint, transport, "svc", "exe", "1.2.3", timeout)
+                        .is_err(),
                     "accepted {endpoint} on {transport}"
                 );
             }
@@ -462,10 +549,63 @@ mod tests {
             "token@observe.example:4317",
         ] {
             assert!(
-                ExporterSettings::new(endpoint, Transport::Http, "svc", "exe", timeout).is_err(),
+                ExporterSettings::new(endpoint, Transport::Http, "svc", "exe", "1.2.3", timeout)
+                    .is_err(),
                 "accepted endpoint userinfo in {endpoint}"
             );
         }
+    }
+
+    /// `service.version` describes the executable that emitted the span, not the library that
+    /// built its exporter. Reading it from this crate's `CARGO_PKG_VERSION` is right only while
+    /// every workspace crate shares one version, and simply wrong for a crates.io consumer.
+    #[test]
+    fn service_version_comes_from_the_caller_and_falls_back_to_this_crate() {
+        let timeout = Duration::from_secs(5);
+        let version = |service_version| {
+            ExporterSettings::new(
+                "http://host",
+                Transport::Http,
+                "svc",
+                "exe",
+                service_version,
+                timeout,
+            )
+            .expect("valid settings")
+            .resource()
+            .get(&opentelemetry::Key::from_static_str("service.version"))
+            .expect("the resource carries a service version")
+            .to_string()
+        };
+
+        assert_eq!(version("4.5.6"), "4.5.6");
+        assert_eq!(version("  "), env!("CARGO_PKG_VERSION"));
+    }
+
+    /// One process needs one blocking client, not one per signal: each `reqwest::blocking::Client`
+    /// owns a private runtime thread and connection pool for as long as the process lives.
+    #[test]
+    fn both_signals_share_one_blocking_http_client() {
+        let settings = ExporterSettings::new(
+            "http://host",
+            Transport::Http,
+            "svc",
+            "exe",
+            "1.2.3",
+            Duration::from_secs(5),
+        )
+        .expect("valid settings");
+
+        assert!(
+            settings.http_client.get().is_none(),
+            "a client was built before any signal asked for one"
+        );
+        let _traces = settings.http_client().expect("the trace signal builds one");
+        let _logs = settings.http_client().expect("the log signal reuses it");
+        assert!(
+            settings.http_client.get().is_some(),
+            "the client is rebuilt per signal instead of being shared"
+        );
     }
 
     /// A rebuilt parent must stay byte-identical and remote, or broker spans silently start a new

@@ -16,7 +16,10 @@ pub struct ServiceStatus {
 
 #[derive(Debug, Default)]
 struct StatusInner {
-    agents: RwLock<AgentInventory>,
+    // The inventory is whole-snapshot replaced and read-only afterwards, so readers take a refcount
+    // rather than a deep copy: a dashboard render otherwise cloned up to a 2 MiB frame's worth of
+    // nested Vec<String> inside the read guard, once per in-flight request.
+    agents: RwLock<Arc<AgentInventory>>,
     inventory_reports: AtomicU64,
     tokens: RwLock<TokenTotals>,
 }
@@ -69,19 +72,20 @@ impl ServiceStatus {
             .inner
             .agents
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = inventory;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(inventory);
         increment(&self.inner.inventory_reports);
     }
 
     /// Returns the latest complete gateway inventory and how many replacements were received.
     #[must_use]
-    pub fn agents(&self) -> (AgentInventory, u64) {
-        let inventory = self
-            .inner
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+    pub fn agents(&self) -> (Arc<AgentInventory>, u64) {
+        let inventory = Arc::clone(
+            &self
+                .inner
+                .agents
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         (
             inventory,
             self.inner.inventory_reports.load(Ordering::Relaxed),
@@ -135,6 +139,11 @@ impl ServiceStatus {
 }
 
 fn increment(counter: &AtomicU64) {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the update closure returns Some unconditionally, so fetch_update's Err half — \
+                  the closure declining the update — is unconstructible here"
+    )]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(1))
     });

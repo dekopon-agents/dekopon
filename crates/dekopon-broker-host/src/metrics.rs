@@ -398,12 +398,21 @@ fn increment(counter: &AtomicU64) {
 }
 
 fn add(counter: &AtomicU64, value: u64) {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the closure always returns `Some`, so `fetch_update` cannot report failure here"
+    )]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(value))
     });
 }
 
 fn update_max(counter: &AtomicU64, candidate: u64) {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the closure returns `None` exactly when the observed maximum already wins, so \
+                  the `Err` is the intended no-op rather than a failure"
+    )]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         (candidate > current).then_some(candidate)
     });

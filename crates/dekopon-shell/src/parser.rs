@@ -1019,6 +1019,12 @@ const COMPOUND_ASSIGNMENT: &str =
 const BITWISE: &str = "bitwise operators are not supported; this arithmetic is numeric only, so use `jq` for bit manipulation";
 const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "both discarded values cover a literal this scanner already shape-validated as an \
+              ASCII digit run with at most one interior dot: ParseFloatError is unreachable and \
+              ParseIntError can only be overflow, which the message it is replaced by states"
+)]
 fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, ParseError> {
     let mut tokens = Vec::new();
     let bytes = source.as_bytes();

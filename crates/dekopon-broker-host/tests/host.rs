@@ -9,7 +9,8 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, HTTP_WIT, PROVIDER_WIT, STORAGE_WIT,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, HTTP_WIT,
+    PROVIDER_WIT, STORAGE_WIT,
 };
 use dekopon_capability::{
     AuthorizedInvocation, EffectKind, ExecutionConstraints, HttpConstraints, Idempotency,
@@ -19,6 +20,7 @@ use dekopon_capability::{
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, TraceId};
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -153,6 +155,11 @@ fn mock_http_stalled() -> (String, Receiver<Vec<u8>>) {
                 Ok(read) => request.extend_from_slice(&buffer[..read]),
             }
         }
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "this fixture exists to hang rather than to be read; a test that gave up on \
+                      the channel and dropped the receiver is a normal way for this send to fail"
+        )]
         let _ = sender.send(request);
         // Hold the connection open past the invocation deadline without ever responding.
         thread::sleep(Duration::from_secs(5));
@@ -708,6 +715,213 @@ async fn rejects_zero_wasm_resource_ceilings() {
             name: "max_memories"
         }
     ));
+}
+
+/// The published artifact digest describes the exact buffer Cranelift compiled.
+#[tokio::test(flavor = "multi_thread")]
+async fn artifact_digest_describes_the_compiled_buffer() {
+    let source = fixture("echo-provider.wasm");
+    let registry = BrokerProviderRegistry::load([source.clone()], BrokerHostLimits::default())
+        .await
+        .expect("provider loads");
+    let metadata = registry
+        .loaded_provider_metadata()
+        .next()
+        .expect("one loaded provider");
+
+    let bytes = std::fs::read(&source).expect("read artifact");
+    let digest = Sha256::digest(&bytes);
+    let expected = digest.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write as _;
+        write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+        text
+    });
+    assert_eq!(metadata.artifact_sha256, expected);
+    assert_eq!(metadata.artifact_bytes, bytes.len() as u64);
+}
+
+/// Loading a command-word provider proves the export statically instead of instantiating twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_word_provider_is_instantiated_once_at_load() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("memory-reservation-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("command-word provider loads");
+    assert_eq!(registry.command_words(), vec!["recall".to_owned()]);
+
+    let stats = registry.metrics().snapshot();
+    assert_eq!(
+        stats.component_instantiations, 1,
+        "describe is the only instantiation a load needs"
+    );
+    assert_eq!(stats.stores_created, 1, "{stats:?}");
+}
+
+/// An aggregate ceiling below one store could never admit an invocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
+    let limits = BrokerHostLimits::default();
+    let options = BrokerHostOptions {
+        max_total_memory_bytes: Some(limits.max_memory_bytes - 1),
+        ..BrokerHostOptions::default()
+    };
+    let error = BrokerProviderRegistry::load_with_options(
+        [fixture("echo-provider.wasm")],
+        limits,
+        None,
+        &options,
+    )
+    .await
+    .expect_err("an unusable aggregate ceiling must fail at load");
+    assert!(
+        matches!(
+            error,
+            BrokerHostError::InvalidLimit {
+                name: "max_total_memory_bytes"
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+/// A second store is refused rather than OOM-killed once the aggregate ceiling is reserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
+    let limits = BrokerHostLimits::default();
+    let options = BrokerHostOptions {
+        // Exactly one live store fits.
+        max_total_memory_bytes: Some(limits.max_memory_bytes),
+        ..BrokerHostOptions::default()
+    };
+    let registry = std::sync::Arc::new(
+        BrokerProviderRegistry::load_with_options(
+            [fixture("http-probe-provider.wasm")],
+            limits,
+            None,
+            &options,
+        )
+        .await
+        .expect("provider loads under an aggregate ceiling"),
+    );
+
+    let (authority, request) = mock_http_stalled();
+    let mut constraints = http_constraints(authority.clone(), "GET");
+    constraints.timeout_ms = 2_000;
+    let holding = tokio::spawn({
+        let registry = std::sync::Arc::clone(&registry);
+        let authority = authority.clone();
+        async move {
+            registry
+                .invoke(
+                    authorized(
+                        "http-probe.fetch".parse().expect("capability"),
+                        json!({"uri": format!("http://{authority}/stalled")}),
+                        constraints,
+                    ),
+                    None,
+                )
+                .await
+        }
+    });
+    // The request bytes only arrive once the guest is inside its host call, which proves the first
+    // store is alive and holding the whole reservation.
+    request
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stalled fixture receives the first request");
+
+    let error = registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().expect("capability"),
+                json!({"uri": format!("http://{authority}/second")}),
+                http_constraints(authority.clone(), "GET"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a second concurrent store exceeds the aggregate ceiling")
+        .error;
+    assert!(
+        matches!(
+            error.as_ref(),
+            BrokerHostError::MemoryBudgetExhausted { .. }
+        ),
+        "{error:?}"
+    );
+
+    let held = holding.await.expect("held invocation joins");
+    assert!(held.is_err(), "the stalled invocation must time out");
+    // The refused store released nothing it never took, and the held one released everything.
+    registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().expect("capability"),
+                json!({"uri": format!("http://{authority}/third")}),
+                http_constraints(authority, "GET"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("the fixture never answers, but the store is admitted");
+}
+
+/// A warm compilation cache serves a later start from the same directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistent_compilation_cache_serves_a_second_load() {
+    let directory = tempfile::tempdir().expect("cache directory");
+    let options = BrokerHostOptions {
+        compile_cache_dir: Some(directory.path().canonicalize().expect("canonical cache")),
+        ..BrokerHostOptions::default()
+    };
+    let cold = BrokerProviderRegistry::load_with_options(
+        [fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("cold load populates the cache");
+    let cold_digest = cold
+        .loaded_provider_metadata()
+        .next()
+        .expect("one provider")
+        .artifact_sha256;
+
+    let warm = BrokerProviderRegistry::load_with_options(
+        [fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("warm load reads the cache");
+    let warm_metadata = warm
+        .loaded_provider_metadata()
+        .next()
+        .expect("one provider");
+    // The digest is of the artifact bytes, never of a cache entry, so a hit cannot change it.
+    assert_eq!(warm_metadata.artifact_sha256, cold_digest);
+
+    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let output = warm
+        .invoke(
+            authorized(capability, json!({"message": "warm"}), constraints_5s()),
+            None,
+        )
+        .await
+        .expect("a cached component still invokes");
+    assert_eq!(output.output["message"], json!("warm"));
+}
+
+fn constraints_5s() -> ExecutionConstraints {
+    ExecutionConstraints {
+        timeout_ms: 5_000,
+        max_output_bytes: 4_096,
+        http: None,
+        storage: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

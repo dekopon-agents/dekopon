@@ -15,7 +15,6 @@ default-run = "dekopon-run"
 include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
-async-trait.workspace = true
 clap.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
@@ -26,10 +25,7 @@ dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
-opentelemetry-http.workspace = true
-opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
-reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

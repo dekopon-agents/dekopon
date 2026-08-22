@@ -5,18 +5,67 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
-    ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageNamespace,
+    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
+    StorageAccess, StorageConstraints, StorageInterface, StorageNamespace,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TraceId,
+};
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeGrant,
-    ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
-    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
-    is_reserved_memory_route, verify_audit_chain,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, BrokerBuildError, ChatMemoryConfig,
+    ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError,
+    FileAuditLog, InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints,
+    encode_host_limits, encode_memory_config, encode_storage_limits, is_reserved_memory_route,
+    verify_audit_chain,
 };
+
+/// A terminal execution event, for the record shapes a decision-only fixture never reaches.
+fn execution(invocation: &str) -> AuditEvent {
+    AuditEvent::Execution {
+        invocation: invocation
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        trace: "trace-test"
+            .parse::<TraceId>()
+            .expect("valid trace fixture"),
+        principal: Some(
+            "caller"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        actor: Some(Actor::Agent {
+            agent: "reviewer".parse::<AgentId>().expect("valid agent fixture"),
+        }),
+        via: None,
+        attested_subject: None,
+        capability: "echo.echo"
+            .parse::<CapabilityId>()
+            .expect("valid capability fixture"),
+        provider: Some("echo".parse().expect("valid provider fixture")),
+        authorized_by: Some(
+            "broker"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        decision_id: format!("decision-{invocation}"),
+        policy_revision: Some("policy-test".to_owned()),
+        policy_ids: vec!["allow-echo".to_owned()],
+        policy_digest: None,
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        idempotency: Idempotency::Idempotent,
+        credential: None,
+        outcome: InvocationOutcome::Succeeded,
+        duration_ms: 3,
+        error: None,
+        output_digest: Some(format!("sha256:{}", "b".repeat(64))),
+        http_calls: Vec::new(),
+        storage_scope_commitment: None,
+        storage: None,
+    }
+}
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {
@@ -535,6 +584,103 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     }
 }
 
+/// A permanent exhaustion is not a momentary outage. The replay ledger never evicts and is
+/// restored from durable history at startup, and the audit log does not rotate, so a client told
+/// to resubmit under a fresh identifier would loop against a broker that is capped forever.
+#[test]
+fn exhausted_bounds_are_terminal_rather_than_retriable() {
+    for error in [
+        super::BrokerError::ReplayLedgerFull { maximum: 100_000 },
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Full { maximum: 200_000 },
+        },
+    ] {
+        assert_eq!(error.capacity_failure_code(), Some("capacity-exhausted"));
+        assert_eq!(
+            error.unaudited_outcome(),
+            None,
+            "an exhaustion refuses before execution"
+        );
+        assert_eq!(error.storage_failure_code(), None);
+    }
+
+    // The same exhaustion *after* execution stays an unaudited outcome: the effect may already
+    // have happened, and that classification outranks how the append failed.
+    let invocation = "invoke-terminal"
+        .parse::<InvocationId>()
+        .expect("valid invocation fixture");
+    let terminal = super::BrokerError::OutcomeAudit {
+        invocation: invocation.clone(),
+        source: super::AuditError::Full { maximum: 200_000 },
+    };
+    assert_eq!(terminal.capacity_failure_code(), None);
+    assert_eq!(terminal.unaudited_outcome(), Some(&invocation));
+
+    // And an ordinary durable failure is still the retriable class.
+    assert_eq!(
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Poisoned,
+        }
+        .capacity_failure_code(),
+        None
+    );
+}
+
+/// A materialization task that panicked reported itself as `StorageHostError::Io`, which sent an
+/// operator to the filesystem for a bug that is in the code. The wire category stays `storage-io`
+/// — the same step failed before any provider ran — but the panic's own account now survives in
+/// the error chain instead of being replaced by a fabricated I/O failure.
+#[tokio::test]
+async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_category() {
+    let source = tokio::task::spawn_blocking(|| panic!("namespace generation pointer is missing"))
+        .await
+        .expect_err("the blocking task panics");
+    let error = super::BrokerError::StorageTask { source };
+
+    assert_eq!(error.storage_failure_code(), Some("storage-io"));
+    assert!(error.unaudited_outcome().is_none());
+    let cause = std::error::Error::source(&error).expect("the join failure is the cause");
+    assert!(
+        cause
+            .to_string()
+            .contains("namespace generation pointer is missing"),
+        "the panic message was discarded: {cause}"
+    );
+}
+
+/// `localSubjectService` is the one chat-scope field that is free-form operator text rather than
+/// a structural rule, and a typo in it used to produce "attestor chat scope is invalid" — the
+/// same sentence four other rejections produce. The refusal now carries the parse failure, which
+/// quotes the word to change.
+#[test]
+fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
+    let grant = |service: &str| AttestorGrant {
+        namespaces: vec!["slack".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::TransportWide {
+            kind: ChatTransportKind::Local,
+            transport: "local".parse().expect("transport"),
+            local_subject_service: Some(service.to_owned()),
+        }],
+    };
+
+    let error = grant("slcak")
+        .validate()
+        .expect_err("an unknown local subject service is refused");
+    assert!(matches!(
+        error,
+        BrokerBuildError::InvalidChatScopeService { .. }
+    ));
+    let cause = std::error::Error::source(&error).expect("the parse failure is the cause");
+    assert!(
+        cause.to_string().contains("slcak"),
+        "the refusal does not name the offending service: {cause}"
+    );
+
+    grant("slack")
+        .validate()
+        .expect("a canonical local subject service is accepted");
+}
+
 #[test]
 fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     for scope in [
@@ -601,6 +747,37 @@ fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     }
     .validate()
     .expect("signed Telegram service limits are accepted exactly");
+
+    AttestorGrant {
+        namespaces: vec!["whatsapp".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Whatsapp,
+            transport: "whatsapp".parse().expect("transport"),
+            channel: "123:456:16034700182".to_owned(),
+            conversation: "123:456:16034700182".to_owned(),
+            local_subject_service: None,
+        }],
+    }
+    .validate()
+    .expect("exact WhatsApp WABA, phone, and sender scope is accepted");
+
+    let scope = ChatScopeClaim {
+        transport: "whatsapp".parse().expect("transport"),
+        kind: ChatTransportKind::Whatsapp,
+        channel: "123:456:16034700182".to_owned(),
+        conversation: "123:456:16034700182".to_owned(),
+    };
+    assert!(canonical_chat_scope(
+        &ExternalSubject::whatsapp("16034700182").expect("subject"),
+        &scope,
+    ));
+    assert!(
+        !canonical_chat_scope(
+            &ExternalSubject::whatsapp("16034700999").expect("subject"),
+            &scope,
+        ),
+        "the signed sender in scope cannot be detached from the attested subject"
+    );
 }
 
 #[test]
@@ -711,7 +888,7 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
     assert_eq!(audit.checkpoint().await, checkpoint);
     assert_eq!(
         audit
-            .replay_ids()
+            .take_replay_ids()
             .await
             .iter()
             .map(InvocationId::as_str)
@@ -722,6 +899,18 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
         .append(decision("invoke-three", true))
         .await
         .expect("append continues verified chain");
+    // Startup-only state: the broker's replay ledger owns these ids now, so nothing keeps
+    // accumulating a second copy of them here for the life of the process.
+    assert!(
+        audit.take_replay_ids().await.is_empty(),
+        "restored identifiers are handed over once, not retained and re-served"
+    );
+    // The reconcile window still answers for the current head and the record before it.
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 3);
+    assert!(audit.contains_checkpoint(3, head.as_deref()).await);
+    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
+    assert!(!audit.contains_checkpoint(2, head.as_deref()).await);
     drop(audit);
 
     let records = fs::read_to_string(&path)
@@ -812,29 +1001,116 @@ async fn durable_audit_rejects_non_private_permissions() {
     assert!(matches!(error, FileAuditError::Io { .. }));
 }
 
+/// Pins exactly which HTTP scopes this broker starts with, now that the grammar is shared.
+///
+/// The rules moved into `HttpConstraints::validate` so the capability gate and the HTTP host stop
+/// carrying weaker copies. Nothing here may become acceptable, and nothing already acceptable may
+/// start failing: this is the same broker startup decision, made in one place.
 #[test]
 fn policy_http_scope_values_are_bounded() {
-    let constraints = ExecutionConstraints {
-        http: Some(dekopon_capability::HttpConstraints {
-            allowed_hosts: vec![" ".to_owned()],
-            allowed_methods: vec!["GET".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 1,
-            max_response_bytes: 1,
-            allow_plaintext_loopback: false,
-        }),
-        ..ExecutionConstraints::default()
+    fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
+        ConstraintSet {
+            provider: "echo".parse().expect("provider"),
+            effect: dekopon_capability::EffectKind::ReadOnly,
+            risk: dekopon_core::RiskLevel::Low,
+            idempotency: dekopon_capability::Idempotency::Idempotent,
+            credential: None,
+            credential_by_agent: Default::default(),
+            constraints: ExecutionConstraints {
+                http: Some(http),
+                ..ExecutionConstraints::default()
+            },
+        }
+    }
+
+    let valid = dekopon_capability::HttpConstraints {
+        allowed_hosts: vec!["api.github.com".to_owned(), "127.0.0.1:8080".to_owned()],
+        allowed_methods: vec!["GET".to_owned(), "POST".to_owned(), "PATCH".to_owned()],
+        max_requests: 1,
+        max_request_bytes: 1,
+        max_response_bytes: 1,
+        allow_plaintext_loopback: false,
     };
-    let set = ConstraintSet {
-        provider: "echo".parse().expect("provider"),
-        effect: dekopon_capability::EffectKind::ReadOnly,
-        risk: dekopon_core::RiskLevel::Low,
-        idempotency: dekopon_capability::Idempotency::Idempotent,
-        credential: None,
-        credential_by_agent: Default::default(),
-        constraints,
-    };
-    assert!(super::validate_set_constraints(&set).is_err());
+    assert!(super::validate_set_constraints(&constrain(valid.clone())).is_ok());
+
+    let rejected_hosts = [
+        String::new(),
+        " ".to_owned(),
+        " api.github.com".to_owned(),
+        "api.github.com ".to_owned(),
+        "*".to_owned(),
+        "a/b".to_owned(),
+        "user@host".to_owned(),
+        "host?query".to_owned(),
+        "host#fragment".to_owned(),
+        "host\tname".to_owned(),
+        "h".repeat(513),
+    ];
+    for host in rejected_hosts {
+        let set = constrain(dekopon_capability::HttpConstraints {
+            allowed_hosts: vec![host.clone()],
+            ..valid.clone()
+        });
+        assert!(
+            super::validate_set_constraints(&set).is_err(),
+            "host {host:?} must not start this broker"
+        );
+    }
+
+    let rejected_methods = [
+        String::new(),
+        "GET POST".to_owned(),
+        "GE\tT".to_owned(),
+        "G/T".to_owned(),
+        "M".repeat(65),
+    ];
+    for method in rejected_methods {
+        let set = constrain(dekopon_capability::HttpConstraints {
+            allowed_methods: vec![method.clone()],
+            ..valid.clone()
+        });
+        assert!(
+            super::validate_set_constraints(&set).is_err(),
+            "method {method:?} must not start this broker"
+        );
+    }
+
+    let unbounded = [
+        dekopon_capability::HttpConstraints {
+            allowed_hosts: Vec::new(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_methods: Vec::new(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_hosts: (0..65).map(|index| format!("h{index}.test")).collect(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            allowed_methods: (0..65).map(|index| format!("M{index}")).collect(),
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_requests: 0,
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_request_bytes: 0,
+            ..valid.clone()
+        },
+        dekopon_capability::HttpConstraints {
+            max_response_bytes: 0,
+            ..valid
+        },
+    ];
+    for http in unbounded {
+        assert!(
+            super::validate_set_constraints(&constrain(http.clone())).is_err(),
+            "{http:?} must not start this broker"
+        );
+    }
 }
 
 /// The authored spelling of a per-agent credential, and what selection does with it.
@@ -901,4 +1177,86 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
             .contains("credentialByAgent"),
         "an empty override map must stay off the wire"
     );
+}
+
+/// Two records written by an earlier build, hashes and all.
+///
+/// The durable chain is the one thing in this crate that outlives the process that wrote it. If a
+/// change to how a record is serialized, hashed, or laid out reaches disk, an operator's existing
+/// audit file stops verifying — so this fixture is a literal, not something the test regenerates.
+const CHAIN_FIXTURE: &str = concat!(
+    r#"{"sequence":1,"event":{"type":"decision","invocation":"invoke-one","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-one","policy_revision":"policy-test","allowed":true,"decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce"}"#,
+    "\n",
+    r#"{"sequence":2,"previousHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce","event":{"type":"decision","invocation":"invoke-two","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-two","policy_revision":"policy-test","allowed":false,"reason":"policy-denied","decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf"}"#,
+    "\n",
+);
+
+#[tokio::test]
+async fn an_existing_chain_still_verifies_and_appends_the_same_bytes() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    fs::write(&path, CHAIN_FIXTURE).expect("write retained chain");
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owner-only fixture");
+
+    // Opening re-derives every record hash from the retained bytes, so a changed hash material,
+    // domain, or field order fails right here.
+    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+        .await
+        .expect("a chain written by an earlier build still verifies");
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 2);
+    assert_eq!(
+        head.as_deref(),
+        Some("sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf")
+    );
+
+    // And a record appended now continues that same chain in the same encoding.
+    let appended = audit
+        .append(decision("invoke-three", true))
+        .await
+        .expect("append continues the retained chain");
+    drop(audit);
+    let raw = fs::read_to_string(&path).expect("read continued chain");
+    assert!(raw.starts_with(CHAIN_FIXTURE), "{raw}");
+    let records = raw
+        .lines()
+        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("valid durable record"))
+        .collect::<Vec<_>>();
+    verify_audit_chain(&records).expect("the continued chain verifies end to end");
+    assert_eq!(records[2], appended);
+}
+
+/// The durable line is spliced around one serialization of the event rather than serializing the
+/// record; this is what proves the splice and the derived encoding are the same bytes.
+#[tokio::test]
+async fn durable_lines_match_the_record_encoding() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    let audit = FileAuditLog::open(&path, 8, 16 * 1024)
+        .await
+        .expect("create durable audit");
+    let mut appended = Vec::new();
+    for event in [
+        decision("invoke-first", true),
+        decision("invoke-second", false),
+        execution("invoke-second"),
+    ] {
+        appended.push(audit.append(event).await.expect("append succeeds"));
+    }
+    drop(audit);
+    for (line, record) in fs::read_to_string(&path)
+        .expect("read durable chain")
+        .lines()
+        .zip(&appended)
+    {
+        assert_eq!(
+            line.as_bytes(),
+            serde_json::to_vec(record)
+                .expect("records reserialize")
+                .as_slice(),
+            "record {} is not written as it serializes",
+            record.sequence
+        );
+    }
 }

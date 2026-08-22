@@ -618,6 +618,54 @@ fn strict_construction_refuses_precisely_what_lenient_tolerates() {
     );
 }
 
+/// A literal outside the identifier grammar is a typo, not an anticipation.
+///
+/// `Dekopon::Action::"GH.Read"` can never become a loaded capability however many providers arrive
+/// later, so tolerating it is meaningless. It used to be pushed to `unresolved`, skipped by
+/// `with_phantoms` because it does not parse, and then rejected by Cedar's strict validator — so
+/// the tolerant default produced a raw `Validation` error carrying Cedar text while strict mode
+/// gave the clearer `UnknownAction` for the same input, and the `UnresolvedName` report was lost
+/// with the `Err`.
+#[test]
+fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
+    let action = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"GH.Read",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("a name outside the grammar refuses startup even when lenient");
+    assert!(
+        matches!(action, PolicyBuildError::UnknownAction { ref action, .. } if action == "GH.Read"),
+        "{action:?}"
+    );
+
+    let provider = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"Not A Provider");"#,
+        &world(),
+    )
+    .expect_err("a provider name outside the grammar refuses startup even when lenient");
+    assert!(
+        matches!(
+            provider,
+            PolicyBuildError::UnknownProvider { ref provider, .. } if provider == "Not A Provider"
+        ),
+        "{provider:?}"
+    );
+
+    // A well-formed name that is merely absent is still tolerated.
+    let (_, unresolved) = PolicyEngine::new_lenient(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"gh.pull-request.approve",
+                  resource == Dekopon::Provider::"gh");"#,
+        &world(),
+    )
+    .expect("a well-formed absent name is still tolerated");
+    assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+}
+
 /// Principals come from owner-authored identities, never from a loaded component, so an undeclared
 /// one is a typo in any mode. Leniency must not turn a misspelled principal into a silent no-match.
 #[test]
@@ -632,6 +680,73 @@ fn an_undeclared_principal_stays_fatal_under_leniency() {
     assert!(
         matches!(error, PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"),
         "{error:?}"
+    );
+}
+
+/// "Undeclared" and "could never be a principal" are different diagnoses with different fixes, and
+/// collapsing the second into the first sends an operator to add an identity they cannot spell.
+#[test]
+fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
+    let error = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"Ops Team",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect_err("a malformed principal must refuse startup");
+    let PolicyBuildError::MalformedPrincipal {
+        ref principal,
+        ref source,
+        ..
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(principal, "Ops Team");
+    assert!(
+        source.to_string().contains('O'),
+        "the parse error names the offending character: {source}"
+    );
+}
+
+/// A capability the world never declared cannot even be phrased as a Cedar question. The answer is
+/// still a denial — but a blanket denial that explains itself, rather than one indistinguishable
+/// from a deployment that simply granted nothing.
+#[test]
+fn a_request_the_schema_cannot_express_says_so() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world(),
+    )
+    .expect("the world declares everything this policy names");
+
+    let decision = engine.authorize(capability_request(
+        "cpetersen",
+        "gh.pull-request.approve",
+        PolicyContext::default(),
+    ));
+    assert!(!decision.allowed);
+    assert!(decision.errors_present);
+    let refusal = decision
+        .refusal
+        .expect("a request the schema cannot express explains itself");
+    assert!(
+        refusal.contains("gh.pull-request.approve"),
+        "the refusal names the undeclared action: {refusal}"
+    );
+
+    // Every decision Cedar actually reached leaves the field alone, denials included.
+    assert!(
+        engine
+            .authorize(capability_request(
+                "direct-caller",
+                "echo.echo",
+                PolicyContext::default()
+            ))
+            .refusal
+            .is_none()
     );
 }
 

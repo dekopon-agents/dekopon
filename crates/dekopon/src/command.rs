@@ -7,9 +7,25 @@ use dekopon_protocol::{Agent, Capability, Provider};
 use serde::Serialize;
 
 use crate::{
-    catalog::{CatalogError, LocalConfigReader, ResourceReader},
-    cli::{Command, ConfigCommand, DescribeCommand, GetCommand},
+    catalog::{CatalogError, LocalConfigReader},
+    cli::{ConfigCommand, DescribeCommand, GetCommand},
 };
+
+/// The subset of [`Command`](crate::cli::Command) that needs a validated catalog.
+///
+/// `version` and `auth` are answered before configuration is discovered, so they are absent from
+/// this enum by construction rather than by a runtime assertion in [`execute`].
+#[derive(Clone, Copy, Debug)]
+pub enum CatalogCommand<'a> {
+    /// Get one resource or list resources.
+    Get(&'a GetCommand),
+    /// Show detailed resource information.
+    Describe(&'a DescribeCommand),
+    /// Parse and validate the resolved local catalog.
+    Validate,
+    /// Inspect resolved configuration.
+    Config(&'a ConfigCommand),
+}
 
 /// Typed result returned by command execution.
 #[derive(Clone, Debug)]
@@ -119,55 +135,48 @@ pub const fn version_result() -> CommandResult {
     })
 }
 
-/// Executes a command against a validated local reader.
+/// Executes a catalog-dependent command against a validated local reader.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when a named resource is absent from the validated catalog.
 pub fn execute(
-    command: &Command,
+    command: CatalogCommand<'_>,
     reader: &LocalConfigReader,
 ) -> Result<CommandResult, CatalogError> {
     match command {
-        Command::Version => Ok(version_result()),
-        Command::Auth { .. } => {
-            unreachable!("auth commands are executed before catalog resolution")
-        }
-        Command::Get { resource } => execute_get(resource, reader),
-        Command::Describe { resource } => execute_describe(resource, reader),
-        Command::Validate => {
-            let agents = reader.list_agents()?.len();
-            let capabilities = reader.list_capabilities()?.len();
-            let providers = reader.list_providers()?.len();
-            Ok(CommandResult::Validation(ValidationSummary {
-                source: reader.source_display(),
-                valid: true,
-                agents,
-                capabilities,
-                providers,
-            }))
-        }
-        Command::Config {
-            command: ConfigCommand::View,
-        } => Ok(CommandResult::Config(reader.snapshot())),
+        CatalogCommand::Get(resource) => execute_get(resource, reader),
+        CatalogCommand::Describe(resource) => execute_describe(resource, reader),
+        CatalogCommand::Validate => Ok(CommandResult::Validation(ValidationSummary {
+            source: reader.source_display(),
+            valid: true,
+            agents: reader.list_agents().len(),
+            capabilities: reader.list_capabilities().len(),
+            providers: reader.list_providers().len(),
+        })),
+        CatalogCommand::Config(ConfigCommand::View) => Ok(CommandResult::Config(reader.snapshot())),
     }
 }
 
 fn execute_get(
     command: &GetCommand,
-    reader: &impl ResourceReader,
+    reader: &LocalConfigReader,
 ) -> Result<CommandResult, CatalogError> {
     match command {
         GetCommand::Agent { name } => reader.get_agent(name).map(CommandResult::Agent),
-        GetCommand::Agents => reader.list_agents().map(CommandResult::Agents),
+        GetCommand::Agents => Ok(CommandResult::Agents(reader.list_agents())),
         GetCommand::Capability { name } => {
             reader.get_capability(name).map(CommandResult::Capability)
         }
-        GetCommand::Capabilities => reader.list_capabilities().map(CommandResult::Capabilities),
+        GetCommand::Capabilities => Ok(CommandResult::Capabilities(reader.list_capabilities())),
         GetCommand::Provider { name } => reader.get_provider(name).map(CommandResult::Provider),
-        GetCommand::Providers => reader.list_providers().map(CommandResult::Providers),
+        GetCommand::Providers => Ok(CommandResult::Providers(reader.list_providers())),
     }
 }
 
 fn execute_describe(
     command: &DescribeCommand,
-    reader: &impl ResourceReader,
+    reader: &LocalConfigReader,
 ) -> Result<CommandResult, CatalogError> {
     match command {
         DescribeCommand::Agent { name } => {

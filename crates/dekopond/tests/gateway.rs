@@ -480,6 +480,11 @@ impl Fixture {
     }
 
     /// Stops both daemons and hands back the directory, which the audit file still lives in.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "a shutdown oneshot fails only when the daemon already exited, and the join \
+                  below is what decides whether it exited cleanly"
+    )]
     async fn shutdown(self) -> tempfile::TempDir {
         let _ = self.stop_gateway.send(());
         self.gateway
@@ -520,6 +525,11 @@ async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture
     );
     let (stop_broker, broker_stopped) = oneshot::channel::<()>();
     let mut broker = tokio::spawn(dekopon_brokerd::run(broker_path, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender means the fixture went away, which is the same instruction \
+                      to shut down as a delivered one"
+        )]
         let _ = broker_stopped.await;
     }));
     wait_for_socket(&directory.path().join("broker.sock"), &mut broker).await;
@@ -537,6 +547,11 @@ async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture
     );
     let (stop_gateway, gateway_stopped) = oneshot::channel::<()>();
     let mut gateway = tokio::spawn(dekopond::run(gateway_path, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender means the fixture went away, which is the same instruction \
+                      to shut down as a delivered one"
+        )]
         let _ = gateway_stopped.await;
     }));
     wait_for_socket(&directory.path().join("dev.sock"), &mut gateway).await;

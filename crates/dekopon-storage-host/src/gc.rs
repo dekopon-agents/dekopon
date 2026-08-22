@@ -43,6 +43,12 @@ pub(crate) fn run(
     ledger: &Arc<QuotaLedger>,
     state: &mut GcState,
 ) -> Result<GcReport, StorageHostError> {
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "SystemTimeError carries only how far the clock sits before the epoch and \
+                  TryFromIntError only out-of-range; Clock and Arithmetic already state both, and \
+                  neither value may be exported as storage telemetry"
+    )]
     let now = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

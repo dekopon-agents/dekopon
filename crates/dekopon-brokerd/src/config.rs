@@ -9,9 +9,9 @@ use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
     ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
 };
-use dekopon_broker_host::BrokerHostLimits;
+use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions};
 use dekopon_broker_protocol::{
-    DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES,
+    DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
 use dekopon_core::{
     Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
@@ -55,6 +55,14 @@ pub struct BrokerdConfig {
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
+    /// Optional broker-owned directory for Wasmtime's persistent compilation cache.
+    ///
+    /// Absent means Cranelift recompiles every provider at every start, inside whatever startup
+    /// budget the deployment allows. Present means compiled code is read back from this directory,
+    /// so it must be broker-owned and writable by nobody else — a deployment points it at durable
+    /// state such as `/var/lib/dekopon/compile-cache`.
+    #[serde(default)]
+    pub compile_cache_path: Option<PathBuf>,
     /// Whether configuration naming something no loaded provider offers refuses startup.
     ///
     /// Defaults to `false`, which warns and continues so a deployment can ship policy and
@@ -148,6 +156,7 @@ impl TelemetryConfig {
             self.transport,
             &self.service_name,
             "dekopon-brokerd",
+            env!("CARGO_PKG_VERSION"),
             Duration::from_millis(self.export_timeout_ms),
         )
         .map_err(|source| ConfigError::Telemetry { source })
@@ -198,6 +207,16 @@ pub struct HostLimitsConfig {
     pub max_http_header_bytes: usize,
     pub fuel: u64,
     pub max_timeout_ms: u64,
+    /// Aggregate guest linear memory reservable across concurrently live provider stores.
+    ///
+    /// `maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once unless this is
+    /// set, so the worst case is `serverLimits.maxConnections` times `maxMemoryBytes` — well past
+    /// a small container's limit at the defaults. Setting it turns an OOM kill into a refusal.
+    ///
+    /// Deliberately absent from the authority commitment: it is a concurrency budget, not a
+    /// ceiling an authorization could narrow, and changing it must not rotate stored authority.
+    #[serde(default)]
+    pub max_total_memory_bytes: Option<usize>,
 }
 
 impl Default for HostLimitsConfig {
@@ -218,6 +237,7 @@ impl Default for HostLimitsConfig {
             max_http_header_bytes: defaults.max_http_header_bytes,
             fuel: defaults.fuel,
             max_timeout_ms: u64::try_from(defaults.max_timeout.as_millis()).unwrap_or(u64::MAX),
+            max_total_memory_bytes: None,
         }
     }
 }
@@ -275,7 +295,7 @@ impl ServerLimitsConfig {
             io_timeout: Duration::from_millis(self.io_timeout_ms),
         }
         .validate()
-        .map_err(|_| ConfigError::InvalidServerLimits)
+        .map_err(|source| ConfigError::InvalidFrameLimits { source })
     }
 
     pub fn shutdown_grace(&self) -> Duration {
@@ -301,6 +321,9 @@ pub struct ResolvedConfig {
     pub policies: String,
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     pub host_limits: BrokerHostLimits,
+    pub host_options: BrokerHostOptions,
+    /// Worst-case concurrent guest memory: `maxConnections` times `maxMemoryBytes`.
+    pub worst_case_guest_memory_bytes: usize,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
     pub storage: Option<StorageConfig>,
@@ -308,6 +331,10 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "the policy file's FromUtf8Error would carry its offending bytes back into a log line; PolicyNotUtf8 names the file and deliberately stops there"
+)]
 pub async fn load(
     path: impl AsRef<Path>,
     expected_uid: u32,
@@ -522,6 +549,12 @@ fn resolve(
     };
     let credentials_path = canonical(config.credentials_path)?;
     let policies_path = canonical(config.policies_path)?;
+    // Wasmtime creates the cache directory itself and requires an absolute path, so this resolves
+    // the parent rather than requiring the directory to already exist.
+    let compile_cache_path = config
+        .compile_cache_path
+        .map(|path| resolve_future_path(resolve_path(path)))
+        .transpose()?;
     let storage = config
         .storage
         .map(|mut storage| {
@@ -530,11 +563,11 @@ fn resolve(
             // parent here would erase precisely the symlink the storage boundary must reject.
             storage.root_path =
                 dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
-                    .map_err(|_| ConfigError::InvalidStorage)?;
+                    .map_err(|source| ConfigError::StoragePath { source })?;
             storage.namespace_key_path = dekopon_storage_host::resolve_namespace_key_path(
                 &resolve_path(storage.namespace_key_path),
             )
-            .map_err(|_| ConfigError::InvalidStorage)?;
+            .map_err(|source| ConfigError::StoragePath { source })?;
             if storage.namespace_key_path.starts_with(&storage.root_path)
                 || storage.namespace_key_path == storage.root_path
             {
@@ -543,7 +576,7 @@ fn resolve(
             storage
                 .limits
                 .validate()
-                .map_err(|_| ConfigError::InvalidStorage)?;
+                .map_err(|source| ConfigError::InvalidStorage { source })?;
             Ok::<_, ConfigError>(storage)
         })
         .transpose()?;
@@ -552,6 +585,10 @@ fn resolve(
         return Err(ConfigError::ChatMemoryWithoutStorage);
     }
     if let (Some(memory), Some(storage)) = (&chat_memory, &storage) {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "every rejection here is the unit variant BrokerBuildError::InvalidChatMemory, which says nothing ConfigError::InvalidChatMemory does not"
+        )]
         memory
             .validate(&storage.limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
@@ -669,6 +706,21 @@ fn resolve(
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
     }
+    // Per-store limits bound one invocation; the connection ceiling decides how many of those can
+    // exist at once. Naming the product here is what makes an operator budget it against the
+    // container limit instead of discovering it as an OOM kill.
+    let worst_case_guest_memory_bytes = config
+        .server_limits
+        .max_connections
+        .checked_mul(host_limits.max_memory_bytes)
+        .ok_or(ConfigError::InvalidHostLimits)?;
+    if config
+        .host_limits
+        .max_total_memory_bytes
+        .is_some_and(|maximum| maximum < host_limits.max_memory_bytes)
+    {
+        return Err(ConfigError::InvalidHostLimits);
+    }
     let maximum_response = host_limits
         .max_output_bytes
         .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
@@ -679,9 +731,17 @@ fn resolve(
         });
     }
     if let Some(memory) = &chat_memory {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "every rejection here is the unit variant BrokerBuildError::InvalidChatMemory, which says nothing ConfigError::InvalidChatMemory does not"
+        )]
         memory
             .validate_host_limits(&host_limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, and a maxResultBytes wider than this platform's usize is exactly the bound InvalidChatMemory names"
+        )]
         let result =
             usize::try_from(memory.max_result_bytes).map_err(|_| ConfigError::InvalidChatMemory)?;
         if result
@@ -736,6 +796,11 @@ fn resolve(
         policies: String::new(),
         constraint_sets: config.constraint_sets,
         host_limits,
+        host_options: BrokerHostOptions {
+            compile_cache_dir: compile_cache_path,
+            max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
+        },
+        worst_case_guest_memory_bytes,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
         storage,
@@ -830,10 +895,26 @@ pub enum ConfigError {
     DuplicateSubject { subject: String },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
+    #[error("invalid broker frame limits")]
+    InvalidFrameLimits {
+        /// Which frame bound was rejected: a zero or over-ceiling maximum, or a zero I/O timeout.
+        #[source]
+        source: ProtocolError,
+    },
     #[error("host timeout must be positive")]
     InvalidHostLimits,
+    #[error("could not safely resolve a configured provider storage path")]
+    StoragePath {
+        /// The offending path and the reason it was refused.
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
     #[error("invalid provider storage limits")]
-    InvalidStorage,
+    InvalidStorage {
+        /// Which storage field, value, or relationship was rejected.
+        #[source]
+        source: dekopon_storage_host::StorageConfigError,
+    },
     #[error("chatMemory requires storage")]
     ChatMemoryWithoutStorage,
     #[error("chat-memory bounds do not compose with frame, Wasm, host, and storage limits")]

@@ -14,11 +14,12 @@ categories = ["wasm", "api-bindings"]
 include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+# Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel); a wasm guest
+# never calls a JsonSchema impl, so the workspace default-features = false keeps schemars out.
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 wit-bindgen.workspace = true
 
 [lints]

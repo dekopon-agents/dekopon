@@ -4,9 +4,10 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** Chat-transport wakeups, chat-scoped attested routing, bounded sessions,
-persistent conversations, truthful transport-acceptance receipts, and optional broker-owned durable
-chat memory are implemented and tested. A route is `oneShot` unless configured otherwise; durable
+**Status: Current.** Chat-transport wakeups, including a first text-only Meta WhatsApp Cloud API
+webhook, chat-scoped attested routing, bounded sessions, persistent conversations, truthful
+transport-acceptance receipts, and optional broker-owned durable chat memory are implemented and
+tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. A
 dedicated gateway UID remains **committed direction**.
 
@@ -54,6 +55,16 @@ transports:
     kind: telegramLongPoll
     botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
     activity: { mode: native }                # renewable native typing; optional/off by default
+  - name: whatsapp
+    kind: whatsappCloudApi
+    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    bind: 0.0.0.0:9080                     # pod bind; expose only through exact-path TLS ingress
+    callbackPath: /webhooks/whatsapp
+    wabaId: "123456789"
+    phoneNumberId: "987654321"
+    graphApiVersion: v23.0                 # explicit; no implicit/latest version
   - name: dev
     kind: local
     socketPath: /path/to/dekopond-dev.sock
@@ -123,7 +134,7 @@ The `conversation:` block is tagged on `mode`, and both halves are strict: an un
 
 ### No secrets in this file
 
-Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**.
+Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
 
 ### Startup fails closed
 
@@ -133,9 +144,10 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
-- a transport endpoint override that is neither its pinned production origin (Slack, Discord, or Telegram) nor a literal loopback `http://` URL;
+- a transport endpoint override that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
-- a missing chat or named image-generator credential environment variable;
+- a missing or blank chat or named image-generator credential environment variable;
+- a route naming an image generator on a text-only transport, which today means `whatsappCloudApi`;
 - an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
   Slack activity with a reaction fallback, or classic native activity with no reaction fallback,
   is also refused because the configured fallback could never take effect;
@@ -165,8 +177,12 @@ principal/subject/channel/transport identifiers, model endpoints and auth paths,
 all credential names and values are absent. The gateway never receives provider credentials or raw
 policy, and the typed view has no field for the chat/model credentials it does hold. Each serialized
 result has a 128 KiB hard ceiling. Calls are repeatable under the prompt loop's shared per-turn tool
-call and model-step bounds; there is no inspection-specific call limit. An oversized view produces
-one fixed content-free diagnostic instead of a partial configuration.
+call and model-step bounds; there is no inspection-specific call limit. What a repeat does not do is
+append a second copy: a tool result stays in the session's message vector and is re-sent to the
+provider on every remaining turn, so the configuration is serialized once and every later call is
+answered with a short pointer at it. The view cannot change while a session runs — it is built once,
+from one fresh broker answer. An oversized view produces one fixed content-free diagnostic instead of
+a partial configuration.
 
 Inspection happens only after the ordinary authorization gate, makes no broker invocation, spends
 no capability-call budget, grants nothing, and creates no durable broker audit record. It does make
@@ -190,7 +206,11 @@ durable memory, provider output, broker protocol, evidence, or audit.
 
 Delivery uses each service's native upload path: Slack's three-step external file flow, Discord
 multipart Create Message, Telegram multipart `sendPhoto`, and an omitted-when-empty base64 `images`
-array on the local socket. `DeliveryReceipt` covers the complete text/image reply. If Telegram or a
+array on the local socket. WhatsApp has no path here — the Cloud API transport is text-only, and
+sending an image through it would need Meta's separate media upload — so a route that names an image
+generator on a `whatsappCloudApi` transport is a startup failure. Discovering that at reply time
+would mean paying a model for a PNG and then dropping it. `DeliveryReceipt` covers the complete
+text/image reply. If Telegram or a
 split Discord reply accepts only part, the session is `reply-failed` and performs no durable record.
 Persistent history remembers only final text; editing or referring to prior pixels requires a fresh
 generation.
@@ -254,6 +274,7 @@ DMs never receive the decline tool.
 The protocol's one sharp edge is redelivery: Slack expects an acknowledgment within roughly three seconds and resends the envelope otherwise. A Dekopon session takes far longer than that, so **the acknowledgment is sent before any processing begins** — before parsing, before routing, before any model call. A bounded ring of 1024 seen `(channel, ts)` pairs absorbs the redeliveries that happen anyway across a reconnect.
 
 - `disconnect` envelopes are routine (Slack rotates sockets on its own schedule) and trigger a reconnect with jittered exponential backoff capped at 60 seconds.
+- Every read has a 90-second liveness deadline, and so does opening a socket — handshake and `hello` together. Slack pings a healthy connection about every 30 seconds and sends no client heartbeat of its own, so silence past the deadline means the path is gone without TCP saying so: a NAT table dropping the flow, or a partition with no RST. An expired deadline logs `gateway_transport_silent` and reports the socket closed, which is the reconnect path the backoff already owns. Without it the reader waits on a half-open socket forever and every route on the workspace goes quiet with nothing logged.
 - Messages carrying `bot_id` and messages from the bot's own user identifier are dropped. Both checks matter: another app's post carries `bot_id`, and this app's own post arrives with the bot's user identifier and no `bot_id` at all.
 - A subtyped message is dropped unless its subtype is `file_share`, `me_message`, or `thread_broadcast`. Most subtypes are events *about* a message — an edit, a deletion, a channel join — and answering one would answer a question twice or answer nobody. Those three are a person making a new request. `file_share` is the one worth naming: Slack stamps it on any message carrying an upload, so while every subtype was dropped, asking a question with a screenshot attached produced no answer at all. The list is an allowlist, so a subtype Slack introduces later is dropped until someone decides it is a request.
 - A message's attachments become **chat assets**, described in the prompt and fetched only on demand. See [Chat assets](#chat-assets) below. The transport reports what arrived and nothing more: names and media types come from the event, so they are sender-controlled and untrusted exactly like the message text. An upload posted with no comment is still a request — the reference note is then the whole message. A message with neither text nor a file is not a request and is dropped.
@@ -297,7 +318,7 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **A file that cannot be shown is still named.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so. Ignoring it is what made the gateway deny a screenshot that plainly existed.
 - **Only the media types a model can actually accept are offered.** Images: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Documents: PDF, plain text, Markdown, CSV, HTML, XML, JSON, RTF, and the Word, PowerPoint, and Excel formats. A chat service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal attachment — so the narrow end of that intersection is the one worth enforcing. A spreadsheet is parsed to its first thousand rows per sheet, which is worth knowing before concluding a model ignored the bottom of one.
 - **A route's model has to opt in to images.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. Documents need no modality: a PDF is a parsed attachment to every endpoint that accepts one at all, so gating it on vision would refuse it to a model perfectly able to read it.
-- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
+- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
 - **Resolving a reference differs by transport.** Slack carries a private download URL on the event itself. Discord carries a signed CDN URL plus the source channel/message/attachment IDs; the CDN request carries no token, and an expired 401/403/404 URL is refreshed by re-reading that exact message through pinned Discord REST before retrying the same attachment ID. Telegram carries only a `file_id`, so a fetch is two calls: `getFile` turns the handle into a path valid for about an hour, and the bytes live under `/file/bot<token>/<path>` rather than the method prefix. The round trip happens at fetch time, which is also when that path is freshest.
 - **Discord specifics.** Photos and arbitrary files share the attachment object, retaining their sender-controlled filename, optional media type, and reported size. Production downloads accept only HTTPS `cdn.discordapp.com` or `media.discordapp.net` URLs, reject credentials and redirects, and enforce the byte ceiling while streaming.
@@ -309,6 +330,8 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 
 Messages from bots are dropped. A private chat is a direct message; a group is a channel. Subject: `telegram.<user id>`. A forum `message_thread_id` creates the distinct canonical conversation `<chat>:topic:<id>`, and the reply carries that same thread ID; plain messages retain the chat itself as their conversation.
 
+`sendMessage` refuses text over 4,096 UTF-16 code units, which is half the gateway's own outbound bound, so an answer is split losslessly across sequential messages the same way Discord's is. Only the first quotes the incoming message; the topic identifier goes on every one, because it is what keeps a continuation in the same forum topic.
+
 Telegram's optional `message_thread_id` is preserved consistently in admission, conversation
 identity, replies, generated-photo uploads, and activity, so a forum-topic pulse cannot appear in
 another topic. Generated PNGs use `sendPhoto`; text up to Telegram's 1,024-unit caption ceiling is
@@ -318,6 +341,65 @@ failure after any accepted part is partial delivery. With
 around every four seconds inside Telegram's five-second lease. There is no explicit clear; renewal
 stops before the final message, which clears the action. Calls override the long-poll client's
 70-second timeout with a short deadline, honor `retry_after`, and remain cosmetic.
+
+### Meta WhatsApp Cloud API
+
+The `whatsappCloudApi` transport is an inbound plain-HTTP listener intended to sit behind
+Cloudflare Tunnel and Traefik (or equivalent operator-owned HTTPS termination). Its configured
+callback path exposes only GET subscription verification and POST webhook delivery. GET requires
+exactly one `hub.mode=subscribe`, verify token, and challenge, compares the token in constant time,
+and returns the decoded challenge without JSON quoting. POST bounds connection time, headers, body,
+concurrency, message count, and queue depth; requires exactly one
+`X-Hub-Signature-256` whose value is `sha256=<lowercase hex>`; and verifies HMAC-SHA256 over the exact raw body before JSON
+parsing. The callback path is a literal lowercase-segment path—wildcards, captures, empty segments,
+and trailing slashes are rejected at startup. Responses carry `Cache-Control: no-store`; errors and
+logs are content-free.
+
+Only `object=whatsapp_business_account`, `field=messages`, `messaging_product=whatsapp` events for
+the configured exact WABA/receiving-phone tuple may produce sessions. Every entry, change, and
+message in a signed batch is inspected. Status-only, unknown, malformed non-message, unsupported
+message type, wrong-destination, and self/echo messages are acknowledged and ignored. Ordinary text
+uses signed `messages[].from` both as reply target and as the sole identity source; profile names,
+display phone numbers, message text, WABA IDs, and phone-number IDs cannot assert the sender.
+Canonical subject is `whatsapp.<wa_id>`. The WABA, receiving phone number, and sender remain in the
+transport-derived chat scope as `<waba>:<phone-number-id>:<wa_id>`.
+
+The handler claims signed `messages[].id` values in a 4,096-entry process-local set and atomically
+enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text
+messages, and the queue admits at most 512 messages across 64 delivery slots. Duplicates seen by
+that running process are acknowledged without another session. This is deliberately not durable
+exactly-once: restart forgets claims, and a crash after 200 but before queue drain may lose the
+accepted work. Queue saturation returns 503 and rolls back new claims so Meta can redeliver.
+
+Replies are bounded JSON POSTs to the pinned
+`https://graph.facebook.com/{version}/{phone-number-id}/messages` endpoint with the gateway-held
+bearer token. Redirects are disabled, responses and time are bounded, and Meta error bodies never
+reach chat or logs. WhatsApp accepts 4,096 Unicode scalar values per text message and the session's
+own outbound bound is 8 KiB, so a long answer is split at a line boundary where one exists and sent
+as consecutive messages rather than truncated — the same rule the Discord transport follows. A
+failure after the first chunk is `partial-delivery`: the answer arrived in part, the underlying
+service category is logged once as `gateway_whatsapp_reply_partial`, and no delivered turn is
+recorded. No send is retried: a timeout after request transmission is outcome-unknown and blindly
+resending could duplicate a visible answer. After Graph accepts every chunk, the signed inbound
+message ID becomes the service-typed delivery identity for optional durable chat memory, bound to
+the WABA and receiving phone number in the attested scope. Failed or outcome-unknown replies record
+no delivered turn. Free-form text remains subject to Meta's customer-service window; there is no
+template fallback.
+
+Refusals are visible without being a megaphone. Every refused request emits
+`gateway_whatsapp_webhook_refused` with a stable `reason` — `unsigned`, `signature`, `oversize`,
+`malformed`, `saturated`, `timeout`, `verification`, `unavailable` — its HTTP status, and nothing
+about its content. A stranger decides how often those happen, so each reason is emitted at most once
+a minute carrying the number of refusals it stands for: a wrong app secret is one obvious line, and
+a flood is still one line a minute. A failed `accept()` is classified rather than treated as the end
+of the listener, because nothing restarts a transport reader: a dead connection is debug-level and
+ignored, descriptor or buffer exhaustion is warned and retried after a short pause, and only a
+listening socket that can never serve again stops the loop with
+`gateway_whatsapp_listener_stopped`.
+
+Media, templates, interactive messages, reactions, activity, status processing, business-management
+APIs, embedded signup, webhook multiplexing, and daemon TLS termination are non-goals. See
+[`../examples/whatsapp/`](../examples/whatsapp/README.md) for placeholder-only setup.
 
 ### Local development transport
 
@@ -369,6 +451,10 @@ Each routed message runs one session. On a `oneShot` route — the default, and 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
+
+**Abandonment is bounded, so exit is too.** A cancelled prompt loop observes its flag at its next cooperative checkpoint, which can be on the far side of a whole synchronous model round trip, and dropping an async runtime waits for every such thread. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s against a 180 s pod termination grace that `dekopon-brokerd`'s own drain also has to fit inside, so a clean stop became SIGKILL in the middle of the broker's drain.
+
+**Losing every transport is a failure, not a stop.** A transport that cannot recover on its own ends its own reader — a revoked Discord token, a fatal gateway close code — and the daemon keeps serving whatever is left. That degraded state is re-announced as `gateway_transports_degraded` every 60 seconds rather than logged once, because the deployment has no gateway probe and the condition long outlives the line that reported it. When the *last* reader ends with no shutdown requested, nothing can wake the daemon again: it exits non-zero instead of reporting the success that let a gateway with no workspaces left look like a clean run.
 
 ## Conversations
 
@@ -546,7 +632,7 @@ The prompt cache key is behind that same gate, as `gateway.session.cache_key`, a
 
 Conversations add to both lists, and change the meaning of one field that already exists. `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. The second-order effect is the one that catches people: on a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_stopped`. Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
+Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## The single-UID caveat
 

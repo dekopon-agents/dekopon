@@ -13,6 +13,7 @@
 //!     // Ordinary callers cannot use a struct literal to cross the authority boundary.
 //!     let _forged = AuthorizedInvocation {
 //!         proposal,
+//!         provider: todo!(),
 //!         receipt: todo!(),
 //!         constraints,
 //!     };
@@ -51,18 +52,14 @@
 
 use std::fmt;
 
-use dekopon_core::{
-    Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
-};
-use schemars::JsonSchema;
+use dekopon_core::{Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, TraceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 /// Whether invoking a capability can cause an externally observable effect.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
     /// Reads data without intentionally mutating local or external state.
@@ -85,9 +82,8 @@ impl fmt::Display for EffectKind {
 }
 
 /// Declared retry behavior for an invocation.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Idempotency {
     /// Repeating an identical invocation has no additional effect.
@@ -110,9 +106,8 @@ impl fmt::Display for Idempotency {
 }
 
 /// A provider permission needed to execute a capability.
-#[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Permission {
     /// Provider-specific operation, such as `pull_requests:read`.
@@ -122,31 +117,16 @@ pub struct Permission {
     pub resource: Option<String>,
 }
 
-/// Human- and policy-readable metadata for a capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CapabilityDescriptor {
-    /// Stable capability identifier.
-    pub id: CapabilityId,
-    /// Provider that implements this capability.
-    pub provider: ProviderId,
-    /// Concise operator-facing description.
-    pub description: String,
-    /// External-effect class.
-    pub effect: EffectKind,
-    /// Coarse policy risk input.
-    pub risk: RiskLevel,
-    /// Retry behavior.
-    pub idempotency: Idempotency,
-    /// Least-privilege provider permissions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permissions: Vec<Permission>,
-}
-
 /// An invocation proposed by a model, agent, or human.
 ///
 /// This type carries intent but no authority to execute an external effect.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+///
+/// Deliberately not [`Deserialize`]: the wire type a broker decodes is
+/// `dekopon_broker_protocol::InvocationRequest`, which the broker converts here after
+/// authenticating the envelope. Deriving `Deserialize` would offer a decoding path that no caller
+/// should take.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
     /// Unique invocation identifier.
@@ -182,7 +162,8 @@ impl ProposedInvocation {
 }
 
 /// Broker-enforced buffered HTTP limits attached to one authorization.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConstraints {
     /// Exact DNS names or IP authorities the invocation may contact.
@@ -204,10 +185,135 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Maximum host or method entries one HTTP grant may carry.
+pub const MAX_HTTP_SCOPE_ENTRIES: usize = 64;
+/// Maximum bytes in one allowed-host entry.
+pub const MAX_HTTP_HOST_BYTES: usize = 512;
+/// Maximum bytes in one allowed-method token.
+pub const MAX_HTTP_METHOD_BYTES: usize = 64;
+
+impl HttpConstraints {
+    /// Checks that the grant is exact: bounded, non-empty, and made of entries the enforcing
+    /// host can actually match.
+    ///
+    /// This is the one definition of the entry grammar the documented fields promise. A grant
+    /// that passes any construction path but fails here would be accepted at startup and then
+    /// deny every call at runtime, so it is refused where it is built instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the grant violates.
+    pub fn validate(&self) -> Result<(), HttpConstraintsError> {
+        if self.allowed_hosts.is_empty() {
+            return Err(HttpConstraintsError::NoHosts);
+        }
+        if self.allowed_methods.is_empty() {
+            return Err(HttpConstraintsError::NoMethods);
+        }
+        if self.allowed_hosts.len() > MAX_HTTP_SCOPE_ENTRIES
+            || self.allowed_methods.len() > MAX_HTTP_SCOPE_ENTRIES
+        {
+            return Err(HttpConstraintsError::TooManyEntries {
+                maximum: MAX_HTTP_SCOPE_ENTRIES,
+            });
+        }
+        if let Some(value) = self
+            .allowed_hosts
+            .iter()
+            .find(|value| !is_authority_scope(value))
+        {
+            return Err(HttpConstraintsError::InvalidHost {
+                value: value.clone(),
+            });
+        }
+        if let Some(value) = self
+            .allowed_methods
+            .iter()
+            .find(|value| value.len() > MAX_HTTP_METHOD_BYTES || !is_http_token(value))
+        {
+            return Err(HttpConstraintsError::InvalidMethod {
+                value: value.clone(),
+            });
+        }
+        if self.max_requests == 0 || self.max_request_bytes == 0 || self.max_response_bytes == 0 {
+            return Err(HttpConstraintsError::ZeroLimit);
+        }
+        Ok(())
+    }
+}
+
+/// An exact authority: a host, or a host and port, with nothing a URL parser would read as
+/// structure and no wildcard.
+fn is_authority_scope(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HTTP_HOST_BYTES
+        && value.trim() == value
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        && !value.contains(['/', '?', '#', '@', '*'])
+}
+
+/// An RFC 9110 token, which is what an HTTP method is.
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Why an HTTP grant is not exact enough to enforce.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum HttpConstraintsError {
+    /// HTTP was granted without an exact destination.
+    #[error("HTTP authorization requires at least one allowed host")]
+    NoHosts,
+    /// HTTP was granted without an exact method.
+    #[error("HTTP authorization requires at least one allowed method")]
+    NoMethods,
+    /// The host or method list exceeded the scope bound.
+    #[error("HTTP authorization allows at most {maximum} host or method entries")]
+    TooManyEntries {
+        /// Entry bound per list.
+        maximum: usize,
+    },
+    /// An allowed host was not an exact authority.
+    #[error("HTTP allowed host {value:?} is not an exact authority")]
+    InvalidHost {
+        /// The rejected entry.
+        value: String,
+    },
+    /// An allowed method was not an exact HTTP token.
+    #[error("HTTP allowed method {value:?} is not an exact HTTP method token")]
+    InvalidMethod {
+        /// The rejected entry.
+        value: String,
+    },
+    /// HTTP was granted without positive call and byte limits.
+    #[error("HTTP authorization limits must be greater than zero")]
+    ZeroLimit,
+}
+
 /// Exact component storage interface selected for one capability.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageInterface {
     /// Curated invocation-transactional JSONL operations.
@@ -217,9 +323,8 @@ pub enum StorageInterface {
 }
 
 /// Storage mutation authority selected for one capability.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageAccess {
     /// Reads only; every mutating host call is terminally denied.
@@ -229,9 +334,8 @@ pub enum StorageAccess {
 }
 
 /// Broker-owned logical namespace class.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageNamespace {
     /// Owner-private chat memory, scoped from trusted chat attestation.
@@ -239,7 +343,8 @@ pub enum StorageNamespace {
 }
 
 /// Exact namespace-bound storage authority attached to one capability.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConstraints {
     /// The only storage interface this invocation may call.
@@ -251,7 +356,8 @@ pub struct StorageConstraints {
 }
 
 /// Broker-enforced execution limits attached to an authorization.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
     /// Maximum wall-clock duration allowed for provider execution.
@@ -281,7 +387,12 @@ impl Default for ExecutionConstraints {
 ///
 /// Receipts are emitted by the broker transition and cannot be assembled with a public
 /// struct literal.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+///
+/// The accessors below exist for evidence and audit inspection inside the broker boundary.
+/// Receipt data reaches every other consumer by [`Serialize`] into the evidence digest, not by
+/// being read field by field.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationReceipt {
     decision_id: String,
@@ -314,9 +425,10 @@ impl AuthorizationReceipt {
 /// Private fields prevent accidental conversion from an untrusted proposal. The selected provider
 /// is bound alongside the proposal and constraints. The value is not cloneable or deserializable:
 /// the broker-owned execution boundary creates and consumes it once. It is serializable as
-/// inert data for future broker-owned audit and evidence recording, but its serialized form
-/// is not a transferable bearer grant and intentionally cannot be deserialized in `0.1.0`.
-#[derive(Debug, JsonSchema, PartialEq, Serialize)]
+/// inert data for broker-owned audit and evidence recording, but its serialized form is not a
+/// transferable bearer grant and intentionally cannot be deserialized.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
     proposal: ProposedInvocation,
@@ -355,7 +467,8 @@ impl AuthorizedInvocation {
 ///
 /// Unlike [`AuthorizationReceipt`], this value is deserializable because it carries no execution
 /// authority and cannot be converted into an [`AuthorizedInvocation`].
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DecisionReference {
     /// Stable broker decision identifier.
@@ -367,7 +480,8 @@ pub struct DecisionReference {
 }
 
 /// A piece of evidence produced during authorization or execution.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Evidence {
     /// Evidence category, such as `provider-response` or `policy-decision`.
@@ -382,7 +496,8 @@ pub struct Evidence {
 }
 
 /// Terminal state of an attempted invocation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum InvocationOutcome {
     /// Provider execution completed successfully.
@@ -394,7 +509,8 @@ pub enum InvocationOutcome {
 }
 
 /// Serializable result and evidence for an invocation.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationResult {
     /// Invocation identifier.
@@ -429,15 +545,9 @@ pub enum AuthorizationError {
     /// Provider execution was authorized without a positive output bound.
     #[error("authorization output limit must be greater than zero")]
     ZeroOutputLimit,
-    /// HTTP was granted without an exact destination.
-    #[error("HTTP authorization requires at least one allowed host")]
-    NoHttpHosts,
-    /// HTTP was granted without an exact method.
-    #[error("HTTP authorization requires at least one allowed method")]
-    NoHttpMethods,
-    /// HTTP was granted without positive call and byte limits.
-    #[error("HTTP authorization limits must be greater than zero")]
-    ZeroHttpLimit,
+    /// The HTTP grant was not exact enough to enforce.
+    #[error(transparent)]
+    InvalidHttp(#[from] HttpConstraintsError),
     /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHttpAndStorage,
@@ -504,18 +614,7 @@ pub mod broker {
                 return Err(AuthorizationError::MixedHttpAndStorage);
             }
             if let Some(http) = &constraints.http {
-                if http.allowed_hosts.is_empty() {
-                    return Err(AuthorizationError::NoHttpHosts);
-                }
-                if http.allowed_methods.is_empty() {
-                    return Err(AuthorizationError::NoHttpMethods);
-                }
-                if http.max_requests == 0
-                    || http.max_request_bytes == 0
-                    || http.max_response_bytes == 0
-                {
-                    return Err(AuthorizationError::ZeroHttpLimit);
-                }
+                http.validate()?;
             }
 
             Ok(AuthorizedInvocation {
@@ -538,7 +637,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthorizationError, ExecutionConstraints, HttpConstraints, ProposedInvocation, broker,
+        AuthorizationError, EffectKind, ExecutionConstraints, HttpConstraints,
+        HttpConstraintsError, Idempotency, MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
     };
 
     fn proposal() -> ProposedInvocation {
@@ -553,6 +653,34 @@ mod tests {
             "trace-1".parse::<TraceId>().expect("valid fixture"),
             json!({"body": "Looks good"}),
         )
+    }
+
+    /// `Display` feeds the web UI and operator errors; serde feeds manifests and constraint-set
+    /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
+    /// variant from rendering one string to an operator and a different one to the audit record.
+    #[test]
+    fn display_matches_the_serde_rendering_for_every_variant() {
+        for effect in [
+            EffectKind::ReadOnly,
+            EffectKind::LocalWrite,
+            EffectKind::ExternalWrite,
+        ] {
+            assert_eq!(
+                serde_json::to_value(effect).expect("effect serializes"),
+                json!(effect.to_string()),
+            );
+        }
+
+        for idempotency in [
+            Idempotency::Idempotent,
+            Idempotency::Conditional,
+            Idempotency::NonIdempotent,
+        ] {
+            assert_eq!(
+                serde_json::to_value(idempotency).expect("idempotency serializes"),
+                json!(idempotency.to_string()),
+            );
+        }
     }
 
     #[test]
@@ -610,21 +738,79 @@ mod tests {
                     allowed_hosts: Vec::new(),
                     ..valid.clone()
                 },
-                AuthorizationError::NoHttpHosts,
+                HttpConstraintsError::NoHosts,
             ),
             (
                 HttpConstraints {
                     allowed_methods: Vec::new(),
                     ..valid.clone()
                 },
-                AuthorizationError::NoHttpMethods,
+                HttpConstraintsError::NoMethods,
             ),
             (
                 HttpConstraints {
                     max_requests: 0,
+                    ..valid.clone()
+                },
+                HttpConstraintsError::ZeroLimit,
+            ),
+            // Entries the gate used to wave through, which then matched no authority the host
+            // could compute and denied every call at runtime.
+            (
+                HttpConstraints {
+                    allowed_hosts: vec![" api.github.com".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: " api.github.com".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec!["*".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: "*".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec!["a/b".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: "a/b".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec![String::new()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: String::new(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_methods: vec!["GET POST".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidMethod {
+                    value: "GET POST".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: (0..=MAX_HTTP_SCOPE_ENTRIES)
+                        .map(|index| format!("host{index}.example.test"))
+                        .collect(),
                     ..valid
                 },
-                AuthorizationError::ZeroHttpLimit,
+                HttpConstraintsError::TooManyEntries {
+                    maximum: MAX_HTTP_SCOPE_ENTRIES,
+                },
             ),
         ];
 
@@ -642,8 +828,28 @@ mod tests {
                     },
                 )
                 .expect_err("incomplete HTTP authority must fail");
-            assert_eq!(error, expected);
+            assert_eq!(error, AuthorizationError::InvalidHttp(expected));
         }
+    }
+
+    /// An authority with a port, and every method token the broker's own policies use.
+    #[test]
+    fn broker_gate_accepts_exact_http_authority() {
+        let http = HttpConstraints {
+            allowed_hosts: vec!["api.example.test".to_owned(), "127.0.0.1:8080".to_owned()],
+            allowed_methods: vec![
+                "GET".to_owned(),
+                "POST".to_owned(),
+                "PATCH".to_owned(),
+                "DELETE".to_owned(),
+            ],
+            max_requests: 4,
+            max_request_bytes: 65_536,
+            max_response_bytes: 1_048_576,
+            allow_plaintext_loopback: true,
+        };
+
+        http.validate().expect("an exact grant is enforceable");
     }
 
     #[test]

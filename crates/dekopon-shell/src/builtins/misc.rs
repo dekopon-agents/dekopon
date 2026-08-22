@@ -118,6 +118,12 @@ impl Builtin for Printf {
 }
 
 /// Renders a curated printf format: `%s`, `%d`, `%f`, `%%`, plus `\n`, `\t`, and `\\`.
+#[allow(
+    clippy::map_err_ignore,
+    reason = "both discarded values are ParseFloatError over a `%d` or `%f` argument the message \
+              quotes back in full; \"invalid float literal\" adds nothing to naming the operand \
+              that was not a number"
+)]
 fn format_text(format: &str, values: &[String]) -> Result<String, CommandFailure> {
     let mut output = String::new();
     let mut next = values.iter();
@@ -278,6 +284,11 @@ fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, C
     }))
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseFloatError has one meaning, \"not a float literal\", over an operand the \
+              message quotes back in full"
+)]
 fn parse_number(command: &str, text: &str) -> Result<f64, CommandFailure> {
     text.trim()
         .parse::<f64>()
@@ -339,6 +350,12 @@ impl Builtin for Sleep {
                 "sleep: exactly one duration in seconds is required",
             ));
         };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "ParseFloatError has one meaning, \"not a float literal\", over an operand \
+                      the message quotes back in full; the range and finiteness checks that \
+                      follow are what carry the interesting rejections"
+        )]
         let seconds = seconds.trim().parse::<f64>().map_err(|_| {
             CommandFailure::usage(format!("sleep: {seconds:?} is not a number of seconds"))
         })?;

@@ -32,7 +32,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Detect unused dependencies
+        run: |
+          cargo install cargo-machete --locked
+          cargo machete
       - name: Verify runner excludes privileged broker machinery
         shell: bash
         run: |
@@ -51,8 +55,37 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify emitted audit events are documented
+        shell: bash
+        run: |
+          set -euo pipefail
+          doc=docs/observability.md
+          emitted=()
+          while IFS= read -r event; do
+            emitted+=("$event")
+          done < <(
+            grep -rhoE 'audit\.event[[:space:]]*=[[:space:]]*"[a-z0-9_.]+"' --include='*.rs' crates \
+              | grep -oE '"[a-z0-9_.]+"' \
+              | tr -d '"' \
+              | sort -u
+          )
+          # An empty set means the emission shape changed and this gate stopped reading anything,
+          # which is the silent failure worth failing on.
+          if [ ${#emitted[@]} -eq 0 ]; then
+            echo 'no audit.event names found in crates/; the extraction pattern is stale' >&2
+            exit 1
+          fi
+          status=0
+          for event in "${emitted[@]}"; do
+            if ! grep -Fq -- "\`$event\`" "$doc"; then
+              echo "undocumented audit event: $event (add \`$event\` to $doc)" >&2
+              status=1
+            fi
+          done
+          printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
+          exit "$status"
       - name: Test workspace
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
@@ -161,6 +194,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test changelog validation
         run: python3 .github/scripts/test_verify_changelog.py
+      - name: Test release metadata validation
+        run: python3 .github/scripts/test_verify_release_metadata.py
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -180,7 +215,7 @@ jobs:
             --plan .github/release-crates.txt \
             --changelog CHANGELOG.md
       - name: Package every publishable crate
-        run: cargo package --workspace --exclude dekopon-testkit --locked
+        run: cargo package --workspace --locked
       - name: Prepare package cache for saving
         run: .github/scripts/prepare-package-cache.sh
 
@@ -333,6 +368,40 @@ jobs:
           helm template dekopon charts/dekopon \
             --set providerStorage.enabled=true \
             --set providerStorage.existingKeySecret=dekopon-storage-key > "$RUNNER_TEMP/provider-storage.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
+            --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
+      # The drains run in sequence, so the pod's grace has to cover their sum. A guard that never
+      # fires is not a guard: render the two shapes that must be refused and prove the message
+      # names the number, not just that something went wrong.
+      - name: Prove the termination budget is refused when it is too short
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_refused() {
+            local expected="$1"
+            shift
+            if helm template dekopon charts/dekopon "$@" > "$RUNNER_TEMP/short-grace.yaml" 2> "$RUNNER_TEMP/short-grace.err"; then
+              echo "expected 'helm template $*' to be refused, but it rendered" >&2
+              exit 1
+            fi
+            grep -q -- "$expected" "$RUNNER_TEMP/short-grace.err" || {
+              echo "refusal did not mention: $expected" >&2
+              cat "$RUNNER_TEMP/short-grace.err" >&2
+              exit 1
+            }
+          }
+          # 120 s of gateway drain then 120 s of broker drain do not fit in 180 s. This was the
+          # chart's own default until the assertion existed.
+          assert_refused "terminationGracePeriodSeconds is 180" \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
+            --set terminationGracePeriodSeconds=180
+          # An existingSecret is opaque to the chart, so the arithmetic runs on the declared
+          # assumption instead of silently skipping.
+          assert_refused "dekopon-brokerd drains for 300000 ms" \
+            --set broker.config.inline= \
+            --set broker.config.existingSecret=dekopon-config \
+            --set drainBudget.assumedBrokerShutdownGraceMs=300000
       - name: Validate rendered manifests against Kubernetes schemas
         run: |
           docker run --rm -i \
@@ -351,6 +420,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/provider-storage.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/gateway-service.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a
@@ -363,7 +436,9 @@ jobs:
           helm package charts/dekopon --destination "$RUNNER_TEMP"
           tarball="$RUNNER_TEMP/dekopon-$version.tgz"
           helm lint "$tarball"
-          for args in "" "-f charts/dekopon/values-pr-summarizer-linter.yaml"; do
+          for args in "" \
+            "-f charts/dekopon/values-pr-summarizer-linter.yaml" \
+            "-f charts/dekopon/values-pr-summarizer-linter.yaml --set gateway.service.enabled=true"; do
             # shellcheck disable=SC2086
             helm template dekopon charts/dekopon $args > "$RUNNER_TEMP/from-source.yaml"
             # shellcheck disable=SC2086
@@ -371,9 +446,11 @@ jobs:
             diff -u "$RUNNER_TEMP/from-source.yaml" "$RUNNER_TEMP/from-package.yaml"
           done
           # The README and the example values are documentation a consumer only has if they are
-          # inside the archive.
-          tar -tzf "$tarball" | grep -qx 'dekopon/README.md'
-          tar -tzf "$tarball" | grep -qx 'dekopon/values-pr-summarizer-linter.yaml'
+          # inside the archive. Materialize the listing before grep: with pipefail, grep -q can
+          # otherwise close a successful tar early and turn its SIGPIPE into a false CI failure.
+          tar -tzf "$tarball" > "$RUNNER_TEMP/chart-contents.txt"
+          grep -Fxq 'dekopon/README.md' "$RUNNER_TEMP/chart-contents.txt"
+          grep -Fxq 'dekopon/values-pr-summarizer-linter.yaml' "$RUNNER_TEMP/chart-contents.txt"
       # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
       # and mode check. This runs the init container's real command in a real container and
       # asserts every permission tier dekopon-brokerd enforces, then seeds a ChatGPT credential,
