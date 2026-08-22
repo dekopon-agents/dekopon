@@ -166,6 +166,21 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Script traces now open one `shell.script` span per run carrying the whole run's command totals,
+  and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
+  one span per step.
+
+### Fixed
+
+- An abandoned `jq` filter is now logged with its elapsed time and counted; `jq` refuses to start a
+  new filter once too many non-terminating workers are still running in the process, and
+  `dekopon_shell::abandoned_filter_workers` reports the live count.
+- Script output no longer loses an oversized line entirely: a line too large for the retained tail
+  is kept as a clamped prefix, so a script's large final result survives truncation.
+- A `grep` or `sed` pattern ending in an escaped `\$` now matches a literal dollar sign instead of
+  being read as an end anchor plus a stray backslash.
+- A command substitution now honors a suppressed trailing newline, so `v=$(printf '%s' a; printf
+  '%s' b)` is `ab` rather than `a\nb`.
 - A capabilities answer now costs one Cedar pass instead of two. The capability listing and the
   command words are derived from a single authorized constraint-set filter, `capability_view`, used
   by the readiness probe's `capabilities`, `capabilitiesFor`, `capabilitiesForChat`, and the startup

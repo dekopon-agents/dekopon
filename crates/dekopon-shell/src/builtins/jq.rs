@@ -17,14 +17,38 @@
 //! The filter therefore runs on a worker thread and the outputs come back over a rendezvous
 //! channel. The evaluator charges each output against the step and value-byte budgets, and waits
 //! for the next one only until the script's deadline. The cost is stated plainly: a filter that is
-//! still running when the deadline passes is *abandoned*, not stopped — its thread stays alive
-//! until the process exits, parked on a send nobody will receive, or spinning if it never yields.
-//! That is a worse outcome than a fuel meter and a better one than a runner that hangs forever, and
-//! it makes the wall-clock bound this crate advertises true for `jq` as well.
+//! still running when the deadline passes is *abandoned*, not stopped. That is a worse outcome than
+//! a fuel meter and a better one than a runner that hangs forever, and it makes the wall-clock
+//! bound this crate advertises true for `jq` as well.
+//!
+//! # What an abandoned worker costs, and what bounds it
+//!
+//! Abandonment is not uniformly expensive. Dropping the receiver disconnects the channel, so a
+//! filter that produces *any* output fails its next `send` and returns — which is the cooperative
+//! cancellation check, sited at the only place jaq hands control back. A wrapping iterator over
+//! `compiled.id.run()` would stop such a filter one output earlier and nothing more.
+//!
+//! The residual is the filter that never yields at all: `jq 'def f: f; f'`, `jq 'last(repeat(0))'`.
+//! jaq offers no interruption point inside it, so its thread spins at 100% of a core until the
+//! process exits. In a long-lived host with a one-core limit that is not a leak to discover from a
+//! flame graph, so two things bound it here:
+//!
+//! - every abandonment logs a `tracing::warn!` carrying the elapsed time and this process's running
+//!   total, and [`crate::abandoned_filter_workers`] exposes how many are still going, and
+//! - once [`MAX_ABANDONED_WORKERS`] of them are outstanding, `jq` refuses to start another filter
+//!   rather than adding one more spinning thread to a host that is already saturated.
+//!
+//! The count is of *live* abandoned workers, not of abandonments: one that notices the closed
+//! channel decrements it immediately, so a script that merely exhausted its value budget does not
+//! spend the process's allowance.
 
 use std::{
-    sync::mpsc::{RecvTimeoutError, sync_channel},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, sync_channel},
+    },
+    time::{Duration, Instant},
 };
 
 use jaq_core::{
@@ -89,6 +113,110 @@ impl Builtin for Jq {
     }
 }
 
+/// How many abandoned filter workers this process tolerates before refusing to start another.
+///
+/// Only workers that never yield can accumulate here, and each one is a core spinning until the
+/// process exits. On the one-core deployment this crate is embedded in, four is already most of the
+/// machine — past that, the honest answer to a new filter is that there is nothing left to run it
+/// with, rather than one more thread nobody can stop.
+const MAX_ABANDONED_WORKERS: usize = 4;
+
+/// Abandoned filter workers that have not yet noticed nobody is listening.
+static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Every abandonment this process has seen, for the warning's running total.
+static TOTAL_ABANDONMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns how many abandoned `jq` filter workers are still running in this process.
+///
+/// See [`crate::abandoned_filter_workers`], which is this counter's public face.
+pub(crate) fn abandoned_workers() -> usize {
+    ABANDONED_WORKERS.load(Ordering::SeqCst)
+}
+
+/// One filter worker's liveness, shared with the evaluator paying for it.
+///
+/// Whichever side reaches the end first wins the exchange: the evaluator charges an abandonment
+/// only when the worker had not already returned, and the worker releases that charge only when it
+/// was in fact the one abandoned. Without the exchange, a filter that finishes in the same instant
+/// the deadline trips would be counted as spinning forever.
+struct Worker(AtomicU8);
+
+impl Worker {
+    const RUNNING: u8 = 0;
+    const FINISHED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::RUNNING))
+    }
+
+    /// Called from the worker thread when its filter is done, however it ended.
+    ///
+    /// Returns whether this released an abandonment charged against the process.
+    fn finish(&self) -> bool {
+        if self
+            .0
+            .compare_exchange(
+                Self::RUNNING,
+                Self::FINISHED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return false;
+        }
+        ABANDONED_WORKERS.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Called from the evaluator when it stops waiting.
+    ///
+    /// Returns this process's running abandonment total when the worker really was still going, and
+    /// `None` when it had already returned and nothing outlives the command.
+    fn abandon(&self) -> Option<u64> {
+        self.0
+            .compare_exchange(
+                Self::RUNNING,
+                Self::ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .ok()?;
+        ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
+        Some(
+            TOTAL_ABANDONMENTS
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1),
+        )
+    }
+}
+
+/// Refuses a new filter once too many abandoned workers are still burning CPU.
+///
+/// A recoverable failure rather than a fatal one: the script sees `jq` fail, writes the reason, and
+/// carries on with whatever it can still do. Ending the whole script would punish it for a filter
+/// an earlier one wrote.
+fn admit(outstanding: usize) -> Result<(), CommandFailure> {
+    if outstanding < MAX_ABANDONED_WORKERS {
+        return Ok(());
+    }
+    Err(CommandFailure::failed(format!(
+        "jq: refusing to start another filter: {outstanding} filter workers abandoned by earlier \
+         non-terminating filters are still running in this process"
+    )))
+}
+
+/// Marks the worker finished when its thread returns, including through a panic.
+struct FinishOnDrop(Arc<Worker>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        let _released = self.0.finish();
+    }
+}
+
 /// One message from the filter worker to the evaluator.
 enum Produced {
     /// One output value, already rendered as JSON text.
@@ -99,22 +227,36 @@ enum Produced {
     Done,
 }
 
+/// Why the evaluator stopped collecting outputs.
+enum Stopped {
+    /// The worker reported the failure itself and is on its way out.
+    Worker(CommandFailure),
+    /// The evaluator gave up first, so the filter is still running.
+    Evaluator(CommandFailure),
+}
+
 /// Compiles and runs one jq filter over one value under the script's budget.
 ///
-/// See the module documentation for why this crosses a thread boundary.
+/// See the module documentation for why this crosses a thread boundary, and why it refuses to cross
+/// it at all once this process is carrying too many workers it can no longer stop.
 pub(crate) fn evaluate(
     filter: &str,
     input: &Value,
     budget: &mut Budget,
 ) -> Result<Value, CommandFailure> {
+    admit(abandoned_workers())?;
+
     // A rendezvous channel, so the filter cannot run ahead of the budget that is paying for it:
     // every output waits until the evaluator has charged the previous one.
     let (sender, receiver) = sync_channel::<Produced>(0);
+    let worker = Arc::new(Worker::new());
+    let owned = Arc::clone(&worker);
     let filter = filter.to_owned();
     let input = input.clone();
     std::thread::Builder::new()
         .name("dekopon-shell-jq".to_owned())
         .spawn(move || {
+            let _finish = FinishOnDrop(owned);
             let message = match run_filter(&filter, &input, &sender) {
                 Ok(()) => Produced::Done,
                 Err(message) => Produced::Failed(message),
@@ -126,6 +268,28 @@ pub(crate) fn evaluate(
             CommandFailure::failed(format!("jq: could not start the filter evaluator: {error}"))
         })?;
 
+    let started = Instant::now();
+    match collect(&receiver, budget) {
+        Ok(outputs) => Ok(reduce(outputs)),
+        Err(Stopped::Worker(failure)) => Err(failure),
+        Err(Stopped::Evaluator(failure)) => {
+            if let Some(total) = worker.abandon() {
+                tracing::warn!(
+                    event = "shell_jq_filter_abandoned",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    abandoned_total = total,
+                    abandoned_live = abandoned_workers(),
+                    "a jq filter outlived the budget that was paying for it; its worker stops at \
+                     its next output, or runs until this process exits if it produces none"
+                );
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// Pulls outputs off the channel, charging each one, until the filter or the budget ends.
+fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Value>, Stopped> {
     let mut outputs = Vec::new();
     loop {
         // Never wait for zero: `remaining` reaching zero one tick before `check_deadline` agrees
@@ -135,34 +299,47 @@ pub(crate) fn evaluate(
             Ok(Produced::Output(produced)) => {
                 // Pulling one value is where a filter's work happens, so each pull is a step and
                 // re-reads the deadline. Without this a whole `jq` command cost exactly one step.
-                budget.charge_step()?;
-                budget.charge_value_bytes(produced.len() as u64)?;
+                budget
+                    .charge_step()
+                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
+                budget
+                    .charge_value_bytes(produced.len() as u64)
+                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
                 outputs.push(serde_json::from_str::<Value>(&produced).map_err(|error| {
-                    CommandFailure::failed(format!("jq: could not read filter output: {error}"))
+                    Stopped::Evaluator(CommandFailure::failed(format!(
+                        "jq: could not read filter output: {error}"
+                    )))
                 })?);
             }
-            Ok(Produced::Failed(message)) => return Err(CommandFailure::failed(message)),
-            Ok(Produced::Done) => break,
+            Ok(Produced::Failed(message)) => {
+                return Err(Stopped::Worker(CommandFailure::failed(message)));
+            }
+            Ok(Produced::Done) => return Ok(outputs),
             Err(RecvTimeoutError::Timeout) => {
-                budget.check_deadline()?;
+                budget
+                    .check_deadline()
+                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
                 // The clock has not actually passed the deadline, so keep waiting for the filter.
-                continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                return Err(CommandFailure::failed(
+                return Err(Stopped::Worker(CommandFailure::failed(
                     "jq: the filter evaluator stopped without producing a result",
-                ));
+                )));
             }
         }
     }
+}
 
-    // A jq filter is a stream. One output stays scalar so `| jq .field | grep x` reads naturally;
-    // several outputs become a JSON array so nothing is silently discarded.
-    Ok(match outputs.len() {
+/// Reduces a filter's output stream to one value.
+///
+/// A jq filter is a stream. One output stays scalar so `| jq .field | grep x` reads naturally;
+/// several outputs become a JSON array so nothing is silently discarded.
+fn reduce(outputs: Vec<Value>) -> Value {
+    match outputs.len() {
         0 => Value::Null,
         1 => outputs.into_iter().next().unwrap_or(Value::Null),
         _ => Value::Array(outputs),
-    })
+    }
 }
 
 /// Compiles one filter and streams its outputs, on the worker thread.
@@ -251,11 +428,16 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use serde_json::{Value, json};
 
     use crate::limits::{Budget, Limits};
 
-    use super::{CommandFailure, evaluate};
+    use super::{
+        CommandFailure, MAX_ABANDONED_WORKERS, TOTAL_ABANDONMENTS, Worker, abandoned_workers,
+        admit, evaluate,
+    };
 
     fn filter(filter: &str, input: &Value) -> Result<Value, CommandFailure> {
         evaluate(filter, input, &mut Budget::start(Limits::default()))
@@ -353,9 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_that_never_yields_is_stopped_by_the_deadline() {
+    fn a_filter_that_never_yields_is_stopped_by_the_deadline_and_counted() {
         // `def f: f; f` recurses forever inside jaq without ever producing an output, so nothing
-        // cooperative can reach it. The wall-clock bound this crate advertises has to hold anyway.
+        // cooperative can reach it — not even the closed channel, which a filter only notices at a
+        // `send` it never reaches. The wall-clock bound this crate advertises has to hold anyway,
+        // and the thread it leaves behind has to be visible rather than inferred from a flame
+        // graph: this test really does leak one spinning worker for the rest of the binary's life,
+        // which is exactly the cost the counters exist to report.
+        let abandonments = TOTAL_ABANDONMENTS.load(Ordering::SeqCst);
         let mut budget = Budget::start(Limits {
             timeout: std::time::Duration::from_millis(50),
             ..Limits::default()
@@ -366,6 +553,54 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
         assert!(message(failure).contains("Deadline"));
+
+        // Strictly greater rather than exactly one more: an abandonment is process-wide, and the
+        // other tests in this binary produce their own.
+        assert!(TOTAL_ABANDONMENTS.load(Ordering::SeqCst) > abandonments);
+        // This one can never come back, so it stays counted against the process.
+        assert!(abandoned_workers() >= 1);
+    }
+
+    #[test]
+    fn a_saturated_process_refuses_to_start_another_filter() {
+        // Every abandoned worker that cannot come back is a core spinning until the process exits,
+        // so past the ceiling the honest answer is that there is nothing left to run a filter with.
+        // Driven through `admit` rather than by leaking four real workers: this test suite would
+        // then refuse every later `jq` in it, which is the failure being guarded against.
+        assert!(admit(MAX_ABANDONED_WORKERS - 1).is_ok());
+        let failure = admit(MAX_ABANDONED_WORKERS).expect_err("a saturated process refuses");
+        assert!(
+            matches!(failure, CommandFailure::Status { .. }),
+            "the script continues; only this filter is refused: {failure:?}"
+        );
+        let message = message(failure);
+        assert!(
+            message.contains("refusing to start another filter"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_worker_stops_counting_once_it_finally_returns() {
+        // The common abandonment is benign: a filter that produced output fails its next `send` and
+        // returns within microseconds. Charging that permanently against the process would let a
+        // script that merely exhausted its value budget disable `jq` for every later session.
+        let worker = Worker::new();
+        assert!(worker.abandon().is_some());
+        assert!(
+            worker.finish(),
+            "returning releases the abandonment it was charged"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_finished_first_is_not_counted_as_abandoned() {
+        // The evaluator gives up and the worker returns in the same instant often enough to matter,
+        // and a filter that reported its own error is already on its way out. Whichever side wins
+        // the exchange, the count must end where it started.
+        let worker = Worker::new();
+        assert!(!worker.finish());
+        assert!(worker.abandon().is_none());
     }
 
     #[test]

@@ -27,8 +27,128 @@
 //! model-authored command word — a shell function's name, or a word that resolved to nothing — is
 //! reported as [`WITHHELD`] rather than copied, mirroring the runner's existing refusal to copy a
 //! model-selected invalid tool name into a rejection event.
+//!
+//! # How much is recorded
+//!
+//! One span per command word is the right reading for a script a person wrote and an unaffordable
+//! one for a script a model wrote: a `while` loop is bounded only by
+//! [`crate::limits::DEFAULT_MAX_STEPS`], so one tool call can execute tens of thousands of command
+//! words, and exporting a span for each is tens of megabytes over OTLP from a workload whose whole
+//! point was to be one round trip.
+//!
+//! So the volume is capped rather than the detail. Each script run opens one [`SCRIPT_SPAN`]
+//! carrying [`ScriptCounters`]' totals, which cost the same whether a script ran three commands or
+//! thirty thousand. Inside it, the first [`MAX_TRACED_COMMANDS`] command words get their span at
+//! INFO and the rest at DEBUG — still emitted, still complete, and off by default at the level
+//! production runs at. Nothing is special-cased by construct: a loop body and an `xargs`
+//! sub-invocation are ordinary command words here, and the cap treats them as such.
 
 use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded};
+
+/// The span one whole script run opens, and the home of its totals.
+pub(crate) const SCRIPT_SPAN: &str = "shell.script";
+
+/// How many `shell.command` spans one script run emits at INFO before the rest drop to DEBUG.
+///
+/// Large enough that every script a person would read in a trace is complete, small enough that a
+/// runaway loop costs a bounded number of exported spans instead of one per step.
+pub(crate) const MAX_TRACED_COMMANDS: u64 = 256;
+
+/// The level one `shell.command` span is emitted at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpanLevel {
+    /// Within the per-script cap: exported wherever INFO goes.
+    Info,
+    /// Past the cap: emitted, but off at the level production runs at.
+    Debug,
+}
+
+/// Per-script command totals, and the span cap they enforce.
+///
+/// These are what survives the cap: whatever a script did, the counters describe its whole run in
+/// four bounded integers, recorded on the [`SCRIPT_SPAN`] when it closes.
+#[derive(Debug, Default)]
+pub(crate) struct ScriptCounters {
+    commands: u64,
+    traced: u64,
+    capability_commands: u64,
+    failed_commands: u64,
+}
+
+impl ScriptCounters {
+    /// Charges one command word, returning the level its span belongs at.
+    pub(crate) fn charge(&mut self, kind: CommandKind) -> SpanLevel {
+        self.commands = self.commands.saturating_add(1);
+        if matches!(kind, CommandKind::Capability | CommandKind::ProviderCommand) {
+            self.capability_commands = self.capability_commands.saturating_add(1);
+        }
+        if self.traced >= MAX_TRACED_COMMANDS {
+            return SpanLevel::Debug;
+        }
+        self.traced = self.traced.saturating_add(1);
+        SpanLevel::Info
+    }
+
+    /// Records the status one command reported.
+    pub(crate) fn record_status(&mut self, status: ExitCode) {
+        if status != ExitCode::SUCCESS {
+            self.failed_commands = self.failed_commands.saturating_add(1);
+        }
+    }
+
+    /// Writes the totals onto the enclosing script span.
+    pub(crate) fn record_on(&self, span: &tracing::Span) {
+        span.record("shell.script.commands", self.commands);
+        span.record("shell.script.commands_traced", self.traced);
+        span.record("shell.script.capability_commands", self.capability_commands);
+        span.record("shell.script.failed_commands", self.failed_commands);
+    }
+}
+
+/// Opens the span for one command word at the level the per-script cap allows.
+///
+/// The two arms are written out rather than parameterized because `tracing`'s level is part of a
+/// span's static callsite metadata, which is exactly what makes a filtered-out DEBUG span nearly
+/// free: the subscriber's interest is cached per callsite, so a capped command word costs an atomic
+/// load rather than a formatted span.
+pub(crate) fn command_span(
+    level: SpanLevel,
+    name: &str,
+    kind: CommandKind,
+    argument_count: usize,
+) -> tracing::Span {
+    match level {
+        SpanLevel::Info => tracing::info_span!(
+            "shell.command",
+            shell.command.name = name,
+            shell.command.kind = kind.label(),
+            shell.command.argument_count = argument_count,
+            shell.command.exit_code = tracing::field::Empty,
+            capability.namespace = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        SpanLevel::Debug => tracing::debug_span!(
+            "shell.command",
+            shell.command.name = name,
+            shell.command.kind = kind.label(),
+            shell.command.argument_count = argument_count,
+            shell.command.exit_code = tracing::field::Empty,
+            capability.namespace = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+    }
+}
+
+/// Opens the span covering one whole script run.
+pub(crate) fn script_span() -> tracing::Span {
+    tracing::info_span!(
+        SCRIPT_SPAN,
+        shell.script.commands = tracing::field::Empty,
+        shell.script.commands_traced = tracing::field::Empty,
+        shell.script.capability_commands = tracing::field::Empty,
+        shell.script.failed_commands = tracing::field::Empty,
+    )
+}
 
 /// Stands in for a command word this crate declines to copy into telemetry.
 ///
