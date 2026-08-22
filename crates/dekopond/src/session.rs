@@ -1240,6 +1240,9 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
         })) if code == ERROR_STORAGE_IO => ERROR_STORAGE_IO,
         MemoryRecordFailure::Broker(BrokerLegError::Client(_)) => "broker",
         MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(_)) => "identifier",
+        MemoryRecordFailure::Broker(BrokerLegError::DuplicateCapabilities { .. }) => {
+            "duplicate-capability"
+        }
         MemoryRecordFailure::Outcome(category) => category,
     }
 }

@@ -50,7 +50,10 @@ authoritative copy of each:
 instructions, session limits, and effective capability classifications. Its type has no
 field for policy source, policy IDs, identity, endpoints, paths, or credentials, and each
 serialized result is hard-bounded. Inspection is repeatable under the prompt loop's shared
-per-turn tool-call and model-step bounds; it has no tool-specific call counter.
+per-turn tool-call and model-step bounds; it has no tool-specific call counter. The bytes are
+spent once: the configuration cannot change inside a session, so a repeated call is answered with
+a short pointer at the copy already in the conversation rather than a second full copy that would
+be re-sent to the provider on every remaining turn.
 
 Nothing in this crate holds authority. The broker leg submits identity-free proposals
 over an authenticated Unix socket and reports back whatever the broker decided; this
@@ -59,6 +62,11 @@ It depends only on the client half of the broker protocol, never on broker inter
 the same dependency discipline CI enforces for `dekopon-run`.
 
 Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.model_turn`,
+`prompt.script`, and `prompt.asset_fetch` when an embedder supplies chat assets) and
+`dekopon_agent::audit` accounting events carry counts, durations, and stable categories;
+prompts, model answers, and script text ride the log stream only when the embedding binary
+opts into payload telemetry, and then the transcript is emitted whole once per session and
+extended by the messages each later turn appended.
 `prompt.script`, `prompt.image_generation`) and `dekopon_agent::audit` accounting events carry counts, durations,
 and stable categories; prompts, model answers, and script text ride the log stream only
 when the embedding binary opts into payload telemetry.

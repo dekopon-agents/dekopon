@@ -181,6 +181,21 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Payload telemetry now emits `agent.model.prompt` whole on a session's first model turn and only
+  the messages appended since the previous turn thereafter, ending the quadratic re-ship of one
+  conversation's transcript.
+- A textual chat asset is clamped to 256 KiB on the way into the prompt with a trailer naming the
+  cut, instead of reaching the model whole and ending the session with a context-length rejection.
+- A repeated `inspect_agent_config` call is answered with a short pointer at the copy already in
+  the conversation rather than a second full serialization retained for the rest of the session.
+
+### Fixed
+
+- `IdSequence::new` now rejects a prefix whose derived invocation identifiers would exceed the
+  identifier length bound, instead of constructing a session whose every capability call fails.
+- A broker capability snapshot naming the same capability twice is refused, listing every repeat,
+  rather than silently last-winning into disagreeing `cap --list` and `inspect_agent_config` views.
+- Removed a run of spaces from the model-facing scripting tool description.
 - Direct `dekopon-run` provider loads now report every duplicate provider, duplicate capability, and
   command-word conflict in one failure instead of stopping at the first, and refuse the same
   command-word conflicts `dekopon-brokerd` refuses at startup.

@@ -578,6 +578,9 @@ async fn connect_prompt_broker(
         .map_err(|error| match error {
             BrokerLegError::Client(source) => AppError::BrokerClient(source),
             BrokerLegError::SessionIdentifier(source) => AppError::SessionIdentifier(source),
+            BrokerLegError::DuplicateCapabilities { capabilities } => {
+                AppError::BrokerDuplicateCapabilities { capabilities }
+            }
         })?;
     tracing::info!(
         target: "dekopon_run::audit",
@@ -979,6 +982,12 @@ enum AppError {
     #[cfg(unix)]
     #[error("could not derive a unique identifier for this broker session")]
     SessionIdentifier(#[source] IdentifierError),
+    #[cfg(unix)]
+    #[error("the broker answered with duplicate capability identifiers: {capabilities}")]
+    BrokerDuplicateCapabilities {
+        /// Every repeated identifier, in identifier order.
+        capabilities: String,
+    },
     #[error("the prompt session did not run to completion")]
     PromptTask(#[source] tokio::task::JoinError),
     #[error("broker capability input must be a JSON object")]
@@ -1044,6 +1053,8 @@ impl AppError {
             Self::BrokerFlagsWithoutOptIn => "broker-flags-without-opt-in",
             #[cfg(unix)]
             Self::SessionIdentifier(_) => "session-identifier",
+            #[cfg(unix)]
+            Self::BrokerDuplicateCapabilities { .. } => "broker-duplicate-capabilities",
             Self::PromptTask(_) => "prompt-task",
             Self::BrokerInputObject => "broker-input-object",
             Self::ChatGpt(_) => "chatgpt",
