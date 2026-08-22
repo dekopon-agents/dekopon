@@ -24,3 +24,10 @@
   is deliberately not packaged in any scanned image directory.
 
 Regenerate each component with the commands in its source README. Do not edit `.wasm` artifacts directly.
+
+These are fixtures: they exist to prove a host property, and they are sized and scoped for that.
+A provider meant for real use lives in its own repository with its own tags, issues, and release
+cadence — [`dekopon-provider-turso-sql`](https://github.com/dekopon-agents/dekopon-provider-turso-sql),
+a SQLite-compatible SQL engine over `durable-files`, is the first. It ships as a signed release
+asset rather than a checked-in component, because an 11 MB artifact and a SQL engine's dependency
+graph are not things a fixture directory should carry.
