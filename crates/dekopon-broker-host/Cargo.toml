@@ -28,6 +28,10 @@ tokio.workspace = true
 wasmtime = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
+# Path-only, deliberately: the testkit depends on this crate, so a version requirement here would
+# be a package cycle crates.io cannot order. Cargo strips a dev-dependency carrying no version at
+# package time, so the cycle exists only inside the workspace.
+dekopon-provider-sdk-testkit = { path = "../dekopon-provider-sdk-testkit" }
 sha2.workspace = true
 tempfile.workspace = true
 

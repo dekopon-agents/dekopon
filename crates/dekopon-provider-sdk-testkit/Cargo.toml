@@ -1,0 +1,31 @@
+[package]
+name = "dekopon-provider-sdk-testkit"
+description = "In-process fake broker for testing Dekopon provider components against a real storage host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-sdk-testkit"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "testing", "provider"]
+categories = ["development-tools::testing", "wasm"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-broker-host.workspace = true
+dekopon-capability.workspace = true
+dekopon-core.workspace = true
+dekopon-storage-host.workspace = true
+serde_json.workspace = true
+# Not a dev-dependency: the temporary root is part of the API surface. A `FakeBroker` owns its
+# `TempDir` so the storage root outlives every invocation made against it.
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

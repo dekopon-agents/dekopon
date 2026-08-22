@@ -14,6 +14,7 @@ verify_release_metadata = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(verify_release_metadata)
 
 verify_libraries_are_consumed = verify_release_metadata.verify_libraries_are_consumed
+is_stripped_dev_dependency = verify_release_metadata.is_stripped_dev_dependency
 GUEST_BINDING_PACKAGES = verify_release_metadata.GUEST_BINDING_PACKAGES
 
 
@@ -94,6 +95,30 @@ class VerifyLibrariesAreConsumedTests(unittest.TestCase):
                     *self.exempt(),
                 )
             )
+
+
+class IsStrippedDevDependencyTests(unittest.TestCase):
+    """A path-only dev-dependency is how a crate depends on a harness that depends back on it."""
+
+    def test_a_path_only_dev_dependency_is_stripped(self) -> None:
+        self.assertTrue(is_stripped_dev_dependency({"name": "testkit", "kind": "dev", "req": "*"}))
+
+    def test_a_versioned_dev_dependency_survives_packaging(self) -> None:
+        # This one reaches the published manifest, so it still constrains publication order.
+        self.assertFalse(
+            is_stripped_dev_dependency({"name": "sha2", "kind": "dev", "req": "^0.11.0"})
+        )
+
+    def test_a_normal_dependency_is_never_stripped(self) -> None:
+        # `kind` is null for normal dependencies, and a path-only one still carries a version in
+        # this workspace; neither may be skipped.
+        self.assertFalse(is_stripped_dev_dependency({"name": "core", "kind": None, "req": "*"}))
+        self.assertFalse(
+            is_stripped_dev_dependency({"name": "core", "kind": None, "req": "^0.10.0"})
+        )
+
+    def test_a_build_dependency_is_never_stripped(self) -> None:
+        self.assertFalse(is_stripped_dev_dependency({"name": "cc", "kind": "build", "req": "*"}))
 
 
 if __name__ == "__main__":
