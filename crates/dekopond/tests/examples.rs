@@ -136,7 +136,14 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
             .any(|scope| scope == "assistant:write")
     );
     assert!(agent_scopes.iter().any(|scope| scope == "assistant:write"));
+    assert!(agent_scopes.iter().any(|scope| scope == "channels:history"));
+    assert!(agent_scopes.iter().any(|scope| scope == "groups:history"));
     assert!(agent_scopes.iter().any(|scope| scope == "reactions:write"));
+    assert!(
+        !classic_scopes
+            .iter()
+            .any(|scope| matches!(scope.as_str(), "channels:history" | "groups:history"))
+    );
     let agent_events = agent["settings"]["event_subscriptions"]["bot_events"]
         .as_sequence()
         .expect("Agent events are a sequence");
@@ -150,6 +157,14 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
             .iter()
             .any(|event| event.as_str() == Some("app_home_opened"))
     );
+    for continuation_event in ["message.channels", "message.groups"] {
+        assert!(
+            agent_events
+                .iter()
+                .any(|event| event.as_str() == Some(continuation_event)),
+            "Agent manifest must receive {continuation_event} for owned-thread continuation"
+        );
+    }
     assert_eq!(
         classic["display_information"]["background_color"],
         "#ff6a3d"

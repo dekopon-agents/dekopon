@@ -224,8 +224,9 @@ macro_rules! identifier {
             where
                 D: Deserializer<'de>,
             {
-                let value = String::deserialize(deserializer)?;
-                value.parse().map_err(D::Error::custom)
+                // `TryFrom<String>` validates the deserialized buffer in place; `parse` would
+                // validate a borrow of it and then allocate a second copy of the same bytes.
+                Self::try_from(String::deserialize(deserializer)?).map_err(D::Error::custom)
             }
         }
     };
