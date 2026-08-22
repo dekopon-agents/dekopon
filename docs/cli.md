@@ -1,6 +1,6 @@
 # CLI reference
 
-`dekopon` is the operator interface for local catalog inspection and model-account lifecycle. It is synchronous and contacts neither `dekopon-brokerd` nor `dekopond`; operator-CLI integration with either is committed direction, not current behavior. Catalog commands read a validated local catalog; `auth` commands instead contact the selected model provider's fixed authentication endpoint. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md).
+`dekopon` is the operator interface for local catalog inspection, model-account lifecycle, and the interactive console. Catalog commands are synchronous, read a validated local catalog, and contact no other process; `auth` commands instead contact the selected model provider's fixed authentication endpoint. `console` is the one command that reaches another process: it is an unprivileged `dekopon-brokerd` client that runs an agent session locally, and it is documented in [its own section](#the-interactive-console) below. `dekopond` remains uncontacted by every command here. The separate experimental `dekopon-run` executable loads read-only Wasm providers and is documented in [`run.md`](run.md).
 
 ## Commands
 
@@ -19,7 +19,16 @@ dekopon get provider <NAME>
 dekopon describe agent <NAME>
 dekopon validate
 dekopon config view
+dekopon console [--subject <SUBJECT>] [--socket <PATH>] [--server-uid <UID>]
+                [--model <MODEL>] [--auth-file <PATH> | --endpoint <URL> [--api-key-env <NAME>]]
+                [--max-steps <COUNT>] [--max-capability-calls <COUNT>]
 ```
+
+`dekopon` with no subcommand opens the console when standard input and standard output are both
+terminals. When either is not — a pipe, a redirect, a CI step — it remains the usage error it has
+always been, printing help to standard error and exiting `2`. Both halves of that check are
+required: drawing needs a terminal to draw on, and the console needs one to read a key from, so a
+piped invocation that opened a full-screen console would hang forever on input that never arrives.
 
 Run `dekopon --help` or `dekopon <COMMAND> --help` for generated syntax.
 
@@ -63,6 +72,97 @@ The manifest carries the document under the key `chatgpt-auth.json`, matching De
 
 The refresh token rotates, so an exported copy is invalidated by the next refresh of the credential it came from. [`chatgpt-credential.md`](chatgpt-credential.md) is the full deployment lifecycle: export, store, seed once into a writable directory, and re-export only on a deliberate rotation.
 
+## The interactive console
+
+`dekopon console` opens a full-screen view over a running `dekopon-brokerd`. It is an ordinary
+unprivileged client of that broker's Unix socket: it holds a model credential and nothing else — no
+policy, no provider credential, no authorization — and every capability call it makes is a proposal
+the broker alone decides.
+
+**It runs the agent session itself.** The broker has no model client and no concept of a turn; in a
+deployment `dekopond` runs the loop and the broker authorizes each capability the loop reaches. The
+console takes that gateway role for one operator at one terminal. This is what lets it show tool
+arguments and results at all: `dekopon-agent`'s conversation history keeps only the prompt and the
+answer, `shell.command` spans carry an argument count rather than argument values, and audit records
+carry digests rather than payloads, so those values exist only inside the process running the loop.
+
+Four panes, cycled with `Tab`: the catalog's agents; one agent's declared capabilities beside what
+policy actually grants it; the conversation with each turn's scripts and capability calls; and a
+prompt bound to the same capability seam the agent's own sessions dispatch through. `?` lists the
+keys. `Esc` requests a cooperative stop, which prevents further work and does not undo a call the
+broker already accepted.
+
+### Connecting
+
+The socket resolves as [`run.md`](run.md) documents: `--socket`, then `$DEKOPON_BROKER_SOCKET`, then
+`$XDG_RUNTIME_DIR/dekopon/broker.sock`, then `$HOME/.local/run/dekopon/broker.sock`. Candidates are
+never probed for existence, because an absent socket is what a stopped daemon looks like; the
+tightest resolved tier is trusted, and a daemon that is not running surfaces as
+`no broker found at <path>` naming that exact path and the tier it came from. `--server-uid`
+defaults to the caller's own effective UID.
+
+### Identity
+
+`--subject <SUBJECT>` (or `DEKOPON_CONSOLE_SUBJECT`) is the canonical external subject sessions
+propose on behalf of, such as `tel.15550100000`. There is no default and none is derived: an
+identity the console guessed is an identity nobody chose, and the broker would refuse it one step
+later having explained nothing.
+
+Declaring a subject grants nothing. Entering an agent opens an attested leg, so what the console may
+do is what policy grants *that subject through that agent* — which requires an `attestor.namespaces`
+entry covering the subject's namespace and an `identityMappings` entry resolving it to a principal,
+both in the broker's own owner-only configuration. A subject the broker will not resolve produces an
+empty capability surface, which the console reports as policy granting nothing rather than as an
+unreachable broker.
+
+### The model credential
+
+The console resolves `chatgpt-auth.console.json`, **not** the `chatgpt-auth.json` that `auth chatgpt`
+and a gateway `authFile` resolve to. Precedence is otherwise identical: `--auth-file`, then
+`$DEKOPON_CHATGPT_AUTH_FILE`, then the platform configuration directory — only the file name differs.
+
+The reason is rotation. A ChatGPT refresh token rotates on use, so whichever process refreshes it
+invalidates every other copy of that credential, including one exported into a secret store. Two
+surfaces sharing one file break each other silently. If discovery lands on the shared file anyway —
+which today only an exported `DEKOPON_CHATGPT_AUTH_FILE` can cause — the console refuses to start and
+names the path. An explicit `--auth-file` accepts it deliberately, the same shape
+`auth chatgpt export` uses for `--expose-credential`.
+
+Create one with a separate device authorization:
+
+```console
+dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
+dekopon console --subject tel.15550100000
+```
+
+`--endpoint <URL>` uses any OpenAI-compatible chat-completions endpoint instead, with
+`--api-key-env <NAME>` naming the environment variable holding its bearer token. As everywhere else
+in Dekopon, that is a variable name and never a value.
+
+### Diagnostics while it is drawing
+
+`-v` and `-vv` still work, but the console owns the terminal in both directions: the alternate
+screen *is* the terminal, so a diagnostic written to standard error lands inside a frame and stays
+there. When the console is about to open and standard error is that same terminal, diagnostics are
+discarded rather than drawn over the view. Redirect them to keep them:
+
+```console
+dekopon console --subject tel.15550100000 -vv 2> console.log
+```
+
+### What it shows about secrets
+
+Provider credentials are never in this data. The broker resolves a symbolic `credential:` name from
+its owner-only credentials file and injects the value inside its native HTTP engine, after guest
+header validation; the model, the script, the component, and the invocation input all see nothing.
+What the console redacts is what a model wrote or a provider returned — a header assembled by hand,
+a token pasted into a turn, a row in a result. A match hides only the run that matched, so the text
+around it survives, and revealing is one keystroke against one field rather than a mode, because a
+revealed secret is in terminal scrollback afterwards.
+
+All rendered text is stripped of terminal control sequences first. A pull-request title and an issue
+body are attacker-controlled text arriving through a read-only capability.
+
 ## Configuration discovery
 
 Paths are considered in this exact order:
@@ -89,7 +189,7 @@ List output is sorted by validated identifier. `name` output uses qualified name
 |---:|---|
 | `0` | Success |
 | `1` | Configuration, validation, rendering, or general runtime failure |
-| `2` | Command-line usage error (emitted by Clap) |
+| `2` | Command-line usage error (emitted by Clap, or by a bare invocation off a terminal) |
 | `3` | Requested resource not found |
 
 These codes are stable across `0.x` releases and are tied to the `dekopon.dev/v1alpha1` resource API rather than to a package version. `3` is distinguished from `1` deliberately so a script can tell "this resource does not exist" from "the catalog would not load"; a future API version is the only thing that would renumber them.
@@ -106,4 +206,6 @@ dekopon --config examples/local/dekopon.yaml validate
 dekopon --config examples/local/dekopon.yaml config view --output json
 dekopon auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -
 dekopon auth chatgpt export --expose-credential --format raw > chatgpt-auth.json
+dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
+dekopon --config examples/local/dekopon.yaml console --subject tel.15550100000
 ```

@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, fmt, io, time::Duration};
 
 #[cfg(unix)]
 use std::{
+    env,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
 };
@@ -2192,6 +2193,165 @@ impl fmt::Display for ProtocolVersion {
         formatter.write_str(match self {
             Self::V1Alpha1 => PROTOCOL_VERSION,
         })
+    }
+}
+
+/// Tier of the broker socket discovery precedence that produced a path.
+///
+/// The tier is telemetry-safe where the path is not: a socket path is excluded from every signal,
+/// but "which tier answered" is exactly what a connection investigation needs.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSocketTier {
+    /// A caller-supplied path, such as a command-line flag or a configuration field.
+    Explicit,
+    /// `DEKOPON_BROKER_SOCKET`.
+    Environment,
+    /// `$XDG_RUNTIME_DIR/dekopon/broker.sock`.
+    XdgRuntimeDir,
+    /// `$HOME/.local/run/dekopon/broker.sock`.
+    Home,
+}
+
+#[cfg(unix)]
+impl BrokerSocketTier {
+    /// Stable low-cardinality label for telemetry and diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Environment => "environment",
+            Self::XdgRuntimeDir => "xdg-runtime-dir",
+            Self::Home => "home",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for BrokerSocketTier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// One resolved broker socket and the discovery tier that produced it.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedBrokerSocket {
+    path: PathBuf,
+    tier: BrokerSocketTier,
+}
+
+#[cfg(unix)]
+impl ResolvedBrokerSocket {
+    /// The resolved path. It is never probed for existence; see [`BrokerSocketDiscovery`].
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Consumes this resolution and returns the owned path.
+    #[must_use]
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+
+    /// Which precedence tier answered.
+    #[must_use]
+    pub const fn tier(&self) -> BrokerSocketTier {
+        self.tier
+    }
+}
+
+/// Inputs used to resolve the broker socket precedence.
+///
+/// This is the one definition of that precedence. `dekopon-run`, `dekopond`, and the operator
+/// console all consult it, so a socket a client finds here is the socket the documentation
+/// describes, and a change lands in one place rather than three that must be kept in step.
+///
+/// Unlike configuration discovery, no candidate is probed for existence: a broker socket is absent
+/// whenever the daemon is not running, so the tightest resolved tier is always trusted and
+/// connection failures are reported against that exact path.
+///
+/// [`Self::resolve`] answers `None` rather than an error because "no tier applied" means something
+/// different to each caller — a usage failure to one, a configuration failure to another — and each
+/// owns the wording an operator acts on.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrokerSocketDiscovery {
+    explicit: Option<PathBuf>,
+    environment: Option<PathBuf>,
+    xdg_runtime_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl BrokerSocketDiscovery {
+    /// Captures discovery inputs from the current process.
+    ///
+    /// An environment variable exported with an empty value is ignored rather than resolved to an
+    /// empty path, matching configuration discovery elsewhere: an empty export is an unset
+    /// variable that happens to exist.
+    #[must_use]
+    pub fn from_process(explicit: Option<PathBuf>) -> Self {
+        Self {
+            explicit,
+            environment: env::var_os("DEKOPON_BROKER_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            xdg_runtime_dir: env::var_os("XDG_RUNTIME_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            home: env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+
+    /// Creates an injectable discovery context, for deterministic tests in any consuming crate.
+    #[must_use]
+    pub const fn new(
+        explicit: Option<PathBuf>,
+        environment: Option<PathBuf>,
+        xdg_runtime_dir: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            explicit,
+            environment,
+            xdg_runtime_dir,
+            home,
+        }
+    }
+
+    /// Resolves the highest-precedence broker socket, or `None` when no tier applies.
+    #[must_use]
+    pub fn resolve(&self) -> Option<ResolvedBrokerSocket> {
+        if let Some(path) = &self.explicit {
+            return Some(ResolvedBrokerSocket {
+                path: path.clone(),
+                tier: BrokerSocketTier::Explicit,
+            });
+        }
+        if let Some(path) = &self.environment {
+            return Some(ResolvedBrokerSocket {
+                path: path.clone(),
+                tier: BrokerSocketTier::Environment,
+            });
+        }
+        if let Some(root) = &self.xdg_runtime_dir {
+            return Some(ResolvedBrokerSocket {
+                path: root.join("dekopon/broker.sock"),
+                tier: BrokerSocketTier::XdgRuntimeDir,
+            });
+        }
+        if let Some(home) = &self.home {
+            return Some(ResolvedBrokerSocket {
+                path: home.join(".local/run/dekopon/broker.sock"),
+                tier: BrokerSocketTier::Home,
+            });
+        }
+        None
     }
 }
 

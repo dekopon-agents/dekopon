@@ -15,6 +15,34 @@ All notable changes to Dekopon are documented here. The format is based on
   `AuthorizationGate`, and defaults its per-invocation ceilings from the host limits in force
   rather than restating them. Storage grants are minted per invocation from constant scope
   material, so successive calls reach one durable namespace.
+- Added `dekopon console`, an interactive terminal view over a running `dekopon-brokerd`. It opens
+  an attested session for one external subject through one catalog agent, shows that agent's
+  declared capabilities beside the surface policy actually grants it, runs turns, and draws each
+  turn's scripts and capability calls with their exact JSON input and result. A bare `dekopon` opens
+  it when standard input and output are both terminals; anywhere else a missing subcommand remains
+  a usage error exiting `2`.
+- Added `dekopon-tui`, the crate behind that console. It observes the agent loop through decorators
+  on `dekopon-agent`'s `ScriptRuntime` and `dekopon-shell`'s `CapabilityInvoker` seams, which is the
+  only place a tool call's arguments and results exist: conversation history keeps prompts and
+  answers, `shell.command` spans keep argument counts, and audit records keep digests. Neither
+  decorator can influence a session. Its local dispatch leg is empty by construction, so every
+  capability reaches the broker and no Wasmtime enters the operator CLI's dependency tree — checked
+  in CI by the same `cargo tree` gate already applied to `dekopon-run` and `dekopond`.
+- Added `dekopon_model::chatgpt::resolve_auth_path_named` and `DEFAULT_AUTH_FILE_NAME`, so a second
+  consumer can resolve a credential under the documented precedence with a different file name.
+  `dekopon console` uses it for `chatgpt-auth.console.json` and refuses to start if discovery lands
+  on the shared `chatgpt-auth.json` instead, because the refresh token rotates and a shared file
+  means whichever process refreshes invalidates the gateway's copy. An explicit `--auth-file`
+  accepts that deliberately.
+
+### Changed
+
+- Broker socket discovery now has one definition, `dekopon_broker_protocol::BrokerSocketDiscovery`,
+  consumed by `dekopon-run`, `dekopond`, and the console. The precedence and the refusal to probe a
+  candidate for existence are unchanged; each caller keeps its own error wording, since "no tier
+  applied" is a usage failure to one and a configuration failure to another.
+- `dekopon --help` now renders `Usage: dekopon [OPTIONS] [COMMAND]`, because the subcommand is
+  genuinely optional on a terminal.
 
 ### Fixed
 
