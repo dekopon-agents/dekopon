@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use dekopon_provider_host::{
     DEFAULT_MAX_INSTANCES, DEFAULT_MAX_MEMORIES, DEFAULT_MAX_MEMORY_BYTES,
-    DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES, HostLimits, PROVIDER_WIT, ProviderHostError,
-    ProviderRegistry,
+    DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES, HostLimits, HostOptions, PROVIDER_WIT,
+    ProviderHostError, ProviderRegistry,
 };
 use serde_json::json;
 
@@ -168,6 +168,41 @@ fn immediate_host_rejects_components_requiring_privileged_imports() {
 #[test]
 fn host_and_guest_sdk_use_the_same_wit_contract() {
     assert_eq!(PROVIDER_WIT, dekopon_provider_sdk::PROVIDER_WIT);
+}
+
+/// A warm compilation cache serves a later process from the same directory.
+///
+/// The registry is per-process, so the only evidence a cache was used at all is that the cold
+/// load wrote entries into an empty directory and a second, independent registry built from those
+/// entries still routes and invokes.
+#[test]
+fn a_persistent_compilation_cache_serves_a_second_load() {
+    let directory = tempfile::tempdir().expect("cache directory");
+    let options = HostOptions {
+        compile_cache_dir: Some(directory.path().to_path_buf()),
+    };
+
+    let cold =
+        ProviderRegistry::load_with_options([provider_path()], HostLimits::default(), &options)
+            .expect("cold load populates the cache");
+    assert_eq!(cold.manifests().len(), 1);
+    assert!(
+        std::fs::read_dir(directory.path())
+            .expect("cache directory is readable")
+            .next()
+            .is_some(),
+        "a cold compile must write cache entries"
+    );
+
+    let warm =
+        ProviderRegistry::load_with_options([provider_path()], HostLimits::default(), &options)
+            .expect("warm load reads the cache");
+    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let output = warm
+        .invoke(&capability, &json!({"message": "warm"}))
+        .expect("a cached component still invokes");
+
+    assert_eq!(output.output, json!({"message": "warm"}));
 }
 
 #[test]

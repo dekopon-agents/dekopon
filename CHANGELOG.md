@@ -63,6 +63,10 @@ All notable changes to Dekopon are documented here. The format is based on
   memory provider.
 - Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
   restart reads compiled provider code back instead of running Cranelift again.
+- Added an optional `dekopon-run --compile-cache <DIRECTORY>` (`DEKOPON_RUN_COMPILE_CACHE`) backed by
+  `dekopon-provider-host`'s `HostOptions::compile_cache_dir`, so repeated `inspect`, `invoke`,
+  `shell`, and `prompt` processes read Wasmtime's compiled provider code back instead of running
+  Cranelift again.
 - Added an optional broker `hostLimits.maxTotalMemoryBytes` aggregate guest-memory ceiling, so
   concurrent invocations past the budget are refused instead of being OOM-killed. The broker also
   states the `maxConnections` × `maxMemoryBytes` worst case in one startup line.
@@ -129,32 +133,6 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
-- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
-  protocol failure kind, the provider host error, the audit failure category, and the full source
-  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
-  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
-  responses are unchanged and stay generic.
-- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
-  the refusal class and the canonical subject on the broker side, while the wire answer stays
-  opaque.
-- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
-  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
-  `broker.execute` records `outcome` and the classified `error`.
-
-### Fixed
-
-- A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
-  `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
-  logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
-  accept failure stays fatal.
-- Broker shutdown now drains the Unix listener, the provider-storage GC, and the web UI concurrently
-  against one shared deadline. They previously ran in sequence, each under its own full
-  `shutdownGraceMs`, so a process with `--http-bind` could take two or three graces to exit against a
-  `terminationGracePeriodSeconds` that budgets one.
-- Startup frame validation now also bounds the capability response an attested session receives, not
-  only each direct peer's. In a gateway deployment the peer holds almost nothing while the mapped
-  principals hold the real capability sets, so an oversized response passed startup and then failed
-  `write_frame` on every session open — the exact failure the check exists to prevent.
 - A finished connection task is now observed as soon as it completes rather than on the next accept,
   so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
 - `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
@@ -219,6 +197,12 @@ All notable changes to Dekopon are documented here. The format is based on
   Cranelift compiled, replacing a before/after comparison that a change-and-revert could pass. The
   unreachable `ArtifactChanged`, `DuplicateProvider`, and `DuplicateCapability` broker-host error
   variants are gone.
+- A provider exporting `resolve-command` with the wrong signature is now reported as a type
+  mismatch instead of as an absent export, and the export is proven from the component's own type
+  rather than by instantiating it once at startup.
+
+### Fixed
+
 - A provider exporting `resolve-command` with the wrong signature is now reported as a type
   mismatch instead of as an absent export, and the export is proven from the component's own type
   rather than by instantiating it once at startup.

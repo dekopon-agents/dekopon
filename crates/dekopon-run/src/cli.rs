@@ -9,7 +9,7 @@ use dekopon_core::{
 };
 use dekopon_provider_host::{
     DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_TIMEOUT,
+    DEFAULT_TIMEOUT, HostOptions,
 };
 use dekopon_shell::{
     DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES as DEFAULT_SHELL_MAX_OUTPUT_BYTES,
@@ -350,12 +350,20 @@ pub struct ProviderArgsError {
     pub source: io::Error,
 }
 
-/// Repeatable provider component arguments.
+/// Repeatable provider component arguments and where their compiled code is kept.
 #[derive(Clone, Debug, Args)]
 pub struct ProviderArgs {
     /// Wasm component or directory of them; repeat for multiple providers.
     #[arg(long, required = true, action = ArgAction::Append, value_name = "COMPONENT")]
     pub provider: Vec<PathBuf>,
+
+    /// Directory holding Wasmtime's compiled-code cache, reused across runs.
+    ///
+    /// Absent, every process Cranelift-compiles every selected component again, which is the
+    /// dominant cost of a short command. The directory holds code this process executes, so name
+    /// one only the invoking user can write.
+    #[arg(long, env = "DEKOPON_RUN_COMPILE_CACHE", value_name = "DIRECTORY")]
+    pub compile_cache: Option<PathBuf>,
 }
 
 impl ProviderArgs {
@@ -400,6 +408,14 @@ impl ProviderArgs {
             components.extend(found);
         }
         Ok(components)
+    }
+
+    /// Returns the operational host settings these arguments select.
+    #[must_use]
+    pub fn host_options(&self) -> HostOptions {
+        HostOptions {
+            compile_cache_dir: self.compile_cache.clone(),
+        }
     }
 }
 
@@ -547,6 +563,7 @@ mod tests {
 
         let arguments = ProviderArgs {
             provider: vec![solo.clone(), nested.clone()],
+            compile_cache: None,
         };
         assert_eq!(
             arguments.components().expect("expansion succeeds"),
@@ -564,6 +581,7 @@ mod tests {
         // path; the registry reports it, not the argument parser.
         let arguments = ProviderArgs {
             provider: vec![missing.clone()],
+            compile_cache: None,
         };
         assert_eq!(
             arguments
