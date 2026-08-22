@@ -200,6 +200,11 @@ All notable changes to Dekopon are documented here. The format is based on
   accepted as an unmatchable subject.
 - The Agent Slack manifest now requests public/private channel history events required to observe
   continuations; ambient traffic is discarded inside the transport before routing or inference.
+- Storage reservations now size the candidate manifest with a fixed-width commitment placeholder
+  instead of recomputing a content HMAC over every dirty file on every positional write, so
+  appending frames costs bytes hashed linear in the change set rather than quadratic in file size.
+  Reservations are byte-identical and durable manifests still carry real commitments over real
+  bytes.
 - `dekopon-run invoke --repeat N` emits one lifecycle log record for the first iteration plus one
   summary rather than one per iteration; failures still report individually and the JSON report is
   unchanged.
