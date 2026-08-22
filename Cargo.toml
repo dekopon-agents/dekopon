@@ -46,8 +46,11 @@ clap = { version = "4.6.4", features = ["derive", "env"] }
 fs2 = "0.4.3"
 getrandom = "0.4.3"
 futures-util = "0.3.31"
+hmac = "0.13.0"
+hyper = { version = "1.11.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 jaq-core = "3.1.0"
-jaq-json = "2.0.1"
+jaq-json = { version = "2.0.1", features = ["serde"] }
 jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["logs", "trace"] }
@@ -73,7 +76,7 @@ tonic = { version = "0.14.1", default-features = false }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
-wasmtime = { version = "36.0.13", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "36.0.13", default-features = false, features = ["cache", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wit-bindgen = { version = "0.44.0", default-features = false, features = ["macros", "realloc"] }
 
 dekopon-agent = { version = "0.9.0", path = "crates/dekopon-agent" }

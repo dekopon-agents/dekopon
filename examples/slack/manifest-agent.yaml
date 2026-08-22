@@ -3,7 +3,9 @@
 # Use this instead of manifest.yaml only when the workspace plan and admin policy enable Slack's
 # Agent messaging experience. The same Socket Mode and bot credentials are used, but Agent DMs are
 # thread-scoped and `agents.sessions.setStatus(processing)` creates Slack's native Working/Stop UI.
-# Dekopon handles `agent_session_stopped` cooperatively and queues a best-effort return to `active`.
+# After one explicitly addressed message is freshly authorized, the same authenticated sender may
+# continue inside that exact Agent thread without repeating the mention. Dekopon handles
+# `agent_session_stopped` cooperatively and queues a best-effort return to `active`.
 # Slack also requires the `app_home_opened` bot event whenever `agent_view` is enabled; opening App
 # Home is not itself a prompt, so dekopond safely acknowledges and ignores that event.
 #
@@ -17,7 +19,11 @@
 # - `reactions:write`: optional free/classic fallback; pair `classicFallback: none` with removing it.
 # - `message.im`/`im:history`: direct-message prompts.
 # - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
+# - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
+#   traffic so the transport can admit only exact freshly authorized sender/thread continuations.
+#   All other ambient messages are dropped before routing, authorization, telemetry, or inference.
 # - `files:read`: lazy access to attachments the sender included.
+# - `files:write`: shares the one bounded PNG an explicitly image-enabled route generated.
 #
 # An xapp token with app-level `connections:write` is still generated manually; app manifests do
 # not declare app-level tokens. Reinstall the app whenever bot scopes change.
@@ -44,8 +50,11 @@ oauth_config:
     bot:
       - app_mentions:read
       - assistant:write
+      - channels:history
       - chat:write
       - files:read
+      - files:write
+      - groups:history
       - im:history
       - reactions:write
 settings:
@@ -54,6 +63,8 @@ settings:
       - agent_session_stopped
       - app_home_opened
       - app_mention
+      - message.channels
+      - message.groups
       - message.im
   interactivity:
     is_enabled: false

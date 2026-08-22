@@ -270,23 +270,30 @@ impl OutputBuffer {
 
     /// Appends one already-rendered line.
     pub fn push_line(&mut self, line: &str) {
-        let line = clamp_line(line, self.max_bytes);
-        let cost = line.len().saturating_add(1);
         self.total_lines = self.total_lines.saturating_add(1);
 
         if !self.truncated {
+            let clamped = clamp_line(line, self.max_bytes);
+            let cost = clamped.len().saturating_add(1);
             let fits = self.head.len() < self.max_lines
                 && self.head_bytes.saturating_add(cost) <= self.max_bytes;
             if fits {
                 self.head_bytes = self.head_bytes.saturating_add(cost);
-                self.head.push(line);
+                self.head.push(clamped);
                 return;
             }
             self.begin_truncation();
         }
 
-        self.tail_bytes = self.tail_bytes.saturating_add(cost);
-        self.tail.push_back(line);
+        // The tail owns only its own share of the byte ceiling, so a line entering it is clamped to
+        // *that* share rather than to the whole one. Clamping to `max_bytes` produced a line
+        // `evict_tail` then dropped whole, so a script that printed diagnostics and one large final
+        // JSON result ended with the truncation marker and no result at all.
+        let clamped = clamp_line(line, self.tail_byte_budget().saturating_sub(1));
+        self.tail_bytes = self
+            .tail_bytes
+            .saturating_add(clamped.len().saturating_add(1));
+        self.tail.push_back(clamped);
         self.evict_tail();
     }
 
@@ -336,8 +343,15 @@ impl OutputBuffer {
         }
     }
 
+    /// Drops the oldest tail lines until the tail is back inside its share of both ceilings.
+    ///
+    /// The most recent line is never evicted, however oversized it is: it has already been clamped
+    /// to the tail's byte budget on the way in, so keeping it is bounded, and it is the line a
+    /// reader most wants — a script's last output is usually its result.
     fn evict_tail(&mut self) {
-        while self.tail.len() > self.tail_line_budget() || self.tail_bytes > self.tail_byte_budget()
+        while self.tail.len() > 1
+            && (self.tail.len() > self.tail_line_budget()
+                || self.tail_bytes > self.tail_byte_budget())
         {
             let Some(dropped) = self.tail.pop_front() else {
                 break;
@@ -345,9 +359,6 @@ impl OutputBuffer {
             self.tail_bytes = self
                 .tail_bytes
                 .saturating_sub(dropped.len().saturating_add(1));
-            if self.tail.is_empty() {
-                break;
-            }
         }
     }
 
@@ -374,15 +385,20 @@ impl OutputBuffer {
 }
 
 /// Clamps one line so a single enormous line cannot defeat the byte ceiling.
+///
+/// The marker counts against `maximum`, so the result is never longer than the budget the caller
+/// checked it against. Clamping to `maximum` and then appending three more bytes produced a line
+/// that overshot every budget it was measured for and was dropped instead of kept.
 fn clamp_line(line: &str, maximum: usize) -> String {
     if line.len() <= maximum {
         return line.to_owned();
     }
-    let mut end = maximum;
+    const MARKER: &str = "...";
+    let mut end = maximum.saturating_sub(MARKER.len());
     while end > 0 && !line.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &line[..end])
+    format!("{}{MARKER}", &line[..end])
 }
 
 #[cfg(test)]
@@ -524,5 +540,44 @@ mod tests {
         assert!(buffer.is_truncated());
         assert!(buffer.render().len() < 200, "{}", buffer.render());
         assert!(buffer.render().ends_with("tail"));
+    }
+
+    #[test]
+    fn a_large_final_line_survives_as_a_clamped_prefix() {
+        // A script that prints diagnostics and then one large JSON result used to end with the
+        // truncation marker and nothing after it: the final line was clamped to the whole byte
+        // ceiling, pushed into a tail that owns half of it, and evicted by the tail's own loop. The
+        // result is the part worth reading, so a prefix of it has to survive.
+        let mut buffer = OutputBuffer::new(&Limits {
+            max_output_bytes: 64,
+            max_output_lines: 100,
+            ..Limits::default()
+        });
+        for index in 0..10 {
+            buffer.push_line(&format!("diagnostic {index}"));
+        }
+        buffer.push_line(&format!("{{\"result\":\"{}\"}}", "y".repeat(4096)));
+
+        let rendered = buffer.render();
+        assert!(buffer.is_truncated());
+        assert!(rendered.contains("{\"result\":\"yy"), "{rendered}");
+        assert!(rendered.ends_with("..."), "{rendered}");
+        // Still bounded: the survivor is a clamped prefix, not the whole 4 KiB line.
+        assert!(rendered.len() < 4 * 64, "{rendered}");
+    }
+
+    #[test]
+    fn a_line_longer_than_the_whole_ceiling_still_leaves_a_prefix() {
+        let mut buffer = OutputBuffer::new(&Limits {
+            max_output_bytes: 32,
+            max_output_lines: 10_000,
+            ..Limits::default()
+        });
+        buffer.push_line(&format!("head {}", "z".repeat(4096)));
+
+        let rendered = buffer.render();
+        assert!(buffer.is_truncated());
+        assert!(rendered.contains("head zz"), "{rendered}");
+        assert!(rendered.len() < 128, "{rendered}");
     }
 }

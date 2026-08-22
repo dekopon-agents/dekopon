@@ -208,6 +208,28 @@ fn functions_participate_in_pipelines_in_both_directions() {
 }
 
 #[test]
+fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
+    // The frame's stdin is shared, not consumed, so each pipeline in a body is offered the same
+    // value however many statements precede it and whether or not they read it.
+    assert_eq!(
+        output("g() { cat; cat; }\necho payload | g"),
+        "payload\npayload"
+    );
+    assert_eq!(
+        output("g() { true; echo first; cat; }\necho payload | g"),
+        "first\npayload"
+    );
+    // Structure survives being handed from stage to stage rather than copied into each one.
+    assert_eq!(output(r#"echo.echo --a 1 --b two | jq '.b' | cat"#), "two");
+    assert_eq!(
+        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; echo.echo --a 1 --b 2 | g"#),
+        "1\n2"
+    );
+    // A here-document still replaces whatever a pipe would have supplied.
+    assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
+}
+
+#[test]
 fn prefix_assignments_are_transient_and_applied_after_expansion() {
     // `x=new echo "[$x]"` must print the *old* value and must not outlive the command.
     assert_eq!(
@@ -284,6 +306,25 @@ fn diagnostics_inside_a_substitution_still_reach_the_output() {
 }
 
 #[test]
+fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
+    // Outside a capture, a command that produced no value writes nothing. Inside one it used to
+    // become an element of the captured stream, and a capture joins its elements with a newline —
+    // so `true` contributed a blank line whose position depended only on where it sat. bash prints
+    // `a` for both of these.
+    assert_eq!(output(r#"x=$(true; echo a); echo "[$x]""#), "[a]");
+    assert_eq!(output(r#"x=$(echo a; true); echo "[$x]""#), "[a]");
+    // A command that selected nothing is the same case: `grep` with no match produces no value.
+    assert_eq!(
+        output(r#"x=$(echo hi | grep zz; echo a); echo "[$x]""#),
+        "[a]"
+    );
+    // Real output is still joined line by line, and the status a null-valued command reported
+    // still reaches `$?`, because it travels through `last_status` rather than the capture.
+    assert_eq!(output(r#"x=$(echo a; echo b); echo "[$x]""#), "[a\nb]");
+    assert_eq!(output("x=$(echo a; false); echo $?"), "1");
+}
+
+#[test]
 fn an_interpolated_substitution_still_reports_its_status() {
     assert_eq!(output("x=a$(false); echo $?"), "1");
     assert_eq!(output("x=$(false); echo $?"), "1");
@@ -353,6 +394,28 @@ fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
     assert_eq!(
         output(r#"r="x$(echo.echo --status 200)"; echo $r"#),
         r#"x{"status":200}"#
+    );
+}
+
+#[test]
+fn a_capture_honors_the_newline_a_command_suppressed() {
+    // Assembling a value piecewise with `printf` is a common model idiom, and a capture that joins
+    // every result with "\n" corrupts every one of them: broken URLs, broken JSON fragments, no
+    // diagnostic. bash prints `ab` for both of these.
+    assert_eq!(
+        output(r#"v=$(printf '%s' a; printf '%s' b); echo "$v""#),
+        "ab"
+    );
+    assert_eq!(output(r#"v=$(echo -n a; echo -n b); echo "$v""#), "ab");
+    // A result that did not suppress its terminator still separates the next one.
+    assert_eq!(
+        output(r#"v=$(echo a; echo b); echo "$v" | wc -l"#),
+        "2".to_owned()
+    );
+    assert_eq!(output(r#"v=$(printf '%s' a; echo b); echo "$v""#), "ab");
+    assert_eq!(
+        output(r#"v=$(echo a; printf '%s' b); echo "$v" | wc -l"#),
+        "2".to_owned()
     );
 }
 
