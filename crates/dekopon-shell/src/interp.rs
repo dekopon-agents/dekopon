@@ -98,6 +98,46 @@ enum Sink {
     },
 }
 
+/// One entry on the stdin stack: the piped value, and how far `read` has consumed it.
+///
+/// The cursor is what separates `read` from every other way of looking at input. `cat` is offered
+/// the whole value on each pipeline in the body — deliberately, so a condition that never reads it
+/// cannot swallow it — while `read` *consumes*, one line per call, which is the only way
+/// `while read line` can terminate rather than seeing line one forever.
+#[derive(Debug, Default)]
+struct StdinSource {
+    value: Option<Rc<Value>>,
+    /// Lines split from `value`, materialized on the first `read` and never again.
+    lines: Option<Vec<String>>,
+    /// How many of those lines `read` has taken.
+    position: usize,
+}
+
+impl StdinSource {
+    fn new(value: Option<Rc<Value>>) -> Self {
+        Self {
+            value,
+            lines: None,
+            position: 0,
+        }
+    }
+
+    /// Takes the next unread line, or `None` at end of input.
+    fn next_line(&mut self) -> Option<String> {
+        let lines = self.lines.get_or_insert_with(|| {
+            self.value
+                .as_deref()
+                .map(value::to_lines)
+                .unwrap_or_default()
+        });
+        let line = lines.get(self.position).cloned();
+        if line.is_some() {
+            self.position += 1;
+        }
+        line
+    }
+}
+
 /// Diagnostics collected while one command's stderr is redirected.
 ///
 /// Bounded by the same output ceilings the combined stream uses. A shell function called as
@@ -243,7 +283,7 @@ struct Evaluator<'a> {
     /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
     /// be deep-copied once per statement — including for the statements that never read input —
     /// and all but the last copy dropped. See [`own`].
-    stdin: Vec<Option<Rc<Value>>>,
+    stdin: Vec<StdinSource>,
     /// The options `set` has turned on.
     options: ShellOptions,
     /// How many enclosing positions are *testing* a status rather than depending on it.
@@ -669,6 +709,144 @@ impl Evaluator<'_> {
         Ok((status, None))
     }
 
+    /// `read [-r] NAME...`: takes one line of input and binds it.
+    ///
+    /// This is what makes `cmd | while read line; do ...; done` terminate. Input is *consumed*
+    /// here, unlike every other way of looking at it: `cat` is offered the whole value on each
+    /// pipeline in the body so a condition cannot swallow it, while `read` advances a cursor and
+    /// reports failure at end of input, which is what ends the loop.
+    ///
+    /// A value that reached this command through a pipe is its own one-shot source; one inherited
+    /// from an enclosing call or compound stage is read through that stage's shared cursor, so
+    /// successive `read`s in a loop body see successive lines.
+    fn run_read(
+        &mut self,
+        arguments: &[String],
+        input: Option<Rc<Value>>,
+        from_pipe: bool,
+    ) -> Result<CommandResult, CommandFailure> {
+        let mut names = arguments;
+        // `-r` is the only flag, and it is what every correct script already passes. Backslashes
+        // are never line continuations here, so it is accepted and changes nothing — said out loud
+        // rather than left as a surprise.
+        if names.first().is_some_and(|first| first == "-r") {
+            names = &names[1..];
+        }
+        if let Some(flag) = names.first().filter(|first| first.starts_with('-')) {
+            return Err(CommandFailure::usage(format!(
+                "read: option {flag:?} is not supported; this shell has only `read [-r] NAME...`"
+            )));
+        }
+        if names.is_empty() {
+            return Err(CommandFailure::usage(
+                "read: needs at least one variable name to bind",
+            ));
+        }
+        for name in names {
+            if !is_variable_name(name) {
+                return Err(CommandFailure::usage(format!(
+                    "read: {name:?} is not a valid variable name"
+                )));
+            }
+        }
+
+        let line = if from_pipe {
+            StdinSource::new(input).next_line()
+        } else {
+            self.stdin.last_mut().and_then(StdinSource::next_line)
+        };
+        let Some(line) = line else {
+            // End of input is a *status*, not a diagnostic: it is the ordinary way a
+            // `while read` loop ends, and a message per loop would be one per iteration.
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+
+        // Several names split the line on whitespace runs, with the remainder landing in the last,
+        // exactly as bash does. This is a rule local to `read` rather than a return of IFS word
+        // splitting: there is no `IFS` here to configure, and nothing else splits.
+        let fields = split_read_fields(&line, names.len());
+        for (index, name) in names.iter().enumerate() {
+            let field = fields.get(index).copied().unwrap_or_default();
+            self.assign(name, Value::String(field.to_owned()))?;
+        }
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+
+    /// `getopts OPTSTRING NAME`: parses one flag out of the current positional parameters.
+    ///
+    /// Scoped to a shell function, because that is the only place positional parameters exist here.
+    /// `OPTIND` and `OPTARG` are ordinary variables, as in bash, so a script resets and inspects
+    /// them the way it already knows how.
+    fn run_getopts(&mut self, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
+        let [optstring, name] = arguments else {
+            return Err(CommandFailure::usage(
+                "getopts: usage: getopts OPTSTRING NAME",
+            ));
+        };
+        if !is_variable_name(name) {
+            return Err(CommandFailure::usage(format!(
+                "getopts: {name:?} is not a valid variable name"
+            )));
+        }
+        if self.frames.is_empty() {
+            return Err(CommandFailure::usage(
+                "getopts: only valid inside a function; positional parameters exist nowhere else \
+                 in this shell",
+            ));
+        }
+
+        let index = self
+            .lookup("OPTIND")
+            .and_then(Value::as_u64)
+            .map_or(1, |index| index as usize)
+            .max(1);
+        let positional = self.positional().to_vec();
+        let Some(argument) = positional.get(index - 1).map(display) else {
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+        if argument == "--" {
+            self.assign("OPTIND", Value::from(index + 1))?;
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        }
+        let Some(letter) = argument.strip_prefix('-').and_then(|rest| {
+            let mut characters = rest.chars();
+            characters
+                .next()
+                .filter(|_| characters.next().is_none() && !rest.is_empty())
+        }) else {
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+
+        let takes_argument = optstring.contains(&format!("{letter}:"));
+        if !optstring.contains(letter) || letter == ':' {
+            self.assign(name, Value::String("?".to_owned()))?;
+            self.assign("OPTARG", Value::String(letter.to_string()))?;
+            self.assign("OPTIND", Value::from(index + 1))?;
+            self.write_line(&format!(
+                "dekopon-shell: getopts: illegal option -- {letter}"
+            ));
+            return Ok(CommandResult::status(ExitCode::SUCCESS));
+        }
+        if takes_argument {
+            let Some(value) = positional.get(index).map(display) else {
+                self.assign(name, Value::String("?".to_owned()))?;
+                self.assign("OPTARG", Value::String(letter.to_string()))?;
+                self.assign("OPTIND", Value::from(index + 1))?;
+                self.write_line(&format!(
+                    "dekopon-shell: getopts: option requires an argument -- {letter}"
+                ));
+                return Ok(CommandResult::status(ExitCode::SUCCESS));
+            };
+            self.assign("OPTARG", Value::String(value))?;
+            self.assign("OPTIND", Value::from(index + 2))?;
+        } else {
+            self.assign("OPTARG", Value::String(String::new()))?;
+            self.assign("OPTIND", Value::from(index + 1))?;
+        }
+        self.assign(name, Value::String(letter.to_string()))?;
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+
     /// Applies one `set` invocation.
     ///
     /// Only the three options this shell actually enforces are accepted. Every other letter and
@@ -804,17 +982,23 @@ impl Evaluator<'_> {
         // each pipeline in the body. It is shared rather than consumed: consuming it would let a
         // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
         // before `cat` could see it, which is the same class of silent data loss as dropping it.
-        let mut input: Option<Rc<Value>> = self.stdin.last().cloned().flatten();
+        let mut input: Option<Rc<Value>> =
+            self.stdin.last().and_then(|source| source.value.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
         let mut stages = Vec::with_capacity(commands);
 
         for (index, command) in pipeline.commands.iter().enumerate() {
             let piped = index + 1 < commands;
+            // Only a later stage's input actually came out of a pipe. The first stage's came from
+            // the enclosing call or compound stage, and `read` has to consume *that* through the
+            // shared cursor rather than through a private copy, or `while read line` would see the
+            // first line forever.
+            let from_pipe = index > 0;
             // A `!` makes the whole pipeline a tested status, and every stage but the last is one
             // anyway: bash exempts both from `errexit`, and so does this.
             match self.tested(pipeline.negated || piped, |evaluator| {
-                evaluator.execute_command(command, input.take(), piped)
+                evaluator.execute_command(command, input.take(), piped, from_pipe)
             })? {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
@@ -862,9 +1046,12 @@ impl Evaluator<'_> {
         command: &Command,
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         match command {
-            Command::Simple(command) => self.execute_simple_command(command, input, capture_output),
+            Command::Simple(command) => {
+                self.execute_simple_command(command, input, capture_output, from_pipe)
+            }
             Command::Compound {
                 statement,
                 redirects,
@@ -897,7 +1084,7 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        self.stdin.push(input);
+        self.stdin.push(StdinSource::new(input));
         if collect {
             self.captures.push(Vec::new());
         }
@@ -964,6 +1151,7 @@ impl Evaluator<'_> {
         command: &SimpleCommand,
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
@@ -1057,7 +1245,7 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        let executed = self.run_argv(&argv, input, capture_output);
+        let executed = self.run_argv(&argv, input, capture_output, from_pipe);
         // Popped before the `?` below: a fatal error must not leave a capture installed for the
         // rest of the script, silently swallowing every later diagnostic.
         let mut diagnostics = capturing
@@ -1241,6 +1429,7 @@ impl Evaluator<'_> {
         argv: &[String],
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
@@ -1265,7 +1454,14 @@ impl Evaluator<'_> {
         }
         let _entered = span.enter();
 
-        let executed = self.dispatch_command(command, arguments, resolution, input, capture_output);
+        let executed = self.dispatch_command(
+            command,
+            arguments,
+            resolution,
+            input,
+            capture_output,
+            from_pipe,
+        );
         let (status, outcome) = match &executed {
             Ok(Executed::Result(result)) => {
                 (result.status, telemetry::outcome_label(result.status))
@@ -1298,9 +1494,10 @@ impl Evaluator<'_> {
         resolution: Option<Resolution>,
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
-            if let Some(executed) = self.run_control_word(command, arguments)? {
+            if let Some(executed) = self.run_control_word(command, arguments, input, from_pipe)? {
                 return Ok(executed);
             }
             // Unreachable while [`telemetry::CONTROL_WORDS`] and `run_control_word` agree, which
@@ -1427,6 +1624,8 @@ impl Evaluator<'_> {
         &mut self,
         command: &str,
         arguments: &[String],
+        input: Option<Rc<Value>>,
+        from_pipe: bool,
     ) -> Result<Option<Executed>, FatalError> {
         let executed = match command {
             "break" | "continue" => {
@@ -1476,6 +1675,20 @@ impl Evaluator<'_> {
                 };
                 Executed::Flow(Flow::Exit(status))
             }
+            "read" => match self.run_read(arguments, input, from_pipe) {
+                Ok(result) => Executed::Result(result),
+                Err(failure) => {
+                    let status = self.absorb(failure)?;
+                    Executed::Result(CommandResult::status(status))
+                }
+            },
+            "getopts" => match self.run_getopts(arguments) {
+                Ok(result) => Executed::Result(result),
+                Err(failure) => {
+                    let status = self.absorb(failure)?;
+                    Executed::Result(CommandResult::status(status))
+                }
+            },
             "local" => {
                 if self.frames.is_empty() {
                     self.write_line("dekopon-shell: local: only valid inside a function");
@@ -1564,7 +1777,7 @@ impl Evaluator<'_> {
             locals: BTreeMap::new(),
             positional,
         });
-        self.stdin.push(input);
+        self.stdin.push(StdinSource::new(input));
         if capture_output {
             self.captures.push(Vec::new());
         }
@@ -1618,7 +1831,7 @@ impl Evaluator<'_> {
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
             self.budget.charge_step()?;
-            match self.run_argv(&invocation, None, true)? {
+            match self.run_argv(&invocation, None, true, false)? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
                     if result.status != ExitCode::SUCCESS {
@@ -2130,6 +2343,36 @@ fn splits_inside_quotes(parameter: &Parameter) -> bool {
         } => !*length && matches!(indices.last(), Some(Index::All)),
         _ => false,
     }
+}
+
+/// Splits one `read` line into at most `count` fields on whitespace runs.
+///
+/// The remainder lands in the last field, as bash does, and leading whitespace is skipped. Local to
+/// `read` rather than a return of IFS word splitting: nothing else in this shell splits, and there
+/// is no `IFS` to configure.
+fn split_read_fields(line: &str, count: usize) -> Vec<&str> {
+    let mut fields = Vec::with_capacity(count);
+    let mut rest = line.trim_start();
+    while fields.len() + 1 < count && !rest.is_empty() {
+        match rest.find(char::is_whitespace) {
+            Some(offset) => {
+                fields.push(&rest[..offset]);
+                rest = rest[offset..].trim_start();
+            }
+            None => break,
+        }
+    }
+    fields.push(rest);
+    fields
+}
+
+/// Reports whether a word can name a shell variable.
+fn is_variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 /// Composes the terminal failure for a `set` option this shell does not enforce.

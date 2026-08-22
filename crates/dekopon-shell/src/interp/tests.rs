@@ -854,6 +854,126 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#
 }
 
 // ---------------------------------------------------------------------------
+// `read` and `getopts`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn while_read_walks_every_line_and_then_stops() {
+    // The idiom this exists for. `read` consumes through the enclosing stage's cursor, so each
+    // iteration sees the next line and end of input is what ends the loop.
+    assert_eq!(
+        output(
+            r#"http-probe.fetch --uri x | jq -r .bodyText | while read line; do echo "[$line]"; done"#
+        ),
+        "[alpha]\n[beta]\n[alpha]"
+    );
+    // And the loop keeps what it assigned, because nothing forked.
+    assert_eq!(
+        output(
+            r#"count=0
+http-probe.fetch --uri x | jq -r .bodyText | while read line; do count=$(( count + 1 )); done
+echo $count"#
+        ),
+        "3"
+    );
+}
+
+#[test]
+fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
+    // A message here would be one per loop, every loop.
+    let outcome = run("echo one | while read line; do echo $line; done");
+    assert_eq!(outcome.output, "one");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(code("echo '' | read x"), 1, "no lines is a failing read");
+}
+
+#[test]
+fn read_binds_several_names_by_splitting_on_whitespace() {
+    // A rule local to `read`, not a return of IFS word splitting: the remainder lands in the last
+    // name, as bash does.
+    assert_eq!(
+        output(
+            r#"echo "alpha beta gamma delta" | { read -r first second rest; echo "1=$first 2=$second rest=$rest"; }"#
+        ),
+        "1=alpha 2=beta rest=gamma delta"
+    );
+    assert_eq!(
+        output(r#"echo "only" | { read -r a b; echo "[$a][$b]"; }"#),
+        "[only][]"
+    );
+}
+
+#[test]
+fn a_piped_read_is_its_own_one_shot_source() {
+    // `echo | read` consumes from the pipe, not from anything the enclosing scope holds.
+    assert_eq!(output("echo hello | read x\necho $x"), "hello");
+}
+
+#[test]
+fn read_refuses_what_it_does_not_implement() {
+    for (script, expected) in [
+        ("echo a | read", "needs at least one variable name"),
+        ("echo a | read -d ,", "option \"-d\" is not supported"),
+        ("echo a | read 1bad", "is not a valid variable name"),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(
+            outcome.output.contains(expected),
+            "{script}: {}",
+            outcome.output
+        );
+    }
+}
+
+#[test]
+fn getopts_parses_a_functions_own_flags() {
+    assert_eq!(
+        output(
+            r#"parse() {
+  while getopts "vn:" opt; do
+    case $opt in
+      v) echo "verbose" ;;
+      n) echo "name=$OPTARG" ;;
+      *) echo "other" ;;
+    esac
+  done
+}
+parse -v -n dekopon"#
+        ),
+        "verbose\nname=dekopon"
+    );
+}
+
+#[test]
+fn getopts_reports_a_bad_flag_and_a_missing_argument() {
+    assert!(
+        output(
+            r#"parse() { getopts "n:" opt; echo "opt=$opt OPTARG=$OPTARG"; }
+parse -z"#
+        )
+        .contains("opt=? OPTARG=z"),
+    );
+    assert!(
+        output(
+            r#"parse() { getopts "n:" opt; echo "opt=$opt"; }
+parse -n"#
+        )
+        .contains("requires an argument")
+    );
+}
+
+#[test]
+fn getopts_is_scoped_to_a_function_because_positionals_are() {
+    let outcome = run("getopts \"v\" opt");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("only valid inside a function"),
+        "{outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Shell options
 // ---------------------------------------------------------------------------
 

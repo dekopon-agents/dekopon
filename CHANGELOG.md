@@ -15,6 +15,13 @@ All notable changes to Dekopon are documented here. The format is based on
   `AuthorizationGate`, and defaults its per-invocation ceilings from the host limits in force
   rather than restating them. Storage grants are minted per invocation from constant scope
   material, so successive calls reach one durable namespace.
+- Added `read` and `getopts` to the sandboxed shell. `read [-r] NAME...` is what makes
+  `cmd | while read line; do ...; done` terminate: it consumes one line per call through a cursor
+  on the enclosing pipeline stage and reports end of input as a status rather than a diagnostic,
+  which would otherwise be one message per loop iteration. Several names split the line on
+  whitespace runs with the remainder in the last, a rule local to `read` rather than a return of
+  IFS word splitting. `getopts` parses a shell function's own flags with `OPTIND` and `OPTARG`, and
+  is scoped to a function because that is the only place positional parameters exist here.
 - Made `set -e`, `set -u`, and `set -o pipefail` real in the sandboxed shell, with their `+` forms,
   and added `${PIPESTATUS[@]}`. `set` was refused outright before on the grounds that an option
   changing nothing while looking like it had is the exact silent wrongness this shell refuses;
