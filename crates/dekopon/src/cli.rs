@@ -207,19 +207,25 @@ fn dns_name(value: &str, limit: usize, dots: bool) -> Result<String, String> {
     if value.is_empty() || value.len() > limit {
         return Err(requirement);
     }
-    let permitted = |character: char| {
-        character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || character == '-'
-            || (dots && character == '.')
-    };
     let alphanumeric =
         |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
-    if !value.chars().all(permitted)
-        || !value.starts_with(alphanumeric)
-        || !value.ends_with(alphanumeric)
-        || value.contains("..")
-    {
+    let label = |label: &str| {
+        !label.is_empty()
+            && label.starts_with(alphanumeric)
+            && label.ends_with(alphanumeric)
+            && label
+                .chars()
+                .all(|character| alphanumeric(character) || character == '-')
+    };
+    // A subdomain is validated per dot-separated label, not as one string: the API server's
+    // regex applies to each label, so `a.-b.c` is rejected there and must be rejected here,
+    // before the credential this name labels has been printed.
+    let valid = if dots {
+        value.split('.').all(label)
+    } else {
+        label(value)
+    };
+    if !valid {
         return Err(requirement);
     }
 

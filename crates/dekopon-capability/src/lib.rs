@@ -205,6 +205,132 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Maximum host or method entries one HTTP grant may carry.
+pub const MAX_HTTP_SCOPE_ENTRIES: usize = 64;
+/// Maximum bytes in one allowed-host entry.
+pub const MAX_HTTP_HOST_BYTES: usize = 512;
+/// Maximum bytes in one allowed-method token.
+pub const MAX_HTTP_METHOD_BYTES: usize = 64;
+
+impl HttpConstraints {
+    /// Checks that the grant is exact: bounded, non-empty, and made of entries the enforcing
+    /// host can actually match.
+    ///
+    /// This is the one definition of the entry grammar the documented fields promise. A grant
+    /// that passes any construction path but fails here would be accepted at startup and then
+    /// deny every call at runtime, so it is refused where it is built instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the grant violates.
+    pub fn validate(&self) -> Result<(), HttpConstraintsError> {
+        if self.allowed_hosts.is_empty() {
+            return Err(HttpConstraintsError::NoHosts);
+        }
+        if self.allowed_methods.is_empty() {
+            return Err(HttpConstraintsError::NoMethods);
+        }
+        if self.allowed_hosts.len() > MAX_HTTP_SCOPE_ENTRIES
+            || self.allowed_methods.len() > MAX_HTTP_SCOPE_ENTRIES
+        {
+            return Err(HttpConstraintsError::TooManyEntries {
+                maximum: MAX_HTTP_SCOPE_ENTRIES,
+            });
+        }
+        if let Some(value) = self
+            .allowed_hosts
+            .iter()
+            .find(|value| !is_authority_scope(value))
+        {
+            return Err(HttpConstraintsError::InvalidHost {
+                value: value.clone(),
+            });
+        }
+        if let Some(value) = self
+            .allowed_methods
+            .iter()
+            .find(|value| value.len() > MAX_HTTP_METHOD_BYTES || !is_http_token(value))
+        {
+            return Err(HttpConstraintsError::InvalidMethod {
+                value: value.clone(),
+            });
+        }
+        if self.max_requests == 0 || self.max_request_bytes == 0 || self.max_response_bytes == 0 {
+            return Err(HttpConstraintsError::ZeroLimit);
+        }
+        Ok(())
+    }
+}
+
+/// An exact authority: a host, or a host and port, with nothing a URL parser would read as
+/// structure and no wildcard.
+fn is_authority_scope(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HTTP_HOST_BYTES
+        && value.trim() == value
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        && !value.contains(['/', '?', '#', '@', '*'])
+}
+
+/// An RFC 9110 token, which is what an HTTP method is.
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Why an HTTP grant is not exact enough to enforce.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum HttpConstraintsError {
+    /// HTTP was granted without an exact destination.
+    #[error("HTTP authorization requires at least one allowed host")]
+    NoHosts,
+    /// HTTP was granted without an exact method.
+    #[error("HTTP authorization requires at least one allowed method")]
+    NoMethods,
+    /// The host or method list exceeded the scope bound.
+    #[error("HTTP authorization allows at most {maximum} host or method entries")]
+    TooManyEntries {
+        /// Entry bound per list.
+        maximum: usize,
+    },
+    /// An allowed host was not an exact authority.
+    #[error("HTTP allowed host {value:?} is not an exact authority")]
+    InvalidHost {
+        /// The rejected entry.
+        value: String,
+    },
+    /// An allowed method was not an exact HTTP token.
+    #[error("HTTP allowed method {value:?} is not an exact HTTP method token")]
+    InvalidMethod {
+        /// The rejected entry.
+        value: String,
+    },
+    /// HTTP was granted without positive call and byte limits.
+    #[error("HTTP authorization limits must be greater than zero")]
+    ZeroLimit,
+}
+
 /// Exact component storage interface selected for one capability.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -430,15 +556,9 @@ pub enum AuthorizationError {
     /// Provider execution was authorized without a positive output bound.
     #[error("authorization output limit must be greater than zero")]
     ZeroOutputLimit,
-    /// HTTP was granted without an exact destination.
-    #[error("HTTP authorization requires at least one allowed host")]
-    NoHttpHosts,
-    /// HTTP was granted without an exact method.
-    #[error("HTTP authorization requires at least one allowed method")]
-    NoHttpMethods,
-    /// HTTP was granted without positive call and byte limits.
-    #[error("HTTP authorization limits must be greater than zero")]
-    ZeroHttpLimit,
+    /// The HTTP grant was not exact enough to enforce.
+    #[error(transparent)]
+    InvalidHttp(#[from] HttpConstraintsError),
     /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHttpAndStorage,
@@ -505,18 +625,7 @@ pub mod broker {
                 return Err(AuthorizationError::MixedHttpAndStorage);
             }
             if let Some(http) = &constraints.http {
-                if http.allowed_hosts.is_empty() {
-                    return Err(AuthorizationError::NoHttpHosts);
-                }
-                if http.allowed_methods.is_empty() {
-                    return Err(AuthorizationError::NoHttpMethods);
-                }
-                if http.max_requests == 0
-                    || http.max_request_bytes == 0
-                    || http.max_response_bytes == 0
-                {
-                    return Err(AuthorizationError::ZeroHttpLimit);
-                }
+                http.validate()?;
             }
 
             Ok(AuthorizedInvocation {
@@ -539,7 +648,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthorizationError, ExecutionConstraints, HttpConstraints, ProposedInvocation, broker,
+        AuthorizationError, ExecutionConstraints, HttpConstraints, HttpConstraintsError,
+        MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
     };
 
     fn proposal() -> ProposedInvocation {
@@ -611,21 +721,79 @@ mod tests {
                     allowed_hosts: Vec::new(),
                     ..valid.clone()
                 },
-                AuthorizationError::NoHttpHosts,
+                HttpConstraintsError::NoHosts,
             ),
             (
                 HttpConstraints {
                     allowed_methods: Vec::new(),
                     ..valid.clone()
                 },
-                AuthorizationError::NoHttpMethods,
+                HttpConstraintsError::NoMethods,
             ),
             (
                 HttpConstraints {
                     max_requests: 0,
+                    ..valid.clone()
+                },
+                HttpConstraintsError::ZeroLimit,
+            ),
+            // Entries the gate used to wave through, which then matched no authority the host
+            // could compute and denied every call at runtime.
+            (
+                HttpConstraints {
+                    allowed_hosts: vec![" api.github.com".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: " api.github.com".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec!["*".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: "*".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec!["a/b".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: "a/b".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: vec![String::new()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidHost {
+                    value: String::new(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_methods: vec!["GET POST".to_owned()],
+                    ..valid.clone()
+                },
+                HttpConstraintsError::InvalidMethod {
+                    value: "GET POST".to_owned(),
+                },
+            ),
+            (
+                HttpConstraints {
+                    allowed_hosts: (0..=MAX_HTTP_SCOPE_ENTRIES)
+                        .map(|index| format!("host{index}.example.test"))
+                        .collect(),
                     ..valid
                 },
-                AuthorizationError::ZeroHttpLimit,
+                HttpConstraintsError::TooManyEntries {
+                    maximum: MAX_HTTP_SCOPE_ENTRIES,
+                },
             ),
         ];
 
@@ -643,8 +811,28 @@ mod tests {
                     },
                 )
                 .expect_err("incomplete HTTP authority must fail");
-            assert_eq!(error, expected);
+            assert_eq!(error, AuthorizationError::InvalidHttp(expected));
         }
+    }
+
+    /// An authority with a port, and every method token the broker's own policies use.
+    #[test]
+    fn broker_gate_accepts_exact_http_authority() {
+        let http = HttpConstraints {
+            allowed_hosts: vec!["api.example.test".to_owned(), "127.0.0.1:8080".to_owned()],
+            allowed_methods: vec![
+                "GET".to_owned(),
+                "POST".to_owned(),
+                "PATCH".to_owned(),
+                "DELETE".to_owned(),
+            ],
+            max_requests: 4,
+            max_request_bytes: 65_536,
+            max_response_bytes: 1_048_576,
+            allow_plaintext_loopback: true,
+        };
+
+        http.validate().expect("an exact grant is enforceable");
     }
 
     #[test]

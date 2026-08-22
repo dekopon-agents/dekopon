@@ -181,6 +181,29 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Catalog validation now scans the whole file and reports every duplicate, invalid name,
+  unsupported API version, and missing reference in one list, instead of stopping at the first.
+- `agent.spec.providers` is now held to the providers the agent's own capabilities route to, in
+  both directions, so a rendered provider inventory can no longer drift from the capability list.
+- The HTTP grant entry grammar — exact authorities, exact method tokens, and the entry-count cap —
+  now lives once on `HttpConstraints::validate` and is enforced by `AuthorizationGate`,
+  `dekopon-broker`, and `dekopon-http-host` alike. The broker's accepted set is unchanged; the gate
+  and HTTP host no longer accept entries the broker refuses.
+- The capability-shaped command-word refusal now explains the real mechanism: the shell resolves
+  provider command words before capability fallback, so such a word would shadow the capability of
+  that name.
+
+### Fixed
+
+- `--secret-name` is now validated per DNS-1123 label, so names such as `a.-b.c` are refused before
+  the credential is printed rather than by `kubectl apply` afterwards.
+- Configuration discovery no longer treats an unexaminable default candidate as absent; anything
+  other than "not found" fails and names the candidate instead of loading a lower-precedence file.
+- A single provider declaring one command word twice is now reported as exactly that, rather than
+  as a collision between more than one provider.
+- Telegram subjects are now required to be numeric in both the constructor and the parser, so an
+  `identityMappings` typo such as `telegram.alice` is refused at broker startup instead of being
+  accepted as an unmatchable subject.
 - The Agent Slack manifest now requests public/private channel history events required to observe
   continuations; ambient traffic is discarded inside the transport before routing or inference.
 - `dekopon-run invoke --repeat N` emits one lifecycle log record for the first iteration plus one

@@ -376,10 +376,16 @@ mod tests {
 pub enum CommandWordConflictKind {
     /// The sandboxed shell owns the word: a builtin, a control word, or one it refuses by name.
     Reserved,
-    /// The word would be taken as a capability identifier by the fallback rule.
+    /// The word is shaped like a capability identifier, which it would shadow.
+    ///
+    /// The shell resolves provider command words *before* capability fallback, so allowing one
+    /// would make the provider command win and the granted capability of that name unreachable
+    /// under its own spelling. Provider words and capability identifiers stay disjoint instead.
     CapabilityShaped,
     /// More than one provider claimed it.
     Duplicate,
+    /// One provider declared it more than once.
+    Repeated,
 }
 
 impl CommandWordConflictKind {
@@ -389,9 +395,11 @@ impl CommandWordConflictKind {
         match self {
             Self::Reserved => "is reserved by the sandboxed shell and could never dispatch",
             Self::CapabilityShaped => {
-                "contains `.`, `-`, or `_`, so the shell would take it as a capability identifier"
+                "contains `.`, `-`, or `_`, so it would shadow the capability of that name; the \
+                 shell resolves provider command words before capability fallback"
             }
             Self::Duplicate => "is claimed by more than one provider",
+            Self::Repeated => "is declared more than once by the same provider",
         }
     }
 
@@ -405,6 +413,7 @@ impl CommandWordConflictKind {
                  by its full identifier"
             }
             Self::Reserved => "rename the command word; this name is reserved",
+            Self::Repeated => "remove the repeated entry from that provider's command words",
         }
     }
 }
@@ -414,7 +423,7 @@ impl CommandWordConflictKind {
 pub struct CommandWordConflict {
     /// The contested word.
     pub word: String,
-    /// Every provider claiming it, in the order they were loaded.
+    /// Every distinct provider claiming it, in the order they were loaded.
     pub claimants: Vec<String>,
     /// Why the claim cannot stand.
     pub kind: CommandWordConflictKind,
@@ -443,18 +452,28 @@ pub fn command_word_conflicts(declared: &[(String, Vec<String>)]) -> Vec<Command
 
     let mut conflicts = Vec::new();
     for (word, providers) in claimants {
+        // A manifest listing one word twice is one provider's mistake, not a collision between
+        // two, so the count that decides Duplicate is of distinct providers.
+        let mut distinct = Vec::with_capacity(providers.len());
+        for provider in &providers {
+            if !distinct.contains(provider) {
+                distinct.push(provider.clone());
+            }
+        }
         let kind = if RESERVED_COMMAND_WORDS.contains(&word) {
             CommandWordConflictKind::Reserved
         } else if word.contains(['.', '-', '_']) && word.parse::<CapabilityId>().is_ok() {
             CommandWordConflictKind::CapabilityShaped
-        } else if providers.len() > 1 {
+        } else if distinct.len() > 1 {
             CommandWordConflictKind::Duplicate
+        } else if distinct.len() < providers.len() {
+            CommandWordConflictKind::Repeated
         } else {
             continue;
         };
         conflicts.push(CommandWordConflict {
             word: word.to_owned(),
-            claimants: providers,
+            claimants: distinct,
             kind,
         });
     }
@@ -511,6 +530,53 @@ mod command_word_tests {
             assert_eq!(conflicts[0].kind, kind, "{word}");
             assert_eq!(conflicts[0].word, word);
         }
+    }
+
+    /// A repeated word is still refused, but the operator is told what actually happened: one
+    /// manifest lists it twice. "More than one provider" would send them looking for a provider
+    /// that does not exist.
+    #[test]
+    fn one_provider_repeating_a_word_is_not_reported_as_two_providers() {
+        let conflicts = command_word_conflicts(&declared(&[("fly", &["deploy", "deploy"])]));
+
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].kind, CommandWordConflictKind::Repeated);
+        assert_eq!(conflicts[0].claimants, ["fly"]);
+        assert!(
+            conflicts[0]
+                .kind
+                .explanation()
+                .contains("more than once by the same provider"),
+            "{}",
+            conflicts[0].kind.explanation()
+        );
+
+        // A real two-provider collision still reads as one, even when one of them repeats.
+        let conflicts = command_word_conflicts(&declared(&[
+            ("fly", &["deploy", "deploy"]),
+            ("k8s", &["deploy"]),
+        ]));
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].kind, CommandWordConflictKind::Duplicate);
+        assert_eq!(conflicts[0].claimants, ["fly", "k8s"]);
+    }
+
+    /// The explanation is printed verbatim in the broker's startup report, so it has to describe
+    /// the mechanism that actually exists: provider words resolve before capability fallback.
+    #[test]
+    fn the_capability_shaped_explanation_names_the_shadowing_hazard() {
+        let conflicts = command_word_conflicts(&declared(&[("some-provider", &["gh.pr"])]));
+
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        let explanation = conflicts[0].kind.explanation();
+        assert!(
+            explanation.contains("shadow the capability"),
+            "{explanation}"
+        );
+        assert!(
+            explanation.contains("before capability fallback"),
+            "{explanation}"
+        );
     }
 
     #[test]

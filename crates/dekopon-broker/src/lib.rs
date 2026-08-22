@@ -79,8 +79,6 @@ use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
-const MAX_POLICY_SCOPE_VALUE_BYTES: usize = 512;
-const MAX_HTTP_METHOD_BYTES: usize = 64;
 const AUDIT_HASH_DOMAIN: &[u8] = b"dekopon-audit-record-v1\0";
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
@@ -1156,24 +1154,10 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
     let Some(http) = &constraints.http else {
         return Ok(());
     };
-    if http.allowed_hosts.is_empty()
-        || http.allowed_methods.is_empty()
-        || http.max_requests == 0
-        || http.max_request_bytes == 0
-        || http.max_response_bytes == 0
-        || http.allowed_hosts.len() > MAX_POLICY_SCOPE_ENTRIES
-        || http.allowed_methods.len() > MAX_POLICY_SCOPE_ENTRIES
-        || http
-            .allowed_hosts
-            .iter()
-            .any(|value| !is_authority_scope(value))
-        || http
-            .allowed_methods
-            .iter()
-            .any(|value| value.len() > MAX_HTTP_METHOD_BYTES || !is_http_token(value))
-    {
-        return Err(BrokerBuildError::InvalidPolicyConstraints);
-    }
+    // The same grammar the capability gate and the HTTP host enforce. A constraint set this
+    // broker accepted but they rejected would authorize calls nothing can serve.
+    http.validate()
+        .map_err(|_| BrokerBuildError::InvalidPolicyConstraints)?;
     Ok(())
 }
 
@@ -1308,40 +1292,6 @@ fn canonical_signed_decimal(value: &str) -> bool {
     value
         .parse::<i64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
-}
-
-fn is_authority_scope(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_POLICY_SCOPE_VALUE_BYTES
-        && value.trim() == value
-        && !value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        && !value.contains(['/', '?', '#', '@', '*'])
-}
-
-fn is_http_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
 }
 
 /// Failure to construct a coherent broker boundary.

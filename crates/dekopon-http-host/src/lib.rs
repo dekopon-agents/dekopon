@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use dekopon_capability::HttpConstraints;
+use dekopon_capability::{HttpConstraints, HttpConstraintsError};
 use dekopon_core::Redacted;
 use futures_util::StreamExt as _;
 use reqwest::{
@@ -163,9 +163,13 @@ pub enum ConfigurationError {
         /// Invalid field.
         field: &'static str,
     },
-    /// Grant omitted required authority or a positive bound.
-    #[error("HTTP authorization is incomplete or unbounded")]
-    InvalidGrant,
+    /// Grant omitted required authority, an exact entry, or a positive bound.
+    #[error("HTTP authorization is not exact: {source}")]
+    InvalidGrant {
+        /// Which entry-grammar or bound rule the grant violated.
+        #[source]
+        source: HttpConstraintsError,
+    },
     /// Grant attempted to exceed a native ceiling.
     #[error("HTTP authorization exceeds native host ceilings")]
     GrantExceedsCeiling,
@@ -940,14 +944,11 @@ fn validate_configuration(
         return Err(ConfigurationError::ZeroTimeout);
     }
     if let Some(grant) = grant {
-        if grant.allowed_hosts.is_empty()
-            || grant.allowed_methods.is_empty()
-            || grant.max_requests == 0
-            || grant.max_request_bytes == 0
-            || grant.max_response_bytes == 0
-        {
-            return Err(ConfigurationError::InvalidGrant);
-        }
+        // One shared definition of an exact grant, so this host cannot accept a scope the
+        // broker that issued it would have refused.
+        grant
+            .validate()
+            .map_err(|source| ConfigurationError::InvalidGrant { source })?;
         if grant.max_requests > ceilings.max_requests
             || grant.max_request_bytes > ceilings.max_request_bytes
             || grant.max_response_bytes > ceilings.max_response_bytes
@@ -1217,7 +1218,7 @@ mod tests {
         time::Duration,
     };
 
-    use dekopon_capability::HttpConstraints;
+    use dekopon_capability::{HttpConstraints, HttpConstraintsError};
     use dekopon_core::Redacted;
 
     use super::{
@@ -1423,6 +1424,43 @@ mod tests {
         let error = BufferedHttpClient::disabled(HttpHostCeilings::default(), Duration::MAX)
             .expect_err("unrepresentable runtime deadline must fail");
         assert_eq!(error, ConfigurationError::TimeoutOverflow);
+    }
+
+    /// An entry this host cannot match is a grant it must refuse, not one it accepts and then
+    /// denies on every call. The rule set is shared with the broker that issues the grant.
+    #[test]
+    fn rejects_grant_entries_no_authority_can_match() {
+        for host in [" api.example.test", "*", "a/b", ""] {
+            let error = BufferedHttpClient::authorized(
+                grant(host.to_owned(), "GET"),
+                HttpHostCeilings::default(),
+                Duration::from_secs(1),
+            )
+            .expect_err("an inexact host must not configure a client");
+            assert_eq!(
+                error,
+                ConfigurationError::InvalidGrant {
+                    source: HttpConstraintsError::InvalidHost {
+                        value: host.to_owned()
+                    }
+                }
+            );
+        }
+
+        let error = BufferedHttpClient::authorized(
+            grant("api.example.test".to_owned(), "GET POST"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect_err("an inexact method must not configure a client");
+        assert_eq!(
+            error,
+            ConfigurationError::InvalidGrant {
+                source: HttpConstraintsError::InvalidMethod {
+                    value: "GET POST".to_owned()
+                }
+            }
+        );
     }
 
     #[test]
