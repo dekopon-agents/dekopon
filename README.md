@@ -36,6 +36,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
   durable chat memory. Memory is model-queryable only under an effective all-three grant and is
   recorded once after gateway-attested complete transport acceptance; it is never automatically
   replayed into a prompt.
+- Unreleased: a text-only Meta WhatsApp Cloud API transport with exact raw-body HMAC verification,
+  bounded process-local message-ID deduplication, `whatsapp.<wa_id>` subjects, one-attempt pinned
+  Graph API replies, and an opt-in chart ClusterIP port for exact-path Traefik routing. It adds no
+  broker authority and exposes no operational UI.
 
 New in 0.9.0 — native chat activity without moving authority:
 

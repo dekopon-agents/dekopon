@@ -168,10 +168,12 @@ async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge
     assert_eq!(commands.len(), 2, "one span per command the script ran");
     for (_, parents) in commands {
         // `prompt.model_turn` is absent by design: the loop drops that guard once the model has
-        // answered, so a script runs under the session rather than under the turn.
+        // answered, so a script runs under the session rather than under the turn. The
+        // interpreter's own `shell.script` sits innermost, where it holds the run's totals.
         assert_eq!(
             parents,
             &[
+                "shell.script".to_owned(),
                 "prompt.script".to_owned(),
                 "prompt.session".to_owned(),
                 "runner.prompt".to_owned(),

@@ -30,7 +30,9 @@ use dekopon_model::{
     chatgpt::{ChatGptCodexModel, ChatGptError},
     model::{ChatModel, ModelError, OpenAiChatModel},
 };
-use dekopon_provider_host::{HostLimits, ProviderHostError, ProviderManifest, ProviderRegistry};
+use dekopon_provider_host::{
+    HostLimits, HostOptions, ProviderHostError, ProviderManifest, ProviderRegistry,
+};
 use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, Interpreter,
     Limits as ShellLimits,
@@ -150,7 +152,11 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             let components = providers.components()?;
             let span = tracing::info_span!("runner.inspect", provider.count = components.len());
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(components, host_limits(limits))?;
+            let registry = ProviderRegistry::load_with_options(
+                components,
+                host_limits(limits),
+                &providers.host_options(),
+            )?;
             let manifests = registry.manifests().collect::<Vec<&ProviderManifest>>();
             serde_json::to_string_pretty(&manifests)
                 .map(CommandOutput::success)
@@ -177,7 +183,11 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 input_file.as_deref(),
                 limits.max_input_bytes,
             )?;
-            let registry = ProviderRegistry::load(components, host_limits(limits))?;
+            let registry = ProviderRegistry::load_with_options(
+                components,
+                host_limits(limits),
+                &providers.host_options(),
+            )?;
             let mut samples = TimingSamples::default();
             let mut last = None;
             let total_start = Instant::now();
@@ -274,7 +284,11 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 shell.max_capability_calls = shell.shell_max_capability_calls
             );
             let _entered = span.enter();
-            let registry = ProviderRegistry::load(components, host_limits(limits))?;
+            let registry = ProviderRegistry::load_with_options(
+                components,
+                host_limits(limits),
+                &providers.host_options(),
+            )?;
             let invoker = RegistryInvoker {
                 registry: &registry,
             };
@@ -312,6 +326,7 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             let components = providers.components()?;
             let settings = PromptSettings {
                 limits: host_limits(limits),
+                options: providers.host_options(),
                 shell: shell_limits(shell),
                 curl_capability: curl_capability.as_ref().map(CapabilityId::to_string),
                 providers: components.clone(),
@@ -393,6 +408,7 @@ async fn evaluate_chat(
 /// `Send`, so borrowing from the parsed CLI is not an option.
 struct PromptSettings {
     limits: HostLimits,
+    options: HostOptions,
     shell: ShellLimits,
     curl_capability: Option<String>,
     providers: Vec<PathBuf>,
@@ -444,7 +460,11 @@ fn run_prompt_session(
     settings: PromptSettings,
     broker: Option<Box<dyn CapabilityInvoker + Send>>,
 ) -> Result<prompt::PromptOutcome, AppError> {
-    let registry = ProviderRegistry::load(settings.providers, settings.limits)?;
+    let registry = ProviderRegistry::load_with_options(
+        settings.providers,
+        settings.limits,
+        &settings.options,
+    )?;
     let model: Box<dyn ChatModel> = if settings.chatgpt_subscription {
         Box::new(ChatGptCodexModel::new(
             &settings.model,
@@ -572,6 +592,9 @@ async fn connect_prompt_broker(
         .map_err(|error| match error {
             BrokerLegError::Client(source) => AppError::BrokerClient(source),
             BrokerLegError::SessionIdentifier(source) => AppError::SessionIdentifier(source),
+            BrokerLegError::DuplicateCapabilities { capabilities } => {
+                AppError::BrokerDuplicateCapabilities { capabilities }
+            }
         })?;
     // The socket tier and the session trace are what a "this session saw zero capabilities"
     // investigation asks for first: which broker was reached, and which audit records are this
@@ -637,6 +660,9 @@ fn host_limits(limits: &LimitArgs) -> HostLimits {
         max_output_bytes: limits.max_output_bytes,
         fuel: limits.fuel,
         timeout: Duration::from_millis(limits.timeout_ms),
+        // Table, instance, and memory-count ceilings have no command-line flag; the host defaults
+        // bound the allocation paths `--max-memory-bytes` does not reach.
+        ..HostLimits::default()
     }
 }
 
@@ -997,6 +1023,12 @@ enum AppError {
     #[cfg(unix)]
     #[error("could not derive a unique identifier for this broker session")]
     SessionIdentifier(#[source] IdentifierError),
+    #[cfg(unix)]
+    #[error("the broker answered with duplicate capability identifiers: {capabilities}")]
+    BrokerDuplicateCapabilities {
+        /// Every repeated identifier, in identifier order.
+        capabilities: String,
+    },
     #[error("the prompt session did not run to completion")]
     PromptTask(#[source] tokio::task::JoinError),
     #[error("broker capability input must be a JSON object")]
@@ -1062,6 +1094,8 @@ impl AppError {
             Self::BrokerFlagsWithoutOptIn => "broker-flags-without-opt-in",
             #[cfg(unix)]
             Self::SessionIdentifier(_) => "session-identifier",
+            #[cfg(unix)]
+            Self::BrokerDuplicateCapabilities { .. } => "broker-duplicate-capabilities",
             Self::PromptTask(_) => "prompt-task",
             Self::BrokerInputObject => "broker-input-object",
             Self::ChatGpt(_) => "chatgpt",

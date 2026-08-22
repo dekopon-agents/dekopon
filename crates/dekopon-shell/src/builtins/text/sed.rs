@@ -115,8 +115,9 @@ impl Substitution {
 
         // Unlike `grep`, this `s` command has no anchors at all, so a leading `^` or trailing `$`
         // would be matched as that character. `sed "s/^ *//"` silently returning its input
-        // unchanged is precisely the failure this module claims cannot happen.
-        if fields[0].starts_with('^') || fields[0].ends_with('$') {
+        // unchanged is precisely the failure this module claims cannot happen. An *escaped* `\$` is
+        // a literal dollar sign rather than an anchor, so it passes through to `literal_pattern`.
+        if fields[0].starts_with('^') || super::ends_with_anchor(&fields[0]) {
             return Err(CommandFailure::usage(format!(
                 "sed: {:?} anchors with `^`/`$`, which this substitution does not support; match the literal text, or use `grep` for anchored selection",
                 fields[0]
@@ -320,6 +321,17 @@ mod tests {
             json!("a y b")
         );
         assert_eq!(sed(&[r"s/x/a\&b/"], json!("x")).value, json!("a&b"));
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_substituted_rather_than_rejected_as_an_anchor() {
+        // `s/price\$/x/` names a literal dollar sign, not an anchor, and rejecting it sent a script
+        // looking for a workaround that does not exist. An even backslash run is still an anchor.
+        assert_eq!(
+            sed(&[r"s/price\$/cost/"], json!("the price$ line")).value,
+            json!("the cost line")
+        );
+        assert!(Substitution::parse(r"s/price\\$/x/").is_err());
     }
 
     #[test]

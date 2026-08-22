@@ -578,6 +578,85 @@ async fn a_group_writable_provider_directory_refuses_to_load() {
         .expect("a private provider directory loads");
 }
 
+fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Value {
+    let defaults = dekopon_broker_host::BrokerHostLimits::default();
+    let mut limits = json!({
+        "maxMemoryBytes": defaults.max_memory_bytes,
+        "maxTableElements": defaults.max_table_elements,
+        "maxInstances": defaults.max_instances,
+        "maxTables": defaults.max_tables,
+        "maxMemories": defaults.max_memories,
+        "maxInputBytes": defaults.max_input_bytes,
+        "maxOutputBytes": defaults.max_output_bytes,
+        "maxHttpRequests": defaults.max_http_requests,
+        "maxHttpRequestBytes": defaults.max_http_request_bytes,
+        "maxHttpResponseBytes": defaults.max_http_response_bytes,
+        "maxHttpHeaders": defaults.max_http_headers,
+        "maxHttpHeaderBytes": defaults.max_http_header_bytes,
+        "fuel": defaults.fuel,
+        "maxTimeoutMs": u64::try_from(defaults.max_timeout.as_millis()).unwrap_or(u64::MAX),
+    });
+    if let Some(maximum) = max_total_memory_bytes {
+        limits["maxTotalMemoryBytes"] = json!(maximum);
+    }
+    limits
+}
+
+/// Per-store limits bound one invocation; the connection ceiling decides how many exist at once.
+/// Configuration is where that product becomes a stated number rather than an OOM kill.
+#[tokio::test]
+async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let policies = directory.path().join("policies.cedar");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(&policies, POLICIES.as_bytes());
+
+    let mut document = attested_document(uid);
+    document["compileCachePath"] = json!("compile-cache");
+    document["hostLimits"] = host_limits_document(Some(256 * 1024 * 1024));
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("an aggregate ceiling above one store loads");
+    assert_eq!(
+        resolved.host_options.compile_cache_dir.as_deref(),
+        Some(
+            directory
+                .path()
+                .canonicalize()
+                .expect("canonical fixture directory")
+                .join("compile-cache")
+                .as_path()
+        )
+    );
+    assert_eq!(
+        resolved.host_options.max_total_memory_bytes,
+        Some(256 * 1024 * 1024)
+    );
+    assert_eq!(
+        resolved.worst_case_guest_memory_bytes,
+        resolved.server_limits.max_connections * resolved.host_limits.max_memory_bytes
+    );
+
+    // A ceiling below one store could never admit a single invocation.
+    document["hostLimits"] = host_limits_document(Some(
+        u64::try_from(dekopon_broker_host::BrokerHostLimits::default().max_memory_bytes)
+            .expect("default fits u64")
+            - 1,
+    ));
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("an unusable aggregate ceiling refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::InvalidHostLimits),
+        "{error:?}"
+    );
+}
+
 /// An empty directory is almost certainly a mount that did not happen or a build that did not run,
 /// so it gets its own error rather than the generic "no providers".
 #[tokio::test]
@@ -869,4 +948,230 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
         serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
         "presence requires every storage field"
     );
+}
+
+/// One transient `accept` failure used to end the privileged daemon, and ending it is the most
+/// expensive answer available: the container restarts, every provider recompiles under Cranelift
+/// before the socket rebinds, and durable audit state waits through all of it. Descriptor
+/// exhaustion — which the unauthenticated `--http-bind` listener can cause on its own — is not a
+/// broken listener.
+#[test]
+fn transient_accept_failures_are_survivable_and_the_rest_are_not() {
+    for (errno, kind) in [
+        (libc::EMFILE, "process-descriptor-limit"),
+        (libc::ENFILE, "system-descriptor-limit"),
+        (libc::ENOBUFS, "kernel-memory"),
+        (libc::ENOMEM, "kernel-memory"),
+        (libc::ECONNABORTED, "connection-aborted"),
+        (libc::ECONNRESET, "connection-reset"),
+        (libc::EINTR, "interrupted"),
+    ] {
+        assert_eq!(
+            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
+            Some(kind),
+            "errno {errno} must not exit the daemon"
+        );
+    }
+
+    // A listener that is gone, unbound, or not a socket is a real fault: retrying it forever would
+    // turn a startup mistake into a silent hang.
+    for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+        assert_eq!(
+            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
+            None,
+            "errno {errno} must stay fatal"
+        );
+    }
+    // Not every `io::Error` carries an errno.
+    assert_eq!(
+        server::retryable_accept_error(&std::io::Error::other("no errno")),
+        None
+    );
+}
+
+/// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
+/// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
+/// storage GC and the web UI a fresh full grace each — that is how a 120 s `shutdownGraceMs`
+/// became a 360 s exit against a 180 s `terminationGracePeriodSeconds`.
+#[tokio::test(start_paused = true)]
+async fn every_drain_shares_one_grace() {
+    let grace = std::time::Duration::from_secs(120);
+    let started = tokio::time::Instant::now();
+    let report = super::drain_services(
+        started + grace,
+        async {
+            tokio::time::sleep(grace).await;
+            Ok(())
+        },
+        tokio::time::sleep(grace * 3 / 4),
+        Some(async {
+            tokio::time::sleep(grace * 3 / 4).await;
+            Ok(())
+        }),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < grace * 2,
+        "three drains that each fit one grace must not take three: {elapsed:?}"
+    );
+    assert!(report.broker.is_ok());
+    assert!(!report.storage_gc_timed_out);
+    assert!(!report.web_timed_out);
+    assert!(matches!(report.web, Some(Ok(()))));
+}
+
+/// And the deadline is shared rather than restarted, so a drain that outlives it is reported
+/// instead of being given the grace over again.
+#[tokio::test(start_paused = true)]
+async fn a_drain_past_the_shared_deadline_times_out() {
+    let grace = std::time::Duration::from_secs(120);
+    let started = tokio::time::Instant::now();
+    let report = super::drain_services(
+        started + grace,
+        async {
+            tokio::time::sleep(grace / 2).await;
+            Ok(())
+        },
+        tokio::time::sleep(grace * 4),
+        Some(async {
+            tokio::time::sleep(grace * 4).await;
+            Ok(())
+        }),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < grace * 2, "{elapsed:?}");
+    assert!(report.storage_gc_timed_out);
+    assert!(report.web_timed_out);
+    assert!(report.web.is_none());
+}
+
+/// The startup frame check exists so an oversized capability response fails here rather than on
+/// the first session. It used to measure only the direct peers, and in the deployment it is written
+/// for the direct peer is the gateway — granted almost nothing. The capability sets that actually
+/// reach the wire belong to the attested principals the identity mappings name, on the
+/// `capabilitiesFor` path the check skipped, so the oversized response passed startup and then
+/// failed `write_frame` on every session open.
+#[tokio::test]
+async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
+    use std::sync::Arc;
+
+    use dekopon_broker::{
+        AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, CredentialStore,
+        IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    };
+    use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+    use dekopon_broker_protocol::ResponseEnvelope;
+    use dekopon_core::{Actor, AgentId, CapabilityId, PrincipalId};
+
+    use super::{BrokerdError, MappedPeer, validate_capability_responses};
+
+    let echo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/echo-provider.wasm");
+    let registry = BrokerProviderRegistry::load([echo], BrokerHostLimits::default())
+        .await
+        .expect("load echo fixture");
+    let capability = "echo.echo"
+        .parse::<CapabilityId>()
+        .expect("valid capability fixture");
+    let world = PolicyWorld::new(
+        ["gateway", "cpetersen"].map(|name| name.parse::<PrincipalId>().expect("valid principal")),
+        [(
+            capability.clone(),
+            "echo".parse().expect("valid provider fixture"),
+        )],
+    )
+    .expect("declared world builds");
+    let catalog = ConstraintCatalog::new([(
+        capability,
+        serde_json::from_value(constraint_set()).expect("constraint set decodes"),
+    )])
+    .expect("one capability builds a catalog");
+    let broker = Broker::new(
+        registry,
+        "broker-test".parse().expect("valid broker principal"),
+        "policy-test".to_owned(),
+        PolicyEngine::new(POLICIES, &world).expect("fixture policy validates"),
+        catalog,
+        CredentialStore::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+            "cpetersen".parse::<PrincipalId>().expect("valid principal"),
+        )])
+        .expect("one mapping builds a directory"),
+        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        BrokerLimits::default(),
+    )
+    .expect("broker starts");
+
+    // The gateway peer itself: it may attest for others and holds no capability of its own, so its
+    // own answer is empty and fits anything.
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().expect("valid principal"),
+        Actor::Service {
+            principal: "gateway".parse().expect("valid principal"),
+        },
+    )
+    .expect("trusted context binds");
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        current_uid(),
+        MappedPeer {
+            context: gateway.clone(),
+            attestor: None,
+        },
+    );
+    let peer_bytes = serde_json::to_vec(&ResponseEnvelope::capabilities(
+        broker.capabilities(&gateway),
+        broker.command_words(&gateway),
+    ))
+    .expect("peer response encodes")
+    .len();
+
+    // A session's answer under `chat-agent` carries the real capability, so it is strictly larger.
+    let (capabilities, words) = broker.capability_ceiling();
+    assert!(
+        !capabilities.is_empty(),
+        "the ceiling must see what policy grants an attested principal"
+    );
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway,
+                Some(&dekopon_broker::AttestorGrant {
+                    namespaces: vec!["slack.t0123abc".to_owned()],
+                    chat_scopes: Vec::new(),
+                }),
+                &"slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                &"chat-agent".parse::<AgentId>().expect("valid agent"),
+            )
+            .expect("the mapped subject is attestable")
+            .0
+            .len()
+            <= capabilities.len(),
+        "the ceiling must bound what a real session receives"
+    );
+
+    let ceiling_bytes = serde_json::to_vec(&ResponseEnvelope::chat_capabilities(
+        capabilities,
+        words,
+        broker.chat_memory_ceiling(),
+    ))
+    .expect("ceiling response encodes")
+    .len();
+    assert!(ceiling_bytes > peer_bytes);
+
+    // A frame that fits every direct peer and nothing else used to pass startup.
+    let error = validate_capability_responses(&broker, &identities, peer_bytes)
+        .expect_err("a frame that cannot carry a session's answer must refuse to start");
+    assert!(
+        matches!(error, BrokerdError::CapabilityCeilingTooLarge { length, maximum }
+            if length == ceiling_bytes && maximum == peer_bytes),
+        "{error}"
+    );
+    validate_capability_responses(&broker, &identities, ceiling_bytes)
+        .expect("a frame that carries the widest answer starts");
 }

@@ -44,15 +44,17 @@ use crate::{
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelFactory, SessionError,
-        SessionGate, SessionRunner, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
-        configured_image_generators, memory_record_outcome_category, run_session,
+        BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache, ModelFactory,
+        SessionError, SessionGate, SessionRunner, SharedModel, UNAUTHORIZED_REPLY,
+        UNREPORTED_WORK_REPLY, configured_image_generators, memory_record_outcome_category,
+        run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
         OutboundReply, ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership,
         TransportError, TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
+        credential_value,
     },
 };
 
@@ -246,6 +248,79 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
     assert!(
         load(directory.path(), &document).await.is_err(),
         "unknown cosmetic settings still fail strict decoding"
+    );
+}
+
+#[tokio::test]
+async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({
+        "name": "support-whatsapp",
+        "kind": "whatsappCloudApi",
+        "appSecretEnv": "DEKOPOND_WHATSAPP_APP_SECRET",
+        "verifyTokenEnv": "DEKOPOND_WHATSAPP_VERIFY_TOKEN",
+        "accessTokenEnv": "DEKOPOND_WHATSAPP_ACCESS_TOKEN",
+        "bind": "127.0.0.1:9080",
+        "callbackPath": "/webhooks/whatsapp",
+        "wabaId": "123456",
+        "phoneNumberId": "789012",
+        "graphApiVersion": "v23.0"
+    });
+    document["routes"][0]["transport"] = json!("support-whatsapp");
+
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("explicit WhatsApp configuration resolves");
+    assert!(matches!(
+        resolved.transports.first(),
+        Some(config::TransportConfig::WhatsappCloudApi {
+            callback_path,
+            graph_endpoint: Some(endpoint),
+            ..
+        }) if callback_path == "/webhooks/whatsapp"
+            && endpoint == config::WHATSAPP_GRAPH_ENDPOINT
+    ));
+
+    for (field, invalid) in [
+        ("appSecretEnv", json!("pasted secret")),
+        ("bind", json!("127.0.0.1:0")),
+        ("callbackPath", json!("relative")),
+        ("callbackPath", json!("/webhooks/{wildcard}")),
+        ("callbackPath", json!("/webhooks//whatsapp")),
+        ("callbackPath", json!("/webhooks/whatsapp/")),
+        ("wabaId", json!("0123")),
+        ("graphApiVersion", json!("latest")),
+        ("graphApiVersion", json!("v01.0")),
+        ("graphApiVersion", json!("v23.1")),
+        ("graphEndpoint", json!("https://evil.example")),
+    ] {
+        let mut invalid_document = document.clone();
+        invalid_document["transports"][0][field] = invalid;
+        assert!(
+            load(directory.path(), &invalid_document).await.is_err(),
+            "invalid {field} must fail closed"
+        );
+    }
+
+    // The transport is text-only. A route that pairs it with an image generator would pay a model
+    // for a PNG this transport has no way to deliver, so the pair is refused at startup rather
+    // than dropped at reply time.
+    let mut with_images = document.clone();
+    with_images["imageGenerators"] = json!([{
+        "name": "openai-images",
+        "kind": "openaiImages",
+        "model": "gpt-image-1",
+        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
+        "timeoutMs": 120_000
+    }]);
+    with_images["routes"][0]["imageGenerator"] = json!("openai-images");
+    let error = load(directory.path(), &with_images)
+        .await
+        .expect_err("a text-only transport cannot carry a generated image");
+    assert!(
+        error.to_string().contains("text-only"),
+        "the refusal names why: {error}"
     );
 }
 
@@ -737,6 +812,67 @@ fn informational_inventory_omits_agent_instructions() {
     assert!(!encoded.contains("instructions"), "{encoded}");
 }
 
+#[tokio::test]
+async fn a_failed_report_names_a_category_and_names_a_timeout_apart_from_one() {
+    // Reporting is informational and never retried, so this line is the whole record of it. Without
+    // a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
+    // gone", which is exactly the triage the report exists for.
+    use dekopon_broker_protocol::ClientError;
+
+    assert_eq!(crate::report_failure(Ok(Ok(()))), None);
+    assert_eq!(
+        crate::report_failure(Ok(Err(ClientError::UnsafeSocket))),
+        Some("unsafe-socket")
+    );
+    assert_eq!(
+        crate::report_failure(Ok(Err(ClientError::ServerIdentity {
+            expected: 501,
+            actual: 0
+        }))),
+        Some("server-identity")
+    );
+    let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .expect_err("a zero deadline elapses");
+    assert_eq!(
+        crate::report_failure(Err(elapsed)),
+        Some("timeout"),
+        "a broker that answered too slowly is not a broker that refused"
+    );
+}
+
+#[test]
+fn every_broker_client_failure_has_its_own_category() {
+    // A category is only triage if two different failures are two different values.
+    use dekopon_broker_protocol::ClientError;
+    use std::{collections::BTreeSet, io};
+
+    let categories = [
+        ClientError::SocketMetadata {
+            source: io::Error::from(io::ErrorKind::NotFound),
+        },
+        ClientError::UnsafeSocket,
+        ClientError::ConnectTimeout,
+        ClientError::Connect {
+            source: io::Error::from(io::ErrorKind::ConnectionRefused),
+        },
+        ClientError::PeerCredentials {
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        },
+        ClientError::ServerIdentity {
+            expected: 501,
+            actual: 0,
+        },
+        ClientError::UnexpectedResponse,
+    ]
+    .iter()
+    .map(crate::client_error_category)
+    .collect::<BTreeSet<_>>();
+
+    assert_eq!(categories.len(), 7);
+    assert!(!categories.contains("timeout"), "{categories:?}");
+}
+
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
     load(directory, document)
         .await
@@ -1047,6 +1183,25 @@ fn a_long_answer_keeps_its_beginning_and_its_conclusion() {
     assert!(bounded.contains("truncated by the gateway"), "{bounded}");
 }
 
+#[test]
+fn an_exported_but_blank_credential_is_refused_by_name() {
+    for blank in ["", " ", "\n\t "] {
+        let error = credential_value("DEKOPOND_WHATSAPP_APP_SECRET", blank.to_owned())
+            .expect_err("a blank credential is the absence of one");
+        assert!(
+            matches!(&error, TransportError::EmptyCredential { name }
+                if name == "DEKOPOND_WHATSAPP_APP_SECRET"),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), "empty-credential");
+    }
+    assert_eq!(
+        credential_value("DEKOPOND_WHATSAPP_APP_SECRET", " token ".to_owned())
+            .expect("a credential with surrounding space is still a credential"),
+        " token "
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -1069,6 +1224,8 @@ struct ModelScript {
     /// serialized one, and every value compared here is computed in this binary.
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
+    /// How many times a client was constructed for this script, which is the sharing assertion.
+    builds: AtomicUsize,
     forbidden: bool,
 }
 
@@ -1085,6 +1242,7 @@ impl ModelScript {
             tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            builds: AtomicUsize::new(0),
             forbidden: false,
         })
     }
@@ -1098,12 +1256,17 @@ impl ModelScript {
             tools: Mutex::new(Vec::new()),
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            builds: AtomicUsize::new(0),
             forbidden: true,
         })
     }
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    fn builds(&self) -> usize {
+        self.builds.load(Ordering::SeqCst)
     }
 
     fn tool_names(&self, index: usize) -> Vec<String> {
@@ -1151,8 +1314,9 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(ScriptedModel(Arc::clone(self))))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(ScriptedModel(Arc::clone(self))))
     }
 }
 
@@ -1625,6 +1789,41 @@ fn message(text: &str) -> InboundMessage {
     }
 }
 
+#[test]
+fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
+    let mut inbound = message("hello");
+    inbound.transport = "support-whatsapp".to_owned();
+    inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
+    inbound.subject = ExternalSubject::whatsapp("16034700182").expect("subject");
+    inbound.channel = "123:456:16034700182".to_owned();
+    inbound.conversation_id = inbound.channel.clone();
+    inbound.message_id = "wamid.delivery".to_owned();
+    inbound.reply = ReplyTarget::WhatsApp {
+        recipient: "16034700182".to_owned(),
+    };
+    let claim = dekopon_broker_protocol::ChatSessionClaim {
+        subject: inbound.subject.clone(),
+        agent: "reviewer".parse().expect("agent"),
+        scope: dekopon_broker_protocol::ChatScopeClaim {
+            transport: "support-whatsapp".parse().expect("transport"),
+            kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
+            channel: inbound.channel.clone(),
+            conversation: inbound.conversation_id.clone(),
+        },
+    };
+    let delivery = crate::session::delivery_identity(&inbound, &claim)
+        .expect("WhatsApp replies can be recorded after transport acceptance");
+    assert_eq!(
+        delivery,
+        dekopon_broker_protocol::DeliveryIdentity::Whatsapp {
+            waba: "123".to_owned(),
+            phone_number: "456".to_owned(),
+            message: "wamid.delivery".to_owned(),
+        }
+    );
+    assert!(delivery.is_canonical_for(&claim.scope));
+}
+
 fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
     ThreadContinuation {
         claim: ThreadClaim::Slack {
@@ -1689,7 +1888,7 @@ fn runner_tracking(
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
         broker,
-        models,
+        models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
@@ -1752,8 +1951,8 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(BlockedHandle(Arc::clone(self))))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(BlockedHandle(Arc::clone(self))))
     }
 }
 
@@ -3111,6 +3310,66 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_client_serves_every_message_routed_to_the_same_model() {
+    // A model client owns an HTTP agent and its connection pool, so a client per message paid a
+    // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
+    // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    for text in ["what broke?", "and the second one?"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(models.requests(), 2, "both messages reached the model");
+    assert_eq!(
+        models.builds(),
+        1,
+        "the second message reused the first message's client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_configured_models_never_share_one_client() {
+    // The key is the configured name the loader already proved unique. Two endpoints sharing a
+    // client would send one route's messages to the other's host.
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let models = ModelScript::new([answer("from one"), answer("from the other")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut second = model_config();
+    if let ModelConfig::OpenaiCompatible { name, .. } = &mut second {
+        *name = "another-endpoint".to_owned();
+    }
+
+    for model in [model_config(), second] {
+        run_session(
+            Arc::clone(&runner),
+            route(model),
+            message("who answers?"),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.builds(),
+        2,
+        "each configured model built its own client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_senders_in_one_conversation_never_see_each_others_history() {
     // In a shared channel this is not a hypothetical. The admission key deliberately has no subject
     // in it; the history key deliberately does, and this is the difference that makes.
@@ -3300,7 +3559,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
         Err(SessionError::Model(ModelError::NoChoices))
     }
 }
@@ -3743,8 +4002,8 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(&self, _model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
-        Ok(Box::new(Self))
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(Self))
     }
 }
 
@@ -3833,7 +4092,12 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
         replier: Arc::new(RecordingReplier::default()),
     };
     let (routed, mut received) = mpsc::channel(4);
-    let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
+    let health = Arc::new(crate::TransportHealth::new(1));
+    let reader = tokio::spawn(crate::read_transport(
+        Box::new(transport),
+        routed,
+        Arc::clone(&health),
+    ));
 
     sender
         .send(message("first"))
@@ -3846,6 +4110,95 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
 
     drop(sender);
     reader.await.expect("the reader ends with its transport");
+    assert_eq!(
+        health.dead(),
+        vec!["dev".to_owned()],
+        "a transport that ended for good is recorded, not only logged once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport() {
+    // The other way a reader ends: shutdown drops the routing loop, so the forward fails. Counting
+    // that as a dead transport would announce a degraded gateway on every clean stop.
+    let (sender, inbound) = mpsc::unbounded_channel();
+    let transport = FakeTransport {
+        name: "dev".to_owned(),
+        inbound,
+        replier: Arc::new(RecordingReplier::default()),
+    };
+    let (routed, received) = mpsc::channel(1);
+    drop(received);
+    let health = Arc::new(crate::TransportHealth::new(1));
+    let reader = tokio::spawn(crate::read_transport(
+        Box::new(transport),
+        routed,
+        Arc::clone(&health),
+    ));
+
+    sender
+        .send(message("nobody is listening"))
+        .expect("fixture accepts a message");
+    reader.await.expect("the reader ends with the daemon");
+    assert!(
+        health.dead().is_empty(),
+        "a reader ending with the daemon is not a transport failure"
+    );
+}
+
+/// Everything `serve` needs when the test is about why it stopped rather than what it routed.
+async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
+    let document = document(directory);
+    let config = resolved(directory, &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory, Vec::new()).await;
+    (runner(broker, ModelScript::forbidden(), 4), routes)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn losing_every_transport_ends_the_daemon_as_a_failure() {
+    // Every reader gone and nobody asked for a shutdown: a gateway whose workspaces all fell off
+    // their tokens has nothing left to answer with, and reporting success would let a supervisor
+    // treat that as a clean run.
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (sender, receiver) = mpsc::channel(4);
+    drop(sender);
+
+    let outcome = crate::serve(
+        runner,
+        routes,
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        receiver,
+        std::future::pending(),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(outcome, crate::ServeOutcome::TransportsLost);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requested_shutdown_ends_the_daemon_successfully() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (_sender, receiver) = mpsc::channel(4);
+
+    let outcome = crate::serve(
+        runner,
+        routes,
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        receiver,
+        std::future::ready(()),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4517,6 +4870,78 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
             .count(),
         2,
         "a disconnect must open a second socket"
+    );
+}
+
+/// A socket that negotiates and then says nothing: the handshake succeeds, the greeting never comes.
+fn spawn_mute_socket_mock() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("socket mock binds");
+    let address = listener.local_addr().expect("socket mock address");
+    listener
+        .set_nonblocking(true)
+        .expect("socket mock is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("socket mock adopts");
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(_socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        // Held open, negotiated, and mute for as long as the test runs.
+        std::future::pending::<()>().await;
+    });
+    format!("ws://{address}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
+    // A half-open connection — a NAT table forgetting the flow, a partition with no RST — reads
+    // exactly like a healthy socket with nothing to say. Slack pings about every 30 seconds and
+    // never goes quiet on its own, so silence past the deadline is a dead path: without one, the
+    // reader waits on it forever and every route on this workspace goes silent with no log line.
+    let second = spawn_socket_mock(vec![events_envelope(
+        "envelope-2",
+        direct_message("u9xyz", "1700000000.000002", "after the wedge"),
+    )]);
+    let wedged = spawn_socket_mock(Vec::new());
+    let http = spawn_http_mock(slack_handler(vec![wedged.url.clone(), second.url.clone()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+    transport.connect().await.expect("slack transport connects");
+
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the transport gives up on a socket that stopped speaking")
+            .expect("a message arrives on the socket that replaced it"),
+    );
+    assert_eq!(message.text, "after the wedge");
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        2,
+        "the wedged socket must be replaced rather than held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_socket_that_never_greets_fails_inside_open() {
+    // The same wedge one round earlier: neither the handshake nor the `hello` wait had a deadline
+    // of its own, so a URL that accepts a connection and then stops parks `connect` for good.
+    let http = spawn_http_mock(slack_handler(vec![spawn_mute_socket_mock()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+
+    let error = tokio::time::timeout(Duration::from_secs(10), transport.connect())
+        .await
+        .expect("open bounds the greeting it waits for")
+        .expect_err("a socket that never greets is not a connected transport");
+
+    assert_eq!(
+        error.category(),
+        "closed",
+        "an expired deadline takes the reconnect path the backoff loop already owns"
     );
 }
 
@@ -6127,6 +6552,135 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
+    // The lock is there to serialize requests, not to serialize waiting. Held across the 429 sleep,
+    // one throttled reply stalled every other session's answer and any model waiting on
+    // `fetch_chat_asset` for as long as Discord asked this one reply to wait.
+    let cdn = spawn_raw_http_mock(|path| match path {
+        "/fresh/document" => (200, "application/pdf", b"fresh pdf bytes".to_vec()),
+        _ => (404, "application/json", br#"{"code":404}"#.to_vec()),
+    });
+    let channel_id = "200000000000000007";
+    let message_id = "300000000000000007";
+    let attachment_id = "400000000000000007";
+    let mut event = discord_message(
+        message_id,
+        channel_id,
+        None,
+        DISCORD_USER,
+        false,
+        "read this",
+    );
+    event["attachments"] = json!([{
+        "id": attachment_id,
+        "filename": "retained.pdf",
+        "content_type": "application/pdf",
+        "size": 15,
+        "url": format!("{}/expired/document", cdn.base)
+    }]);
+    let socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let gateway_url = socket.url.clone();
+    let fresh_url = format!("{}/fresh/document", cdn.base);
+    let posts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&posts);
+    let http = spawn_raw_http_mock(move |path| match path {
+        "/api/v10/gateway/bot" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "url": gateway_url,
+                "shards": 1,
+                "session_start_limit": {
+                    "total": 1000,
+                    "remaining": 999,
+                    "reset_after": 60_000,
+                    "max_concurrency": 1
+                }
+            }))
+            .expect("Gateway response serializes"),
+        ),
+        "/api/v10/channels/200000000000000007/messages" => {
+            // One second is long enough that the refresh below could not have finished after it by
+            // accident, and short enough to keep the test quick.
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                (
+                    429,
+                    "application/json",
+                    br#"{"retry_after":1.0,"global":false}"#.to_vec(),
+                )
+            } else {
+                (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "id": "444444444444444444",
+                        "channel_id": "200000000000000007",
+                    }))
+                    .expect("Create Message response serializes"),
+                )
+            }
+        }
+        "/api/v10/channels/200000000000000007/messages/300000000000000007" => (
+            200,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "id": "300000000000000007",
+                "attachments": [{"id": "400000000000000007", "url": fresh_url}]
+            }))
+            .expect("message response serializes"),
+        ),
+        _ => (404, "application/json", br#"{"code":10008}"#.to_vec()),
+    });
+    let mut transport = discord(&http.base);
+    transport.connect().await.expect("Discord connects");
+    let message = next_message(&mut transport).await;
+    let source = message.assets[0]
+        .source
+        .clone()
+        .expect("attachment has a source");
+    let replier = transport.replier();
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Discord has an asset fetcher");
+
+    let reply = tokio::spawn(async move {
+        replier
+            .reply(
+                ReplyTarget::Discord {
+                    channel_id: "200000000000000007".to_owned(),
+                    reply_to: None,
+                },
+                OutboundReply::text("throttled"),
+            )
+            .await
+            .expect("the bounded retry still succeeds");
+        Instant::now()
+    });
+    // The wait only exists once Discord has answered 429, so the refresh has to start after that.
+    while posts.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let bytes = fetcher
+        .fetch(&source, 1024)
+        .await
+        .expect("the expired URL is refreshed while the reply is waiting out its rate limit");
+    let refreshed = Instant::now();
+    assert_eq!(bytes, b"fresh pdf bytes");
+    let replied = reply.await.expect("the reply task finishes");
+    assert!(
+        refreshed < replied,
+        "the attachment refresh must not queue behind the reply's rate-limit sleep"
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "the reply was retried once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn discord_failure_after_one_accepted_chunk_is_partial_delivery() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&attempts);
@@ -6719,6 +7273,113 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
+    // `sendMessage` refuses text over 4,096 UTF-16 units, and the gateway's own outbound bound is
+    // twice that. Before splitting, an ordinary long answer was rejected in full and the person who
+    // asked heard nothing at all.
+    let http = spawn_http_mock(move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": [
+                {"update_id": 400, "message": telegram_chat_message(-1001, "supergroup", 16034700182_i64, false, 21, "@dekopon_bot summarize")}
+            ]});
+        }
+        if path.contains("sendMessage") {
+            // Every chunk is acknowledged as its own message: the receipt is minted from the
+            // service's answer, so a bare `true` is no longer an accepted delivery.
+            return json!({"ok": true, "result": {"message_id": 7, "chat": {"id": -1001}}});
+        }
+        json!({"ok": true, "result": []})
+    });
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        http.base.clone(),
+        "12345:test-token".to_owned(),
+        ActivityMode::Off,
+    )
+    .expect("telegram transport builds");
+    transport.connect().await.expect("Telegram connects");
+    let message = next_message(&mut transport).await;
+
+    // Astral characters are the case a scalar-value count gets wrong: 3,000 crabs are 6,000 UTF-16
+    // code units, so a splitter counting characters would post one message Telegram refuses.
+    let long = format!("{}\n{}", "a".repeat(2_000), "🦀".repeat(3_000));
+    transport
+        .replier()
+        .reply(message.reply, OutboundReply::text(long.clone()))
+        .await
+        .expect("a long answer is delivered");
+
+    let sent = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path.contains("sendMessage"))
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).expect("reply body is JSON"))
+        .collect::<Vec<_>>();
+    assert!(sent.len() > 1, "the answer needed more than one message");
+    assert!(
+        sent.iter().all(|body| body["text"]
+            .as_str()
+            .expect("each chunk carries text")
+            .encode_utf16()
+            .count()
+            <= 4_096),
+        "every chunk is inside Telegram's UTF-16 ceiling"
+    );
+    let rejoined = sent
+        .iter()
+        .map(|body| body["text"].as_str().unwrap_or_default())
+        .collect::<String>();
+    assert_eq!(
+        rejoined, long,
+        "splitting loses nothing and reorders nothing"
+    );
+    assert_eq!(
+        sent[0]["reply_to_message_id"], 21,
+        "the first chunk quotes the message it answers"
+    );
+    assert!(
+        sent[1..]
+            .iter()
+            .all(|body| body["reply_to_message_id"].is_null()),
+        "a continuation must not draw a second reply arrow"
+    );
+}
+
+#[test]
+fn a_chunk_never_splits_a_character_and_prefers_a_line_break() {
+    // The ceiling is in UTF-16 code units, and a chunk boundary is still a character boundary: an
+    // astral character straddling one would be two halves of a replacement glyph in both clients.
+    let text = format!("{}\n{}", "a".repeat(100), "🦀".repeat(2_048));
+    let chunks = crate::transport::split_message(&text, 4_096);
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunks[0],
+        format!("{}\n", "a".repeat(100)),
+        "the split fell on the newline rather than mid-line"
+    );
+    assert_eq!(chunks.concat(), text);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk.encode_utf16().count() <= 4_096)
+    );
+}
+
+#[test]
+fn an_empty_answer_still_becomes_one_post() {
+    // Every chat service refuses an empty message. Saying so is better than a silent failure the
+    // sender reads as the bot ignoring them.
+    assert_eq!(
+        crate::transport::split_message("", 4_096),
+        vec!["[empty response]".to_owned()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
     // chat: consecutive messages continue one exchange, and a group is not the private chat.
@@ -7016,9 +7677,9 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         first.conversation_id, second.conversation_id,
         "two requests on one connection continue one conversation"
     );
-    assert_ne!(
-        first.message_id, second.message_id,
-        "each request is still its own message"
+    assert_eq!(
+        second.text, "second",
+        "two requests on one connection are still two messages"
     );
     let parts = first.message_id.split('-').collect::<Vec<_>>();
     assert_eq!(parts.len(), 3);

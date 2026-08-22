@@ -90,6 +90,23 @@ Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or e
 
 Version 0.9.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds only the transport credentials it already needed, derives every activity target from authenticated envelopes, and treats every status failure as cosmetic.
 
+## Unreleased — text-only Meta WhatsApp Cloud API transport
+
+- Strict environment-name-only app-secret, verification-token, and access-token configuration with
+  explicit bind/callback, WABA, receiving phone-number, and Graph API version.
+- Bounded plain-HTTP webhook behind external TLS termination; exact subscription verification and
+  raw-body HMAC-SHA256 authentication before parsing.
+- Batched signed text routing under canonical `whatsapp.<wa_id>` subjects and exact configured
+  WABA/phone scope, with bounded process-local message-ID deduplication and acknowledgement before
+  asynchronous session work.
+- Pinned Graph messages endpoint, 4,096-character text bound, bounded responses, and no blind retry
+  for outcome-unknown sends.
+
+This adds an inbound listener and three gateway-held chat credentials, but no provider credential,
+policy, authorization path, or effect authority. Media, templates, interactivity, reactions, status
+processing, business management, embedded signup, webhook multiplexing, and TLS termination remain
+out of scope.
+
 ## Unreleased — generated image replies, provider storage, and durable on-demand chat memory
 
 - Explicit route-scoped OpenAI Images generators: one bounded prompt/attempt/PNG per session,
@@ -123,7 +140,7 @@ than attribution — also remains future.
 Each of these was raised, deliberately scoped out, and accepted as a follow-up rather than dropped. None was committed direction in the design sense when it was raised; a struck entry has since had a design pass of its own, which is what promoted it.
 
 - **A dedicated gateway UID and a 0660 socket transport.** The one change that turns `via` and namespace scoping from attribution into real isolation. It widens who may connect to the privileged socket, so it needs its own security review rather than a permission-bit edit.
-- **WhatsApp as a transport.** Unlike Socket Mode and long polling, it requires a public webhook endpoint — an inbound HTTP surface on the unprivileged daemon, with signature verification and replay handling of its own.
+- ~~**WhatsApp as a transport.** Unlike Socket Mode and long polling, it requires a public webhook endpoint — an inbound HTTP surface on the unprivileged daemon, with signature verification and replay handling of its own.~~ Done for ordinary inbound/outbound text: the callback is exact-path, bounded, raw-body-HMAC authenticated, and process-locally deduplicated; templates, media, and durable exactly-once remain explicit non-goals.
 - **Per-principal credential overrides for one capability.** Half of this landed as `credentialByAgent`: a constraint set now binds a default credential plus per-agent overrides, which is what "one token per team, channel, or organization" needs, because a route already binds a transport and a channel match to an agent. What remains open is the principal axis — "approve as the person who asked" — which is a different trade: one entry per human in a file that otherwise declares capabilities and agents, and a per-person token to manage for each.
 - ~~**Conversation memory and multi-turn threads in `dekopond`.** Each message is an independent session with no history. Memory is a new trust surface — text that persists across sessions and is replayed into a prompt — and belongs behind its own design pass.~~ Done: the design pass this item asked for is the [conversation contract](dekopond.md#conversations) and the [trust surface](security-model.md#conversation-memory-as-a-trust-surface) it accepts, and `dekopond` now implements it. History lives in gateway memory, is keyed on the transport, the conversation identity, and the sender's canonical subject, is compacted to question-and-answer pairs inside a sliding window, and is dropped on an idle timeout, an LRU ceiling, or a changed capability grant. Authorization is never cached; what persistence widens is an injected instruction's dwell time, which is why the security model states it rather than the roadmap.
 - **`dekopon policy explain` and `auth can-i` operator commands.** The broker already computes the determining `policy_ids` for every decision; the missing half is an operator path to ask the question without making an effect happen. It is also the first CLI-to-broker integration and inherits that whole boundary discussion.

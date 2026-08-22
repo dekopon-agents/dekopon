@@ -476,6 +476,12 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
             .iter()
             .any(|word| word == storage_word)
     );
+    // One authorization pass, two derived listings: a combined view that disagreed with either
+    // listing would break the guarantee that what a session is shown is what it may invoke.
+    assert_eq!(
+        broker.capability_view(&direct),
+        (broker.capabilities(&direct), broker.command_words(&direct))
+    );
 
     let session = claim();
     let legacy_grant = AttestorGrant {

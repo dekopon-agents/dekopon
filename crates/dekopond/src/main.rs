@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{io, process::ExitCode};
+use std::{future::Future, io, process::ExitCode, time::Duration};
 
 #[cfg(unix)]
 use clap::Parser as _;
@@ -21,11 +21,51 @@ use tracing_subscriber::{
 #[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_shell=trace,dekopon_model=trace,hyper=off,h2=off,opentelemetry=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
+/// How long exit may still wait on blocking session work after everything else has stopped.
+///
+/// The gateway's shutdown grace is the deadline for a session to *finish*; abandoning one only
+/// cancels the async owner's await on its blocking half. The synchronous prompt loop keeps running
+/// until it observes cancellation at its next cooperative checkpoint, which can be on the far side
+/// of a whole synchronous model round trip. Dropping a Tokio runtime waits for every one of those
+/// threads, so the process would exit `shutdownGraceMs` *plus* a model timeout after the signal —
+/// past a pod termination grace that the broker's own drain also has to fit inside. Here the wait
+/// is bounded and the remaining threads are left to die with the process; a model request already
+/// in flight was never rollbackable, and waiting for it does not make it so.
 #[cfg(unix)]
-#[tokio::main]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
+const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(unix)]
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(cli)) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("dekopond: could not start the async runtime: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `body` on an owned runtime whose teardown is bounded rather than unbounded.
+///
+/// `#[tokio::main]` drops its runtime, and that drop blocks until every blocking task returns.
+/// Owning the runtime is what makes [`tokio::runtime::Runtime::shutdown_timeout`] — the one exit
+/// bound Tokio offers — reachable at all.
+#[cfg(unix)]
+fn bounded_runtime<T>(
+    exit_timeout: Duration,
+    body: impl Future<Output = T>,
+) -> Result<T, io::Error> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let value = runtime.block_on(body);
+    runtime.shutdown_timeout(exit_timeout);
+    Ok(value)
+}
+
+#[cfg(unix)]
+async fn serve(cli: Cli) -> ExitCode {
     // Read the export settings before serving. A failure here is discarded rather than reported:
     // `run` parses the same file and surfaces every configuration error with full context, so
     // reporting it twice would only make the first message the confusing one.
@@ -149,6 +189,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use clap::CommandFactory as _;
     use dekopond::cli::Cli;
@@ -199,6 +240,32 @@ mod tests {
         assert_eq!(
             *recorded.0.lock().expect("target log"),
             vec!["dekopond".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exit_does_not_wait_for_blocking_work_that_outlived_its_session() {
+        // The shape of an abandoned session: the async owner is gone, its synchronous half is
+        // parked inside a model call, and nothing can interrupt it. Exit must not inherit that
+        // wait — the pod's termination grace is shared with the broker's own drain, and
+        // overshooting it turns a clean stop into SIGKILL mid-drain.
+        let started = Instant::now();
+        let (running, is_running) = tokio::sync::oneshot::channel();
+        let value = super::bounded_runtime(Duration::from_millis(50), async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = running.send(());
+                std::thread::sleep(Duration::from_secs(10));
+            });
+            is_running.await.expect("the blocking half is running");
+            "served"
+        })
+        .expect("the runtime builds");
+
+        assert_eq!(value, "served");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "exit waited on abandoned blocking work: {:?}",
+            started.elapsed()
         );
     }
 }

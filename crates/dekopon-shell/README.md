@@ -47,14 +47,24 @@ The variable namespace is seeded only from the script's own assignments; the hos
 
 One residual is worth stating plainly rather than leaving to be discovered. jaq has no fuel meter and no safe point to interrupt from outside, so a filter that loops without producing output (`jq 'def f: f; f'`) cannot be stopped cooperatively. It runs on a worker thread whose outputs are charged against the budget as they arrive, and a filter still running at the deadline is abandoned rather than stopped: the script reports its timeout correctly, and that thread stays alive until the process exits.
 
+Dropping the receiver is the cancellation check for every filter that *does* yield — it fails its next send and returns — so what accumulates is only the non-terminating kind. Each abandonment logs a `tracing::warn!` with the elapsed time, `dekopon_shell::abandoned_filter_workers()` reports how many are still running, and past a small ceiling `jq` refuses to start another filter rather than adding one more spinning thread to a host that is already saturated.
+
+The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `curl ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name, as the JSON parser refused them before, and output nesting keeps the same 128-container ceiling that parser applied.
+
 ## Observability
 
-Every command word a script runs emits a `tracing` span named `shell.command`, with a
-`shell.command.started`/`shell.command.completed` event pair inside it. A trace therefore reads as
-the ordered list of commands a script actually executed — `jq`, then `curl`, then
+Each script run opens a `tracing` span named `shell.script`, and every command word inside it opens
+a `shell.command` span — the span carries the whole record, and there are no events. A trace
+therefore reads as the ordered list of commands a script actually executed — `jq`, then `curl`, then
 `http-probe.fetch`, then `grep` — rather than as one opaque "a script ran, exit 0". One script word
 that drives several executions is shown as several: `xargs` mapping a command over ten items
 produces ten nested spans.
+
+Volume is capped rather than detail. A model-authored `while` loop is bounded only by the step
+budget, so one tool call can execute tens of thousands of command words; the first few hundred
+`shell.command` spans are emitted at INFO and the rest at DEBUG. The `shell.script` span carries the
+run's totals — commands executed, commands traced, capability commands, failed commands — which
+cost the same whether a script ran three commands or thirty thousand.
 
 A word that resolved to nothing is reported as `not-granted` when it names a capability in a
 namespace this session holds, and `not-found` otherwise. Only the namespace is exported, from the
@@ -68,11 +78,11 @@ telemetry code.
 `tracing` is this crate's only dependency for that. There is no exporter here, no collector, and no
 telemetry protocol — the embedding binary's subscriber decides where spans go, exactly as `curl`
 here links no HTTP client and only assembles a request for one capability. Spans must therefore be
-assumed to leave the process, so a command records its resolution kind, its argument *count*, a
-duration, an exit code, and a stable outcome label, and never an argument value: a `curl -d` body
-and a `cap <id> {...}` object are capability input wearing argv's clothes. A model-authored command
-word — a shell function's name, or a word that resolved to nothing — is reported as `<withheld>`
-rather than copied, while its kind still says what happened.
+assumed to leave the process, so a command records its name, its resolution kind, its argument
+*count*, a duration, an exit code, and a stable outcome label, and never an argument value: a
+`curl -d` body and a `cap <id> {...}` object are capability input wearing argv's clothes. A
+model-authored command word — a shell function's name, or a word that resolved to nothing — is
+reported as `<withheld>` rather than copied, while its kind still says what happened.
 
 ## License
 
