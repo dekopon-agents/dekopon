@@ -47,6 +47,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rustup toolchain install 1.89.0 --profile minimal \
+            --component clippy,rustfmt --target wasm32-unknown-unknown
           rustup toolchain install "$PROVIDER_RUST_TOOLCHAIN" --profile minimal
           rustup override set "$PROVIDER_RUST_TOOLCHAIN"
           rustup target add wasm32-unknown-unknown --toolchain "$PROVIDER_RUST_TOOLCHAIN"
