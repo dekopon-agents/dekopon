@@ -28,6 +28,13 @@ All notable changes to Dekopon are documented here. The format is based on
   authorized, that authenticated sender can continue in the exact thread without another mention.
 - Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
   allowing the agent to post nothing instead of always taking the last word.
+- Added `docs/catalog.md`, the field-by-field `v1alpha1` resource reference, naming what consumes
+  each `AgentSpec`/`CapabilitySpec`/`ProviderSpec` field and stating that `policyProfile`,
+  `credentialRef`, `status`, and `labels` are read by nothing.
+- Added `docs/upgrading.md`, covering the 0.3.0 `rules` → `policiesPath`/`constraintSets` migration,
+  the 0.5.0 broker-protocol lockstep, later operator-visible changes, and the restart order.
+- Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
+  checkpoint recovery is reachable from `docs/` instead of only from a crate README.
 
 ### Changed
 
@@ -51,6 +58,19 @@ All notable changes to Dekopon are documented here. The format is based on
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
 - The Agent Slack manifest now requests public/private channel history events required to observe
   continuations; ambient traffic is discarded inside the transport before routing or inference.
+- `docs/broker-http.md` now documents the `provider-error` failure code, the deliberately ungated
+  `resolveCommand` operation, and a version-and-compatibility section stating that all four
+  executables upgrade together; its startup-validation section no longer claims every entity literal
+  is proved, since agent names are the deliberate exception.
+- `docs/run.md` no longer describes the gateway chat client as stateless: `--subject` plus
+  `--conversation` selects a persistent history on a `persistent` route, including one a chat-service
+  sender created.
+- `charts/dekopon/README.md` separates "never installed on a cluster" from "not published"; chart
+  `0.1.0` and the container image it pulls are both published.
+- Corrected the `dekopon-model` attachment-rendering example, added `resolveCommand` to the
+  `dekopon-broker-protocol` README, fixed the `dekopon-provider-sdk` WIT-package description and
+  documented `export_provider_with_commands!`, dropped the stale `0.1.x` and `0.1.0` version pins
+  from `docs/cli.md` and `dekopon-capability`, and gave `Broker::capabilities` its own rustdoc.
 
 ### Security
 

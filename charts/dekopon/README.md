@@ -3,13 +3,19 @@
 A Helm chart that runs `dekopon-brokerd` and `dekopond` as one pod on a single-node arm64 k3s
 cluster.
 
-**Status: current, but unapplied and unpublished.** Every claim below about rendered YAML, file
-ownership, and file modes was verified locally. Nothing in this chart has been installed on a
-cluster; no released container image exists for it to pull yet, and no chart has been pushed to
-GHCR — see [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+**Status: published, but never applied to a cluster.** Those are two separate claims and only one of
+them limits you.
 
-The chart is published to GHCR over OCI on `dekopon-chart-*` tags and is consumed from ArgoCD by
-registry path, not by Git path. Both GHCR packages are public.
+*Published* is settled. `dekopon-chart-0.1.0` shipped the chart to
+`oci://ghcr.io/dekopon-agents/charts/dekopon:0.1.0`, and application tags from `v0.4.0` onward
+publish the container image it pulls, so `helm install` from the registry has everything it needs.
+The chart is consumed from ArgoCD by registry path, not by Git path, and both GHCR packages are
+public. See [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
+
+*Never applied* is the real caveat. Every claim below about rendered YAML, file ownership, and file
+modes was verified against `helm template` and the CI render checks, not against a running cluster.
+Nothing here has been installed on a live Kubernetes API server, so treat the manifests as reviewed
+rather than as field-proven.
 
 Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/dekopon/blob/main/crates/dekopon-brokerd/README.md) and
 [`docs/dekopond.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/dekopond.md) first. The chart places files and sets
@@ -380,9 +386,10 @@ The published coordinates are:
 oci://ghcr.io/dekopon-agents/charts/dekopon
 ```
 
-**Nothing has been published yet.** Like the container image, this path is unproven until the first
-`dekopon-chart-*` tag exists. The packaging half is proven — CI packages the chart on every run and
-diffs the archive's rendered output against the source tree's — but no push to GHCR has happened.
+Chart `0.1.0` is published there. The packaging half is checked on every CI run, which packages the
+chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.1.0`
+tag ran the push. What remains unproven is the *pull*: no cluster has installed the published chart,
+so a first install should be treated as the first exercise of this path.
 
 ### Both GHCR packages are public, and that is a manual step
 
@@ -531,13 +538,15 @@ own volume. It may post one review comment and has no approval, request-changes,
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout, but no
   `kubectl apply` has happened.
-- No image exists to pull yet. The daemons have never been started from this configuration.
-- **The publish path is unproven.** No `dekopon-chart-*` tag has been pushed, so
-  `chart-publish.yml` has never run and nothing exists at
-  `oci://ghcr.io/dekopon-agents/charts/dekopon`. What *is* proven is packaging: CI packages the
-  chart, lints the archive, and diffs the archive's rendered output against the source tree's for
-  both value sets, so the tarball that would be pushed is known to be complete and to render
-  identically.
+- The daemons have never been started from this configuration. The images exist — application tags
+  from `v0.4.0` onward publish `ghcr.io/dekopon-agents/dekopon:v<VERSION>` — but no pod has run one
+  from these manifests.
+- **The pull path is unproven.** `dekopon-chart-0.1.0` ran `chart-publish.yml` and chart `0.1.0`
+  exists at `oci://ghcr.io/dekopon-agents/charts/dekopon`, and packaging is checked continuously:
+  CI packages the chart, lints the archive, and diffs the archive's rendered output against the
+  source tree's for both value sets, so the pushed tarball is known to be complete and to render
+  identically. What has not happened is an anonymous `helm pull` or an ArgoCD sync against that
+  registry path.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a
   separate rpi-homelab change.

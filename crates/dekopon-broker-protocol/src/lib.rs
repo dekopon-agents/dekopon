@@ -1076,7 +1076,11 @@ pub enum BrokerRequest {
     ResolveCommand {
         /// The command word, which must belong to a loaded provider.
         word: String,
-        /// Arguments as the script supplied them, `argv[0]` being the word itself.
+        /// Arguments as the script supplied them, **without** the word itself.
+        ///
+        /// The word travels in its own field because the broker selects the declaring provider by
+        /// it before the guest runs, so repeating it here would give the guest a second, editable
+        /// copy of a routing decision already made.
         argv: Vec<String>,
     },
     /// Replaces the broker's in-memory informational view of the gateway catalog.

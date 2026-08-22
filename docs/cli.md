@@ -90,7 +90,7 @@ List output is sorted by validated identifier. `name` output uses qualified name
 | `2` | Command-line usage error (emitted by Clap) |
 | `3` | Requested resource not found |
 
-These codes are stable for the `0.1.x` CLI.
+These codes are stable across `0.x` releases and are tied to the `dekopon.dev/v1alpha1` resource API rather than to a package version. `3` is distinguished from `1` deliberately so a script can tell "this resource does not exist" from "the catalog would not load"; a future API version is the only thing that would renumber them.
 
 ## Examples
 

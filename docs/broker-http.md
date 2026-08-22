@@ -71,6 +71,7 @@ The protocol exposes only the operations needed by a broker client:
 - submit one invocation proposal;
 - inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
 - submit one proposal attested on behalf of an external subject (`invokeFor`);
+- rewrite one provider-declared shell command word into a capability proposal (`resolveCommand`);
 - use invocation-bound chat operations (`capabilitiesForChat`, `resolveCommandForChat`, and
   `invokeForChat`) only under a matching owner-authored `chatScopes` grant;
 - submit hidden post-acceptance recording only through `recordDeliveredTurnForChat` — never generic
@@ -82,6 +83,16 @@ The informational operations are deliberately outside the authority flow. Their 
 
 `AuthorizedInvocation` is never accepted from or returned to the client. It is created and consumed inside the broker process.
 
+### `resolveCommand` is deliberately ungated
+
+`resolveCommand` is the one operation that is **not** gated on the caller's grants, and the only one that runs guest code on request without an authorization decision first. A provider may declare command words in its manifest — `memory`, `gh` — so a model can write `memory recent --last 5` instead of assembling a capability input by hand. The broker selects the declaring provider by the word, calls that component's `resolve-command` export with the remaining arguments, and returns what it produces.
+
+The reasoning is that the export is a **pure rewrite** and what it returns is a *proposal*. It runs inside the declaring component with no imports, bounded by the same fuel and timeout as any other guest call, and the proposal it produces is authorized on exactly the path a directly written capability call takes: constraint-set lookup, Cedar evaluation, credential injection at the native HTTP boundary. Gating the rewrite would add a principal check to a function that grants nothing. A caller who rewrites a word for a capability they may not use receives a denial one step later, having learned nothing they could not learn by naming the capability directly — and the word list a session is shown is already filtered by policy, so an ungranted principal is not handed the vocabulary in the first place.
+
+Everything that is not a rewrite collapses into one opaque answer. A word no loaded provider declares, a guest that traps or reaches for a host import, and a resolution the broker cannot decode all return the stable `provider-error` code with a fixed message; the guest's own failure text is provider-controlled and never reaches a caller through this path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases apart from the audit stream that a caller deliberately cannot. A provider that simply *declines* the arguments is not a failure at all: that is a usage error, and the provider's own message travels back for the model to read.
+
+Reserved words are unreachable through this path regardless of the provider that declares them: the broker refuses `memory` and any word belonging to the trusted memory provider, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. `resolveCommandForChat` is the chat-scoped twin, which *is* bound to an attested claim.
+
 ### Attested on-behalf-of operations
 
 `capabilitiesFor` and `invokeFor` carry a canonical external subject and an agent identity. They carry no principal, because the subject-to-principal mapping is owner-controlled broker state; a peer states *which authenticated external identity it is relaying*, and the broker decides who that is. Both are honored only for peers whose configuration grants attestor authority over the subject's namespace.
@@ -92,6 +103,19 @@ The two refusals differ in kind. A refused attestation on `invokeFor` is a norma
 
 The `operation` tag is the compatibility seam for this addition. Requests are strict-decoded, so a broker built before these operations existed rejects an unknown tag as a clean `invalid-request` rather than misreading it as an operation it does know. A client can therefore probe for attestation support without risking a misinterpreted proposal.
 
+### Version and compatibility
+
+**Status: current.** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha1`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
+
+**`dekopond`, `dekopon-run`, and `dekopon-brokerd` must be upgraded together.** They are separately installable — Homebrew, crates.io, release archives, the container image, and the chart with its own `image.tag` — so a mixed set is a normal deployment mistake rather than a hypothetical one, and the alpha protocol has no compatibility promise across releases. 0.5.0 changed it for policy-filtered command words and command resolution and required exactly this lockstep. The chart and the container image ship all four executables from one release for the same reason.
+
+A mismatch fails in two different directions, and only one of them is loud:
+
+- **A newer client against an older broker** is refused per operation. Operations added later are unknown `operation` tags, which strict decoding rejects as `invalid-request` rather than misreading as an operation the broker does know. That is the seam working as designed, and it is why a client can probe for a feature safely.
+- **An older client against a newer broker** fails on the response instead. Response variants are `deny_unknown_fields`, so a field added to a response an old client already understands — `commandWords` on `Capabilities`, for instance — makes that response undecodable. Additive-looking changes are therefore breaking in this direction, which is the half a rolling upgrade is most likely to produce.
+
+Restart order follows from the gateway's startup probe rather than from the protocol: `dekopond` asks the broker for capabilities once before connecting any transport and exits non-zero if the broker does not answer. Start the broker first and stop it last. [`upgrading.md`](upgrading.md) records the per-release steps.
+
 ### Failure codes
 
 A failure response carries a stable code and a bounded message. The code is the contract; the message is human-facing and may change. Codes are exported as constants from `dekopon-broker-protocol` so clients need not hardcode strings.
@@ -101,6 +125,7 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
+| `provider-error` | A `resolveCommand` rewrite did not produce a resolution: no loaded provider declares the word, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word or its arguments; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. | Yes under a fresh identifier after correcting or reconciling the storage condition. |
 
@@ -196,11 +221,25 @@ and subject mappings name, and the providers and capabilities its loaded manifes
 policy set is validated against it in Cedar's strict mode. An unknown action, unknown entity type,
 or ill-typed expression refuses startup.
 
-Cedar's validator checks types, not instances, so the engine separately proves every entity literal
-against that world: `principal == Dekopon::Principal::"typo"` is well typed and would simply never
-match, and refusing it at startup is what the exact engine's reachability check used to buy.
-Templates are refused, source is capped at 1 MiB and 1024 policies, and empty policy text is valid
-and permits nothing.
+Cedar's validator checks types, not instances, so the engine separately classifies every *principal*,
+*provider*, and *action* literal against that world: `principal == Dekopon::Principal::"typo"` is
+well typed and would simply never match, and catching it at startup is what the exact engine's
+reachability check used to buy. An undeclared principal is always fatal; an undeclared provider or
+capability is fatal only under `strict: true`, and is otherwise reported and registered as a
+schema-only phantom, because it names a provider the deployment has not dropped in yet rather than a
+typo. Templates are refused, source is capped at 1 MiB and 1024 policies, and empty policy text is
+valid and permits nothing.
+
+**Agents are the deliberate exception, and it is the one place a typo survives startup.** The agent
+catalog belongs to `dekopond`, not to the broker, so the broker declares the `Dekopon::Agent` type
+and matches instances by UID without enumerating them. `resource == Dekopon::Agent::"revewer"`
+therefore validates, starts cleanly, and then matches nothing — every session that agent should have
+been permitted is denied `agent-denied` at runtime, which is exactly the latent-dead-policy failure
+mode the entity-literal check exists to prevent, in the one place the check does not apply. The
+gateway's own configuration is the check that remains: a route naming an agent the catalog does not
+contain is a `dekopond` startup failure. Cross-read the two files when a grant is written, and see
+the Cedar name table in
+[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#policy).
 
 ### Decisions
 

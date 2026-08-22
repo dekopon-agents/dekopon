@@ -2502,10 +2502,6 @@ where
         })
     }
 
-    /// Returns only capabilities policy allows for this exact authenticated context.
-    ///
-    /// The listing and the invocation decision come from the same evaluation, so a capability can
-    /// never appear here and then refuse — or be hidden here and then succeed.
     /// Returns the command words this context may use.
     ///
     /// A word appears only when policy allows this context at least one capability of the provider
@@ -2607,6 +2603,11 @@ where
         Ok(resolution)
     }
 
+    /// Returns only capabilities policy allows for this exact authenticated context.
+    ///
+    /// The listing and the invocation decision come from the same evaluation, so a capability can
+    /// never appear here and then refuse — or be hidden here and then succeed.
+    #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
         let mut capabilities = self
             .constraints
