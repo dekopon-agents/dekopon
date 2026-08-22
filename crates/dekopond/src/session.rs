@@ -81,12 +81,15 @@ const SESSION_COMPLETING: u8 = 2;
 /// [`crate::conversation`] is the other question and carries the sender.
 type AdmissionKey = (String, String, Option<String>);
 
+/// One model client, shared by every session that routes to the same configured model.
+pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
+
 /// Builds the model client one route selected.
 ///
 /// A seam rather than a direct call because the alternative is a test suite that cannot exercise
 /// routing, admission, or authorization without a live model endpoint.
 pub(crate) trait ModelFactory: Send + Sync {
-    fn build(&self, model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError>;
+    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError>;
 }
 
 /// The real factory: whatever `models:` configured, constructed exactly as `dekopon-run` does.
@@ -133,7 +136,7 @@ pub(crate) fn configured_image_generators(
 }
 
 impl ModelFactory for ConfiguredModels {
-    fn build(&self, model: &ModelConfig) -> Result<Box<dyn ChatModel + Send>, SessionError> {
+    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
         match model {
             ModelConfig::OpenaiCompatible {
                 endpoint,
@@ -145,7 +148,7 @@ impl ModelFactory for ConfiguredModels {
                 let bearer_token = api_key_env
                     .as_deref()
                     .and_then(|name| std::env::var(name).ok());
-                Ok(Box::new(OpenAiChatModel::new(
+                Ok(Arc::new(OpenAiChatModel::new(
                     endpoint,
                     model,
                     bearer_token,
@@ -157,12 +160,62 @@ impl ModelFactory for ConfiguredModels {
                 auth_file,
                 timeout_ms,
                 ..
-            } => Ok(Box::new(ChatGptCodexModel::new(
+            } => Ok(Arc::new(ChatGptCodexModel::new(
                 model,
                 auth_file.as_deref(),
                 std::time::Duration::from_millis(*timeout_ms),
             )?)),
         }
+    }
+}
+
+/// One client per configured model, built on first use and shared by every session after it.
+///
+/// A model client owns an HTTP agent and its connection pool, so rebuilding one per message paid a
+/// fresh TCP and TLS handshake before the first token of every answer — on a Pi talking to a remote
+/// endpoint, more added latency than the routing and authorization ahead of it cost together.
+/// Everything that legitimately varies per message — the prompt cache key, the completion options —
+/// is request-scoped and stays that way.
+///
+/// Keyed by the configured model name, which the loader has already proved unique, so two routes
+/// naming one endpoint share its pool and two endpoints never share a client.
+///
+/// A build failure is not cached: an absent credential file or an unset key is the kind of thing an
+/// operator repairs while the daemon runs, and the next message should find it repaired.
+pub(crate) struct ModelCache {
+    factory: Arc<dyn ModelFactory>,
+    clients: Mutex<HashMap<String, SharedModel>>,
+}
+
+impl ModelCache {
+    pub(crate) fn new(factory: Arc<dyn ModelFactory>) -> Self {
+        Self {
+            factory,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The client for one configured model, building it if this is the first message to need it.
+    pub(crate) fn client(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        if let Some(client) = self
+            .clients
+            .lock()
+            .expect("gateway model clients")
+            .get(model.name())
+        {
+            return Ok(Arc::clone(client));
+        }
+        // Built outside the lock: two sessions racing on the first message to one endpoint should
+        // not serialize, and whichever finishes second discards its client rather than replacing a
+        // pool another session is already using.
+        let built = self.factory.build(model)?;
+        Ok(Arc::clone(
+            self.clients
+                .lock()
+                .expect("gateway model clients")
+                .entry(model.name().to_owned())
+                .or_insert(built),
+        ))
     }
 }
 
@@ -425,7 +478,7 @@ impl Drop for ActiveRegistration {
 /// Everything shared by every session this daemon runs.
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
-    pub models: Arc<dyn ModelFactory>,
+    pub models: Arc<ModelCache>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
@@ -737,10 +790,9 @@ async fn session(
         max_capability_calls: limits.max_capability_calls,
         ..ShellLimits::default()
     };
-    // Request-scoped and built here rather than handed to `ModelFactory::build`. The client is
-    // rebuilt per message today and the obvious optimization is to share one across sessions, at
-    // which point a key captured in a constructor would describe the first conversation forever
-    // while quietly mislabeling every later one.
+    // Request-scoped and built here rather than handed to `ModelFactory::build`, which is what lets
+    // `ModelCache` share one client across sessions: a key captured in a constructor would describe
+    // the first conversation forever while quietly mislabeling every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
 
     // Activity is armed only after the fresh authorization gate and immediately before the costly
@@ -775,9 +827,10 @@ async fn session(
         .is_some_and(|continuation| continuation.inherited);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
-        // Built before the accumulator exists, so a model client that cannot be constructed
-        // returns without a turn: nothing was asked, so there is no exchange to remember.
-        let model = match models.build(&model_config) {
+        // Resolved before the accumulator exists, so a model client that cannot be constructed
+        // returns without a turn: nothing was asked, so there is no exchange to remember. Only the
+        // first message to reach a given endpoint actually builds one.
+        let model = match models.client(&model_config) {
             Ok(model) => model,
             Err(error) => return (Err(error), None, None),
         };
