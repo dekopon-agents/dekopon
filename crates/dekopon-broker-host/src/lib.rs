@@ -174,6 +174,8 @@ pub struct BrokerHostOptions {
     /// `None` leaves the aggregate unbounded, which is only safe when the connection ceiling
     /// multiplied by the per-store ceiling still fits the container.
     pub max_total_memory_bytes: Option<usize>,
+}
+
 /// Upper bound on the fuel a store may burn between async yields.
 ///
 /// A store holding billions of units of fuel must still hand the executor back often enough for the
