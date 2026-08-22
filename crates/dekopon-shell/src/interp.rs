@@ -24,13 +24,15 @@ use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        DEV_NULL, ForLoop, IfStatement, Parameter, Pipeline, Program, Redirect, RedirectTarget,
-        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
+        DEV_NULL, ForLoop, IfStatement, Index, Modifier, Parameter, Pipeline, Program, Redirect,
+        Pattern, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
     dispatch::{self, Resolution, arguments_to_input},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    parser::{expanded_case_pattern, parse, pattern_metacharacter},
+    parser::{
+        expanded_case_pattern, expanded_parameter_pattern, parse, pattern_metacharacter,
+    },
     value::{self, display},
 };
 
@@ -257,7 +259,9 @@ impl Evaluator<'_> {
             FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
                 "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
             ),
-            FatalError::Unsupported(reason) => format!("dekopon-shell: {reason}"),
+            FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
+                format!("dekopon-shell: {reason}")
+            }
         };
         // Straight to the combined output, never into a redirected stderr capture: the script is
         // ending, the capture is about to be abandoned unrouted, and `cmd 2> log` must not be able
@@ -1333,19 +1337,28 @@ impl Evaluator<'_> {
 
     /// Evaluates an assignment right-hand side.
     ///
-    /// A whole-RHS `$(cmd)` keeps its structured value instead of collapsing to text. This is the
-    /// documented deviation from bash that makes `ip=$(curl ...)` followed by `${ip[origin]}` work.
+    /// A whole-RHS `$(cmd)` or `$NAME` keeps its structured value instead of collapsing to text.
+    /// This is the documented deviation from bash that makes `ip=$(curl ...)` followed by
+    /// `${ip[origin]}` work, and it has to cover both spellings or `copy=$ip` would silently
+    /// flatten what `ip` holds.
     fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if word.parts.is_empty() {
             return Ok(Value::String(String::new()));
         }
-        if let Some(WordPart::CommandSubstitution(program)) = word.parts.first()
-            && word.is_bare_command_substitution()
-        {
-            let (value, status) = self.run_substitution(program)?;
-            self.last_substitution_status = status;
-            return Ok(value);
+        if let [part] = word.parts.as_slice() {
+            match part {
+                WordPart::CommandSubstitution(program) => {
+                    let (value, status) = self.run_substitution(program)?;
+                    self.last_substitution_status = status;
+                    return Ok(value);
+                }
+                // A whole-RHS parameter expansion keeps its value for the same reason a whole-RHS
+                // substitution does: `b=$a` followed by `${b[key]}` is asking about the object `a`
+                // holds, and stringifying it here would answer about that object's JSON text.
+                WordPart::Parameter(parameter) => return self.parameter_value(parameter),
+                _ => {}
+            }
         }
         let expanded = self.expand_word(word)?;
         Ok(Value::String(expanded.join(" ")))
@@ -1425,9 +1438,15 @@ impl Evaluator<'_> {
                     let number = self.evaluate_arithmetic(expression)?;
                     append(&mut fields, &render_number(number));
                 }
-                WordPart::Parameter(Parameter::AllPositional) => {
-                    let mut positional = self.positional().iter().map(display);
-                    let Some(first) = positional.next() else {
+                WordPart::Parameter(parameter) if splits_inside_quotes(parameter) => {
+                    let value = self.parameter_value(parameter)?;
+                    let elements = match value {
+                        Value::Array(items) => items,
+                        Value::Null => Vec::new(),
+                        scalar => vec![scalar],
+                    };
+                    let mut elements = elements.iter().map(display);
+                    let Some(first) = elements.next() else {
                         // A bare `"$@"` with no parameters is no word at all, so `f "$@"` with
                         // nothing to forward calls `f` with zero arguments rather than one empty
                         // one. Glued to other text it contributes nothing instead.
@@ -1437,7 +1456,7 @@ impl Evaluator<'_> {
                         continue;
                     };
                     append(&mut fields, &first);
-                    fields.extend(positional);
+                    fields.extend(elements);
                 }
                 WordPart::Parameter(parameter) => {
                     let value = self.parameter_value(parameter)?;
@@ -1454,14 +1473,19 @@ impl Evaluator<'_> {
 
     fn parameter_value(&mut self, parameter: &Parameter) -> Result<Value, CommandFailure> {
         Ok(match parameter {
-            Parameter::Named { name, indices } => {
-                let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
-                for index in indices {
-                    let expanded = self.expand_word(index)?;
-                    let key = expanded.join(" ");
-                    value = value::index(&value, &key);
+            Parameter::Named {
+                name,
+                indices,
+                modifier,
+                length,
+            } => {
+                let (value, bound) = self.select_parameter(name, indices)?;
+                let value = self.apply_modifier(name, indices, modifier, value, bound)?;
+                if *length {
+                    parameter_length(&value)
+                } else {
+                    value
                 }
-                value
             }
             Parameter::Positional(0) => Value::String("dekopon-shell".to_owned()),
             Parameter::Positional(position) => self
@@ -1481,6 +1505,152 @@ impl Evaluator<'_> {
             Parameter::PositionalCount => Value::from(self.positional().len()),
             Parameter::LastStatus => Value::from(self.last_status.get()),
         })
+    }
+
+    /// Walks a parameter's indices, reporting the selection and whether it was bound at all.
+    ///
+    /// "Bound" is what separates `${NAME-word}` from `${NAME:-word}`: the first substitutes only
+    /// for a name nothing ever assigned, the second also for one holding an empty value.
+    fn select_parameter(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+    ) -> Result<(Value, bool), CommandFailure> {
+        let mut bound = self.lookup(name).is_some();
+        let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
+        for index in indices {
+            match index {
+                Index::At(word) => {
+                    let expanded = self.expand_word(word)?;
+                    let key = expanded.join(" ");
+                    value = value::index(&value, &key);
+                    bound = !value.is_null();
+                }
+                // `[@]` and `[*]` select the whole thing; what differs is how the *word* they sit
+                // in splits, which `expand_word` and `expand_quoted_fields` decide.
+                Index::All => {}
+                Index::AllJoined => {
+                    value = Value::String(value::to_lines(&value).join(" "));
+                }
+            }
+        }
+        Ok((value, bound))
+    }
+
+    /// Applies one `${NAME<op>word}` transformation.
+    fn apply_modifier(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+        modifier: &Modifier,
+        value: Value,
+        bound: bool,
+    ) -> Result<Value, CommandFailure> {
+        // `:` widens "absent" from "never assigned" to "assigned nothing useful", which is the
+        // distinction bash draws and the one a script almost always wants.
+        let absent = |colon: bool| {
+            if colon {
+                value.is_null() || display(&value).is_empty()
+            } else {
+                !bound
+            }
+        };
+        Ok(match modifier {
+            Modifier::None => value,
+            Modifier::Default { colon, word } => {
+                if absent(*colon) {
+                    self.assignment_value(word)?
+                } else {
+                    value
+                }
+            }
+            Modifier::Assign { colon, word } => {
+                if !absent(*colon) {
+                    return Ok(value);
+                }
+                if !indices.is_empty() {
+                    return Err(CommandFailure::usage(format!(
+                        "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
+                    )));
+                }
+                let substitute = self.assignment_value(word)?;
+                self.assign(name, substitute.clone())?;
+                substitute
+            }
+            Modifier::Require { colon, word } => {
+                if !absent(*colon) {
+                    return Ok(value);
+                }
+                let message = match word {
+                    Some(word) => self.expand_quoted(&word.parts)?,
+                    None => "parameter is not set".to_owned(),
+                };
+                return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
+                    "{name}: {message}"
+                ))));
+            }
+            Modifier::Alternate { colon, word } => {
+                if absent(*colon) {
+                    Value::Null
+                } else {
+                    self.assignment_value(word)?
+                }
+            }
+            Modifier::StripPrefix(pattern) => {
+                let pattern = self.literal_pattern(pattern)?;
+                let text = display(&value);
+                Value::String(
+                    text.strip_prefix(&pattern)
+                        .map_or(text.clone(), str::to_owned),
+                )
+            }
+            Modifier::StripSuffix(pattern) => {
+                let pattern = self.literal_pattern(pattern)?;
+                let text = display(&value);
+                Value::String(
+                    text.strip_suffix(&pattern)
+                        .map_or(text.clone(), str::to_owned),
+                )
+            }
+            Modifier::Replace {
+                all,
+                pattern,
+                replacement,
+            } => {
+                let pattern = self.literal_pattern(pattern)?;
+                let replacement = self.expand_quoted(&replacement.parts)?;
+                let text = display(&value);
+                if pattern.is_empty() {
+                    return Err(CommandFailure::usage(format!(
+                        "${{{name}/...}} needs text to replace; an empty pattern matches everywhere"
+                    )));
+                }
+                Value::String(if *all {
+                    text.replace(&pattern, &replacement)
+                } else {
+                    text.replacen(&pattern, &replacement, 1)
+                })
+            }
+        })
+    }
+
+    /// Expands one `${NAME#pattern}`-family pattern and refuses the metacharacters it cannot honor.
+    ///
+    /// Same rule as a `grep`, `sed`, or `case` pattern. A constant pattern was already checked by
+    /// the parser, where quoting was still visible; only one assembled at run time is checked here.
+    fn literal_pattern(&mut self, pattern: &Pattern) -> Result<String, CommandFailure> {
+        match pattern {
+            Pattern::Literal(word) => self.expand_quoted(&word.parts),
+            Pattern::Expanded(word) => {
+                let text = self.expand_quoted(&word.parts)?;
+                if let Some((character, meaning)) = pattern_metacharacter(&text) {
+                    return Err(CommandFailure::usage(expanded_parameter_pattern(
+                        character, meaning,
+                    )));
+                }
+                Ok(text)
+            }
+        }
     }
 
     /// Runs a command substitution, capturing what its pipelines produced.
@@ -1569,6 +1739,36 @@ impl Evaluator<'_> {
                 arithmetic(*operator, left, right)?
             }
         })
+    }
+}
+
+/// Reports whether a parameter keeps splitting into one word per element inside double quotes.
+///
+/// `"$@"` is the most-trained idiom in shell and `"${NAME[@]}"` is its named-variable counterpart:
+/// both exist precisely so a list survives quoting intact. Every other expansion inside quotes is
+/// one field.
+fn splits_inside_quotes(parameter: &Parameter) -> bool {
+    match parameter {
+        Parameter::AllPositional => true,
+        Parameter::Named {
+            indices, length, ..
+        } => !*length && matches!(indices.last(), Some(Index::All)),
+        _ => false,
+    }
+}
+
+/// Reports what `${#NAME}` counts, per value kind.
+///
+/// A string counts characters, the way bash does. An array counts elements and an object counts
+/// keys, which is what `${#NAME}` has to mean once values are real JSON rather than text; anything
+/// else counts the characters of its display form.
+fn parameter_length(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::from(0),
+        Value::String(text) => Value::from(text.chars().count()),
+        Value::Array(items) => Value::from(items.len()),
+        Value::Object(fields) => Value::from(fields.len()),
+        other => Value::from(display(other).chars().count()),
     }
 }
 

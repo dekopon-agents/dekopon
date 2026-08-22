@@ -116,6 +116,12 @@ pub(crate) enum FatalError {
     Limit(LimitExceeded),
     /// The script reached a construct this shell deliberately excludes.
     Unsupported(String),
+    /// A `${NAME:?message}` assertion found the parameter absent.
+    ///
+    /// Terminal rather than recoverable, because that is the whole point of the construct: a
+    /// script writes it to stop when a value it depends on is missing. Reporting a status and
+    /// carrying on with an empty string would be the silent wrongness this shell exists to refuse.
+    Assertion(String),
 }
 
 /// Everything a builtin may touch.
