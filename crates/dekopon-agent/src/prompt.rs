@@ -1450,7 +1450,8 @@ The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `|
 pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
 because nothing here forks — `break`/`continue`, functions \
 with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, `${#NAME}`, \
-`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, `return`, \
+`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, \
+`${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
 redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
 named in-memory buffers all behave the way you expect. Everything outside that curated set fails \

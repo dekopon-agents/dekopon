@@ -60,6 +60,21 @@ enum Executed {
     Flow(Flow),
 }
 
+/// The shell options `set` toggles.
+///
+/// Each one is enforced, not accepted-and-ignored: the reason `set` was refused outright before was
+/// that an option which changed nothing while looking like it had is exactly the class of silent
+/// wrongness this shell exists to refuse. That reason stops applying once the option is real.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShellOptions {
+    /// `set -e`: a command that fails outside a tested position ends the script.
+    errexit: bool,
+    /// `set -u`: expanding a parameter nothing ever set ends the script.
+    nounset: bool,
+    /// `set -o pipefail`: a pipeline reports its rightmost failure, not just its last stage.
+    pipefail: bool,
+}
+
 /// Where one of a command's two streams ends up.
 ///
 /// [`Sink::Value`] and [`Sink::Diagnostics`] are the two defaults, and they are also what a
@@ -165,6 +180,8 @@ pub(crate) fn run(
         function_names: BTreeSet::new(),
         buffers: BTreeMap::new(),
         captures: Vec::new(),
+        options: ShellOptions::default(),
+        testing_status: 0,
         stdin: Vec::new(),
         stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
@@ -227,6 +244,15 @@ struct Evaluator<'a> {
     /// be deep-copied once per statement — including for the statements that never read input —
     /// and all but the last copy dropped. See [`own`].
     stdin: Vec<Option<Rc<Value>>>,
+    /// The options `set` has turned on.
+    options: ShellOptions,
+    /// How many enclosing positions are *testing* a status rather than depending on it.
+    ///
+    /// `errexit` must not fire for a command whose failure the script is already asking about: an
+    /// `if`/`while`/`until` condition, every operand of an `&&`/`||` chain but the last, and a
+    /// pipeline inverted by `!`. Bash draws exactly these three exemptions, and a counter rather
+    /// than a flag is what keeps them composing — `if a && b; then` nests two of them.
+    testing_status: u32,
     /// Diagnostic capture stack, one frame per command whose stderr is redirected.
     ///
     /// A stack rather than a field because a redirection nests: a shell function called as
@@ -446,7 +472,8 @@ impl Evaluator<'_> {
 
     fn execute_if(&mut self, statement: &IfStatement) -> Result<Flow, FatalError> {
         for (condition, body) in &statement.branches {
-            let (status, flow) = self.execute_list(condition)?;
+            let (status, flow) =
+                self.tested(true, |evaluator| evaluator.execute_list(condition))?;
             self.last_status = status;
             if let Some(flow) = flow {
                 return Ok(flow);
@@ -571,7 +598,9 @@ impl Evaluator<'_> {
             // Every iteration charges a step. This is the only thing standing between
             // `while true; do :; done` and an unbounded loop.
             self.budget.charge_step()?;
-            let (status, flow) = self.execute_list(&statement.condition)?;
+            let (status, flow) = self.tested(true, |evaluator| {
+                evaluator.execute_list(&statement.condition)
+            })?;
             self.last_status = status;
             if let Some(flow) = flow {
                 return Ok(flow);
@@ -606,13 +635,18 @@ impl Evaluator<'_> {
     }
 
     fn execute_list(&mut self, list: &AndOrList) -> Result<(ExitCode, Option<Flow>), FatalError> {
-        let (mut status, flow) = self.execute_pipeline(&list.first)?;
+        // Every operand of an `&&`/`||` chain but the last is a tested status: the chain is asking
+        // whether it succeeded, so `errexit` must not answer by ending the script.
+        let (mut status, flow) = self.tested(!list.rest.is_empty(), |evaluator| {
+            evaluator.execute_pipeline(&list.first)
+        })?;
         self.last_status = status;
         if flow.is_some() {
             return Ok((status, flow));
         }
 
-        for (operator, pipeline) in &list.rest {
+        let last = list.rest.len().saturating_sub(1);
+        for (index, (operator, pipeline)) in list.rest.iter().enumerate() {
             let should_run = match operator {
                 AndOr::And => status == ExitCode::SUCCESS,
                 AndOr::Or => status != ExitCode::SUCCESS,
@@ -620,14 +654,144 @@ impl Evaluator<'_> {
             if !should_run {
                 continue;
             }
-            let (next, flow) = self.execute_pipeline(pipeline)?;
+            let (next, flow) =
+                self.tested(index < last, |evaluator| evaluator.execute_pipeline(pipeline))?;
             status = next;
             self.last_status = status;
             if flow.is_some() {
                 return Ok((status, flow));
             }
         }
+        if let Some(exit) = self.errexit_trip(status) {
+            return Ok((status, Some(exit)));
+        }
         Ok((status, None))
+    }
+
+    /// Applies one `set` invocation.
+    ///
+    /// Only the three options this shell actually enforces are accepted. Every other letter and
+    /// long name **ends the script** by name rather than being ignored: an accepted-and-ignored
+    /// option is the exact failure that kept `set` out of this shell in the first place, and a
+    /// refusal the script could carry on past would leave it running without the option it asked
+    /// for, which is the same failure wearing a status code.
+    fn apply_set_options(&mut self, arguments: &[String]) -> Result<(), CommandFailure> {
+        if arguments.is_empty() {
+            return Err(unsupported_option(
+                "set: listing or setting positional parameters is not supported; \
+                 use `set -e`, `set -u`, `set -o pipefail`, or their `+` forms",
+            ));
+        }
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = arguments[index].as_str();
+            let enable = match argument.chars().next() {
+                Some('-') => true,
+                Some('+') => false,
+                _ => {
+                    return Err(unsupported_option(format!(
+                        "set: {argument:?} is not an option; this shell supports only -e, -u, and \
+                         -o pipefail"
+                    )));
+                }
+            };
+            if argument.len() == 1 {
+                return Err(unsupported_option(format!(
+                    "set: {argument:?} on its own is not an option"
+                )));
+            }
+            if argument == "--" || argument == "++" {
+                return Err(unsupported_option(
+                    "set: `--` sets positional parameters, which this shell has only inside a \
+                     function and only from its arguments",
+                ));
+            }
+            index += 1;
+            for letter in argument.chars().skip(1) {
+                match letter {
+                    'e' => self.options.errexit = enable,
+                    'u' => self.options.nounset = enable,
+                    'o' => {
+                        let Some(name) = arguments.get(index) else {
+                            return Err(unsupported_option(
+                                "set: -o needs an option name; the only one is `pipefail`",
+                            ));
+                        };
+                        index += 1;
+                        self.set_long_option(name, enable)?;
+                    }
+                    other => {
+                        return Err(unsupported_option(format!(
+                            "set: option -{other} is not supported; this shell has -e, -u, and \
+                             -o pipefail"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one `set -o NAME` / `set +o NAME`.
+    fn set_long_option(&mut self, name: &str, enable: bool) -> Result<(), CommandFailure> {
+        match name {
+            "pipefail" => self.options.pipefail = enable,
+            "errexit" => self.options.errexit = enable,
+            "nounset" => self.options.nounset = enable,
+            other => {
+                return Err(unsupported_option(format!(
+                    "set: -o {other} is not supported; this shell has pipefail, errexit, and nounset"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes one pipeline's per-stage statuses as `PIPESTATUS`.
+    ///
+    /// An ordinary global, so `${PIPESTATUS[@]}`, `${PIPESTATUS[0]}`, and `${#PIPESTATUS[@]}` all
+    /// work through the expansion machinery that already exists rather than through a special case.
+    /// Written straight into the map instead of through [`Evaluator::assign`] because it *replaces*
+    /// a bounded array of small integers on every pipeline rather than accumulating one; charging
+    /// it against the value-byte ceiling would let a long loop exhaust that ceiling with a value
+    /// the script never asked for.
+    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) {
+        self.globals.insert(
+            "PIPESTATUS".to_owned(),
+            Value::Array(
+                stages
+                    .into_iter()
+                    .map(|stage| Value::from(stage.get()))
+                    .collect(),
+            ),
+        );
+    }
+
+    /// Runs `body` with `errexit` suspended when `suspended`, restoring the count afterwards.
+    fn tested<T>(
+        &mut self,
+        suspended: bool,
+        body: impl FnOnce(&mut Self) -> Result<T, FatalError>,
+    ) -> Result<T, FatalError> {
+        if suspended {
+            self.testing_status += 1;
+        }
+        let outcome = body(self);
+        if suspended {
+            self.testing_status -= 1;
+        }
+        outcome
+    }
+
+    /// Reports the exit `errexit` demands for this status, if any.
+    fn errexit_trip(&mut self, status: ExitCode) -> Option<Flow> {
+        if !self.options.errexit || self.testing_status > 0 || status == ExitCode::SUCCESS {
+            return None;
+        }
+        self.write_line(&format!(
+            "dekopon-shell: command failed with status {status} and `set -e` is on"
+        ));
+        Some(Flow::Exit(status))
     }
 
     fn execute_pipeline(
@@ -642,12 +806,18 @@ impl Evaluator<'_> {
         let mut input: Option<Rc<Value>> = self.stdin.last().cloned().flatten();
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
+        let mut stages = Vec::with_capacity(commands);
 
         for (index, command) in pipeline.commands.iter().enumerate() {
             let piped = index + 1 < commands;
-            match self.execute_command(command, input.take(), piped)? {
+            // A `!` makes the whole pipeline a tested status, and every stage but the last is one
+            // anyway: bash exempts both from `errexit`, and so does this.
+            match self.tested(pipeline.negated || piped, |evaluator| {
+                evaluator.execute_command(command, input.take(), piped)
+            })? {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
+                    stages.push(result.status);
                     if piped {
                         // Only the terminal command's result is ever read, and the terminal
                         // command is by construction never piped — so an intermediate value moves
@@ -662,11 +832,18 @@ impl Evaluator<'_> {
             }
         }
 
-        let status = if pipeline.negated {
-            invert(last.status)
-        } else {
-            last.status
-        };
+        // `pipefail` reports the rightmost stage that failed, so `cap x | jq .` stops hiding a
+        // capability that never ran behind a `jq` that was handed nothing and succeeded.
+        let mut status = last.status;
+        if self.options.pipefail
+            && let Some(failed) = stages.iter().rev().find(|stage| **stage != ExitCode::SUCCESS)
+        {
+            status = *failed;
+        }
+        self.record_pipe_statuses(stages);
+        if pipeline.negated {
+            status = invert(status);
+        }
         self.emit(last);
         Ok((status, None))
     }
@@ -1258,6 +1435,15 @@ impl Evaluator<'_> {
                     Flow::Continue(level)
                 })
             }
+            "set" => {
+                match self.apply_set_options(arguments) {
+                    Ok(()) => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
+                    Err(failure) => {
+                        let status = self.absorb(failure)?;
+                        Executed::Result(CommandResult::status(status))
+                    }
+                }
+            }
             "return" => {
                 if self.frames.is_empty() {
                     self.write_line("dekopon-shell: return: only valid inside a function");
@@ -1601,6 +1787,14 @@ impl Evaluator<'_> {
                 length,
             } => {
                 let (value, bound) = self.select_parameter(name, indices)?;
+                // `set -u` only governs a plain reference. `${x:-d}` and its relatives exist
+                // precisely to handle an absent value, so tripping on them would make the option
+                // refuse the idiom written to satisfy it.
+                if self.options.nounset && !bound && *modifier == Modifier::None {
+                    return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
+                        "{name}: unbound variable, and `set -u` is on"
+                    ))));
+                }
                 let value = self.apply_modifier(name, indices, modifier, value, bound)?;
                 if *length {
                     parameter_length(&value)
@@ -1930,6 +2124,11 @@ fn splits_inside_quotes(parameter: &Parameter) -> bool {
         } => !*length && matches!(indices.last(), Some(Index::All)),
         _ => false,
     }
+}
+
+/// Composes the terminal failure for a `set` option this shell does not enforce.
+fn unsupported_option(message: impl Into<String>) -> CommandFailure {
+    CommandFailure::Fatal(FatalError::Unsupported(message.into()))
 }
 
 /// Reports what `${#NAME}` counts, per value kind.

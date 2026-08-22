@@ -9,6 +9,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Made `set -e`, `set -u`, and `set -o pipefail` real in the sandboxed shell, with their `+` forms,
+  and added `${PIPESTATUS[@]}`. `set` was refused outright before on the grounds that an option
+  changing nothing while looking like it had is the exact silent wrongness this shell refuses;
+  that argument stops applying once the option is enforced and still holds for every option that
+  is not, so `set -x`, `set -o noclobber`, and `set --` now end the script by name rather than
+  being ignored. `errexit` exempts the three positions bash exempts, and they compose. `pipefail`
+  matters more here than in bash: `some.capability x | jq .` succeeded by default even when the
+  capability never ran, because `jq` was handed nothing and had no complaint.
+
 - Accepted `[[ ... ]]` in the sandboxed shell. It runs the same tests `[` and `test` run — one
   function, so the two spellings cannot disagree — and adds bash's connective grammar (`&&`, `||`,
   `!`, parentheses, short-circuiting) plus the promise that an unquoted expansion is one operand.
