@@ -136,7 +136,7 @@ if no model turn remains, the gateway posts a fixed warning to inspect audit bef
 
 ## Current control paths
 
-The published `0.9.0` release retains the local catalog read path introduced in 0.1:
+The published `0.10.0` release retains the local catalog read path introduced in 0.1:
 
 ```text
 parse dekopon CLI

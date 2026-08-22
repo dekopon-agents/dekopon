@@ -7,11 +7,148 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-22
+
+### Added
+
+- Added a first text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook,
+  process-local message-ID deduplication, canonical `whatsapp.<wa_id>` subjects, and pinned Graph
+  API text replies.
+- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
+  Discord, Telegram, and the local development transport.
+- Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
+  engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
+- Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
+  search` commands, with stable or non-reusing authority-bound continuity across restarts.
+- Added chat-scope grants, invocation-bound chat attestations, and dedicated post-transport
+  `RecordDeliveredTurnForChat` recording.
+- Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
+  memory provider.
+- Documented the nine refusal, error, and outcome audit events `docs/observability.md` had never
+  named, and made an emitted `audit.event` name absent from that file a CI failure.
+- Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
+  restart reads compiled provider code back instead of running Cranelift again.
+- Added an optional `dekopon-run --compile-cache <DIRECTORY>` (`DEKOPON_RUN_COMPILE_CACHE`) backed by
+  `dekopon-provider-host`'s `HostOptions::compile_cache_dir`, so repeated `inspect`, `invoke`,
+  `shell`, and `prompt` processes read Wasmtime's compiled provider code back instead of running
+  Cranelift again.
+- Added an optional broker `hostLimits.maxTotalMemoryBytes` aggregate guest-memory ceiling, so
+  concurrent invocations past the budget are refused instead of being OOM-killed. The broker also
+  states the `maxConnections` × `maxMemoryBytes` worst case in one startup line.
+- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
+  protocol failure kind, the provider host error, the audit failure category, and the full source
+  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
+  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
+  responses are unchanged and stay generic.
+- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
+  the refusal class and the canonical subject on the broker side, while the wire answer stays
+  opaque.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
+  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
+  `broker.execute` records `outcome` and the classified `error`.
+- A finished connection task is now observed as soon as it completes rather than on the next accept,
+  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
+- `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
+  suspended. The section awaits the replay ledger and, on every denial, a durable audit append that
+  fsyncs, so whatever the runtime polled next on that thread was exported as a child of another
+  request's authorization while that request's own later events lost it. The span instruments the
+  section instead of being held across the awaits; its fields and values are unchanged.
+
 ### Changed
 
 - `dekopond` now builds one model client per configured model instead of one per message, so a
   routed message no longer pays a fresh TCP and TLS handshake to the model endpoint before its
   first token. Prompt cache keys and completion options remain per-request.
+- `dekopon-protocol` resources now carry a per-resource single-variant `kind`, so a document whose
+  `kind` names another resource fails to decode in the crate itself rather than only in
+  `dekopon-config`. `model_class`, `policy_profile`, `credential_ref`, `CapabilityStatus`, and
+  `ProviderStatus` documentation now matches what 0.9.0 actually does with them.
+- `JsonSchema` derives in `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` moved behind
+  a default-on `schemars` feature, and `dekopon-provider-sdk` no longer enables it, so a wasm
+  provider build drops `schemars`, `schemars_derive`, and `syn`.
+- Broker provider components now compile concurrently through Wasmtime's parallel Cranelift backend
+  instead of one at a time on a single core, while conflict reporting and the first reported
+  failure stay in configured order.
+- Broker provider imports are now linked once per component into a cached `InstancePre`, so an
+  invocation, description, or command rewrite no longer rebuilds a linker and re-resolves imports.
+- The `provider.compile` span now carries the component path, artifact bytes, and elapsed
+  milliseconds; each loaded provider emits one info event; `resolve_command` runs inside a
+  `provider.resolve_command` span carrying the provider and the command word.
+- Added Slack Agent owned-thread continuation: after one explicitly addressed message is freshly
+  authorized, that authenticated sender can continue in the exact thread without another mention.
+- Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
+  allowing the agent to post nothing instead of always taking the last word.
+- Added `docs/catalog.md`, the field-by-field `v1alpha1` resource reference, naming what consumes
+  each `AgentSpec`/`CapabilitySpec`/`ProviderSpec` field and stating that `policyProfile`,
+  `credentialRef`, `status`, and `labels` are read by nothing.
+- Added `docs/upgrading.md`, covering the 0.3.0 `rules` → `policiesPath`/`constraintSets` migration,
+  the 0.5.0 broker-protocol lockstep, later operator-visible changes, and the restart order.
+- Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
+  checkpoint recovery is reachable from `docs/` instead of only from a crate README.
+- An exhausted replay ledger or audit log now answers the new stable failure code
+  `capacity-exhausted` and logs `broker_capacity_exhausted`, instead of the retriable
+  `broker-unavailable`. Neither bound evicts, rotates, or clears on restart, so a client was being
+  invited to retry forever. `maxReplayIds` must be sized against `auditMaxRecords`, which is now
+  documented in `docs/broker-http.md` and the chart README.
+- A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
+  service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
+  significant failed.
+- The `--http-bind` web UI now serves at most sixteen concurrent connections, refusing rather than
+  queuing further ones, and drops any connection that exceeds a thirty-second budget from accept to
+  close; both ceilings are configurable through `dekopon_webui::serve_with_limits`.
+- The web UI emits one `debug` tracing event per request with method, path, status, and response
+  bytes, and no query string or body.
+- Web UI provider pages are rendered once at broker startup instead of per request, the dashboard's
+  agent inventory is shared by reference rather than deep-copied per render, and the provider page's
+  "Manifest API" row now shows the manifest's own `apiVersion` value instead of the Rust variant
+  name.
+- The web UI's "Fuel yield interval" row now reports the interval `dekopon-broker-host` actually
+  configures rather than re-deriving it.
+- A route that names an image generator on the text-only WhatsApp transport is now a startup
+  failure, rather than paying a model for a PNG that has no delivery path.
+- A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
+  sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
+  the first chunk reports `partial-delivery` and records no delivered turn.
+- A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
+  name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
+- Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
+  durable recording uses the exact bounded answer once and is never retried automatically.
+- Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
+  totals, using domain-separated keyed commitments and coarse counters instead.
+- Storage now uses retained descriptor-relative tree operations, base→generation lease ordering,
+  exact manifest/entry reservations, bounded finalization, strict recovery/quarantine, and
+  canonical effective-authority generations independent of configuration ordering.
+- Chat recording now uses service-typed scope-bound delivery identities and requires successful
+  Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
+- Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
+  memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- Catalog validation now scans the whole file and reports every duplicate, invalid name,
+  unsupported API version, and missing reference in one list, instead of stopping at the first.
+- `agent.spec.providers` is now held to the providers the agent's own capabilities route to, in
+  both directions, so a rendered provider inventory can no longer drift from the capability list.
+- The HTTP grant entry grammar — exact authorities, exact method tokens, and the entry-count cap —
+  now lives once on `HttpConstraints::validate` and is enforced by `AuthorizationGate`,
+  `dekopon-broker`, and `dekopon-http-host` alike. The broker's accepted set is unchanged; the gate
+  and HTTP host no longer accept entries the broker refuses.
+- The capability-shaped command-word refusal now explains the real mechanism: the shell resolves
+  provider command words before capability fallback, so such a word would shadow the capability of
+  that name.
+
+### Removed
+
+- Removed `dekopon-testkit`, which no workspace crate depended on, the `dekopon-capability`
+  dependency of `dekopon`, `thiserror` from `dekopon-provider-sdk`, four unreferenced dependencies
+  of `dekopon-run`, and three of `dekopon-telemetry`.
+- Removed `CapabilityDescriptor` and `ProposedInvocation`'s unused `Deserialize` derive from
+  `dekopon-capability`, `ResourceReader` from `dekopon`, and the single-implementation `Provider`
+  trait from `dekopon-provider-host`, whose methods are now inherent on `WasmProvider`.
+- A Cedar literal outside the Dekopon identifier grammar now returns `UnknownAction` or
+  `UnknownProvider` in tolerant startup mode instead of an opaque validation error, and a policy
+  that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
+  to source text.
 
 ### Fixed
 
@@ -38,93 +175,6 @@ All notable changes to Dekopon are documented here. The format is based on
   distinguishes an expired credential from a transient rejection.
 - Kept a device login polling through a transient network failure until its fifteen-minute deadline
   rather than discarding the user code on one dropped packet.
-
-### Security
-
-- Swept abandoned `chatgpt-auth.tmp-*` staging files, which hold access and refresh tokens in the
-  clear, on every credential save and on `dekopon auth chatgpt logout`, and `fsync`ed the credential
-  directory after the rename so a rotated credential cannot be lost to a power failure.
-### Added
-
-- Added a first text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook,
-  process-local message-ID deduplication, canonical `whatsapp.<wa_id>` subjects, and pinned Graph
-  API text replies.
-- Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
-  operator-owned exact-path webhook ingress.
-- Added opt-in route-scoped OpenAI image generation and bounded generated-PNG replies across Slack,
-  Discord, Telegram, and the local development transport.
-- Added broker-owned, namespace-bound provider storage with strict quotas, transactional JSONL,
-  engine-neutral durable files, feature-gated Rust guest bindings, and content-free evidence.
-- Added the optional generated `memory-chat` provider and on-demand `memory recent` / `memory
-  search` commands, with stable or non-reusing authority-bound continuity across restarts.
-- Added chat-scope grants, invocation-bound chat attestations, and dedicated post-transport
-  `RecordDeliveredTurnForChat` recording.
-- Added opt-in broker-only provider-storage PVC/key mounts and optional container packaging for the
-  memory provider.
-- Documented the nine refusal, error, and outcome audit events `docs/observability.md` had never
-  named, and made an emitted `audit.event` name absent from that file a CI failure.
-- Added an optional broker `compileCachePath` for Wasmtime's persistent compilation cache, so a
-  restart reads compiled provider code back instead of running Cranelift again.
-- Added an optional `dekopon-run --compile-cache <DIRECTORY>` (`DEKOPON_RUN_COMPILE_CACHE`) backed by
-  `dekopon-provider-host`'s `HostOptions::compile_cache_dir`, so repeated `inspect`, `invoke`,
-  `shell`, and `prompt` processes read Wasmtime's compiled provider code back instead of running
-  Cranelift again.
-- Added an optional broker `hostLimits.maxTotalMemoryBytes` aggregate guest-memory ceiling, so
-  concurrent invocations past the budget are refused instead of being OOM-killed. The broker also
-  states the `maxConnections` × `maxMemoryBytes` worst case in one startup line.
-
-### Changed
-
-- `dekopon-protocol` resources now carry a per-resource single-variant `kind`, so a document whose
-  `kind` names another resource fails to decode in the crate itself rather than only in
-  `dekopon-config`. `model_class`, `policy_profile`, `credential_ref`, `CapabilityStatus`, and
-  `ProviderStatus` documentation now matches what 0.9.0 actually does with them.
-- `JsonSchema` derives in `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` moved behind
-  a default-on `schemars` feature, and `dekopon-provider-sdk` no longer enables it, so a wasm
-  provider build drops `schemars`, `schemars_derive`, and `syn`.
-- Broker provider components now compile concurrently through Wasmtime's parallel Cranelift backend
-  instead of one at a time on a single core, while conflict reporting and the first reported
-  failure stay in configured order.
-- Broker provider imports are now linked once per component into a cached `InstancePre`, so an
-  invocation, description, or command rewrite no longer rebuilds a linker and re-resolves imports.
-- The `provider.compile` span now carries the component path, artifact bytes, and elapsed
-  milliseconds; each loaded provider emits one info event; `resolve_command` runs inside a
-  `provider.resolve_command` span carrying the provider and the command word.
-
-- Added Slack Agent owned-thread continuation: after one explicitly addressed message is freshly
-  authorized, that authenticated sender can continue in the exact thread without another mention.
-- Added the request-scoped `decline_chat_reply` model tool for unaddressed owned-thread follow-ups,
-  allowing the agent to post nothing instead of always taking the last word.
-- Added `docs/catalog.md`, the field-by-field `v1alpha1` resource reference, naming what consumes
-  each `AgentSpec`/`CapabilitySpec`/`ProviderSpec` field and stating that `policyProfile`,
-  `credentialRef`, `status`, and `labels` are read by nothing.
-- Added `docs/upgrading.md`, covering the 0.3.0 `rules` → `policiesPath`/`constraintSets` migration,
-  the 0.5.0 broker-protocol lockstep, later operator-visible changes, and the restart order.
-- Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
-  checkpoint recovery is reachable from `docs/` instead of only from a crate README.
-
-### Added
-
-- Broker connection, framing, audit-append, and checkpoint failures now log their cause: the
-  protocol failure kind, the provider host error, the audit failure category, and the full source
-  chain reach `broker_request_frame_invalid`, `broker_audit_append_failed`,
-  `broker_checkpoint_poisoned`, `broker_connection_failed`, and `broker_outcome_unaudited`. Wire
-  responses are unchanged and stay generic.
-- A refused `capabilitiesFor`/`capabilitiesForChat` now emits `broker_capabilities_refused` naming
-  the refusal class and the canonical subject on the broker side, while the wire answer stays
-  opaque.
-- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
-  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
-  `broker.execute` records `outcome` and the classified `error`.
-
-### Added
-
-- `broker.authorize` now records `policy.errors_present`, and a Cedar evaluation error denies with
-  the distinct reason `policy-error` instead of being indistinguishable from `policy-denied`.
-  `broker.execute` records `outcome` and the classified `error`.
-
-### Fixed
-
 - A transient `accept` failure on the broker's Unix listener — `EMFILE`, `ENFILE`, `ENOBUFS`,
   `ENOMEM`, `ECONNABORTED`, `ECONNRESET`, or `EINTR` — no longer exits the privileged daemon. It is
   logged as `broker_accept_retried` with its errno and retried after a bounded backoff; every other
@@ -139,78 +189,6 @@ All notable changes to Dekopon are documented here. The format is based on
   `write_frame` on every session open — the exact failure the check exists to prevent.
 - A finished connection task is now observed as soon as it completes rather than on the next accept,
   so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
-
-### Added
-
-- A finished connection task is now observed as soon as it completes rather than on the next accept,
-  so `broker_outcome_unaudited` no longer waits for unrelated traffic on a quiet broker.
-- `broker.authorize` no longer stays entered on its worker thread while the authorizing task is
-  suspended. The section awaits the replay ledger and, on every denial, a durable audit append that
-  fsyncs, so whatever the runtime polled next on that thread was exported as a child of another
-  request's authorization while that request's own later events lost it. The span instruments the
-  section instead of being held across the awaits; its fields and values are unchanged.
-
-### Changed
-
-- An exhausted replay ledger or audit log now answers the new stable failure code
-  `capacity-exhausted` and logs `broker_capacity_exhausted`, instead of the retriable
-  `broker-unavailable`. Neither bound evicts, rotates, or clears on restart, so a client was being
-  invited to retry forever. `maxReplayIds` must be sized against `auditMaxRecords`, which is now
-  documented in `docs/broker-http.md` and the chart README.
-- A broker socket cleanup failure at shutdown no longer masks the serve or web UI failure that ended
-  service; it is logged as `broker_socket_cleanup_failed` and returned only when nothing more
-  significant failed.
-- The `--http-bind` web UI now serves at most sixteen concurrent connections, refusing rather than
-  queuing further ones, and drops any connection that exceeds a thirty-second budget from accept to
-  close; both ceilings are configurable through `dekopon_webui::serve_with_limits`.
-- The web UI emits one `debug` tracing event per request with method, path, status, and response
-  bytes, and no query string or body.
-- Web UI provider pages are rendered once at broker startup instead of per request, the dashboard's
-  agent inventory is shared by reference rather than deep-copied per render, and the provider page's
-  "Manifest API" row now shows the manifest's own `apiVersion` value instead of the Rust variant
-  name.
-- The web UI's "Fuel yield interval" row now reports the interval `dekopon-broker-host` actually
-  configures rather than re-deriving it.
-
-- A route that names an image generator on the text-only WhatsApp transport is now a startup
-  failure, rather than paying a model for a PNG that has no delivery path.
-- A WhatsApp answer longer than one 4,096-scalar text message is now split at a line boundary and
-  sent as consecutive messages instead of truncated, matching the Discord transport; a failure after
-  the first chunk reports `partial-delivery` and records no delivered turn.
-- A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
-  name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
-- Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
-  durable recording uses the exact bounded answer once and is never retried automatically.
-- Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
-  totals, using domain-separated keyed commitments and coarse counters instead.
-- Storage now uses retained descriptor-relative tree operations, base→generation lease ordering,
-  exact manifest/entry reservations, bounded finalization, strict recovery/quarantine, and
-  canonical effective-authority generations independent of configuration ordering.
-- Chat recording now uses service-typed scope-bound delivery identities and requires successful
-  Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
-- Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
-  memory and fuel headroom, so every accepted default store can advance and query at its bounds.
-- The Helm chart's `terminationGracePeriodSeconds` now covers both drains in sequence — the
-  gateway's and then the broker's `shutdownGraceMs` plus `drainBudget.bufferSeconds`, 270 s at the
-  shipped defaults — and `helm template` refuses a shorter budget instead of letting the kubelet
-  SIGKILL a draining broker mid-invocation and mid-audit-append.
-- The Helm chart's `appVersion` now names the current application release, so
-  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.4.0` on pods running a
-  later one.
-- Catalog validation now scans the whole file and reports every duplicate, invalid name,
-  unsupported API version, and missing reference in one list, instead of stopping at the first.
-- `agent.spec.providers` is now held to the providers the agent's own capabilities route to, in
-  both directions, so a rendered provider inventory can no longer drift from the capability list.
-- The HTTP grant entry grammar — exact authorities, exact method tokens, and the entry-count cap —
-  now lives once on `HttpConstraints::validate` and is enforced by `AuthorizationGate`,
-  `dekopon-broker`, and `dekopon-http-host` alike. The broker's accepted set is unchanged; the gate
-  and HTTP host no longer accept entries the broker refuses.
-- The capability-shaped command-word refusal now explains the real mechanism: the shell resolves
-  provider command words before capability fallback, so such a word would shadow the capability of
-  that name.
-
-### Fixed
-
 - `--secret-name` is now validated per DNS-1123 label, so names such as `a.-b.c` are refused before
   the credential is printed rather than by `kubectl apply` afterwards.
 - Configuration discovery no longer treats an unexaminable default candidate as absent; anything
@@ -226,9 +204,6 @@ All notable changes to Dekopon are documented here. The format is based on
   summary rather than one per iteration; failures still report individually and the JSON report is
   unchanged.
 - OTLP over HTTP builds one blocking HTTP client per process instead of one per signal.
-
-### Fixed
-
 - OTLP export failures now report themselves. The OpenTelemetry `internal-logs` feature is enabled,
   so a rejected token, a missing `organization` header, or an unreachable receiver reaches the
   runner's stderr and the daemons' stdout instead of being discarded in silence; every binary keeps
@@ -251,9 +226,6 @@ All notable changes to Dekopon are documented here. The format is based on
   cut, instead of reaching the model whole and ending the session with a context-length rejection.
 - A repeated `inspect_agent_config` call is answered with a short pointer at the copy already in
   the conversation rather than a second full serialization retained for the rest of the session.
-
-### Fixed
-
 - `IdSequence::new` now rejects a prefix whose derived invocation identifiers would exceed the
   identifier length bound, instead of constructing a session whose every capability call fails.
 - A broker capability snapshot naming the same capability twice is refused, listing every repeat,
@@ -268,9 +240,6 @@ All notable changes to Dekopon are documented here. The format is based on
   spawned and joined per describe and invoke.
 - A direct provider call that completes at its deadline boundary now returns its output; only a
   failed call is reported as a timeout, and it keeps the Wasmtime error as the timeout's source.
-
-### Fixed
-
 - A broker provider artifact is now read once and its recorded SHA-256 is of the exact buffer
   Cranelift compiled, replacing a before/after comparison that a change-and-revert could pass. The
   unreachable `ArtifactChanged`, `DuplicateProvider`, and `DuplicateCapability` broker-host error
@@ -278,24 +247,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - A provider exporting `resolve-command` with the wrong signature is now reported as a type
   mismatch instead of as an absent export, and the export is proven from the component's own type
   rather than by instantiating it once at startup.
-
-### Fixed
-
 - A provider exporting `resolve-command` with the wrong signature is now reported as a type
   mismatch instead of as an absent export, and the export is proven from the component's own type
   rather than by instantiating it once at startup.
-
-### Removed
-
-- Removed `dekopon-testkit`, which no workspace crate depended on, the `dekopon-capability`
-  dependency of `dekopon`, `thiserror` from `dekopon-provider-sdk`, four unreferenced dependencies
-  of `dekopon-run`, and three of `dekopon-telemetry`.
-- Removed `CapabilityDescriptor` and `ProposedInvocation`'s unused `Deserialize` derive from
-  `dekopon-capability`, `ResourceReader` from `dekopon`, and the single-implementation `Provider`
-  trait from `dekopon-provider-host`, whose methods are now inherent on `WasmProvider`.
-
-### Fixed
-
 - A provider whose manifest cannot be serialized now describes itself with the serialization error
   instead of an empty description a host misdiagnoses.
 - `HttpError` renders the `dekopon:http@1.0.0` kebab-case error names instead of Rust variant
@@ -304,37 +258,6 @@ All notable changes to Dekopon are documented here. The format is based on
   `UnknownProvider` in tolerant startup mode instead of an opaque validation error, and a policy
   that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
   to source text.
-
-### Removed
-
-- A Cedar literal outside the Dekopon identifier grammar now returns `UnknownAction` or
-  `UnknownProvider` in tolerant startup mode instead of an opaque validation error, and a policy
-  that cannot be canonicalized for the policy digest refuses startup instead of silently degrading
-  to source text.
-
-### Security
-
-- Direct `dekopon-run` provider stores now bound table elements, tables, linear memories, and core
-  instances as well as linear-memory size, closing a `table.grow` path that could allocate far past
-  `--max-memory-bytes`.
-- Script traces now open one `shell.script` span per run carrying the whole run's command totals,
-  and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
-  one span per step.
-- A piped value now moves from one pipeline stage to the next and is shared with a function body's
-  statements rather than deep-copied for each of them, and `grep` no longer copies every input line
-  it tests.
-- Command-word and namespace resolution now ask `CapabilityInvoker` membership questions
-  (`has_command_word`, `grants_namespace`) instead of materializing, sorting, and deduplicating both
-  session legs' capability and command-word lists for every command a script runs. Resolution order
-  is unchanged.
-- `jq` reuses one filter worker per thread instead of spawning and joining a thread per call, and
-  values cross that boundary directly rather than through JSON text on each side. A filter output
-  JSON cannot represent — `nan`, `infinite`, a byte string, a non-string object key, or nesting
-  past 128 containers — is still refused, now by name rather than as a parse error, and a float no
-  longer loses its last bit to the round trip.
-
-### Fixed
-
 - An abandoned `jq` filter is now logged with its elapsed time and counted; `jq` refuses to start a
   new filter once too many non-terminating workers are still running in the process, and
   `dekopon_shell::abandoned_filter_workers` reports the live count.
@@ -382,9 +305,6 @@ All notable changes to Dekopon are documented here. The format is based on
   instead of paying a fresh lookup and TLS handshake per request.
 - Destinations resolving to more addresses than the native pin set holds are now deduplicated and
   truncated, with every retained address still validated, instead of failing the whole request.
-
-### Fixed
-
 - Fixed `http.request` spans mis-parenting concurrent trace events: the span is now attached with
   `Instrument` rather than an entered guard held across DNS, connection, and body awaits.
 - Fixed IPv6 literal destinations, which could never match a grant or be resolved because the URL
@@ -400,13 +320,10 @@ All notable changes to Dekopon are documented here. The format is based on
 - `docs/run.md` no longer describes the gateway chat client as stateless: `--subject` plus
   `--conversation` selects a persistent history on a `persistent` route, including one a chat-service
   sender created.
-- `charts/dekopon/README.md` separates "never installed on a cluster" from "not published"; chart
-  `0.1.0` and the container image it pulls are both published.
 - Corrected the `dekopon-model` attachment-rendering example, added `resolveCommand` to the
   `dekopon-broker-protocol` README, fixed the `dekopon-provider-sdk` WIT-package description and
   documented `export_provider_with_commands!`, dropped the stale `0.1.x` and `0.1.0` version pins
   from `docs/cli.md` and `dekopon-capability`, and gave `Broker::capabilities` its own rustdoc.
-
 - A chat-service reply that is not valid JSON is now reported as `malformed-response` carrying the
   parse position, distinct from the well-formed-but-missing-field `response` class it previously
   shared, so an interposed proxy's HTML error page and a renamed API field no longer look alike.
@@ -421,9 +338,6 @@ All notable changes to Dekopon are documented here. The format is based on
   into one shared "invalid limits" message.
 - Native HTTP malformed-URI failures now carry the parser's reason, and a failed DNS lookup is
   traced inside the `http.request` span rather than being reduced to `outcome=failed`.
-
-### Fixed
-
 - `runner.command` no longer holds a `tracing` span guard across suspension points, so a concurrent
   task's events could parent under the wrong span and the holder's own events lost their parent on
   resume. The span instruments the section instead, matching `http.request` and `broker.authorize`.
@@ -432,6 +346,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Security
 
+- Swept abandoned `chatgpt-auth.tmp-*` staging files, which hold access and refresh tokens in the
+  clear, on every credential save and on `dekopon auth chatgpt logout`, and `fsync`ed the credential
+  directory after the rename so a rotated credential cannot be lost to a power failure.
+- Direct `dekopon-run` provider stores now bound table elements, tables, linear memories, and core
+  instances as well as linear-memory size, closing a `table.grow` path that could allocate far past
+  `--max-memory-bytes`.
+- Script traces now open one `shell.script` span per run carrying the whole run's command totals,
+  and emit only the first 256 `shell.command` spans at `INFO` so a loop-heavy script cannot export
+  one span per step.
+- A piped value now moves from one pipeline stage to the next and is shared with a function body's
+  statements rather than deep-copied for each of them, and `grep` no longer copies every input line
+  it tests.
+- Command-word and namespace resolution now ask `CapabilityInvoker` membership questions
+  (`has_command_word`, `grants_namespace`) instead of materializing, sorting, and deduplicating both
+  session legs' capability and command-word lists for every command a script runs. Resolution order
+  is unchanged.
+- `jq` reuses one filter worker per thread instead of spawning and joining a thread per call, and
+  values cross that boundary directly rather than through JSON text on each side. A filter output
+  JSON cannot represent — `nan`, `infinite`, a byte string, a non-string object key, or nesting
+  past 128 containers — is still refused, now by name rather than as a parse error, and a float no
+  longer loses its last bit to the round trip.
 - WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender
   come only from the signed envelope, transport secrets remain gateway-only, and outcome-unknown
   Graph sends are never blindly retried.
@@ -451,9 +386,6 @@ All notable changes to Dekopon are documented here. The format is based on
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
-- Retained Helm chart claims now also carry `argocd.argoproj.io/sync-options:
-  Prune=false,Delete=false`, so a GitOps prune cannot delete the audit chain, its checkpoint, the
-  live ChatGPT credential, or durable provider data that only a Helm-uninstall annotation protected.
 - Every web UI response now carries the closed no-store/nosniff/no-referrer/CSP header set,
   including the 405 axum produces for a mutating method, which previously left the router unprotected.
 - Bound Slack continuation ownership to an exact transport-authenticated workspace/channel/thread/
@@ -461,6 +393,31 @@ All notable changes to Dekopon are documented here. The format is based on
   cleared on restart. A decline selected alongside work runs nothing, and capability work requires
   a visible reply—or a fixed audit-before-retry warning when the turn budget is exhausted—rather
   than permitting the model to hide an effect.
+
+## [dekopon-chart-0.2.0] - 2026-08-22
+
+### Added
+
+- Added an opt-in chart-managed ClusterIP Service and readiness-gated gateway port for an
+  operator-owned exact-path webhook ingress.
+
+### Changed
+
+- The Helm chart's `terminationGracePeriodSeconds` now covers both drains in sequence — the
+  gateway's and then the broker's `shutdownGraceMs` plus `drainBudget.bufferSeconds`, 270 s at the
+  shipped defaults — and `helm template` refuses a shorter budget instead of letting the kubelet
+  SIGKILL a draining broker mid-invocation and mid-audit-append.
+
+### Fixed
+
+- The Helm chart's `appVersion` now names the current application release, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.4.0` on pods running a
+  later one.
+- `charts/dekopon/README.md` separates "never installed on a cluster" from "not published"; chart
+  `0.1.0` and the container image it pulls are both published.
+- Retained Helm chart claims now also carry `argocd.argoproj.io/sync-options:
+  Prune=false,Delete=false`, so a GitOps prune cannot delete the audit chain, its checkpoint, the
+  live ChatGPT credential, or durable provider data that only a Helm-uninstall annotation protected.
 
 ## [0.9.0] - 2026-08-20
 

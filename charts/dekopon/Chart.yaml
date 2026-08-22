@@ -10,7 +10,7 @@ type: application
 # Chart version. Independent of the application: this moves when the chart changes, and it is
 # published by a `dekopon-chart-<version>` tag. chart-publish.yml refuses to publish unless the tag
 # and this field agree, so the tree never disagrees with the registry about which version it is.
-version: 0.1.0
+version: 0.2.0
 
 # The application release this chart deploys. It is also what app.kubernetes.io/version reports on
 # every rendered object, so it has to track the image or the cluster answers `kubectl get pods -l
@@ -18,7 +18,7 @@ version: 0.1.0
 # the release-prep commit; see README.md ("Two version numbers"). v0.3.0 and earlier predate the
 # container-image workflow and have no image. The image tag is the Git tag, so the rendered
 # reference is v<appVersion>, not <appVersion>.
-appVersion: "0.9.0"
+appVersion: "0.10.0"
 
 # The broker is a sidecar container (an initContainer with restartPolicy: Always) so it is
 # started and probed before dekopond runs, and torn down after it. Native sidecars are beta and
