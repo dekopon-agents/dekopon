@@ -9,6 +9,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_model::image::GeneratedImage;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
@@ -17,13 +18,21 @@ use crate::{
     config::ActivityMode,
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, ReplyTarget, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, floor_boundary,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
     },
 };
 
 /// Ceiling on one attachment's file name.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
+/// Telegram's `sendMessage` text ceiling, which the Bot API counts in UTF-16 code units.
+///
+/// Below the gateway's own 8 KiB outbound bound, so a normal long answer is two or three posts
+/// rather than a rejected one. Splitting is shared with Discord's 2,000-unit ceiling through
+/// [`crate::transport::split_message`], newline preference and all.
+const MAX_MESSAGE_CHARS: usize = 4_096;
+/// Telegram's `sendPhoto` caption ceiling.
+const MAX_PHOTO_CAPTION_CHARS: usize = 1_024;
 
 /// Server-side wait per poll, in seconds. Telegram's own ceiling is fifty.
 const POLL_SECONDS: u64 = 50;
@@ -178,6 +187,7 @@ impl TelegramTransport {
             conversation,
             // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
+            thread_continuation: None,
             reply: ReplyTarget::Telegram {
                 chat_id,
                 reply_to,
@@ -459,7 +469,7 @@ impl ChatReplier for TelegramReplier {
     fn reply(
         &self,
         target: ReplyTarget,
-        text: String,
+        reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Telegram {
@@ -470,46 +480,174 @@ impl ChatReplier for TelegramReplier {
             else {
                 return Err(TransportError::Response);
             };
-            let mut body = json!({ "chat_id": chat_id, "text": text });
-            if let Some(reply_to) = reply_to {
-                body["reply_to_message_id"] = json!(reply_to);
+            let OutboundReply { text, image } = reply;
+            if let Some(image) = image {
+                let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
+                let image_receipt = self
+                    .send_photo(
+                        chat_id,
+                        reply_to,
+                        message_thread_id,
+                        caption_fits.then_some(text.as_str()),
+                        image,
+                    )
+                    .await?;
+                if caption_fits {
+                    return Ok(image_receipt);
+                }
+                return self
+                    .send_text_chunks(chat_id, reply_to, message_thread_id, &text, true)
+                    .await;
             }
-            if let Some(message_thread_id) = message_thread_id {
-                body["message_thread_id"] = json!(message_thread_id);
-            }
-            let response = self
-                .http
-                .post(format!(
-                    "{}/bot{}/sendMessage",
-                    self.endpoint,
-                    self.token.expose()
-                ))
-                .header("content-type", "application/json")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
+            self.send_text_chunks(chat_id, reply_to, message_thread_id, &text, false)
                 .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let response = decode(response).await?;
-            let result = response["result"]
-                .as_object()
-                .ok_or(TransportError::Response)?;
-            let message_id = result
-                .get("message_id")
-                .and_then(Value::as_i64)
-                .filter(|id| *id > 0)
-                .ok_or(TransportError::Response)?;
-            let response_chat = result
-                .get("chat")
-                .and_then(Value::as_object)
-                .and_then(|chat| chat.get("id"))
-                .and_then(Value::as_i64)
-                .ok_or(TransportError::Response)?;
-            let response_thread = result.get("message_thread_id").and_then(Value::as_i64);
-            if response_chat != chat_id || response_thread != message_thread_id {
-                return Err(TransportError::Response);
-            }
-            Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
         })
+    }
+}
+
+impl TelegramReplier {
+    async fn send_text_chunks(
+        &self,
+        chat_id: i64,
+        reply_to: Option<i64>,
+        message_thread_id: Option<i64>,
+        text: &str,
+        prior_accepted: bool,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let mut accepted = prior_accepted;
+        let mut last_receipt = None;
+        for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS)
+            .into_iter()
+            .enumerate()
+        {
+            let first_text_reply = (!prior_accepted && index == 0)
+                .then_some(reply_to)
+                .flatten();
+            match self
+                .send_text(chat_id, first_text_reply, message_thread_id, chunk)
+                .await
+            {
+                Ok(receipt) => {
+                    accepted = true;
+                    last_receipt = Some(receipt);
+                }
+                Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                Err(error) => return Err(error),
+            }
+        }
+        last_receipt.ok_or(TransportError::Response)
+    }
+
+    async fn send_text(
+        &self,
+        chat_id: i64,
+        reply_to: Option<i64>,
+        message_thread_id: Option<i64>,
+        text: String,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let mut body = json!({ "chat_id": chat_id, "text": text });
+        if let Some(reply_to) = reply_to {
+            body["reply_to_message_id"] = json!(reply_to);
+        }
+        if let Some(message_thread_id) = message_thread_id {
+            body["message_thread_id"] = json!(message_thread_id);
+        }
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/sendMessage",
+                self.endpoint,
+                self.token.expose()
+            ))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let response = decode(response).await?;
+        let result = response["result"]
+            .as_object()
+            .ok_or(TransportError::Response)?;
+        let message_id = result
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+            .ok_or(TransportError::Response)?;
+        let response_chat = result
+            .get("chat")
+            .and_then(Value::as_object)
+            .and_then(|chat| chat.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or(TransportError::Response)?;
+        let response_thread = result.get("message_thread_id").and_then(Value::as_i64);
+        if response_chat != chat_id || response_thread != message_thread_id {
+            return Err(TransportError::Response);
+        }
+        Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
+    }
+
+    async fn send_photo(
+        &self,
+        chat_id: i64,
+        reply_to: Option<i64>,
+        message_thread_id: Option<i64>,
+        caption: Option<&str>,
+        image: GeneratedImage,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let part = reqwest::multipart::Part::bytes(image.into_bytes())
+            .file_name("generated-image.png")
+            .mime_str("image/png")
+            .map_err(|_| TransportError::Response)?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("photo", part);
+        if let Some(caption) = caption {
+            form = form.text("caption", caption.to_owned());
+        }
+        if let Some(reply_to) = reply_to {
+            form = form.text(
+                "reply_parameters",
+                json!({"message_id": reply_to}).to_string(),
+            );
+        }
+        if let Some(message_thread_id) = message_thread_id {
+            form = form.text("message_thread_id", message_thread_id.to_string());
+        }
+        let response = self
+            .http
+            .post(format!(
+                "{}/bot{}/sendPhoto",
+                self.endpoint,
+                self.token.expose()
+            ))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let response = decode(response).await?;
+        let result = response["result"]
+            .as_object()
+            .ok_or(TransportError::Response)?;
+        let message_id = result
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+            .ok_or(TransportError::Response)?;
+        let response_chat = result
+            .get("chat")
+            .and_then(Value::as_object)
+            .and_then(|chat| chat.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or(TransportError::Response)?;
+        let response_thread = result.get("message_thread_id").and_then(Value::as_i64);
+        let accepted_photo = result
+            .get("photo")
+            .and_then(Value::as_array)
+            .is_some_and(|photo| !photo.is_empty());
+        if response_chat != chat_id || response_thread != message_thread_id || !accepted_photo {
+            return Err(TransportError::Response);
+        }
+        Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
     }
 }
 

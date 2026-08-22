@@ -174,6 +174,26 @@ pub struct BrokerHostOptions {
     /// `None` leaves the aggregate unbounded, which is only safe when the connection ceiling
     /// multiplied by the per-store ceiling still fits the container.
     pub max_total_memory_bytes: Option<usize>,
+/// Upper bound on the fuel a store may burn between async yields.
+///
+/// A store holding billions of units of fuel must still hand the executor back often enough for the
+/// wall-clock deadline to fire, so the interval is capped independently of the fuel ceiling. Kept
+/// private so the policy has exactly one definition: [`BrokerHostLimits::fuel_yield_interval`].
+const MAX_FUEL_YIELD_INTERVAL: u64 = 10_000;
+
+impl BrokerHostLimits {
+    /// Returns the fuel interval every store built from these limits actually yields on.
+    ///
+    /// An operational view that re-derived this from [`fuel`](Self::fuel) would keep displaying the
+    /// old formula after the policy changed, with no compile error and no failing test.
+    #[must_use]
+    pub const fn fuel_yield_interval(&self) -> u64 {
+        if self.fuel < MAX_FUEL_YIELD_INTERVAL {
+            self.fuel
+        } else {
+            MAX_FUEL_YIELD_INTERVAL
+        }
+    }
 }
 
 /// Failed broker-provider invocation and the evidence for calls that already executed.
@@ -365,7 +385,7 @@ impl Runtime {
             .set_fuel(self.limits.fuel)
             .map_err(|source| BrokerHostError::Store { source })?;
         store
-            .fuel_async_yield_interval(Some(self.limits.fuel.min(10_000)))
+            .fuel_async_yield_interval(Some(self.limits.fuel_yield_interval()))
             .map_err(|source| BrokerHostError::Store { source })?;
         Ok(store)
     }
@@ -1180,6 +1200,25 @@ impl BrokerProviderRegistry {
             .runtime
             .metrics
             .clone()
+    }
+
+    /// Returns one routed capability and the provider declaring it, by identifier.
+    ///
+    /// Routes are already keyed by capability, so a caller filtering constraint sets does not have
+    /// to scan every route per set.
+    #[must_use]
+    pub fn capability(
+        &self,
+        capability: &CapabilityId,
+    ) -> Option<(&ProviderId, &ProviderCapability)> {
+        let provider = &self.providers[*self.routes.get(capability)?];
+        let capability = provider
+            .manifest
+            .capabilities
+            .iter()
+            .find(|candidate| &candidate.id == capability)
+            .expect("routes originate from validated provider manifests");
+        Some((&provider.manifest.id, capability))
     }
 
     /// Returns capabilities in deterministic identifier order.
