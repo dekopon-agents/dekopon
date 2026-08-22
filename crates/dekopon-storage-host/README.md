@@ -41,7 +41,8 @@ large targets/stages through a fixed-size streaming buffer rather than retaining
 | every other read/write combination | valid, within handle and quota limits |
 
 Reads are positional and return available bytes, including an empty short read at or beyond EOF. A
-SQLite adapter must zero-fill its own short-read buffer. Positional writes are exact-or-error and
+SQLite adapter must zero-fill its own short-read buffer; this is load-bearing rather than
+hypothetical, because turso treats any short read as a hard error and does not zero-fill itself. Positional writes are exact-or-error and
 charge both supplied bytes and any sparse logical growth. Remove, replacement, or rename of an open
 source or target is `busy`. `delete-on-close` marks the file for unlink and applies it only after the
 last invocation handle closes.
@@ -64,8 +65,18 @@ readers drain. Exclusive requires every other handle on that file to be at `none
 and deadlocking a single-threaded guest. `check-reserved-lock` observes reserved, pending, or
 exclusive on any live handle.
 
-These are rollback-journal primitives. There is no SHM operation, no WAL claim, and no
-multiprocess-database claim.
+These are rollback-journal primitives, and no I/O path consults them: read, write, size, truncate,
+and sync never inspect handle lock state, so a guest may read and write at `none`. The table
+constrains the shape of a lock sequence, not access.
+
+The ladder is currently unused. Turso is WAL-only, its own lock surface is two-state, and
+`turso_core` never calls `lock_file` at all, so an adapter that never locks is equally correct — do
+not read a coarser guest lock surface as a compatibility failure.
+
+There is no SHM operation and no multiprocess-database claim. There is no WAL *implementation*
+either, but a single-instance WAL engine needs neither: its log is an ordinary durable file and its
+index lives in guest memory. The host commits the database and its log together in one invocation
+transaction, so there is no torn-WAL divergence to recover from.
 
 ### Durability
 

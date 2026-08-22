@@ -52,6 +52,14 @@ All notable changes to Dekopon are documented here. The format is based on
   the 0.5.0 broker-protocol lockstep, later operator-visible changes, and the restart order.
 - Added `docs/operations.md`, an operator index into the per-crate operational contracts, so audit
   checkpoint recovery is reachable from `docs/` instead of only from a crate README.
+- SQL is now available to providers, out of this tree. `turso-sql` is a SQLite-compatible engine
+  (`turso_core`, pure Rust) compiled to `wasm32-unknown-unknown`, importing
+  `dekopon:storage/durable-files@0.1.0` and nothing else — no WASI, no JS interop, no C in the
+  artifact. It lives at
+  [dekopon-agents/dekopon-provider-turso-sql](https://github.com/dekopon-agents/dekopon-provider-turso-sql)
+  with its own tags and release cadence, because its component is 11 MB and its dependency graph is
+  an order of magnitude heavier than any example in this repository. Nothing here depends on it and
+  no shipped memory path uses it; an operator who wants it fetches the release asset.
 
 ### Changed
 
@@ -74,6 +82,14 @@ All notable changes to Dekopon are documented here. The format is based on
   the first chunk reports `partial-delivery` and records no delivered turn.
 - A transport endpoint override must now be a literal loopback address (`127.0.0.1`, `::1`); the
   name `localhost` is no longer accepted, because what it resolves to is the resolver's decision.
+- Corrected the durable-files documentation: the five-level lock ladder constrains the shape of a
+  lock sequence and is consulted by no I/O path, so a guest may read and write at `none` and an
+  adapter that never locks is equally correct. The SHM and multiprocess-database disclaimers stand;
+  the "no WAL claim" wording did not, since a single-instance WAL engine needs neither and runs on
+  these primitives unchanged.
+- Rescoped the 2026-08-20 Turso gate result in the roadmap, security model, and experiment log. It
+  tested the crates.io `turso` wrapper, whose SDK-kit dependencies are not reachable from the
+  engine; it was not a finding about `turso_core`.
 - Chat replies now produce opaque receipts only after complete service/kernel transport acceptance;
   durable recording uses the exact bounded answer once and is never retried automatically.
 - Storage-backed audit and telemetry omit raw identity/scope/provider fields and exact payload byte
