@@ -7,6 +7,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added `dekopon-provider-sdk-testkit`, an in-process fake broker that loads a provider component
+  and runs it against a real `StorageHost` over a temporary root, so storage-backed providers can
+  be tested end to end. It skips Cedar and the constraint catalog by minting authorization through
+  `AuthorizationGate`, and defaults its per-invocation ceilings from the host limits in force
+  rather than restating them. Storage grants are minted per invocation from constant scope
+  material, so successive calls reach one durable namespace.
+
 ### Fixed
 
 - Held the `test (Rust 1.89.0)` job to the MSRV it names. `rust-toolchain.toml` pins `channel =

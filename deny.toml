@@ -24,6 +24,12 @@ exceptions = []
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# Narrowly: a *path* dependency may carry `version = "*"`. It cannot reach crates.io that way —
+# cargo requires a real version on any published dependency — so this admits no unpinned registry
+# crate. It exists for `dekopon-broker-host`'s path-only dev-dependency on
+# `dekopon-provider-sdk-testkit`, which depends back on it; omitting the version is what makes
+# `cargo package` strip the edge so the cycle never leaves the workspace.
+allow-wildcard-paths = true
 highlight = "all"
 deny = []
 skip = [
