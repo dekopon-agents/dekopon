@@ -181,6 +181,13 @@ All notable changes to Dekopon are documented here. The format is based on
   Slack/Telegram HTTP status; legacy subject-only attestors retain ordinary non-memory chat access.
 - Memory composition now validates complete compaction/read/write/host-call/file/input/result/Wasm
   memory and fuel headroom, so every accepted default store can advance and query at its bounds.
+- The Helm chart's `terminationGracePeriodSeconds` now covers both drains in sequence — the
+  gateway's and then the broker's `shutdownGraceMs` plus `drainBudget.bufferSeconds`, 270 s at the
+  shipped defaults — and `helm template` refuses a shorter budget instead of letting the kubelet
+  SIGKILL a draining broker mid-invocation and mid-audit-append.
+- The Helm chart's `appVersion` now names the current application release, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.4.0` on pods running a
+  later one.
 - Catalog validation now scans the whole file and reports every duplicate, invalid name,
   unsupported API version, and missing reference in one list, instead of stopping at the first.
 - `agent.spec.providers` is now held to the providers the agent's own capabilities route to, in
@@ -387,6 +394,9 @@ All notable changes to Dekopon are documented here. The format is based on
   execute hidden memory recording. Storage imports receive only an exact interface/access grant.
 - Documented finite JSONL dedup capacity, no automatic replay/deletion/export, no encryption-at-rest
   claim, native-I/O timeout and same-UID filesystem limitations, and no database/WAL/SHM claim.
+- Retained Helm chart claims now also carry `argocd.argoproj.io/sync-options:
+  Prune=false,Delete=false`, so a GitOps prune cannot delete the audit chain, its checkpoint, the
+  live ChatGPT credential, or durable provider data that only a Helm-uninstall annotation protected.
 - Every web UI response now carries the closed no-store/nosniff/no-referrer/CSP header set,
   including the 405 axum produces for a mutating method, which previously left the router unprotected.
 - Bound Slack continuation ownership to an exact transport-authenticated workspace/channel/thread/

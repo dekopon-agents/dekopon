@@ -164,7 +164,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.1.0` retains `appVersion: 0.4.0`; deployments select a newer compatible application release such as `v0.9.0` through the chart's `image.tag` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Published chart `0.1.0` retains `appVersion: 0.4.0` and is immutable; the working tree now declares `appVersion: 0.9.0`, so the next `dekopon-chart-*` release deploys `v0.9.0` by default. Until then, or to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
 
 ## Run the flagship example
 
