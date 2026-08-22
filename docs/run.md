@@ -17,7 +17,8 @@ dekopon auth chatgpt <login | status | logout | export>
 
 **`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
 
-Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
+Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
+Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
 The checked-in Rust echo provider is immediately runnable:
 
@@ -111,7 +112,7 @@ dekopon-run broker invoke \
   jsonplaceholder.posts.get --input '{"postId":7}'
 ```
 
-The caller must generate and retain unique invocation IDs; reuse is durably denied. The client never retries automatically: after a lost response to an external write, treat the outcome as unknown and consult broker audit rather than issuing a new ID blindly. A broker failure response distinguishes the two cases explicitly — `broker-unavailable` means no provider work began, while `outcome-unaudited` means the effect may already have happened and was not recorded, so it must not be resubmitted under any identifier. See the failure-code table in `broker-http.md`. `--max-frame-bytes` and `--io-timeout-ms` constrain client allocation and each connect/frame operation. Broker results are `InvocationResult` JSON with policy decision linkage and evidence. Provider output is intentionally printed to the invoking client but remains absent from broker audit fields. Direct Wasm limits do not appear in broker subcommands because only broker policy and host ceilings constrain provider execution.
+The caller must generate and retain unique invocation IDs; reuse is durably denied. The client never retries automatically: after a lost response to an external write, treat the outcome as unknown and consult broker audit rather than issuing a new ID blindly. A broker failure response distinguishes the two cases explicitly — `broker-unavailable` means no provider work began, while `outcome-unaudited` means the effect may already have happened and was not recorded, so it must not be resubmitted under any identifier. A client-side framing failure preserves the same distinction: `ClientError` records whether the request or the response half failed, and a response-phase failure reaches a prompt script as `denied` (exit `126`) so a model cannot read it as a retryable error. See the failure-code table in `broker-http.md`. `--max-frame-bytes` and `--io-timeout-ms` constrain client allocation and each connect/frame operation. Broker results are `InvocationResult` JSON with policy decision linkage and evidence. Provider output is intentionally printed to the invoking client but remains absent from broker audit fields. Direct Wasm limits do not appear in broker subcommands because only broker policy and host ceilings constrain provider execution.
 
 ## Gateway chat client
 
@@ -145,7 +146,17 @@ memory surface may run `memory recent --last N` or `memory search --query TEXT` 
 turns across restarts. Durable text is never replayed automatically, and `memory.chat.record` is
 absent from shell listing, description, command resolution, and generic invocation.
 
-Today the identifier's only visible effect is on the gateway's admission check, which keys an in-flight set on `(transport, channel, thread)`. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
+**This is not a stateless dev socket.** The local transport sends `--conversation` as the message's
+`channel`, which the gateway takes verbatim as the conversation identity, and history is keyed on
+`(transport, conversation identity, the sender's canonical subject)`. So on a `persistent` route the
+pair `--subject` and `--conversation` names an existing history rather than opening a fresh one, and
+because the local transport trusts its caller to declare a subject, naming one a Slack sender
+created replays that person's compacted exchange into this prompt. No authority moves — the broker
+decides every invocation for itself — but text does. That is a second reason the socket is `0600`
+and a development tool. See [`dekopond.md`](dekopond.md#conversations) for the window's bounds,
+compaction, and grant-change invalidation.
+
+The identifier's other effect is on the gateway's admission check, which keys a separate in-flight set on `(transport, channel, thread)` with no subject in it. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
 
 Nothing about this command widens what a caller can reach. The local transport trusts its caller to declare a subject — that is what makes it a development transport rather than a production one — and it grants nothing by doing so, because the declared subject is only a claim the broker must still map. The broker needs an attestor grant covering that namespace plus an owner-controlled mapping before the claim resolves to a principal, so a session reaches exactly the authority the owner already configured for the subject it names. The socket's `0600` mode keeps it reachable only by the owner's UID. See [`dekopond.md`](dekopond.md#local-development-transport) for the transport's side of that position.
 
@@ -182,7 +193,8 @@ By default a prompt session is direct-only and contacts no broker, so a local de
 
 This is what makes an HTTP-capable capability reachable at all. Direct mode's linker is import-free by construction, so a component there cannot perform I/O; `curl` and any fetching capability therefore resolve over the broker leg or not at all. Dispatch checks the direct registry first — a capability that can run locally always does, without an authorization decision or an audit record — and falls through to the broker only for what direct mode cannot serve. The broker remains the sole authority: `dekopon-run` submits an identity-free proposal per call and reports back whatever the broker decided, so a policy refusal surfaces to the script as exit code `126` (denied) rather than a generic failure, and a capability outside the session as `127`. Each call carries a freshly generated invocation ID extending one per-session trace ID, because the broker treats an invocation ID as a durable replay-rejection key.
 
-Passing `--socket` or `--server-uid` without `--broker` is a usage error rather than a silent no-op:
+Passing any broker connection flag — `--socket`, `--server-uid`, `--max-frame-bytes`, or
+`--io-timeout-ms` — without `--broker` is a usage error rather than a silent no-op:
 
 ```console
 cargo run -p dekopon-run -- prompt \
@@ -260,6 +272,14 @@ Direct-operation bounds are configurable on `inspect`, `invoke`, and `prompt` wi
 - `--max-output-bytes`
 - `--fuel`
 - `--timeout-ms`
+
+`--max-memory-bytes` bounds each linear memory rather than the whole store, so the host also applies
+fixed ceilings on table elements, tables, linear memories, and core instances per store. Those have
+no flag: they close the `table.grow` path, where one cheap instruction under fuel accounting could
+otherwise make the host allocate far past the memory bound. `--max-output-bytes` likewise bounds
+what the host will parse, not peak allocation — the buffered-string contract lifts the whole guest
+string into host memory before it can be measured, and the store's memory limits are what bound
+that.
 
 The host supplies no WASI, filesystem, network, environment, clock, random, credential, JSONL, or
 durable-file imports. It accepts only capabilities declaring `read-only`. Consequently this path

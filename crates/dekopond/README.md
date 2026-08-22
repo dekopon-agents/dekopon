@@ -9,14 +9,16 @@ waits for a wakeup, routes each authenticated message to a named agent from the 
 runs one bounded model session with the sandboxed shell plus safe on-demand meta tools,
 and replies with the answer.
 
-- **Transports** — Slack Socket Mode and Discord Gateway (outbound WebSockets, so no public HTTP
-  endpoint), Telegram long polling, and an owner-only Unix development socket.
+- **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
+  polling, a raw-body-HMAC-authenticated text-only WhatsApp Cloud API webhook with pinned Graph
+  replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
+  it expects operator-owned TLS termination and exact-path routing.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
-  its own traffic. Unmatched traffic is ignored, and a channel additionally requires the bot
-  to be @-mentioned — a route decides which agent answers, the mention decides whether
-  anything answers at all, and neither widens a grant.
+  its own traffic. Unmatched traffic is ignored, and a channel initially requires the bot to be
+  @-mentioned. In Slack Agent mode, fresh authorization claims that exact sender/thread so later
+  unmentioned follow-ups can continue; every other ambient channel message remains ignored.
 - **Chat assets** — Slack, Discord, and Telegram photos/files become numbered, bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
@@ -29,7 +31,8 @@ and replies with the answer.
   failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
   bounded model turns, bounded capability calls, cooperative Stop checks, and one fixed line on
-  failure.
+  failure. An unaddressed owned-thread follow-up also offers `decline_chat_reply`, which ends a
+  no-work session without sending anything to chat instead of making the agent take the last word.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
 - **Conversations** — one independent session per message unless a route sets
@@ -39,7 +42,8 @@ and replies with the answer.
 - **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
   standing prompt, route limits, and fresh subject-specific effective Cedar grants. The fixed
   shape omits raw policy, identity, endpoints, paths, and all credential names and values. Calls
-  are repeatable under the prompt loop's shared bounds, with no inspection-specific counter.
+  are repeatable under the prompt loop's shared bounds, with no inspection-specific counter; a
+  repeat points at the copy already in the conversation instead of appending a second one.
 - **Informational status** — after the broker probe, the gateway best-effort reports a bounded
   content-free catalog inventory; each session separately coalesces provider-reported model usage.
   These feed only the broker-hosted web UI, reset with the broker process, and never affect a

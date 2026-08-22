@@ -1,6 +1,6 @@
 # JSONPlaceholder provider
 
-A narrow Rust demonstration provider that composes `dekopon:provider@0.1.0` with the broker-owned `dekopon:http/client@1.0.0` import.
+A narrow Rust demonstration provider that composes `dekopon:provider@0.2.0` with the broker-owned `dekopon:http/client@1.0.0` import.
 
 It deliberately separates authority:
 

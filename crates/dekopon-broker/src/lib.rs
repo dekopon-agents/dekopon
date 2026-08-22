@@ -32,6 +32,7 @@ use std::{
     fmt,
     future::Future,
     io::{self, SeekFrom},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -66,6 +67,7 @@ use dekopon_storage_host::{
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -961,7 +963,10 @@ impl AttestorGrant {
 /// resolve to nothing and fail closed; principals are never minted on demand.
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
-    mappings: BTreeMap<String, PrincipalId>,
+    // Keyed by the subject itself rather than its rendered canonical form: the canonical string is
+    // injective over the segments, so the two keys are equivalent, and a lookup on the attested
+    // path no longer allocates one just to throw it away.
+    mappings: BTreeMap<ExternalSubject, PrincipalId>,
 }
 
 impl IdentityDirectory {
@@ -977,10 +982,12 @@ impl IdentityDirectory {
     ) -> Result<Self, BrokerBuildError> {
         let mut mappings = BTreeMap::new();
         for (subject, principal) in entries {
-            let canonical = subject.canonical();
-            if mappings.insert(canonical.clone(), principal).is_some() {
-                return Err(BrokerBuildError::DuplicateSubjectMapping { subject: canonical });
+            if mappings.contains_key(&subject) {
+                return Err(BrokerBuildError::DuplicateSubjectMapping {
+                    subject: subject.canonical(),
+                });
             }
+            mappings.insert(subject, principal);
         }
         Ok(Self { mappings })
     }
@@ -988,7 +995,7 @@ impl IdentityDirectory {
     /// Resolves one canonical subject to its stable principal.
     #[must_use]
     pub fn resolve(&self, subject: &ExternalSubject) -> Option<&PrincipalId> {
-        self.mappings.get(&subject.canonical())
+        self.mappings.get(subject)
     }
 
     /// Iterates the mapped principals, for construction-time policy validation.
@@ -1004,6 +1011,13 @@ pub struct BrokerLimits {
     /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,
     /// Maximum invocation IDs retained for this process lifetime.
+    ///
+    /// Size this against `auditMaxRecords` rather than below it. The ledger never evicts, and
+    /// restart restores one entry per durable Decision event, so the bound is cumulative across
+    /// restarts rather than per process. A denial costs one audit record and one ledger slot,
+    /// which means a denial-heavy history exhausts a ledger sized at half the audit budget first
+    /// — before the designed [`AuditError::Full`] refusal ever fires. Reaching this bound is
+    /// `capacity-exhausted`: permanent, and an operator's problem rather than a client's.
     pub max_replay_ids: usize,
 }
 
@@ -1154,18 +1168,35 @@ fn is_memory_capability(capability: &CapabilityId) -> bool {
     )
 }
 
+/// The model-facing note announcing durable chat memory.
+///
+/// Shared by the live surface and the startup frame ceiling so the check measures the exact bytes
+/// a session would receive.
+fn memory_prompt_note(max_lookback_turns: u32) -> String {
+    format!(
+        "Durable chat memory is available on demand. Use `memory recent --last N` or `memory \
+         search --query TEXT`. Searches inspect at most {max_lookback_turns} prior turns. Do not \
+         claim recall without retrieving it."
+    )
+}
+
 fn is_reserved_memory_route(capability: &CapabilityId, set: Option<&ConstraintSet>) -> bool {
     capability.as_str().starts_with("memory.chat.")
         || set.is_some_and(|set| set.provider.as_str() == MEMORY_PROVIDER)
 }
 
 fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-    let subject_matches = matches!(
-        (scope.kind, subject.service()),
+    let subject_matches = match (scope.kind, subject.service()) {
         (ChatTransportKind::Slack, SubjectService::Slack)
-            | (ChatTransportKind::Discord, SubjectService::Discord)
-            | (ChatTransportKind::Telegram, SubjectService::Telegram)
-    ) || scope.kind == ChatTransportKind::Local;
+        | (ChatTransportKind::Discord, SubjectService::Discord)
+        | (ChatTransportKind::Telegram, SubjectService::Telegram) => true,
+        (ChatTransportKind::Whatsapp, SubjectService::Whatsapp) => scope
+            .channel
+            .rsplit_once(':')
+            .is_some_and(|(_, sender)| sender == subject.subject()),
+        (ChatTransportKind::Local, _) => true,
+        _ => false,
+    };
     subject_matches && canonical_chat_scope_shape(scope)
 }
 
@@ -1197,6 +1228,14 @@ fn canonical_chat_scope_shape(scope: &ChatScopeClaim) -> bool {
                         .conversation
                         .strip_prefix(&format!("{}:topic:", scope.channel))
                         .is_some_and(canonical_positive_service_decimal))
+        }
+        ChatTransportKind::Whatsapp => {
+            let mut parts = scope.channel.split(':');
+            let canonical = parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_some_and(canonical_meta_decimal)
+                && parts.next().is_none();
+            canonical && scope.conversation == scope.channel
         }
         ChatTransportKind::Local => {
             lowercase_scope_value(&scope.channel) && lowercase_scope_value(&scope.conversation)
@@ -1234,6 +1273,13 @@ fn canonical_unsigned_decimal(value: &str) -> bool {
     value
         .parse::<u64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+fn canonical_meta_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn canonical_positive_service_decimal(value: &str) -> bool {
@@ -1607,8 +1653,12 @@ struct FileAuditState {
     file: File,
     count: usize,
     head: Option<String>,
-    record_hashes: Vec<String>,
-    replay_ids: BTreeSet<InvocationId>,
+    /// The hash before `head`: the whole reconcile window, since an audit log can be at most one
+    /// append ahead of its checkpoint. Retaining every verified hash instead would hold roughly
+    /// 20 MB at the production record cap for the process lifetime, for a startup-only check.
+    previous_head: Option<String>,
+    /// Decision identifiers restored at startup, until the broker's replay ledger takes them.
+    replay_ids: Option<BTreeSet<InvocationId>>,
     poisoned: bool,
 }
 
@@ -1654,7 +1704,7 @@ impl FileAuditLog {
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);
-        let (count, head, record_hashes, replay_ids) =
+        let (count, head, previous_head, replay_ids) =
             scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
         let mut file = reader.into_inner();
         file.seek(SeekFrom::End(0))
@@ -1668,8 +1718,8 @@ impl FileAuditLog {
                 file,
                 count,
                 head,
-                record_hashes,
-                replay_ids,
+                previous_head,
+                replay_ids: Some(replay_ids),
                 poisoned: false,
             }),
         })
@@ -1688,20 +1738,36 @@ impl FileAuditLog {
     }
 
     /// Reports whether a retained sequence/head pair is an exact verified chain prefix.
+    ///
+    /// Only the reconcile window is answered for: the current head, the record before it, and the
+    /// empty chain. A checkpoint further behind than one append is not a prefix this log will
+    /// confirm — reconciliation rejects that gap on its own, and confirming it would mean keeping
+    /// every verified hash resident forever.
     pub async fn contains_checkpoint(&self, count: usize, head: Option<&str>) -> bool {
         let state = self.state.lock().await;
         match count {
             0 => head.is_none(),
-            count if count <= state.record_hashes.len() => {
-                head == Some(state.record_hashes[count - 1].as_str())
+            count if count == state.count => head == state.head.as_deref(),
+            count if Some(count) == state.count.checked_sub(1) => {
+                head == state.previous_head.as_deref()
             }
             _ => false,
         }
     }
 
-    /// Returns invocation IDs reconstructed from verified decision records.
-    pub async fn replay_ids(&self) -> Vec<InvocationId> {
-        self.state.lock().await.replay_ids.iter().cloned().collect()
+    /// Returns invocation IDs reconstructed from verified decision records, once.
+    ///
+    /// Consuming on purpose. The only caller hands them straight to the broker's replay ledger,
+    /// which owns them from then on; keeping a second copy here would duplicate the ledger at
+    /// startup and then grow it forever on a path nothing reads again. A later call returns
+    /// nothing, and appends stop recording once they have been taken.
+    pub async fn take_replay_ids(&self) -> Vec<InvocationId> {
+        let mut state = self.state.lock().await;
+        state
+            .replay_ids
+            .take()
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1721,15 +1787,22 @@ impl AuditLog for FileAuditLog {
             .and_then(|value| value.checked_add(1))
             .ok_or(AuditError::SequenceOverflow)?;
         let previous_hash = state.head.clone();
-        let record_hash = audit_record_hash(sequence, previous_hash.as_deref(), &event)?;
+        let encoded = encode_audit_event(&event)?;
+        let record_hash = encoded_audit_record_hash(sequence, previous_hash.as_deref(), &encoded)?;
+        // The one serialization of the event covers both the hash material and the durable line.
+        let mut line = serde_json::to_vec(&AuditRecordLine {
+            sequence,
+            previous_hash: previous_hash.as_deref(),
+            event: &encoded,
+            record_hash: &record_hash,
+        })
+        .map_err(|source| AuditError::Serialize { source })?;
         let record = AuditRecord {
             sequence,
             previous_hash,
             event,
             record_hash,
         };
-        let mut line =
-            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
         if line.len() > self.maximum_line_bytes {
             return Err(AuditError::RecordTooLarge {
                 length: line.len(),
@@ -1749,10 +1822,11 @@ impl AuditLog for FileAuditLog {
             return Err(AuditError::Io { source });
         }
         state.count += 1;
-        state.head = Some(record.record_hash.clone());
-        state.record_hashes.push(record.record_hash.clone());
-        if let AuditEvent::Decision { invocation, .. } = &record.event {
-            state.replay_ids.insert(invocation.clone());
+        state.previous_head = state.head.replace(record.record_hash.clone());
+        if let Some(ids) = state.replay_ids.as_mut()
+            && let AuditEvent::Decision { invocation, .. } = &record.event
+        {
+            ids.insert(invocation.clone());
         }
         state.poisoned = false;
         Ok(record)
@@ -1763,14 +1837,22 @@ async fn scan_audit_file(
     reader: &mut BufReader<File>,
     maximum_records: usize,
     maximum_line_bytes: usize,
-) -> Result<(usize, Option<String>, Vec<String>, BTreeSet<InvocationId>), FileAuditError> {
+) -> Result<
+    (
+        usize,
+        Option<String>,
+        Option<String>,
+        BTreeSet<InvocationId>,
+    ),
+    FileAuditError,
+> {
     let mut count = 0_usize;
     let mut previous = None::<String>;
-    let mut record_hashes = Vec::new();
+    let mut before_previous = None::<String>;
     let mut replay_ids = BTreeSet::new();
     loop {
         let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
-            return Ok((count, previous, record_hashes, replay_ids));
+            return Ok((count, previous, before_previous, replay_ids));
         };
         if count >= maximum_records {
             return Err(FileAuditError::TooManyRecords {
@@ -1787,8 +1869,7 @@ async fn scan_audit_file(
         if let AuditEvent::Decision { invocation, .. } = &record.event {
             replay_ids.insert(invocation.clone());
         }
-        record_hashes.push(record.record_hash.clone());
-        previous = Some(record.record_hash);
+        before_previous = previous.replace(record.record_hash);
         count += 1;
     }
 }
@@ -1992,6 +2073,25 @@ pub enum AuditError {
     },
 }
 
+impl AuditError {
+    /// Stable low-cardinality classification for logs and span fields.
+    ///
+    /// A designed refusal, a handle that stays dead until restart, and a filesystem that stopped
+    /// accepting writes need three different operator responses, so the failure that reaches
+    /// telemetry must name which one happened.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::Full { .. } => "full",
+            Self::Poisoned => "poisoned",
+            Self::RecordTooLarge { .. } => "record-too-large",
+            Self::SequenceOverflow => "sequence-overflow",
+            Self::Serialize { .. } => "serialize",
+            Self::Io { .. } => "io",
+        }
+    }
+}
+
 /// Audit-chain verification failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuditIntegrityError {
@@ -2054,13 +2154,40 @@ pub fn verify_audit_chain(records: &[AuditRecord]) -> Result<(), AuditIntegrityE
 struct AuditHashMaterial<'a> {
     sequence: u64,
     previous_hash: Option<&'a str>,
-    event: &'a AuditEvent,
+    event: &'a RawValue,
+}
+
+/// The durable JSONL shape of [`AuditRecord`], over an already-serialized event.
+///
+/// Field names, order, and the absent-`previousHash` rule must stay identical to `AuditRecord`'s
+/// derived encoding: this is the same bytes on disk, written without serializing the event a
+/// second time. `durable_line_matches_the_record_encoding` fails if the two ever diverge.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditRecordLine<'a> {
+    sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_hash: Option<&'a str>,
+    event: &'a RawValue,
+    record_hash: &'a str,
+}
+
+fn encode_audit_event(event: &AuditEvent) -> Result<Box<RawValue>, AuditError> {
+    serde_json::value::to_raw_value(event).map_err(|source| AuditError::Serialize { source })
 }
 
 fn audit_record_hash(
     sequence: u64,
     previous_hash: Option<&str>,
     event: &AuditEvent,
+) -> Result<String, AuditError> {
+    encoded_audit_record_hash(sequence, previous_hash, &encode_audit_event(event)?)
+}
+
+fn encoded_audit_record_hash(
+    sequence: u64,
+    previous_hash: Option<&str>,
+    event: &RawValue,
 ) -> Result<String, AuditError> {
     let bytes = serde_json::to_vec(&AuditHashMaterial {
         sequence,
@@ -2432,10 +2559,24 @@ where
         })
     }
 
-    /// Returns only capabilities policy allows for this exact authenticated context.
+    /// The constraint sets policy allows this exact context, one Cedar evaluation each.
     ///
-    /// The listing and the invocation decision come from the same evaluation, so a capability can
-    /// never appear here and then refuse — or be hidden here and then succeed.
+    /// Every listing filters this same list. That is what makes a listing identical to the
+    /// decision an invocation would receive: there is only ever one evaluation to disagree with.
+    fn authorized_sets(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> Vec<(&CapabilityId, &ConstraintSet)> {
+        self.constraints
+            .iter()
+            .filter(|(capability, set)| {
+                !is_reserved_memory_route(capability, Some(set))
+                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && self.authorize_capability(context, capability, set).allowed
+            })
+            .collect()
+    }
+
     /// Returns the command words this context may use.
     ///
     /// A word appears only when policy allows this context at least one capability of the provider
@@ -2443,15 +2584,17 @@ where
     /// principal granted nothing sees an empty vocabulary rather than a map of the deployment.
     #[must_use]
     pub fn command_words(&self, context: &AuthenticatedContext) -> Vec<String> {
-        let reachable = self
-            .constraints
+        self.reachable_command_words(context, &self.authorized_sets(context))
+    }
+
+    fn reachable_command_words(
+        &self,
+        context: &AuthenticatedContext,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<String> {
+        let reachable = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
-            .map(|(_, set)| set.provider.clone())
+            .map(|(_, set)| &set.provider)
             .collect::<BTreeSet<_>>();
         let storage_providers = self
             .constraints
@@ -2475,7 +2618,7 @@ where
             .into_iter()
             .filter(|(provider, _)| {
                 !reserved_providers.contains(*provider)
-                    && reachable.contains(*provider)
+                    && reachable.contains(provider)
                     && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
             })
             .flat_map(|(_, words)| {
@@ -2537,20 +2680,42 @@ where
         Ok(resolution)
     }
 
+    /// Returns only capabilities policy allows for this exact authenticated context.
+    ///
+    /// The listing and the invocation decision come from the same evaluation, so a capability can
+    /// never appear here and then refuse — or be hidden here and then succeed.
+    #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
-        let mut capabilities = self
-            .constraints
+        self.available_capabilities(&self.authorized_sets(context))
+    }
+
+    /// Returns the capability listing and the command words from one authorization pass.
+    ///
+    /// Both halves of a capabilities answer are policy filters over the same constraint sets, and
+    /// a session opens with one. Computing them separately evaluates every set through Cedar
+    /// twice for identical inputs on the broker's most frequent request.
+    #[must_use]
+    pub fn capability_view(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> (Vec<AvailableCapability>, Vec<String>) {
+        let authorized = self.authorized_sets(context);
+        (
+            self.available_capabilities(&authorized),
+            self.reachable_command_words(context, &authorized),
+        )
+    }
+
+    fn available_capabilities(
+        &self,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<AvailableCapability> {
+        let mut capabilities = authorized
             .iter()
-            .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
-                    && (set.constraints.storage.is_none() || context.chat_scope().is_some())
-                    && self.authorize_capability(context, capability, set).allowed
-            })
             .map(|(capability_id, set)| {
                 let (_, manifest_capability) = self
                     .registry
-                    .capabilities()
-                    .find(|(_, capability)| &capability.id == capability_id)
+                    .capability(capability_id)
                     .expect("constraint validation proves every capability route");
                 let mut capability = manifest_capability.clone();
                 capability.effect = set.effect;
@@ -2564,6 +2729,46 @@ where
             .collect::<Vec<_>>();
         capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
         capabilities
+    }
+
+    /// The widest capability answer this broker could ever produce.
+    ///
+    /// [`Self::capabilities`], [`Self::command_words`], and the chat surface are all policy
+    /// filters over exactly these values, for every context the broker can build — direct peer,
+    /// attested, or chat. Enumerating those contexts is not possible here: the agent catalog
+    /// belongs to the gateway, and production policy conditions on `context.agent`, so a broker
+    /// that guessed an agent would measure a surface no session ever receives. Bounding them is
+    /// what a startup frame check actually needs, because a ceiling that fits proves that no
+    /// session's answer can overflow the frame.
+    #[must_use]
+    pub fn capability_ceiling(&self) -> (Vec<AvailableCapability>, Vec<String>) {
+        let mut capabilities = self
+            .constraints
+            .iter()
+            .filter_map(|(capability, _)| self.available_capability(capability))
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
+        let mut words = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .flat_map(|(_, words)| words.iter().cloned())
+            .collect::<Vec<_>>();
+        words.sort();
+        words.dedup();
+        (capabilities, words)
+    }
+
+    /// The chat memory surface a session could be told about, sized for the frame check.
+    ///
+    /// Policy still decides whether any given session sees it; this is only its byte cost.
+    #[must_use]
+    pub fn chat_memory_ceiling(&self) -> Option<ChatMemorySurface> {
+        let config = self.chat_memory.as_ref()?;
+        Some(ChatMemorySurface {
+            max_lookback_turns: config.max_lookback_turns,
+            prompt_note: memory_prompt_note(config.max_lookback_turns),
+        })
     }
 
     /// Evaluates and, when allowed, executes one authenticated proposal exactly once.
@@ -2618,8 +2823,8 @@ where
             }
             None => {
                 let decision = self.authorize_agent_prompt(&context, &attestation.agent);
-                (!decision.allowed).then_some(Refusal {
-                    reason: "agent-denied",
+                (!decision.allowed).then(|| Refusal {
+                    reason: denial_reason(&decision, "agent-denied"),
                     policy_ids: decision.determining_policy_ids,
                 })
             }
@@ -2633,6 +2838,11 @@ where
     /// a policy that does not let this principal drive this agent at all — which callers must not
     /// conflate with "allowed to ask, granted nothing" (`Some` with an empty list). Answering a
     /// refused caller with an empty list would tell it whether the subject is mapped.
+    ///
+    /// The bare `Option` keeps the wire answer opaque, so the refusal class is reported here
+    /// instead: one `broker_capabilities_refused` event names the class and the canonical subject
+    /// on the broker's own side of the socket, where a session that never invokes would otherwise
+    /// leave no trace of why it saw nothing.
     #[must_use]
     pub fn capabilities_for(
         &self,
@@ -2642,22 +2852,38 @@ where
         agent: &AgentId,
     ) -> Option<(Vec<AvailableCapability>, Vec<String>)> {
         if !grant.is_some_and(|grant| grant.permits(subject)) {
+            report_inspection_refusal("attestation-denied", peer, subject, agent);
             return None;
         }
-        let principal = self.identities.resolve(subject)?;
-        let context = AuthenticatedContext::attested(
+        let Some(principal) = self.identities.resolve(subject) else {
+            report_inspection_refusal("unmapped-subject", peer, subject, agent);
+            return None;
+        };
+        let context = match AuthenticatedContext::attested(
             principal.clone(),
             Actor::Agent {
                 agent: agent.clone(),
             },
             peer.principal().clone(),
             subject.clone(),
-        )
-        .ok()?;
-        if !self.authorize_agent_prompt(&context, agent).allowed {
+        ) {
+            Ok(context) => context,
+            Err(_) => {
+                report_inspection_refusal("attestation-denied", peer, subject, agent);
+                return None;
+            }
+        };
+        let decision = self.authorize_agent_prompt(&context, agent);
+        if !decision.allowed {
+            report_inspection_refusal(
+                denial_reason(&decision, "agent-denied"),
+                peer,
+                subject,
+                agent,
+            );
             return None;
         }
-        Some((self.capabilities(&context), self.command_words(&context)))
+        Some(self.capability_view(&context))
     }
 
     /// Returns a freshly authorized chat surface. Scope refusal reveals no mapping or namespace.
@@ -2672,9 +2898,14 @@ where
         Vec<String>,
         Option<ChatMemorySurface>,
     )> {
-        let context = self.resolve_chat_claim(peer, grant, claim)?;
-        let mut capabilities = self.capabilities(&context);
-        let mut words = self.command_words(&context);
+        let context = match self.resolve_chat_claim(peer, grant, claim) {
+            Ok(context) => context,
+            Err(reason) => {
+                report_inspection_refusal(reason, peer, &claim.subject, &claim.agent);
+                return None;
+            }
+        };
+        let (mut capabilities, mut words) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
             for identifier in [MEMORY_RECENT, MEMORY_SEARCH] {
@@ -2698,7 +2929,7 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        let Some(context) = self.resolve_chat_claim(peer, grant, claim) else {
+        let Ok(context) = self.resolve_chat_claim(peer, grant, claim) else {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
@@ -2760,9 +2991,9 @@ where
         };
         let context = self
             .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
         let mut refusal = (attestation.invocation != request.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_none())
+            || self.resolve_chat_claim(peer, grant, &claim).is_err())
         .then_some(Refusal {
             reason: "chat-attestation-denied",
             policy_ids: Vec::new(),
@@ -2811,9 +3042,9 @@ where
         };
         let context = self
             .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|| peer.with_refused_subject(attestation.subject.clone()));
+            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
         let refusal = if attestation.invocation != turn.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_none()
+            || self.resolve_chat_claim(peer, grant, &claim).is_err()
         {
             Some(Refusal {
                 reason: "chat-attestation-denied",
@@ -2848,14 +3079,21 @@ where
         self.invoke_inner(&context, request, refusal).await
     }
 
+    /// Derives the chat context, or the stable refusal class that stopped it.
+    ///
+    /// The class exists so an inspection refusal can be reported once by its caller; the wire
+    /// answer stays the same opaque nothing it was.
     fn resolve_chat_claim(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         claim: &ChatSessionClaim,
-    ) -> Option<AuthenticatedContext> {
-        let grant = grant?;
-        let principal = self.identities.resolve(&claim.subject)?;
+    ) -> Result<AuthenticatedContext, &'static str> {
+        let grant = grant.ok_or("attestation-denied")?;
+        let principal = self
+            .identities
+            .resolve(&claim.subject)
+            .ok_or("unmapped-subject")?;
         // `chatScopes` was added for storage namespace authority. An existing subject-only
         // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
         // using the chat operations. It receives the legacy context with no trusted chat scope,
@@ -2863,7 +3101,7 @@ where
         // chat scope is authored, the service-specific canonical checks and exact grant apply.
         let context = if grant.chat_scopes.is_empty() {
             if !grant.permits(&claim.subject) {
-                return None;
+                return Err("attestation-denied");
             }
             AuthenticatedContext::attested(
                 principal.clone(),
@@ -2873,10 +3111,10 @@ where
                 peer.principal().clone(),
                 claim.subject.clone(),
             )
-            .ok()?
+            .map_err(|_| "attestation-denied")?
         } else {
             if !grant.permits_chat(&claim.subject, &claim.scope) {
-                return None;
+                return Err("attestation-denied");
             }
             AuthenticatedContext::attested_chat(
                 principal.clone(),
@@ -2887,11 +3125,14 @@ where
                 claim.subject.clone(),
                 claim.scope.clone(),
             )
-            .ok()?
+            .map_err(|_| "attestation-denied")?
         };
-        self.authorize_agent_prompt(&context, &claim.agent)
-            .allowed
-            .then_some(context)
+        let decision = self.authorize_agent_prompt(&context, &claim.agent);
+        if decision.allowed {
+            Ok(context)
+        } else {
+            Err(denial_reason(&decision, "agent-denied"))
+        }
     }
 
     fn memory_surface(
@@ -2912,21 +3153,13 @@ where
         }
         Some(ChatMemorySurface {
             max_lookback_turns: config.max_lookback_turns,
-            prompt_note: format!(
-                "Durable chat memory is available on demand. Use `memory recent --last N` or \
-                 `memory search --query TEXT`. Searches inspect at most {} prior turns. Do not \
-                 claim recall without retrieving it.",
-                config.max_lookback_turns
-            ),
+            prompt_note: memory_prompt_note(config.max_lookback_turns),
         })
     }
 
     fn available_capability(&self, capability: &CapabilityId) -> Option<AvailableCapability> {
         let set = self.constraints.get(capability)?;
-        let (_, manifest) = self
-            .registry
-            .capabilities()
-            .find(|(_, candidate)| &candidate.id == capability)?;
+        let (_, manifest) = self.registry.capability(capability)?;
         let mut capability = manifest.clone();
         capability.effect = set.effect;
         capability.risk = set.risk;
@@ -3162,6 +3395,7 @@ where
                 "broker.authorize",
                 invocation = %request.id,
                 outcome = tracing::field::Empty,
+                policy.errors_present = tracing::field::Empty,
             )
         } else {
             tracing::info_span!(
@@ -3171,6 +3405,7 @@ where
             subject = tracing::field::Empty,
             via = tracing::field::Empty,
             outcome = tracing::field::Empty,
+            policy.errors_present = tracing::field::Empty,
             input = tracing::field::Empty,
             )
         };
@@ -3186,13 +3421,18 @@ where
         if !storage_candidate && dekopon_core::telemetry_payloads() {
             authorize.record("input", tracing::field::display(&request.input));
         }
-        let (set, policy_ids) = {
-            let _entered = authorize.enter();
+        // Instrumented rather than entered with a guard: this section awaits the replay ledger and,
+        // on every denial, a durable audit append that fsyncs. A guard held across those awaits
+        // stays entered on the worker thread while this task is suspended, so another connection's
+        // spans parent under this request's authorization and this request's own events lose it
+        // when the task resumes elsewhere.
+        let authorized = async {
             if !self.replay.reserve(&request.id).await? {
                 authorize.record("outcome", "replayed-invocation");
                 return self
                     .deny(context, &request, "replayed-invocation", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A refused attestation or agent gate still consumes its invocation identifier above:
             // the denial is a decision about this exact proposal, and letting the same identifier
@@ -3201,7 +3441,8 @@ where
                 authorize.record("outcome", refusal.reason);
                 return self
                     .deny(context, &request, refusal.reason, refusal.policy_ids)
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A missing constraint set means there is nothing to execute regardless of what policy
             // says. Under `Leniency::Strict` this is defense in depth behind the startup check;
@@ -3212,37 +3453,66 @@ where
                 authorize.record("outcome", "unconstrained-capability");
                 return self
                     .deny(context, &request, "unconstrained-capability", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             };
             if set.constraints.storage.is_some() && context.chat_scope().is_none() {
                 authorize.record("outcome", "chat-scope-required");
                 return self
                     .deny(context, &request, "chat-scope-required", Vec::new())
-                    .await;
+                    .await
+                    .map(ControlFlow::Break);
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
+            // A policy that errors at evaluation time denies exactly like a policy that does not
+            // match, so the flag is the only thing that separates a broken rule from a working one.
+            // It is a flag rather than the error text on purpose: an explanation must not become a
+            // per-request channel for policy source or entity data.
+            authorize.record("policy.errors_present", decision.errors_present);
             if !decision.allowed {
-                authorize.record("outcome", "policy-denied");
+                let reason = denial_reason(&decision, "policy-denied");
+                authorize.record("outcome", reason);
+                if decision.errors_present {
+                    // The invocation identifier only: it joins this event to the authorize span,
+                    // which is where the capability lives when the route may carry one.
+                    tracing::warn!(
+                        event = "broker_policy_evaluation_error",
+                        invocation = %request.id,
+                        policy.target = "capability",
+                    );
+                }
                 return self
-                    .deny(
-                        context,
-                        &request,
-                        "policy-denied",
-                        decision.determining_policy_ids,
-                    )
-                    .await;
+                    .deny(context, &request, reason, decision.determining_policy_ids)
+                    .await
+                    .map(ControlFlow::Break);
             }
             authorize.record("outcome", "allowed");
-            (set, decision.determining_policy_ids)
+            Ok(ControlFlow::Continue((
+                set,
+                decision.determining_policy_ids,
+            )))
+        }
+        .instrument(authorize.clone())
+        .await?;
+        let (set, policy_ids) = match authorized {
+            ControlFlow::Break(denied) => return Ok(denied),
+            ControlFlow::Continue(allowed) => allowed,
         };
         let provider = set.provider.clone();
         let execute = if set.constraints.storage.is_some() {
-            tracing::info_span!("broker.execute", storage = true)
+            tracing::info_span!(
+                "broker.execute",
+                storage = true,
+                outcome = tracing::field::Empty,
+                error = tracing::field::Empty,
+            )
         } else {
             tracing::info_span!(
                 "broker.execute",
                 provider = %provider,
                 credential = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                error = tracing::field::Empty,
             )
         };
         // The symbolic name only, exactly as the audit record carries it: once one capability can
@@ -3323,7 +3593,10 @@ where
                 storage: None,
             })
             .await
-            .map_err(|source| BrokerError::DecisionAudit { source })?;
+            .map_err(|source| {
+                report_audit_failure("decision", &request.id, &source);
+                BrokerError::DecisionAudit { source }
+            })?;
         Ok(InvocationResult {
             invocation: request.id.clone(),
             decision,
@@ -3478,7 +3751,12 @@ where
                 storage: None,
             })
             .await
-            .map_err(|source| BrokerError::DecisionAudit { source })?;
+            .map_err(|source| {
+                tracing::Span::current().record("outcome", "decision-unaudited");
+                tracing::Span::current().record("error", source.category());
+                report_audit_failure("decision", &invocation_id, &source);
+                BrokerError::DecisionAudit { source }
+            })?;
 
         let storage_grant = match storage_preparation.take() {
             None => None,
@@ -3652,13 +3930,31 @@ where
             }
         };
 
-        self.audit
-            .append(audit_event)
-            .await
-            .map_err(|source| BrokerError::OutcomeAudit {
-                invocation: invocation_id,
+        // The same sanitized pair the terminal audit record carries. A trace that ends at "the
+        // provider ran" cannot say whether the effect worked, and `error` here is the classified
+        // reason the client is already told, never provider output.
+        let execution = tracing::Span::current();
+        execution.record(
+            "outcome",
+            if matches!(result.outcome, InvocationOutcome::Succeeded) {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+        if let Some(error) = result.error.as_deref() {
+            execution.record("error", error);
+        }
+
+        self.audit.append(audit_event).await.map_err(|source| {
+            execution.record("outcome", "outcome-unaudited");
+            execution.record("error", source.category());
+            report_audit_failure("outcome", &invocation_id, &source);
+            BrokerError::OutcomeAudit {
+                invocation: invocation_id.clone(),
                 source,
-            })?;
+            }
+        })?;
         Ok(result)
     }
 
@@ -3968,6 +4264,70 @@ struct Refusal {
     policy_ids: Vec<String>,
 }
 
+/// Separates a policy that could not be evaluated from one that simply did not match.
+///
+/// Both deny, and until now both denied identically in audit and telemetry, so a Cedar evaluation
+/// error — an extension call on a malformed value, say — was indistinguishable from a clean
+/// no-match by anything an operator can read.
+const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'static str {
+    if decision.errors_present {
+        "policy-error"
+    } else {
+        denied
+    }
+}
+
+/// Names why an attested inspection saw nothing, on the broker's own side of the socket.
+///
+/// The response stays opaque — it must not tell a refused caller whether the subject is mapped —
+/// so this event is the only place the refusal class and the canonical subject meet. It is what
+/// makes an unmapped sender diagnosable without a payload-carrying gateway span.
+fn report_inspection_refusal(
+    reason: &'static str,
+    peer: &AuthenticatedContext,
+    subject: &ExternalSubject,
+    agent: &AgentId,
+) {
+    tracing::warn!(
+        event = "broker_capabilities_refused",
+        reason,
+        subject = %subject,
+        agent = %agent,
+        via = %peer.principal(),
+    );
+}
+
+/// Reports why the broker could not durably account for a decision or an outcome.
+///
+/// This is the most consequential failure the broker can have and it used to be anonymous: the
+/// wire code and the connection log both carried a category with no cause, so a bounded log
+/// reaching its limit, a poisoned handle, and a full filesystem all read the same.
+fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: &AuditError) {
+    tracing::error!(
+        event = "broker_audit_append_failed",
+        audit.stage = stage,
+        category = source.category(),
+        invocation = %invocation,
+        error = %error_chain(source),
+    );
+}
+
+/// Renders an error and its sources as one `a: b: c` line.
+///
+/// The chain is the point: `AuditError::Io`'s own message says only that a durable append failed,
+/// and the errno that says *why* — `ENOSPC`, the deployment's named top risk — lives one level
+/// down.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "audit construction keeps every trusted correlation field explicit"
@@ -4068,18 +4428,24 @@ fn outcome_evidence_digest(
 }
 
 fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut material = Vec::with_capacity(label.len() + 1 + bytes.len());
-    material.extend_from_slice(label.as_bytes());
-    material.push(0);
-    material.extend_from_slice(&bytes);
-    Ok(domain_digest(EVIDENCE_HASH_DOMAIN, &material))
+    // Streamed rather than concatenated: the serialized value here is a whole provider response,
+    // up to the host output ceiling, and the joined buffer existed only to be hashed once.
+    Ok(digest_parts(
+        EVIDENCE_HASH_DOMAIN,
+        &[label.as_bytes(), &[0], &serde_json::to_vec(value)?],
+    ))
 }
 
 fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
+    digest_parts(domain, &[bytes])
+}
+
+fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(bytes);
+    for part in parts {
+        hasher.update(part);
+    }
     format!("sha256:{}", hex_bytes(&hasher.finalize()))
 }
 
@@ -4114,7 +4480,9 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         // already survived them — but naming them keeps this match exhaustive by proof rather than
         // by a wildcard that would silently absorb a future variant into the wrong public reason.
         BrokerHostError::ConflictingProviders { .. }
-        | BrokerHostError::MissingResolveCommand { .. } => "provider-configuration",
+        | BrokerHostError::MissingResolveCommand { .. }
+        | BrokerHostError::ResolveCommandSignature { .. } => "provider-configuration",
+        BrokerHostError::MemoryBudgetExhausted { .. } => "host-memory-budget",
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
@@ -4177,15 +4545,13 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::Store { .. }
         | BrokerHostError::Linker { .. }
         | BrokerHostError::ArtifactMetadata { .. }
-        | BrokerHostError::ArtifactChanged { .. }
+        | BrokerHostError::CompileCache { .. }
         | BrokerHostError::Compile { .. }
         | BrokerHostError::Instantiate { .. }
         | BrokerHostError::DescribeUsedHostImport { .. }
         | BrokerHostError::Describe { .. }
         | BrokerHostError::InvalidManifest { .. }
-        | BrokerHostError::Manifest { .. }
-        | BrokerHostError::DuplicateProvider { .. }
-        | BrokerHostError::DuplicateCapability { .. } => "broker-host-failure",
+        | BrokerHostError::Manifest { .. } => "broker-host-failure",
     }
 }
 
@@ -4255,15 +4621,10 @@ pub enum BrokerError {
 }
 
 impl BrokerError {
-    /// Invocation whose provider work may already have completed with no terminal audit record.
+    /// Stable pre-execution class for a broker-owned storage failure, when that is what happened.
     ///
-    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
-    /// execution: the external effect may have taken place, nothing durably recorded its
-    /// outcome, and the request must not be resubmitted under any identifier. `None` when
-    /// execution provably never began, so resubmission under a fresh identifier is safe.
-    ///
-    /// Transports are expected to preserve this distinction; collapsing both cases into one
-    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
+    /// Nothing executed, so a corrected request may use a fresh invocation identifier — the class
+    /// only says which storage condition an operator has to reconcile first.
     #[must_use]
     pub const fn storage_failure_code(&self) -> Option<&'static str> {
         let Self::Storage { source } = self else {
@@ -4281,6 +4642,47 @@ impl BrokerError {
         })
     }
 
+    /// Stable class for an exhaustion that no resubmission can outlast.
+    ///
+    /// The retriable class is for a broker that could not complete *this* request. These two
+    /// cannot complete any request. The replay ledger never evicts and restart restores it from
+    /// durable history, so a fresh invocation identifier fails identically and keeps failing; the
+    /// audit log does not rotate, so a full one refuses every append until an operator raises the
+    /// bound or moves the file. Reporting either as `broker-unavailable` invites an unbounded
+    /// retry loop against a permanently capped broker.
+    ///
+    /// A *terminal* audit failure is deliberately absent: [`Self::OutcomeAudit`] is an unaudited
+    /// outcome first, whatever exhausted it, and that classification must not be weakened here.
+    #[must_use]
+    pub const fn capacity_failure_code(&self) -> Option<&'static str> {
+        match self {
+            Self::ReplayLedgerFull { .. } => Some("capacity-exhausted"),
+            Self::DecisionAudit {
+                source: AuditError::Full { .. },
+            } => Some("capacity-exhausted"),
+            Self::MemoryUnavailable
+            | Self::InvalidMemoryInput
+            | Self::Storage { .. }
+            | Self::Authorization { .. }
+            | Self::DecisionEvidence { .. }
+            | Self::DecisionAudit { .. }
+            | Self::OutcomeEvidence { .. }
+            | Self::StorageOutcome { .. }
+            | Self::OutcomeAudit { .. } => None,
+        }
+    }
+
+    /// Invocation whose provider work may already have completed with no terminal audit record.
+    ///
+    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
+    /// execution: the external effect may have taken place, nothing durably recorded its
+    /// outcome, and the request must not be resubmitted under any identifier. `None` when
+    /// execution provably never began — which makes resubmission *safe*, not useful:
+    /// [`Self::capacity_failure_code`] separates the failures a retry can outlive from the
+    /// exhaustions it cannot.
+    ///
+    /// Transports are expected to preserve this distinction; collapsing both cases into one
+    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
     #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {

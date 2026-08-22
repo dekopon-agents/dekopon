@@ -5,18 +5,66 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
-    ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageNamespace,
+    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
+    StorageAccess, StorageConstraints, StorageInterface, StorageNamespace,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TraceId,
+};
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeGrant,
-    ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog,
-    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
-    is_reserved_memory_route, verify_audit_chain,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeClaim,
+    ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog,
+    InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints, encode_host_limits,
+    encode_memory_config, encode_storage_limits, is_reserved_memory_route, verify_audit_chain,
 };
+
+/// A terminal execution event, for the record shapes a decision-only fixture never reaches.
+fn execution(invocation: &str) -> AuditEvent {
+    AuditEvent::Execution {
+        invocation: invocation
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        trace: "trace-test"
+            .parse::<TraceId>()
+            .expect("valid trace fixture"),
+        principal: Some(
+            "caller"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        actor: Some(Actor::Agent {
+            agent: "reviewer".parse::<AgentId>().expect("valid agent fixture"),
+        }),
+        via: None,
+        attested_subject: None,
+        capability: "echo.echo"
+            .parse::<CapabilityId>()
+            .expect("valid capability fixture"),
+        provider: Some("echo".parse().expect("valid provider fixture")),
+        authorized_by: Some(
+            "broker"
+                .parse::<PrincipalId>()
+                .expect("valid principal fixture"),
+        ),
+        decision_id: format!("decision-{invocation}"),
+        policy_revision: Some("policy-test".to_owned()),
+        policy_ids: vec!["allow-echo".to_owned()],
+        policy_digest: None,
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        idempotency: Idempotency::Idempotent,
+        credential: None,
+        outcome: InvocationOutcome::Succeeded,
+        duration_ms: 3,
+        error: None,
+        output_digest: Some(format!("sha256:{}", "b".repeat(64))),
+        http_calls: Vec::new(),
+        storage_scope_commitment: None,
+        storage: None,
+    }
+}
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {
@@ -535,6 +583,48 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     }
 }
 
+/// A permanent exhaustion is not a momentary outage. The replay ledger never evicts and is
+/// restored from durable history at startup, and the audit log does not rotate, so a client told
+/// to resubmit under a fresh identifier would loop against a broker that is capped forever.
+#[test]
+fn exhausted_bounds_are_terminal_rather_than_retriable() {
+    for error in [
+        super::BrokerError::ReplayLedgerFull { maximum: 100_000 },
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Full { maximum: 200_000 },
+        },
+    ] {
+        assert_eq!(error.capacity_failure_code(), Some("capacity-exhausted"));
+        assert_eq!(
+            error.unaudited_outcome(),
+            None,
+            "an exhaustion refuses before execution"
+        );
+        assert_eq!(error.storage_failure_code(), None);
+    }
+
+    // The same exhaustion *after* execution stays an unaudited outcome: the effect may already
+    // have happened, and that classification outranks how the append failed.
+    let invocation = "invoke-terminal"
+        .parse::<InvocationId>()
+        .expect("valid invocation fixture");
+    let terminal = super::BrokerError::OutcomeAudit {
+        invocation: invocation.clone(),
+        source: super::AuditError::Full { maximum: 200_000 },
+    };
+    assert_eq!(terminal.capacity_failure_code(), None);
+    assert_eq!(terminal.unaudited_outcome(), Some(&invocation));
+
+    // And an ordinary durable failure is still the retriable class.
+    assert_eq!(
+        super::BrokerError::DecisionAudit {
+            source: super::AuditError::Poisoned,
+        }
+        .capacity_failure_code(),
+        None
+    );
+}
+
 #[test]
 fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     for scope in [
@@ -601,6 +691,37 @@ fn exact_chat_scope_configuration_requires_service_canonical_forms() {
     }
     .validate()
     .expect("signed Telegram service limits are accepted exactly");
+
+    AttestorGrant {
+        namespaces: vec!["whatsapp".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::ExactConversation {
+            kind: ChatTransportKind::Whatsapp,
+            transport: "whatsapp".parse().expect("transport"),
+            channel: "123:456:16034700182".to_owned(),
+            conversation: "123:456:16034700182".to_owned(),
+            local_subject_service: None,
+        }],
+    }
+    .validate()
+    .expect("exact WhatsApp WABA, phone, and sender scope is accepted");
+
+    let scope = ChatScopeClaim {
+        transport: "whatsapp".parse().expect("transport"),
+        kind: ChatTransportKind::Whatsapp,
+        channel: "123:456:16034700182".to_owned(),
+        conversation: "123:456:16034700182".to_owned(),
+    };
+    assert!(canonical_chat_scope(
+        &ExternalSubject::whatsapp("16034700182").expect("subject"),
+        &scope,
+    ));
+    assert!(
+        !canonical_chat_scope(
+            &ExternalSubject::whatsapp("16034700999").expect("subject"),
+            &scope,
+        ),
+        "the signed sender in scope cannot be detached from the attested subject"
+    );
 }
 
 #[test]
@@ -711,7 +832,7 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
     assert_eq!(audit.checkpoint().await, checkpoint);
     assert_eq!(
         audit
-            .replay_ids()
+            .take_replay_ids()
             .await
             .iter()
             .map(InvocationId::as_str)
@@ -722,6 +843,18 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
         .append(decision("invoke-three", true))
         .await
         .expect("append continues verified chain");
+    // Startup-only state: the broker's replay ledger owns these ids now, so nothing keeps
+    // accumulating a second copy of them here for the life of the process.
+    assert!(
+        audit.take_replay_ids().await.is_empty(),
+        "restored identifiers are handed over once, not retained and re-served"
+    );
+    // The reconcile window still answers for the current head and the record before it.
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 3);
+    assert!(audit.contains_checkpoint(3, head.as_deref()).await);
+    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
+    assert!(!audit.contains_checkpoint(2, head.as_deref()).await);
     drop(audit);
 
     let records = fs::read_to_string(&path)
@@ -988,4 +1121,86 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
             .contains("credentialByAgent"),
         "an empty override map must stay off the wire"
     );
+}
+
+/// Two records written by an earlier build, hashes and all.
+///
+/// The durable chain is the one thing in this crate that outlives the process that wrote it. If a
+/// change to how a record is serialized, hashed, or laid out reaches disk, an operator's existing
+/// audit file stops verifying — so this fixture is a literal, not something the test regenerates.
+const CHAIN_FIXTURE: &str = concat!(
+    r#"{"sequence":1,"event":{"type":"decision","invocation":"invoke-one","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-one","policy_revision":"policy-test","allowed":true,"decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce"}"#,
+    "\n",
+    r#"{"sequence":2,"previousHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce","event":{"type":"decision","invocation":"invoke-two","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-two","policy_revision":"policy-test","allowed":false,"reason":"policy-denied","decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf"}"#,
+    "\n",
+);
+
+#[tokio::test]
+async fn an_existing_chain_still_verifies_and_appends_the_same_bytes() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    fs::write(&path, CHAIN_FIXTURE).expect("write retained chain");
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owner-only fixture");
+
+    // Opening re-derives every record hash from the retained bytes, so a changed hash material,
+    // domain, or field order fails right here.
+    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+        .await
+        .expect("a chain written by an earlier build still verifies");
+    let (count, head) = audit.checkpoint().await;
+    assert_eq!(count, 2);
+    assert_eq!(
+        head.as_deref(),
+        Some("sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf")
+    );
+
+    // And a record appended now continues that same chain in the same encoding.
+    let appended = audit
+        .append(decision("invoke-three", true))
+        .await
+        .expect("append continues the retained chain");
+    drop(audit);
+    let raw = fs::read_to_string(&path).expect("read continued chain");
+    assert!(raw.starts_with(CHAIN_FIXTURE), "{raw}");
+    let records = raw
+        .lines()
+        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("valid durable record"))
+        .collect::<Vec<_>>();
+    verify_audit_chain(&records).expect("the continued chain verifies end to end");
+    assert_eq!(records[2], appended);
+}
+
+/// The durable line is spliced around one serialization of the event rather than serializing the
+/// record; this is what proves the splice and the derived encoding are the same bytes.
+#[tokio::test]
+async fn durable_lines_match_the_record_encoding() {
+    let directory = tempfile::tempdir().expect("create audit fixture directory");
+    let path = directory.path().join("audit.jsonl");
+    let audit = FileAuditLog::open(&path, 8, 16 * 1024)
+        .await
+        .expect("create durable audit");
+    let mut appended = Vec::new();
+    for event in [
+        decision("invoke-first", true),
+        decision("invoke-second", false),
+        execution("invoke-second"),
+    ] {
+        appended.push(audit.append(event).await.expect("append succeeds"));
+    }
+    drop(audit);
+    for (line, record) in fs::read_to_string(&path)
+        .expect("read durable chain")
+        .lines()
+        .zip(&appended)
+    {
+        assert_eq!(
+            line.as_bytes(),
+            serde_json::to_vec(record)
+                .expect("records reserialize")
+                .as_slice(),
+            "record {} is not written as it serializes",
+            record.sequence
+        );
+    }
 }
