@@ -72,11 +72,7 @@ pub(crate) fn resolve(
     }
     // After builtins, so a provider can never shadow one. A provider claiming a builtin name is
     // refused at load rather than silently losing here; this ordering is the second line.
-    if invoker
-        .command_words()
-        .iter()
-        .any(|candidate| candidate == word)
-    {
+    if invoker.has_command_word(word) {
         return Resolution::ProviderCommand;
     }
     if looks_like_capability(word) {
@@ -102,14 +98,7 @@ fn granted_namespace_of(word: &str, invoker: &dyn CapabilityInvoker) -> Option<S
         return None;
     }
     invoker
-        .granted()
-        .iter()
-        .any(|granted| {
-            granted
-                .split('.')
-                .next()
-                .is_some_and(|candidate| candidate == namespace)
-        })
+        .grants_namespace(namespace)
         .then(|| namespace.to_owned())
 }
 
@@ -208,7 +197,7 @@ fn to_camel_case(flag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{cell::Cell, collections::BTreeSet};
 
     use serde_json::{Value, json};
 
@@ -264,6 +253,116 @@ mod tests {
         assert!(matches!(
             resolve("unknown", &functions, &Granted),
             Resolution::NotFound
+        ));
+    }
+
+    /// An invoker that answers membership directly and counts every list it is asked to build.
+    #[derive(Default)]
+    struct Indexed {
+        granted_lists: Cell<usize>,
+        word_lists: Cell<usize>,
+    }
+
+    impl CapabilityInvoker for Indexed {
+        fn granted(&self) -> Vec<String> {
+            self.granted_lists.set(self.granted_lists.get() + 1);
+            vec!["echo.echo".to_owned()]
+        }
+
+        fn is_granted(&self, capability: &str) -> bool {
+            capability == "echo.echo"
+        }
+
+        fn grants_namespace(&self, namespace: &str) -> bool {
+            namespace == "echo"
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            self.word_lists.set(self.word_lists.get() + 1);
+            vec!["deploy".to_owned(), "echo.echo".to_owned()]
+        }
+
+        fn has_command_word(&self, word: &str) -> bool {
+            word == "deploy" || word == "echo.echo"
+        }
+
+        fn invoke(&self, _capability: &str, input: Value) -> CapabilityCallResult {
+            CapabilityCallResult::Succeeded(input)
+        }
+    }
+
+    #[test]
+    fn resolution_asks_membership_instead_of_materializing_a_list_per_command() {
+        // Both queries run for every command word a script executes, so a loop of a thousand
+        // commands used to build, sort, and dedup the whole granted and command-word lists a
+        // thousand times over. An invoker that can answer directly must never be asked for them.
+        let invoker = Indexed::default();
+        let functions = BTreeSet::new();
+        for word in [
+            "deploy",
+            "echo.echo",
+            "echo.other",
+            "nothing.here",
+            "unknown",
+        ] {
+            let _resolution = resolve(word, &functions, &invoker);
+        }
+        assert_eq!(invoker.granted_lists.get(), 0);
+        assert_eq!(invoker.word_lists.get(), 0);
+    }
+
+    #[test]
+    fn a_provider_command_word_resolves_before_capability_fallback() {
+        // `Indexed` claims `echo.echo` as both a command word and a granted capability. The
+        // provider's rewrite wins, and the order that decides it is the documented one — moving
+        // the membership test must not reorder the steps around it.
+        let invoker = Indexed::default();
+        let functions = BTreeSet::new();
+        assert!(matches!(
+            resolve("echo.echo", &functions, &invoker),
+            Resolution::ProviderCommand
+        ));
+        assert!(matches!(
+            resolve("deploy", &functions, &invoker),
+            Resolution::ProviderCommand
+        ));
+        // A builtin still wins over a command word, and a function over both.
+        assert!(matches!(
+            resolve("jq", &functions, &invoker),
+            Resolution::Builtin(_)
+        ));
+        // A word in a held namespace that was not granted is still distinguished for telemetry.
+        assert!(matches!(
+            resolve("echo.other", &functions, &invoker),
+            Resolution::NotGranted { namespace } if namespace == "echo"
+        ));
+        assert!(matches!(
+            resolve("nothing.here", &functions, &invoker),
+            Resolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn the_default_queries_answer_from_the_lists() {
+        // `Granted` overrides neither membership query, so both fall back to scanning. An embedder
+        // that has nothing cheaper must still resolve identically.
+        let functions = BTreeSet::new();
+        assert!(matches!(
+            resolve("echo.echo", &functions, &Granted),
+            Resolution::Capability
+        ));
+        assert!(matches!(
+            resolve("echo.missing", &functions, &Granted),
+            Resolution::NotGranted { namespace } if namespace == "echo"
+        ));
+        assert!(matches!(
+            resolve("other.missing", &functions, &Granted),
+            Resolution::NotFound
+        ));
+        // A separator-free grant is its own namespace, the way the interpreter reads one.
+        assert!(matches!(
+            resolve("with_underscore", &functions, &Granted),
+            Resolution::Capability
         ));
     }
 

@@ -621,6 +621,9 @@ fn host_limits(limits: &LimitArgs) -> HostLimits {
         max_output_bytes: limits.max_output_bytes,
         fuel: limits.fuel,
         timeout: Duration::from_millis(limits.timeout_ms),
+        // Table, instance, and memory-count ceilings have no command-line flag; the host defaults
+        // bound the allocation paths `--max-memory-bytes` does not reach.
+        ..HostLimits::default()
     }
 }
 

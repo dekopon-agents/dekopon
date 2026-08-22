@@ -14,14 +14,14 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use dekopon_capability::EffectKind;
-use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
 pub use dekopon_provider_sdk::{
     ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
@@ -41,8 +41,16 @@ mod bindings {
 /// The WIT contract implemented by provider components.
 pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 
-/// Default maximum linear-memory allocation per provider invocation (64 MiB).
+/// Default maximum size of each linear memory in one store (64 MiB).
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Default maximum elements in each Wasm table.
+pub const DEFAULT_MAX_TABLE_ELEMENTS: usize = 100_000;
+/// Default maximum core instances in one store.
+pub const DEFAULT_MAX_INSTANCES: usize = 64;
+/// Default maximum tables in one store.
+pub const DEFAULT_MAX_TABLES: usize = 16;
+/// Default maximum linear memories in one store.
+pub const DEFAULT_MAX_MEMORIES: usize = 4;
 /// Default maximum serialized provider input size (1 MiB).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// Default maximum serialized provider output or manifest size (1 MiB).
@@ -55,11 +63,26 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Limits applied independently to every provider description or invocation call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostLimits {
-    /// Maximum linear-memory allocation in one store.
+    /// Maximum size of each linear memory in one store.
+    ///
+    /// Wasmtime applies this per memory, not per store, which is why the store also bounds how many
+    /// memories, tables, table elements, and instances a component may create.
     pub max_memory_bytes: usize,
+    /// Maximum elements in each Wasm table.
+    pub max_table_elements: usize,
+    /// Maximum core instances in one store.
+    pub max_instances: usize,
+    /// Maximum tables in one store.
+    pub max_tables: usize,
+    /// Maximum linear memories in one store.
+    pub max_memories: usize,
     /// Maximum serialized invocation input.
     pub max_input_bytes: usize,
     /// Maximum serialized manifest or invocation output.
+    ///
+    /// This bounds what the host will parse, not peak host allocation: the buffered-string WIT
+    /// contract lifts the whole guest string into host memory before it can be measured, so the
+    /// transient allocation is bounded by the store's memory limits instead.
     pub max_output_bytes: usize,
     /// Wasm instruction fuel supplied to one store.
     pub fuel: u64,
@@ -71,6 +94,10 @@ impl Default for HostLimits {
     fn default() -> Self {
         Self {
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            max_table_elements: DEFAULT_MAX_TABLE_ELEMENTS,
+            max_instances: DEFAULT_MAX_INSTANCES,
+            max_tables: DEFAULT_MAX_TABLES,
+            max_memories: DEFAULT_MAX_MEMORIES,
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             fuel: DEFAULT_FUEL,
@@ -128,6 +155,7 @@ struct Runtime {
     engine: Engine,
     limits: HostLimits,
     execution: Mutex<()>,
+    deadline: DeadlineWorker,
 }
 
 impl Runtime {
@@ -149,17 +177,23 @@ impl Runtime {
             })?));
         }
         let engine = Engine::new(&config).map_err(|source| ProviderHostError::Engine { source })?;
+        let deadline = DeadlineWorker::start(engine.clone())?;
 
         Ok(Self {
             engine,
             limits,
             execution: Mutex::new(()),
+            deadline,
         })
     }
 
     fn store(&self) -> Result<Store<StoreState>, ProviderHostError> {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
+            .table_elements(self.limits.max_table_elements)
+            .instances(self.limits.max_instances)
+            .tables(self.limits.max_tables)
+            .memories(self.limits.max_memories)
             .build();
         let mut store = Store::new(
             &self.engine,
@@ -278,11 +312,15 @@ impl Provider for WasmProvider {
             });
         }
 
+        let timeout_ms = self.runtime.limits.timeout.as_millis();
         let span = tracing::info_span!(
             "provider.invoke",
             provider.id = %self.manifest.id,
             capability.id = %capability,
-            provider.path = %self.source.display()
+            provider.path = %self.source.display(),
+            input.bytes = input_json.len(),
+            output.bytes = tracing::field::Empty,
+            fuel.remaining = tracing::field::Empty
         );
         let _entered = span.enter();
         let _execution = self
@@ -293,15 +331,21 @@ impl Provider for WasmProvider {
 
         let mut store = self.runtime.store()?;
         let linker = Linker::new(&self.runtime.engine);
-        let mut timer =
-            EpochTimer::start(self.runtime.engine.clone(), self.runtime.limits.timeout)?;
+        let mut deadline = self.runtime.deadline.arm(self.runtime.limits.timeout)?;
         let bindings = match bindings::Provider::instantiate(&mut store, &self.component, &linker) {
             Ok(bindings) => bindings,
             Err(source) => {
-                if timer.stop() {
+                if deadline.stop() {
+                    tracing::warn!(
+                        provider.id = %self.manifest.id,
+                        capability.id = %capability,
+                        timeout_ms = %timeout_ms,
+                        "instantiating a provider component exceeded its wall-clock deadline"
+                    );
                     return Err(ProviderHostError::Timeout {
                         operation: format!("instantiate {}", self.manifest.id),
-                        timeout_ms: self.runtime.limits.timeout.as_millis(),
+                        timeout_ms,
+                        source: Some(source),
                     });
                 }
                 return Err(ProviderHostError::Instantiate {
@@ -311,20 +355,48 @@ impl Provider for WasmProvider {
             }
         };
         let result = bindings.call_invoke(&mut store, capability.as_str(), &input_json);
-        let expired = timer.stop();
-        if expired {
-            return Err(ProviderHostError::Timeout {
-                operation: format!("invoke {capability}"),
-                timeout_ms: self.runtime.limits.timeout.as_millis(),
-            });
+        let expired = deadline.stop();
+        if let Ok(fuel) = store.get_fuel() {
+            span.record("fuel.remaining", fuel);
         }
-        let output_json = result.map_err(|source| ProviderHostError::Invoke {
-            provider: self.manifest.id.clone(),
-            capability: capability.clone(),
-            source,
-        })?;
+        let output_json = match settle(result, expired) {
+            CallOutcome::Completed(output_json) => output_json,
+            CallOutcome::TimedOut(source) => {
+                tracing::warn!(
+                    provider.id = %self.manifest.id,
+                    capability.id = %capability,
+                    timeout_ms = %timeout_ms,
+                    "provider invocation exceeded its wall-clock deadline"
+                );
+                return Err(ProviderHostError::Timeout {
+                    operation: format!("invoke {capability}"),
+                    timeout_ms,
+                    source: Some(source),
+                });
+            }
+            CallOutcome::Failed(source) => {
+                tracing::warn!(
+                    provider.id = %self.manifest.id,
+                    capability.id = %capability,
+                    "provider invocation trapped or failed inside the component"
+                );
+                return Err(ProviderHostError::Invoke {
+                    provider: self.manifest.id.clone(),
+                    capability: capability.clone(),
+                    source,
+                });
+            }
+        };
 
+        span.record("output.bytes", output_json.len());
         if output_json.len() > self.runtime.limits.max_output_bytes {
+            tracing::warn!(
+                provider.id = %self.manifest.id,
+                capability.id = %capability,
+                output.bytes = output_json.len(),
+                maximum = self.runtime.limits.max_output_bytes,
+                "provider returned more output than the configured maximum"
+            );
             return Err(ProviderHostError::OutputTooLarge {
                 provider: self.manifest.id.to_string(),
                 length: output_json.len(),
@@ -348,6 +420,77 @@ impl Provider for WasmProvider {
                 message: error.message,
             }),
         }
+    }
+}
+
+/// Everything wrong with one provider set, gathered so an operator sees it once.
+///
+/// Ambiguity is fatal in a way absence is not: a word or capability two components both claim has no
+/// meaning this host can pick without silently choosing for the operator. This reports rather than
+/// resolves, and reports *all of it* — fixing a `--provider` list should take one run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderConflicts {
+    /// Provider identities declared by more than one component.
+    pub providers: Vec<ProviderId>,
+    /// Capability identifiers declared by more than one component.
+    pub capabilities: Vec<CapabilityId>,
+    /// Command words that cannot be granted to the providers claiming them.
+    pub command_words: Vec<CommandWordConflict>,
+}
+
+impl ProviderConflicts {
+    /// Reports how many distinct conflicts this covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.providers.len() + self.capabilities.len() + self.command_words.len()
+    }
+
+    /// Reports whether there is nothing to complain about.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl fmt::Display for ProviderConflicts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "refusing to load \u{2014} {} provider conflict(s)",
+            self.len()
+        )?;
+        for provider in &self.providers {
+            writeln!(formatter, "\n  provider {provider}")?;
+            writeln!(formatter, "    declared by more than one component")?;
+            writeln!(
+                formatter,
+                "    fix: remove one, or drop its --provider argument"
+            )?;
+        }
+        for capability in &self.capabilities {
+            writeln!(formatter, "\n  capability {capability}")?;
+            writeln!(formatter, "    declared by more than one component")?;
+            writeln!(
+                formatter,
+                "    fix: rename it in one provider, or drop that provider"
+            )?;
+        }
+        for conflict in &self.command_words {
+            writeln!(formatter, "\n  command word `{}`", conflict.word)?;
+            for claimant in &conflict.claimants {
+                writeln!(formatter, "    claimed by  {claimant}")?;
+            }
+            writeln!(formatter, "    {}", conflict.kind.explanation())?;
+            writeln!(formatter, "    fix: {}", conflict.kind.remedy())?;
+        }
+        if !self.command_words.is_empty() {
+            write!(
+                formatter,
+                "\nReserved words: {}",
+                dekopon_core::RESERVED_COMMAND_WORDS.join(" ")
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -387,14 +530,21 @@ impl ProviderRegistry {
         let mut providers = Vec::with_capacity(sources.len());
         let mut provider_ids = BTreeSet::new();
         let mut routes = BTreeMap::new();
+        // Every conflict, then one failure. Returning on the first would make fixing a provider set
+        // take one run per mistake; an operator should see the whole picture once.
+        let mut duplicate_providers = BTreeSet::new();
+        let mut duplicate_capabilities = BTreeSet::new();
+        let mut declared_words = Vec::new();
 
         for source in sources {
             let provider = WasmProvider::load(Arc::clone(&runtime), source)?;
             if !provider_ids.insert(provider.manifest.id.clone()) {
-                return Err(ProviderHostError::DuplicateProvider {
-                    provider: provider.manifest.id.clone(),
-                });
+                duplicate_providers.insert(provider.manifest.id.clone());
             }
+            declared_words.push((
+                provider.manifest.id.to_string(),
+                provider.manifest.command_words.clone(),
+            ));
 
             let provider_index = providers.len();
             for capability in &provider.manifest.capabilities {
@@ -402,12 +552,26 @@ impl ProviderRegistry {
                     .insert(capability.id.clone(), provider_index)
                     .is_some()
                 {
-                    return Err(ProviderHostError::DuplicateCapability {
-                        capability: capability.id.clone(),
-                    });
+                    duplicate_capabilities.insert(capability.id.clone());
                 }
             }
             providers.push(provider);
+        }
+
+        // The broker refuses these words at startup; the lab host has to agree, or an author learns
+        // about a conflict only once the provider reaches `dekopon-brokerd`.
+        let command_words = dekopon_core::command_word_conflicts(&declared_words);
+        if !duplicate_providers.is_empty()
+            || !duplicate_capabilities.is_empty()
+            || !command_words.is_empty()
+        {
+            return Err(ProviderHostError::ConflictingProviders {
+                report: Box::new(ProviderConflicts {
+                    providers: duplicate_providers.into_iter().collect(),
+                    capabilities: duplicate_capabilities.into_iter().collect(),
+                    command_words,
+                }),
+            });
         }
 
         Ok(Self { providers, routes })
@@ -466,16 +630,23 @@ fn describe_component(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+    let timeout_ms = runtime.limits.timeout.as_millis();
     let mut store = runtime.store()?;
     let linker = Linker::new(&runtime.engine);
-    let mut timer = EpochTimer::start(runtime.engine.clone(), runtime.limits.timeout)?;
+    let mut deadline = runtime.deadline.arm(runtime.limits.timeout)?;
     let bindings = match bindings::Provider::instantiate(&mut store, component, &linker) {
         Ok(bindings) => bindings,
         Err(error) => {
-            if timer.stop() {
+            if deadline.stop() {
+                tracing::warn!(
+                    provider.path = %source.display(),
+                    timeout_ms = %timeout_ms,
+                    "instantiating a provider component exceeded its wall-clock deadline"
+                );
                 return Err(ProviderHostError::Timeout {
                     operation: format!("instantiate {}", source.display()),
-                    timeout_ms: runtime.limits.timeout.as_millis(),
+                    timeout_ms,
+                    source: Some(error),
                 });
             }
             return Err(ProviderHostError::Instantiate {
@@ -485,23 +656,59 @@ fn describe_component(
         }
     };
     let result = bindings.call_describe(&mut store);
-    let expired = timer.stop();
+    let expired = deadline.stop();
 
-    if expired {
-        return Err(ProviderHostError::Timeout {
-            operation: format!("describe {}", source.display()),
-            timeout_ms: runtime.limits.timeout.as_millis(),
-        });
+    match settle(result, expired) {
+        CallOutcome::Completed(manifest_json) => Ok(manifest_json),
+        CallOutcome::TimedOut(error) => {
+            tracing::warn!(
+                provider.path = %source.display(),
+                timeout_ms = %timeout_ms,
+                "describing a provider component exceeded its wall-clock deadline"
+            );
+            Err(ProviderHostError::Timeout {
+                operation: format!("describe {}", source.display()),
+                timeout_ms,
+                source: Some(error),
+            })
+        }
+        CallOutcome::Failed(error) => Err(ProviderHostError::Describe {
+            path: source.to_path_buf(),
+            source: error,
+        }),
     }
-    result.map_err(|error| ProviderHostError::Describe {
-        path: source.to_path_buf(),
-        source: error,
-    })
+}
+
+/// Outcome of one guest call once its wall-clock deadline has been disarmed.
+enum CallOutcome<T> {
+    /// The call returned before anything interrupted it.
+    Completed(T),
+    /// The call failed and the deadline had already fired.
+    TimedOut(wasmtime::Error),
+    /// The call failed on its own.
+    Failed(wasmtime::Error),
+}
+
+/// Settles the race between a completed call and a deadline that fired around the same moment.
+///
+/// The epoch can tick in the window between the guest returning and the deadline being disarmed,
+/// where it interrupted nothing — an interruption that landed in time produces `Err` instead. So a
+/// completed `Ok` wins, and only a failed call may be reported as a timeout.
+fn settle<T>(result: Result<T, wasmtime::Error>, expired: bool) -> CallOutcome<T> {
+    match result {
+        Ok(value) => CallOutcome::Completed(value),
+        Err(error) if expired => CallOutcome::TimedOut(error),
+        Err(error) => CallOutcome::Failed(error),
+    }
 }
 
 fn validate_limits(limits: &HostLimits) -> Result<(), ProviderHostError> {
     for (name, value) in [
         ("max_memory_bytes", limits.max_memory_bytes as u128),
+        ("max_table_elements", limits.max_table_elements as u128),
+        ("max_instances", limits.max_instances as u128),
+        ("max_tables", limits.max_tables as u128),
+        ("max_memories", limits.max_memories as u128),
         ("max_input_bytes", limits.max_input_bytes as u128),
         ("max_output_bytes", limits.max_output_bytes as u128),
         ("fuel", u128::from(limits.fuel)),
@@ -573,50 +780,110 @@ fn invalid_manifest(source: &Path, message: impl Into<String>) -> ProviderHostEr
     }
 }
 
-#[derive(Debug)]
-struct EpochTimer {
-    cancel: Option<Sender<()>>,
-    handle: Option<JoinHandle<()>>,
+/// One deadline armed on the runtime's worker.
+struct Armed {
+    timeout: Duration,
     expired: Arc<AtomicBool>,
+    cancel: Receiver<()>,
+    done: SyncSender<()>,
 }
 
-impl EpochTimer {
-    fn start(engine: Engine, timeout: Duration) -> Result<Self, ProviderHostError> {
-        let (cancel, receiver) = mpsc::channel();
-        let expired = Arc::new(AtomicBool::new(false));
-        let thread_expired = Arc::clone(&expired);
+/// The single wall-clock deadline thread a [`Runtime`] owns.
+///
+/// The execution mutex admits one call at a time, so a thread spawned and joined per describe and
+/// invoke was pure overhead on the hot path — and thread creation is the first thing a loaded host
+/// refuses. This one parks on its command channel between calls and outlives all of them.
+struct DeadlineWorker {
+    deadlines: Option<Sender<Armed>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DeadlineWorker {
+    fn start(engine: Engine) -> Result<Self, ProviderHostError> {
+        let (deadlines, armed) = mpsc::channel::<Armed>();
         let handle = thread::Builder::new()
             .name("dekopon-provider-deadline".to_owned())
             .spawn(move || {
-                if matches!(
-                    receiver.recv_timeout(timeout),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    thread_expired.store(true, Ordering::Release);
-                    engine.increment_epoch();
+                while let Ok(armed) = armed.recv() {
+                    if matches!(
+                        armed.cancel.recv_timeout(armed.timeout),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        armed.expired.store(true, Ordering::Release);
+                        engine.increment_epoch();
+                    }
+                    // Only now is `expired` final, so a caller waiting on this signal cannot read
+                    // the flag while the deadline is still firing.
+                    let _ignored = armed.done.send(());
                 }
             })
             .map_err(|source| ProviderHostError::Timer { source })?;
 
         Ok(Self {
-            cancel: Some(cancel),
+            deadlines: Some(deadlines),
             handle: Some(handle),
-            expired,
         })
     }
 
+    fn arm(&self, timeout: Duration) -> Result<Deadline, ProviderHostError> {
+        let (cancel, cancelled) = mpsc::channel();
+        // Bounded at one so the worker's completion signal never blocks on a caller that is gone.
+        let (done, finished) = mpsc::sync_channel(1);
+        let expired = Arc::new(AtomicBool::new(false));
+        self.deadlines
+            .as_ref()
+            .ok_or_else(deadline_worker_stopped)?
+            .send(Armed {
+                timeout,
+                expired: Arc::clone(&expired),
+                cancel: cancelled,
+                done,
+            })
+            .map_err(|_ignored| deadline_worker_stopped())?;
+
+        Ok(Deadline {
+            cancel: Some(cancel),
+            finished,
+            expired,
+        })
+    }
+}
+
+impl Drop for DeadlineWorker {
+    fn drop(&mut self) {
+        // Closing the command channel ends the loop; join so the worker cannot outlive the engine
+        // whose epoch it increments.
+        drop(self.deadlines.take());
+        if let Some(handle) = self.handle.take() {
+            let _ignored = handle.join();
+        }
+    }
+}
+
+fn deadline_worker_stopped() -> ProviderHostError {
+    ProviderHostError::Timer {
+        source: io::Error::other("the provider deadline worker is no longer running"),
+    }
+}
+
+/// One call's armed deadline, disarmed exactly once.
+struct Deadline {
+    cancel: Option<Sender<()>>,
+    finished: Receiver<()>,
+    expired: Arc<AtomicBool>,
+}
+
+impl Deadline {
     fn stop(&mut self) -> bool {
         if let Some(cancel) = self.cancel.take() {
             let _ignored = cancel.send(());
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ignored = handle.join();
+            let _ignored = self.finished.recv();
         }
         self.expired.load(Ordering::Acquire)
     }
 }
 
-impl Drop for EpochTimer {
+impl Drop for Deadline {
     fn drop(&mut self) {
         let _expired = self.stop();
     }
@@ -720,17 +987,11 @@ pub enum ProviderHostError {
         /// Rejected effect.
         effect: EffectKind,
     },
-    /// Two components declared the same provider ID.
-    #[error("provider {provider} is declared by more than one component")]
-    DuplicateProvider {
-        /// Duplicate provider identity.
-        provider: ProviderId,
-    },
-    /// Two loaded components declared the same capability ID.
-    #[error("capability {capability} is declared by more than one provider component")]
-    DuplicateCapability {
-        /// Duplicate capability identity.
-        capability: CapabilityId,
+    /// The loaded component set contained duplicate providers, capabilities, or command words.
+    #[error("{report}")]
+    ConflictingProviders {
+        /// Every conflict found across the whole load.
+        report: Box<ProviderConflicts>,
     },
     /// No loaded component declared the requested capability.
     #[error("no loaded provider implements capability {capability}")]
@@ -786,6 +1047,9 @@ pub enum ProviderHostError {
         operation: String,
         /// Configured timeout.
         timeout_ms: u128,
+        /// The interruption Wasmtime reported, when the call reported one.
+        #[source]
+        source: Option<wasmtime::Error>,
     },
     /// Calling a provider export trapped or otherwise failed.
     #[error("provider {provider} failed while invoking capability {capability}")]
@@ -832,8 +1096,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProviderApiVersion, ProviderCapability, ProviderHostError, ProviderManifest,
-        validate_manifest,
+        CallOutcome, ProviderApiVersion, ProviderCapability, ProviderHostError, ProviderManifest,
+        settle, validate_manifest,
     };
 
     fn manifest(effect: EffectKind, input_schema: serde_json::Value) -> ProviderManifest {
@@ -873,5 +1137,29 @@ mod tests {
         .expect_err("prompt tools require object arguments");
 
         assert!(matches!(error, ProviderHostError::Manifest { .. }));
+    }
+
+    #[test]
+    fn a_completed_call_outlives_a_deadline_that_fired_too_late() {
+        // The epoch can tick between the guest returning and the deadline being disarmed. It
+        // interrupted nothing, so the output stands rather than being reported as a timeout.
+        let outcome = settle(Ok::<_, wasmtime::Error>("{\"kind\":\"succeeded\"}"), true);
+
+        assert!(matches!(
+            outcome,
+            CallOutcome::Completed("{\"kind\":\"succeeded\"}")
+        ));
+    }
+
+    #[test]
+    fn a_failed_call_separates_a_fired_deadline_from_a_guest_trap() {
+        let timed_out = settle(
+            Err::<(), _>(wasmtime::Error::msg("epoch deadline reached")),
+            true,
+        );
+        let failed = settle(Err::<(), _>(wasmtime::Error::msg("unreachable")), false);
+
+        assert!(matches!(timed_out, CallOutcome::TimedOut(_)));
+        assert!(matches!(failed, CallOutcome::Failed(_)));
     }
 }

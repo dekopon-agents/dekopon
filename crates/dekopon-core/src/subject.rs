@@ -1,10 +1,11 @@
 //! External chat-transport subjects and their canonical, identifier-safe form.
 //!
 //! A subject names *who a message came from* on an external service — a Slack user inside a Slack
-//! workspace, a Discord or Telegram account, or a telephone number. Raw external identifiers do
-//! not fit the workspace identifier grammar (Slack IDs are uppercase, E.164 numbers start with
-//! `+`), so this type owns one canonical normalization: dotted lowercase segments such as
-//! `slack.t0123abc.u9xyz`, `discord.123456789`, `telegram.5551234`, or `tel.16034700182`.
+//! workspace, a Discord or Telegram account, a WhatsApp account, or a telephone number. Raw
+//! external identifiers do not fit the workspace identifier grammar (Slack IDs are uppercase,
+//! E.164 numbers start with `+`), so this type owns one canonical normalization: dotted lowercase
+//! segments such as `slack.t0123abc.u9xyz`, `discord.123456789`, `telegram.5551234`,
+//! `whatsapp.16034700182`, or `tel.16034700182`.
 //!
 //! The canonical form is deliberately restrictive — each segment is `[a-z0-9]+` with no separator
 //! characters inside it — so the dotted string parses back unambiguously and the whole value
@@ -33,6 +34,8 @@ pub enum SubjectService {
     Discord,
     /// A Telegram account, identified by its numeric user identifier.
     Telegram,
+    /// A WhatsApp account, identified by the signed webhook `wa_id`.
+    Whatsapp,
     /// A telephone number in digits-only E.164 form (the `+` is stripped).
     Tel,
 }
@@ -45,6 +48,7 @@ impl SubjectService {
             Self::Slack => "slack",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
+            Self::Whatsapp => "whatsapp",
             Self::Tel => "tel",
         }
     }
@@ -62,6 +66,7 @@ impl FromStr for SubjectService {
             "slack" => Ok(Self::Slack),
             "discord" => Ok(Self::Discord),
             "telegram" => Ok(Self::Telegram),
+            "whatsapp" => Ok(Self::Whatsapp),
             "tel" => Ok(Self::Tel),
             _ => Err(SubjectError::UnknownService {
                 service: value.to_owned(),
@@ -103,6 +108,20 @@ impl ExternalSubject {
     pub fn telegram(user: &str) -> Result<Self, SubjectError> {
         let subject = normalize_segment(user, "subject")?;
         Self::build(SubjectService::Telegram, None, subject)
+    }
+
+    /// A WhatsApp account: `whatsapp.<wa_id>`, using the signed digits-only sender identifier.
+    pub fn whatsapp(wa_id: &str) -> Result<Self, SubjectError> {
+        if wa_id.is_empty()
+            || wa_id.starts_with('0')
+            || !wa_id.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(SubjectError::InvalidSegment {
+                segment: "subject",
+                value: wa_id.to_owned(),
+            });
+        }
+        Self::build(SubjectService::Whatsapp, None, wa_id.to_owned())
     }
 
     /// A telephone number: `tel.<digits>`, with one leading `+` stripped.
@@ -166,13 +185,33 @@ impl ExternalSubject {
     ///
     /// Matching is segment-boundary exact: `slack.t0123abc` covers `slack.t0123abc.u9xyz` but not
     /// `slack.t0123abcx.u9`. A scope equal to the whole canonical form also matches.
+    ///
+    /// Compared segment by segment rather than against a rendered canonical string: an attestor
+    /// grant asks this once per configured namespace on every attested request, and the answer
+    /// never needs the joined form.
     #[must_use]
     pub fn in_namespace(&self, scope: &str) -> bool {
-        let canonical = self.canonical();
-        canonical == scope
-            || (canonical.len() > scope.len()
-                && canonical.starts_with(scope)
-                && canonical.as_bytes()[scope.len()] == b'.')
+        let mut wanted = scope.split('.');
+        for segment in self.segments() {
+            match wanted.next() {
+                // The scope ran out exactly on a segment boundary, so it is a covering prefix.
+                None => return true,
+                Some(value) if value == segment => {}
+                Some(_) => return false,
+            }
+        }
+        wanted.next().is_none()
+    }
+
+    /// The canonical segments in order, without joining them.
+    fn segments(&self) -> impl Iterator<Item = &str> {
+        [
+            Some(self.service.as_str()),
+            self.tenant.as_deref(),
+            Some(self.subject.as_str()),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -214,6 +253,9 @@ impl FromStr for ExternalSubject {
         let subject = require_canonical_segment(subject, "subject")?;
         let numeric = match service {
             SubjectService::Discord => is_discord_snowflake(&subject),
+            SubjectService::Whatsapp => {
+                !subject.starts_with('0') && subject.bytes().all(|byte| byte.is_ascii_digit())
+            }
             SubjectService::Tel => subject.bytes().all(|byte| byte.is_ascii_digit()),
             _ => true,
         };
@@ -334,6 +376,10 @@ mod tests {
         assert_eq!(discord.service(), SubjectService::Discord);
         assert_eq!(discord.tenant(), None);
 
+        let whatsapp = ExternalSubject::whatsapp("16034700182").expect("WhatsApp subject");
+        assert_eq!(whatsapp.canonical(), "whatsapp.16034700182");
+        assert_eq!(whatsapp.service(), SubjectService::Whatsapp);
+
         let tel = ExternalSubject::telephone("+16034700182").expect("telephone subject");
         assert_eq!(tel.canonical(), "tel.16034700182");
         assert_eq!(tel.tenant(), None);
@@ -348,6 +394,7 @@ mod tests {
             "slack.t0123abc.u9xyz",
             "discord.123456789012345678",
             "telegram.5551234",
+            "whatsapp.16034700182",
             "tel.16034700182",
         ] {
             let subject = canonical
@@ -368,6 +415,7 @@ mod tests {
             "slack.t0123abc.u9xyz",
             "discord.123456789012345678",
             "telegram.5551234",
+            "whatsapp.16034700182",
             "tel.16034700182",
         ] {
             canonical
@@ -389,6 +437,8 @@ mod tests {
             "discord.18446744073709551616",
             "discord.123.extra",
             "telegram.5551234.extra",
+            "whatsapp.not-digits",
+            "whatsapp.1603.extra",
             "tel.not-digits",
             "tel.+1603",
             "sms.5551234",
@@ -402,6 +452,8 @@ mod tests {
         }
         assert!(ExternalSubject::slack("team space", "user").is_err());
         assert!(ExternalSubject::discord("not-a-snowflake").is_err());
+        assert!(ExternalSubject::whatsapp("+1603").is_err());
+        assert!(ExternalSubject::whatsapp("01603").is_err());
         assert!(ExternalSubject::telephone("call-me").is_err());
     }
 
@@ -416,5 +468,19 @@ mod tests {
         assert!(!subject.in_namespace("slack.t0123abcx"));
         assert!(!subject.in_namespace("slack.t0123ab"));
         assert!(!subject.in_namespace("tel"));
+        // A scope is never a partial segment, an empty string, or longer than the subject itself.
+        assert!(!subject.in_namespace(""));
+        assert!(!subject.in_namespace("slack."));
+        assert!(!subject.in_namespace("slack.t0123abc."));
+        assert!(!subject.in_namespace("slack.t0123abc.u9xyz.extra"));
+        assert!(!subject.in_namespace(".slack"));
+
+        let tenantless = "tel.16034700182"
+            .parse::<ExternalSubject>()
+            .expect("canonical form parses");
+        assert!(tenantless.in_namespace("tel"));
+        assert!(tenantless.in_namespace("tel.16034700182"));
+        assert!(!tenantless.in_namespace("tel.1603470018"));
+        assert!(!tenantless.in_namespace("tel.16034700182.extra"));
     }
 }
