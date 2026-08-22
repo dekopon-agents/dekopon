@@ -3,7 +3,7 @@
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
 //! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
-//! image.
+//! image unless an optional owned-thread continuation deliberately declines.
 //!
 //! # Authority
 //!
@@ -71,8 +71,9 @@ use crate::{
     },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        OutboundReply, SessionStop, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
+        discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
+        telegram::TelegramTransport, whatsapp::WhatsappTransport,
     },
 };
 
@@ -180,6 +181,7 @@ where
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
+    let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
     for spec in &config.transports {
         let mut transport = build_transport(spec)?;
         let identity =
@@ -205,6 +207,9 @@ where
         if let Some(activity) = transport.activity() {
             activities.insert(spec.name().to_owned(), activity);
         }
+        if let Some(ownership) = transport.thread_ownership() {
+            thread_ownership.insert(spec.name().to_owned(), ownership);
+        }
         transports.push(transport);
     }
 
@@ -229,6 +234,7 @@ where
         asset_fetchers,
         image_generators,
         activities,
+        thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
     });
@@ -566,14 +572,23 @@ fn dispatch(
         );
         return;
     };
-    // A channel route that fired on every message would be noise and cost, so a shared
-    // conversation requires the bot to be addressed. A direct message is addressed by definition.
+    // A channel route that fired on every message would be noise and cost. Shared conversations
+    // therefore require an explicit address, except for one Slack Agent continuation that the
+    // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
+    // A direct message is addressed by definition.
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
             .is_some_and(|identity| identity.is_addressed(&message.text))
     });
-    if matches!(message.conversation, ConversationKind::Channel(_)) && !addressed {
+    let inherited_thread = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.inherited);
+    if matches!(message.conversation, ConversationKind::Channel(_))
+        && !addressed
+        && !inherited_thread
+    {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -679,6 +694,31 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Dek
                     .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
                 transport::read_credential(bot_token_env)?,
                 activity.mode,
+            )?),
+            TransportConfig::WhatsappCloudApi {
+                name,
+                app_secret_env,
+                verify_token_env,
+                access_token_env,
+                bind,
+                callback_path,
+                waba_id,
+                phone_number_id,
+                graph_api_version,
+                graph_endpoint,
+            } => Box::new(WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
             )?),
             TransportConfig::TelegramLongPoll {
                 name,

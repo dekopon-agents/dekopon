@@ -2,8 +2,10 @@
 
 This directory contains the Slack app profiles used by the
 [PR summarizer and linter](../pr-summarizer-linter/README.md). Both receive direct messages and
-explicit channel mentions over Socket Mode, open supported attachments on demand, publish
-best-effort in-flight activity, and post replies. No public endpoint is needed.
+explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
+best-effort in-flight activity. The Agent profile additionally receives channel history so one
+freshly authorized sender can continue in that exact owned thread without repeating the mention;
+all other ambient messages are dropped before routing. No public endpoint is needed.
 
 Choose the profile before creating the app:
 
@@ -44,7 +46,11 @@ bounded generated-image replies; remove it only when no route names an image gen
 `reactions:write` for the explicitly configured fallback; remove that scope and leave activity off
 if the classic deployment wants final replies only. The Agent profile additionally adds
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
-requires for Agent View. Opening App Home is not itself routed as a prompt.
+requires for Agent View. It also adds `channels:history`/`message.channels` and
+`groups:history`/`message.groups` for exact owned-thread continuation. Opening App Home is not
+itself routed as a prompt, and ambient channel-history events are discarded inside the transport.
+An existing Agent installation must apply the updated manifest and reinstall to grant the two new
+history scopes before owned-thread continuation can receive unmentioned replies.
 
 ### Generate the app-level token (`xapp-…`)
 
@@ -113,7 +119,11 @@ activity:
 
 `experience` controls conversation semantics and never changes in response to a cosmetic API
 failure. Classic DMs retain top-level replies and one whole-DM conversation. Agent DMs use one
-Slack thread/session per root message, including their conversation history and Stop key.
+Slack thread/session per root message, including their conversation history and Stop key. In an
+Agent channel, the initial request still must mention the bot. Fresh authorization then claims the
+exact workspace/channel/root-thread/sender tuple in a bounded process-local registry, allowing only
+that sender's unmentioned follow-ups in that thread. Revocation removes the claim and restart clears
+all claims; another sender must mention and authorize independently.
 
 In Agent mode, Dekopon sets `processing` once—Slack owns the standard Working UI and one-hour
 processing timeout—sends the durable reply, and queues `active` cleanup.
@@ -121,6 +131,13 @@ Slack's Stop button produces an authenticated `agent_session_stopped` event. Dek
 prevents subsequent model turns and capability calls, suppresses the stale answer/history commit,
 and posts `Stopped.` An already-running model request or provider effect cannot be rolled back and
 may finish before the synchronous loop reaches its next cancellation boundary.
+
+An unmentioned owned-thread follow-up is also told that a reply is optional and receives the
+payload-free `decline_chat_reply` tool. Choosing it before capability work sends no Slack message,
+creates no delivery receipt, and avoids taking the last word. A decline selected alongside work
+runs none of it; after any earlier capability invocation, the model must visibly summarize the
+result. If its turn budget is exhausted, a fixed warning says to inspect audit before retrying.
+Explicit mentions and DMs always require replies.
 
 Activity failures never delay or fail the terminal reply. `feature_disabled`, `missing_scope`, and
 other permanent Agent installation failures trip a per-transport breaker. Reaction cleanup removes
@@ -154,5 +171,6 @@ attestor:
   namespaces: [slack.t0123abc]
 ```
 
-An unmapped sender is refused before any model call. In channels, the app responds only when it is
-mentioned; direct messages route normally.
+An unmapped sender is refused before any model call. In channels, a new conversation responds only
+when mentioned. An Agent channel thread then accepts unmentioned follow-ups only from each exact
+sender it already freshly authorized there; direct messages route normally.

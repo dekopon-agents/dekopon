@@ -145,7 +145,17 @@ memory surface may run `memory recent --last N` or `memory search --query TEXT` 
 turns across restarts. Durable text is never replayed automatically, and `memory.chat.record` is
 absent from shell listing, description, command resolution, and generic invocation.
 
-Today the identifier's only visible effect is on the gateway's admission check, which keys an in-flight set on `(transport, channel, thread)`. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
+**This is not a stateless dev socket.** The local transport sends `--conversation` as the message's
+`channel`, which the gateway takes verbatim as the conversation identity, and history is keyed on
+`(transport, conversation identity, the sender's canonical subject)`. So on a `persistent` route the
+pair `--subject` and `--conversation` names an existing history rather than opening a fresh one, and
+because the local transport trusts its caller to declare a subject, naming one a Slack sender
+created replays that person's compacted exchange into this prompt. No authority moves — the broker
+decides every invocation for itself — but text does. That is a second reason the socket is `0600`
+and a development tool. See [`dekopond.md`](dekopond.md#conversations) for the window's bounds,
+compaction, and grant-change invalidation.
+
+The identifier's other effect is on the gateway's admission check, which keys a separate in-flight set on `(transport, channel, thread)` with no subject in it. Do not run two sessions on one conversation identifier at once: the second message is refused as busy, which arrives as the reply `I'm busy — try again shortly.` unless the gateway's `replyOnBusy` is turned off, in which case the refusal is silent and this client waits for a reply that never comes. A minted identifier is unique per invocation, so reaching that requires passing the same `--conversation` to two concurrent sessions deliberately.
 
 Nothing about this command widens what a caller can reach. The local transport trusts its caller to declare a subject — that is what makes it a development transport rather than a production one — and it grants nothing by doing so, because the declared subject is only a claim the broker must still map. The broker needs an attestor grant covering that namespace plus an owner-controlled mapping before the claim resolves to a principal, so a session reaches exactly the authority the owner already configured for the subject it names. The socket's `0600` mode keeps it reachable only by the owner's UID. See [`dekopond.md`](dekopond.md#local-development-transport) for the transport's side of that position.
 

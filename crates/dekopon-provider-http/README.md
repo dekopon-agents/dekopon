@@ -7,7 +7,7 @@ The crate is statically compiled into a provider component. It supplies request/
 ```rust,ignore
 use dekopon_provider_http::{Header, Request, method};
 
-let request = Request::new(method::POST, "https://api.example.test/items")
+let request = Request::new(method::POST, "https://api.example.test/items")?
     .with_header(Header::text("content-type", "application/json")?)
     .with_body(br#"{"name":"example"}"#.to_vec());
 let response = dekopon_provider_http::send(request)?;

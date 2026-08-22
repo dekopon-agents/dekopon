@@ -274,6 +274,7 @@ pub enum ChatTransportKind {
     Slack,
     Discord,
     Telegram,
+    Whatsapp,
     Local,
 }
 
@@ -283,6 +284,7 @@ impl fmt::Display for ChatTransportKind {
             Self::Slack => "slack",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
+            Self::Whatsapp => "whatsapp",
             Self::Local => "local",
         })
     }
@@ -411,8 +413,8 @@ impl fmt::Debug for ChatAttestation {
 
 /// Service-specific identity of the inbound delivery whose answer was accepted.
 ///
-/// The tagged shape prevents a Slack timestamp, Discord snowflake, Telegram message, or local
-/// nonce from being replayed under another transport kind. Channel/topic fields are checked
+/// The tagged shape prevents a Slack timestamp, Discord snowflake, Telegram message, WhatsApp
+/// message ID, or local nonce from being replayed under another transport kind. Scope fields are checked
 /// against the separately attested chat scope before any namespace is derived.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
@@ -443,6 +445,14 @@ pub enum DeliveryIdentity {
         )]
         topic: Option<String>,
         #[serde(deserialize_with = "deserialize_positive_service_decimal")]
+        message: String,
+    },
+    Whatsapp {
+        #[serde(deserialize_with = "deserialize_meta_decimal")]
+        waba: String,
+        #[serde(deserialize_with = "deserialize_meta_decimal")]
+        phone_number: String,
+        #[serde(deserialize_with = "deserialize_whatsapp_message_id")]
         message: String,
     },
     Local {
@@ -494,6 +504,25 @@ impl DeliveryIdentity {
                     && canonical_positive_service_decimal(message)
             }
             (
+                Self::Whatsapp {
+                    waba,
+                    phone_number,
+                    message,
+                },
+                ChatTransportKind::Whatsapp,
+            ) => {
+                let mut parts = scope.channel.split(':');
+                let canonical = parts.next() == Some(waba.as_str())
+                    && parts.next() == Some(phone_number.as_str())
+                    && parts.next().is_some_and(canonical_meta_decimal)
+                    && parts.next().is_none();
+                canonical
+                    && scope.conversation == scope.channel
+                    && canonical_meta_decimal(waba)
+                    && canonical_meta_decimal(phone_number)
+                    && canonical_whatsapp_message_id(message)
+            }
+            (
                 Self::Local {
                     transport,
                     conversation,
@@ -515,6 +544,37 @@ impl DeliveryIdentity {
             _ => false,
         }
     }
+}
+
+fn deserialize_whatsapp_message_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 256>(deserializer)?;
+    canonical_whatsapp_message_id(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("WhatsApp message ID is not canonical"))
+}
+
+fn canonical_whatsapp_message_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn deserialize_meta_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_bounded_string::<D, 64>(deserializer)?;
+    canonical_meta_decimal(&value)
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("identifier is not a canonical Meta decimal"))
+}
+
+fn canonical_meta_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn deserialize_positive_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -1016,7 +1076,11 @@ pub enum BrokerRequest {
     ResolveCommand {
         /// The command word, which must belong to a loaded provider.
         word: String,
-        /// Arguments as the script supplied them, `argv[0]` being the word itself.
+        /// Arguments as the script supplied them, **without** the word itself.
+        ///
+        /// The word travels in its own field because the broker selects the declaring provider by
+        /// it before the guest runs, so repeating it here would give the guest a second, editable
+        /// copy of a routing decision already made.
         argv: Vec<String>,
     },
     /// Replaces the broker's in-memory informational view of the gateway catalog.

@@ -183,18 +183,40 @@ attested context was derived.
 
 | Span | Fields |
 |---|---|
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content.
 
-Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `unauthorized` means the broker's `capabilitiesFor` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute.
+Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's `capabilitiesForChat` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
 
 In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
 only `operation` plus the stable transport-error category. A permanent Slack installation fallback
 emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
+
+### The WhatsApp webhook is the one signal a stranger can drive
+
+Every other transport's volume is bounded by a service the daemon dialed. The WhatsApp callback is
+public, so an unauthenticated caller decides how many refusals happen, and this sink is a 30-day
+retention claim rather than an infinite one. Refusals are therefore rate-limited rather than
+per-request, and they are the only WhatsApp events at `info` or above:
+
+| Event | Level | Fields |
+|---|---|---|
+| `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`, `unavailable`), `status`, `suppressed` |
+| `gateway_whatsapp_accept_failed` | debug for `kind=connection`, warn for `kind=exhausted` | `transport`, `kind`, `error` |
+| `gateway_whatsapp_listener_stopped` | error | `transport`, `error` |
+| `gateway_whatsapp_reply_partial` | warn | `category`, `delivered` |
+
+`suppressed` is the count this line stands for: each reason is emitted at most once a minute, and
+the next emission carries how many refusals were folded into the gap. A misconfigured app secret is
+therefore one `reason=signature` line a minute rather than one per delivery attempt, and reading the
+rate means reading `suppressed` rather than counting lines. `error` on the accept and listener
+events is the operating system's message for a socket call — never a request, a body, or a sender.
+None of these carries a phone number, a WABA identifier, a message ID, or message text; the sender's
+canonical subject still arrives only through `gateway.message.received` under the payload gate.
 
 ### What conversation history changes
 
@@ -415,7 +437,8 @@ Telemetry includes operation names, model/provider/capability identifiers, bound
 - model tool-call IDs and the script text a model authors, along with that script's output;
 - provider input and output (including every durable-memory query and turn);
 - inbound chat message text, durable memory content/query/scope, and canonical subject identifiers of the people who sent it;
-- activity channel/thread/message targets, native status text, reaction names, and raw service errors;
+- activity targets, owned-thread workspace/channel/thread/sender claims, native status text, reaction
+  names, and raw service errors;
 - chat bot tokens and the environment variable values behind every configured credential;
 - command arguments, in every form and at every level;
 - bearer tokens, OTLP authorization headers, and provider credentials; and

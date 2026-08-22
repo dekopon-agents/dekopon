@@ -183,6 +183,7 @@ impl TelegramTransport {
             conversation,
             // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
+            thread_continuation: None,
             reply: ReplyTarget::Telegram {
                 chat_id,
                 reply_to,
