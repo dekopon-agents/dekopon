@@ -24,6 +24,11 @@ pub enum Statement {
     While(WhileLoop),
     /// `case WORD in PATTERN) ...;; esac`.
     Case(CaseStatement),
+    /// A `{ ...; }` group: several statements run as one command, in the current scope.
+    ///
+    /// Not a subshell — this shell forks nothing. The group exists so a list of statements can be
+    /// one pipeline stage, one redirection target, or one `||` branch.
+    Group(Program),
     /// `name() { ... }`.
     Function(FunctionDefinition),
 }
@@ -53,9 +58,29 @@ pub enum AndOr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pipeline {
     /// Commands in left-to-right order; never empty.
-    pub commands: Vec<SimpleCommand>,
+    pub commands: Vec<Command>,
     /// `true` when a leading `!` inverts the pipeline's exit status.
     pub negated: bool,
+}
+
+/// One stage of a pipeline.
+///
+/// A stage is a simple command or a compound one — `if`, `for`, `while`, `until`, `case`, or a
+/// `{ ...; }` group — which is what makes `cmd | while read line; do ...; done` and
+/// `cmd || { echo failed; exit 1; }` expressible. A compound stage runs in the *current* scope:
+/// there are no subshells here, so a variable a piped `while` loop assigns is still set afterwards,
+/// which is the opposite of bash and the thing that makes the idiom usable rather than a trap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Command {
+    /// A command word with its arguments.
+    Simple(SimpleCommand),
+    /// A compound statement, with any redirections written after it.
+    Compound {
+        /// The statement to run.
+        statement: Box<Statement>,
+        /// Redirections applied to the whole statement.
+        redirects: Vec<Redirect>,
+    },
 }
 
 /// One command: optional assignment prefixes, argv words, and its redirections.
