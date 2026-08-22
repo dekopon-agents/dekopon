@@ -846,6 +846,98 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#),
 }
 
 // ---------------------------------------------------------------------------
+// Shell options
+// ---------------------------------------------------------------------------
+
+#[test]
+fn errexit_ends_the_script_at_the_first_untested_failure() {
+    let outcome = run("set -e\necho before\nnosuchcmd.here\necho after");
+    assert_eq!(outcome.exit_code.get(), 127);
+    assert!(outcome.output.contains("before"), "{outcome:?}");
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+    assert!(outcome.output.contains("`set -e` is on"), "{outcome:?}");
+
+    // Off by default, and `set +e` turns it back off.
+    assert!(output("nosuchcmd.here\necho after").contains("after"));
+    assert!(
+        output("set -e\nset +e\nnosuchcmd.here\necho after").contains("after"),
+        "`set +e` must restore the default"
+    );
+}
+
+#[test]
+fn errexit_leaves_a_tested_status_alone() {
+    // Bash's three exemptions, each one a position where the script is already asking whether the
+    // command failed. Tripping there would break the very idiom used to handle failure.
+    for script in [
+        "set -e\nif nosuchcmd.here; then echo yes; else echo handled; fi\necho after",
+        "set -e\nnosuchcmd.here || echo handled\necho after",
+        // `if a && b` nests two exemptions.
+        "set -e\nif true && nosuchcmd.here; then echo handled; else echo handled; fi\necho after",
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{script}");
+        assert!(outcome.output.contains("handled"), "{script}: {}", outcome.output);
+        assert!(outcome.output.contains("after"), "{script}: {}", outcome.output);
+    }
+    assert_eq!(code("set -e\n! nosuchcmd.here\necho after"), 0);
+    assert_eq!(code("set -e\nwhile nosuchcmd.here; do echo body; done\necho after"), 0);
+    // The final operand of a chain is *not* exempt: nothing is asking about it.
+    let outcome = run("set -e\ntrue && nosuchcmd.here\necho after");
+    assert_eq!(outcome.exit_code.get(), 127);
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+}
+
+#[test]
+fn nounset_refuses_a_name_nothing_ever_set() {
+    let outcome = run("set -u\necho \"[$missing]\"\necho after");
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+    assert!(outcome.output.contains("missing: unbound variable"), "{outcome:?}");
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+
+    // The expansions written to handle an absent value must not be what trips it.
+    assert_eq!(output("set -u\necho ${missing:-fallback}"), "fallback");
+    assert_eq!(output("set -u\necho \"[${missing+set}]\""), "[]");
+    assert_eq!(output("set -u\nx=\necho \"[$x]\""), "[]");
+}
+
+#[test]
+fn pipefail_reports_the_rightmost_stage_that_failed() {
+    // Without it, a capability that never ran hides behind a `jq` that was handed nothing and
+    // succeeded anyway — the exact shape a model writes and then misreads.
+    assert_eq!(code("nosuchcmd.here | jq ."), 0);
+    assert_eq!(code("set -o pipefail\nnosuchcmd.here | jq ."), 127);
+    assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
+    assert_eq!(code("set -o pipefail\nset +o pipefail\nnosuchcmd.here | jq ."), 0);
+}
+
+#[test]
+fn pipestatus_reports_every_stage() {
+    assert!(output("nosuchcmd.here | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
+    assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
+    assert_eq!(output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"), "1\n3");
+}
+
+#[test]
+fn set_refuses_every_option_it_does_not_enforce() {
+    for (script, expected) in [
+        ("set", "listing or setting positional parameters"),
+        ("set -x", "option -x is not supported"),
+        ("set -o", "-o needs an option name"),
+        ("set -o noclobber", "-o noclobber is not supported"),
+        ("set --", "sets positional parameters"),
+        ("set nope", "is not an option"),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(outcome.output.contains(expected), "{script}: {}", outcome.output);
+    }
+    // The long spellings of the three that are real do work.
+    assert_eq!(code("set -o errexit\nnosuchcmd.here"), 127);
+    assert_eq!(code("set -o nounset\necho $missing"), 1);
+}
+
+// ---------------------------------------------------------------------------
 // `[[ ... ]]`
 // ---------------------------------------------------------------------------
 
@@ -1243,9 +1335,10 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
         // Descriptors beyond the two streams that exist.
         ("echo hi 3>/dev/null", "only descriptors 1"),
         ("cat 0< buf", "input duplication"),
-        // Shell options: `set -e` changing nothing while looking like it had is the exact
-        // failure this design forbids.
-        ("set -euo pipefail\necho after", "no shell options"),
+        // A shell option this shell does not enforce is refused by name rather than accepted and
+        // ignored, which is the failure that kept `set` out entirely before.
+        ("set -x\necho after", "option -x is not supported"),
+        ("set -o noclobber\necho after", "-o noclobber is not supported"),
         // Paren-shaped constructs are four different features, not one subshell.
         ("i=0; ((i++))", "arithmetic command"),
         ("arr=(a b c)", "bash array literals"),

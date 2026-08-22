@@ -84,10 +84,6 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
         "export",
         "`export` is excluded: there is no process environment to export into",
     ),
-    (
-        "set",
-        "`set` is excluded: this shell has no shell options, so `set -e`/`set -u`/`set -o pipefail` would change nothing while looking like they had; check each command's status with `$?`, `&&`, `||`, or `exit`",
-    ),
 ];
 
 /// Words the grammar owns, which therefore cannot be a command word or a function name.
