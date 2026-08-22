@@ -367,6 +367,10 @@ impl ChatTransport for WhatsappTransport {
                                 let connection = builder.serve_connection(TokioIo::new(stream), service);
                                 // This includes header parsing, so a slowloris cannot hold a socket
                                 // beyond the same hard deadline as a buffered webhook request.
+                                #[allow(
+                                    clippy::let_underscore_must_use,
+                                    reason = "the outcome is that one untrusted client's connection ended, by deadline or by hanging up; the router already recorded whatever it answered"
+                                )]
                                 let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
                             });
                         }
@@ -751,6 +755,11 @@ fn parse_query(query: &str) -> Result<Vec<(String, String)>, ()> {
     Ok(fields)
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "FromUtf8Error carries back the attacker-supplied query bytes, and this function's \
+              only caller discards the error entirely to answer 403"
+)]
 fn percent_decode(value: &str) -> Result<String, ()> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -816,6 +825,11 @@ struct WhatsappReplier {
 impl WhatsappReplier {
     /// One text message, sent exactly once and never retried.
     async fn send_text(&self, recipient: &str, body: &str) -> Result<String, TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let payload = serde_json::to_vec(&json!({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -843,7 +857,8 @@ impl WhatsappReplier {
                 code: status.as_u16().to_string(),
             });
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| TransportError::Response)?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(TransportError::MalformedResponse)?;
         if value.get("messaging_product").and_then(Value::as_str) != Some("whatsapp") {
             return Err(TransportError::Response);
         }
@@ -1417,6 +1432,51 @@ mod tests {
         assert_eq!(body["text"]["preview_url"], false);
     }
 
+    /// A 200 that is not JSON is what an interposed proxy or a captive portal returns, and it is
+    /// indistinguishable from a missing field unless the parse error survives the call.
+    #[tokio::test]
+    async fn a_graph_response_that_is_not_json_keeps_the_parse_error() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("read");
+            assert!(read > 0, "the request arrives");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 32\r\nConnection: close\r\n\r\n<html><body>Forbidden</body></ht",
+                )
+                .await
+                .expect("write");
+        });
+        let replier = WhatsappReplier {
+            transport: "wa".to_owned(),
+            endpoint: format!("http://{address}"),
+            version: "v23.0".to_owned(),
+            phone_number_id: "456".to_owned(),
+            access_token: Redacted::new("access-secret".to_owned()),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client"),
+        };
+        let error = replier
+            .send_text("1603", "hello")
+            .await
+            .expect_err("HTML is not a Graph response");
+        assert_eq!(error.category(), "malformed-response");
+        let source = std::error::Error::source(&error).expect("the parse error is kept");
+        let detail = source.to_string();
+        assert!(detail.contains("line 1 column 1"), "{detail}");
+        server.await.expect("server");
+    }
+
     #[tokio::test]
     async fn outcome_unknown_timeout_is_not_retried() {
         use tokio::io::AsyncReadExt as _;
@@ -1428,6 +1488,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("one accept");
             let mut bytes = [0_u8; 1024];
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "this mock only has to hold the connection past the client's deadline; \
+                          whether the request bytes arrived changes nothing about the timeout \
+                          under test"
+            )]
             let _ = stream.read(&mut bytes).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
         });

@@ -164,6 +164,12 @@ impl Selection {
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "ParseIntError separates only empty, non-digit, and overflow for a field spec the \
+              message quotes back in full; the zero check below is what distinguishes the one \
+              rejection an operator is likely to hit"
+)]
 fn parse_position(command: &str, text: &str) -> Result<usize, CommandFailure> {
     let position = text.trim().parse::<usize>().map_err(|_| {
         CommandFailure::usage(format!("{command}: {text:?} is not a positive position"))

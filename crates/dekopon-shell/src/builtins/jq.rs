@@ -327,6 +327,11 @@ fn submit(job: Job) -> Result<(), CommandFailure> {
     // cannot fail.
     let sent = jobs.send(job);
     WORKER.replace(Some(jobs));
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "SendError hands back the job nobody received and says nothing else; the worker \
+                  died before serving it, which the message already states"
+    )]
     sent.map_err(|_| CommandFailure::failed("jq: the filter evaluator stopped before it started"))
 }
 
@@ -352,6 +357,12 @@ fn serve(queue: &Receiver<Job>) {
             Err(message) => Produced::Failed(message),
         };
         // A closed receiver means the evaluator already gave up on this filter.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a closed receiver is the normal end of a filter the budget cut short, \
+                      and the returned SendError only hands back the message nobody is left \
+                      to read; this worker has no caller to report to either way"
+        )]
         let _ = outputs.send(message);
     }
 }
@@ -595,6 +606,11 @@ fn weigh(value: &Value) -> u64 {
 
     let mut meter = Meter(0);
     // Infallible: `Meter` never fails, and a `Value` is always serializable.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "Meter::write and flush both return Ok, and serde_json only fails here on a \
+                  writer error, so there is no failure to propagate and no counter to correct"
+    )]
     let _ = serde_json::to_writer(&mut meter, value);
     meter.0
 }

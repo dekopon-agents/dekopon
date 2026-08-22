@@ -381,6 +381,10 @@ where
         result = &mut broker_serve => broker_result = Some(result),
         result = &mut web_serve => web_result = Some(result),
     }
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "SendError here means every serve task already ended, which is the outcome this broadcast asks for"
+    )]
     let _ = shutdown_sender.send(true);
 
     let drained = drain_services(

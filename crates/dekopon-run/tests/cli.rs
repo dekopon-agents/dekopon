@@ -233,6 +233,12 @@ async fn explicit_broker_mode_uses_authenticated_client_without_loading_componen
     let server = BrokerServer::new(broker, identities, limits).expect("build server fixture");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let server_task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is a shutdown signal like a sent one: this future exists \
+                      to complete, and a test that panicked before sending must still stop the \
+                      server"
+        )]
         let _ = shutdown_receive.await;
     }));
     let socket_text = socket.to_str().expect("UTF-8 socket path").to_owned();
@@ -465,6 +471,12 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
     .expect("build server fixture");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let server_task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is a shutdown signal like a sent one: this future exists \
+                      to complete, and a test that panicked before sending must still stop the \
+                      server"
+        )]
         let _ = shutdown_receive.await;
     }));
 

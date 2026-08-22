@@ -798,6 +798,12 @@ pub(crate) fn read_error_body(response: http::Response<ureq::Body>) -> String {
         .into_reader()
         .take(MAX_ERROR_BODY_BYTES);
     let mut text = String::new();
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "best-effort diagnostic read on a path that has already failed; a short or \
+                  interrupted body leaves whatever arrived in `text`, and reporting the read \
+                  error instead of the service's own message would lose the useful half"
+    )]
     let _ = body.read_to_string(&mut text);
     let text = sanitize_diagnostic(&text);
     if text.trim().is_empty() {

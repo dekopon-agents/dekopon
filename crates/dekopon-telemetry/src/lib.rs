@@ -305,10 +305,27 @@ impl OtlpHttpClient {
             })
             .map_err(TelemetryError::HttpClientThread)?
             .join()
-            .map_err(|_| TelemetryError::HttpClientThreadPanicked)?
+            .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
+                message: panic_message(&*payload),
+            })?
             .map_err(TelemetryError::HttpClient)?;
         Ok(Self(client))
     }
+}
+
+/// Recovers the printable message from a panic payload.
+///
+/// A panic payload is the one failure a `Result` cannot carry, so the message has to be lifted
+/// out here or it is lost with the box. `std::panic` stores a literal message as `&'static str`
+/// and a formatted one as `String`; anything else came from `panic_any` and has no text at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "no panic message".to_owned()
 }
 
 #[async_trait]
@@ -390,8 +407,11 @@ pub enum TelemetryError {
     #[error("could not start OTLP HTTP client builder")]
     HttpClientThread(#[source] std::io::Error),
     /// The dedicated HTTP client thread panicked.
-    #[error("OTLP HTTP client builder panicked")]
-    HttpClientThreadPanicked,
+    #[error("OTLP HTTP client builder panicked: {message}")]
+    HttpClientThreadPanicked {
+        /// The panic's own message; a bare "the builder panicked" names no cause to act on.
+        message: String,
+    },
     /// The reqwest client could not be constructed.
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
@@ -408,9 +428,35 @@ pub enum TelemetryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExporterSettings, TraceContextParts, Transport, remote_context, signal_endpoint};
+    use super::{
+        ExporterSettings, TelemetryError, TraceContextParts, Transport, panic_message,
+        remote_context, signal_endpoint,
+    };
     use opentelemetry::trace::TraceContextExt as _;
     use std::time::Duration;
+
+    /// The panic payload is the only account of why the client thread died, and it is the whole
+    /// reason the failure is reachable: a builder that panics says what it could not build —
+    /// a runtime it could not spawn, a TLS root store it could not load. Reporting "the builder
+    /// panicked" and nothing else leaves an operator with the fact of a dead thread and no cause.
+    #[test]
+    fn a_client_thread_panic_keeps_its_message() {
+        let literal = std::panic::catch_unwind(|| panic!("failed to create tokio runtime"))
+            .expect_err("the closure panics");
+        assert_eq!(panic_message(&*literal), "failed to create tokio runtime");
+
+        let formatted = std::panic::catch_unwind(|| panic!("{} roots missing", 3))
+            .expect_err("the closure panics");
+        assert_eq!(panic_message(&*formatted), "3 roots missing");
+
+        assert_eq!(
+            TelemetryError::HttpClientThreadPanicked {
+                message: panic_message(&*literal),
+            }
+            .to_string(),
+            "OTLP HTTP client builder panicked: failed to create tokio runtime"
+        );
+    }
 
     #[test]
     fn generic_otlp_http_endpoint_gets_signal_paths() {

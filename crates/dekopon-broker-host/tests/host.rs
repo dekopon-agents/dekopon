@@ -155,6 +155,11 @@ fn mock_http_stalled() -> (String, Receiver<Vec<u8>>) {
                 Ok(read) => request.extend_from_slice(&buffer[..read]),
             }
         }
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "this fixture exists to hang rather than to be read; a test that gave up on \
+                      the channel and dropped the receiver is a normal way for this send to fail"
+        )]
         let _ = sender.send(request);
         // Hold the connection open past the invocation deadline without ever responding.
         thread::sleep(Duration::from_secs(5));

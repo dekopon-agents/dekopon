@@ -41,6 +41,10 @@ impl StorageTransaction {
         if offset > size {
             return Err(StorageHostError::InvalidArgument);
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, which Arithmetic already states"
+        )]
         let maximum = usize::try_from(u64::from(max_bytes).min(size - offset))
             .map_err(|_| StorageHostError::Arithmetic)?;
         let bytes = if self.entries[&token].loaded {
@@ -48,6 +52,11 @@ impl StorageTransaction {
                 .data
                 .as_ref()
                 .ok_or(StorageHostError::NotFound)?;
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, \
+                          which InvalidArgument already states"
+            )]
             let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
             data[start..start + maximum].to_vec()
         } else {

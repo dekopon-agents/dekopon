@@ -407,6 +407,29 @@ All notable changes to Dekopon are documented here. The format is based on
   documented `export_provider_with_commands!`, dropped the stale `0.1.x` and `0.1.0` version pins
   from `docs/cli.md` and `dekopon-capability`, and gave `Broker::capabilities` its own rustdoc.
 
+- A chat-service reply that is not valid JSON is now reported as `malformed-response` carrying the
+  parse position, distinct from the well-formed-but-missing-field `response` class it previously
+  shared, so an interposed proxy's HTML error page and a renamed API field no longer look alike.
+- A broker `policy-denied` the policy engine never evaluated — a request the Cedar schema does not
+  admit — now emits `policy.request.refused` naming the reason. The wire result and audit reason
+  stay `policy-denied`, so the taxonomy callers act on is unchanged.
+- A retained storage document that fails to decode now emits `storage_document_decode_failed` with
+  the decode class, line, and column, and nothing else; a corruption error previously named a scope
+  and left no description of what was actually wrong with the retained state.
+- Broker daemon configuration failures now name what refused them: an invalid storage path, storage
+  limit, or frame limit reports the offending field and its underlying cause rather than collapsing
+  into one shared "invalid limits" message.
+- Native HTTP malformed-URI failures now carry the parser's reason, and a failed DNS lookup is
+  traced inside the `http.request` span rather than being reduced to `outcome=failed`.
+
+### Fixed
+
+- `runner.command` no longer holds a `tracing` span guard across suspension points, so a concurrent
+  task's events could parent under the wrong span and the holder's own events lost their parent on
+  resume. The span instruments the section instead, matching `http.request` and `broker.authorize`.
+- The workspace now denies `await_holding_invalid_type` for `tracing`'s `Entered` and `EnteredSpan`,
+  so a span guard held across an `.await` is a compile error rather than a review catch.
+
 ### Security
 
 - WhatsApp webhook HMAC is checked over exact raw bytes before parsing; WABA/phone scope and sender

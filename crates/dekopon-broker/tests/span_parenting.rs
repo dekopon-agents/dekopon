@@ -170,6 +170,11 @@ struct GatedAudit {
 
 impl AuditLog for GatedAudit {
     async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the gate announces that it was entered; a test that has stopped listening \
+                      has already made its assertion, and this append must still proceed"
+        )]
         let _ = self.entered.send(());
         self.release.notified().await;
         self.inner.append(event).await

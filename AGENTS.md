@@ -1,10 +1,8 @@
 # Guidance for coding agents
 
-This file applies to the entire repository. Humans can use the same reading guide; agents are expected to follow it before editing code or documentation.
-
 ## Required reading
 
-**Always read [`docs/design.md`](docs/design.md) first.** It is the canonical overview of Dekopon's product model, vocabulary, authority transition, component ownership, and the distinction between current behavior and committed direction. Reading only the roadmap is not enough: roadmap entries are sequencing ideas, not proof that a feature exists or permission to weaken a boundary.
+**Always read [`docs/design.md`](docs/design.md) first.** It is the canonical overview of Dekopon's product model, vocabulary, authority transition, component ownership, and the distinction between current behavior and committed direction.
 
 Then read [`docs/development.md`](docs/development.md). It maps source and tests, records generated and mirrored files, explains the separate provider workspace, and gives scope-specific validation commands.
 
@@ -42,28 +40,30 @@ Finally, read the documents selected by the work:
 - `dekopond` and `dekopon-brokerd` remain separate processes. External-write authority exists now, so this is a live invariant rather than a future one: the gateway must never gain policy, provider credentials, or an authorization path of its own, and CI rejects any broker crate appearing in its normal dependency tree.
 - The direct `dekopon-run` provider path remains read-only and import-free; do not add provider credentials, WASI, host I/O, local writes, external writes, or authorization claims to immediate mode. A broker-backed mode may submit proposals, but only the separate broker may resolve privileged imports or execute effects.
 - Do not describe unimplemented daemons, policy, privileged provider interfaces, or external effects as available.
-- Do not add empty crates or heavy future dependencies without meaningful, tested behavior.
 - Parse config once into typed resources; do not spread YAML handling through command execution.
 - Provider schemas are model-facing metadata, not complete host validation; providers must validate capability-specific input.
 - The SDK and host provider WIT files must remain identical. The SDK copy is also the source for the published `dekopon:provider` WIT package; preserve its import-free boundary and bump its WIT version before changing an already-published contract. The canonical `dekopon:http` WIT file and every checked-in guest or broker-host mirror must also remain identical. Never hand-edit generated provider `.wasm` files; rebuild them from their Rust source.
 - Root workspace commands do not cover the separate workspaces under `examples/providers/`; validate each affected provider workspace explicitly.
 - Do not publish crates, create releases, weaken branch protection, or add credentials without explicit human authorization.
 
+## Known failure patterns — check your diff against each
+
+These are the classes a deep review actually found, repeatedly. Each is checkable.
+
+- Never discard an error's cause. `map_err(|_| …)`, `let _ = fallible()`, and bool/Option returns from multi-cause checks are bugs: emit a tracing event carrying the reason at the discard site, or return an error naming which check failed.
+- Classify errors on the axis the caller acts on: retryable vs permanent, executed vs not-executed. Never report a permanent exhaustion as transient, a completed result as timed out, or exit 0 with the daemon's work dead.
+- Validation reports every conflict, then fails. Never stop at the first error; never last-wins on duplicate keys.
+- Never hold a span guard (`Entered`/`EnteredSpan`) across `.await`; use `.instrument(span)` or `in_scope`.
+- Everything that grows or blocks needs a bound and an owner: a peer-claimed length is a limit to enforce, never a size to preallocate; state retained across model turns needs dedup/eviction; every spawned thread, connection, and network read needs a deadline and something that observes its exit.
+- INFO-level telemetry volume must not scale with model turns, script words, or repeat iterations — but every refusal/failure path must emit its cause once.
+- Construct expensive resources once: HTTP/model clients, Wasmtime engines, linkers, compiled components, and worker threads live at process or session scope, never per request/message/invocation.
+- Every new pub item, dependency, config field, and error variant needs a non-test consumer in the same PR; otherwise make it private or delete it. Parsed-but-unread config and unreachable variants are bugs, not future-proofing.
+- One definition per fact. A pre-validator mirroring an enforcing layer (CLI vs API server, gate vs broker, `Display` vs serde, copied constant) must share the definition or carry an equality-pinning test; a mirror that accepts what the authority rejects is worse than no mirror.
+- New or renamed telemetry/audit event names land in [`docs/observability.md`](docs/observability.md) in the same PR; grep `docs/` and crate READMEs for every identifier or event you rename or remove.
+
 ## Release and publication discipline
 
-Read the maintainer procedure in [`README.md`](README.md#maintainer-release-process) and the validation details in [`docs/development.md`](docs/development.md#dependencies-crates-ci-or-releases) before changing versions, tags, package metadata, or release automation.
-
-- Explicit authorization applies only to the release the human named; it is not standing permission for later versions.
-- Prepare from a clean, current `main`. Every public workspace package must share the release version, and the tag must be exactly `v<VERSION>`.
-- Every release must update [`CHANGELOG.md`](CHANGELOG.md): application tag `v<VERSION>` requires a dated, non-empty `[VERSION]` section, and chart tag `dekopon-chart-<VERSION>` requires `[dekopon-chart-<VERSION>]`. Keep pending work under `[Unreleased]`. Pull-request CI checks both current versions, and each tag workflow rechecks its own entry before publishing.
-- `cargo release` prepares the shared-version commit and tag. Repository configuration intentionally disables its publish and push phases; GitHub Actions owns release artifacts and crates.io trusted publication.
-- An explicitly authorized application tag push validates and publishes provenance-attested GitHub archives, the container image, and every crates.io package in dependency order. The `crates-io` environment is part of the trusted-publisher OIDC identity, not a second required-reviewer gate. A manual `Release` workflow dispatch with `publish_to_crates=true` is only the idempotent recovery path for an existing tag; it skips immutable versions already present.
-- Keep [`.github/release-crates.txt`](.github/release-crates.txt) in package-dependency order, including internal build and dev dependencies that `cargo package` resolves. Pull-request and release-metadata validation check exact coverage, uniqueness, and ordering so a newly public crate cannot be silently omitted or published before a dependency needed for verification.
-- Every public package must have a crates.io GitHub trusted-publisher configuration for repository `dekopon-agents/dekopon`, workflow `release.yml`, and environment `crates-io`. A brand-new crate name cannot use OIDC before it exists: bootstrap it only with explicit authorization and a narrowly scoped credential, register that trusted publisher immediately, then revoke the bootstrap credential.
-- Before tagging, update release-facing status/install text in the root and crate READMEs, then run `cargo package --workspace --locked` in addition to the full test, lint, docs, and dependency checks. Package verification proves local archives; it does not prove the crates publication list is complete, which is why the workflow checks both.
-- Treat crate versions and Git tags as immutable. Never move a release tag, overwrite a published package, expose a long-lived token in a workflow, or print credentials while diagnosing publication. Routine publication uses the OIDC workflow; an explicitly authorized local recovery must use the narrowest credential available and revoke it when the recovery is complete.
-- The publication job may retry only crates.io's explicit new-package `429`, waiting until the server-provided retry time. Any other upload or API failure must stop rather than being hidden by a generic retry loop.
-- After publication, verify every public package through crates.io and test fresh version-pinned installs of `dekopon`, `dekopon-run`, and `dekopon-brokerd`. Do not announce success based only on an upload command.
+Releases require explicit human authorization for the named version only — never standing permission. Follow [`README.md`](README.md#maintainer-release-process) and [`docs/development.md`](docs/development.md#dependencies-crates-ci-or-releases) exactly; CI validates changelog entries, the crates publication list, and package metadata on every pull request, so do not improvise around a red check. `cargo release` only prepares the shared-version commit and tag; GitHub Actions owns publication. Crate versions and Git tags are immutable; never print or expose credentials while diagnosing publication. After publishing, verify crates.io and fresh version-pinned installs of `dekopon`, `dekopon-run`, and `dekopon-brokerd` — an upload command is not verification.
 
 ## Working method
 
@@ -72,7 +72,7 @@ Read the maintainer procedure in [`README.md`](README.md#maintainer-release-proc
 3. Identify the process that owns the data and the process that owns the authority.
 4. Inspect the relevant implementation, nearest tests, generated files, and mirrored contracts; do not infer current behavior from roadmap prose.
 5. Make the smallest coherent change that preserves the authority boundary.
-6. Add failure-path, serialization, CLI, or compile-fail tests appropriate to the change.
+6. Add failure-path, serialization, CLI, or compile-fail tests appropriate to the change. A failure-path test asserts the surfaced error/log carries the underlying cause; a validation test constructs at least two simultaneous conflicts and asserts both are reported.
 7. Update affected documentation and examples in the same pull request.
 8. Run the scope-specific checks in `docs/development.md`; never report a check or remote operation as successful unless it was verified.
 

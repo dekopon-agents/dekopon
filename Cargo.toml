@@ -116,6 +116,15 @@ broken_intra_doc_links = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+# Span guards, mutexes, and RefCell borrows held across `.await` corrupt trace parenting or
+# deadlock. `clippy.toml` names the tracing guard types for `await_holding_invalid_type`.
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+# Discarding a failure's cause at the site that discards it is the most common defect class in
+# this repository. A site that legitimately drops one takes a scoped `#[allow]` with a reason.
+map_err_ignore = "deny"
+let_underscore_must_use = "deny"
 
 [profile.release]
 lto = "thin"

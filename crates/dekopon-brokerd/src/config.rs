@@ -11,7 +11,7 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions};
 use dekopon_broker_protocol::{
-    DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES,
+    DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
 use dekopon_core::{
     Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
@@ -295,7 +295,7 @@ impl ServerLimitsConfig {
             io_timeout: Duration::from_millis(self.io_timeout_ms),
         }
         .validate()
-        .map_err(|_| ConfigError::InvalidServerLimits)
+        .map_err(|source| ConfigError::InvalidFrameLimits { source })
     }
 
     pub fn shutdown_grace(&self) -> Duration {
@@ -331,6 +331,10 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "the policy file's FromUtf8Error would carry its offending bytes back into a log line; PolicyNotUtf8 names the file and deliberately stops there"
+)]
 pub async fn load(
     path: impl AsRef<Path>,
     expected_uid: u32,
@@ -559,11 +563,11 @@ fn resolve(
             // parent here would erase precisely the symlink the storage boundary must reject.
             storage.root_path =
                 dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
-                    .map_err(|_| ConfigError::InvalidStorage)?;
+                    .map_err(|source| ConfigError::StoragePath { source })?;
             storage.namespace_key_path = dekopon_storage_host::resolve_namespace_key_path(
                 &resolve_path(storage.namespace_key_path),
             )
-            .map_err(|_| ConfigError::InvalidStorage)?;
+            .map_err(|source| ConfigError::StoragePath { source })?;
             if storage.namespace_key_path.starts_with(&storage.root_path)
                 || storage.namespace_key_path == storage.root_path
             {
@@ -572,7 +576,7 @@ fn resolve(
             storage
                 .limits
                 .validate()
-                .map_err(|_| ConfigError::InvalidStorage)?;
+                .map_err(|source| ConfigError::InvalidStorage { source })?;
             Ok::<_, ConfigError>(storage)
         })
         .transpose()?;
@@ -581,6 +585,10 @@ fn resolve(
         return Err(ConfigError::ChatMemoryWithoutStorage);
     }
     if let (Some(memory), Some(storage)) = (&chat_memory, &storage) {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "every rejection here is the unit variant BrokerBuildError::InvalidChatMemory, which says nothing ConfigError::InvalidChatMemory does not"
+        )]
         memory
             .validate(&storage.limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
@@ -723,9 +731,17 @@ fn resolve(
         });
     }
     if let Some(memory) = &chat_memory {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "every rejection here is the unit variant BrokerBuildError::InvalidChatMemory, which says nothing ConfigError::InvalidChatMemory does not"
+        )]
         memory
             .validate_host_limits(&host_limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "TryFromIntError carries only out-of-range, and a maxResultBytes wider than this platform's usize is exactly the bound InvalidChatMemory names"
+        )]
         let result =
             usize::try_from(memory.max_result_bytes).map_err(|_| ConfigError::InvalidChatMemory)?;
         if result
@@ -879,10 +895,26 @@ pub enum ConfigError {
     DuplicateSubject { subject: String },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
+    #[error("invalid broker frame limits")]
+    InvalidFrameLimits {
+        /// Which frame bound was rejected: a zero or over-ceiling maximum, or a zero I/O timeout.
+        #[source]
+        source: ProtocolError,
+    },
     #[error("host timeout must be positive")]
     InvalidHostLimits,
+    #[error("could not safely resolve a configured provider storage path")]
+    StoragePath {
+        /// The offending path and the reason it was refused.
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
     #[error("invalid provider storage limits")]
-    InvalidStorage,
+    InvalidStorage {
+        /// Which storage field, value, or relationship was rejected.
+        #[source]
+        source: dekopon_storage_host::StorageConfigError,
+    },
     #[error("chatMemory requires storage")]
     ChatMemoryWithoutStorage,
     #[error("chat-memory bounds do not compose with frame, Wasm, host, and storage limits")]

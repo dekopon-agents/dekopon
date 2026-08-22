@@ -661,6 +661,11 @@ impl BrokerWasmProvider {
                 })?;
             Ok::<_, BrokerHostError>(output)
         };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\"; the \
+                      Timeout variant already names the operation and the budget it exceeded"
+        )]
         let output =
             timeout(operation_timeout, operation)
                 .await
@@ -841,6 +846,11 @@ impl BrokerWasmProvider {
                     source,
                 })
         };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\"; the \
+                      Timeout variant already names the operation and the budget it exceeded"
+        )]
         let operation_result =
             timeout(operation_timeout, operation)
                 .await
@@ -1037,9 +1047,13 @@ impl BrokerProviderRegistry {
         let mut provider_ids = BTreeSet::new();
         let mut declared_words = Vec::new();
         for (source, compiling) in sources.into_iter().zip(compiling) {
-            let compiled = compiling.await.map_err(|_| BrokerHostError::Compile {
+            // A compilation task that panicked used to report itself as a fabricated "did not
+            // complete", sending an operator to look for a truncated artifact. The join failure
+            // says which it was — a panic and its message, or a cancellation — so it is kept as
+            // the cause rather than replaced.
+            let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
                 path: source,
-                source: wasmtime::Error::msg("component compilation task did not complete"),
+                source: wasmtime::Error::new(join),
             })??;
             let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
             if !provider_ids.insert(provider.manifest.id.clone()) {
@@ -1296,6 +1310,13 @@ impl BrokerProviderRegistry {
             (None, None) => None,
             (None, Some(_)) => return Err(BrokerHostError::UnexpectedStorageGrant.into()),
             (Some(_), None) => return Err(BrokerHostError::MissingStorageGrant.into()),
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "a `JoinError` from `spawn_blocking` distinguishes only a panic from \
+                          runtime cancellation, and the panic hook has already printed the panic \
+                          with its location; `storage::StorageState::call` classes the same \
+                          failure as `Io` for the same reason"
+            )]
             (Some(constraints), Some(grant)) => {
                 if grant.invocation() != &proposal.id
                     || grant.capability() != &proposal.capability
@@ -1375,6 +1396,11 @@ async fn describe_component(
                 source: error,
             })
     };
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\"; the Timeout \
+                  variant already names the operation and the budget it exceeded"
+    )]
     let manifest =
         timeout(operation_timeout, operation)
             .await

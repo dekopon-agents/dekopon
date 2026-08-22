@@ -282,12 +282,24 @@ where
     readers.abort_all();
     while readers.join_next().await.is_some() {}
     health_reporter.abort();
+    // Awaiting an aborted handle is how the task is joined, not how it is checked: the only
+    // answer it can give is the cancellation just asked for.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the JoinHandle was aborted on the line above, so its Result is the cancellation \
+                  this shutdown requested rather than an outcome anything can act on"
+    )]
     let _ = health_reporter.await;
     if timeout(STATUS_REPORT_TIMEOUT, &mut usage_reporter)
         .await
         .is_err()
     {
         usage_reporter.abort();
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "reaping a handle this line just aborted, which yields JoinError::Cancelled; \
+                      a reporter that had failed on its own would have completed the timeout above"
+        )]
         let _ = usage_reporter.await;
         tracing::warn!(event = "gateway_usage_reporter_abandoned");
     }

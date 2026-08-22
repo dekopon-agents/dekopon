@@ -125,6 +125,12 @@ impl StorageKey {
                 path: path.to_path_buf(),
             });
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "withheld for secrecy: a YAML failure over the namespace-key document quotes \
+                      the offending scalar, which is the raw key material this type redacts \
+                      everywhere else"
+        )]
         let document: KeyDocument =
             serde_yaml::from_slice(&bytes).map_err(|_| StorageHostError::InvalidKeyFile)?;
         if document.api_version != "dekopon.dev/storage-key/v1alpha1"
@@ -138,8 +144,14 @@ impl StorageKey {
         }
         let mut key = [0_u8; 32];
         for (index, output) in key.iter_mut().enumerate() {
-            *output = u8::from_str_radix(&document.key[index * 2..index * 2 + 2], 16)
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "the 64 characters were just validated as lowercase hexadecimal, so this \
+                          cannot fail, and ParseIntError would quote the key material if it did"
+            )]
+            let byte = u8::from_str_radix(&document.key[index * 2..index * 2 + 2], 16)
                 .map_err(|_| StorageHostError::InvalidKeyFile)?;
+            *output = byte;
         }
         Ok(Self(key))
     }

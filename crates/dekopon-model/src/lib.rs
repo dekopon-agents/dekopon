@@ -7,9 +7,9 @@
 
 /// Native ChatGPT/Codex subscription authentication and Responses transport.
 pub mod chatgpt;
-#[cfg(test)]
-mod mock;
 /// Bounded generated-image clients and output types.
 pub mod image;
+#[cfg(test)]
+mod mock;
 /// Generic chat-model contract and OpenAI-compatible transport.
 pub mod model;

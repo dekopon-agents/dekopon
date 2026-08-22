@@ -209,7 +209,8 @@ impl SlackTransport {
                 return Err(TransportError::Closed);
             }
         };
-        let frame = serde_json::from_str::<Value>(&frame).map_err(|_| TransportError::Response)?;
+        let frame =
+            serde_json::from_str::<Value>(&frame).map_err(TransportError::MalformedResponse)?;
 
         if let Some(envelope) = frame["envelope_id"].as_str() {
             // Before parsing, before routing, before any model call. Slack resends in about three
@@ -433,8 +434,8 @@ async fn open_socket(url: &str) -> Result<Socket, TransportError> {
     loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => {
-                let frame =
-                    serde_json::from_str::<Value>(&text).map_err(|_| TransportError::Response)?;
+                let frame = serde_json::from_str::<Value>(&text)
+                    .map_err(TransportError::MalformedResponse)?;
                 if frame["type"] == "hello" {
                     break;
                 }
@@ -572,6 +573,11 @@ impl ChatReplier for SlackReplier {
             if let Some(thread_ts) = thread_ts {
                 body["thread_ts"] = Value::String(thread_ts);
             }
+            #[allow(
+                clippy::map_err_ignore,
+                reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
+                          keys and serde_json::Number rejects non-finite floats"
+            )]
             let response = self
                 .http
                 .post(format!("{}/api/chat.postMessage", self.endpoint))
@@ -657,6 +663,11 @@ impl SlackReplier {
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts);
         }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let completed = check_ok(
             self.http
                 .post(format!(
@@ -858,6 +869,11 @@ impl SlackReplier {
     }
 
     async fn post_activity_json(&self, method: &str, body: &Value) -> Result<(), TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
         let response = self
             .http
             .post(format!("{}/api/{method}", self.endpoint))
@@ -1246,7 +1262,8 @@ async fn check_ok(response: reqwest::Response) -> Result<Value, TransportError> 
         .bytes()
         .await
         .map_err(|source| TransportError::Request(Box::new(source)))?;
-    let body = serde_json::from_slice::<Value>(&bytes).map_err(|_| TransportError::Response)?;
+    let body =
+        serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() && body["ok"] == Value::Bool(true) {
         return Ok(body);
     }

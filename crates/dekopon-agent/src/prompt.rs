@@ -1681,8 +1681,8 @@ mod tests {
         IMAGE_GENERATION_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
         ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_NAME,
         ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
-        run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
+        script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.

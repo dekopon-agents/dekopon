@@ -327,6 +327,11 @@ async fn a_saturated_listener_refuses_further_connections() {
             connection_timeout: Duration::from_secs(30),
         },
         async {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "this future's only job is to resolve; a signal and a dropped sender both \
+                          mean stop, and the server treats them identically"
+            )]
             let _ = shutdown_receive.await;
         },
     ));
@@ -343,6 +348,13 @@ async fn a_saturated_listener_refuses_further_connections() {
     refused
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout applies");
+    // Whether this write lands or hits an already-closed socket is exactly what is under test,
+    // and the read below is where the answer is asserted.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the server refusing this connection may close it before the write completes; \
+                  the assertion is the read that follows, not this send"
+    )]
     let _ = refused.write_all(b"GET /ui HTTP/1.1\r\nhost: localhost\r\n\r\n");
     let mut answer = Vec::new();
     // Closed without ever being read, so the peer sees either a clean EOF or a reset — never a
@@ -378,6 +390,11 @@ async fn a_saturated_listener_refuses_further_connections() {
         String::from_utf8_lossy(&answer)
     );
 
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the server may have already stopped on its own, which drops the receiver; the \
+                  await on the next line is what proves it exited"
+    )]
     let _ = shutdown_send.send(());
     server
         .await
@@ -402,6 +419,11 @@ async fn an_idle_connection_is_closed_when_its_deadline_elapses() {
             connection_timeout: Duration::from_millis(300),
         },
         async {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "this future's only job is to resolve; a signal and a dropped sender both \
+                          mean stop, and the server treats them identically"
+            )]
             let _ = shutdown_receive.await;
         },
     ));
@@ -423,6 +445,11 @@ async fn an_idle_connection_is_closed_when_its_deadline_elapses() {
         "a connection cut at its deadline never produced a response"
     );
 
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the server may have already stopped on its own, which drops the receiver; the \
+                  await on the next line is what proves it exited"
+    )]
     let _ = shutdown_send.send(());
     server
         .await

@@ -167,7 +167,20 @@ pub(crate) fn initialize(
         .with(otel_log_layer)
         .try_init()
     {
+        // Best-effort teardown of two providers that never received a span: `try_init` just
+        // failed, so nothing was exported and there is no installed subscriber for a shutdown
+        // diagnostic to reach anyway.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of providers that exported nothing; the returned Subscriber error \
+                      is the failure, and no subscriber is installed to carry a second one"
+        )]
         let _ = logger_provider.shutdown_with_timeout(shutdown_timeout);
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "rollback of providers that exported nothing; the returned Subscriber error \
+                      is the failure, and no subscriber is installed to carry a second one"
+        )]
         let _ = tracer_provider.shutdown_with_timeout(shutdown_timeout);
         return Err(TraceError::Subscriber(error.to_string()));
     }

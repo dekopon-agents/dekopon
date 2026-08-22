@@ -61,6 +61,12 @@ impl Builtin for Base64 {
         let bytes = STANDARD
             .decode(compact.as_bytes())
             .map_err(|error| CommandFailure::failed(format!("base64: invalid input: {error}")))?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "FromUtf8Error adds only the byte offset of the first invalid sequence, and \
+                      the message already names the whole diagnosis: the decode succeeded and the \
+                      shell has no value type for the bytes it produced"
+        )]
         let decoded = String::from_utf8(bytes).map_err(|_| {
             CommandFailure::failed(
                 "base64: decoded bytes are not valid UTF-8, and this shell has no binary value type",

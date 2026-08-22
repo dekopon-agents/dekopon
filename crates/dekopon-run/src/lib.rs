@@ -888,6 +888,11 @@ fn read_bounded(reader: impl Read, source_name: &str, maximum: usize) -> Result<
     })
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "the error `OsString::into_string` returns is the rejected OsString itself — the \
+              secret this function reads — so naming the cause would print key bytes to stderr"
+)]
 fn read_optional_secret(variable: &str) -> Result<Option<String>, AppError> {
     if variable.trim().is_empty() {
         return Err(AppError::Environment(

@@ -903,6 +903,11 @@ mod tests {
                         read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
                             .await
                             .expect("stub broker reads one request");
+                    #[allow(
+                        clippy::let_underscore_must_use,
+                        reason = "`stub_leg` drops the observation receiver immediately, so a \
+                                  closed channel is the ordinary case for every unobserved test"
+                    )]
                     let _ = observed.send(request);
                     write_frame(&mut stream, &response, FrameLimits::default())
                         .await

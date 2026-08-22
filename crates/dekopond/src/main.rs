@@ -253,6 +253,11 @@ mod tests {
         let (running, is_running) = tokio::sync::oneshot::channel();
         let value = super::bounded_runtime(Duration::from_millis(50), async move {
             tokio::task::spawn_blocking(move || {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the receiver is awaited on the next line and its expect is the real \
+                              assertion; a dropped receiver fails the test there, not here"
+                )]
                 let _ = running.send(());
                 std::thread::sleep(Duration::from_secs(10));
             });

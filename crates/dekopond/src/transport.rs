@@ -402,6 +402,14 @@ pub enum TransportError {
     Service { code: String },
     #[error("chat service response was not the expected shape")]
     Response,
+    /// A service response was not JSON at all, as opposed to JSON missing a field the call needs.
+    ///
+    /// The source is safe to render: every parse behind it targets [`serde_json::Value`], which
+    /// accepts any well-formed document, so the only failures reachable here are syntactic. The
+    /// message is a byte offset and what the parser expected there — an HTML error page from an
+    /// interposed proxy, or a body cut short — and never a field of the payload.
+    #[error("chat service response was not valid JSON")]
+    MalformedResponse(#[source] serde_json::Error),
     #[error("chat service accepted only part of a split answer")]
     PartialDelivery,
     #[error("chat socket closed")]
@@ -424,6 +432,7 @@ impl TransportError {
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::Response => "response",
+            Self::MalformedResponse(_) => "malformed-response",
             Self::PartialDelivery => "partial-delivery",
             Self::Closed => "closed",
             Self::Io(_) => "io",
@@ -438,6 +447,11 @@ pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
     let value = std::env::var_os(name).ok_or_else(|| TransportError::MissingCredential {
         name: name.to_owned(),
     })?;
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "OsString::into_string returns the credential value itself as its error; keeping \
+                  it would move the secret into an error this daemon renders"
+    )]
     let value = value
         .into_string()
         .map_err(|_| TransportError::NonUtf8Credential {

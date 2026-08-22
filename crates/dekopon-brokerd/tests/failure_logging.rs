@@ -239,6 +239,11 @@ async fn framing_and_audit_failures_name_their_cause() {
         BrokerServer::new(broker(1).await, identities(uid), limits()).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "this future's only job is to resolve; a signal and a dropped sender both \
+                      mean stop, and serve treats them identically"
+        )]
         let _ = shutdown_receive.await;
     }));
 
@@ -301,5 +306,11 @@ async fn framing_and_audit_failures_name_their_cause() {
     );
 
     shutdown_send.send(()).expect("signal clean shutdown");
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the expect above is the assertion that the task joined; serve's own Result is \
+                  the shutdown it was just asked for, and every behavior under test was already \
+                  asserted through the client"
+    )]
     let _ = task.await.expect("server task exits");
 }

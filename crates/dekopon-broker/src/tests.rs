@@ -14,10 +14,11 @@ use dekopon_core::{
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, ChatMemoryConfig, ChatScopeClaim,
-    ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError, FileAuditLog,
-    InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints, encode_host_limits,
-    encode_memory_config, encode_storage_limits, is_reserved_memory_route, verify_audit_chain,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, BrokerBuildError, ChatMemoryConfig,
+    ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError,
+    FileAuditLog, InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints,
+    encode_host_limits, encode_memory_config, encode_storage_limits, is_reserved_memory_route,
+    verify_audit_chain,
 };
 
 /// A terminal execution event, for the record shapes a decision-only fixture never reaches.
@@ -623,6 +624,61 @@ fn exhausted_bounds_are_terminal_rather_than_retriable() {
         .capacity_failure_code(),
         None
     );
+}
+
+/// A materialization task that panicked reported itself as `StorageHostError::Io`, which sent an
+/// operator to the filesystem for a bug that is in the code. The wire category stays `storage-io`
+/// — the same step failed before any provider ran — but the panic's own account now survives in
+/// the error chain instead of being replaced by a fabricated I/O failure.
+#[tokio::test]
+async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_category() {
+    let source = tokio::task::spawn_blocking(|| panic!("namespace generation pointer is missing"))
+        .await
+        .expect_err("the blocking task panics");
+    let error = super::BrokerError::StorageTask { source };
+
+    assert_eq!(error.storage_failure_code(), Some("storage-io"));
+    assert!(error.unaudited_outcome().is_none());
+    let cause = std::error::Error::source(&error).expect("the join failure is the cause");
+    assert!(
+        cause
+            .to_string()
+            .contains("namespace generation pointer is missing"),
+        "the panic message was discarded: {cause}"
+    );
+}
+
+/// `localSubjectService` is the one chat-scope field that is free-form operator text rather than
+/// a structural rule, and a typo in it used to produce "attestor chat scope is invalid" — the
+/// same sentence four other rejections produce. The refusal now carries the parse failure, which
+/// quotes the word to change.
+#[test]
+fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
+    let grant = |service: &str| AttestorGrant {
+        namespaces: vec!["slack".to_owned()],
+        chat_scopes: vec![ChatScopeGrant::TransportWide {
+            kind: ChatTransportKind::Local,
+            transport: "local".parse().expect("transport"),
+            local_subject_service: Some(service.to_owned()),
+        }],
+    };
+
+    let error = grant("slcak")
+        .validate()
+        .expect_err("an unknown local subject service is refused");
+    assert!(matches!(
+        error,
+        BrokerBuildError::InvalidChatScopeService { .. }
+    ));
+    let cause = std::error::Error::source(&error).expect("the parse failure is the cause");
+    assert!(
+        cause.to_string().contains("slcak"),
+        "the refusal does not name the offending service: {cause}"
+    );
+
+    grant("slack")
+        .validate()
+        .expect("a canonical local subject service is accepted");
 }
 
 #[test]

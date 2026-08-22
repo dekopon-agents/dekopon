@@ -427,6 +427,11 @@ impl Simulation {
         self.observe()
     }
 
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "both discarded values are TryFromIntError over a positive i128 accumulator, \
+                  carrying only out-of-range, which Arithmetic already states"
+    )]
     fn observe(&mut self) -> Result<(), StorageHostError> {
         // A plan may shrink an existing pointer/marker, so its net delta can be negative. Only the
         // positive peak needs reserving above the already-accounted baseline.
@@ -526,6 +531,12 @@ fn file_length(parent: &Directory, name: &str) -> Result<Option<u64>, StorageHos
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "serializing these owned all-string pointer structs has no failing case; serde_json \
+              fails only on a non-string map key or a Serialize implementation error, and neither \
+              exists here"
+)]
 fn encode_pointer(
     key: &StorageKey,
     base_token: &str,
@@ -576,17 +587,25 @@ fn read_pointer(
     if !base_directory.exists("current")? {
         return Ok(None);
     }
-    let document: PointerDocument =
-        serde_json::from_slice(&base_directory.read_bounded("current", 4_096)?).map_err(|_| {
-            StorageHostError::Corrupt {
-                scope: "authority-pointer",
-            }
-        })?;
+    let document: PointerDocument = serde_json::from_slice(
+        &base_directory.read_bounded("current", 4_096)?,
+    )
+    .map_err(|error| {
+        crate::report_decode_failure("authority-pointer", &error);
+        StorageHostError::Corrupt {
+            scope: "authority-pointer",
+        }
+    })?;
     let body = PointerBody {
         api_version: document.api_version.clone(),
         authority: document.authority.clone(),
         epoch: document.epoch.clone(),
     };
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "serializing this owned all-string pointer body has no failing case; only the \
+                  decode above can actually reject retained bytes"
+    )]
     let encoded = serde_json::to_vec(&body).map_err(|_| StorageHostError::Corrupt {
         scope: "authority-pointer",
     })?;
@@ -811,6 +830,12 @@ pub(crate) fn lifecycle_timestamp(
         return Ok(None);
     }
     let bytes = directory.read_bounded(marker, 4_096)?;
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "Utf8Error reports only a byte offset inside a marker whose every other \
+                  malformation—missing line, extra line, unparsable timestamp—already collapses to \
+                  the same `lifecycle-marker` scope"
+    )]
     let text = std::str::from_utf8(&bytes).map_err(|_| StorageHostError::Corrupt {
         scope: "lifecycle-marker",
     })?;
@@ -826,6 +851,12 @@ pub(crate) fn lifecycle_timestamp(
             scope: "lifecycle-marker",
         });
     }
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "ParseIntError separates only empty, non-digit, and overflow for a line whose one \
+                  valid form is a decimal millisecond timestamp; the MAC check below rejects every \
+                  such line anyway"
+    )]
     let timestamp = timestamp_text
         .parse::<u64>()
         .map_err(|_| StorageHostError::Corrupt {
@@ -875,6 +906,12 @@ pub(crate) fn lock_exclusive(file: &File, timeout_ms: u64) -> Result<(), Storage
     }
 }
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "SystemTimeError carries only how far the clock sits before the epoch and \
+              TryFromIntError only out-of-range; Clock and Arithmetic already state both, and \
+              neither value may be exported as storage telemetry"
+)]
 fn now_ms() -> Result<u64, StorageHostError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)

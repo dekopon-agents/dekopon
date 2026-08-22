@@ -106,7 +106,7 @@ where
         limits
             .frame
             .validate()
-            .map_err(|_| ServerError::InvalidLimits)?;
+            .map_err(|source| ServerError::InvalidFrameLimits { source })?;
         if limits.max_connections == 0
             || limits.max_connections > HARD_MAX_CONNECTIONS
             || limits.shutdown_grace.is_zero()
@@ -717,6 +717,12 @@ impl ConnectionError {
 pub enum ServerError {
     #[error("server limits must be positive and valid")]
     InvalidLimits,
+    #[error("broker frame limits are invalid")]
+    InvalidFrameLimits {
+        /// Which frame bound was rejected: a zero or over-ceiling maximum, or a zero I/O timeout.
+        #[source]
+        source: ProtocolError,
+    },
     #[error("could not accept a broker connection")]
     Accept {
         #[source]

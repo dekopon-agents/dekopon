@@ -11,7 +11,9 @@
 //!    evaluation error at decision time denies.
 //! 3. **Explainable without leaking.** A decision carries the identifiers of the policies that
 //!    determined it and a flag saying whether Cedar reported evaluation errors. Policy text
-//!    reaches a caller only through construction errors, never through a decision.
+//!    reaches a caller only through construction errors, never through a decision. The one
+//!    decision-time text is [`PolicyDecision::refusal`], which describes a request that never
+//!    reached a policy at all.
 //!
 //! Execution constraints deliberately live outside Cedar. Cedar answers "may this principal do
 //! this?"; how narrowly the broker then executes it — timeouts, output ceilings, HTTP destinations,
@@ -90,7 +92,7 @@ use cedar_policy::{
     PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use dekopon_capability::{EffectKind, Idempotency};
-use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
+use dekopon_core::{AgentId, CapabilityId, IdentifierError, PrincipalId, ProviderId, RiskLevel};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -387,15 +389,28 @@ pub struct PolicyDecision {
     /// A stable flag rather than the error text: a denial explanation must not become a channel for
     /// policy source or entity data on a per-request path.
     pub errors_present: bool,
+    /// Why the request could not be turned into a Cedar query at all, when that is what happened.
+    ///
+    /// `None` for every decision Cedar actually made, ordinary denials included. `Some` means the
+    /// broker asked a question the schema does not admit — in practice a capability the policy world
+    /// never declared — which would otherwise present as a blanket denial with nothing anywhere
+    /// saying why.
+    ///
+    /// This does not reopen what [`Self::errors_present`] deliberately closes. That flag is terse
+    /// because an *evaluation* error is reached through policy source and entity attributes. This
+    /// text describes only the request the broker itself assembled from trusted routing state, and
+    /// is reached before any policy is consulted.
+    pub refusal: Option<String>,
 }
 
 impl PolicyDecision {
     /// The answer given when a request could not even be constructed.
-    fn refused() -> Self {
+    fn refused(error: &RequestError) -> Self {
         Self {
             allowed: false,
             determining_policy_ids: Vec::new(),
             errors_present: true,
+            refusal: Some(error.to_string()),
         }
     }
 }
@@ -617,8 +632,9 @@ impl PolicyEngine {
     /// Decides one request; every failure path denies.
     #[must_use]
     pub fn authorize(&self, request: PolicyRequest) -> PolicyDecision {
-        let Ok(cedar_request) = self.build_request(request) else {
-            return PolicyDecision::refused();
+        let cedar_request = match self.build_request(request) {
+            Ok(cedar_request) => cedar_request,
+            Err(error) => return PolicyDecision::refused(&error),
         };
         let response =
             self.authorizer
@@ -635,6 +651,7 @@ impl PolicyEngine {
             allowed: matches!(response.decision(), Decision::Allow) && !errors_present,
             determining_policy_ids,
             errors_present,
+            refusal: None,
         }
     }
 
@@ -664,7 +681,7 @@ impl PolicyEngine {
         &self.digest
     }
 
-    fn build_request(&self, request: PolicyRequest) -> Result<cedar_policy::Request, ()> {
+    fn build_request(&self, request: PolicyRequest) -> Result<cedar_policy::Request, RequestError> {
         let PolicyRequest {
             principal,
             target,
@@ -715,10 +732,40 @@ impl PolicyEngine {
                 pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
             }
         }
-        let context = Context::from_pairs(pairs).map_err(|_| ())?;
+        let context = Context::from_pairs(pairs).map_err(|source| RequestError::Context {
+            message: source.to_string(),
+        })?;
         cedar_policy::Request::new(principal, action, resource, context, Some(&self.schema))
-            .map_err(|_| ())
+            .map_err(|source| RequestError::Schema {
+                message: source.to_string(),
+            })
     }
+}
+
+/// Why one [`PolicyRequest`] could not be expressed as a Cedar query.
+///
+/// Private, and surfaced only as the [`PolicyDecision::refusal`] text: the variants are a debugging
+/// aid for a misconfigured deployment, not an authorization outcome callers should branch on. Every
+/// one of them denies.
+///
+/// Carries rendered diagnostics rather than the Cedar errors themselves, for the same reason
+/// [`PolicyBuildError`] does: those types are neither `Clone` nor small, and this one is reachable
+/// from a value the broker clones per request.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+enum RequestError {
+    /// The trusted routing metadata could not be assembled into a Cedar record.
+    #[error("trusted routing context could not be assembled: {message}")]
+    Context {
+        /// Context-construction diagnostics.
+        message: String,
+    },
+    /// The assembled request does not typecheck against the generated schema. In practice this is a
+    /// capability the policy world does not declare, which no policy could ever have permitted.
+    #[error("request does not validate against the policy schema: {message}")]
+    Schema {
+        /// Request-validation diagnostics.
+        message: String,
+    },
 }
 
 /// Renames each policy to its optional `@id("…")` annotation.
@@ -806,10 +853,11 @@ fn classify_policies(
             let value = uid.id().unescaped().to_owned();
             match type_name.as_str() {
                 PRINCIPAL_TYPE => {
-                    let principal = value.parse::<PrincipalId>().map_err(|_| {
-                        PolicyBuildError::UnknownPrincipal {
+                    let principal = value.parse::<PrincipalId>().map_err(|source| {
+                        PolicyBuildError::MalformedPrincipal {
                             policy: id.clone(),
                             principal: value.clone(),
+                            source,
                         }
                     })?;
                     if !world.principals.contains(&principal) {
@@ -1065,6 +1113,21 @@ pub enum PolicyBuildError {
         policy: String,
         /// Undeclared principal.
         principal: String,
+    },
+    /// A policy named a principal that is not a well-formed identifier.
+    ///
+    /// Deliberately distinct from [`Self::UnknownPrincipal`]. That one says "add this to the
+    /// deployment's identities", which is advice an operator cannot take here: the name could never
+    /// be a principal at all, and the parse error names the rule it broke and where.
+    #[error("policy {policy} names malformed principal {principal:?}")]
+    MalformedPrincipal {
+        /// Policy identifier.
+        policy: String,
+        /// The malformed name, exactly as the policy spelled it.
+        principal: String,
+        /// Why it is not a valid principal identifier.
+        #[source]
+        source: IdentifierError,
     },
     /// A policy named a provider the world does not declare.
     #[error("policy {policy} names undeclared provider {provider:?}")]
