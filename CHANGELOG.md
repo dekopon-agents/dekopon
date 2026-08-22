@@ -9,6 +9,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Bounded every Slack Socket Mode read, and opening a socket, with a 90-second liveness deadline,
+  so a half-open connection is abandoned and reconnected instead of wedging every Slack route
+  silently and indefinitely.
+- Bounded `dekopond`'s exit after the shutdown grace expires, so abandoned blocking session work can
+  no longer overshoot the pod's termination grace by a further full model timeout.
+- `dekopond` now exits non-zero when every chat transport has ended without a requested shutdown,
+  and re-announces individually dead transports as `gateway_transports_degraded` on an interval
+  instead of logging them once.
 - Serialized ChatGPT subscription refreshes across processes on an advisory lock beside the
   credential file, adopting a record another process rotated instead of presenting a refresh token
   the provider has already invalidated, and kept a turn alive on the freshly rotated in-memory

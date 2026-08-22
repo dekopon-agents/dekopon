@@ -3961,7 +3961,12 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
         replier: Arc::new(RecordingReplier::default()),
     };
     let (routed, mut received) = mpsc::channel(4);
-    let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
+    let health = Arc::new(crate::TransportHealth::new(1));
+    let reader = tokio::spawn(crate::read_transport(
+        Box::new(transport),
+        routed,
+        Arc::clone(&health),
+    ));
 
     sender
         .send(message("first"))
@@ -3974,6 +3979,95 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
 
     drop(sender);
     reader.await.expect("the reader ends with its transport");
+    assert_eq!(
+        health.dead(),
+        vec!["dev".to_owned()],
+        "a transport that ended for good is recorded, not only logged once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport() {
+    // The other way a reader ends: shutdown drops the routing loop, so the forward fails. Counting
+    // that as a dead transport would announce a degraded gateway on every clean stop.
+    let (sender, inbound) = mpsc::unbounded_channel();
+    let transport = FakeTransport {
+        name: "dev".to_owned(),
+        inbound,
+        replier: Arc::new(RecordingReplier::default()),
+    };
+    let (routed, received) = mpsc::channel(1);
+    drop(received);
+    let health = Arc::new(crate::TransportHealth::new(1));
+    let reader = tokio::spawn(crate::read_transport(
+        Box::new(transport),
+        routed,
+        Arc::clone(&health),
+    ));
+
+    sender
+        .send(message("nobody is listening"))
+        .expect("fixture accepts a message");
+    reader.await.expect("the reader ends with the daemon");
+    assert!(
+        health.dead().is_empty(),
+        "a reader ending with the daemon is not a transport failure"
+    );
+}
+
+/// Everything `serve` needs when the test is about why it stopped rather than what it routed.
+async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
+    let document = document(directory);
+    let config = resolved(directory, &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory, Vec::new()).await;
+    (runner(broker, ModelScript::forbidden(), 4), routes)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn losing_every_transport_ends_the_daemon_as_a_failure() {
+    // Every reader gone and nobody asked for a shutdown: a gateway whose workspaces all fell off
+    // their tokens has nothing left to answer with, and reporting success would let a supervisor
+    // treat that as a clean run.
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (sender, receiver) = mpsc::channel(4);
+    drop(sender);
+
+    let outcome = crate::serve(
+        runner,
+        routes,
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        receiver,
+        std::future::pending(),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(outcome, crate::ServeOutcome::TransportsLost);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requested_shutdown_ends_the_daemon_successfully() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (_sender, receiver) = mpsc::channel(4);
+
+    let outcome = crate::serve(
+        runner,
+        routes,
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        receiver,
+        std::future::ready(()),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4645,6 +4739,78 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
             .count(),
         2,
         "a disconnect must open a second socket"
+    );
+}
+
+/// A socket that negotiates and then says nothing: the handshake succeeds, the greeting never comes.
+fn spawn_mute_socket_mock() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("socket mock binds");
+    let address = listener.local_addr().expect("socket mock address");
+    listener
+        .set_nonblocking(true)
+        .expect("socket mock is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("socket mock adopts");
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(_socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        // Held open, negotiated, and mute for as long as the test runs.
+        std::future::pending::<()>().await;
+    });
+    format!("ws://{address}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
+    // A half-open connection — a NAT table forgetting the flow, a partition with no RST — reads
+    // exactly like a healthy socket with nothing to say. Slack pings about every 30 seconds and
+    // never goes quiet on its own, so silence past the deadline is a dead path: without one, the
+    // reader waits on it forever and every route on this workspace goes silent with no log line.
+    let second = spawn_socket_mock(vec![events_envelope(
+        "envelope-2",
+        direct_message("u9xyz", "1700000000.000002", "after the wedge"),
+    )]);
+    let wedged = spawn_socket_mock(Vec::new());
+    let http = spawn_http_mock(slack_handler(vec![wedged.url.clone(), second.url.clone()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+    transport.connect().await.expect("slack transport connects");
+
+    let message = expect_message(
+        tokio::time::timeout(Duration::from_secs(10), transport.next())
+            .await
+            .expect("the transport gives up on a socket that stopped speaking")
+            .expect("a message arrives on the socket that replaced it"),
+    );
+    assert_eq!(message.text, "after the wedge");
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        2,
+        "the wedged socket must be replaced rather than held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_socket_that_never_greets_fails_inside_open() {
+    // The same wedge one round earlier: neither the handshake nor the `hello` wait had a deadline
+    // of its own, so a URL that accepts a connection and then stops parks `connect` for good.
+    let http = spawn_http_mock(slack_handler(vec![spawn_mute_socket_mock()]));
+    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+
+    let error = tokio::time::timeout(Duration::from_secs(10), transport.connect())
+        .await
+        .expect("open bounds the greeting it waits for")
+        .expect_err("a socket that never greets is not a connected transport");
+
+    assert_eq!(
+        error.category(),
+        "closed",
+        "an expired deadline takes the reconnect path the backoff loop already owns"
     );
 }
 

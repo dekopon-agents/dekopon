@@ -85,6 +85,13 @@ use crate::{
 const INBOUND_BUFFER: usize = 64;
 /// Informational model-usage deltas waiting to be coalesced for the broker-hosted web UI.
 const USAGE_REPORT_BUFFER: usize = 64;
+/// How often a transport that ended for good is announced again while the daemon keeps serving.
+///
+/// A transport whose reader stops is gone until the process restarts, and the deployment has no
+/// gateway probe: one error line at the moment it happened is a signal nobody is looking at an hour
+/// later. Re-stating it on an interval is what lets an alert fire on the condition rather than on
+/// catching the edge.
+const TRANSPORT_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 /// Informational reporting must not delay gateway startup, an answer, or shutdown.
 const STATUS_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Re-publishes static inventory so a restarted broker recovers its in-memory view.
@@ -240,11 +247,17 @@ where
     });
 
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
+    let health = Arc::new(TransportHealth::new(transports.len()));
     let mut readers = JoinSet::new();
     for transport in transports {
-        readers.spawn(read_transport(transport, sender.clone()));
+        readers.spawn(read_transport(
+            transport,
+            sender.clone(),
+            Arc::clone(&health),
+        ));
     }
     drop(sender);
+    let health_reporter = tokio::spawn(report_transport_health(Arc::clone(&health)));
 
     tracing::info!(
         event = "gateway_started",
@@ -252,7 +265,7 @@ where
         route.count = routes.len()
     );
 
-    serve(
+    let outcome = serve(
         runner,
         routes,
         Arc::new(identities),
@@ -264,6 +277,8 @@ where
     .await;
     readers.abort_all();
     while readers.join_next().await.is_some() {}
+    health_reporter.abort();
+    let _ = health_reporter.await;
     if timeout(STATUS_REPORT_TIMEOUT, &mut usage_reporter)
         .await
         .is_err()
@@ -273,8 +288,19 @@ where
         tracing::warn!(event = "gateway_usage_reporter_abandoned");
     }
 
-    tracing::info!(event = "gateway_stopped");
-    Ok(())
+    match outcome {
+        ServeOutcome::Shutdown => {
+            tracing::info!(event = "gateway_stopped", reason = "shutdown");
+            Ok(())
+        }
+        // Nothing can wake the daemon again, and nobody asked it to stop. Exiting successfully
+        // here is what let a gateway that lost every workspace to a revoked token look like a
+        // clean run to whatever supervises it.
+        ServeOutcome::TransportsLost => {
+            tracing::error!(event = "gateway_stopped", reason = "transports-lost");
+            Err(DekopondError::TransportsLost)
+        }
+    }
 }
 
 fn agent_inventory(catalog: &LocalCatalog) -> AgentInventory {
@@ -487,6 +513,15 @@ fn merge_usage(total: &mut ModelUsageReport, next: ModelUsageReport) {
         .saturating_add(next.total_unreported_calls);
 }
 
+/// Why the routing loop stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServeOutcome {
+    /// Somebody asked the daemon to stop.
+    Shutdown,
+    /// Every transport reader ended, so no message can reach the daemon again.
+    TransportsLost,
+}
+
 /// The routing loop: one message in, at most one session task out.
 #[allow(clippy::too_many_arguments)]
 async fn serve<F>(
@@ -497,11 +532,13 @@ async fn serve<F>(
     mut receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
-) where
+) -> ServeOutcome
+where
     F: Future<Output = ()> + Send,
 {
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
+    let mut outcome = ServeOutcome::Shutdown;
 
     loop {
         // Reaped opportunistically rather than awaited: a finished session's task must not hold a
@@ -512,7 +549,10 @@ async fn serve<F>(
         tokio::select! {
             () = &mut shutdown => break,
             event = receiver.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    outcome = ServeOutcome::TransportsLost;
+                    break;
+                };
                 match event {
                     TransportEvent::Message(message) => {
                         dispatch(&runner, &routes, &identities, &repliers, &mut sessions, *message);
@@ -539,6 +579,7 @@ async fn serve<F>(
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
     }
+    outcome
 }
 
 /// Reports a session task that did not finish normally.
@@ -639,6 +680,7 @@ fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
     sender: mpsc::Sender<TransportEvent>,
+    health: Arc<TransportHealth>,
 ) {
     loop {
         match transport.next().await {
@@ -655,9 +697,68 @@ async fn read_transport(
                     transport = transport.name(),
                     category = error.category()
                 );
+                // Recorded rather than only logged: this daemon keeps serving whatever is left,
+                // so the condition outlives the line that reported it.
+                health.mark_dead(transport.name());
                 return;
             }
         }
+    }
+}
+
+/// Which transports have ended for good, shared by the readers and the health reporter.
+#[derive(Debug)]
+struct TransportHealth {
+    configured: usize,
+    dead: std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl TransportHealth {
+    fn new(configured: usize) -> Self {
+        Self {
+            configured,
+            dead: std::sync::Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn mark_dead(&self, transport: &str) {
+        self.dead
+            .lock()
+            .expect("gateway transport health")
+            .insert(transport.to_owned());
+    }
+
+    /// The dead transports by name, sorted so one line means the same thing every time.
+    fn dead(&self) -> Vec<String> {
+        self.dead
+            .lock()
+            .expect("gateway transport health")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Re-states a degraded transport set on an interval for as long as it stays degraded.
+async fn report_transport_health(health: Arc<TransportHealth>) {
+    let mut interval = tokio::time::interval(TRANSPORT_HEALTH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately once, and nothing can be dead before the readers start.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let dead = health.dead();
+        if dead.is_empty() {
+            continue;
+        }
+        // Configured transport names, which an operator wrote and telemetry already carries per
+        // event. Nothing here comes from a chat service.
+        tracing::warn!(
+            event = "gateway_transports_degraded",
+            transport.dead = dead.len(),
+            transport.configured = health.configured,
+            transports = %dead.join(",")
+        );
     }
 }
 
@@ -770,6 +871,12 @@ pub enum DekopondError {
         #[source]
         source: TransportError,
     },
+    /// Every transport ended on its own, with no shutdown asked for.
+    ///
+    /// The daemon has no way left to hear a message, so it stops. Reporting it as a failure is the
+    /// difference between a supervisor restarting the gateway and a pod that stays green.
+    #[error("every chat transport ended; the gateway can no longer be reached")]
+    TransportsLost,
 }
 
 #[cfg(test)]
