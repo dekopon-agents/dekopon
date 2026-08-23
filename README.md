@@ -13,6 +13,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
 - A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
+- Unreleased: `dekopon console`, a terminal view over a running broker. It shows what policy actually grants an agent beside what its catalog declares, runs turns, and draws each turn's scripts and capability calls with their exact JSON input and result — which exists nowhere else, because history keeps prompts and answers, spans keep argument counts, and audit records keep digests.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic local GitHub catalog with no embedded credentials.
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
@@ -201,6 +202,25 @@ dekopon --config examples/local/dekopon.yaml config view -o json
 The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
 
 See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
+
+## Drive an agent from a terminal
+
+```console
+dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
+dekopon --config examples/local/dekopon.yaml console --subject dev.console.xavier
+```
+
+`dekopon console` is an unprivileged client of a running `dekopon-brokerd` that happens to run the
+agent loop itself, which is the only way to see a tool call's arguments and result at all. A bare
+`dekopon` on a terminal opens the same view; anywhere else it stays the usage error it has always
+been, so nothing scripted changes.
+
+It holds a model credential and nothing else — no policy, no provider credential, no authorization
+— and proposes on behalf of a `dev.<surface>.<name>` subject, the one subject service no external
+service authenticated. A broker admits that only under `allowDevelopmentSubjects: true`, plus the
+same attestor grant and identity mapping every other subject needs. See
+[`docs/cli.md`](docs/cli.md#the-interactive-console) and
+[`crates/dekopon-tui/README.md`](crates/dekopon-tui/README.md).
 
 ## Run a Rust provider immediately
 

@@ -30,8 +30,16 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | Mechanism | Owner | Purpose | Current Dekopon behavior |
 |---|---|---|---|
 | Prompt-prefix cache | Model provider | Avoid recomputing an identical leading prompt | Sends a stable key and stable prefixes; cannot inspect, create, refresh, or delete provider entries |
-| Conversation history | `dekopond` | Let a person ask a follow-up | Optional bounded `(question, final answer)` window in process memory |
+| Conversation history | `dekopond`, and `dekopon console` for its own sessions | Let a person ask a follow-up | Optional bounded `(question, final answer)` window in process memory |
 | Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns + permanent finite dedup; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
+
+A fourth thing is easy to mistake for conversation history and is not: the console's own
+transcript. `dekopon console` keeps every script, capability call, argument, and result of the
+session it ran, and shows which turns are still inside the replay window above. That record is a
+view, never an input — the model receives the same bounded `(question, final answer)` window a
+gateway session would, and the transcript is held in the console's memory for its lifetime and sent
+nowhere. Showing the two side by side is the point: "why did it forget?" is answerable by seeing
+which turns fell out of the window, and nothing else in the system can show that.
 
 A cache hit never substitutes an old answer. The provider still evaluates the complete current request and produces a new response. “Fresh” therefore refers to whether prefix computation can be reused, not whether the answer or its underlying data is fresh.
 
