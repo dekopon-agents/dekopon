@@ -35,7 +35,7 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
 - Bounded per-sender conversation history on `mode: persistent` routes, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key.
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
-- A checked-in nineteen-capability `gh` provider, a `gh` shell builtin, and the `examples/pr-summarizer-linter` end-to-end walkthrough.
+- The `examples/conditional-write` end-to-end walkthrough. The nineteen-capability GitHub provider and its own walkthrough ship from [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh); the image fetches that component at a pinned tag.
 
 Version 0.3.0 is published as provenance-attested CLI archives and a Git tag covering 20 public crates. Those crates were never uploaded: crates.io publication is a separate manual dispatch that has not been run, so crates.io still holds the 17 packages of `0.2.0`. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
 
@@ -90,7 +90,9 @@ Version 0.8.0 adds no crate, inbound listener, policy, provider credential, or e
 
 Version 0.9.0 adds no crate, inbound listener, policy, provider credential, or effect authority. The gateway holds only the transport credentials it already needed, derives every activity target from authenticated envelopes, and treats every status failure as cosmetic.
 
-## Unreleased — text-only Meta WhatsApp Cloud API transport
+## 0.10 — WhatsApp transport, image replies, provider storage, and a review hardening pass (released)
+
+Shipped as one release in two threads. The transport:
 
 - Strict environment-name-only app-secret, verification-token, and access-token configuration with
   explicit bind/callback, WABA, receiving phone-number, and Graph API version.
@@ -107,7 +109,7 @@ policy, authorization path, or effect authority. Media, templates, interactivity
 processing, business management, embedded signup, webhook multiplexing, and TLS termination remain
 out of scope.
 
-## Unreleased — generated image replies, provider storage, and durable on-demand chat memory
+### Generated image replies, provider storage, and durable on-demand chat memory
 
 - Explicit route-scoped OpenAI Images generators: one bounded prompt/attempt/PNG per session,
   native Slack/Discord/Telegram uploads, and a byte-free local/text-history/durable-memory contract.
@@ -124,6 +126,13 @@ out of scope.
   component path outside the default scan.
 - Pinned Turso 0.7.2 gate failed on forbidden JS/C/build paths and wasm compilation, so SQLite did
   not ship. Durable-files remains engine-neutral and makes no WAL/SHM claim.
+
+Version 0.10.0 adds one bounded inbound listener — the WhatsApp webhook, HMAC-authenticated
+before parsing and behind external TLS — and broker-owned provider storage behind explicit storage
+grants. Identity mapping and effect authorization remain solely the broker's, and the gateway holds
+only transport credentials. The same release lands a 145-finding deep-review hardening pass:
+diagnosable failure causes end to end, single-pass authorization and audit serialization on the hot
+path, and three recurring failure classes promoted to deny-by-default clippy lints.
 
 ## Next milestones
 

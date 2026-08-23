@@ -11,6 +11,7 @@ dekopon-http-host
 dekopon-protocol
 dekopon-provider-sdk
 dekopon-broker-host
+dekopon-provider-sdk-testkit
 dekopon-broker-protocol
 dekopon-webui
 dekopon-agent

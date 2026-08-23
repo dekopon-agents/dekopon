@@ -4,7 +4,7 @@
 //! A catalog that stops parsing, or an agent whose capability list drifts from the workflow the
 //! example promises, breaks instructions a reader follows literally. Both review examples may
 //! propose a comment and neither may approve or merge; the end-to-end example additionally proves
-//! that its complete `gh` surface agrees with the broker configuration and provider manifest.
+//! that its complete surface agrees with the broker configuration and the provider manifest.
 
 use std::path::{Path, PathBuf};
 
@@ -45,12 +45,16 @@ fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
 }
 
 #[test]
-fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
-    let catalog = load(&example("pr-summarizer-linter/dekopon.yaml"));
+fn the_conditional_write_example_matches_the_http_probe_provider_manifest() {
+    let catalog = load(&example("conditional-write/dekopon.yaml"));
 
     let agent = catalog
-        .agent(&"pr-summarizer-linter".parse().expect("valid agent id"))
-        .expect("the PR summarizer and linter agent exists");
+        .agent(
+            &"xaviers-conditional-writer"
+                .parse()
+                .expect("valid agent id"),
+        )
+        .expect("the conditional writer agent exists");
     assert!(agent.spec.enabled, "a disabled agent routes to nothing");
     assert_eq!(agent.spec.model_class.as_deref(), Some("reasoning"));
     assert!(
@@ -59,7 +63,7 @@ fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
             .instructions
             .as_ref()
             .is_some_and(|instructions| !instructions.trim().is_empty()),
-        "review behavior must be explicit standing orders"
+        "write behavior must be explicit standing orders"
     );
     let capabilities = agent
         .spec
@@ -69,22 +73,12 @@ fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
         .collect::<Vec<_>>();
     assert_eq!(
         capabilities,
-        vec![
-            "gh.content.read",
-            "gh.pull-request.read",
-            "gh.pull-request.files",
-            "gh.pull-request.diff",
-            "gh.pull-request.status",
-            "gh.pull-request.comment",
-        ],
-        "the catalog surface must stay the narrow summarize-and-lint slice"
+        vec!["http-probe.fetch", "http-probe.conditional-write"],
+        "the catalog surface must stay the slice the broker constrains"
     );
     assert!(
-        !capabilities.iter().any(|capability| matches!(
-            *capability,
-            "gh.pull-request.approve" | "gh.pull-request.request-changes" | "gh.pull-request.merge"
-        )),
-        "summary and lint authority must not imply review verdict or merge authority"
+        !capabilities.contains(&"http-probe.purge"),
+        "the manifest exposes more than this deployment grants, and it must stay that way"
     );
 
     // The classification a reader compares against the manifest and broker.yaml. The broker
@@ -92,39 +86,15 @@ fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
     // unprivileged catalog from disagreeing with both.
     let expected = [
         (
-            "gh.content.read",
+            "http-probe.fetch",
             EffectKind::ReadOnly,
             RiskLevel::Low,
             Idempotency::Idempotent,
         ),
         (
-            "gh.pull-request.read",
-            EffectKind::ReadOnly,
-            RiskLevel::Low,
-            Idempotency::Idempotent,
-        ),
-        (
-            "gh.pull-request.files",
-            EffectKind::ReadOnly,
-            RiskLevel::Low,
-            Idempotency::Idempotent,
-        ),
-        (
-            "gh.pull-request.diff",
-            EffectKind::ReadOnly,
-            RiskLevel::Low,
-            Idempotency::Idempotent,
-        ),
-        (
-            "gh.pull-request.status",
-            EffectKind::ReadOnly,
-            RiskLevel::Low,
-            Idempotency::Idempotent,
-        ),
-        (
-            "gh.pull-request.comment",
+            "http-probe.conditional-write",
             EffectKind::ExternalWrite,
-            RiskLevel::Medium,
+            RiskLevel::High,
             Idempotency::Conditional,
         ),
     ];
@@ -140,8 +110,8 @@ fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
         );
         assert_eq!(
             capability.spec.provider.as_str(),
-            "gh",
-            "{name} routes to the gh provider"
+            "http-probe",
+            "{name} routes to the probe provider"
         );
         assert!(
             !capability.spec.permissions.is_empty(),
@@ -150,10 +120,10 @@ fn the_pr_summarizer_linter_example_matches_the_gh_provider_manifest() {
     }
 
     let provider = catalog
-        .provider(&"gh".parse().expect("valid provider id"))
-        .expect("the gh provider is declared");
-    assert_eq!(provider.spec.provider_type, "github");
+        .provider(&"http-probe".parse().expect("valid provider id"))
+        .expect("the probe provider is declared");
+    assert_eq!(provider.spec.provider_type, "http");
     // Symbolic, and the same name the broker's constraint sets bind. The value lives in the
     // broker's credentials file and nowhere else.
-    assert_eq!(provider.spec.credential_ref, "github-pat");
+    assert_eq!(provider.spec.credential_ref, "api-token");
 }

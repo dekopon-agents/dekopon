@@ -1445,12 +1445,19 @@ Run one script in Dekopon's sandboxed shell. Returns the script's combined outpu
 `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `break`/`continue`, functions \
-with `$1`/`$@`/`$#`/`shift`/`local`, `$NAME`, `${NAME[index]}`, `$( )`, `$(( ))`, `$?`, `return`, \
+`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` groups \
+— the compound ones all usable as \
+pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
+because nothing here forks — `break`/`continue`, functions \
+with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, \
+`${#NAME}`, \
+`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, \
+`${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, \
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
-`>`/`>>` into named in-memory buffers all behave the way you expect. Everything outside that \
-curated set fails loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `2>&1`, \
-`<<<`, and `&` backgrounding are errors, never silent no-ops. If a script ran, it did what it said.
+redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
+named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
+loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `<<<`, and `&` backgrounding \
+are errors, never silent no-ops. If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
@@ -1461,22 +1468,27 @@ environment variables, and no network reachable except through a capability.
 `posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \"includeBody\": true}`. A repeated \
 flag becomes an array, and a single bare `{...}` argument is used as the input verbatim.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
-in to work on it.
+in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
+`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you capture \
+the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a quiet \
+command leaves its value, and its type, untouched.
 4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
 tripping one ends the script with a message naming it.
 
-Builtins: `jq`, `curl`, `gh`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
-`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Three of them \
+Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
+`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them \
 depend on session configuration and report their exact missing prerequisite otherwise: `curl`, \
 which opens no socket of its own but assembles a request for whichever HTTP capability the session \
-was given; `gh`, which maps GitHub-CLI subcommands (`gh pr view 7 -R owner/repo`, `gh pr review 7 \
--R owner/repo --approve`) onto the correspondingly named granted `gh.*` capabilities; and `date`, \
-which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may contribute \
-further command words; any this session has are listed at the end of this description.
+was given; and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A \
+provider may contribute further command words, which behave the same way and are authorized \
+identically; any this session has are listed at the end of this description.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
-and a `case` pattern too, where `*)` remains the default branch but `*.json)` is an error rather \
-than a silent mismatch. Use `jq` for real matching. A here-document's body arrives as one JSON \
+a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand of `==` inside `[[ ]]`, and a \
+`case` pattern too, where `*)` remains the \
+default branch but `*.json)` is an error rather than a silent mismatch. `${#NAME}` counts \
+characters of a string but elements of an array and keys of an object, because values here are \
+real JSON. Use `jq` for real matching. A here-document's body arrives as one JSON \
 string, so pipe it through `jq` when you want structure out of it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \

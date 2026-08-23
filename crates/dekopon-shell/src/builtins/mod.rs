@@ -26,7 +26,6 @@ pub(crate) mod cap;
 pub(crate) mod clock;
 pub(crate) mod curl;
 pub(crate) mod encode;
-pub(crate) mod gh;
 pub(crate) mod jq;
 pub(crate) mod misc;
 pub(crate) mod text;
@@ -117,6 +116,12 @@ pub(crate) enum FatalError {
     Limit(LimitExceeded),
     /// The script reached a construct this shell deliberately excludes.
     Unsupported(String),
+    /// A `${NAME:?message}` assertion found the parameter absent.
+    ///
+    /// Terminal rather than recoverable, because that is the whole point of the construct: a
+    /// script writes it to stop when a value it depends on is missing. Reporting a status and
+    /// carrying on with an empty string would be the silent wrongness this shell exists to refuse.
+    Assertion(String),
 }
 
 /// Everything a builtin may touch.
@@ -205,7 +210,6 @@ pub(crate) enum BuiltinKind {
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &curl::Curl,
-    &gh::Gh,
     &clock::Date,
     &misc::Sleep,
     &text::Grep,
@@ -400,7 +404,6 @@ mod tests {
             "date",
             "echo",
             "false",
-            "gh",
             "grep",
             "jq",
             "printf",

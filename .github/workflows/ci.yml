@@ -16,8 +16,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: classify CI changes
+    runs-on: ubuntu-24.04
+    outputs:
+      run_expensive: ${{ steps.classify.outputs.run_expensive }}
+    steps:
+      - name: Check out source and pull request history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          is_ci_input() {
+            local path=$1
+            case "$path" in
+              .github/workflows/ci.yml | \
+                .github/release-crates.txt | \
+                .github/scripts/prepare-package-cache.sh | \
+                .github/scripts/test_verify_changelog.py | \
+                .github/scripts/verify-release-metadata.py | \
+                .github/scripts/verify_changelog.py | \
+                CHANGELOG.md | .cargo/* | .clippy.toml | .rustfmt.toml | \
+                Cargo.lock | Cargo.toml | clippy.toml | deny.toml | rust-toolchain.toml | rustfmt.toml | \
+                examples/local/dekopon.yaml | \
+                examples/otel-traces/compose.yaml | examples/otel-traces/smoke-test.sh | \
+                examples/providers/*-provider.wasm | wit/http/http.wit | charts/dekopon/*)
+                return 0
+                ;;
+            esac
+
+            [[ "$path" =~ ^crates/[^/]+/(Cargo\.toml|build\.rs)$ ]] ||
+              [[ "$path" =~ ^crates/[^/]+/(src|tests|examples|benches|wit)/ ]] ||
+              [[ "$path" =~ ^crates/[^/]+/(\.clippy|clippy|\.rustfmt|rustfmt)\.toml$ ]] ||
+              [[ "$path" =~ ^examples/pr-summarizer-linter/[^/]+\.(cedar|yaml|yaml\.example)$ ]] ||
+              [[ "$path" =~ ^examples/providers/[^/]+/(Cargo\.lock|Cargo\.toml|build\.rs)$ ]] ||
+              [[ "$path" =~ ^examples/providers/[^/]+/(src|tests|examples|benches|wit)/ ]] ||
+              [[ "$path" =~ ^examples/providers/[^/]+/(\.clippy|clippy|\.rustfmt|rustfmt)\.toml$ ]]
+          }
+
+          run_expensive=false
+          while IFS= read -r -d '' path; do
+            if is_ci_input "$path"; then
+              printf 'CI input changed: %s\n' "$path"
+              run_expensive=true
+              break
+            fi
+          done < <(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA")
+          echo "run_expensive=$run_expensive" >> "$GITHUB_OUTPUT"
+
+  # Missing classifier output is not false, so classification failures fall back to full CI.
   quality:
     name: quality (stable)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -139,6 +198,8 @@ jobs:
 
   otel-e2e:
     name: OTLP OpenObserve smoke test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Reads the mirrored OpenObserve image from this organization's registry. Narrower than the
@@ -171,7 +232,14 @@ jobs:
 
   msrv:
     name: test (Rust 1.89.0)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
+    # rust-toolchain.toml pins `channel = "stable"`, which outranks the `rustup default`
+    # the toolchain action sets, so this job silently built on stable until 2026-08.
+    # RUSTUP_TOOLCHAIN outranks the toolchain file and is what actually holds the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -179,6 +247,27 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: 1.89.0
+      - name: Verify the MSRV toolchain is in effect
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=1.89.0
+          actual=$(rustc --version | cut -d' ' -f2)
+          if [ "$actual" != "$expected" ]; then
+            printf 'MSRV gate is not binding: expected rustc %s, got %s\n' "$expected" "$actual" >&2
+            rustup show >&2
+            exit 1
+          fi
+      - name: Verify the declared MSRV matches this job
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=1.89.0
+          declared=$(sed -ne 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$declared" != "$expected" ]; then
+            printf 'workspace rust-version is %s but this job pins %s; update both\n' "$declared" "$expected" >&2
+            exit 1
+          fi
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -188,6 +277,8 @@ jobs:
 
   package:
     name: package crates
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -221,6 +312,8 @@ jobs:
 
   cli-smoke:
     name: CLI smoke tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -324,6 +417,8 @@ jobs:
 
   deny:
     name: dependency policy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -336,6 +431,8 @@ jobs:
 
   chart:
     name: helm chart
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source

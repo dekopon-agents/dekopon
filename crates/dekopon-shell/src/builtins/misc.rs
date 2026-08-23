@@ -5,7 +5,7 @@ use std::{thread, time::Duration};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::ExitCode;
+use crate::{ExitCode, ast::DEV_NULL};
 
 /// `echo [-neE] ARGS...`.
 pub(crate) struct Echo;
@@ -218,7 +218,10 @@ impl Builtin for TestBracket {
 ///
 /// File tests (`-f`, `-d`, `-e`, `-r`, `-w`, `-x`) are absent: there is no filesystem, so accepting
 /// them would answer a question this shell cannot ask.
-fn evaluate_test(command: &str, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
+pub(crate) fn evaluate_test(
+    command: &str,
+    arguments: &[String],
+) -> Result<CommandResult, CommandFailure> {
     // Leading `!`s are counted in a loop rather than peeled off by recursion. argv length here is
     // attacker-controlled — an unquoted expansion of a JSON array spreads element by element — so
     // one frame per `!` let a three-line script build a 20,000-deep stack and abort the process.
@@ -407,6 +410,13 @@ impl Builtin for Cat {
 
         let mut values = Vec::new();
         for name in arguments {
+            // `/dev/null` is the one name that never needs a prior write: it discards on the way in
+            // and reads empty on the way out, which is what makes `cmd > /dev/null` and
+            // `cat /dev/null` mean here what they mean everywhere else.
+            if name == DEV_NULL {
+                values.push(Value::Null);
+                continue;
+            }
             let Some(value) = context.buffers.get(name) else {
                 return Err(CommandFailure::failed(format!(
                     "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"

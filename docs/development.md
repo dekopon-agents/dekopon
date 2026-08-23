@@ -21,7 +21,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Domain identifiers and enums | `crates/dekopon-core/src/lib.rs` | Inline unit and compile-fail tests |
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
-| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/pr-summarizer-linter/dekopon.yaml` |
+| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/conditional-write/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, and environment-credential tests |
 | Operator CLI and model auth commands | `crates/dekopon/src/` | `crates/dekopon/tests/cli.rs` |
 | Model clients, bounded OpenAI image generation, and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
@@ -34,7 +34,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket/CLI tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/pr-summarizer-linter/` against the loaded `gh` manifest and Cedar grammar |
+| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket/CLI tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
 | Broker operational web UI | `crates/dekopon-webui/src/`; Wasmtime observations in `crates/dekopon-broker-host/src/{metrics,metadata}.rs` | Router/rendering, escaping/security-header, provider-detail, live-counter, artifact/interface, GET-only, and listener-ceiling tests in `crates/dekopon-webui/tests/dashboard.rs`, request-tracing coverage in `crates/dekopon-webui/tests/request_tracing.rs` (both live outside `src/` because their `echo-provider.wasm` fixture is outside the published package); real bind/redirect coverage in `crates/dekopon-brokerd/tests/server.rs` |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
@@ -42,9 +42,9 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
-| Shared internal fixtures | `crates/dekopon-testkit/` | `crates/dekopon-testkit/tests/` |
+| Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving the checked-in `echo`, `storage-probe`, and `memory-chat` components |
 | Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `gh/`, `skylight-private/`, `memory-chat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
-| End-to-end deployment example | `examples/pr-summarizer-linter/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
+| End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
@@ -82,7 +82,6 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `crates/dekopon-broker-host/wit/deps/http.wit`
 - `examples/providers/http-probe/wit/deps/http.wit`
 - `examples/providers/jsonplaceholder/wit/deps/http.wit`
-- `examples/providers/gh/wit/deps/http.wit`
 - `examples/providers/skylight-private/wit/deps/http.wit`
 
 The storage package is mirrored byte-for-byte at:
@@ -98,7 +97,6 @@ The broker host and imported guests also mirror the provider package:
 - `crates/dekopon-broker-host/wit/deps/provider.wit`
 - `examples/providers/http-probe/wit/deps/provider.wit`
 - `examples/providers/jsonplaceholder/wit/deps/provider.wit`
-- `examples/providers/gh/wit/deps/provider.wit`
 - `examples/providers/skylight-private/wit/deps/provider.wit`
 - `examples/providers/memory-chat/wit/deps/provider.wit`
 - `examples/providers/memory-reservation-probe/wit/deps/provider.wit`
@@ -117,7 +115,6 @@ The checked-in components are generated:
 | `examples/providers/echo/src/lib.rs` | `examples/providers/echo/build.sh` | `examples/providers/echo-provider.wasm` |
 | `examples/providers/http-probe/src/lib.rs` | `examples/providers/http-probe/build.sh` | `examples/providers/http-probe-provider.wasm` |
 | `examples/providers/jsonplaceholder/src/lib.rs` | `examples/providers/jsonplaceholder/build.sh` | `examples/providers/jsonplaceholder-provider.wasm` |
-| `examples/providers/gh/src/` | `examples/providers/gh/build.sh` | `examples/providers/gh-provider.wasm` |
 | `examples/providers/skylight-private/src/lib.rs` | `examples/providers/skylight-private/build.sh` | `examples/providers/skylight-private-provider.wasm` |
 | `examples/providers/memory-chat/src/lib.rs` | `examples/providers/memory-chat/build.sh` | `examples/providers/memory-chat-provider.wasm` |
 | `examples/providers/memory-reservation-probe/src/lib.rs` | `examples/providers/memory-reservation-probe/build.sh` | `examples/providers/memory-reservation-probe-provider.wasm` |
@@ -224,7 +221,7 @@ OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
 
 ### Provider example workspaces
 
-Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `gh`, `skylight-private`, `memory-chat`, `memory-reservation-probe`, `provider-v0-1-compat`, and `storage-probe`):
+Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `skylight-private`, `memory-chat`, `memory-reservation-probe`, `provider-v0-1-compat`, and `storage-probe`):
 
 ```console
 cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
@@ -244,16 +241,13 @@ cargo install wasm-tools --version 1.236.1 --locked
 examples/providers/echo/build.sh
 examples/providers/http-probe/build.sh
 examples/providers/jsonplaceholder/build.sh
-examples/providers/gh/build.sh
 examples/providers/skylight-private/build.sh
 wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools validate examples/providers/jsonplaceholder-provider.wasm
-wasm-tools validate examples/providers/gh-provider.wasm
 wasm-tools validate examples/providers/skylight-private-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/jsonplaceholder-provider.wasm
-wasm-tools component wit examples/providers/gh-provider.wasm
 wasm-tools component wit examples/providers/skylight-private-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked

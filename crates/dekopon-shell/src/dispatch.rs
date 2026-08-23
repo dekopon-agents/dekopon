@@ -471,7 +471,11 @@ mod tests {
 mod reserved {
     use std::collections::BTreeSet;
 
-    use crate::{builtins, interp::telemetry::CONTROL_WORDS, parser::REJECTED_COMMANDS};
+    use crate::{
+        builtins,
+        interp::telemetry::CONTROL_WORDS,
+        parser::{REJECTED_COMMANDS, RESERVED_WORDS},
+    };
 
     /// `dekopon_core::RESERVED_COMMAND_WORDS` and this crate's live tables must agree exactly.
     ///
@@ -481,14 +485,18 @@ mod reserved {
     ///
     /// Missing a word means a provider could claim something the shell would then shadow, and the
     /// manifest would be a lie. Reserving a word no table owns is the opposite failure and the one
-    /// worth naming: when the `gh` builtin is deleted and `gh` becomes an ordinary provider command
-    /// word, a stale entry here would keep the real `gh` provider from claiming its own name.
+    /// worth naming: `gh` was reserved until its builtin was deleted, and had the entry outlived
+    /// the builtin it would have kept the out-of-tree `gh` provider from claiming its own name.
     #[test]
     fn the_reserved_list_matches_the_shells_own_tables() {
         let live = builtins::names()
             .into_iter()
             .chain(CONTROL_WORDS.iter().copied())
             .chain(REJECTED_COMMANDS.iter().map(|(word, _)| *word))
+            // Grammar keywords belong here for the same reason: the parser consumes them before
+            // dispatch ever runs, so a provider declaring `do` as a command word would load
+            // successfully and then never be reachable — a manifest that is a lie.
+            .chain(RESERVED_WORDS.iter().copied())
             .collect::<BTreeSet<_>>();
         let declared = dekopon_core::RESERVED_COMMAND_WORDS
             .iter()

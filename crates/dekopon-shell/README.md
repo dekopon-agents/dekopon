@@ -23,17 +23,156 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 ## Grammar
 
-**Kept**: simple commands; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `$NAME`, `${NAME}`, `${NAME[index]}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and `>`/`>>` into named in-memory buffers read back by `cat`.
+**Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, `getopts`, and `local` under bash's dynamic scoping; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
-**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, `[[ ]]`, `set` and its options, file-descriptor redirection (`2>`, `>&2`, `2>&1`), here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, `${name:-default}`-style parameter expansions, regex metacharacters in a `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
+**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in a `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
 That last one is where "rejected loudly" reaches inside a construct that was kept. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns already follow, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
+## `read`
+
+`read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
+place input is *consumed*. Everywhere else a piped value is *offered*: every pipeline in a body sees
+it, deliberately, so a condition that never looks at it cannot swallow it before the command that
+does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
+which is what ends the loop. End of input is a status and not a diagnostic, because a message there
+would be one per loop, every loop.
+
+Several names split the line on whitespace runs with the remainder in the last, exactly as bash
+does. That is a rule local to `read`, not a return of POSIX IFS word splitting: nothing else here
+splits, and there is no `IFS` to configure. `-r` is accepted and changes nothing — backslashes are
+never line continuations here — which is said out loud rather than left as a surprise.
+
+`getopts OPTSTRING NAME` parses a shell function's own flags, setting `OPTIND` and `OPTARG` as
+ordinary variables. It is scoped to a function because that is the only place positional parameters
+exist here, and says so rather than silently finding none.
+
+## Shell options
+
+`set -e`, `set -u`, and `set -o pipefail` are real, and their `+` forms turn them back off. `set`
+was refused outright before on the grounds that an option changing nothing while looking like it had
+is the exact class of silent wrongness this shell refuses — which stops being an argument once the
+option is enforced, and remains one for every option that is not. So `set -x`, `set -o noclobber`,
+and `set --` **end the script** by name rather than being ignored or letting it carry on without
+what it asked for.
+
+`errexit` exempts the three positions bash exempts, because each is a place the script is already
+asking whether the command failed: an `if`/`while`/`until` condition, every operand of an `&&`/`||`
+chain but the last, and a pipeline inverted by `!`. They compose — `if a && b; then` nests two — so
+the exemption is a counter rather than a flag.
+
+`pipefail` makes a pipeline report its rightmost failing stage. It matters more here than in bash:
+`some.capability x | jq .` succeeds by default even when the capability never ran, because `jq` was
+handed nothing and had no complaint. `${PIPESTATUS[@]}` is an ordinary global holding one status per
+stage, so `${PIPESTATUS[0]}` and `${#PIPESTATUS[@]}` work through the expansion machinery already
+here.
+
+`nounset` governs a plain `$name` only. `${name:-default}` and its relatives exist precisely to
+handle an absent value, so tripping on them would make the option refuse the idiom written to
+satisfy it.
+
+## `[[ ... ]]`
+
+`[[ ... ]]` runs the **same tests** `[` and `test` run — one function, so the two spellings cannot
+disagree about what `-z` or `-lt` mean, and file tests stay refused with the same message. What it
+adds is the connective grammar bash gives it (`&&`, `||`, `!`, parentheses, all short-circuiting)
+and the promise that an unquoted expansion is one operand, so `[[ -n $v ]]` holds for a value with
+spaces where `[ -n $v ]` falls apart.
+
+One thing is refused rather than translated. In bash the right operand of `==` is a **glob**, so
+`[[ $f == *.json ]]` is a pattern match; every pattern here is literal text, and comparing that
+operand literally would answer exactly that script wrongly and silently. The metacharacter is named
+instead, with quoting as the way out while the parser can still see it (`[[ $f == '*' ]]` compares
+an asterisk) and a run-time-assembled operand checked when it expands. `=~` is refused outright for
+the same reason: there are no regular expressions here to run.
+
+`<` and `>` inside the brackets are string comparisons, not redirections — the lexer cannot know
+that, so the parser translates them back.
+
+## Compound commands
+
+`if`, `for`, `while`, `until`, `case`, and `{ ...; }` are pipeline stages, not just statements, so
+`cmd | while ...; do ...; done` and `cmd || { echo failed; exit 1; }` are ordinary things to write.
+They parse through the same production either way, and carry their own redirections:
+`{ a; b; } 2> log`.
+
+A compound stage runs in the **current scope**. There are no subshells here to run it in, so a
+variable a piped `while` loop assigns is still set after the loop — the opposite of bash, where that
+assignment is thrown away with the subshell and is the single most notorious trap in the language.
+The obvious script does the obvious thing.
+
+A stage feeding a pipe, a redirection, or a `$( )` has its emissions collected into one value, since
+each statement inside emits separately and `{ echo a; echo b; } | wc -l` must see both. That is the
+same collection a command substitution already performed.
+
+`{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
+unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.
+
+## Parameter expansion
+
+`${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}` and their colon-free forms behave as bash
+does, including the distinction the colon draws: `:-` substitutes for a name holding nothing, `-`
+only for one nothing ever assigned. `${NAME:?w}` **ends the script**, because that is what the
+construct is for — reporting a status and carrying on with an empty string would leave a script
+believing it had the value it just asserted it needed.
+
+Two of them answer differently here than in bash, because values are real JSON rather than text.
+`${#NAME}` counts characters of a string, but *elements* of an array and *keys* of an object; the
+character count of an object's JSON text would be an answer about its rendering rather than about
+the value. And `${NAME[@]}` is not bash's sparse-array emulation: it selects the elements of a real
+JSON array, so `"${arr[@]}"` yields one word per element the way `"$@"` does, `${arr[*]}` joins
+them, and `${#arr[@]}` counts them. An unquoted `$NAME` holding an array already spread element by
+element; `[@]` is how that survives quoting.
+
+`${NAME#p}`, `${NAME%p}`, and `${NAME/p/r}` take **literal** patterns, the rule `grep`, `sed`, and
+`case` patterns already follow. A literal pattern matches in exactly one way, so bash's
+longest/shortest pairs (`##`, `%%`) are accepted as a second spelling of the same request rather
+than as a second behavior. A metacharacter is rejected by name: `${p##*/}` is a parse error, and
+quoting is the way through (`${p#'*'}` strips a literal asterisk) exactly while the parser can still
+see the quotes. A pattern assembled at run time is checked when it expands instead, and quoting
+cannot exempt that one because its quotes are already gone. `basename` and `dirname` are the answer
+for the path-slicing idiom `${p##*/}` would have covered.
+
+A whole right-hand side keeps its value rather than collapsing to text — `copy=$obj` followed by
+`${copy[key]}` works, the same deviation that already made `ip=$(curl ...)` followed by
+`${ip[origin]}` work. Glued to anything else it is text again.
+
+Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index re-enters the tokenizer on the native
+stack, so nesting has a fixed ceiling and deep `${a:-${a:- ... }}` is a lex error rather than a
+crashed host process — the same bound the parser applies to `$( $( ... ) )`.
+
+## The two streams
+
+A command produces a **value** on stdout and **text** on stderr, and that split was always there:
+`$( )` captures the value while diagnostics escape it to the terminal, exactly as a real shell
+sends command-substitution stderr past the capture. What is new is that a script can address the
+two halves. `2> log` collects a command's diagnostics into a buffer; `>&2` sends its value to the
+diagnostic stream, which is how `echo "problem" >&2` reports without polluting what the command
+returns; `&> all` sends both to one buffer; and `> /dev/null` discards, that one name being reserved
+rather than a path, because it is the spelling every shell shares and refusing it would be worse
+than admitting it.
+
+`2>&1` is the one place the value model shows through. Merging a text channel into a value channel
+has to mean something exact, so it means what every text-shaped builtin already means: the
+diagnostics become extra lines. A command that produced no diagnostics has nothing to merge and its
+value is left alone — including its type, so `posts.get 2>&1` still hands `jq` an object rather than
+that object's JSON text. The result is that `x=$(cmd 2>&1)` captures *why* something failed, which
+is the idiom the construct exists for.
+
+Redirections resolve left to right, so a duplication copies the destination its target holds at that
+point. The reversed spelling `2>&1 > buf` is a parse error naming itself: bash copies the file
+*description* there and leaves stderr pointing at the terminal, this interpreter has destinations
+rather than descriptions and cannot represent the difference, and that ordering is precisely the one
+a script writes when it believes it captured diagnostics that went somewhere else.
+
+`ScriptOutcome::output` stays one combined, interleaved stream. The streams are addressable from
+inside a script; what a caller receives is still the transcript a terminal would have shown.
+
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `gh` (GitHub-CLI-shaped subcommands dispatching to correspondingly named `gh.*` capabilities), `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint.
 
 Two of them exist only when the embedder configured them, and are "command not found" otherwise: `curl`, whose target capability is fixed for the whole execution, and `date`, which is gated by the off-by-default `Limits::allow_clock`. Reading the wall clock is ambient authority with no capability to go through — there is no provider for "what time is it", and minting a fake one would be a capability nobody granted and nothing audited — so it is an explicit embedder opt-in instead. Off, `date` looks exactly like any ungranted capability; a script cannot distinguish "not permitted" from "not a command" and go looking for a way around. On, it renders the current UTC time as `+%s` or an ISO-8601 instant, and rejects every other format by name rather than shipping a partial `strftime` whose gaps would each be a silently wrong answer.
 

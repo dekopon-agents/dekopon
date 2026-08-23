@@ -152,7 +152,6 @@ fn immediate_host_rejects_components_requiring_privileged_imports() {
     for fixture in [
         "http-probe-provider.wasm",
         "jsonplaceholder-provider.wasm",
-        "gh-provider.wasm",
         "skylight-private-provider.wasm",
         "memory-chat-provider.wasm",
         "storage-probe-provider.wasm",

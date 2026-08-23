@@ -1005,9 +1005,9 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
 
 /// Serves a fixed sequence of responses, one connection each, recording every request.
 ///
-/// The gh provider's conditional writes are two-call capabilities (a pre-read pins the head SHA a
-/// write then carries), so a single-response mock cannot exercise them. Responses carry
-/// `Connection: close`, forcing the client onto a fresh connection per call.
+/// A conditional write is a two-call capability (a pre-read pins the etag the write then carries),
+/// so a single-response mock cannot exercise one. Responses carry `Connection: close`, forcing the
+/// client onto a fresh connection per call.
 fn mock_http_sequence(
     responses: Vec<Vec<u8>>,
 ) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
@@ -1060,27 +1060,18 @@ fn json_http_response(body: &serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
-fn gh_pull_body() -> serde_json::Value {
-    json!({
-        "number": 7,
-        "title": "Add ferocious test coverage",
-        "state": "open",
-        "draft": false,
-        "merged": false,
-        "body": "A body",
-        "user": {"login": "cpetersen"},
-        "head": {"ref": "feature/x", "sha": "a".repeat(40)},
-        "base": {"ref": "main", "sha": "b".repeat(40)},
-        "additions": 10,
-        "deletions": 2,
-        "changed_files": 3,
-        "mergeable_state": "clean",
-        "created_at": "2026-08-01T00:00:00Z",
-        "updated_at": "2026-08-02T00:00:00Z",
-    })
+/// A response carrying the etag the conditional write pins itself to.
+fn etagged_response(etag: &str) -> Vec<u8> {
+    let body = "{}";
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: \
+         {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
-fn gh_approve_constraints(
+fn conditional_write_constraints(
     authority: String,
     methods: &[&str],
     max_requests: u32,
@@ -1100,90 +1091,73 @@ fn gh_approve_constraints(
     }
 }
 
+/// Two authorized calls in one invocation, which is the shape worth covering in tree.
+///
+/// `gh.pull-request.approve` used to be the only in-tree capability that did this, and it left with
+/// the GitHub provider. `http-probe.conditional-write` replaces it so host coverage of `maxRequests`,
+/// per-call evidence, and the host-call limit does not depend on a provider in another repository.
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_pins_the_observed_head_and_leaves_two_evidence_entries() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads without host calls during describe");
-    let review = json!({
-        "id": 42,
-        "state": "APPROVED",
-        "commit_id": "a".repeat(40),
-        "user": {"login": "xavier"},
-        "submitted_at": "2026-08-02T01:00:00Z",
-    });
+async fn a_two_request_capability_leaves_two_evidence_entries() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("the probe loads without host calls during describe");
     let (authority, recorded, server) = mock_http_sequence(vec![
-        json_http_response(&gh_pull_body()),
-        json_http_response(&review),
+        etagged_response("\"v1\""),
+        json_http_response(&json!({"written": true})),
     ]);
 
     let output = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET", "POST"], 2),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET", "POST"], 2),
             ),
             None,
         )
         .await
-        .expect("authorized two-call approve succeeds");
+        .expect("authorized two-call conditional write succeeds");
 
-    assert_eq!(output.provider.as_str(), "gh");
-    assert_eq!(output.output["state"], "APPROVED");
-    assert_eq!(output.output["reviewId"], 42);
-    assert_eq!(output.output["headSha"], "a".repeat(40));
+    assert_eq!(output.provider.as_str(), "http-probe");
+    assert_eq!(output.output["observedEtag"], "\"v1\"");
 
-    // The trace of what actually happened: a pre-read, then a write pinned to the observed SHA.
+    // The trace of what actually happened: a pre-read, then a write pinned to what it observed.
     assert_eq!(output.http_calls.len(), 2);
     assert_eq!(output.http_calls[0].method, "GET");
     assert_eq!(output.http_calls[1].method, "POST");
     let pre_read = String::from_utf8(recorded.recv().expect("pre-read recorded"))
         .expect("fixture request is UTF-8");
-    assert!(
-        pre_read.starts_with("GET /repos/octo/hello/pulls/7 "),
-        "{pre_read}"
-    );
+    assert!(pre_read.starts_with("GET /resource "), "{pre_read}");
     let write = String::from_utf8(recorded.recv().expect("write recorded"))
         .expect("fixture request is UTF-8");
-    assert!(
-        write.starts_with("POST /repos/octo/hello/pulls/7/reviews "),
-        "{write}"
-    );
-    assert!(
-        write.contains(&format!("\"commit_id\":\"{}\"", "a".repeat(40))),
-        "{write}"
-    );
-    assert!(write.contains("\"event\":\"APPROVE\""), "{write}");
+    assert!(write.starts_with("POST /resource "), "{write}");
+    assert!(write.contains("if-match: \"v1\""), "{write}");
     server.join().expect("fixture server exits");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads");
-    let (authority, recorded, server) =
-        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("the probe loads");
+    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
 
     let failure = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET"], 2),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET"], 2),
             ),
             None,
         )
@@ -1206,25 +1180,23 @@ async fn gh_approve_without_post_authority_is_a_terminal_policy_rejection() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gh_approve_over_its_call_budget_trips_the_host_call_limit() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("gh-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("gh provider loads");
-    let (authority, recorded, server) =
-        mock_http_sequence(vec![json_http_response(&gh_pull_body())]);
+async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("the probe loads");
+    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
 
     let failure = registry
         .invoke(
             authorized(
-                "gh.pull-request.approve".parse().expect("valid capability"),
-                json!({
-                    "owner": "octo",
-                    "repo": "hello",
-                    "number": 7,
-                    "endpoint": format!("http://{authority}"),
-                }),
-                gh_approve_constraints(authority.clone(), &["GET", "POST"], 1),
+                "http-probe.conditional-write"
+                    .parse()
+                    .expect("valid capability"),
+                json!({"uri": format!("http://{authority}/resource")}),
+                conditional_write_constraints(authority.clone(), &["GET", "POST"], 1),
             ),
             None,
         )
@@ -1388,68 +1360,28 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
     )
 }
 
+/// The same storage-backed invocation as the raw-API tests above, driven through the testkit.
+///
+/// It is the one place in this suite that exercises the composition a provider author actually
+/// uses, and it keeps `dekopon-provider-sdk-testkit` honest against the host it wraps. Every other
+/// storage test here — the sticky-denial matrix below in particular — still drives
+/// `invoke_with_storage` directly, so the host's own behaviour is never observed only through a
+/// wrapper around it.
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
-    let directory = tempfile::tempdir().expect("storage directory");
-    let directory = directory
-        .path()
-        .canonicalize()
-        .expect("canonical storage directory");
-    let root = directory.join("root");
-    let key = directory.join("key.yaml");
-    std::fs::write(
-        &key,
-        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    )
-    .expect("write key");
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
-    let registry = BrokerProviderRegistry::load_with_storage(
-        [fixture("storage-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        Some(storage.clone()),
-    )
-    .await
-    .expect("probe loads");
-    let capability = "storage-probe.run"
-        .parse::<CapabilityId>()
-        .expect("capability");
-    let constraints = ExecutionConstraints {
-        timeout_ms: 10_000,
-        max_output_bytes: 64 * 1024,
-        http: None,
-        storage: Some(StorageConstraints {
-            interface: StorageInterface::DurableFiles,
-            access: StorageAccess::ReadWrite,
-            namespace: StorageNamespace::Chat,
-        }),
-    };
-    let grant = storage
-        .grant(StorageGrantRequest::new(
-            "invoke-test".parse().expect("invocation"),
-            capability.clone(),
-            "storage-probe".parse().expect("provider"),
-            StorageInterface::DurableFiles,
-            StorageAccess::ReadWrite,
-            StorageNamespace::Chat,
-            "provider-test".parse().expect("agent"),
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            "slack",
-            "probe-transport",
-            "c0123abc",
-            "c0123abc:1712345678.000100",
-            ContinuityPolicy::Stable,
-            b"probe-authority".to_vec(),
-        ))
-        .expect("grant");
-    let output = registry
-        .invoke_with_storage(
-            authorized_for("storage-probe", capability, json!({}), constraints),
-            None,
-            Some(grant),
-        )
+    let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
+        .component(fixture("storage-probe-provider.wasm"))
+        .provider("storage-probe")
+        .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
+        .build()
+        .await
+        .expect("probe loads");
+
+    let output = broker
+        .invoke_full("storage-probe.run", json!({}))
         .await
         .expect("probe succeeds");
+
     assert_eq!(output.output["clocksCalled"], true);
     assert!(output.storage.is_some());
 }
