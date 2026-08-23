@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-23
+
+### Fixed
+
+- Moved the container image's runtime base from `gcr.io/distroless/cc-debian12` (glibc 2.36) to
+  `cc-debian13` (glibc 2.41). `dekopon`'s console gained two weak-linked symbols at `GLIBC_2.39`,
+  `pidfd_spawnp`/`pidfd_getpid` — Rust's std probes both at runtime and falls back cleanly when
+  either is absent, but glibc's dynamic linker refuses to load a binary naming a version node the
+  runtime library lacks at all, weak reference or not, so v0.11.0's container-image publish failed
+  outright. Pure infrastructure: no crate's source changed.
+
 ## [0.11.0] - 2026-08-23
 
 ### Added
@@ -841,7 +852,8 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/dekopon-agents/dekopon/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/dekopon-agents/dekopon/compare/v0.10.0...v0.11.0
 [dekopon-chart-0.2.1]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.2.0...dekopon-chart-0.2.1
 [0.10.0]: https://github.com/dekopon-agents/dekopon/compare/v0.9.0...v0.10.0

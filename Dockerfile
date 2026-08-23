@@ -33,10 +33,15 @@
 # manager. Glibc rather than musl because the release targets are `*-unknown-linux-gnu`. No CA
 # bundle is needed either: `reqwest` and `ureq` use rustls with compiled-in webpki roots.
 #
-# The release archives are built on `ubuntu-24.04`, whose glibc is newer than Debian 12's 2.36, so
-# the runtime base is the constraint the release does not know about. The staging script asserts
-# that no binary requires a symbol newer than 2.36 before staging it; today the highest is 2.34.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+# The release archives are built on `ubuntu-24.04`, whose glibc is newer than the runtime base's,
+# so the runtime base is a constraint the release does not know about. The staging script asserts
+# that no binary requires a symbol newer than what this base provides before staging it. Debian 12
+# (glibc 2.36) held through v0.10.0; the console's `dekopon` binary in v0.11.0 references
+# `pidfd_spawnp`/`pidfd_getpid`, which Rust's std probes as weak symbols at GLIBC_2.39 and falls
+# back from cleanly at runtime — but glibc's dynamic linker refuses to load a binary naming a
+# version node the runtime library lacks at all, weak reference or not, so the weak binding does
+# not exempt it from this floor. Debian 13 (glibc 2.41) covers it with room to spare.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:a77defd6fedbb3392b175ba8ea3d1c22be963c1597c248c3ba987ddd80bfb512
 
 # BuildKit sets this per requested platform. It is the only thing that differs between the two.
 ARG TARGETARCH

@@ -146,7 +146,10 @@ opt-in `dev.<surface>.<name>` subject service. `dekopon-shell` gains the bash-sc
 script author expects — compound commands as pipeline stages, `[[ ... ]]`, enforced
 `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable
 streams. The `gh` shell builtin moves out of tree to `dekopon-provider-gh`, joining `turso-sql` as a
-provider published and versioned separately from this repository.
+provider published and versioned separately from this repository. Version 0.11.1 moves the
+container image's runtime base from Debian 12 to Debian 13 so it publishes at all: the console
+binary references two symbols glibc's dynamic linker requires the runtime library to name even
+though both are weak-probed and safely absent on an older one. No crate's source changed.
 
 ## Next milestones
 

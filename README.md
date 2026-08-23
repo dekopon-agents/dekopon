@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, an interactive terminal console, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.1** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, an interactive terminal console, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
-## What works today in 0.11.0
+## What works today in 0.11.1
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -147,26 +147,26 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.11.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.11.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.11.1 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.11.1). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.11.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.11.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.11.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.11.1 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.11.1-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.11.1-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.11.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.11.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.11.1-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.11.1-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-The workspace contains twenty-five public crates, and the `0.11.0` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
+The workspace contains twenty-five public crates, and the `0.11.1` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
-cargo install --locked --version 0.11.0 dekopon
-cargo install --locked --version 0.11.0 dekopon-run
-cargo install --locked --version 0.11.0 dekopon-brokerd
-cargo install --locked --version 0.11.0 dekopond
+cargo install --locked --version 0.11.1 dekopon
+cargo install --locked --version 0.11.1 dekopon-run
+cargo install --locked --version 0.11.1 dekopon-brokerd
+cargo install --locked --version 0.11.1 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
