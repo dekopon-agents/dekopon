@@ -163,7 +163,7 @@ pub(crate) const WITHHELD: &str = "<withheld>";
 /// matches. This list is that question's answer, and
 /// [`super::tests::control_words_and_their_dispatcher_agree`] pins the two together.
 pub(crate) const CONTROL_WORDS: &[&str] = &[
-    "break", "continue", "return", "exit", "local", "shift", "unset", ":",
+    "break", "continue", "exit", "getopts", "local", "read", "return", "set", "shift", "unset", ":",
 ];
 
 /// Reports whether the evaluator owns this command word rather than the dispatch table.
@@ -282,6 +282,8 @@ pub(crate) fn fatal_exit_code(fatal: &FatalError) -> ExitCode {
     match fatal {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => ExitCode::TIMEOUT,
         FatalError::Limit(_) | FatalError::Unsupported(_) => ExitCode::SYNTAX,
+        // Matches bash, which exits 1 when `${NAME:?}` fires in a script.
+        FatalError::Assertion(_) => ExitCode::FAILURE,
     }
 }
 
@@ -295,6 +297,7 @@ pub(crate) fn fatal_outcome(fatal: &FatalError) -> &'static str {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => "timed-out",
         FatalError::Limit(_) => "limit-exceeded",
         FatalError::Unsupported(_) => "rejected",
+        FatalError::Assertion(_) => "assertion-failed",
     }
 }
 

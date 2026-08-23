@@ -12,6 +12,8 @@ use std::{fmt, iter::Peekable, str::CharIndices};
 
 use thiserror::Error;
 
+use crate::ast::Stream;
+
 /// One lexed token with the source line it started on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Token {
@@ -48,10 +50,20 @@ pub enum TokenKind {
     LeftBrace,
     /// `}` used as a reserved word.
     RightBrace,
-    /// `>`.
-    Great,
-    /// `>>`.
-    GreatGreat,
+    /// `>`, `>>`, `1>`, `1>>`, `2>`, `2>>`, `&>`, `&>>` — a stream into a named buffer.
+    Redirect {
+        /// The stream being redirected.
+        source: Stream,
+        /// `true` for the doubled `>>` forms.
+        append: bool,
+    },
+    /// `>&1`, `>&2`, `1>&2`, `2>&1` — one stream cross-wired onto the other.
+    Duplicate {
+        /// The stream being redirected.
+        source: Stream,
+        /// The stream it is redirected onto; never [`Stream::Both`].
+        target: Stream,
+    },
     /// `<`. Kept so the parser can explain that there are no files to read.
     Less,
     /// A `<<DELIM` here-document, with its body already collected off the following lines.
@@ -76,8 +88,22 @@ impl fmt::Display for TokenKind {
             Self::RightParen => ")",
             Self::LeftBrace => "{",
             Self::RightBrace => "}",
-            Self::Great => ">",
-            Self::GreatGreat => ">>",
+            Self::Redirect { source, append } => {
+                return write!(
+                    formatter,
+                    "{}{}",
+                    source.descriptor(),
+                    if *append { ">>" } else { ">" }
+                );
+            }
+            Self::Duplicate { source, target } => {
+                return write!(
+                    formatter,
+                    "{}>&{}",
+                    source.descriptor(),
+                    target.descriptor()
+                );
+            }
             Self::Less => "<",
             Self::LessParen => "<(",
         };
@@ -132,12 +158,16 @@ pub enum RawPart {
 /// A parameter reference before index words are parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawParameter {
-    /// `$NAME`, `${NAME}`, `${NAME[index]...}`.
+    /// `$NAME`, `${NAME}`, `${NAME[index]...}`, and the transforming `${NAME...}` forms.
     Named {
         /// Variable name.
         name: String,
-        /// Zero or more index words, applied left to right.
-        indices: Vec<RawWord>,
+        /// Zero or more indices, applied left to right.
+        indices: Vec<RawIndex>,
+        /// The transformation to apply.
+        modifier: RawModifier,
+        /// `${#NAME}`.
+        length: bool,
     },
     /// `$1` .. `${N}`.
     Positional(usize),
@@ -149,6 +179,65 @@ pub enum RawParameter {
     PositionalCount,
     /// `$?`.
     LastStatus,
+}
+
+/// One `[...]` selector, before words have been parsed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RawIndex {
+    /// `[expr]`.
+    At(RawWord),
+    /// `[@]`.
+    All,
+    /// `[*]`.
+    AllJoined,
+}
+
+/// One `${NAME...}` transformation, before words have been parsed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RawModifier {
+    /// None.
+    None,
+    /// `:-` / `-`.
+    Default {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// The substitute.
+        word: RawWord,
+    },
+    /// `:=` / `=`.
+    Assign {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// The substitute.
+        word: RawWord,
+    },
+    /// `:?` / `?`.
+    Require {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// The message, if the script gave one.
+        word: Option<RawWord>,
+    },
+    /// `:+` / `+`.
+    Alternate {
+        /// `true` for the `:` form.
+        colon: bool,
+        /// What to produce instead.
+        word: RawWord,
+    },
+    /// `#` / `##`.
+    StripPrefix(RawWord),
+    /// `%` / `%%`.
+    StripSuffix(RawWord),
+    /// `/` / `//`.
+    Replace {
+        /// `true` for `//`.
+        all: bool,
+        /// The literal text to find.
+        pattern: RawWord,
+        /// What to put in its place.
+        replacement: RawWord,
+    },
 }
 
 /// A tokenizer failure.
@@ -164,8 +253,20 @@ pub struct LexError {
 /// Why backtick command substitution is refused, in both quoting contexts.
 const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
 
-/// Why file-descriptor redirection is refused.
-const FD_REDIRECTION_REJECTION: &str = "file-descriptor redirection (`2>`, `>&2`, `2>&1`) is not supported: this shell has one combined output stream, not numbered descriptors; `>` and `>>` write named in-memory buffers";
+/// Why descriptors other than 1 and 2 are refused.
+///
+/// There are no numbered descriptors here to open; there are exactly two streams, and naming a
+/// third would be naming something that does not exist.
+const UNKNOWN_DESCRIPTOR_REJECTION: &str = "only descriptors 1 (the value stream) and 2 (the diagnostic stream) exist in this shell; there is nothing else to redirect";
+
+/// Why input duplication is refused.
+const INPUT_DUPLICATION_REJECTION: &str = "input duplication (`<&`) is not supported: there is no input descriptor to duplicate; pipe a value or `cat` a named buffer instead";
+
+/// Why `&>&` is refused.
+const BOTH_DUPLICATION_REJECTION: &str = "`&>&` is not a redirection: `&>` already sends both streams to one buffer, so there is no second stream left to duplicate";
+
+/// Why a duplication must name a stream rather than a buffer.
+const DUPLICATION_TARGET_REJECTION: &str = "a duplication must name a stream: write `>&1` or `>&2`; to write a buffer use `> name`, `2> name`, or `&> name`";
 
 /// Why the here-string `<<<` is refused.
 ///
@@ -203,9 +304,27 @@ impl LexError {
     }
 }
 
+/// How deeply a `${NAME[...]}` index or a `${NAME:-word}` substitute may nest.
+///
+/// Reading one re-enters the tokenizer on the native stack, so without this a few kilobytes of
+/// `${a:-${a:-${a:- ... }}}` would abort the host process instead of returning a lex error. The
+/// parser applies its own ceiling to `$( $( ... ) )` for exactly the same reason.
+const MAX_PARAMETER_NESTING: u32 = 32;
+
 /// Tokenizes one script.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source).run()
+    Lexer::new(source, 0).run()
+}
+
+/// Tokenizes one embedded fragment already `depth` parameter expansions deep.
+fn tokenize_nested(source: &str, depth: u32, line: usize) -> Result<Vec<Token>, LexError> {
+    if depth >= MAX_PARAMETER_NESTING {
+        return Err(LexError::new(
+            line,
+            format!("parameter expansions nested deeper than {MAX_PARAMETER_NESTING}"),
+        ));
+    }
+    Lexer::new(source, depth).run()
 }
 
 struct Lexer<'a> {
@@ -219,10 +338,12 @@ struct Lexer<'a> {
     word_line: usize,
     /// Here-documents whose operator has been seen but whose body has not started yet.
     pending_here_docs: Vec<PendingHereDoc>,
+    /// How many parameter expansions this tokenizer is already nested inside.
+    depth: u32,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new(source: &'a str, depth: u32) -> Self {
         Self {
             source,
             chars: source.char_indices().peekable(),
@@ -233,6 +354,7 @@ impl<'a> Lexer<'a> {
             word_started: false,
             word_line: 1,
             pending_here_docs: Vec::new(),
+            depth,
         }
     }
 
@@ -636,7 +758,7 @@ impl<'a> Lexer<'a> {
 
     /// Interpolates an unquoted here-document body by re-scanning it as quoted-style text.
     fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
-        let mut lexer = Lexer::new(body);
+        let mut lexer = Lexer::new(body, 0);
         // The body starts on the line *after* the operator, so a diagnostic from inside it counts
         // from there. Seeding this with the operator's own line put every such error one line early.
         lexer.line = line + 1;
@@ -704,6 +826,8 @@ impl<'a> Lexer<'a> {
                 Ok(Some(RawPart::Parameter(RawParameter::Named {
                     name,
                     indices: Vec::new(),
+                    modifier: RawModifier::None,
+                    length: false,
                 })))
             }
             _ => Ok(None),
@@ -747,10 +871,7 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     return Ok(RawPart::Parameter(RawParameter::PositionalCount));
                 }
-                return Err(LexError::new(
-                    line,
-                    "${#name} length expansion is not supported; use `jq length` or `wc` instead",
-                ));
+                return self.read_named_parameter(line, true);
             }
             Some(digit) if digit.is_ascii_digit() => {
                 let mut digits = String::new();
@@ -779,35 +900,220 @@ impl<'a> Lexer<'a> {
             _ => {}
         }
 
+        self.read_named_parameter(line, false)
+    }
+
+    /// Reads `${NAME…}` after any leading `#`, up to and including the closing brace.
+    fn read_named_parameter(&mut self, line: usize, length: bool) -> Result<RawPart, LexError> {
         let name = self.read_name();
         if name.is_empty() {
             return Err(LexError::new(line, "empty ${} parameter reference"));
         }
 
         let mut indices = Vec::new();
-        loop {
-            match self.chars.peek().map(|(_, character)| *character) {
-                Some('}') => {
-                    self.chars.next();
-                    break;
-                }
-                Some('[') => {
-                    self.chars.next();
-                    indices.push(self.read_index_word(line)?);
-                }
-                Some(other) => {
-                    return Err(LexError::new(
-                        line,
-                        format!(
-                            "unsupported ${{{name}{other}...}} parameter expansion; this shell keeps only ${{NAME}} and ${{NAME[index]}}"
-                        ),
-                    ));
-                }
-                None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
+        while self.chars.peek().map(|(_, character)| *character) == Some('[') {
+            // `[@]` and `[*]` select everything, so there is nothing left for a further subscript
+            // to index into. Bash refuses the same shape.
+            if matches!(indices.last(), Some(RawIndex::All | RawIndex::AllJoined)) {
+                return Err(LexError::new(
+                    line,
+                    format!(
+                        "${{{name}[@]}} selects every element, so it cannot be indexed further"
+                    ),
+                ));
             }
+            self.chars.next();
+            indices.push(self.read_index(line)?);
         }
 
-        Ok(RawPart::Parameter(RawParameter::Named { name, indices }))
+        let modifier = self.read_modifier(line, &name, length)?;
+        Ok(RawPart::Parameter(RawParameter::Named {
+            name,
+            indices,
+            modifier,
+            length,
+        }))
+    }
+
+    /// Reads the `${NAME<op>word}` operator, consuming the closing brace.
+    fn read_modifier(
+        &mut self,
+        line: usize,
+        name: &str,
+        length: bool,
+    ) -> Result<RawModifier, LexError> {
+        let first = match self.chars.peek().map(|(_, character)| *character) {
+            Some('}') => {
+                self.chars.next();
+                return Ok(RawModifier::None);
+            }
+            Some(character) => character,
+            None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
+        };
+        // `${#NAME}` asks for a length; there is nothing left for an operator to transform, and
+        // bash agrees. Naming it beats producing the length of a substituted default.
+        if length {
+            return Err(LexError::new(
+                line,
+                format!(
+                    "${{#{name}{first}...}} combines a length with a transformation; ask for one or the other"
+                ),
+            ));
+        }
+        self.chars.next();
+
+        let colon = first == ':';
+        let operator = if colon {
+            match self.chars.next() {
+                Some((_, character)) => character,
+                None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
+            }
+        } else {
+            first
+        };
+
+        let modifier = match operator {
+            '-' => RawModifier::Default {
+                colon,
+                word: self.read_modifier_word(line, &['}'])?.0,
+            },
+            '=' => RawModifier::Assign {
+                colon,
+                word: self.read_modifier_word(line, &['}'])?.0,
+            },
+            '?' => {
+                let word = self.read_modifier_word(line, &['}'])?.0;
+                RawModifier::Require {
+                    colon,
+                    word: (!word.parts.is_empty()).then_some(word),
+                }
+            }
+            '+' => RawModifier::Alternate {
+                colon,
+                word: self.read_modifier_word(line, &['}'])?.0,
+            },
+            // The doubled forms mean "longest match" in bash. A literal pattern has exactly one
+            // match, so they are the same request spelled twice and are accepted as such.
+            '#' | '%' | '/' if colon => {
+                return Err(LexError::new(
+                    line,
+                    format!(
+                        "`${{{name}:{operator}...}}` is not a parameter expansion; drop the colon"
+                    ),
+                ));
+            }
+            '#' | '%' => {
+                let doubled = self.chars.peek().map(|(_, character)| *character) == Some(operator);
+                if doubled {
+                    self.chars.next();
+                }
+                let pattern = self.read_modifier_word(line, &['}'])?.0;
+                if operator == '#' {
+                    RawModifier::StripPrefix(pattern)
+                } else {
+                    RawModifier::StripSuffix(pattern)
+                }
+            }
+            '/' => {
+                let all = self.chars.peek().map(|(_, character)| *character) == Some('/');
+                if all {
+                    self.chars.next();
+                }
+                let (pattern, terminator) = self.read_modifier_word(line, &['/', '}'])?;
+                let replacement = if terminator == '/' {
+                    self.read_modifier_word(line, &['}'])?.0
+                } else {
+                    RawWord { parts: Vec::new() }
+                };
+                RawModifier::Replace {
+                    all,
+                    pattern,
+                    replacement,
+                }
+            }
+            other => {
+                return Err(LexError::new(
+                    line,
+                    format!(
+                        "unsupported ${{{name}{}{other}...}} parameter expansion; this shell keeps \
+                         ${{NAME}}, ${{NAME[index]}}, ${{#NAME}}, `:-`, `:=`, `:?`, `:+`, `#`, `%`, \
+                         and `/`",
+                        if colon { ":" } else { "" }
+                    ),
+                ));
+            }
+        };
+        Ok(modifier)
+    }
+
+    /// Reads the word after a `${NAME<op>` operator, stopping at one of `terminators`.
+    ///
+    /// Returns the word and the terminator that ended it. Nesting is tracked so
+    /// `${a:-${b:-c}}` and `${a:-$(cmd)}` reach their own closing brace rather than the outer one.
+    fn read_modifier_word(
+        &mut self,
+        line: usize,
+        terminators: &[char],
+    ) -> Result<(RawWord, char), LexError> {
+        let mut text = String::new();
+        let mut braces = 0_usize;
+        let mut parens = 0_usize;
+        loop {
+            let Some((_, character)) = self.chars.peek().copied() else {
+                return Err(LexError::new(line, "unterminated ${} parameter reference"));
+            };
+            if braces == 0 && parens == 0 && terminators.contains(&character) {
+                self.chars.next();
+                let word = if text.is_empty() {
+                    RawWord { parts: Vec::new() }
+                } else {
+                    self.sub_word(line, &text)?
+                };
+                return Ok((word, character));
+            }
+            self.chars.next();
+            match character {
+                '{' => braces += 1,
+                '}' => braces = braces.saturating_sub(1),
+                '(' => parens += 1,
+                ')' => parens = parens.saturating_sub(1),
+                '\n' => self.line += 1,
+                '\\' => {
+                    text.push(character);
+                    if let Some((_, escaped)) = self.chars.next() {
+                        text.push(escaped);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            text.push(character);
+        }
+    }
+
+    /// Tokenizes one embedded word, for the right-hand side of a `${NAME<op>word}` expansion.
+    fn sub_word(&mut self, line: usize, text: &str) -> Result<RawWord, LexError> {
+        let tokens = tokenize_nested(text, self.depth + 1, line)?;
+        let mut parts = Vec::new();
+        for (index, token) in tokens.into_iter().enumerate() {
+            match token.kind {
+                // Several words means the text held a separator; the expansion produces one value,
+                // so they are rejoined with the space that separated them.
+                TokenKind::Word(word) => {
+                    if index > 0 {
+                        parts.push(RawPart::SingleQuoted(" ".to_owned()));
+                    }
+                    parts.extend(word.parts);
+                }
+                other => {
+                    return Err(LexError::new(
+                        line,
+                        format!("`{other}` is not allowed inside a ${{}} parameter expansion"),
+                    ));
+                }
+            }
+        }
+        Ok(RawWord { parts })
     }
 
     fn expect_brace_close(&mut self, line: usize) -> Result<(), LexError> {
@@ -817,29 +1123,36 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Reads the index text inside `${NAME[...]}`.
+    /// Reads one selector inside `${NAME[...]}`.
     ///
-    /// Bash's own sparse and associative array emulation is dropped: `${NAME[@]}` and `${NAME[*]}`
-    /// are rejected by name because indexing here is backed by real JSON arrays and objects.
-    fn read_index_word(&mut self, line: usize) -> Result<RawWord, LexError> {
+    /// Indexing here is backed by real JSON arrays and objects, so `[expr]` is an array offset or
+    /// an object key, `[@]` is every element, and `[*]` is every element joined.
+    fn read_index(&mut self, line: usize) -> Result<RawIndex, LexError> {
         let mut text = String::new();
+        let mut depth = 0_usize;
         loop {
             match self.chars.next() {
-                Some((_, ']')) => break,
+                Some((_, ']')) if depth == 0 => break,
                 Some((_, '\n')) => {
                     return Err(LexError::new(line, "unterminated ${NAME[index]} reference"));
                 }
-                Some((_, character)) => text.push(character),
+                Some((_, character)) => {
+                    match character {
+                        '[' => depth += 1,
+                        ']' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                    text.push(character);
+                }
                 None => return Err(LexError::new(line, "unterminated ${NAME[index]} reference")),
             }
         }
-        if text == "@" || text == "*" {
-            return Err(LexError::new(
-                line,
-                "${NAME[@]} array expansion is not supported; an unquoted $NAME holding a JSON array already expands element by element",
-            ));
+        match text.as_str() {
+            "@" => return Ok(RawIndex::All),
+            "*" => return Ok(RawIndex::AllJoined),
+            _ => {}
         }
-        let tokens = tokenize(&text)?;
+        let tokens = tokenize_nested(&text, self.depth + 1, line)?;
         let mut words = tokens.into_iter().filter_map(|token| match token.kind {
             TokenKind::Word(word) => Some(word),
             _ => None,
@@ -853,7 +1166,7 @@ impl<'a> Lexer<'a> {
                 "${NAME[index]} accepts exactly one index expression",
             ));
         }
-        Ok(word)
+        Ok(RawIndex::At(word))
     }
 
     /// Captures a balanced `$( ... )` or `$(( ... ))` body as raw source.
@@ -932,22 +1245,63 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Reads the stream name after a `>&`, having already consumed the `&`.
+    fn read_duplication(&mut self, source: Stream) -> Result<(), LexError> {
+        let target = match self.chars.peek().map(|(_, character)| *character) {
+            Some('1') => Stream::Stdout,
+            Some('2') => Stream::Stderr,
+            _ => return Err(LexError::new(self.line, DUPLICATION_TARGET_REJECTION)),
+        };
+        self.chars.next();
+        // `>&12` would otherwise read as `>&1` followed by the argument `2`, quietly redirecting
+        // somewhere the script did not ask for.
+        if self
+            .chars
+            .peek()
+            .is_some_and(|(_, character)| character.is_ascii_digit())
+        {
+            return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION));
+        }
+        self.push(TokenKind::Duplicate { source, target });
+        Ok(())
+    }
+
     fn read_operator(&mut self, character: char) -> Result<(), LexError> {
-        // `2>`, `2>&1`, and `>&2` all begin as a bare digit word glued to a redirection operator.
-        // Letting the digit finish as an ordinary word would append it to argv and divert the
-        // output into a buffer named `/dev/null`, so the whole shape is rejected by name instead.
-        if matches!(character, '<' | '>')
+        // `2>`, `2>>`, and `2>&1` are a bare descriptor glued to a redirection operator. The digit
+        // belongs to the operator, not to argv: letting it finish as an ordinary word would send
+        // `echo hi 2> log` the argument `2` and redirect its *value* into `log`.
+        let mut source = Stream::Stdout;
+        if character == '>'
             && self.word_started
             && self.parts.is_empty()
             && !self.literal.is_empty()
             && self.literal.chars().all(|digit| digit.is_ascii_digit())
         {
-            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+            source = match self.literal.as_str() {
+                "1" => Stream::Stdout,
+                "2" => Stream::Stderr,
+                _ => return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION)),
+            };
+            // Consumed as the operator's prefix, so it must not also become a word. Clearing the
+            // literal alone would leave `finish_word` pushing an empty word onto argv.
+            self.literal.clear();
+            self.word_started = false;
+        } else if character == '<'
+            && self.word_started
+            && self.parts.is_empty()
+            && !self.literal.is_empty()
+            && self.literal.chars().all(|digit| digit.is_ascii_digit())
+        {
+            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
         }
         self.finish_word();
         let next = self.chars.peek().map(|(_, character)| *character);
-        if matches!((character, next), ('<' | '>', Some('&'))) {
-            return Err(LexError::new(self.line, FD_REDIRECTION_REJECTION));
+        if matches!((character, next), ('<', Some('&'))) {
+            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
+        }
+        if character == '>' && next == Some('&') {
+            self.chars.next();
+            return self.read_duplication(source);
         }
         let kind = match (character, next) {
             ('|', Some('|')) => {
@@ -958,6 +1312,22 @@ impl<'a> Lexer<'a> {
             ('&', Some('&')) => {
                 self.chars.next();
                 TokenKind::AndAnd
+            }
+            // `&>` and `&>>` send both streams to one buffer. Checked after `&&` so that a
+            // conjunction is never read as a redirection.
+            ('&', Some('>')) => {
+                self.chars.next();
+                if self.chars.peek().map(|(_, character)| *character) == Some('&') {
+                    return Err(LexError::new(self.line, BOTH_DUPLICATION_REJECTION));
+                }
+                let append = self.chars.peek().map(|(_, character)| *character) == Some('>');
+                if append {
+                    self.chars.next();
+                }
+                TokenKind::Redirect {
+                    source: Stream::Both,
+                    append,
+                }
             }
             ('&', _) => TokenKind::Ampersand,
             (';', Some(';')) => {
@@ -973,9 +1343,15 @@ impl<'a> Lexer<'a> {
             (';', _) => TokenKind::Semicolon,
             ('>', Some('>')) => {
                 self.chars.next();
-                TokenKind::GreatGreat
+                TokenKind::Redirect {
+                    source,
+                    append: true,
+                }
             }
-            ('>', _) => TokenKind::Great,
+            ('>', _) => TokenKind::Redirect {
+                source,
+                append: false,
+            },
             ('<', Some('<')) => {
                 self.chars.next();
                 return self.read_here_doc_header();
@@ -996,7 +1372,9 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawParameter, RawPart, TokenKind, tokenize};
+    use super::{
+        RawIndex, RawModifier, RawParameter, RawPart, RawWord, Stream, TokenKind, tokenize,
+    };
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         tokenize(source)
@@ -1083,6 +1461,8 @@ mod tests {
                 RawPart::Parameter(RawParameter::Named {
                     name: "NAME".to_owned(),
                     indices: Vec::new(),
+                    modifier: RawModifier::None,
+                    length: false,
                 }),
                 RawPart::Literal(" ".to_owned()),
                 RawPart::CommandSubstitution("echo b".to_owned()),
@@ -1111,12 +1491,22 @@ mod tests {
     #[test]
     fn indexed_parameters_capture_their_index_word() {
         let parts = single_word("${obj[key]}");
-        let RawPart::Parameter(RawParameter::Named { name, indices }) = &parts[0] else {
+        let RawPart::Parameter(RawParameter::Named { name, indices, .. }) = &parts[0] else {
             panic!("expected an indexed parameter, found {parts:?}");
         };
         assert_eq!(name, "obj");
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].as_literal(), Some("key"));
+        assert_eq!(
+            indices.as_slice(),
+            [RawIndex::At(RawWord {
+                parts: vec![RawPart::Literal("key".to_owned())]
+            })]
+        );
+
+        let parts = single_word("${list[@]}");
+        let RawPart::Parameter(RawParameter::Named { indices, .. }) = &parts[0] else {
+            panic!("expected an indexed parameter, found {parts:?}");
+        };
+        assert_eq!(indices.as_slice(), [RawIndex::All]);
     }
 
     #[test]
@@ -1124,14 +1514,17 @@ mod tests {
         // One case per rejection branch, so a branch that regresses to falling through to
         // `read_name` (where `${#x}` would quietly become the positional count `$#`) fails here.
         for (source, expected) in [
-            ("echo ${arr[@]}", "${NAME[@]}"),
-            ("echo ${arr[*]}", "${NAME[@]}"),
-            ("echo ${#items}", "${#name} length expansion"),
-            ("echo ${name:-default}", "keeps only"),
-            ("echo ${name/a/b}", "keeps only"),
-            ("echo ${name^^}", "keeps only"),
+            ("echo ${arr[@][0]}", "cannot be indexed further"),
+            (
+                "echo ${#items:-x}",
+                "combines a length with a transformation",
+            ),
+            ("echo ${name:#a}", "drop the colon"),
+            ("echo ${name^^}", "this shell keeps"),
+            ("echo ${name@Q}", "this shell keeps"),
             ("echo ${}", "empty ${} parameter reference"),
             ("echo ${name", "unterminated"),
+            ("echo ${name:-a|b}", "is not allowed inside"),
         ] {
             let error = tokenize(source)
                 .map(|tokens| format!("{tokens:?}"))
@@ -1180,16 +1573,69 @@ mod tests {
     }
 
     #[test]
-    fn file_descriptor_redirection_is_rejected_by_name() {
-        for source in ["echo hi 2>buf", "echo hi 2>&1", "echo hi >&2", "cmd 2>>buf"] {
-            let error = tokenize(source).expect_err("fd redirection is dropped");
-            assert!(
-                error.message.contains("file-descriptor redirection"),
-                "{source}: {error}"
-            );
+    fn file_descriptor_redirection_is_tokenized_per_stream() {
+        assert!(kinds("echo hi 2>buf").contains(&TokenKind::Redirect {
+            source: Stream::Stderr,
+            append: false
+        }));
+        assert!(kinds("cmd 2>>buf").contains(&TokenKind::Redirect {
+            source: Stream::Stderr,
+            append: true
+        }));
+        assert!(kinds("cmd 1> buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(kinds("cmd &> buf").contains(&TokenKind::Redirect {
+            source: Stream::Both,
+            append: false
+        }));
+        assert!(kinds("cmd &>> buf").contains(&TokenKind::Redirect {
+            source: Stream::Both,
+            append: true
+        }));
+        assert!(kinds("echo hi 2>&1").contains(&TokenKind::Duplicate {
+            source: Stream::Stderr,
+            target: Stream::Stdout
+        }));
+        assert!(kinds("echo hi >&2").contains(&TokenKind::Duplicate {
+            source: Stream::Stdout,
+            target: Stream::Stderr
+        }));
+
+        // A digit that is a plain argument, separated from the operator, still redirects the value
+        // stream and stays on argv.
+        let separated = kinds("echo 2 > buf");
+        assert!(separated.contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(separated.iter().any(|kind| matches!(
+            kind,
+            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+        )));
+
+        // A glued descriptor is consumed by the operator and must not also reach argv.
+        assert!(!kinds("echo hi 2> buf").iter().any(|kind| matches!(
+            kind,
+            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+        )));
+    }
+
+    #[test]
+    fn descriptors_this_shell_does_not_have_are_rejected_by_name() {
+        for (source, expected) in [
+            ("cmd 3> buf", "only descriptors 1"),
+            ("cmd 2>&3", "must name a stream"),
+            ("cmd >&12", "only descriptors 1"),
+            ("cmd 0< buf", "input duplication"),
+            ("cmd <& 1", "input duplication"),
+            ("cmd &>& buf", "`&>&` is not a redirection"),
+            ("cmd >& buf", "must name a stream"),
+        ] {
+            let error = tokenize(source).expect_err("rejected");
+            assert!(error.message.contains(expected), "{source}: {error}");
         }
-        // A digit that is a plain argument, separated from the operator, still redirects normally.
-        assert!(kinds("echo 2 > buf").contains(&TokenKind::Great));
     }
 
     #[test]
@@ -1224,6 +1670,8 @@ mod tests {
                 RawPart::Parameter(RawParameter::Named {
                     name: "id".to_owned(),
                     indices: Vec::new(),
+                    modifier: RawModifier::None,
+                    length: false,
                 }),
             ]
         );
@@ -1364,8 +1812,14 @@ mod tests {
 
     #[test]
     fn redirection_and_backgrounding_operators_are_tokenized_not_dropped() {
-        assert!(kinds("echo hi > buf").contains(&TokenKind::Great));
-        assert!(kinds("echo hi >> buf").contains(&TokenKind::GreatGreat));
+        assert!(kinds("echo hi > buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: false
+        }));
+        assert!(kinds("echo hi >> buf").contains(&TokenKind::Redirect {
+            source: Stream::Stdout,
+            append: true
+        }));
         assert!(kinds("sleep 1 &").contains(&TokenKind::Ampersand));
         assert!(kinds("cat < f").contains(&TokenKind::Less));
         assert!(kinds("diff <(a) b").contains(&TokenKind::LessParen));
