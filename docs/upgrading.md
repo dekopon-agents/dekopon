@@ -177,20 +177,7 @@ transport and falls back to the configured reaction, then to nothing. A workspac
 Agent support therefore degrades rather than failing, which also means a half-finished manifest
 update looks like a working deployment with no Working UI.
 
-### Chart upgrades
-
-The chart is versioned independently of the application: `dekopon-chart-*` tags publish the chart,
-`v*.*.*` tags publish crates, archives, and the container image. `appVersion` is what `image.tag`
-defaults to, so a chart release and an application release are two separate upgrades. To run a newer
-application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
-for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
-has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
-audit chain in place.
-
-## Pending the next release
-
-These are implemented in this tree and sit under `[Unreleased]` in the changelog. They move into a
-release section here when that release is tagged.
+### 0.9 → 0.11.0 — everything here is opt-in except the console credential
 
 - **A transport endpoint override must be a literal loopback address.** `127.0.0.1` and `::1` are
   accepted; the name `localhost` is not, because what it resolves to is the resolver's decision. A
@@ -216,6 +203,28 @@ release section here when that release is tagged.
   configuration is unaffected. A broker only needs it to admit `dev.<surface>.<name>` subjects; if
   one is configured without the field, startup lists every offending mapping and attestor namespace
   and refuses, rather than starting with development identities an operator did not ask for.
+- **The `gh` shell builtin is gone from this repository.** It ships from
+  [dekopon-provider-gh](https://github.com/dekopon-agents/dekopon-provider-gh) now, an out-of-tree
+  provider component fetched and pinned like any other. The container image is unaffected — it still
+  stages `gh` at a pinned, attested tag — so an operator running the image has nothing to do; one
+  building a custom image from `examples/providers/` no longer finds `gh` there.
+
+### Chart upgrades
+
+The chart is versioned independently of the application: `dekopon-chart-*` tags publish the chart,
+`v*.*.*` tags publish crates, archives, and the container image. `appVersion` is what `image.tag`
+defaults to, so a chart release and an application release are two separate upgrades. To run a newer
+application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
+for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
+has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
+audit chain in place.
+
+## Pending the next release
+
+These are implemented in this tree and sit under `[Unreleased]` in the changelog. They move into a
+release section here when that release is tagged.
+
+Nothing yet.
 
 ## Related documents
 

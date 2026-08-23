@@ -140,6 +140,14 @@ only transport credentials. The same release lands a 145-finding deep-review har
 diagnosable failure causes end to end, single-pass authorization and audit serialization on the hot
 path, and three recurring failure classes promoted to deny-by-default clippy lints.
 
+Version 0.11.0 adds `dekopon console`, one command that opens an attested broker session and runs
+the agent loop locally with a model credential and no broker authority of its own, backed by an
+opt-in `dev.<surface>.<name>` subject service. `dekopon-shell` gains the bash-script surface a
+script author expects — compound commands as pipeline stages, `[[ ... ]]`, enforced
+`set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable
+streams. The `gh` shell builtin moves out of tree to `dekopon-provider-gh`, joining `turso-sql` as a
+provider published and versioned separately from this repository.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.

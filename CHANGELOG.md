@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-23
+
 ### Added
 
 - Added `dekopon-provider-sdk-testkit`, an in-process fake broker that loads a provider component
@@ -45,15 +47,6 @@ All notable changes to Dekopon are documented here. The format is based on
   on the shared `chatgpt-auth.json` instead, because the refresh token rotates and a shared file
   means whichever process refreshes invalidates the gateway's copy. An explicit `--auth-file`
   accepts that deliberately.
-
-### Changed
-
-- Broker socket discovery now has one definition, `dekopon_broker_protocol::BrokerSocketDiscovery`,
-  consumed by `dekopon-run`, `dekopond`, and the console. The precedence and the refusal to probe a
-  candidate for existence are unchanged; each caller keeps its own error wording, since "no tier
-  applied" is a usage failure to one and a configuration failure to another.
-- `dekopon --help` now renders `Usage: dekopon [OPTIONS] [COMMAND]`, because the subcommand is
-  genuinely optional on a terminal.
 - Added `read` and `getopts` to the sandboxed shell. `read [-r] NAME...` is what makes
   `cmd | while read line; do ...; done` terminate: it consumes one line per call through a cursor
   on the enclosing pipeline stage and reports end of input as a status rather than a diagnostic,
@@ -109,6 +102,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Broker socket discovery now has one definition, `dekopon_broker_protocol::BrokerSocketDiscovery`,
+  consumed by `dekopon-run`, `dekopond`, and the console. The precedence and the refusal to probe a
+  candidate for existence are unchanged; each caller keeps its own error wording, since "no tier
+  applied" is a usage failure to one and a configuration failure to another.
+- `dekopon --help` now renders `Usage: dekopon [OPTIONS] [COMMAND]`, because the subcommand is
+  genuinely optional on a terminal.
 - A whole right-hand side keeps its value rather than collapsing to text for a bare `$NAME` as well
   as a bare `$(cmd)`, so `copy=$obj` followed by `${copy[key]}` works. Previously only the
   substitution spelling survived, and `copy=$obj` silently flattened the object into its JSON text.
@@ -126,6 +125,18 @@ All notable changes to Dekopon are documented here. The format is based on
   tested the crates.io `turso` wrapper, whose SDK-kit dependencies are not reachable from the
   engine; it was not a finding about `turso_core`.
 
+### Removed
+
+- The `gh` shell builtin and its six `gh.*` capabilities left this repository. `gh` now ships from
+  [dekopon-agents/dekopon-provider-gh](https://github.com/dekopon-agents/dekopon-provider-gh) with
+  its own tags, issues, and release cadence — `gh-provider.wasm`, its `.sha256`, and a SLSA
+  provenance attestation, the same standard the release archives here are held to.
+  `examples/pr-summarizer-linter/`, the only in-tree example carrying a broker configuration, a
+  Cedar policy, and a credentials template, moved with it. `examples/conditional-write/` replaces it
+  as the walkthrough exercising two authorized calls in one invocation — `http-probe.conditional-write`
+  in place of `gh.pull-request.approve`. The container image still ships `gh`, fetched at a pinned
+  tag with its digest and build provenance verified before staging.
+
 ### Fixed
 
 - Held the `test (Rust 1.89.0)` job to the MSRV it names. `rust-toolchain.toml` pins `channel =
@@ -133,6 +144,17 @@ All notable changes to Dekopon are documented here. The format is based on
   1.89.0, used it only for a cache key, and then compiled on current stable. It now exports
   `RUSTUP_TOOLCHAIN` and fails loudly if the effective `rustc` or the workspace `rust-version`
   drifts from the pin.
+
+## [dekopon-chart-0.2.1] - 2026-08-23
+
+### Fixed
+
+- The Helm chart's `appVersion` now names `0.11.0`, the current application release, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.10.0` on pods running a
+  later one.
+- `charts/dekopon/values-pr-summarizer-linter.yaml` and `charts/dekopon/README.md` now point at
+  [dekopon-agents/dekopon-provider-gh](https://github.com/dekopon-agents/dekopon-provider-gh), where
+  the pr-summarizer-linter walkthrough moved with the `gh` provider. No rendered manifest changed.
 
 ## [0.10.0] - 2026-08-22
 
@@ -819,7 +841,11 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/dekopon-agents/dekopon/compare/v0.10.0...v0.11.0
+[dekopon-chart-0.2.1]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.2.0...dekopon-chart-0.2.1
+[0.10.0]: https://github.com/dekopon-agents/dekopon/compare/v0.9.0...v0.10.0
+[dekopon-chart-0.2.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.1.0...dekopon-chart-0.2.0
 [0.9.0]: https://github.com/dekopon-agents/dekopon/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/dekopon-agents/dekopon/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dekopon-agents/dekopon/compare/v0.7.0...v0.8.0
