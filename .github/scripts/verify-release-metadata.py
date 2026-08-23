@@ -47,6 +47,18 @@ def read_plan(path: Path) -> list[str]:
     return configured
 
 
+def is_stripped_dev_dependency(dependency: dict) -> bool:
+    """Reports whether `cargo package` removes this dependency from the published manifest.
+
+    A dev-dependency carrying no version requirement is path-only, and Cargo drops it when it
+    packages the crate. It therefore imposes no crates.io publication order — which matters
+    because it is how a crate depends on a test harness that depends back on it. A dev-dependency
+    that *does* carry a version survives packaging and must still be ordered.
+    """
+
+    return dependency.get("kind") == "dev" and dependency.get("req") == "*"
+
+
 def verify_libraries_are_consumed(workspace: dict[str, dict]) -> None:
     """Require every non-binary member to be a dependency of some other member."""
 
@@ -125,6 +137,8 @@ def main() -> None:
     for name, package in publishable.items():
         for dependency in package["dependencies"]:
             dependency_name = dependency["name"]
+            if is_stripped_dev_dependency(dependency):
+                continue
             if dependency_name in publishable and position[dependency_name] > position[name]:
                 raise SystemExit(
                     f"{dependency_name} must be published before dependent package {name}"

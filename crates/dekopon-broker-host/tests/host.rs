@@ -1360,68 +1360,28 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
     )
 }
 
+/// The same storage-backed invocation as the raw-API tests above, driven through the testkit.
+///
+/// It is the one place in this suite that exercises the composition a provider author actually
+/// uses, and it keeps `dekopon-provider-sdk-testkit` honest against the host it wraps. Every other
+/// storage test here — the sticky-denial matrix below in particular — still drives
+/// `invoke_with_storage` directly, so the host's own behaviour is never observed only through a
+/// wrapper around it.
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
-    let directory = tempfile::tempdir().expect("storage directory");
-    let directory = directory
-        .path()
-        .canonicalize()
-        .expect("canonical storage directory");
-    let root = directory.join("root");
-    let key = directory.join("key.yaml");
-    std::fs::write(
-        &key,
-        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    )
-    .expect("write key");
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
-    let registry = BrokerProviderRegistry::load_with_storage(
-        [fixture("storage-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        Some(storage.clone()),
-    )
-    .await
-    .expect("probe loads");
-    let capability = "storage-probe.run"
-        .parse::<CapabilityId>()
-        .expect("capability");
-    let constraints = ExecutionConstraints {
-        timeout_ms: 10_000,
-        max_output_bytes: 64 * 1024,
-        http: None,
-        storage: Some(StorageConstraints {
-            interface: StorageInterface::DurableFiles,
-            access: StorageAccess::ReadWrite,
-            namespace: StorageNamespace::Chat,
-        }),
-    };
-    let grant = storage
-        .grant(StorageGrantRequest::new(
-            "invoke-test".parse().expect("invocation"),
-            capability.clone(),
-            "storage-probe".parse().expect("provider"),
-            StorageInterface::DurableFiles,
-            StorageAccess::ReadWrite,
-            StorageNamespace::Chat,
-            "provider-test".parse().expect("agent"),
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            "slack",
-            "probe-transport",
-            "c0123abc",
-            "c0123abc:1712345678.000100",
-            ContinuityPolicy::Stable,
-            b"probe-authority".to_vec(),
-        ))
-        .expect("grant");
-    let output = registry
-        .invoke_with_storage(
-            authorized_for("storage-probe", capability, json!({}), constraints),
-            None,
-            Some(grant),
-        )
+    let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
+        .component(fixture("storage-probe-provider.wasm"))
+        .provider("storage-probe")
+        .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
+        .build()
+        .await
+        .expect("probe loads");
+
+    let output = broker
+        .invoke_full("storage-probe.run", json!({}))
         .await
         .expect("probe succeeds");
+
     assert_eq!(output.output["clocksCalled"], true);
     assert!(output.storage.is_some());
 }
