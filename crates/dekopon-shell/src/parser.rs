@@ -11,10 +11,13 @@ use thiserror::Error;
 use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
-        CasePattern, CaseStatement, ForLoop, FunctionDefinition, IfStatement, Parameter, Pipeline,
-        Program, Redirect, SimpleCommand, Statement, WhileLoop, Word, WordPart,
+        CasePattern, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
+        FunctionDefinition, IfStatement, Index, Modifier, Parameter, Pattern, Pipeline, Program,
+        Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
-    lexer::{LexError, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize},
+    lexer::{
+        LexError, RawIndex, RawModifier, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize,
+    },
 };
 
 /// How deeply the grammar may nest before parsing stops.
@@ -79,19 +82,16 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
         "export",
         "`export` is excluded: there is no process environment to export into",
     ),
-    (
-        "set",
-        "`set` is excluded: this shell has no shell options, so `set -e`/`set -u`/`set -o pipefail` would change nothing while looking like they had; check each command's status with `$?`, `&&`, `||`, or `exit`",
-    ),
-    (
-        "[[",
-        "`[[ ... ]]` is not part of this shell; use `[ ... ]` or `test`, which support -z, -n, =, !=, <, >, and -eq/-ne/-lt/-le/-gt/-ge",
-    ),
 ];
 
-const RESERVED_WORDS: &[&str] = &[
+/// Words the grammar owns, which therefore cannot be a command word or a function name.
+///
+/// Mirrored into `dekopon_core::RESERVED_COMMAND_WORDS` and pinned in both directions by
+/// [`crate::dispatch::reserved`], so a provider can never declare one of these and then find that
+/// the parser consumed the word before dispatch ever saw it.
+pub(crate) const RESERVED_WORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "case", "esac",
-    "until", "select", "function",
+    "until", "select", "function", "[[", "]]",
 ];
 
 /// A parse failure. These map to exit code `2`.
@@ -135,6 +135,42 @@ fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
         return Err(ParseError::syntax(line, format!("unexpected {kind}")));
     }
     Ok(program)
+}
+
+/// Refuses a duplication whose target stream is redirected after it.
+///
+/// `cmd > buf 2>&1` sends both streams to `buf`; `cmd 2>&1 > buf` does not, because bash copies the
+/// file *description* stdout held at that moment and a later `> buf` leaves that copy pointing at
+/// the terminal. This interpreter has destinations rather than descriptions, so it cannot represent
+/// the difference — and the reversed spelling is precisely the one a script writes when it believes
+/// it captured diagnostics that in fact went somewhere else. It is named instead.
+fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), ParseError> {
+    for (index, redirect) in redirects.iter().enumerate() {
+        let RedirectTarget::Stream(copied) = redirect.target else {
+            continue;
+        };
+        let reassigned = redirects[index + 1..].iter().any(|later| {
+            matches!(later.target, RedirectTarget::Buffer { .. })
+                && (later.source == copied || later.source == Stream::Both)
+        });
+        if reassigned {
+            return Err(ParseError::syntax(
+                line,
+                format!(
+                    "`{}>&{}` must come after the redirection of stream {}, not before it: \
+                     write `> name {}>&{}` rather than `{}>&{} > name`",
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                    copied.descriptor(),
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                    redirect.source.descriptor(),
+                    copied.descriptor(),
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reports the nesting ceiling as a syntax error a script can act on.
@@ -286,11 +322,11 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek_reserved() {
-            Some("if") => return self.parse_if().map(Statement::If),
-            Some("for") => return self.parse_for().map(Statement::For),
-            Some("while") => return self.parse_while(false).map(Statement::While),
-            Some("until") => return self.parse_while(true).map(Statement::While),
-            Some("case") => return self.parse_case().map(Statement::Case),
+            // Compound commands are parsed as pipeline stages even at statement level, so
+            // `while ...; done | wc -l` and a bare `while` reach the same production.
+            Some("if" | "for" | "while" | "until" | "case" | "[[") => {
+                return self.parse_and_or_list().map(Statement::List);
+            }
             Some("esac") => {
                 let line = self.line();
                 return Err(ParseError::syntax(line, "`esac` without a matching `case`"));
@@ -614,13 +650,279 @@ impl Parser {
         // command word instead would report "!: command not found" and silently invert every
         // `if ! cmd` branch, so it is recognized here rather than left to the builtin table.
         let negated = self.eat_pipeline_negation();
-        let mut commands = vec![self.parse_simple_command()?];
+        let mut commands = vec![self.parse_command()?];
         while matches!(self.peek_kind(), Some(TokenKind::Pipe)) {
             self.position += 1;
             self.skip_newlines();
-            commands.push(self.parse_simple_command()?);
+            commands.push(self.parse_command()?);
         }
         Ok(Pipeline { commands, negated })
+    }
+
+    /// Parses one pipeline stage: a compound command, or a simple one.
+    ///
+    /// A compound stage is what lets `cmd | while read line; do ...; done` parse at all, and it is
+    /// the same production a statement uses — so the two spellings cannot drift apart.
+    fn parse_command(&mut self) -> Result<Command, ParseError> {
+        let compound = match self.peek_reserved() {
+            Some("if") => Some(Statement::If(self.parse_if()?)),
+            Some("for") => Some(Statement::For(self.parse_for()?)),
+            Some("while") => Some(Statement::While(self.parse_while(false)?)),
+            Some("until") => Some(Statement::While(self.parse_while(true)?)),
+            Some("case") => Some(Statement::Case(self.parse_case()?)),
+            _ => None,
+        };
+        let compound = match compound {
+            Some(statement) => Some(statement),
+            None if self.peek_literal_word("[[") => {
+                Some(Statement::Conditional(self.parse_conditional()?))
+            }
+            // A `{` opens a group only where a command may start, so `a{b}` stays one literal word
+            // and a function body is still parsed by `try_parse_function`.
+            None if matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) => {
+                Some(Statement::Group(self.parse_group()?))
+            }
+            None => None,
+        };
+        let Some(statement) = compound else {
+            return Ok(Command::Simple(self.parse_simple_command()?));
+        };
+        let redirects = self.parse_redirects()?;
+        Ok(Command::Compound {
+            statement: Box::new(statement),
+            redirects,
+        })
+    }
+
+    /// Reports whether the next token is exactly the given literal word.
+    fn peek_literal_word(&self, expected: &str) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Word(word)) if word.as_literal() == Some(expected))
+    }
+
+    /// Parses `[[ ... ]]`.
+    fn parse_conditional(&mut self) -> Result<Conditional, ParseError> {
+        let line = self.line();
+        self.position += 1;
+        self.enter("a `[[ ... ]]` conditional")?;
+        let expression = self.parse_conditional_or()?;
+        self.leave();
+        if !self.peek_literal_word("]]") {
+            let found = self
+                .peek_kind()
+                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
+            return Err(ParseError::syntax(
+                line,
+                format!("expected `]]` to close a `[[ ... ]]` conditional, found {found}"),
+            ));
+        }
+        self.position += 1;
+        Ok(expression)
+    }
+
+    fn parse_conditional_or(&mut self) -> Result<Conditional, ParseError> {
+        let mut left = self.parse_conditional_and()?;
+        while matches!(self.peek_kind(), Some(TokenKind::OrOr)) {
+            self.position += 1;
+            let right = self.parse_conditional_and()?;
+            left = Conditional::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_conditional_and(&mut self) -> Result<Conditional, ParseError> {
+        let mut left = self.parse_conditional_unary()?;
+        while matches!(self.peek_kind(), Some(TokenKind::AndAnd)) {
+            self.position += 1;
+            let right = self.parse_conditional_unary()?;
+            left = Conditional::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_conditional_unary(&mut self) -> Result<Conditional, ParseError> {
+        if self.peek_literal_word("!") {
+            self.position += 1;
+            self.enter("a `!` inside `[[ ... ]]`")?;
+            let inner = self.parse_conditional_unary()?;
+            self.leave();
+            return Ok(Conditional::Not(Box::new(inner)));
+        }
+        if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
+            let line = self.line();
+            self.position += 1;
+            self.enter("a group inside `[[ ... ]]`")?;
+            let inner = self.parse_conditional_or()?;
+            self.leave();
+            if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
+                return Err(ParseError::syntax(
+                    line,
+                    "expected `)` to close a group inside `[[ ... ]]`",
+                ));
+            }
+            self.position += 1;
+            return Ok(inner);
+        }
+        self.parse_conditional_test()
+    }
+
+    /// Collects one primary's operands and validates its operator.
+    fn parse_conditional_test(&mut self) -> Result<Conditional, ParseError> {
+        let line = self.line();
+        let depth = self.depth;
+        let mut raws = Vec::new();
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Word(word)) if word.as_literal() == Some("]]") => break,
+                Some(TokenKind::Word(word)) => {
+                    let word = word.clone();
+                    self.position += 1;
+                    raws.push(word);
+                }
+                // Inside `[[ ]]` these are comparison operators, not redirections. The lexer has
+                // no way to know that, so they are translated back into operand words here.
+                Some(TokenKind::Less) => {
+                    self.position += 1;
+                    raws.push(RawWord {
+                        parts: vec![RawPart::SingleQuoted("<".to_owned())],
+                    });
+                }
+                Some(TokenKind::Redirect {
+                    source: Stream::Stdout,
+                    append: false,
+                }) => {
+                    self.position += 1;
+                    raws.push(RawWord {
+                        parts: vec![RawPart::SingleQuoted(">".to_owned())],
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        if raws.is_empty() {
+            let found = self
+                .peek_kind()
+                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
+            return Err(ParseError::syntax(
+                line,
+                format!("expected a condition inside `[[ ... ]]`, found {found}"),
+            ));
+        }
+        if raws.len() > 3 {
+            return Err(ParseError::syntax(
+                line,
+                "a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses",
+            ));
+        }
+
+        let mut check_right_pattern = false;
+        if let [_, operator, right] = raws.as_slice() {
+            let operator = operator.as_literal().unwrap_or_default().to_owned();
+            if operator == "=~" {
+                return Err(ParseError::syntax(
+                    line,
+                    "`=~` regex matching is not supported: every pattern in this shell is literal                      text; compare with `==`, or match structurally with `jq`",
+                ));
+            }
+            if matches!(operator.as_str(), "=" | "==" | "!=") {
+                // In bash this operand is a glob. Comparing it literally would answer
+                // `[[ $f == *.json ]]` wrongly and silently.
+                if word_is_constant(right) {
+                    if let Some((character, meaning)) = literal_pattern_metacharacter(right) {
+                        return Err(ParseError::syntax(
+                            line,
+                            unsupported_conditional_pattern(character, meaning),
+                        ));
+                    }
+                } else {
+                    check_right_pattern = true;
+                }
+            }
+        }
+
+        let words = raws
+            .iter()
+            .map(|raw| convert_word(raw, line, depth))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Conditional::Test(ConditionalTest {
+            words,
+            check_right_pattern,
+        }))
+    }
+
+    /// Parses `{ ...; }` as a group of statements run in the current scope.
+    fn parse_group(&mut self) -> Result<Program, ParseError> {
+        let line = self.line();
+        self.position += 1;
+        self.enter("a `{ ...; }` group")?;
+        let body = self.parse_program(&["}"])?;
+        self.leave();
+        if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
+            return Err(ParseError::syntax(
+                line,
+                "expected `}` to close a `{ ...; }` group",
+            ));
+        }
+        self.position += 1;
+        if body.statements.is_empty() {
+            return Err(ParseError::syntax(
+                line,
+                "an empty `{ }` group runs nothing; remove it or put a command in it",
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Parses the redirections trailing a compound command.
+    fn parse_redirects(&mut self) -> Result<Vec<Redirect>, ParseError> {
+        let mut redirects = Vec::new();
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Redirect { source, append }) => {
+                    let (source, append) = (*source, *append);
+                    let line = self.line();
+                    let depth = self.depth;
+                    self.position += 1;
+                    let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+                        return Err(ParseError::syntax(
+                            line,
+                            "expected an in-memory buffer name after a redirection operator",
+                        ));
+                    };
+                    let raw = raw.clone();
+                    self.position += 1;
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Buffer {
+                            append,
+                            target: convert_word(&raw, line, depth)?,
+                        },
+                    });
+                }
+                Some(TokenKind::Duplicate { source, target }) => {
+                    let (source, target) = (*source, *target);
+                    let line = self.line();
+                    self.position += 1;
+                    if source == target {
+                        return Err(ParseError::syntax(
+                            line,
+                            format!(
+                                "`{}>&{}` redirects a stream onto itself and would do nothing",
+                                source.descriptor(),
+                                target.descriptor()
+                            ),
+                        ));
+                    }
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Stream(target),
+                    });
+                }
+                _ => break,
+            }
+        }
+        check_duplication_order(&redirects, self.line())?;
+        Ok(redirects)
     }
 
     fn eat_pipeline_negation(&mut self) -> bool {
@@ -637,7 +939,7 @@ impl Parser {
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
-        let mut redirect: Option<Redirect> = None;
+        let mut redirects: Vec<Redirect> = Vec::new();
         let mut here_doc: Option<Word> = None;
         // `arr=(a b c)` lexes as an empty assignment followed by `(`; remembering that shape is
         // what lets the paren below name array literals instead of blaming subshells.
@@ -669,8 +971,8 @@ impl Parser {
                     after_empty_assignment = false;
                     words.push(convert_word(&raw, line, depth)?);
                 }
-                Some(TokenKind::Great | TokenKind::GreatGreat) => {
-                    let append = matches!(self.peek_kind(), Some(TokenKind::GreatGreat));
+                Some(TokenKind::Redirect { source, append }) => {
+                    let (source, append) = (*source, *append);
                     let line = self.line();
                     let depth = self.depth;
                     self.position += 1;
@@ -682,16 +984,36 @@ impl Parser {
                     };
                     let raw = raw.clone();
                     self.position += 1;
-                    if redirect.is_some() {
+                    after_empty_assignment = false;
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Buffer {
+                            append,
+                            target: convert_word(&raw, line, depth)?,
+                        },
+                    });
+                }
+                Some(TokenKind::Duplicate { source, target }) => {
+                    let (source, target) = (*source, *target);
+                    let line = self.line();
+                    self.position += 1;
+                    // `>&1` and `2>&2` ask for the stream a command already writes to. Bash makes
+                    // them no-ops; here they are a parse error, because a redirection that changes
+                    // nothing is a script believing it moved output that never moved.
+                    if source == target {
                         return Err(ParseError::syntax(
                             line,
-                            "a command accepts at most one buffer redirection",
+                            format!(
+                                "`{}>&{}` redirects a stream onto itself and would do nothing",
+                                source.descriptor(),
+                                target.descriptor()
+                            ),
                         ));
                     }
                     after_empty_assignment = false;
-                    redirect = Some(Redirect {
-                        append,
-                        target: convert_word(&raw, line, depth)?,
+                    redirects.push(Redirect {
+                        source,
+                        target: RedirectTarget::Stream(target),
                     });
                 }
                 // Job control is dropped whole. A trailing `&` must never be silently discarded:
@@ -733,13 +1055,6 @@ impl Parser {
                     return Err(ParseError::syntax(line, "unexpected `)`"));
                 }
                 // Brace command groups are dropped; only `name() { ... }` uses braces.
-                Some(TokenKind::LeftBrace) => {
-                    let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "brace command groups `{ ...; }` are not supported; only function bodies use braces",
-                    ));
-                }
                 // A here-document arrives with its body already collected off the following lines.
                 Some(TokenKind::HereDoc(raw)) => {
                     let raw = raw.clone();
@@ -784,10 +1099,11 @@ impl Parser {
             ));
         }
 
+        check_duplication_order(&redirects, self.line())?;
         Ok(SimpleCommand {
             assignments,
             words,
-            redirect,
+            redirects,
             here_doc,
         })
     }
@@ -823,6 +1139,34 @@ pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> 
 pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String {
     format!(
         "a `case` pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the value out, add another `PATTERN|PATTERN` alternative, quote it as `'{character}'` to match the character itself, or use `*)` for the default branch"
+    )
+}
+
+/// Composes the rejection for a `${NAME#pattern}`-family pattern this shell cannot honor.
+pub(crate) fn unsupported_parameter_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "a `${{NAME}}` expansion pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the text out, or slice the value with `jq` instead"
+    )
+}
+
+/// Composes the rejection for a `[[ x == PATTERN ]]` operand this shell cannot honor.
+pub(crate) fn unsupported_conditional_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "the right operand of `==` inside `[[ ... ]]` is a glob in bash, and every pattern here is literal text, so `{character}` — which would match {meaning} — is not supported; quote it as `'{character}'` to compare the character itself, or match structurally with `jq`"
+    )
+}
+
+/// Composes the rejection for a `[[ ]]` operand that only exists once a script has run.
+pub(crate) fn expanded_conditional_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `[[ ... ]]` comparison expanded to text containing `{character}`, which bash would match as {meaning}; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — compare without `{character}`, or match structurally with `jq`"
+    )
+}
+
+/// Composes the rejection for a `${NAME}` expansion pattern that only exists once a script has run.
+pub(crate) fn expanded_parameter_pattern(character: char, meaning: &str) -> String {
+    format!(
+        "this `${{NAME}}` expansion pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or slice the value with `jq` instead"
     )
 }
 
@@ -922,18 +1266,91 @@ fn convert_part(raw: &RawPart, line: usize, depth: u32) -> Result<WordPart, Pars
 
 fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Parameter, ParseError> {
     Ok(match raw {
-        RawParameter::Named { name, indices } => Parameter::Named {
+        RawParameter::Named {
+            name,
+            indices,
+            modifier,
+            length,
+        } => Parameter::Named {
             name: name.clone(),
             indices: indices
                 .iter()
-                .map(|index| convert_word(index, line, depth))
+                .map(|index| convert_index(index, line, depth))
                 .collect::<Result<Vec<_>, _>>()?,
+            modifier: convert_modifier(modifier, line, depth)?,
+            length: *length,
         },
         RawParameter::Positional(position) => Parameter::Positional(*position),
         RawParameter::AllPositional => Parameter::AllPositional,
         RawParameter::AllPositionalJoined => Parameter::AllPositionalJoined,
         RawParameter::PositionalCount => Parameter::PositionalCount,
         RawParameter::LastStatus => Parameter::LastStatus,
+    })
+}
+
+/// Converts one `${NAME#pattern}`-family pattern, checking it here when it is constant.
+///
+/// Quoting is the escape hatch, and it only works while the parser can still see it: `${p#'*'}`
+/// strips a literal asterisk, while `${p#*}` names the metacharacter and what it would have meant.
+fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, ParseError> {
+    let word = convert_word(raw, line, depth)?;
+    if word_is_constant(raw) {
+        if let Some((character, meaning)) = literal_pattern_metacharacter(raw) {
+            return Err(ParseError::syntax(
+                line,
+                unsupported_parameter_pattern(character, meaning),
+            ));
+        }
+        return Ok(Pattern::Literal(word));
+    }
+    Ok(Pattern::Expanded(word))
+}
+
+fn convert_index(raw: &RawIndex, line: usize, depth: u32) -> Result<Index, ParseError> {
+    Ok(match raw {
+        RawIndex::At(word) => Index::At(convert_word(word, line, depth)?),
+        RawIndex::All => Index::All,
+        RawIndex::AllJoined => Index::AllJoined,
+    })
+}
+
+fn convert_modifier(raw: &RawModifier, line: usize, depth: u32) -> Result<Modifier, ParseError> {
+    Ok(match raw {
+        RawModifier::None => Modifier::None,
+        RawModifier::Default { colon, word } => Modifier::Default {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::Assign { colon, word } => Modifier::Assign {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::Require { colon, word } => Modifier::Require {
+            colon: *colon,
+            word: word
+                .as_ref()
+                .map(|word| convert_word(word, line, depth))
+                .transpose()?,
+        },
+        RawModifier::Alternate { colon, word } => Modifier::Alternate {
+            colon: *colon,
+            word: convert_word(word, line, depth)?,
+        },
+        RawModifier::StripPrefix(pattern) => {
+            Modifier::StripPrefix(convert_pattern(pattern, line, depth)?)
+        }
+        RawModifier::StripSuffix(pattern) => {
+            Modifier::StripSuffix(convert_pattern(pattern, line, depth)?)
+        }
+        RawModifier::Replace {
+            all,
+            pattern,
+            replacement,
+        } => Modifier::Replace {
+            all: *all,
+            pattern: convert_pattern(pattern, line, depth)?,
+            replacement: convert_word(replacement, line, depth)?,
+        },
     })
 }
 
@@ -1288,7 +1705,10 @@ impl ArithParser {
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::{ArithBinaryOp, ArithExpr, CasePattern, Statement, WordPart};
+    use crate::ast::{
+        ArithBinaryOp, ArithExpr, CasePattern, Command, Redirect, RedirectTarget, SimpleCommand,
+        Statement, Stream, Word, WordPart,
+    };
 
     use super::{ParseError, parse};
 
@@ -1311,6 +1731,24 @@ mod tests {
     }
 
     #[test]
+    fn a_compound_command_parses_the_same_alone_as_in_a_pipeline() {
+        // One production, so the two spellings cannot drift apart.
+        let alone = compound_in(&parse("while true; do echo x; done").unwrap().statements[0]);
+        let piped = {
+            let program = parse("cat | while true; do echo x; done").expect("valid script");
+            let Statement::List(list) = &program.statements[0] else {
+                panic!("expected a list");
+            };
+            assert_eq!(list.first.commands.len(), 2);
+            let Command::Compound { statement, .. } = &list.first.commands[1] else {
+                panic!("expected a compound stage");
+            };
+            (**statement).clone()
+        };
+        assert_eq!(alone, piped);
+    }
+
+    #[test]
     fn parses_control_flow_and_functions() {
         let program = parse(
             "greet() { echo \"hi $1\"; }\nfor name in a b; do greet $name; done\nwhile false; do break; done\nif true; then echo y; elif false; then echo m; else echo n; fi",
@@ -1318,41 +1756,120 @@ mod tests {
         .expect("valid script");
         assert_eq!(program.statements.len(), 4);
         assert!(matches!(program.statements[0], Statement::Function(_)));
-        assert!(matches!(program.statements[1], Statement::For(_)));
-        assert!(matches!(program.statements[2], Statement::While(_)));
-        assert!(matches!(program.statements[3], Statement::If(_)));
+        assert!(matches!(
+            compound_in(&program.statements[1]),
+            Statement::For(_)
+        ));
+        assert!(matches!(
+            compound_in(&program.statements[2]),
+            Statement::While(_)
+        ));
+        assert!(matches!(
+            compound_in(&program.statements[3]),
+            Statement::If(_)
+        ));
+    }
+
+    /// Unwraps one statement into the compound command it wraps.
+    ///
+    /// Every compound command is a pipeline stage now, including one written on its own line, so
+    /// `while ...; done` and `cmd | while ...; done` cannot drift into two different productions.
+    fn compound_in(statement: &Statement) -> Statement {
+        let Statement::List(list) = statement else {
+            panic!("expected a list, found {statement:?}");
+        };
+        let Command::Compound { statement, .. } = &list.first.commands[0] else {
+            panic!("expected a compound command");
+        };
+        (**statement).clone()
+    }
+
+    /// Returns the only simple command of the only statement of `source`.
+    fn simple_command_of(source: &str) -> SimpleCommand {
+        let program = parse(source).expect("valid script");
+        let Statement::List(list) = &program.statements[0] else {
+            panic!("expected a list");
+        };
+        let Command::Simple(command) = &list.first.commands[0] else {
+            panic!("expected a simple command");
+        };
+        command.clone()
+    }
+
+    /// Returns the redirections of the only command in the only statement of `source`.
+    fn redirects_of(source: &str) -> Vec<Redirect> {
+        simple_command_of(source).redirects
     }
 
     #[test]
     fn parses_buffer_redirections() {
-        let program = parse("echo hi > buf\necho there >> buf").expect("valid script");
-        let Statement::List(list) = &program.statements[0] else {
-            panic!("expected a list");
-        };
-        let redirect = list.first.commands[0]
-            .redirect
-            .as_ref()
-            .expect("a redirect");
-        assert!(!redirect.append);
-        let Statement::List(list) = &program.statements[1] else {
-            panic!("expected a list");
-        };
-        assert!(
-            list.first.commands[0]
-                .redirect
-                .as_ref()
-                .expect("a redirect")
-                .append
+        assert_eq!(
+            redirects_of("echo hi > buf"),
+            vec![Redirect {
+                source: Stream::Stdout,
+                target: RedirectTarget::Buffer {
+                    append: false,
+                    target: Word {
+                        parts: vec![WordPart::Literal("buf".to_owned())]
+                    }
+                }
+            }]
         );
+        let appended = redirects_of("echo there >> buf");
+        assert!(matches!(
+            appended.as_slice(),
+            [Redirect {
+                target: RedirectTarget::Buffer { append: true, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn parses_each_stream_and_keeps_redirections_in_source_order() {
+        let redirects = redirects_of("cmd > out 2> err");
+        assert_eq!(redirects.len(), 2);
+        assert_eq!(redirects[0].source, Stream::Stdout);
+        assert_eq!(redirects[1].source, Stream::Stderr);
+
+        assert_eq!(
+            redirects_of("cmd > out 2>&1")[1],
+            Redirect {
+                source: Stream::Stderr,
+                target: RedirectTarget::Stream(Stream::Stdout)
+            }
+        );
+        assert_eq!(
+            redirects_of("echo oops >&2"),
+            vec![Redirect {
+                source: Stream::Stdout,
+                target: RedirectTarget::Stream(Stream::Stderr)
+            }]
+        );
+        let both = redirects_of("cmd &> all");
+        assert_eq!(both[0].source, Stream::Both);
+    }
+
+    #[test]
+    fn redirections_that_would_do_nothing_or_mislead_are_refused() {
+        // A stream redirected onto itself moves nothing.
+        for source in ["cmd >&1", "cmd 2>&2"] {
+            let error = parse(source).expect_err("self-duplication is refused");
+            assert!(format!("{error}").contains("onto itself"), "{source}");
+        }
+        // `2>&1 > buf` is the classic footgun: bash copies the *description*, so stderr keeps
+        // going to the terminal while stdout moves. Nothing here can represent that difference,
+        // so it is named rather than silently given the other meaning.
+        let error = parse("cmd 2>&1 > buf").expect_err("reversed duplication is refused");
+        assert!(format!("{error}").contains("before"), "{error}");
+        // The supported spelling still parses.
+        assert_eq!(redirects_of("cmd > buf 2>&1").len(), 2);
     }
 
     #[test]
     fn parses_arithmetic_with_precedence() {
-        let program = parse("echo $(( 1 + 2 * 3 ))").expect("valid script");
-        let Statement::List(list) = &program.statements[0] else {
-            panic!("expected a list");
-        };
-        let WordPart::Arithmetic(expression) = &list.first.commands[0].words[1].parts[0] else {
+        let command = simple_command_of("echo $(( 1 + 2 * 3 ))");
+        let WordPart::Arithmetic(expression) = &command.words[1].parts[0] else {
             panic!("expected arithmetic");
         };
         let ArithExpr::Binary(ArithBinaryOp::Add, left, right) = expression else {
@@ -1375,7 +1892,6 @@ mod tests {
     #[test]
     fn dropped_grammar_is_rejected_by_name() {
         assert!(syntax_error("(echo hi)").contains("subshells"));
-        assert!(syntax_error("{ echo hi; }").contains("brace command groups"));
         assert!(syntax_error("cat <<<\"$x\"").contains("here-string"));
         assert!(syntax_error("diff <(a) b").contains("process substitution"));
         assert!(syntax_error("cat < file").contains("input redirection"));
@@ -1389,7 +1905,7 @@ mod tests {
         let program =
             parse("case $x in\n  a|b) echo ab ;;\n  ready) echo go ;;\n  *) echo other ;;\nesac")
                 .expect("valid script");
-        let Statement::Case(statement) = &program.statements[0] else {
+        let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
             panic!(
                 "expected a case statement, found {:?}",
                 program.statements[0]
@@ -1403,7 +1919,7 @@ mod tests {
     #[test]
     fn a_final_case_clause_may_omit_its_terminator() {
         let program = parse("case $x in a) echo a ;; *) echo b\nesac").expect("valid script");
-        let Statement::Case(statement) = &program.statements[0] else {
+        let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
             panic!("expected a case statement");
         };
         assert_eq!(statement.clauses.len(), 2);
@@ -1430,7 +1946,7 @@ mod tests {
         // classify as a literal match, never as the bare `*)` default branch — that would
         // silently route every subject through the escaped clause.
         let program = parse("case $f in \\*) echo star ;; esac").expect("valid script");
-        let Statement::Case(statement) = &program.statements[0] else {
+        let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
             panic!("expected a case statement");
         };
         assert!(matches!(
@@ -1449,11 +1965,7 @@ mod tests {
 
     #[test]
     fn a_here_document_becomes_the_command_input() {
-        let program = parse("jq . <<EOF\n{\"a\": 1}\nEOF\n").expect("valid script");
-        let Statement::List(list) = &program.statements[0] else {
-            panic!("expected a list");
-        };
-        let command = &list.first.commands[0];
+        let command = simple_command_of("jq . <<EOF\n{\"a\": 1}\nEOF\n");
         assert_eq!(command.words.len(), 2);
         let body = command.here_doc.as_ref().expect("a here-document");
         assert_eq!(body.as_literal(), Some("{\"a\": 1}"));
@@ -1474,14 +1986,17 @@ mod tests {
         let Statement::Function(definition) = &program.statements[0] else {
             panic!("expected a function definition");
         };
-        let Statement::For(loop_statement) = &definition.body.statements[0] else {
+        let Statement::For(loop_statement) = &compound_in(&definition.body.statements[0]) else {
             panic!("expected a for loop");
         };
-        let Statement::While(inner) = &loop_statement.body.statements[0] else {
+        let Statement::While(inner) = &compound_in(&loop_statement.body.statements[0]) else {
             panic!("expected an until loop");
         };
         assert!(inner.until);
-        assert!(matches!(inner.body.statements[0], Statement::If(_)));
+        assert!(matches!(
+            compound_in(&inner.body.statements[0]),
+            Statement::If(_)
+        ));
     }
 
     #[test]
@@ -1495,23 +2010,17 @@ mod tests {
 
     #[test]
     fn globbing_characters_parse_as_literal_words() {
-        let program = parse("echo *").expect("an unquoted `*` is an ordinary character");
-        let Statement::List(list) = &program.statements[0] else {
-            panic!("expected a list");
-        };
         assert_eq!(
-            list.first.commands[0].words[1].parts,
-            vec![WordPart::Literal("*".to_owned())]
+            simple_command_of("echo *").words[1].parts,
+            vec![WordPart::Literal("*".to_owned())],
+            "an unquoted `*` is an ordinary character"
         );
     }
 
     #[test]
     fn command_substitution_is_parsed_recursively() {
-        let program = parse("x=$(echo hi)").expect("valid script");
-        let Statement::List(list) = &program.statements[0] else {
-            panic!("expected a list");
-        };
-        let assignment = &list.first.commands[0].assignments[0];
+        let command = simple_command_of("x=$(echo hi)");
+        let assignment = &command.assignments[0];
         assert_eq!(assignment.name, "x");
         assert!(assignment.value.is_bare_command_substitution());
     }

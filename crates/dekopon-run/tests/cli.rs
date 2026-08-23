@@ -1206,15 +1206,34 @@ fn shell_rejects_every_loudly_dropped_grammar_feature_rather_than_ignoring_it() 
         ("echo pwned &", "backgrounding", "pwned"),
         ("eval 'echo pwned'", "eval", "pwned"),
         ("echo `echo pwned`", "backtick", "pwned"),
-        ("set -euo pipefail\necho pwned", "shell options", "pwned"),
-        ("echo pwned 2>/dev/null", "file-descriptor", "pwned"),
-        ("[[ -n x ]] && echo pwned", "[[ ... ]]", "pwned"),
+        ("set -x\necho pwned", "option -x is not supported", "pwned"),
+        ("echo pwned 3>/dev/null", "only descriptors 1", "pwned"),
+        ("[[ abc =~ a.c ]] && echo pwned", "regex matching", "pwned"),
+        (
+            "f=a.json\n[[ $f == *.json ]] && echo pwned",
+            "glob in bash",
+            "pwned",
+        ),
     ] {
         let (stdout, code) = shell(script, &[]);
         assert_eq!(code, 2, "{script}: {stdout}");
         assert!(stdout.contains(expected), "{script}: {stdout}");
         assert!(!stdout.contains(forbidden), "{script}: {stdout}");
     }
+
+    // The three options that *are* enforced work end to end, and `set -e` stops the script where
+    // it says it will.
+    let (stdout, code) = shell("set -euo pipefail\nnosuchcmd.here | jq .\necho pwned", &[]);
+    assert_eq!(code, 127, "{stdout}");
+    assert!(!stdout.contains("pwned"), "{stdout}");
+
+    // The two streams a script *can* address end up in the one combined transcript a terminal
+    // would have shown, so an operator replaying a model's script sees what the model saw.
+    let (stdout, code) = shell("echo kept\necho noted >&2\nnosuchcmd.here 2>/dev/null", &[]);
+    assert_eq!(code, 127, "{stdout}");
+    assert!(stdout.contains("kept"), "{stdout}");
+    assert!(stdout.contains("noted"), "{stdout}");
+    assert!(!stdout.contains("command not found"), "{stdout}");
 }
 
 #[test]

@@ -603,7 +603,6 @@ fn ambient_authority_commands_are_rejected_by_name() {
 fn subshells_here_strings_and_process_substitution_are_rejected() {
     for (script, expected) in [
         ("(echo hi)", "subshells"),
-        ("{ echo hi; }", "brace command groups"),
         ("cat <<<\"$x\"", "here-string"),
         ("diff <(echo a) b", "process substitution"),
         ("cat < file", "input redirection"),
@@ -820,10 +819,681 @@ fn the_clock_builtin_cannot_reach_the_process_environment() {
 }
 
 #[test]
-fn bash_array_emulation_is_rejected_in_favor_of_json() {
-    let outcome = run("echo ${arr[@]}");
+fn array_expansion_is_backed_by_real_json() {
+    // `${NAME[@]}` is not bash's sparse-array emulation; it selects the elements of a real JSON
+    // array, which is what an unquoted `$NAME` holding one already spreads into.
+    assert_eq!(
+        output(
+            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+for item in "${arr[@]}"; do echo "[$item]"; done"#
+        ),
+        "[x]\n[y]"
+    );
+    assert_eq!(
+        output(
+            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+echo "${arr[*]}""#
+        ),
+        "x y"
+    );
+    assert_eq!(
+        output(
+            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+echo ${#arr[@]}"#
+        ),
+        "2"
+    );
+    // A quoted `"${NAME[@]}"` holding one element stays one word, spaces and all.
+    assert_eq!(
+        output(
+            r#"arr=$(echo.echo --a "one two" | jq '[.a]')
+for item in "${arr[@]}"; do echo "[$item]"; done"#
+        ),
+        "[one two]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `read` and `getopts`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn while_read_walks_every_line_and_then_stops() {
+    // The idiom this exists for. `read` consumes through the enclosing stage's cursor, so each
+    // iteration sees the next line and end of input is what ends the loop.
+    assert_eq!(
+        output(
+            r#"http-probe.fetch --uri x | jq -r .bodyText | while read line; do echo "[$line]"; done"#
+        ),
+        "[alpha]\n[beta]\n[alpha]"
+    );
+    // And the loop keeps what it assigned, because nothing forked.
+    assert_eq!(
+        output(
+            r#"count=0
+http-probe.fetch --uri x | jq -r .bodyText | while read line; do count=$(( count + 1 )); done
+echo $count"#
+        ),
+        "3"
+    );
+}
+
+#[test]
+fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
+    // A message here would be one per loop, every loop.
+    let outcome = run("echo one | while read line; do echo $line; done");
+    assert_eq!(outcome.output, "one");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(code("echo '' | read x"), 1, "no lines is a failing read");
+}
+
+#[test]
+fn read_binds_several_names_by_splitting_on_whitespace() {
+    // A rule local to `read`, not a return of IFS word splitting: the remainder lands in the last
+    // name, as bash does.
+    assert_eq!(
+        output(
+            r#"echo "alpha beta gamma delta" | { read -r first second rest; echo "1=$first 2=$second rest=$rest"; }"#
+        ),
+        "1=alpha 2=beta rest=gamma delta"
+    );
+    assert_eq!(
+        output(r#"echo "only" | { read -r a b; echo "[$a][$b]"; }"#),
+        "[only][]"
+    );
+}
+
+#[test]
+fn a_piped_read_is_its_own_one_shot_source() {
+    // `echo | read` consumes from the pipe, not from anything the enclosing scope holds.
+    assert_eq!(output("echo hello | read x\necho $x"), "hello");
+}
+
+#[test]
+fn read_refuses_what_it_does_not_implement() {
+    for (script, expected) in [
+        ("echo a | read", "needs at least one variable name"),
+        ("echo a | read -d ,", "option \"-d\" is not supported"),
+        ("echo a | read 1bad", "is not a valid variable name"),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(
+            outcome.output.contains(expected),
+            "{script}: {}",
+            outcome.output
+        );
+    }
+}
+
+#[test]
+fn getopts_parses_a_functions_own_flags() {
+    assert_eq!(
+        output(
+            r#"parse() {
+  while getopts "vn:" opt; do
+    case $opt in
+      v) echo "verbose" ;;
+      n) echo "name=$OPTARG" ;;
+      *) echo "other" ;;
+    esac
+  done
+}
+parse -v -n dekopon"#
+        ),
+        "verbose\nname=dekopon"
+    );
+}
+
+#[test]
+fn getopts_reports_a_bad_flag_and_a_missing_argument() {
+    assert!(
+        output(
+            r#"parse() { getopts "n:" opt; echo "opt=$opt OPTARG=$OPTARG"; }
+parse -z"#
+        )
+        .contains("opt=? OPTARG=z"),
+    );
+    assert!(
+        output(
+            r#"parse() { getopts "n:" opt; echo "opt=$opt"; }
+parse -n"#
+        )
+        .contains("requires an argument")
+    );
+}
+
+#[test]
+fn getopts_is_scoped_to_a_function_because_positionals_are() {
+    let outcome = run("getopts \"v\" opt");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(outcome.output.contains("JSON array"), "{}", outcome.output);
+    assert!(
+        outcome.output.contains("only valid inside a function"),
+        "{outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shell options
+// ---------------------------------------------------------------------------
+
+#[test]
+fn errexit_ends_the_script_at_the_first_untested_failure() {
+    let outcome = run("set -e\necho before\nnosuchcmd.here\necho after");
+    assert_eq!(outcome.exit_code.get(), 127);
+    assert!(outcome.output.contains("before"), "{outcome:?}");
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+    assert!(outcome.output.contains("`set -e` is on"), "{outcome:?}");
+
+    // Off by default, and `set +e` turns it back off.
+    assert!(output("nosuchcmd.here\necho after").contains("after"));
+    assert!(
+        output("set -e\nset +e\nnosuchcmd.here\necho after").contains("after"),
+        "`set +e` must restore the default"
+    );
+}
+
+#[test]
+fn errexit_leaves_a_tested_status_alone() {
+    // Bash's three exemptions, each one a position where the script is already asking whether the
+    // command failed. Tripping there would break the very idiom used to handle failure.
+    for script in [
+        "set -e\nif nosuchcmd.here; then echo yes; else echo handled; fi\necho after",
+        "set -e\nnosuchcmd.here || echo handled\necho after",
+        // `if a && b` nests two exemptions.
+        "set -e\nif true && nosuchcmd.here; then echo handled; else echo handled; fi\necho after",
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{script}");
+        assert!(
+            outcome.output.contains("handled"),
+            "{script}: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("after"),
+            "{script}: {}",
+            outcome.output
+        );
+    }
+    assert_eq!(code("set -e\n! nosuchcmd.here\necho after"), 0);
+    assert_eq!(
+        code("set -e\nwhile nosuchcmd.here; do echo body; done\necho after"),
+        0
+    );
+    // The final operand of a chain is *not* exempt: nothing is asking about it.
+    let outcome = run("set -e\ntrue && nosuchcmd.here\necho after");
+    assert_eq!(outcome.exit_code.get(), 127);
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+}
+
+#[test]
+fn nounset_refuses_a_name_nothing_ever_set() {
+    let outcome = run("set -u\necho \"[$missing]\"\necho after");
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+    assert!(
+        outcome.output.contains("missing: unbound variable"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+
+    // The expansions written to handle an absent value must not be what trips it.
+    assert_eq!(output("set -u\necho ${missing:-fallback}"), "fallback");
+    assert_eq!(output("set -u\necho \"[${missing+set}]\""), "[]");
+    assert_eq!(output("set -u\nx=\necho \"[$x]\""), "[]");
+}
+
+#[test]
+fn pipefail_reports_the_rightmost_stage_that_failed() {
+    // Without it, a capability that never ran hides behind a `jq` that was handed nothing and
+    // succeeded anyway — the exact shape a model writes and then misreads.
+    assert_eq!(code("nosuchcmd.here | jq ."), 0);
+    assert_eq!(code("set -o pipefail\nnosuchcmd.here | jq ."), 127);
+    assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
+    assert_eq!(
+        code("set -o pipefail\nset +o pipefail\nnosuchcmd.here | jq ."),
+        0
+    );
+}
+
+#[test]
+fn pipestatus_reports_every_stage() {
+    assert!(output("nosuchcmd.here | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
+    assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
+    assert_eq!(
+        output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
+        "1\n3"
+    );
+}
+
+#[test]
+fn set_refuses_every_option_it_does_not_enforce() {
+    for (script, expected) in [
+        ("set", "listing or setting positional parameters"),
+        ("set -x", "option -x is not supported"),
+        ("set -o", "-o needs an option name"),
+        ("set -o noclobber", "-o noclobber is not supported"),
+        ("set --", "sets positional parameters"),
+        ("set nope", "is not an option"),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(
+            outcome.output.contains(expected),
+            "{script}: {}",
+            outcome.output
+        );
+    }
+    // The long spellings of the three that are real do work.
+    assert_eq!(code("set -o errexit\nnosuchcmd.here"), 127);
+    assert_eq!(code("set -o nounset\necho $missing"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// `[[ ... ]]`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_brackets_run_the_same_tests_single_ones_do() {
+    // Same code underneath, so the two spellings can never disagree about an operator.
+    for (double, single) in [
+        ("[[ -n x ]]", "[ -n x ]"),
+        ("[[ -z \"\" ]]", "[ -z \"\" ]"),
+        ("[[ a = a ]]", "[ a = a ]"),
+        ("[[ a != b ]]", "[ a != b ]"),
+        ("[[ 2 -lt 10 ]]", "[ 2 -lt 10 ]"),
+        ("[[ ! -n \"\" ]]", "[ ! -n \"\" ]"),
+    ] {
+        assert_eq!(code(double), code(single), "{double} vs {single}");
+        assert_eq!(code(double), 0, "{double}");
+    }
+    assert_eq!(code("[[ -n \"\" ]]"), 1);
+}
+
+#[test]
+fn double_brackets_add_the_connectives_single_ones_lack() {
+    assert_eq!(output("[[ -n a && -n b ]] && echo both"), "both");
+    assert_eq!(output("[[ -z a || -n b ]] && echo either"), "either");
+    assert_eq!(
+        output("[[ ! ( -n a && -z b ) ]] && echo grouped"),
+        "grouped"
+    );
+    assert_eq!(
+        output("x=5\n[[ $x -gt 1 && $x -lt 10 ]] && echo between"),
+        "between"
+    );
+    // `&&` short-circuits, so the right side is never evaluated for an unset name.
+    assert_eq!(
+        output("[[ -n \"$missing\" && $missing -eq 1 ]] || echo skipped"),
+        "skipped"
+    );
+    // And it composes into the constructs that take a condition.
+    assert_eq!(output("if [[ -n x ]]; then echo yes; fi"), "yes");
+    assert_eq!(
+        output("i=0\nwhile [[ $i -lt 2 ]]; do echo $i; i=$(( i + 1 )); done"),
+        "0\n1"
+    );
+}
+
+#[test]
+fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
+    // The promise `[[ ]]` makes over `[ ]`: a value that spreads into several words elsewhere is
+    // still one operand here.
+    assert_eq!(
+        output(
+            r#"v=$(echo.echo --a "one two" | jq '[.a]')
+[[ -n $v ]] && echo held"#
+        ),
+        "held"
+    );
+}
+
+#[test]
+fn comparison_operands_inside_double_brackets_stay_literal() {
+    // In bash the right operand of `==` is a glob. Comparing it literally would answer this
+    // wrongly and silently, so the metacharacter is named instead.
+    let outcome = run("f=report.json\n[[ $f == *.json ]] && echo matched");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("glob in bash"), "{outcome:?}");
+    assert!(!outcome.output.contains("matched"), "{outcome:?}");
+
+    // Quoting is the way through while the parser can still see it.
+    assert_eq!(output("f='*'\n[[ $f == '*' ]] && echo literal"), "literal");
+    // One assembled at run time is caught when it expands.
+    let outcome = run("p='*.json'\nf=report.json\n[[ $f == $p ]] && echo matched");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("quoting cannot exempt"),
+        "{outcome:?}"
+    );
+
+    // Regex matching names itself rather than being read as a string comparison.
+    let outcome = run("[[ abc =~ a.c ]]");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("regex matching"), "{outcome:?}");
+}
+
+#[test]
+fn a_malformed_double_bracket_condition_names_what_is_wrong() {
+    assert!(run("[[ -n x ").output.contains("expected `]]`"));
+    assert!(run("[[ ]]").output.contains("expected a condition"));
+    assert!(
+        run("[[ a b c d ]]")
+            .output
+            .contains("at most three operands")
+    );
+    assert!(run("[[ ( -n x ]]").output.contains("expected `)`"));
+    // File tests stay refused, with the same message `test` gives.
+    assert!(run("[[ -f x ]]").output.contains("no filesystem"));
+}
+
+// ---------------------------------------------------------------------------
+// Compound commands as pipeline stages
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_compound_command_can_be_a_pipeline_stage() {
+    // The shape this whole change exists for. `cat` inside the loop body reads the value piped
+    // into the loop, which is the same rule a function body already followed.
+    assert_eq!(
+        output(r#"echo.echo --a 1 | while [ -n "$(cat | jq -r .a)" ]; do echo saw; break; done"#),
+        "saw"
+    );
+    assert_eq!(
+        output("echo.echo --a 1 | if [ $(cat | jq -r .a) -eq 1 ]; then echo yes; else echo no; fi"),
+        "yes"
+    );
+    assert_eq!(
+        output(
+            "echo.echo --a 1 --b 2 | case $(cat | jq -r .a) in 1) echo one ;; *) echo other ;; esac"
+        ),
+        "one"
+    );
+}
+
+#[test]
+fn a_piped_compound_stage_keeps_the_variables_it_assigns() {
+    // bash runs this in a subshell and throws the assignment away, which is the single most
+    // notorious trap in the language. There are no subshells here, so it simply works — and a
+    // model writing the obvious thing gets the obvious result.
+    assert_eq!(
+        output(
+            r#"total=0
+echo.echo --a 7 | while [ $total -eq 0 ]; do total=$(cat | jq -r .a); done
+echo $total"#
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn a_compound_stage_feeding_a_pipe_collects_everything_it_emitted() {
+    // Each statement inside emits separately, so without collecting them the next stage would see
+    // only the last one.
+    assert_eq!(output("{ echo a; echo b; } | wc -l"), "2");
+    assert_eq!(output("for x in 1 2 3; do echo $x; done | wc -l"), "3");
+    assert_eq!(output("{ echo a; echo b; } > buf\ncat buf | wc -l"), "2");
+}
+
+#[test]
+fn a_brace_group_runs_in_the_current_scope_and_is_one_branch() {
+    // The idiom braces exist for.
+    let outcome = run("nosuchcmd.here || { echo handled; exit 3; }\necho unreachable");
+    assert_eq!(outcome.exit_code.get(), 3);
+    assert!(outcome.output.contains("handled"), "{outcome:?}");
+    assert!(!outcome.output.contains("unreachable"), "{outcome:?}");
+
+    // No subshell, so an assignment inside is still an assignment outside.
+    assert_eq!(output("{ x=inside; }\necho $x"), "inside");
+    // A group reports the status of its last command, like bash.
+    assert_eq!(output("{ true; false; } && echo yes || echo no"), "no");
+}
+
+#[test]
+fn an_empty_or_unterminated_group_is_a_parse_error_naming_itself() {
+    assert!(run("{ }").output.contains("empty `{ }` group"));
+    assert!(run("{ echo hi").output.contains("expected `}`"));
+}
+
+#[test]
+fn a_compound_stage_carries_its_own_redirections() {
+    let outcome = run("{ nosuchcmd.one; nosuchcmd.two; } 2> log\necho ---\ncat log | wc -l");
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert_eq!(after.trim(), "2");
+}
+
+// ---------------------------------------------------------------------------
+// Parameter expansion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_and_alternate_expansions_follow_bash_including_the_colon() {
+    assert_eq!(output("echo ${missing:-fallback}"), "fallback");
+    assert_eq!(output("x=set\necho ${x:-fallback}"), "set");
+    // The colon is the whole distinction: `:-` also substitutes for a name holding nothing,
+    // `-` only for a name nothing ever assigned.
+    assert_eq!(output("x=\necho ${x:-fallback}"), "fallback");
+    assert_eq!(output("x=\necho \"[${x-fallback}]\""), "[]");
+
+    assert_eq!(output("x=set\necho ${x:+present}"), "present");
+    assert_eq!(output("echo \"[${missing:+present}]\""), "[]");
+
+    // A default may itself be an expansion, and a bare substitution keeps its structure.
+    assert_eq!(output("y=inner\necho ${x:-$y}"), "inner");
+    assert_eq!(
+        output("v=${x:-$(echo.echo --a 1)}\necho ${v[a]}"),
+        "1",
+        "a bare substitution default keeps its structure"
+    );
+}
+
+#[test]
+fn a_whole_right_hand_side_expansion_keeps_the_value_it_names() {
+    // `copy=$obj` has to keep the object, or the very indexing this value model exists for stops
+    // surviving one assignment.
+    assert_eq!(
+        output("obj=$(echo.echo --a 1)\ncopy=$obj\necho ${copy[a]}"),
+        "1"
+    );
+    // Glued to anything else it is text again, as it must be.
+    assert_eq!(
+        output("obj=$(echo.echo --a 1)\njoined=x$obj\necho $joined"),
+        r#"x{"a":1}"#
+    );
+}
+
+#[test]
+fn assign_expansion_binds_the_name_it_substituted_for() {
+    assert_eq!(output("echo ${x:=first}\necho $x"), "first\nfirst");
+    assert_eq!(output("x=kept\necho ${x:=other}\necho $x"), "kept\nkept");
+    // Assigning *through* an index has nowhere to write, so it says so rather than dropping the
+    // write on the floor.
+    let outcome = run("obj=$(echo.echo --a 1)\necho ${obj[b]:=x}");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("cannot assign through an index"));
+}
+
+#[test]
+fn a_required_expansion_ends_the_script_rather_than_carrying_on_empty() {
+    // The point of `${x:?}` is to stop. Reporting a status and continuing with an empty string
+    // would leave a script believing it had the value it just asserted it needed.
+    let outcome = run("echo ${token:?no credential in scope}\necho after");
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+    assert!(
+        outcome.output.contains("token: no credential in scope"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.output.contains("after"), "{outcome:?}");
+
+    assert_eq!(output("token=ok\necho ${token:?missing}"), "ok");
+    // Without a message of its own it still names the parameter.
+    assert!(
+        run("echo ${token:?}")
+            .output
+            .contains("token: parameter is not set")
+    );
+}
+
+#[test]
+fn length_counts_what_the_value_actually_is() {
+    assert_eq!(output("x=hello\necho ${#x}"), "5");
+    assert_eq!(output("echo ${#missing}"), "0");
+    // Real JSON, so an array counts elements and an object counts keys — a string's character
+    // count would be an answer about its JSON text rather than about the value.
+    assert_eq!(output("obj=$(echo.echo --a 1 --b 2)\necho ${#obj}"), "2");
+    // Characters, not bytes.
+    assert_eq!(output("x=héllo\necho ${#x}"), "5");
+}
+
+#[test]
+fn prefix_suffix_and_replacement_operate_on_literal_text() {
+    assert_eq!(output("p=owner/repo\necho ${p#owner/}"), "repo");
+    assert_eq!(output("p=owner/repo\necho ${p%/repo}"), "owner");
+    // A pattern that does not match leaves the value alone, as bash does.
+    assert_eq!(output("p=owner/repo\necho ${p#nope}"), "owner/repo");
+    // The doubled forms are the same request: a literal pattern matches in exactly one way.
+    assert_eq!(output("p=owner/repo\necho ${p##owner/}"), "repo");
+    assert_eq!(output("p=owner/repo\necho ${p%%/repo}"), "owner");
+
+    assert_eq!(output("p=a-b-c\necho ${p/-/+}"), "a+b-c");
+    assert_eq!(output("p=a-b-c\necho ${p//-/+}"), "a+b+c");
+    assert_eq!(output("p=a-b\necho ${p//-}"), "ab");
+}
+
+#[test]
+fn a_metacharacter_in_an_expansion_pattern_is_rejected_rather_than_matched_literally() {
+    // Same rule as a `grep`, `sed`, or `case` pattern, and for the same reason: a partial
+    // wildcard is exactly what a literal matcher answers wrongly and silently.
+    for script in ["p=a/b\necho ${p##*/}", "p=a.json\necho ${p%.*}"] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(outcome.output.contains("literal text"), "{script}");
+    }
+    // One assembled at run time is caught when it expands, where quoting can no longer help.
+    let outcome = run("star='*'\np=a.json\necho ${p%$star}");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("quoting cannot exempt"),
+        "{outcome:?}"
+    );
+    // Quoting is the way through, as everywhere else.
+    assert_eq!(output("p='*.json'\necho ${p#'*'}"), ".json");
+}
+
+#[test]
+fn nested_parameter_expansions_have_a_ceiling_rather_than_a_stack_overflow() {
+    let deep = format!("echo {}x{}", "${a:-".repeat(200), "}".repeat(200));
+    let outcome = run(&deep);
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("nested deeper"), "{outcome:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The two streams
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_redirected_stderr_leaves_the_combined_output() {
+    // The diagnostic is real — the exit code proves the command failed — but the script asked for
+    // it to go somewhere else, and it went there.
+    let outcome = run("nosuchcmd.here 2>/dev/null\necho done");
+    assert_eq!(outcome.output, "done");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+
+    assert_eq!(code("nosuchcmd.here 2>/dev/null"), 127);
+}
+
+#[test]
+fn stderr_redirects_into_a_named_buffer_that_cat_reads_back() {
+    let outcome = run("nosuchcmd.here 2> log\necho ---\ncat log");
+    assert!(!outcome.output.starts_with("dekopon-shell:"), "{outcome:?}");
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert!(after.contains("command not found"), "{after:?}");
+}
+
+#[test]
+fn a_value_sent_to_stderr_escapes_a_command_substitution() {
+    // `echo oops >&2` is how a script reports a problem without polluting what it returns. The
+    // line still reaches the reader; it just stops being the substitution's value.
+    let outcome = run(r#"x=$(echo oops >&2; echo kept)
+echo "[$x]""#);
+    assert!(outcome.output.contains("oops"), "{outcome:?}");
+    assert!(outcome.output.contains("[kept]"), "{outcome:?}");
+}
+
+#[test]
+fn two_to_one_merges_diagnostics_into_the_value_a_substitution_captures() {
+    // The idiom this exists for: capture *why* something failed, not just that it did.
+    let outcome = run(r#"x=$(nosuchcmd.here 2>&1)
+echo "[$x]""#);
+    assert!(outcome.output.contains("command not found]"), "{outcome:?}");
+}
+
+#[test]
+fn two_to_one_leaves_a_quiet_command_s_value_and_its_type_alone() {
+    // Merging is what a *diagnostic* forces; with none there is nothing to merge, and an object
+    // must not be flattened into its own JSON text just because `2>&1` was written.
+    assert_eq!(output("echo hi 2>&1"), "hi");
+    assert_eq!(
+        output("echo.echo --a 1 2>&1 | jq -r .a"),
+        "1",
+        "a quiet capability keeps its object"
+    );
+}
+
+#[test]
+fn both_streams_can_land_in_one_buffer() {
+    let outcome = run("nosuchcmd.here > out 2>&1\ncat out");
+    assert!(outcome.output.contains("command not found"), "{outcome:?}");
+
+    let outcome = run("echo hi &> all\ncat all");
+    assert_eq!(outcome.output, "hi");
+}
+
+#[test]
+fn dev_null_discards_on_write_and_reads_empty() {
+    assert_eq!(output("echo hi > /dev/null\necho after"), "after");
+    assert_eq!(output("cat /dev/null"), "");
+    // And it needs no prior write, unlike every other buffer name.
+    assert!(output("cat nosuchbuffer").contains("no such buffer"));
+}
+
+#[test]
+fn a_redirection_covers_the_whole_body_of_the_function_it_is_written_on() {
+    let outcome = run(
+        "noisy() { nosuchcmd.one; nosuchcmd.two; echo value; }\nnoisy 2> log\necho ---\ncat log | wc -l",
+    );
+    let (before, after) = outcome.output.split_once("---").expect("the marker");
+    assert!(!before.contains("command not found"), "{before:?}");
+    assert_eq!(after.trim(), "2", "both diagnostics were collected");
+}
+
+#[test]
+fn a_fatal_diagnostic_is_never_swallowed_by_a_redirection() {
+    // The script is ending and the capture is about to be abandoned. If `2>` could eat this line,
+    // a model would see an empty result with no explanation at all.
+    let outcome = run_with(
+        "loop() { loop; }\nloop 2>/dev/null",
+        Limits {
+            max_recursion_depth: 4,
+            ..Limits::default()
+        },
+    );
+    assert!(outcome.output.contains("nested deeper"), "{outcome:?}");
+}
+
+#[test]
+fn a_redirection_target_still_has_to_be_one_word() {
+    // An unquoted expansion holding a JSON array is what produces several words here; there is no
+    // IFS to split a string on.
+    let outcome = run("x=$(echo.echo --a one --b two | jq '[.a,.b]')\necho hi > $x");
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
+    assert!(
+        outcome.output.contains("exactly one buffer name"),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -834,14 +1504,16 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
         // Backticks: the second-most-common substitution form in real bash.
         ("echo `echo hi`", "backtick command substitution"),
         ("x=`date`", "backtick command substitution"),
-        // Numbered descriptors: this shell has one combined stream.
-        ("echo hi 2>/dev/null", "file-descriptor redirection"),
-        ("echo hi >&2", "file-descriptor redirection"),
-        ("echo hi 2>&1", "file-descriptor redirection"),
-        // Shell options: `set -e` changing nothing while looking like it had is the exact
-        // failure this design forbids.
-        ("set -euo pipefail\necho after", "no shell options"),
-        ("[[ -n \"x\" ]] && echo yes", "[[ ... ]]"),
+        // Descriptors beyond the two streams that exist.
+        ("echo hi 3>/dev/null", "only descriptors 1"),
+        ("cat 0< buf", "input duplication"),
+        // A shell option this shell does not enforce is refused by name rather than accepted and
+        // ignored, which is the failure that kept `set` out entirely before.
+        ("set -x\necho after", "option -x is not supported"),
+        (
+            "set -o noclobber\necho after",
+            "-o noclobber is not supported",
+        ),
         // Paren-shaped constructs are four different features, not one subshell.
         ("i=0; ((i++))", "arithmetic command"),
         ("arr=(a b c)", "bash array literals"),

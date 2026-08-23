@@ -54,6 +54,61 @@ All notable changes to Dekopon are documented here. The format is based on
   applied" is a usage failure to one and a configuration failure to another.
 - `dekopon --help` now renders `Usage: dekopon [OPTIONS] [COMMAND]`, because the subcommand is
   genuinely optional on a terminal.
+- Added `read` and `getopts` to the sandboxed shell. `read [-r] NAME...` is what makes
+  `cmd | while read line; do ...; done` terminate: it consumes one line per call through a cursor
+  on the enclosing pipeline stage and reports end of input as a status rather than a diagnostic,
+  which would otherwise be one message per loop iteration. Several names split the line on
+  whitespace runs with the remainder in the last, a rule local to `read` rather than a return of
+  IFS word splitting. `getopts` parses a shell function's own flags with `OPTIND` and `OPTARG`, and
+  is scoped to a function because that is the only place positional parameters exist here.
+- Made `set -e`, `set -u`, and `set -o pipefail` real in the sandboxed shell, with their `+` forms,
+  and added `${PIPESTATUS[@]}`. `set` was refused outright before on the grounds that an option
+  changing nothing while looking like it had is the exact silent wrongness this shell refuses;
+  that argument stops applying once the option is enforced and still holds for every option that
+  is not, so `set -x`, `set -o noclobber`, and `set --` now end the script by name rather than
+  being ignored. `errexit` exempts the three positions bash exempts, and they compose. `pipefail`
+  matters more here than in bash: `some.capability x | jq .` succeeded by default even when the
+  capability never ran, because `jq` was handed nothing and had no complaint.
+- Accepted `[[ ... ]]` in the sandboxed shell. It runs the same tests `[` and `test` run — one
+  function, so the two spellings cannot disagree — and adds bash's connective grammar (`&&`, `||`,
+  `!`, parentheses, short-circuiting) plus the promise that an unquoted expansion is one operand.
+  The right operand of `==` is a glob in bash; every pattern here is literal text, so a
+  metacharacter there is refused by name rather than compared literally, and `=~` is refused
+  outright. Grammar keywords are now mirrored into `dekopon_core::RESERVED_COMMAND_WORDS`, closing
+  a hole where a provider could declare a command word like `do` or `then`, load successfully, and
+  never be reachable because the parser consumed the word first.
+- Made compound commands — `if`, `for`, `while`, `until`, `case`, and the newly accepted `{ ...; }`
+  group — usable as pipeline stages, so `cmd | while read-shaped loop` and
+  `cmd || { echo failed; exit 1; }` parse, and a compound stage carries its own redirections. A
+  piped compound runs in the current scope rather than a subshell, so a `while` loop feeding off a
+  pipe keeps the variables it assigns; bash discards them with the subshell, which is the single
+  most notorious trap in the language. A stage feeding a pipe or a redirection has its emissions
+  collected into one value, the same collection a command substitution already performed.
+- Gave the sandboxed shell real parameter expansion: `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`,
+  `${NAME:+w}` and their colon-free forms, `${#NAME}`, `${NAME[@]}`/`${NAME[*]}`, and the literal
+  `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`. Two answer differently than bash because values are real
+  JSON: `${#NAME}` counts elements of an array and keys of an object, and `${NAME[@]}` selects the
+  elements of a JSON array rather than emulating a bash array. `${NAME:?w}` ends the script, which
+  is what the construct is for. Expansion patterns are literal text like every other pattern here,
+  with quoting as the escape hatch while the parser can still see it.
+- Gave the sandboxed shell two script-addressable streams. `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2`,
+  and `> /dev/null` now redirect a command's diagnostics or its value into a named in-memory
+  buffer, and a command may carry more than one redirection. The stdout/stderr split already
+  governed behaviour — `$( )` captured the value while diagnostics escaped to the terminal — and
+  this makes it something a script can address. `x=$(cmd 2>&1)` therefore captures *why* a
+  capability failed rather than only that it did; a quiet command's value, and its type, are left
+  untouched. `ScriptOutcome::output` is still the one combined transcript a terminal would show.
+
+### Changed
+
+- A whole right-hand side keeps its value rather than collapsing to text for a bare `$NAME` as well
+  as a bare `$(cmd)`, so `copy=$obj` followed by `${copy[key]}` works. Previously only the
+  substitution spelling survived, and `copy=$obj` silently flattened the object into its JSON text.
+- The shell no longer rejects file-descriptor redirection wholesale. Descriptors other than 1 and 2
+  (`3>`, `<&`) are still refused by name, as is `2>&1` written *before* the redirection it copies:
+  bash duplicates the file description there and leaves stderr on the terminal, this interpreter
+  has destinations rather than descriptions, and that spelling is the one a script writes when it
+  believes it captured output that went elsewhere.
 
 ### Fixed
 

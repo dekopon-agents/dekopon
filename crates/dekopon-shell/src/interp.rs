@@ -24,13 +24,19 @@ use crate::{
     CapabilityInvoker, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        ForLoop, IfStatement, Parameter, Pipeline, Program, SimpleCommand, Statement, WhileLoop,
-        Word, WordPart,
+        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
+        Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget, SimpleCommand, Statement,
+        Stream, WhileLoop, Word, WordPart,
     },
-    builtins::{BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs},
+    builtins::{
+        self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
+    },
     dispatch::{self, Resolution, arguments_to_input},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    parser::{expanded_case_pattern, parse, pattern_metacharacter},
+    parser::{
+        expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
+        pattern_metacharacter,
+    },
     value::{self, display},
 };
 
@@ -54,17 +60,133 @@ enum Executed {
     Flow(Flow),
 }
 
+/// The shell options `set` toggles.
+///
+/// Each one is enforced, not accepted-and-ignored: the reason `set` was refused outright before was
+/// that an option which changed nothing while looking like it had is exactly the class of silent
+/// wrongness this shell exists to refuse. That reason stops applying once the option is real.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShellOptions {
+    /// `set -e`: a command that fails outside a tested position ends the script.
+    errexit: bool,
+    /// `set -u`: expanding a parameter nothing ever set ends the script.
+    nounset: bool,
+    /// `set -o pipefail`: a pipeline reports its rightmost failure, not just its last stage.
+    pipefail: bool,
+}
+
+/// Where one of a command's two streams ends up.
+///
+/// [`Sink::Value`] and [`Sink::Diagnostics`] are the two defaults, and they are also what a
+/// duplication copies: `2>&1` gives stderr the sink stdout holds, and `>&2` the reverse. They are
+/// destinations in their own right rather than "unredirected", which is what makes
+/// `x=$(cmd 2>&1)` capture the diagnostics the way a real shell does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Sink {
+    /// The value channel: what the command produces, and what `$( )` captures.
+    Value,
+    /// The diagnostic channel: text lines that escape a capture, as a terminal's stderr does.
+    Diagnostics,
+    /// `/dev/null`.
+    Discard,
+    /// A named in-memory buffer.
+    Buffer {
+        /// Buffer name.
+        name: String,
+        /// `true` for the `>>` forms.
+        append: bool,
+    },
+}
+
+/// One entry on the stdin stack: the piped value, and how far `read` has consumed it.
+///
+/// The cursor is what separates `read` from every other way of looking at input. `cat` is offered
+/// the whole value on each pipeline in the body — deliberately, so a condition that never reads it
+/// cannot swallow it — while `read` *consumes*, one line per call, which is the only way
+/// `while read line` can terminate rather than seeing line one forever.
+#[derive(Debug, Default)]
+struct StdinSource {
+    value: Option<Rc<Value>>,
+    /// Lines split from `value`, materialized on the first `read` and never again.
+    lines: Option<Vec<String>>,
+    /// How many of those lines `read` has taken.
+    position: usize,
+}
+
+impl StdinSource {
+    fn new(value: Option<Rc<Value>>) -> Self {
+        Self {
+            value,
+            lines: None,
+            position: 0,
+        }
+    }
+
+    /// Takes the next unread line, or `None` at end of input.
+    fn next_line(&mut self) -> Option<String> {
+        let lines = self.lines.get_or_insert_with(|| {
+            self.value
+                .as_deref()
+                .map(value::to_lines)
+                .unwrap_or_default()
+        });
+        let line = lines.get(self.position).cloned();
+        if line.is_some() {
+            self.position += 1;
+        }
+        line
+    }
+}
+
+/// Diagnostics collected while one command's stderr is redirected.
+///
+/// Bounded by the same output ceilings the combined stream uses. A shell function called as
+/// `f 2> log` can run thousands of commands, so this must not be the one accumulator in the
+/// interpreter without a ceiling.
+#[derive(Debug)]
+struct StderrCapture {
+    lines: Vec<String>,
+    bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            lines: Vec::new(),
+            bytes: 0,
+            max_lines: limits.max_output_lines,
+            max_bytes: limits.max_output_bytes,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += line.len();
+        self.lines.push(line.to_owned());
+    }
+
+    /// Returns the captured lines, with a marker line when any were dropped.
+    fn finish(mut self) -> Vec<String> {
+        if self.truncated {
+            self.lines
+                .push("... redirected diagnostics truncated ...".to_owned());
+        }
+        self.lines
+    }
+}
+
 /// One shell-function activation.
 #[derive(Debug, Default)]
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
-    /// The value piped into the call, offered to the first command of each pipeline in the body.
-    ///
-    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
-    /// be deep-copied once per statement — including for the statements that never read input —
-    /// and all but the last copy dropped. See [`own`].
-    stdin: Option<Rc<Value>>,
 }
 
 /// Parses and evaluates one script, returning its outcome.
@@ -90,6 +212,7 @@ pub(crate) fn run(
     let mut evaluator = Evaluator {
         invoker,
         budget: Budget::start(limits),
+        limits,
         output: OutputBuffer::new(&limits),
         globals: BTreeMap::new(),
         frames: Vec::new(),
@@ -97,6 +220,10 @@ pub(crate) fn run(
         function_names: BTreeSet::new(),
         buffers: BTreeMap::new(),
         captures: Vec::new(),
+        options: ShellOptions::default(),
+        testing_status: 0,
+        stdin: Vec::new(),
+        stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
         allow_clock: limits.allow_clock,
         counters: telemetry::ScriptCounters::default(),
@@ -137,6 +264,8 @@ pub(crate) fn run(
 struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
+    /// The configured bounds, kept for the ceilings a redirected stderr capture reuses.
+    limits: Limits,
     output: OutputBuffer,
     globals: BTreeMap<String, Value>,
     frames: Vec<Frame>,
@@ -144,6 +273,32 @@ struct Evaluator<'a> {
     function_names: BTreeSet<String>,
     buffers: BTreeMap<String, Value>,
     captures: Vec<Vec<CommandResult>>,
+    /// The value piped into the enclosing call or compound stage, innermost last.
+    ///
+    /// Separate from [`Frame`] because the two nest differently: a shell function opens a variable
+    /// scope *and* receives input, while a compound pipeline stage receives input and deliberately
+    /// does not open a scope — `cmd | while read x; do total=$x; done` has to leave `total` set,
+    /// which is the opposite of bash's subshell and the whole reason the idiom is worth having.
+    ///
+    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
+    /// be deep-copied once per statement — including for the statements that never read input —
+    /// and all but the last copy dropped. See [`own`].
+    stdin: Vec<StdinSource>,
+    /// The options `set` has turned on.
+    options: ShellOptions,
+    /// How many enclosing positions are *testing* a status rather than depending on it.
+    ///
+    /// `errexit` must not fire for a command whose failure the script is already asking about: an
+    /// `if`/`while`/`until` condition, every operand of an `&&`/`||` chain but the last, and a
+    /// pipeline inverted by `!`. Bash draws exactly these three exemptions, and a counter rather
+    /// than a flag is what keeps them composing — `if a && b; then` nests two of them.
+    testing_status: u32,
+    /// Diagnostic capture stack, one frame per command whose stderr is redirected.
+    ///
+    /// A stack rather than a field because a redirection nests: a shell function called as
+    /// `f 2> log` collects its whole body's diagnostics, while a command *inside* that body with
+    /// its own `2>` collects only its own and then restores the function's.
+    stderr_capture: Vec<StderrCapture>,
     curl_capability: Option<String>,
     /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
     allow_clock: bool,
@@ -180,19 +335,29 @@ impl Evaluator<'_> {
             FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
                 "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
             ),
-            FatalError::Unsupported(reason) => format!("dekopon-shell: {reason}"),
+            FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
+                format!("dekopon-shell: {reason}")
+            }
         };
-        self.write_line(&message);
+        // Straight to the combined output, never into a redirected stderr capture: the script is
+        // ending, the capture is about to be abandoned unrouted, and `cmd 2> log` must not be able
+        // to swallow the one line explaining why nothing else ran.
+        self.output.push_block(&message);
         telemetry::fatal_exit_code(fatal)
     }
 
-    /// Writes one diagnostic to the combined output.
+    /// Writes one diagnostic to the diagnostic stream.
     ///
     /// Diagnostics escape a `$( )` capture on purpose. Only the *value* of a substitution is being
     /// captured; suppressing its errors too would leave `v=$(nosuchcmd)` with an empty variable, no
     /// explanation, and only a numeric `$?` the script may never inspect. Real shells send command
-    /// substitution stderr to the terminal for exactly this reason.
+    /// substitution stderr to the terminal for exactly this reason. A script that *wants* them
+    /// captured says so with `2>&1`, which is what the capture stack consulted here implements.
     fn write_line(&mut self, line: &str) {
+        if let Some(capture) = self.stderr_capture.last_mut() {
+            capture.push(line);
+            return;
+        }
         self.output.push_block(line);
     }
 
@@ -324,6 +489,17 @@ impl Evaluator<'_> {
             Statement::For(statement) => self.execute_for(statement),
             Statement::While(statement) => self.execute_while(statement),
             Statement::Case(statement) => self.execute_case(statement),
+            // A group runs its statements in the current scope; it exists to make several of them
+            // one command, not to open a subshell this evaluator does not have.
+            Statement::Group(body) => self.execute_program(body),
+            Statement::Conditional(expression) => {
+                let status = match self.evaluate_conditional(expression) {
+                    Ok(status) => status,
+                    Err(failure) => self.absorb(failure)?,
+                };
+                self.last_status = status;
+                Ok(Flow::Normal)
+            }
             Statement::Function(definition) => {
                 self.function_names.insert(definition.name.clone());
                 self.functions
@@ -336,7 +512,8 @@ impl Evaluator<'_> {
 
     fn execute_if(&mut self, statement: &IfStatement) -> Result<Flow, FatalError> {
         for (condition, body) in &statement.branches {
-            let (status, flow) = self.execute_list(condition)?;
+            let (status, flow) =
+                self.tested(true, |evaluator| evaluator.execute_list(condition))?;
             self.last_status = status;
             if let Some(flow) = flow {
                 return Ok(flow);
@@ -461,7 +638,9 @@ impl Evaluator<'_> {
             // Every iteration charges a step. This is the only thing standing between
             // `while true; do :; done` and an unbounded loop.
             self.budget.charge_step()?;
-            let (status, flow) = self.execute_list(&statement.condition)?;
+            let (status, flow) = self.tested(true, |evaluator| {
+                evaluator.execute_list(&statement.condition)
+            })?;
             self.last_status = status;
             if let Some(flow) = flow {
                 return Ok(flow);
@@ -496,13 +675,18 @@ impl Evaluator<'_> {
     }
 
     fn execute_list(&mut self, list: &AndOrList) -> Result<(ExitCode, Option<Flow>), FatalError> {
-        let (mut status, flow) = self.execute_pipeline(&list.first)?;
+        // Every operand of an `&&`/`||` chain but the last is a tested status: the chain is asking
+        // whether it succeeded, so `errexit` must not answer by ending the script.
+        let (mut status, flow) = self.tested(!list.rest.is_empty(), |evaluator| {
+            evaluator.execute_pipeline(&list.first)
+        })?;
         self.last_status = status;
         if flow.is_some() {
             return Ok((status, flow));
         }
 
-        for (operator, pipeline) in &list.rest {
+        let last = list.rest.len().saturating_sub(1);
+        for (index, (operator, pipeline)) in list.rest.iter().enumerate() {
             let should_run = match operator {
                 AndOr::And => status == ExitCode::SUCCESS,
                 AndOr::Or => status != ExitCode::SUCCESS,
@@ -510,14 +694,283 @@ impl Evaluator<'_> {
             if !should_run {
                 continue;
             }
-            let (next, flow) = self.execute_pipeline(pipeline)?;
+            let (next, flow) = self.tested(index < last, |evaluator| {
+                evaluator.execute_pipeline(pipeline)
+            })?;
             status = next;
             self.last_status = status;
             if flow.is_some() {
                 return Ok((status, flow));
             }
         }
+        if let Some(exit) = self.errexit_trip(status) {
+            return Ok((status, Some(exit)));
+        }
         Ok((status, None))
+    }
+
+    /// `read [-r] NAME...`: takes one line of input and binds it.
+    ///
+    /// This is what makes `cmd | while read line; do ...; done` terminate. Input is *consumed*
+    /// here, unlike every other way of looking at it: `cat` is offered the whole value on each
+    /// pipeline in the body so a condition cannot swallow it, while `read` advances a cursor and
+    /// reports failure at end of input, which is what ends the loop.
+    ///
+    /// A value that reached this command through a pipe is its own one-shot source; one inherited
+    /// from an enclosing call or compound stage is read through that stage's shared cursor, so
+    /// successive `read`s in a loop body see successive lines.
+    fn run_read(
+        &mut self,
+        arguments: &[String],
+        input: Option<Rc<Value>>,
+        from_pipe: bool,
+    ) -> Result<CommandResult, CommandFailure> {
+        let mut names = arguments;
+        // `-r` is the only flag, and it is what every correct script already passes. Backslashes
+        // are never line continuations here, so it is accepted and changes nothing — said out loud
+        // rather than left as a surprise.
+        if names.first().is_some_and(|first| first == "-r") {
+            names = &names[1..];
+        }
+        if let Some(flag) = names.first().filter(|first| first.starts_with('-')) {
+            return Err(CommandFailure::usage(format!(
+                "read: option {flag:?} is not supported; this shell has only `read [-r] NAME...`"
+            )));
+        }
+        if names.is_empty() {
+            return Err(CommandFailure::usage(
+                "read: needs at least one variable name to bind",
+            ));
+        }
+        for name in names {
+            if !is_variable_name(name) {
+                return Err(CommandFailure::usage(format!(
+                    "read: {name:?} is not a valid variable name"
+                )));
+            }
+        }
+
+        let line = if from_pipe {
+            StdinSource::new(input).next_line()
+        } else {
+            self.stdin.last_mut().and_then(StdinSource::next_line)
+        };
+        let Some(line) = line else {
+            // End of input is a *status*, not a diagnostic: it is the ordinary way a
+            // `while read` loop ends, and a message per loop would be one per iteration.
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+
+        // Several names split the line on whitespace runs, with the remainder landing in the last,
+        // exactly as bash does. This is a rule local to `read` rather than a return of IFS word
+        // splitting: there is no `IFS` here to configure, and nothing else splits.
+        let fields = split_read_fields(&line, names.len());
+        for (index, name) in names.iter().enumerate() {
+            let field = fields.get(index).copied().unwrap_or_default();
+            self.assign(name, Value::String(field.to_owned()))?;
+        }
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+
+    /// `getopts OPTSTRING NAME`: parses one flag out of the current positional parameters.
+    ///
+    /// Scoped to a shell function, because that is the only place positional parameters exist here.
+    /// `OPTIND` and `OPTARG` are ordinary variables, as in bash, so a script resets and inspects
+    /// them the way it already knows how.
+    fn run_getopts(&mut self, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
+        let [optstring, name] = arguments else {
+            return Err(CommandFailure::usage(
+                "getopts: usage: getopts OPTSTRING NAME",
+            ));
+        };
+        if !is_variable_name(name) {
+            return Err(CommandFailure::usage(format!(
+                "getopts: {name:?} is not a valid variable name"
+            )));
+        }
+        if self.frames.is_empty() {
+            return Err(CommandFailure::usage(
+                "getopts: only valid inside a function; positional parameters exist nowhere else \
+                 in this shell",
+            ));
+        }
+
+        let index = self
+            .lookup("OPTIND")
+            .and_then(Value::as_u64)
+            .map_or(1, |index| index as usize)
+            .max(1);
+        let positional = self.positional().to_vec();
+        let Some(argument) = positional.get(index - 1).map(display) else {
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+        if argument == "--" {
+            self.assign("OPTIND", Value::from(index + 1))?;
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        }
+        let Some(letter) = argument.strip_prefix('-').and_then(|rest| {
+            let mut characters = rest.chars();
+            characters
+                .next()
+                .filter(|_| characters.next().is_none() && !rest.is_empty())
+        }) else {
+            return Ok(CommandResult::status(ExitCode::FAILURE));
+        };
+
+        let takes_argument = optstring.contains(&format!("{letter}:"));
+        if !optstring.contains(letter) || letter == ':' {
+            self.assign(name, Value::String("?".to_owned()))?;
+            self.assign("OPTARG", Value::String(letter.to_string()))?;
+            self.assign("OPTIND", Value::from(index + 1))?;
+            self.write_line(&format!(
+                "dekopon-shell: getopts: illegal option -- {letter}"
+            ));
+            return Ok(CommandResult::status(ExitCode::SUCCESS));
+        }
+        if takes_argument {
+            let Some(value) = positional.get(index).map(display) else {
+                self.assign(name, Value::String("?".to_owned()))?;
+                self.assign("OPTARG", Value::String(letter.to_string()))?;
+                self.assign("OPTIND", Value::from(index + 1))?;
+                self.write_line(&format!(
+                    "dekopon-shell: getopts: option requires an argument -- {letter}"
+                ));
+                return Ok(CommandResult::status(ExitCode::SUCCESS));
+            };
+            self.assign("OPTARG", Value::String(value))?;
+            self.assign("OPTIND", Value::from(index + 2))?;
+        } else {
+            self.assign("OPTARG", Value::String(String::new()))?;
+            self.assign("OPTIND", Value::from(index + 1))?;
+        }
+        self.assign(name, Value::String(letter.to_string()))?;
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+
+    /// Applies one `set` invocation.
+    ///
+    /// Only the three options this shell actually enforces are accepted. Every other letter and
+    /// long name **ends the script** by name rather than being ignored: an accepted-and-ignored
+    /// option is the exact failure that kept `set` out of this shell in the first place, and a
+    /// refusal the script could carry on past would leave it running without the option it asked
+    /// for, which is the same failure wearing a status code.
+    fn apply_set_options(&mut self, arguments: &[String]) -> Result<(), CommandFailure> {
+        if arguments.is_empty() {
+            return Err(unsupported_option(
+                "set: listing or setting positional parameters is not supported; \
+                 use `set -e`, `set -u`, `set -o pipefail`, or their `+` forms",
+            ));
+        }
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = arguments[index].as_str();
+            let enable = match argument.chars().next() {
+                Some('-') => true,
+                Some('+') => false,
+                _ => {
+                    return Err(unsupported_option(format!(
+                        "set: {argument:?} is not an option; this shell supports only -e, -u, and \
+                         -o pipefail"
+                    )));
+                }
+            };
+            if argument.len() == 1 {
+                return Err(unsupported_option(format!(
+                    "set: {argument:?} on its own is not an option"
+                )));
+            }
+            if argument == "--" || argument == "++" {
+                return Err(unsupported_option(
+                    "set: `--` sets positional parameters, which this shell has only inside a \
+                     function and only from its arguments",
+                ));
+            }
+            index += 1;
+            for letter in argument.chars().skip(1) {
+                match letter {
+                    'e' => self.options.errexit = enable,
+                    'u' => self.options.nounset = enable,
+                    'o' => {
+                        let Some(name) = arguments.get(index) else {
+                            return Err(unsupported_option(
+                                "set: -o needs an option name; the only one is `pipefail`",
+                            ));
+                        };
+                        index += 1;
+                        self.set_long_option(name, enable)?;
+                    }
+                    other => {
+                        return Err(unsupported_option(format!(
+                            "set: option -{other} is not supported; this shell has -e, -u, and \
+                             -o pipefail"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one `set -o NAME` / `set +o NAME`.
+    fn set_long_option(&mut self, name: &str, enable: bool) -> Result<(), CommandFailure> {
+        match name {
+            "pipefail" => self.options.pipefail = enable,
+            "errexit" => self.options.errexit = enable,
+            "nounset" => self.options.nounset = enable,
+            other => {
+                return Err(unsupported_option(format!(
+                    "set: -o {other} is not supported; this shell has pipefail, errexit, and nounset"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes one pipeline's per-stage statuses as `PIPESTATUS`.
+    ///
+    /// An ordinary global, so `${PIPESTATUS[@]}`, `${PIPESTATUS[0]}`, and `${#PIPESTATUS[@]}` all
+    /// work through the expansion machinery that already exists rather than through a special case.
+    /// Written straight into the map instead of through [`Evaluator::assign`] because it *replaces*
+    /// a bounded array of small integers on every pipeline rather than accumulating one; charging
+    /// it against the value-byte ceiling would let a long loop exhaust that ceiling with a value
+    /// the script never asked for.
+    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) {
+        self.globals.insert(
+            "PIPESTATUS".to_owned(),
+            Value::Array(
+                stages
+                    .into_iter()
+                    .map(|stage| Value::from(stage.get()))
+                    .collect(),
+            ),
+        );
+    }
+
+    /// Runs `body` with `errexit` suspended when `suspended`, restoring the count afterwards.
+    fn tested<T>(
+        &mut self,
+        suspended: bool,
+        body: impl FnOnce(&mut Self) -> Result<T, FatalError>,
+    ) -> Result<T, FatalError> {
+        if suspended {
+            self.testing_status += 1;
+        }
+        let outcome = body(self);
+        if suspended {
+            self.testing_status -= 1;
+        }
+        outcome
+    }
+
+    /// Reports the exit `errexit` demands for this status, if any.
+    fn errexit_trip(&mut self, status: ExitCode) -> Option<Flow> {
+        if !self.options.errexit || self.testing_status > 0 || status == ExitCode::SUCCESS {
+            return None;
+        }
+        self.write_line(&format!(
+            "dekopon-shell: command failed with status {status} and `set -e` is on"
+        ));
+        Some(Flow::Exit(status))
     }
 
     fn execute_pipeline(
@@ -529,15 +982,27 @@ impl Evaluator<'_> {
         // each pipeline in the body. It is shared rather than consumed: consuming it would let a
         // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
         // before `cat` could see it, which is the same class of silent data loss as dropping it.
-        let mut input: Option<Rc<Value>> = self.frames.last().and_then(|frame| frame.stdin.clone());
+        let mut input: Option<Rc<Value>> =
+            self.stdin.last().and_then(|source| source.value.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
         let commands = pipeline.commands.len();
+        let mut stages = Vec::with_capacity(commands);
 
         for (index, command) in pipeline.commands.iter().enumerate() {
             let piped = index + 1 < commands;
-            match self.execute_command(command, input.take(), piped)? {
+            // Only a later stage's input actually came out of a pipe. The first stage's came from
+            // the enclosing call or compound stage, and `read` has to consume *that* through the
+            // shared cursor rather than through a private copy, or `while read line` would see the
+            // first line forever.
+            let from_pipe = index > 0;
+            // A `!` makes the whole pipeline a tested status, and every stage but the last is one
+            // anyway: bash exempts both from `errexit`, and so does this.
+            match self.tested(pipeline.negated || piped, |evaluator| {
+                evaluator.execute_command(command, input.take(), piped, from_pipe)
+            })? {
                 Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
                 Executed::Result(result) => {
+                    stages.push(result.status);
                     if piped {
                         // Only the terminal command's result is ever read, and the terminal
                         // command is by construction never piped — so an intermediate value moves
@@ -552,11 +1017,21 @@ impl Evaluator<'_> {
             }
         }
 
-        let status = if pipeline.negated {
-            invert(last.status)
-        } else {
-            last.status
-        };
+        // `pipefail` reports the rightmost stage that failed, so `cap x | jq .` stops hiding a
+        // capability that never ran behind a `jq` that was handed nothing and succeeded.
+        let mut status = last.status;
+        if self.options.pipefail
+            && let Some(failed) = stages
+                .iter()
+                .rev()
+                .find(|stage| **stage != ExitCode::SUCCESS)
+        {
+            status = *failed;
+        }
+        self.record_pipe_statuses(stages);
+        if pipeline.negated {
+            status = invert(status);
+        }
         self.emit(last);
         Ok((status, None))
     }
@@ -565,11 +1040,118 @@ impl Evaluator<'_> {
     // Commands
     // -----------------------------------------------------------------------
 
+    /// Runs one pipeline stage.
     fn execute_command(
+        &mut self,
+        command: &Command,
+        input: Option<Rc<Value>>,
+        capture_output: bool,
+        from_pipe: bool,
+    ) -> Result<Executed, FatalError> {
+        match command {
+            Command::Simple(command) => {
+                self.execute_simple_command(command, input, capture_output, from_pipe)
+            }
+            Command::Compound {
+                statement,
+                redirects,
+            } => self.execute_compound_command(statement, redirects, input, capture_output),
+        }
+    }
+
+    /// Runs a compound statement as one pipeline stage.
+    ///
+    /// The stage's emissions are collected into one value whenever anything downstream will read
+    /// them — a later pipe, a redirection, an enclosing `$( )`. Each statement inside emits
+    /// separately, so without that `{ echo a; echo b; } | wc -l` would hand `wc` only the last one.
+    fn execute_compound_command(
+        &mut self,
+        statement: &Statement,
+        redirects: &[Redirect],
+        input: Option<Rc<Value>>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
+        let (stdout, stderr) = match self.resolve_redirects(redirects) {
+            Ok(sinks) => sinks,
+            Err(failure) => {
+                let status = self.absorb(failure)?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
+        };
+        let collect = capture_output || stdout != Sink::Value;
+
+        let capturing = stderr != Sink::Diagnostics;
+        if capturing {
+            self.stderr_capture.push(StderrCapture::new(&self.limits));
+        }
+        self.stdin.push(StdinSource::new(input));
+        if collect {
+            self.captures.push(Vec::new());
+        }
+
+        let flow = self.execute_statement(statement);
+
+        let captured = if collect {
+            self.captures.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.stdin.pop();
+        let mut diagnostics = capturing
+            .then(|| self.stderr_capture.pop())
+            .flatten()
+            .map(StderrCapture::finish)
+            .unwrap_or_default();
+
+        let flow = flow?;
+        let value = if collect {
+            reduce_captured(captured)
+        } else {
+            Value::Null
+        };
+        let status = match flow {
+            Flow::Normal => self.last_status,
+            _ => {
+                self.route_diagnostics(diagnostics, &stderr)?;
+                return Ok(Executed::Flow(flow));
+            }
+        };
+
+        let mut result = CommandResult {
+            value,
+            status,
+            suppress_newline: false,
+        };
+        if stderr == Sink::Value {
+            result.value = merge_diagnostics(result.value, diagnostics);
+            diagnostics = Vec::new();
+        }
+        self.open_buffers(&[&stdout, &stderr]);
+        self.route_diagnostics(diagnostics, &stderr)?;
+
+        match stdout {
+            Sink::Value => Ok(Executed::Result(result)),
+            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
+            Sink::Diagnostics => {
+                if !result.value.is_null() {
+                    let text = display(&result.value);
+                    self.write_line(&text);
+                }
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+            Sink::Buffer { name, .. } => {
+                self.append_buffer(&name, result.value)?;
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+        }
+    }
+
+    fn execute_simple_command(
         &mut self,
         command: &SimpleCommand,
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
@@ -647,32 +1229,153 @@ impl Evaluator<'_> {
             },
         };
 
-        let executed = self.run_argv(&argv, input, capture_output);
-        self.restore_all(restore);
-        let executed = executed?;
-        let Executed::Result(result) = executed else {
-            return Ok(executed);
-        };
-
-        let Some(redirect) = &command.redirect else {
-            return Ok(Executed::Result(result));
-        };
-
-        let target = match self.expand_word(&redirect.target) {
-            Ok(expanded) => expanded,
+        // Redirections are resolved *before* the command runs, the way bash resolves them, because
+        // a redirected stderr has to be in place while the command is producing diagnostics rather
+        // than applied to a value afterwards.
+        let (stdout, stderr) = match self.resolve_redirects(&command.redirects) {
+            Ok(sinks) => sinks,
             Err(failure) => {
+                self.restore_all(restore);
                 let status = self.absorb(failure)?;
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
         };
-        let [name] = target.as_slice() else {
-            self.write_line(
-                "dekopon-shell: a redirection target must expand to exactly one buffer name",
-            );
-            return Ok(Executed::Result(CommandResult::status(ExitCode::SYNTAX)));
+
+        let capturing = stderr != Sink::Diagnostics;
+        if capturing {
+            self.stderr_capture.push(StderrCapture::new(&self.limits));
+        }
+        let executed = self.run_argv(&argv, input, capture_output, from_pipe);
+        // Popped before the `?` below: a fatal error must not leave a capture installed for the
+        // rest of the script, silently swallowing every later diagnostic.
+        let mut diagnostics = capturing
+            .then(|| self.stderr_capture.pop())
+            .flatten()
+            .map(StderrCapture::finish)
+            .unwrap_or_default();
+        self.restore_all(restore);
+        let executed = executed?;
+        let Executed::Result(mut result) = executed else {
+            self.route_diagnostics(diagnostics, &stderr)?;
+            return Ok(executed);
         };
-        self.write_buffer(name, redirect.append, result.value)?;
-        Ok(Executed::Result(CommandResult::status(result.status)))
+
+        if stderr == Sink::Value {
+            result.value = merge_diagnostics(result.value, diagnostics);
+            diagnostics = Vec::new();
+        }
+
+        // Truncation belongs to the redirection, not to each write, exactly as a real shell
+        // truncates once when it opens the file. Without this, `cmd > out 2>&1` would write the
+        // diagnostics and then have the value overwrite them, or the reverse depending on order.
+        self.open_buffers(&[&stdout, &stderr]);
+        self.route_diagnostics(diagnostics, &stderr)?;
+
+        match stdout {
+            Sink::Value => Ok(Executed::Result(result)),
+            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
+            Sink::Diagnostics => {
+                if !result.value.is_null() {
+                    let text = display(&result.value);
+                    self.write_line(&text);
+                }
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+            Sink::Buffer { name, .. } => {
+                self.append_buffer(&name, result.value)?;
+                Ok(Executed::Result(CommandResult::status(result.status)))
+            }
+        }
+    }
+
+    /// Truncates every buffer a non-appending redirection names, once, before anything is written.
+    ///
+    /// A truncated buffer is left holding `null` rather than removed, so `cmd > out` makes `out`
+    /// exist and readable even when the command produced nothing — the way redirecting into a file
+    /// creates an empty one.
+    fn open_buffers(&mut self, sinks: &[&Sink]) {
+        for sink in sinks {
+            if let Sink::Buffer {
+                name,
+                append: false,
+            } = sink
+            {
+                self.buffers.insert(name.clone(), Value::Null);
+            }
+        }
+    }
+
+    /// Resolves a command's redirections into one destination per stream.
+    ///
+    /// Walked left to right so a duplication copies the sink its target holds *at that point*,
+    /// which is how a real shell's `dup2` behaves. The parser refuses the one ordering where that
+    /// distinction is invisible and wrong — a duplication whose target is redirected afterwards.
+    fn resolve_redirects(
+        &mut self,
+        redirects: &[Redirect],
+    ) -> Result<(Sink, Sink), CommandFailure> {
+        let mut stdout = Sink::Value;
+        let mut stderr = Sink::Diagnostics;
+        for redirect in redirects {
+            let sink = match &redirect.target {
+                RedirectTarget::Stream(Stream::Stdout) => stdout.clone(),
+                RedirectTarget::Stream(Stream::Stderr) => stderr.clone(),
+                RedirectTarget::Stream(Stream::Both) => {
+                    unreachable!("the lexer never produces `&` as a duplication target")
+                }
+                RedirectTarget::Buffer { append, target } => {
+                    let expanded = self.expand_word(target)?;
+                    let [name] = expanded.as_slice() else {
+                        return Err(CommandFailure::usage(
+                            "dekopon-shell: a redirection target must expand to exactly one buffer name",
+                        ));
+                    };
+                    if name == DEV_NULL {
+                        Sink::Discard
+                    } else {
+                        Sink::Buffer {
+                            name: name.clone(),
+                            append: *append,
+                        }
+                    }
+                }
+            };
+            match redirect.source {
+                Stream::Stdout => stdout = sink,
+                Stream::Stderr => stderr = sink,
+                Stream::Both => {
+                    stdout = sink.clone();
+                    stderr = sink;
+                }
+            }
+        }
+        Ok((stdout, stderr))
+    }
+
+    /// Sends one command's collected diagnostics to their redirected destination.
+    fn route_diagnostics(
+        &mut self,
+        diagnostics: Vec<String>,
+        sink: &Sink,
+    ) -> Result<(), FatalError> {
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+        match sink {
+            Sink::Discard => {}
+            Sink::Diagnostics | Sink::Value => {
+                // `Value` reaches here only for a command that produced no result to merge into,
+                // which is a flow word; its diagnostics still belong somewhere visible.
+                for line in diagnostics {
+                    self.write_line(&line);
+                }
+            }
+            Sink::Buffer { name, .. } => {
+                let name = name.clone();
+                self.append_buffer(&name, value::from_lines(diagnostics))?;
+            }
+        }
+        Ok(())
     }
 
     /// Restores every binding a transient prefix assignment shadowed, in reverse order.
@@ -682,20 +1385,19 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Stores a redirected value in the named in-memory buffer store.
-    fn write_buffer(
-        &mut self,
-        name: &str,
-        append: bool,
-        value: Value,
-    ) -> Result<(), LimitExceeded> {
-        self.budget.charge_value_bytes(value_bytes(&value))?;
-        if !append {
-            self.buffers.insert(name.to_owned(), value);
+    /// Adds one value to the named in-memory buffer store, folding repeats into an array.
+    fn append_buffer(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
+        // A command that produced nothing writes nothing, matching `emit`. Otherwise
+        // `nosuchcmd > out 2>&1` would leave a stray `null` sitting in front of the one line that
+        // explains what happened.
+        if value.is_null() {
             return Ok(());
         }
+        self.budget.charge_value_bytes(value_bytes(&value))?;
         match self.buffers.remove(name) {
-            None => {
+            // `null` is what an opened-and-truncated buffer holds, so it reads as empty rather
+            // than as a first element.
+            None | Some(Value::Null) => {
                 self.buffers.insert(name.to_owned(), value);
             }
             Some(Value::Array(mut existing)) => {
@@ -727,6 +1429,7 @@ impl Evaluator<'_> {
         argv: &[String],
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
@@ -751,7 +1454,14 @@ impl Evaluator<'_> {
         }
         let _entered = span.enter();
 
-        let executed = self.dispatch_command(command, arguments, resolution, input, capture_output);
+        let executed = self.dispatch_command(
+            command,
+            arguments,
+            resolution,
+            input,
+            capture_output,
+            from_pipe,
+        );
         let (status, outcome) = match &executed {
             Ok(Executed::Result(result)) => {
                 (result.status, telemetry::outcome_label(result.status))
@@ -784,9 +1494,10 @@ impl Evaluator<'_> {
         resolution: Option<Resolution>,
         input: Option<Rc<Value>>,
         capture_output: bool,
+        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
-            if let Some(executed) = self.run_control_word(command, arguments)? {
+            if let Some(executed) = self.run_control_word(command, arguments, input, from_pipe)? {
                 return Ok(executed);
             }
             // Unreachable while [`telemetry::CONTROL_WORDS`] and `run_control_word` agree, which
@@ -913,6 +1624,8 @@ impl Evaluator<'_> {
         &mut self,
         command: &str,
         arguments: &[String],
+        input: Option<Rc<Value>>,
+        from_pipe: bool,
     ) -> Result<Option<Executed>, FatalError> {
         let executed = match command {
             "break" | "continue" => {
@@ -929,6 +1642,13 @@ impl Evaluator<'_> {
                     Flow::Continue(level)
                 })
             }
+            "set" => match self.apply_set_options(arguments) {
+                Ok(()) => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
+                Err(failure) => {
+                    let status = self.absorb(failure)?;
+                    Executed::Result(CommandResult::status(status))
+                }
+            },
             "return" => {
                 if self.frames.is_empty() {
                     self.write_line("dekopon-shell: return: only valid inside a function");
@@ -955,6 +1675,20 @@ impl Evaluator<'_> {
                 };
                 Executed::Flow(Flow::Exit(status))
             }
+            "read" => match self.run_read(arguments, input, from_pipe) {
+                Ok(result) => Executed::Result(result),
+                Err(failure) => {
+                    let status = self.absorb(failure)?;
+                    Executed::Result(CommandResult::status(status))
+                }
+            },
+            "getopts" => match self.run_getopts(arguments) {
+                Ok(result) => Executed::Result(result),
+                Err(failure) => {
+                    let status = self.absorb(failure)?;
+                    Executed::Result(CommandResult::status(status))
+                }
+            },
             "local" => {
                 if self.frames.is_empty() {
                     self.write_line("dekopon-shell: local: only valid inside a function");
@@ -1042,8 +1776,8 @@ impl Evaluator<'_> {
         self.frames.push(Frame {
             locals: BTreeMap::new(),
             positional,
-            stdin: input,
         });
+        self.stdin.push(StdinSource::new(input));
         if capture_output {
             self.captures.push(Vec::new());
         }
@@ -1054,6 +1788,7 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
+        self.stdin.pop();
         self.frames.pop();
         self.budget.leave_call();
 
@@ -1096,7 +1831,7 @@ impl Evaluator<'_> {
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
             self.budget.charge_step()?;
-            match self.run_argv(&invocation, None, true)? {
+            match self.run_argv(&invocation, None, true, false)? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
                     if result.status != ExitCode::SUCCESS {
@@ -1128,19 +1863,28 @@ impl Evaluator<'_> {
 
     /// Evaluates an assignment right-hand side.
     ///
-    /// A whole-RHS `$(cmd)` keeps its structured value instead of collapsing to text. This is the
-    /// documented deviation from bash that makes `ip=$(curl ...)` followed by `${ip[origin]}` work.
+    /// A whole-RHS `$(cmd)` or `$NAME` keeps its structured value instead of collapsing to text.
+    /// This is the documented deviation from bash that makes `ip=$(curl ...)` followed by
+    /// `${ip[origin]}` work, and it has to cover both spellings or `copy=$ip` would silently
+    /// flatten what `ip` holds.
     fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if word.parts.is_empty() {
             return Ok(Value::String(String::new()));
         }
-        if let Some(WordPart::CommandSubstitution(program)) = word.parts.first()
-            && word.is_bare_command_substitution()
-        {
-            let (value, status) = self.run_substitution(program)?;
-            self.last_substitution_status = status;
-            return Ok(value);
+        if let [part] = word.parts.as_slice() {
+            match part {
+                WordPart::CommandSubstitution(program) => {
+                    let (value, status) = self.run_substitution(program)?;
+                    self.last_substitution_status = status;
+                    return Ok(value);
+                }
+                // A whole-RHS parameter expansion keeps its value for the same reason a whole-RHS
+                // substitution does: `b=$a` followed by `${b[key]}` is asking about the object `a`
+                // holds, and stringifying it here would answer about that object's JSON text.
+                WordPart::Parameter(parameter) => return self.parameter_value(parameter),
+                _ => {}
+            }
         }
         let expanded = self.expand_word(word)?;
         Ok(Value::String(expanded.join(" ")))
@@ -1220,9 +1964,15 @@ impl Evaluator<'_> {
                     let number = self.evaluate_arithmetic(expression)?;
                     append(&mut fields, &render_number(number));
                 }
-                WordPart::Parameter(Parameter::AllPositional) => {
-                    let mut positional = self.positional().iter().map(display);
-                    let Some(first) = positional.next() else {
+                WordPart::Parameter(parameter) if splits_inside_quotes(parameter) => {
+                    let value = self.parameter_value(parameter)?;
+                    let elements = match value {
+                        Value::Array(items) => items,
+                        Value::Null => Vec::new(),
+                        scalar => vec![scalar],
+                    };
+                    let mut elements = elements.iter().map(display);
+                    let Some(first) = elements.next() else {
                         // A bare `"$@"` with no parameters is no word at all, so `f "$@"` with
                         // nothing to forward calls `f` with zero arguments rather than one empty
                         // one. Glued to other text it contributes nothing instead.
@@ -1232,7 +1982,7 @@ impl Evaluator<'_> {
                         continue;
                     };
                     append(&mut fields, &first);
-                    fields.extend(positional);
+                    fields.extend(elements);
                 }
                 WordPart::Parameter(parameter) => {
                     let value = self.parameter_value(parameter)?;
@@ -1249,14 +1999,27 @@ impl Evaluator<'_> {
 
     fn parameter_value(&mut self, parameter: &Parameter) -> Result<Value, CommandFailure> {
         Ok(match parameter {
-            Parameter::Named { name, indices } => {
-                let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
-                for index in indices {
-                    let expanded = self.expand_word(index)?;
-                    let key = expanded.join(" ");
-                    value = value::index(&value, &key);
+            Parameter::Named {
+                name,
+                indices,
+                modifier,
+                length,
+            } => {
+                let (value, bound) = self.select_parameter(name, indices)?;
+                // `set -u` only governs a plain reference. `${x:-d}` and its relatives exist
+                // precisely to handle an absent value, so tripping on them would make the option
+                // refuse the idiom written to satisfy it.
+                if self.options.nounset && !bound && *modifier == Modifier::None {
+                    return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
+                        "{name}: unbound variable, and `set -u` is on"
+                    ))));
                 }
-                value
+                let value = self.apply_modifier(name, indices, modifier, value, bound)?;
+                if *length {
+                    parameter_length(&value)
+                } else {
+                    value
+                }
             }
             Parameter::Positional(0) => Value::String("dekopon-shell".to_owned()),
             Parameter::Positional(position) => self
@@ -1276,6 +2039,206 @@ impl Evaluator<'_> {
             Parameter::PositionalCount => Value::from(self.positional().len()),
             Parameter::LastStatus => Value::from(self.last_status.get()),
         })
+    }
+
+    /// Walks a parameter's indices, reporting the selection and whether it was bound at all.
+    ///
+    /// "Bound" is what separates `${NAME-word}` from `${NAME:-word}`: the first substitutes only
+    /// for a name nothing ever assigned, the second also for one holding an empty value.
+    fn select_parameter(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+    ) -> Result<(Value, bool), CommandFailure> {
+        let mut bound = self.lookup(name).is_some();
+        let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
+        for index in indices {
+            match index {
+                Index::At(word) => {
+                    let expanded = self.expand_word(word)?;
+                    let key = expanded.join(" ");
+                    value = value::index(&value, &key);
+                    bound = !value.is_null();
+                }
+                // `[@]` and `[*]` select the whole thing; what differs is how the *word* they sit
+                // in splits, which `expand_word` and `expand_quoted_fields` decide.
+                Index::All => {}
+                Index::AllJoined => {
+                    value = Value::String(value::to_lines(&value).join(" "));
+                }
+            }
+        }
+        Ok((value, bound))
+    }
+
+    /// Applies one `${NAME<op>word}` transformation.
+    fn apply_modifier(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+        modifier: &Modifier,
+        value: Value,
+        bound: bool,
+    ) -> Result<Value, CommandFailure> {
+        // `:` widens "absent" from "never assigned" to "assigned nothing useful", which is the
+        // distinction bash draws and the one a script almost always wants.
+        let absent = |colon: bool| {
+            if colon {
+                value.is_null() || display(&value).is_empty()
+            } else {
+                !bound
+            }
+        };
+        Ok(match modifier {
+            Modifier::None => value,
+            Modifier::Default { colon, word } => {
+                if absent(*colon) {
+                    self.assignment_value(word)?
+                } else {
+                    value
+                }
+            }
+            Modifier::Assign { colon, word } => {
+                if !absent(*colon) {
+                    return Ok(value);
+                }
+                if !indices.is_empty() {
+                    return Err(CommandFailure::usage(format!(
+                        "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
+                    )));
+                }
+                let substitute = self.assignment_value(word)?;
+                self.assign(name, substitute.clone())?;
+                substitute
+            }
+            Modifier::Require { colon, word } => {
+                if !absent(*colon) {
+                    return Ok(value);
+                }
+                let message = match word {
+                    Some(word) => self.expand_quoted(&word.parts)?,
+                    None => "parameter is not set".to_owned(),
+                };
+                return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
+                    "{name}: {message}"
+                ))));
+            }
+            Modifier::Alternate { colon, word } => {
+                if absent(*colon) {
+                    Value::Null
+                } else {
+                    self.assignment_value(word)?
+                }
+            }
+            Modifier::StripPrefix(pattern) => {
+                let pattern = self.literal_pattern(pattern)?;
+                let text = display(&value);
+                Value::String(
+                    text.strip_prefix(&pattern)
+                        .map_or(text.clone(), str::to_owned),
+                )
+            }
+            Modifier::StripSuffix(pattern) => {
+                let pattern = self.literal_pattern(pattern)?;
+                let text = display(&value);
+                Value::String(
+                    text.strip_suffix(&pattern)
+                        .map_or(text.clone(), str::to_owned),
+                )
+            }
+            Modifier::Replace {
+                all,
+                pattern,
+                replacement,
+            } => {
+                let pattern = self.literal_pattern(pattern)?;
+                let replacement = self.expand_quoted(&replacement.parts)?;
+                let text = display(&value);
+                if pattern.is_empty() {
+                    return Err(CommandFailure::usage(format!(
+                        "${{{name}/...}} needs text to replace; an empty pattern matches everywhere"
+                    )));
+                }
+                Value::String(if *all {
+                    text.replace(&pattern, &replacement)
+                } else {
+                    text.replacen(&pattern, &replacement, 1)
+                })
+            }
+        })
+    }
+
+    /// Expands one `${NAME#pattern}`-family pattern and refuses the metacharacters it cannot honor.
+    ///
+    /// Same rule as a `grep`, `sed`, or `case` pattern. A constant pattern was already checked by
+    /// the parser, where quoting was still visible; only one assembled at run time is checked here.
+    fn literal_pattern(&mut self, pattern: &Pattern) -> Result<String, CommandFailure> {
+        match pattern {
+            Pattern::Literal(word) => self.expand_quoted(&word.parts),
+            Pattern::Expanded(word) => {
+                let text = self.expand_quoted(&word.parts)?;
+                if let Some((character, meaning)) = pattern_metacharacter(&text) {
+                    return Err(CommandFailure::usage(expanded_parameter_pattern(
+                        character, meaning,
+                    )));
+                }
+                Ok(text)
+            }
+        }
+    }
+
+    /// Evaluates one `[[ ... ]]` expression.
+    ///
+    /// `&&` and `||` short-circuit, exactly as they do between commands, so
+    /// `[[ -n $x && $x == ok ]]` never evaluates the comparison for an unset `x`.
+    fn evaluate_conditional(
+        &mut self,
+        expression: &Conditional,
+    ) -> Result<ExitCode, CommandFailure> {
+        self.budget.charge_step()?;
+        match expression {
+            Conditional::Test(test) => self.evaluate_conditional_test(test),
+            Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
+            Conditional::And(left, right) => {
+                let status = self.evaluate_conditional(left)?;
+                if status == ExitCode::SUCCESS {
+                    return self.evaluate_conditional(right);
+                }
+                Ok(status)
+            }
+            Conditional::Or(left, right) => {
+                let status = self.evaluate_conditional(left)?;
+                if status == ExitCode::SUCCESS {
+                    return Ok(status);
+                }
+                self.evaluate_conditional(right)
+            }
+        }
+    }
+
+    /// Evaluates one `[[ ]]` primary.
+    ///
+    /// Each operand expands to exactly one word — that is the promise `[[ ]]` makes over `[ ]`, and
+    /// it is why `[[ -n $x ]]` holds for a value with spaces where `[ -n $x ]` falls apart. The
+    /// test itself is [`builtins::misc::evaluate_test`], the same code `test` and `[` run, so the
+    /// two spellings can never disagree about what `-z` or `-lt` mean.
+    fn evaluate_conditional_test(
+        &mut self,
+        test: &ConditionalTest,
+    ) -> Result<ExitCode, CommandFailure> {
+        let mut operands = Vec::with_capacity(test.words.len());
+        for word in &test.words {
+            operands.push(self.expand_quoted(&word.parts)?);
+        }
+        if test.check_right_pattern
+            && let [_, _, right] = operands.as_slice()
+            && let Some((character, meaning)) = pattern_metacharacter(right)
+        {
+            return Err(CommandFailure::usage(expanded_conditional_pattern(
+                character, meaning,
+            )));
+        }
+        Ok(builtins::misc::evaluate_test("[[", &operands)?.status)
     }
 
     /// Runs a command substitution, capturing what its pipelines produced.
@@ -1365,6 +2328,86 @@ impl Evaluator<'_> {
             }
         })
     }
+}
+
+/// Reports whether a parameter keeps splitting into one word per element inside double quotes.
+///
+/// `"$@"` is the most-trained idiom in shell and `"${NAME[@]}"` is its named-variable counterpart:
+/// both exist precisely so a list survives quoting intact. Every other expansion inside quotes is
+/// one field.
+fn splits_inside_quotes(parameter: &Parameter) -> bool {
+    match parameter {
+        Parameter::AllPositional => true,
+        Parameter::Named {
+            indices, length, ..
+        } => !*length && matches!(indices.last(), Some(Index::All)),
+        _ => false,
+    }
+}
+
+/// Splits one `read` line into at most `count` fields on whitespace runs.
+///
+/// The remainder lands in the last field, as bash does, and leading whitespace is skipped. Local to
+/// `read` rather than a return of IFS word splitting: nothing else in this shell splits, and there
+/// is no `IFS` to configure.
+fn split_read_fields(line: &str, count: usize) -> Vec<&str> {
+    let mut fields = Vec::with_capacity(count);
+    let mut rest = line.trim_start();
+    while fields.len() + 1 < count && !rest.is_empty() {
+        match rest.find(char::is_whitespace) {
+            Some(offset) => {
+                fields.push(&rest[..offset]);
+                rest = rest[offset..].trim_start();
+            }
+            None => break,
+        }
+    }
+    fields.push(rest);
+    fields
+}
+
+/// Reports whether a word can name a shell variable.
+fn is_variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Composes the terminal failure for a `set` option this shell does not enforce.
+fn unsupported_option(message: impl Into<String>) -> CommandFailure {
+    CommandFailure::Fatal(FatalError::Unsupported(message.into()))
+}
+
+/// Reports what `${#NAME}` counts, per value kind.
+///
+/// A string counts characters, the way bash does. An array counts elements and an object counts
+/// keys, which is what `${#NAME}` has to mean once values are real JSON rather than text; anything
+/// else counts the characters of its display form.
+fn parameter_length(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::from(0),
+        Value::String(text) => Value::from(text.chars().count()),
+        Value::Array(items) => Value::from(items.len()),
+        Value::Object(fields) => Value::from(fields.len()),
+        other => Value::from(display(other).chars().count()),
+    }
+}
+
+/// Folds a command's captured diagnostics into its value, for `2>&1`.
+///
+/// A command with nothing to say leaves its value untouched — including its type, so
+/// `posts.get 2>&1` still yields an object rather than that object's JSON text. Only when there
+/// *are* diagnostics do the two channels have to become one, and they become one the way every
+/// text-shaped builtin already crosses between a value and its lines.
+fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
+    if diagnostics.is_empty() {
+        return value;
+    }
+    let mut lines = value::to_lines(&value);
+    lines.extend(diagnostics);
+    value::from_lines(lines)
 }
 
 /// Materializes a piped value for a command that consumes it by value.
