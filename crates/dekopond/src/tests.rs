@@ -16,8 +16,9 @@ use dekopon_agent::prompt::{
     HistoryLimits, IMAGE_GENERATION_TOOL_NAME, PromptLimits,
 };
 use dekopon_broker_protocol::{
-    AvailableCapability, BrokerRequest, ChatMemorySurface, FrameLimits, InvocationOutcome,
-    InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface, FrameLimits,
+    InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
+    write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
@@ -39,7 +40,7 @@ use crate::{
     config::{
         self, ActivityMode, ConversationPolicy, ConversationWindow, ImageGeneratorConfig,
         ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch, SlackActivityConfig,
-        SlackActivityFallback, SlackExperience, SocketDiscovery,
+        SlackActivityFallback, SlackExperience,
     },
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
@@ -761,7 +762,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
     let resolved = config::resolve(
         document,
         PathBuf::from("/tmp/dekopond.json"),
-        &SocketDiscovery::new(None, Some(PathBuf::from("/run/user/1000")), None),
+        &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/1000")), None),
         501,
     )
     .expect("discovery resolves");

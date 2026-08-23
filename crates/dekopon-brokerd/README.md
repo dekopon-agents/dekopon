@@ -202,6 +202,44 @@ A peer identity may carry an optional `attestor` grant, which lets it propose on
 authenticated external chat identity. `identityMappings` is the other half: it is the only place a
 canonical subject becomes a principal.
 
+### Development identities
+
+`allowDevelopmentSubjects: true` additionally admits `dev.<surface>.<name>` subjects. It is off by
+default and it is the whole enforcement: a broker that started without it provably holds no `dev.*`
+mapping, so an attested development subject resolves to nothing through the same unmapped-subject
+refusal every unknown subject gets. Startup lists **every** offending entry — mappings and attestor
+namespaces alike — and then fails, so one restart fixes the file rather than one entry.
+
+The reason it is a separate line rather than an inference from the namespace list is what a `dev.*`
+subject actually is. Every other subject carries a name Slack, Discord, Telegram, WhatsApp, or a
+carrier verified before the message reached a transport. A `dev.*` subject carries a name a local
+caller typed on an owner-only socket — which is what makes `dekopon console` usable, and what makes
+it something an operator should have to say out loud. Reviewing a production `broker.yaml` should
+be one grep, not a careful read of which namespace among several happens to be rooted at `dev`.
+
+It exists because the alternative is worse. A development tool with no service of its own has to
+borrow one, and `tel.15550100000` then sits in `identityMappings`, in Cedar policy, and in the
+audit chain looking exactly like a phone number that somebody could be reached at. Every later
+reader has to be told which of those are real.
+
+```yaml
+allowDevelopmentSubjects: true
+identities:
+  - uid: 1000
+    principal: dekopond-gateway
+    actor: { type: service, principal: dekopond-gateway }
+    attestor:
+      namespaces: [slack.t0123abc, dev.console]   # `dev.console`, not all of `dev`
+identityMappings:
+  - subject: dev.console.xavier
+    principal: xavier-console                     # its own principal, revocable on its own
+```
+
+The surface segment is why the tenant exists: `dev.console` admits the console without admitting
+`dev.ci`, exactly as `slack.t0123abc` admits one workspace without admitting another. Give it its
+own principal rather than reusing a person's — the console can then be granted the writes you want
+to test without widening what the live gateway may do.
+
 ```yaml
 # broker.yaml
 identities:

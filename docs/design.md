@@ -81,7 +81,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 
 | Component | Authority and responsibility | Status |
 |---|---|---|
-| `dekopon` | Human/operator CLI; reads typed resources, renders results, and owns model-account lifecycle commands | **Current**, local catalog plus isolated model auth |
+| `dekopon` | Human/operator CLI; reads typed resources, renders results, owns model-account lifecycle commands, and hosts the interactive console | **Current**, local catalog plus isolated model auth; `console` is the one command that contacts another process, as an unprivileged broker client holding a model credential and no authority |
 | `dekopon-core` | Validated identifiers and dependency-light domain types | **Current** |
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, and reference validation | **Current** |
@@ -98,8 +98,9 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-broker-protocol` | Lightweight strict versioned bounded frames and Unix client with identity/authority-free payloads and server peer-UID verification | **Current** shared broker/runner API with no privileged host or native-HTTP dependency |
 | `dekopon-model` | Bounded chat-model contract, OpenAI-compatible transport, ChatGPT/Codex subscription auth and Responses client, plus a fixed-endpoint bounded OpenAI Images client | **Current**, consumed by both CLIs and the gateway |
 | `dekopon-shell` | Sandboxed bash-flavored interpreter whose command words dispatch to capabilities through one abstract seam, with its own step, recursion, output, deadline, and capability-call bounds | **Current**; it links no Wasmtime, broker, HTTP, or filesystem code |
-| `dekopon-agent` | The shared agent session layer: the bounded scripting prompt loop, optional bounded asset/configuration/image-generation meta tools, the script runtime spending a session-wide capability budget, and a broker-leg facade over the protocol client | **Current**, holding no authority; consumed by `dekopon-run` and `dekopond` |
+| `dekopon-agent` | The shared agent session layer: the bounded scripting prompt loop, optional bounded asset/configuration/image-generation meta tools, the script runtime spending a session-wide capability budget, and a broker-leg facade over the protocol client | **Current**, holding no authority; consumed by `dekopon-run`, `dekopond`, and `dekopon-tui` |
 | `dekopon-telemetry` | OTLP exporter settings and subscriber wiring, with ingest credentials read only from the environment | **Current** library shared by the executables |
+| `dekopon-tui` | The operator console: a terminal view over an attested broker session, observing the agent loop through decorators on the script and capability seams, with render-time redaction and terminal-control sanitisation | **Current**, holding a model credential and no authority; embedded only in `dekopon` |
 | `dekopon-webui` | GET-only, unauthenticated operational HTML for broker-loaded providers, Wasmtime counters, credential-free OTLP settings, and bounded gateway-reported agent/token status | **Current** library embedded only in `dekopon-brokerd`; listener enablement is explicit |
 | `dekopon-run` | One-shot direct invocation, a single model scripting tool, local/OTLP trace export, audit-safe lifecycle logs, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands |
 | `dekopond` | Chat-transport wakeups, including a signed text-only WhatsApp Cloud API webhook, attested routing, opt-in route-scoped image generation, text/image replies, authorization-fed Slack Agent thread ownership, optional no-reply decisions, best-effort native in-flight activity, cooperatively cancellable bounded agent sessions with no broker authority, credential-free self-inspection, and bounded per-sender conversation history | **Current** unprivileged daemon; a route is one independent session per message unless it opts into `mode: persistent`, generation/activity are explicit opt-ins after authorization, Slack continuation is installed only after authorization, WhatsApp TLS terminates outside the daemon and replay handling is process-local, and a dedicated gateway UID remains **committed direction** |
@@ -289,6 +290,15 @@ from the token, not from Dekopon.
 The CLI is the stable operator surface, analogous to `kubectl` where that improves discovery. Its pipeline remains parse → resolve → read → execute → render. Human-readable output may evolve; machine-readable resources, output formats, and documented exit behavior require compatibility consideration.
 
 Future commands should continue the resource-oriented vocabulary (`get tasks`, `logs agent/reviewer`, `auth can-i`, `policy explain`, `apply`, `delete`) but must not be added as nonfunctional placeholders.
+
+`console` is the deliberate exception to the read-resolve-read-render pipeline, and the boundary it
+does not cross is worth stating. It runs an agent session in the operator's own process, which makes
+it a gateway for one terminal — so it holds a model credential, exactly as `dekopond` does, and no
+policy, provider credential, or authorization, exactly as `dekopond` does not. CI applies the same
+dependency check to `dekopon` that it already applies to `dekopon-run` and `dekopond`. The reason it
+runs the loop rather than driving one is that tool-call arguments and results exist only inside the
+process running it: history keeps prompts and answers, spans keep argument counts, and audit records
+keep digests.
 
 See [`cli.md`](cli.md) for the current command contract.
 

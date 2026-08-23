@@ -1236,3 +1236,82 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     validate_capability_responses(&broker, &identities, ceiling_bytes)
         .expect("a frame that carries the widest answer starts");
 }
+
+/// A `dev.*` subject is the one kind no external service authenticated, so a broker admits it only
+/// when an operator said so — and says every place the configuration assumed otherwise, at once.
+#[tokio::test]
+async fn development_subjects_need_an_explicit_opt_in() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+
+    let mut document = attested_document(uid);
+    document["identities"][1]["attestor"]["namespaces"] = json!(["slack.t0123abc", "dev.console"]);
+    document["identityMappings"] = json!([
+        {"subject": "slack.t0123abc.u9xyz", "principal": "cpetersen"},
+        {"subject": "dev.console.xavier", "principal": "xavier-console"}
+    ]);
+
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("development identities need the opt-in");
+    let config::ConfigError::DevelopmentSubjectsNotAllowed { entries } = &error else {
+        panic!("expected the development-subject refusal, got {error:?}");
+    };
+    // Both, in one report: an operator who fixed the mapping and restarted only to be told about
+    // the namespace would read the check as arbitrary rather than their configuration.
+    assert_eq!(
+        entries.len(),
+        2,
+        "every offending entry must be named: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.contains("dev.console.xavier")),
+        "{entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| entry.contains("dev.console")),
+        "{entries:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("allowDevelopmentSubjects"), "{message}");
+
+    // With the opt-in, the same configuration resolves and both mappings survive.
+    document["allowDevelopmentSubjects"] = json!(true);
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("the opt-in admits development identities");
+    assert_eq!(resolved.identity_mappings.len(), 2);
+}
+
+/// A namespace that merely starts with the same letters is an ordinary namespace.
+#[tokio::test]
+async fn a_namespace_is_matched_on_segment_boundaries_not_letters() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+
+    let mut document = attested_document(uid);
+    document["identities"][1]["attestor"]["namespaces"] = json!(["slack.t0123abc"]);
+    write_config(&path, &document);
+    assert!(
+        config::load(&path, uid).await.is_ok(),
+        "an ordinary deployment must not need the development opt-in"
+    );
+}

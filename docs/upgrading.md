@@ -200,6 +200,22 @@ release section here when that release is tagged.
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves
   the broker exactly as it was.
+- **A bare `dekopon` on a terminal now opens the console instead of printing help.** Off a terminal
+  — a pipe, a redirect, a CI step — it is unchanged: help to standard error, exit `2`. Nothing
+  scripted moves, because the console requires both standard input and standard output to be
+  terminals before it will draw. A shell alias or muscle memory that relied on bare `dekopon` for
+  usage should use `dekopon --help`.
+- **`dekopon console` needs a credential of its own.** It resolves
+  `chatgpt-auth.console.json` rather than the `chatgpt-auth.json` that `auth chatgpt` and a gateway
+  `authFile` resolve to, and refuses to start if discovery lands on the shared file. Run
+  `dekopon auth chatgpt login --auth-file <PATH>` once. This is not a migration — the gateway's
+  credential is untouched — but it is the step that makes the console usable, and skipping it is a
+  refusal rather than a fallback. The reason is rotation: a shared file means whichever process
+  refreshes invalidates the other's copy, including one exported into a secret store.
+- **`allowDevelopmentSubjects` is a new `broker.yaml` field, off by default.** An existing
+  configuration is unaffected. A broker only needs it to admit `dev.<surface>.<name>` subjects; if
+  one is configured without the field, startup lists every offending mapping and attestor namespace
+  and refuses, rather than starting with development identities an operator did not ask for.
 
 ## Related documents
 

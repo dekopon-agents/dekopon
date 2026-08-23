@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use dekopon_core::{AgentId, CapabilityId, ProviderId};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use dekopon_core::{AgentId, CapabilityId, ExternalSubject, ProviderId};
 
 /// Dekopon operator command line.
 #[derive(Clone, Debug, Parser)]
@@ -48,8 +48,12 @@ pub struct Cli {
     pub verbose: u8,
 
     /// Operation to perform.
+    ///
+    /// Optional so that a bare `dekopon` on a terminal opens the console. Absent on anything that
+    /// is not a terminal, it stays the usage error it has always been: a piped `dekopon` that
+    /// opened a full-screen console would hang a script forever waiting on raw-mode input.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// Supported top-level operations.
@@ -83,6 +87,95 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Open the interactive console against a running local broker.
+    #[cfg(unix)]
+    Console(ConsoleArgs),
+}
+
+/// Connection, identity, and model settings for the interactive console.
+///
+/// Every one of these has a resolved default, so `dekopon console` with no flags is the ordinary
+/// invocation; each flag exists for the deployment that is not the local single-UID one.
+#[cfg(unix)]
+#[derive(Clone, Debug, Args, Default)]
+pub struct ConsoleArgs {
+    /// Broker socket path.
+    ///
+    /// Resolves as `dekopon-run` documents: this flag, then `$DEKOPON_BROKER_SOCKET`, then
+    /// `$XDG_RUNTIME_DIR/dekopon/broker.sock`, then `$HOME/.local/run/dekopon/broker.sock`.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+
+    /// Trusted UID owning the broker process; defaults to the caller's own.
+    #[arg(long, value_name = "UID")]
+    pub server_uid: Option<u32>,
+
+    /// Canonical external subject sessions propose on behalf of.
+    ///
+    /// The broker still has to hold an attestor grant covering its namespace and a mapping
+    /// resolving it to a principal; declaring one here grants nothing at all.
+    ///
+    /// Optional only so that a bare `dekopon` can take it from the environment. There is no
+    /// default: an identity the console guessed would be an identity nobody chose, and the broker
+    /// would refuse it anyway one step later having told you nothing useful.
+    #[arg(long, value_name = "SUBJECT", env = "DEKOPON_CONSOLE_SUBJECT")]
+    pub subject: Option<ExternalSubject>,
+
+    /// Model name handed to the backend.
+    #[arg(long, value_name = "MODEL", default_value = ConsoleArgs::DEFAULT_MODEL)]
+    pub model: String,
+
+    /// ChatGPT credential file.
+    ///
+    /// Defaults to the console's own `chatgpt-auth.console.json` rather than the file every other
+    /// surface resolves to, because the refresh token rotates and sharing it would invalidate the
+    /// gateway's copy. Passing this explicitly accepts whatever it points at.
+    #[arg(long, value_name = "PATH", conflicts_with = "endpoint")]
+    pub auth_file: Option<PathBuf>,
+
+    /// OpenAI-compatible endpoint to use instead of the ChatGPT subscription.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+
+    /// Name of the environment variable holding the endpoint's bearer token.
+    #[arg(long, value_name = "NAME", requires = "endpoint")]
+    pub api_key_env: Option<String>,
+
+    /// Maximum model turns one session may take.
+    #[arg(long, value_name = "COUNT", default_value_t = 8)]
+    pub max_steps: u32,
+
+    /// Capability invocations one session may drive in total.
+    #[arg(long, value_name = "COUNT", default_value_t = 16)]
+    pub max_capability_calls: u32,
+}
+
+#[cfg(unix)]
+impl ConsoleArgs {
+    /// Model a console session talks to when nothing names one.
+    pub const DEFAULT_MODEL: &'static str = "gpt-5.6-luna";
+
+    /// The settings a bare `dekopon` opens with.
+    ///
+    /// Everything but the subject has a default; the subject comes from `DEKOPON_CONSOLE_SUBJECT`
+    /// or not at all, and `console::execute` reports its absence by naming both ways to supply it.
+    #[must_use]
+    pub fn interactive_default() -> Self {
+        Self {
+            socket: None,
+            server_uid: None,
+            subject: std::env::var("DEKOPON_CONSOLE_SUBJECT")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse().ok()),
+            model: Self::DEFAULT_MODEL.to_owned(),
+            auth_file: None,
+            endpoint: None,
+            api_key_env: None,
+            max_steps: 8,
+            max_capability_calls: 16,
+        }
+    }
 }
 
 /// Model-account authentication namespaces.
@@ -319,11 +412,11 @@ mod tests {
 
         assert!(matches!(
             cli.command,
-            Command::Auth {
+            Some(Command::Auth {
                 account: AuthCommand::ChatGpt {
                     command: ChatGptAuthCommand::Status { .. }
                 }
-            }
+            })
         ));
     }
 
@@ -345,7 +438,7 @@ mod tests {
 
         assert!(matches!(
             cli.command,
-            Command::Auth {
+            Some(Command::Auth {
                 account: AuthCommand::ChatGpt {
                     command: ChatGptAuthCommand::Export {
                         format: ExportFormat::Secret,
@@ -354,7 +447,7 @@ mod tests {
                         ..
                     }
                 }
-            }
+            })
         ));
     }
 
@@ -383,9 +476,9 @@ mod tests {
         assert_eq!(cli.output, OutputFormat::Wide);
         assert!(matches!(
             cli.command,
-            Command::Get {
+            Some(Command::Get {
                 resource: GetCommand::Agents
-            }
+            })
         ));
     }
 }

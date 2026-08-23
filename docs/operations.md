@@ -36,6 +36,9 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | What files and directories must exist, and with what ownership and modes? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) |
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`broker-http.md` § Startup validation](broker-http.md#startup-validation) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
+| The broker refuses to start naming `dev.*` subjects. | [`dekopon-brokerd` § Development identities](../crates/dekopon-brokerd/README.md#development-identities) — `allowDevelopmentSubjects` is off by default, and the refusal lists every offending entry at once |
+| The console refuses to start naming a credential file. | [`cli.md` § The model credential](cli.md#the-model-credential) — it will not share the file the gateway rotates |
+| The console says no broker was found. | It names the exact path and the discovery tier that produced it; candidates are never probed, so a stopped broker reports against the path it would have used |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
 | This release changed configuration — what do I edit? | [`upgrading.md`](upgrading.md) |

@@ -1,7 +1,8 @@
 //! External chat-transport subjects and their canonical, identifier-safe form.
 //!
 //! A subject names *who a message came from* on an external service — a Slack user inside a Slack
-//! workspace, a Discord or Telegram account, a WhatsApp account, or a telephone number. Raw
+//! workspace, a Discord or Telegram account, a WhatsApp account, a telephone number, or a local
+//! development identity that no service authenticated at all. Raw
 //! external identifiers do not fit the workspace identifier grammar (Slack IDs are uppercase,
 //! E.164 numbers start with `+`), so this type owns one canonical normalization: dotted lowercase
 //! segments such as `slack.t0123abc.u9xyz`, `discord.123456789`, `telegram.5551234`,
@@ -38,6 +39,23 @@ pub enum SubjectService {
     Whatsapp,
     /// A telephone number in digits-only E.164 form (the `+` is stripped).
     Tel,
+    /// A local development identity: `dev.<surface>.<name>`, authenticated by nothing.
+    ///
+    /// This is the one service in this enum with no external authenticator behind it. The other
+    /// five carry a name a real service verified before the message reached a transport; this one
+    /// carries a name a local caller typed on an owner-only socket. It exists because the
+    /// alternative — a development tool borrowing `tel.15550100000` — puts a value in
+    /// `identityMappings`, in policy, and in the audit chain that reads like a phone number and is
+    /// not one, and every later reader has to be told which of those are real.
+    ///
+    /// Because nothing authenticates it, a broker admits it only under an explicit opt-in; see
+    /// `dekopon-brokerd`'s `allowDevelopmentSubjects`. Nothing here enforces that, exactly as
+    /// nothing here enforces which Slack workspaces a deployment trusts: this type owns the
+    /// canonical shape, and authority stays with the broker's owner-controlled configuration.
+    ///
+    /// The tenant segment names the surface that minted it — `dev.console.xavier` — so a grant can
+    /// scope to one development surface without also admitting every other.
+    Dev,
 }
 
 impl SubjectService {
@@ -50,11 +68,21 @@ impl SubjectService {
             Self::Telegram => "telegram",
             Self::Whatsapp => "whatsapp",
             Self::Tel => "tel",
+            Self::Dev => "dev",
         }
     }
 
     const fn requires_tenant(self) -> bool {
-        matches!(self, Self::Slack)
+        matches!(self, Self::Slack | Self::Dev)
+    }
+
+    /// Whether a real external service authenticated this subject before it reached a transport.
+    ///
+    /// The distinction a deployment acts on: an unauthenticated subject is a claim a local caller
+    /// made, so a broker requires an explicit opt-in before it will resolve one to a principal.
+    #[must_use]
+    pub const fn is_authenticated_externally(self) -> bool {
+        !matches!(self, Self::Dev)
     }
 }
 
@@ -68,6 +96,7 @@ impl FromStr for SubjectService {
             "telegram" => Ok(Self::Telegram),
             "whatsapp" => Ok(Self::Whatsapp),
             "tel" => Ok(Self::Tel),
+            "dev" => Ok(Self::Dev),
             _ => Err(SubjectError::UnknownService {
                 service: value.to_owned(),
             }),
@@ -129,6 +158,18 @@ impl ExternalSubject {
         let digits = number.strip_prefix('+').unwrap_or(number);
         let subject = digits_segment(digits, "subject")?;
         Self::build(SubjectService::Tel, None, subject)
+    }
+
+    /// A local development identity: `dev.<surface>.<name>`, both segments lowercased.
+    ///
+    /// `surface` names the tool that minted it, such as `console`, so a deployment can grant one
+    /// development surface without admitting every other. Constructing one asserts nothing: a
+    /// broker resolves it to a principal only under an explicit opt-in and an owner-authored
+    /// mapping, exactly as it does for a subject a real service authenticated.
+    pub fn development(surface: &str, name: &str) -> Result<Self, SubjectError> {
+        let tenant = normalize_segment(surface, "tenant")?;
+        let subject = normalize_segment(name, "subject")?;
+        Self::build(SubjectService::Dev, Some(tenant), subject)
     }
 
     fn build(
@@ -254,7 +295,7 @@ impl FromStr for ExternalSubject {
             SubjectService::Telegram | SubjectService::Tel => {
                 subject.bytes().all(|byte| byte.is_ascii_digit())
             }
-            SubjectService::Slack => true,
+            SubjectService::Slack | SubjectService::Dev => true,
         };
         if !numeric {
             return Err(SubjectError::InvalidSegment {
@@ -369,7 +410,7 @@ pub enum SubjectError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExternalSubject, SubjectService};
+    use super::{ExternalSubject, SubjectError, SubjectService};
 
     #[test]
     fn raw_transport_identifiers_normalize_into_canonical_form() {
@@ -494,5 +535,72 @@ mod tests {
         assert!(tenantless.in_namespace("tel.16034700182"));
         assert!(!tenantless.in_namespace("tel.1603470018"));
         assert!(!tenantless.in_namespace("tel.16034700182.extra"));
+    }
+
+    #[test]
+    fn a_development_subject_is_canonical_and_tenanted() {
+        let subject = ExternalSubject::development("Console", "Xavier").expect("dev subject");
+        assert_eq!(subject.canonical(), "dev.console.xavier");
+        assert_eq!(subject.service(), SubjectService::Dev);
+        assert_eq!(subject.tenant(), Some("console"));
+        assert_eq!(subject.subject(), "xavier");
+        assert_eq!(
+            "dev.console.xavier"
+                .parse::<ExternalSubject>()
+                .expect("round trips"),
+            subject
+        );
+    }
+
+    #[test]
+    fn a_development_subject_names_the_surface_that_minted_it() {
+        // The tenant segment is what lets a grant admit one development surface without admitting
+        // every other, exactly as Slack's team segment does.
+        let console = ExternalSubject::development("console", "xavier").expect("dev subject");
+        assert!(console.in_namespace("dev.console"));
+        assert!(console.in_namespace("dev"));
+        assert!(!console.in_namespace("dev.ci"));
+        assert!(!console.in_namespace("dev.consolex"));
+    }
+
+    #[test]
+    fn a_development_subject_needs_both_segments() {
+        assert!(matches!(
+            "dev.xavier".parse::<ExternalSubject>(),
+            Err(SubjectError::MissingSegment { segment: "subject" })
+        ));
+        assert!(ExternalSubject::development("", "xavier").is_err());
+        assert!(ExternalSubject::development("console", "").is_err());
+        assert!(
+            ExternalSubject::development("con sole", "xavier").is_err(),
+            "the canonical segment alphabet has no separators inside a segment"
+        );
+    }
+
+    #[test]
+    fn only_the_development_service_lacks_an_external_authenticator() {
+        // The distinction a broker acts on before it will resolve a subject to a principal.
+        assert!(!SubjectService::Dev.is_authenticated_externally());
+        for service in [
+            SubjectService::Slack,
+            SubjectService::Discord,
+            SubjectService::Telegram,
+            SubjectService::Whatsapp,
+            SubjectService::Tel,
+        ] {
+            assert!(
+                service.is_authenticated_externally(),
+                "{service:?} is authenticated by a real service"
+            );
+        }
+    }
+
+    #[test]
+    fn a_development_subject_cannot_impersonate_a_numeric_service() {
+        // `dev` is not numeric-constrained, but that laxity must not leak into the services whose
+        // identifiers a real transport verified.
+        assert!("dev.console.a1b2".parse::<ExternalSubject>().is_ok());
+        assert!("tel.notanumber".parse::<ExternalSubject>().is_err());
+        assert!("telegram.abc".parse::<ExternalSubject>().is_err());
     }
 }

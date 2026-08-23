@@ -22,6 +22,8 @@ use dekopon_agent::{
     prompt::{PromptError, PromptLimits, format_script_outcome, run_prompt},
 };
 #[cfg(unix)]
+use dekopon_broker_protocol::BrokerSocketDiscovery;
+#[cfg(unix)]
 use dekopon_broker_protocol::{BrokerClient, ClientError, InvocationOutcome, InvocationRequest};
 #[cfg(unix)]
 use dekopon_core::IdentifierError;
@@ -623,10 +625,12 @@ async fn connect_prompt_broker(
 fn broker_client(
     connection: &BrokerConnectionArgs,
 ) -> Result<(BrokerClient, &'static str), AppError> {
-    let socket = BrokerSocketDiscovery::from_process(connection.socket.clone()).resolve()?;
+    let socket = BrokerSocketDiscovery::from_process(connection.socket.clone())
+        .resolve()
+        .ok_or(AppError::BrokerSocketUnresolved)?;
     let server_uid = resolve_broker_server_uid(connection.server_uid);
-    let client = BrokerClient::new(&socket.path, server_uid, connection.frame_limits())?;
-    Ok((client, socket.tier))
+    let client = BrokerClient::new(socket.path(), server_uid, connection.frame_limits())?;
+    Ok((client, socket.tier().label()))
 }
 
 #[cfg(not(unix))]
@@ -735,96 +739,6 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
 #[cfg(not(unix))]
 async fn evaluate_broker(_command: &BrokerCommand) -> Result<CommandOutput, AppError> {
     Err(AppError::BrokerUnsupported)
-}
-
-/// Inputs used to resolve the broker socket precedence.
-///
-/// Unlike configuration discovery, no candidate is probed for existence: a broker socket is
-/// absent whenever the daemon is not running, so the tightest resolved tier is always trusted
-/// and connection failures are reported against that exact path.
-#[cfg(unix)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BrokerSocketDiscovery {
-    explicit: Option<PathBuf>,
-    environment: Option<PathBuf>,
-    xdg_runtime_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
-}
-
-#[cfg(unix)]
-impl BrokerSocketDiscovery {
-    /// Captures discovery inputs from the current process.
-    fn from_process(explicit: Option<PathBuf>) -> Self {
-        Self {
-            explicit,
-            environment: env::var_os("DEKOPON_BROKER_SOCKET")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-            xdg_runtime_dir: env::var_os("XDG_RUNTIME_DIR")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-            home: env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-        }
-    }
-
-    /// Creates an injectable discovery context for deterministic tests.
-    #[cfg(test)]
-    fn new(
-        explicit: Option<PathBuf>,
-        environment: Option<PathBuf>,
-        xdg_runtime_dir: Option<PathBuf>,
-        home: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            explicit,
-            environment,
-            xdg_runtime_dir,
-            home,
-        }
-    }
-
-    /// Resolves the highest-precedence broker socket path and names the tier it came from.
-    fn resolve(&self) -> Result<ResolvedSocket, AppError> {
-        if let Some(path) = &self.explicit {
-            return Ok(ResolvedSocket::new(path.clone(), "explicit"));
-        }
-        if let Some(path) = &self.environment {
-            return Ok(ResolvedSocket::new(path.clone(), "environment"));
-        }
-        if let Some(root) = &self.xdg_runtime_dir {
-            return Ok(ResolvedSocket::new(
-                root.join("dekopon/broker.sock"),
-                "xdg-runtime-dir",
-            ));
-        }
-        if let Some(home) = &self.home {
-            return Ok(ResolvedSocket::new(
-                home.join(".local/run/dekopon/broker.sock"),
-                "home",
-            ));
-        }
-        Err(AppError::BrokerSocketUnresolved)
-    }
-}
-
-/// One resolved broker socket and the discovery tier that produced it.
-///
-/// The tier is telemetry-safe where the path is not: a socket path is excluded from every signal,
-/// but "which tier answered" is exactly what a connection investigation needs.
-#[cfg(unix)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedSocket {
-    path: PathBuf,
-    tier: &'static str,
-}
-
-#[cfg(unix)]
-impl ResolvedSocket {
-    const fn new(path: PathBuf, tier: &'static str) -> Self {
-        Self { path, tier }
-    }
 }
 
 /// Resolves the trusted broker server UID, defaulting to the caller's own effective UID.
@@ -1126,9 +1040,6 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
-    use std::path::PathBuf;
-
-    #[cfg(unix)]
     use super::{AppError, BrokerSocketDiscovery, resolve_broker_server_uid};
     use super::{InvocationReport, TimingSamples, read_input};
 
@@ -1172,76 +1083,24 @@ mod tests {
         assert_eq!(report.timing.max_ms, 4.0);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn explicit_broker_socket_outranks_every_default() {
-        let discovery = BrokerSocketDiscovery::new(
-            Some(PathBuf::from("/explicit/broker.sock")),
-            Some(PathBuf::from("/environment/broker.sock")),
-            Some(PathBuf::from("/run/user/1000")),
-            Some(PathBuf::from("/home/dekopon")),
-        );
-
-        let resolved = discovery.resolve().expect("explicit socket");
-        assert_eq!(resolved.path, PathBuf::from("/explicit/broker.sock"));
-        assert_eq!(resolved.tier, "explicit");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broker_socket_environment_outranks_runtime_and_home_defaults() {
-        let discovery = BrokerSocketDiscovery::new(
-            None,
-            Some(PathBuf::from("/environment/broker.sock")),
-            Some(PathBuf::from("/run/user/1000")),
-            Some(PathBuf::from("/home/dekopon")),
-        );
-
-        let resolved = discovery.resolve().expect("environment socket");
-        assert_eq!(resolved.path, PathBuf::from("/environment/broker.sock"));
-        assert_eq!(resolved.tier, "environment");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broker_socket_runtime_directory_outranks_the_home_default() {
-        let discovery = BrokerSocketDiscovery::new(
-            None,
-            None,
-            Some(PathBuf::from("/run/user/1000")),
-            Some(PathBuf::from("/home/dekopon")),
-        );
-
-        let resolved = discovery.resolve().expect("runtime socket");
-        assert_eq!(
-            resolved.path,
-            PathBuf::from("/run/user/1000/dekopon/broker.sock")
-        );
-        assert_eq!(resolved.tier, "xdg-runtime-dir");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broker_socket_falls_back_to_the_documented_home_path() {
-        let discovery =
-            BrokerSocketDiscovery::new(None, None, None, Some(PathBuf::from("/home/dekopon")));
-
-        let resolved = discovery.resolve().expect("home socket");
-        assert_eq!(
-            resolved.path,
-            PathBuf::from("/home/dekopon/.local/run/dekopon/broker.sock")
-        );
-        assert_eq!(resolved.tier, "home");
-    }
-
+    // The precedence itself is pinned in `dekopon-broker-protocol`, which owns the one definition
+    // every client shares. What belongs here is the mapping this crate applies on top of it: an
+    // unresolvable socket is a runner usage failure with actionable guidance, not a silent default.
     #[cfg(unix)]
     #[test]
     fn unresolvable_broker_socket_reports_actionable_guidance() {
         let error = BrokerSocketDiscovery::new(None, None, None, None)
             .resolve()
+            .ok_or(AppError::BrokerSocketUnresolved)
             .expect_err("no socket candidate");
 
         assert!(matches!(error, AppError::BrokerSocketUnresolved));
+        assert!(
+            error
+                .to_string()
+                .contains("pass --socket or set DEKOPON_BROKER_SOCKET"),
+            "the refusal must name both ways out: {error}"
+        );
     }
 
     #[cfg(unix)]

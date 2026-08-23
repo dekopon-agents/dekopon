@@ -987,3 +987,85 @@ fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bou
         );
     }
 }
+
+#[cfg(unix)]
+mod broker_socket_discovery {
+    use std::path::PathBuf;
+
+    use crate::{BrokerSocketDiscovery, BrokerSocketTier};
+
+    fn every_tier_supplied() -> BrokerSocketDiscovery {
+        BrokerSocketDiscovery::new(
+            Some(PathBuf::from("/explicit/broker.sock")),
+            Some(PathBuf::from("/environment/broker.sock")),
+            Some(PathBuf::from("/run/user/501")),
+            Some(PathBuf::from("/home/dekopon")),
+        )
+    }
+
+    #[test]
+    fn explicit_wins_over_every_other_tier() {
+        let resolved = every_tier_supplied().resolve().expect("a tier applies");
+        assert_eq!(resolved.path(), PathBuf::from("/explicit/broker.sock"));
+        assert_eq!(resolved.tier(), BrokerSocketTier::Explicit);
+    }
+
+    #[test]
+    fn environment_wins_over_the_derived_tiers() {
+        let discovery = BrokerSocketDiscovery::new(
+            None,
+            Some(PathBuf::from("/environment/broker.sock")),
+            Some(PathBuf::from("/run/user/501")),
+            Some(PathBuf::from("/home/dekopon")),
+        );
+        let resolved = discovery.resolve().expect("a tier applies");
+        assert_eq!(resolved.path(), PathBuf::from("/environment/broker.sock"));
+        assert_eq!(resolved.tier(), BrokerSocketTier::Environment);
+    }
+
+    #[test]
+    fn xdg_runtime_dir_derives_the_documented_suffix() {
+        let discovery = BrokerSocketDiscovery::new(
+            None,
+            None,
+            Some(PathBuf::from("/run/user/501")),
+            Some(PathBuf::from("/home/dekopon")),
+        );
+        let resolved = discovery.resolve().expect("a tier applies");
+        assert_eq!(
+            resolved.path(),
+            PathBuf::from("/run/user/501/dekopon/broker.sock")
+        );
+        assert_eq!(resolved.tier(), BrokerSocketTier::XdgRuntimeDir);
+    }
+
+    #[test]
+    fn home_derives_the_documented_suffix() {
+        let discovery =
+            BrokerSocketDiscovery::new(None, None, None, Some(PathBuf::from("/home/dekopon")));
+        let resolved = discovery.resolve().expect("a tier applies");
+        assert_eq!(
+            resolved.path(),
+            PathBuf::from("/home/dekopon/.local/run/dekopon/broker.sock")
+        );
+        assert_eq!(resolved.tier(), BrokerSocketTier::Home);
+    }
+
+    #[test]
+    fn no_tier_resolves_to_none_rather_than_a_guess() {
+        assert!(
+            BrokerSocketDiscovery::new(None, None, None, None)
+                .resolve()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tier_labels_are_stable() {
+        assert_eq!(BrokerSocketTier::Explicit.label(), "explicit");
+        assert_eq!(BrokerSocketTier::Environment.label(), "environment");
+        assert_eq!(BrokerSocketTier::XdgRuntimeDir.label(), "xdg-runtime-dir");
+        assert_eq!(BrokerSocketTier::Home.label(), "home");
+        assert_eq!(BrokerSocketTier::Home.to_string(), "home");
+    }
+}

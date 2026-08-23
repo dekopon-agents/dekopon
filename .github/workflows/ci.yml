@@ -105,6 +105,15 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify the operator CLI excludes privileged broker machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopon --edges normal --prefix none)
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
       - name: Verify gateway excludes privileged broker machinery
         shell: bash
         run: |

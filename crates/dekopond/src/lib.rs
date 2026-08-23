@@ -54,8 +54,7 @@ pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
     ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
     ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
-    SlackActivityConfig, SlackActivityFallback, SlackExperience, SocketDiscovery, TelemetryConfig,
-    TransportConfig,
+    SlackActivityConfig, SlackActivityFallback, SlackExperience, TelemetryConfig, TransportConfig,
 };
 pub use routes::RouteError;
 pub use session::SessionError;

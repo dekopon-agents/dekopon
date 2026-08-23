@@ -1180,7 +1180,26 @@ fn oauth_error_description(body: &str) -> Option<String> {
         .map(sanitize_diagnostic)
 }
 
-fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+/// File name every ordinary Dekopon surface resolves its ChatGPT credential to.
+pub const DEFAULT_AUTH_FILE_NAME: &str = "chatgpt-auth.json";
+
+/// Resolves the credential path a caller would read, under a caller-chosen file name.
+///
+/// The precedence is fixed — an explicit path, then `DEKOPON_CHATGPT_AUTH_FILE`, then the
+/// platform configuration directory — and only the leaf name varies. That is the seam a second
+/// consumer in this workspace needs: the refresh token rotates, so two processes sharing one file
+/// invalidate each other's copy, and the fix is a different file rather than a different
+/// precedence an operator would then have to hold two versions of in their head.
+///
+/// The environment tier deliberately returns its value verbatim: an operator who exported a path
+/// named one, and honouring it is what makes the variable mean anything. A caller that must not
+/// land on another surface's file compares this answer against that surface's own and refuses.
+///
+/// Nothing is read or probed here, so a path comes back whether or not a credential exists at it.
+pub fn resolve_auth_path_named(
+    explicit: Option<&Path>,
+    file_name: &str,
+) -> Result<PathBuf, ChatGptError> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
@@ -1188,24 +1207,24 @@ fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
         return Ok(PathBuf::from(path));
     }
     if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(config)
-            .join("dekopon")
-            .join("chatgpt-auth.json"));
+        return Ok(PathBuf::from(config).join("dekopon").join(file_name));
     }
     if let Some(home) = env::var_os("HOME") {
         return Ok(PathBuf::from(home)
             .join(".config")
             .join("dekopon")
-            .join("chatgpt-auth.json"));
+            .join(file_name));
     }
     if let Some(app_data) = env::var_os("APPDATA") {
-        return Ok(PathBuf::from(app_data)
-            .join("dekopon")
-            .join("chatgpt-auth.json"));
+        return Ok(PathBuf::from(app_data).join("dekopon").join(file_name));
     }
     Err(ChatGptError::Configuration(
         "could not determine credential path; set DEKOPON_CHATGPT_AUTH_FILE".to_owned(),
     ))
+}
+
+fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+    resolve_auth_path_named(explicit, DEFAULT_AUTH_FILE_NAME)
 }
 
 /// Whether the access token is inside the refresh margin.

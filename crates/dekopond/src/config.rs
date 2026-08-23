@@ -18,7 +18,8 @@ use std::{
 
 use dekopon_agent::prompt::HistoryLimits;
 use dekopon_broker_protocol::{
-    DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
+    BrokerSocketDiscovery, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
+    ResolvedBrokerSocket,
 };
 use dekopon_core::AgentId;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -724,7 +725,12 @@ pub async fn load(
     }
     let config = serde_yaml::from_slice::<DekopondConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
-    resolve(config, path, &SocketDiscovery::from_process(), expected_uid)
+    resolve(
+        config,
+        path,
+        &BrokerSocketDiscovery::from_process(None),
+        expected_uid,
+    )
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -736,64 +742,10 @@ fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
         .map_err(|source| ConfigError::CurrentDirectory { source })
 }
 
-/// Broker socket discovery, mirroring `dekopon-run`'s documented precedence exactly.
-///
-/// No candidate is probed for existence: the socket is simply absent whenever the broker is not
-/// running, so the tightest resolved tier is trusted and the startup probe reports against it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SocketDiscovery {
-    environment: Option<PathBuf>,
-    xdg_runtime_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
-}
-
-impl SocketDiscovery {
-    fn from_process() -> Self {
-        Self {
-            environment: env::var_os("DEKOPON_BROKER_SOCKET")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-            xdg_runtime_dir: env::var_os("XDG_RUNTIME_DIR")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-            home: env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-        }
-    }
-
-    /// Creates an injectable discovery context for deterministic tests.
-    #[must_use]
-    pub const fn new(
-        environment: Option<PathBuf>,
-        xdg_runtime_dir: Option<PathBuf>,
-        home: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            environment,
-            xdg_runtime_dir,
-            home,
-        }
-    }
-
-    fn resolve(&self) -> Result<PathBuf, ConfigError> {
-        if let Some(path) = &self.environment {
-            return Ok(path.clone());
-        }
-        if let Some(root) = &self.xdg_runtime_dir {
-            return Ok(root.join("dekopon/broker.sock"));
-        }
-        if let Some(home) = &self.home {
-            return Ok(home.join(".local/run/dekopon/broker.sock"));
-        }
-        Err(ConfigError::BrokerSocketUnresolved)
-    }
-}
-
 pub(crate) fn resolve(
     config: DekopondConfig,
     source: PathBuf,
-    discovery: &SocketDiscovery,
+    discovery: &BrokerSocketDiscovery,
     current_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let base = source
@@ -1079,7 +1031,10 @@ pub(crate) fn resolve(
     .map_err(|source| ConfigError::BrokerLimits { source })?;
     let socket_path = match config.broker.socket_path {
         Some(path) => resolve_path(path),
-        None => discovery.resolve()?,
+        None => discovery
+            .resolve()
+            .map(ResolvedBrokerSocket::into_path)
+            .ok_or(ConfigError::BrokerSocketUnresolved)?,
     };
     let broker = ResolvedBroker {
         socket_path,

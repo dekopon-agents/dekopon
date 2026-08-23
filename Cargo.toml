@@ -22,6 +22,7 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
+    "crates/dekopon-tui",
     "crates/dekopon-webui",
     "crates/dekopond",
 ]
@@ -43,6 +44,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 base64 = "0.23.1"
 cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 fs2 = "0.4.3"
 getrandom = "0.4.3"
 futures-util = "0.3.31"
@@ -64,6 +66,7 @@ opentelemetry-http = { version = "0.32.0", default-features = false }
 # rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 schemars = { version = "1.2.2", features = ["derive"] }
@@ -105,6 +108,7 @@ dekopon-protocol = { version = "0.10.0", path = "crates/dekopon-protocol" }
 dekopon-shell = { version = "0.10.0", path = "crates/dekopon-shell" }
 dekopon-storage-host = { version = "0.10.0", path = "crates/dekopon-storage-host" }
 dekopon-telemetry = { version = "0.10.0", path = "crates/dekopon-telemetry" }
+dekopon-tui = { version = "0.10.0", path = "crates/dekopon-tui" }
 dekopon-webui = { version = "0.10.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.10.0", path = "crates/dekopond" }
 

@@ -14,7 +14,7 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
 use dekopon_core::{
-    Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
+    Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId, SubjectService,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -73,6 +73,24 @@ pub struct BrokerdConfig {
     /// `unconstrained-capability` at invocation regardless of this setting.
     #[serde(default)]
     pub strict: bool,
+    /// Whether this broker admits `dev.*` subjects, which no external service authenticated.
+    ///
+    /// Every other subject carries a name Slack, Discord, Telegram, WhatsApp, or a carrier
+    /// verified before it reached a transport. A `dev.*` subject carries a name a local caller
+    /// typed on an owner-only socket, which is exactly what makes a development console usable and
+    /// exactly why it is not on by default.
+    ///
+    /// This is deliberately one line rather than an inference from the identity configuration
+    /// below. A deployment reviewer reading a production `broker.yaml` should be able to answer
+    /// "does this broker accept development identities?" by grepping one field, instead of
+    /// noticing that one entry among several namespaces happens to be rooted at `dev`.
+    ///
+    /// It is also the whole enforcement. Configuration is immutable for a process, so a broker
+    /// that started with this unset provably holds no `dev.*` mapping, and an attested `dev.*`
+    /// subject therefore resolves to nothing through the ordinary unmapped-subject refusal. There
+    /// is no second check at invocation time to disagree with this one.
+    #[serde(default)]
+    pub allow_development_subjects: bool,
     pub identities: Vec<PeerIdentity>,
     /// Owner-controlled subject-to-principal mappings consulted for attested proposals.
     #[serde(default)]
@@ -685,6 +703,31 @@ fn resolve(
             });
         }
     }
+    if !config.allow_development_subjects {
+        // Every offending entry at once, then fail. An operator who removed the one name in the
+        // error and restarted, only to be told about the next one, would conclude the check was
+        // arbitrary rather than that their configuration was.
+        let mut development: Vec<String> = config
+            .identity_mappings
+            .iter()
+            .filter(|mapping| !mapping.subject.service().is_authenticated_externally())
+            .map(|mapping| format!("identityMappings subject {}", mapping.subject.canonical()))
+            .collect();
+        development.extend(
+            config
+                .identities
+                .iter()
+                .filter_map(|identity| identity.attestor.as_ref())
+                .flat_map(|attestor| &attestor.namespaces)
+                .filter(|namespace| is_development_namespace(namespace))
+                .map(|namespace| format!("attestor namespace {namespace}")),
+        );
+        if !development.is_empty() {
+            return Err(ConfigError::DevelopmentSubjectsNotAllowed {
+                entries: development,
+            });
+        }
+    }
     // A deployment that declares executable capabilities and no policy file would start and refuse
     // everything, which is a configuration mistake dressed as deny-by-default. Every other check
     // the old reachability validation performed now happens in policy-world construction: an
@@ -893,6 +936,17 @@ pub enum ConfigError {
     },
     #[error("identity mapping duplicates subject {subject:?}")]
     DuplicateSubject { subject: String },
+    /// Development identities are configured on a broker that did not opt into them.
+    #[error(
+        "this configuration names development identities but does not set \
+         allowDevelopmentSubjects: {}. A dev.* subject is a name a local caller typed, not one a \
+         chat service authenticated, so a broker admits it only when an operator said so",
+        entries.join("; ")
+    )]
+    DevelopmentSubjectsNotAllowed {
+        /// Every offending entry, so one restart fixes the configuration rather than one entry.
+        entries: Vec<String>,
+    },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
     #[error("invalid broker frame limits")]
@@ -930,4 +984,16 @@ pub enum ConfigError {
         #[source]
         source: TelemetryError,
     },
+}
+
+/// Whether one attestor namespace is rooted at the development service.
+///
+/// Segment-boundary matched, exactly as `ExternalSubject::in_namespace` matches: `dev` and
+/// `dev.console` are development namespaces, `development-team` is an ordinary one that merely
+/// starts with the same letters.
+fn is_development_namespace(namespace: &str) -> bool {
+    namespace
+        .split('.')
+        .next()
+        .is_some_and(|root| root == SubjectService::Dev.as_str())
 }
