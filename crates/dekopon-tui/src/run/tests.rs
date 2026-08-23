@@ -34,7 +34,7 @@ fn console() -> App {
     };
     App::new(
         vec![agent],
-        "tel.15550100000".to_owned(),
+        "dev.console.xavier".to_owned(),
         "/run/dekopon/broker.sock".to_owned(),
         "/config/dekopon/chatgpt-auth.console.json".to_owned(),
     )

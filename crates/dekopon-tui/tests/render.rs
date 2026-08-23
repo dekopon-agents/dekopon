@@ -35,7 +35,7 @@ fn agent(name: &str, description: &str) -> Agent {
 fn console(agents: Vec<Agent>) -> App {
     App::new(
         agents,
-        "tel.15550100000".to_owned(),
+        "dev.console.xavier".to_owned(),
         "/run/dekopon/broker.sock".to_owned(),
         "/config/dekopon/chatgpt-auth.console.json".to_owned(),
     )
@@ -75,7 +75,10 @@ fn the_status_line_shows_the_subject_and_the_credential_file() {
     // Both are resolved rather than typed, and both decide what a session may do and whose token it
     // spends. An operator must never have to guess either.
     let drawn = frame(&console(Vec::new()));
-    assert!(drawn.contains("tel.15550100000"), "the subject is missing");
+    assert!(
+        drawn.contains("dev.console.xavier"),
+        "the subject is missing"
+    );
     assert!(
         drawn.contains("chatgpt-auth.console.json"),
         "the credential file is missing"

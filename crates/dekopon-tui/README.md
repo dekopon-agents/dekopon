@@ -40,6 +40,18 @@ import-free Wasmtime registry; the console does not, because every capability it
 performs I/O — which the import-free host cannot do — so a local leg would put Wasmtime in the
 operator CLI's dependency tree in exchange for nothing.
 
+## Its identity
+
+Sessions propose on behalf of a `dev.<surface>.<name>` subject — `dev.console.xavier`. That service
+exists so a development tool does not have to impersonate a real one: a console borrowing
+`tel.15550100000` would put a value in `identityMappings`, in Cedar policy, and in the audit chain
+that reads like a phone number and is not one.
+
+It is the only subject service nothing authenticated, which is why the broker admits it only under
+`allowDevelopmentSubjects: true` and refuses to start if development identities are configured
+without it. Declaring one here still grants nothing: the broker resolves it through owner-controlled
+`identityMappings` or refuses it, exactly as it does for a subject Slack authenticated.
+
 ## What it holds
 
 A model credential. That is the whole list: no policy, no provider credential, no authorization.

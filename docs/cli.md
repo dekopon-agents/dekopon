@@ -104,14 +104,25 @@ defaults to the caller's own effective UID.
 ### Identity
 
 `--subject <SUBJECT>` (or `DEKOPON_CONSOLE_SUBJECT`) is the canonical external subject sessions
-propose on behalf of, such as `tel.15550100000`. There is no default and none is derived: an
+propose on behalf of, normally `dev.console.<name>`. There is no default and none is derived: an
 identity the console guessed is an identity nobody chose, and the broker would refuse it one step
 later having explained nothing.
 
+`dev` is a subject service like `slack` or `tel`, with one difference that decides how it is
+treated: nothing authenticated it. The others carry a name a real service verified before the
+message reached a transport; a `dev.*` subject carries a name a local caller typed on an owner-only
+socket. So a broker admits one only under `allowDevelopmentSubjects: true`, and refuses to start if
+its configuration names development identities without it. The alternative — a console borrowing
+`tel.15550100000` — would put a value in `identityMappings`, in Cedar policy, and in the audit
+chain that reads like a phone number and is not one.
+
+The `console` segment names the surface that minted the subject, so a grant can admit
+`dev.console` without also admitting `dev.ci`.
+
 Declaring a subject grants nothing. Entering an agent opens an attested leg, so what the console may
-do is what policy grants *that subject through that agent* — which requires an `attestor.namespaces`
-entry covering the subject's namespace and an `identityMappings` entry resolving it to a principal,
-both in the broker's own owner-only configuration. A subject the broker will not resolve produces an
+do is what policy grants *that subject through that agent* — which requires `allowDevelopmentSubjects`,
+an `attestor.namespaces` entry covering the subject's namespace, and an `identityMappings` entry
+resolving it to a principal, all in the broker's own owner-only configuration. A subject the broker will not resolve produces an
 empty capability surface, which the console reports as policy granting nothing rather than as an
 unreachable broker.
 
@@ -132,7 +143,7 @@ Create one with a separate device authorization:
 
 ```console
 dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
-dekopon console --subject tel.15550100000
+dekopon console --subject dev.console.xavier
 ```
 
 `--endpoint <URL>` uses any OpenAI-compatible chat-completions endpoint instead, with
@@ -147,7 +158,7 @@ there. When the console is about to open and standard error is that same termina
 discarded rather than drawn over the view. Redirect them to keep them:
 
 ```console
-dekopon console --subject tel.15550100000 -vv 2> console.log
+dekopon console --subject dev.console.xavier -vv 2> console.log
 ```
 
 ### What it shows about secrets
@@ -207,5 +218,5 @@ dekopon --config examples/local/dekopon.yaml config view --output json
 dekopon auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -
 dekopon auth chatgpt export --expose-credential --format raw > chatgpt-auth.json
 dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
-dekopon --config examples/local/dekopon.yaml console --subject tel.15550100000
+dekopon --config examples/local/dekopon.yaml console --subject dev.console.xavier
 ```

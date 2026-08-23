@@ -204,18 +204,40 @@ fn the_console_refuses_without_a_subject_rather_than_guessing_one() {
     let stderr = stderr(&output);
     assert!(stderr.contains("--subject"), "got: {stderr}");
     assert!(stderr.contains("DEKOPON_CONSOLE_SUBJECT"), "got: {stderr}");
+    assert!(
+        stderr.contains("allowDevelopmentSubjects"),
+        "the refusal must name the broker-side opt-in too, or the next failure is a mystery: {stderr}"
+    );
 }
 
 #[test]
 fn the_console_rejects_a_subject_no_service_could_issue() {
     let output = binary()
-        .args(["console", "--subject", "dev.console.xavier"])
+        .args(["console", "--subject", "sms.15550100000"])
         .output()
         .expect("CLI process starts");
 
-    // Five services exist and `dev` is not one of them, so this fails at the command line rather
-    // than as a broker refusal several steps later.
+    // An unknown service fails at the command line rather than as a broker refusal several steps
+    // later, where the operator would have learned nothing about which part was wrong.
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn the_console_accepts_a_development_subject() {
+    // `dev.console.<name>` is what the missing-subject refusal suggests, so it has to parse. It
+    // still reaches nothing until the broker opts in and maps it — this only pins the grammar.
+    let output = binary()
+        .args(["console", "--subject", "dev.console.xavier"])
+        .env("DEKOPON_BROKER_SOCKET", "/nonexistent/broker.sock")
+        .output()
+        .expect("CLI process starts");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "a development subject must not be a usage error: {}",
+        stderr(&output)
+    );
 }
 
 #[test]

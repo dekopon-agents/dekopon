@@ -33,10 +33,23 @@ pub enum ConsoleError {
     /// No subject was supplied.
     #[error(
         "no console subject: pass --subject <SUBJECT> or set DEKOPON_CONSOLE_SUBJECT, for example \
-         tel.15550100000. The broker must also hold an attestor grant covering that namespace and \
-         a mapping resolving it to a principal"
+         dev.console.{}. The broker must also set allowDevelopmentSubjects, hold an attestor grant \
+         covering that namespace, and map the subject to a principal",
+        whoami()
     )]
     NoSubject,
+}
+
+/// A plausible name for the example in the missing-subject refusal.
+///
+/// Cosmetic: an operator reading `dev.console.<their own name>` copies it, where a placeholder is
+/// one more thing to work out. It never becomes a default, because an identity nobody chose is an
+/// identity the broker would refuse having explained nothing.
+fn whoami() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty() && user.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map_or_else(|| "you".to_owned(), |user| user.to_ascii_lowercase())
 }
 
 /// Whether a bare `dekopon` should open the console.

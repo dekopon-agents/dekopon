@@ -141,7 +141,7 @@ async fn a_stopped_broker_is_refused_by_the_exact_path_that_was_tried() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let absent = directory.path().join("broker.sock");
     let mut options = super::ConsoleOptions::new(
-        "tel.15550100000".parse().expect("valid subject fixture"),
+        "dev.console.xavier".parse().expect("valid subject fixture"),
         "test-model".to_owned(),
     );
     options.socket = Some(absent.clone());

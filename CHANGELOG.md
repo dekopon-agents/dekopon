@@ -28,6 +28,17 @@ All notable changes to Dekopon are documented here. The format is based on
   decorator can influence a session. Its local dispatch leg is empty by construction, so every
   capability reaches the broker and no Wasmtime enters the operator CLI's dependency tree — checked
   in CI by the same `cargo tree` gate already applied to `dekopon-run` and `dekopond`.
+- Added a `dev.<surface>.<name>` subject service and a `dekopon-brokerd` `allowDevelopmentSubjects`
+  opt-in that admits it. It is the only subject service no external service authenticated — a name
+  a local caller typed on an owner-only socket rather than one Slack or a carrier verified — so it
+  is off by default, and a broker whose configuration names development identities without it lists
+  every offending mapping and attestor namespace at once and refuses to start. The opt-in is the
+  whole enforcement: configuration is immutable for a process, so a broker started without it holds
+  no `dev.*` mapping and an attested development subject resolves to nothing through the ordinary
+  unmapped-subject refusal. It exists so `dekopon console` need not borrow `tel.15550100000`, which
+  would put a value in `identityMappings`, in policy, and in the audit chain that reads like a phone
+  number and is not one. The surface segment scopes a grant to `dev.console` without admitting
+  `dev.ci`.
 - Added `dekopon_model::chatgpt::resolve_auth_path_named` and `DEFAULT_AUTH_FILE_NAME`, so a second
   consumer can resolve a credential under the documented precedence with a different file name.
   `dekopon console` uses it for `chatgpt-auth.console.json` and refuses to start if discovery lands
