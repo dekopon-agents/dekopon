@@ -275,7 +275,7 @@ This detects valid-prefix truncation relative to the retained checkpoint and mak
 
 ## Storage is a sibling privileged host interface
 
-**Status: current in this tree, unreleased.** `dekopon:storage@0.1.0` is independent of HTTP.
+**Status: current.** `dekopon:storage@0.1.0` is independent of HTTP.
 Constraint sets select exactly `jsonl` or `durable-files`, read-only or read-write, and chat
 namespace; combining HTTP and storage is refused. The broker derives every opaque namespace from
 the authorized context, consumes a host-instance/invocation/capability/provider-bound grant, and

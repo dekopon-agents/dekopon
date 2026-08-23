@@ -111,9 +111,9 @@ The broker owns the only authority transition in this flow. The authenticated re
 
 The agent daemon must not gain effect authority merely because it coordinates a task. The broker must not perform model orchestration merely because it can execute a provider. Image generation is model inference rather than a provider effect: its explicitly named model credential stays inside the unprivileged gateway/model client, while the model can choose only a bounded prompt and never the endpoint, credential, filename, or authenticated chat destination.
 
-### Unreleased provider storage and durable chat memory
+### Provider storage and durable chat memory
 
-**Status: current in this tree, unreleased.** `dekopon-brokerd` may opt into a separate broker-only
+**Status: current.** `dekopon-brokerd` may opt into a separate broker-only
 storage root and namespace key. Exact `jsonl` or `durable-files` plus read-only/read-write authority
 is bound to one authorization; HTTP and storage cannot coexist in one v1 capability. Raw scope and
 logical names never select paths. Mutations remain provisional until a successful, bounded,
@@ -127,7 +127,7 @@ conversation: `stable` deliberately survives semantic authority changes; the def
 `authority-bound` persists an opaque pointer and random epoch so A→B→A creates three generations.
 The store has finite permanent deduplication and no deletion/export UX or encryption-at-rest claim.
 
-Slack Agent channel continuation is also current in this tree and unreleased. One explicitly
+Slack Agent channel continuation is also current. One explicitly
 addressed, freshly authorized message claims an exact workspace/channel/thread/sender tuple in a
 bounded gateway-only registry. Only that sender's later message in that thread bypasses the repeat
 mention, and every continuation is authorized again. The prompt marks that unaddressed follow-up as
@@ -137,7 +137,7 @@ if no model turn remains, the gateway posts a fixed warning to inspect audit bef
 
 ## Current control paths
 
-The published `0.10.0` release retains the local catalog read path introduced in 0.1:
+The published `0.11.0` release retains the local catalog read path introduced in 0.1:
 
 ```text
 parse dekopon CLI

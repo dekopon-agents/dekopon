@@ -165,7 +165,7 @@ And not into the [prompt cache key](dekopond.md#the-prompt-cache-key). Every mod
 
 ## Provider storage and durable on-demand chat memory
 
-**Status: current in this tree, unreleased.** The broker may hold a separate provider-storage PVC
+**Status: current.** The broker may hold a separate provider-storage PVC
 and a 32-byte namespace key. Components still receive no WASI, host path, environment, socket, or
 ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
 instance, invocation, capability, provider, interface, access, chat namespace, scope commitment,

@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.10.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, an interactive terminal console, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves destination-bound provider credentials, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,15 +8,15 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
-## What works today in 0.10.0
+## What works today in 0.11.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
 - A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
-- Unreleased: `dekopon console`, a terminal view over a running broker. It shows what policy actually grants an agent beside what its catalog declares, runs turns, and draws each turn's scripts and capability calls with their exact JSON input and result — which exists nowhere else, because history keeps prompts and answers, spans keep argument counts, and audit records keep digests.
+- `dekopon console`, an interactive terminal view over a running broker, opened with a bare `dekopon` on a terminal. It shows what policy actually grants an agent beside what its catalog declares, runs turns, and draws each turn's scripts and capability calls with their exact JSON input and result — which exists nowhere else, because history keeps prompts and answers, spans keep argument counts, and audit records keep digests. An opt-in `dev.<surface>.<name>` subject service backs it without borrowing a real phone number.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
-- A realistic local GitHub catalog with no embedded credentials.
-- A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call.
+- A realistic broker-configured example — Cedar policy, credential template, and audit chain on its own volume — exercising two authorized calls in one invocation (`examples/conditional-write/`).
+- A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call, and an in-process fake-broker testkit (`dekopon-provider-sdk-testkit`) that runs a provider component against real storage for end-to-end tests.
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
@@ -25,22 +25,46 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
   a classic/free `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat
   actions. Activity failure never changes the answer, and Stop is cooperative rather than rollback.
-- Unreleased: Slack Agent channel threads become owned per authenticated sender only after fresh
+- Slack Agent channel threads become owned per authenticated sender only after fresh
   authorization. That sender can continue without repeating the mention, while the optional
   `decline_chat_reply` decision lets the agent post nothing when a response would only take the
   last word. Ambient channel history never reaches routing or inference.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
 - Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
-- A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
-- Unreleased: generic broker-owned JSONL and durable-file provider storage plus optional on-demand
+- A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable streams. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+- Generic broker-owned JSONL and durable-file provider storage plus optional on-demand
   durable chat memory. Memory is model-queryable only under an effective all-three grant and is
   recorded once after gateway-attested complete transport acceptance; it is never automatically
   replayed into a prompt.
-- Unreleased: a text-only Meta WhatsApp Cloud API transport with exact raw-body HMAC verification,
+- A text-only Meta WhatsApp Cloud API transport with exact raw-body HMAC verification,
   bounded process-local message-ID deduplication, `whatsapp.<wa_id>` subjects, one-attempt pinned
   Graph API replies, and an opt-in chart ClusterIP port for exact-path Traefik routing. It adds no
   broker authority and exposes no operational UI.
+- SQL available to providers, out of this tree: a SQLite-compatible `turso-sql` engine compiled to
+  `wasm32-unknown-unknown`, importing only `dekopon:storage/durable-files@0.1.0`, published
+  separately from [dekopon-provider-turso-sql](https://github.com/dekopon-agents/dekopon-provider-turso-sql).
+
+New in 0.11.0 — an interactive console, and `dekopon-shell`'s real bash-script surface:
+
+- `dekopon console`, an interactive terminal view over a running broker: it opens an attested
+  session for one external subject through one catalog agent, shows what policy actually grants
+  beside what the catalog declares, and draws every turn's scripts and capability calls with their
+  exact JSON input and result. A `dev.<surface>.<name>` subject service backs it without borrowing a
+  real identity.
+- `dekopon-shell` gained compound commands as pipeline stages, `[[ ... ]]`, enforced
+  `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two
+  script-addressable streams — the bash surface a script author expects, minus glob matching and
+  regex.
+- The `gh` shell builtin and its capabilities moved to
+  [dekopon-provider-gh](https://github.com/dekopon-agents/dekopon-provider-gh), an out-of-tree
+  provider with its own release cadence; the container image still ships it, verified at a pinned
+  tag.
+- `dekopon-provider-sdk-testkit`, an in-process fake broker that runs a provider component against
+  real storage, so storage-backed providers can be tested end to end without Cedar or the constraint
+  catalog.
+- SQL for providers, out of this tree: `dekopon-provider-turso-sql`, a SQLite-compatible engine with
+  no WASI and no C in the artifact.
 
 New in 0.10.0 — a deep-review hardening pass, and three new surfaces:
 
@@ -123,26 +147,26 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.10.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.10.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.11.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.11.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.10.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.10.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.10.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.11.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.11.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.11.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.10.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.10.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.11.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.11.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-The workspace contains twenty-three public crates, and the `0.10.0` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
+The workspace contains twenty-five public crates, and the `0.11.0` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
-cargo install --locked --version 0.10.0 dekopon
-cargo install --locked --version 0.10.0 dekopon-run
-cargo install --locked --version 0.10.0 dekopon-brokerd
-cargo install --locked --version 0.10.0 dekopond
+cargo install --locked --version 0.11.0 dekopon
+cargo install --locked --version 0.11.0 dekopon-run
+cargo install --locked --version 0.11.0 dekopon-brokerd
+cargo install --locked --version 0.11.0 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
@@ -180,7 +204,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.2.0` declares `appVersion: 0.10.0`, so it deploys `v0.10.0` by default; to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.2.1` declares `appVersion: 0.11.0`, so it deploys `v0.11.0` by default; to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
 
 ## Run the flagship example
 
