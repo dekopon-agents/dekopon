@@ -59,6 +59,14 @@ All notable changes to Dekopon are documented here. The format is based on
   this makes it something a script can address. `x=$(cmd 2>&1)` therefore captures *why* a
   capability failed rather than only that it did; a quiet command's value, and its type, are left
   untouched. `ScriptOutcome::output` is still the one combined transcript a terminal would show.
+- SQL is now available to providers, out of this tree. `turso-sql` is a SQLite-compatible engine
+  (`turso_core`, pure Rust) compiled to `wasm32-unknown-unknown`, importing
+  `dekopon:storage/durable-files@0.1.0` and nothing else — no WASI, no JS interop, no C in the
+  artifact. It lives at
+  [dekopon-agents/dekopon-provider-turso-sql](https://github.com/dekopon-agents/dekopon-provider-turso-sql)
+  with its own tags and release cadence, because its component is 11 MB and its dependency graph is
+  an order of magnitude heavier than any example in this repository. Nothing here depends on it and
+  no shipped memory path uses it; an operator who wants it fetches the release asset.
 
 ### Changed
 
@@ -70,6 +78,14 @@ All notable changes to Dekopon are documented here. The format is based on
   bash duplicates the file description there and leaves stderr on the terminal, this interpreter
   has destinations rather than descriptions, and that spelling is the one a script writes when it
   believes it captured output that went elsewhere.
+- Corrected the durable-files documentation: the five-level lock ladder constrains the shape of a
+  lock sequence and is consulted by no I/O path, so a guest may read and write at `none` and an
+  adapter that never locks is equally correct. The SHM and multiprocess-database disclaimers stand;
+  the "no WAL claim" wording did not, since a single-instance WAL engine needs neither and runs on
+  these primitives unchanged.
+- Rescoped the 2026-08-20 Turso gate result in the roadmap, security model, and experiment log. It
+  tested the crates.io `turso` wrapper, whose SDK-kit dependencies are not reachable from the
+  engine; it was not a finding about `turso_core`.
 
 ### Fixed
 

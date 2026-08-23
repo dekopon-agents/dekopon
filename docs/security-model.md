@@ -200,9 +200,14 @@ namespace corruption is quarantined while retaining quota. An actively malicious
 racing filesystem mutation is out of scope. Native filesystem operations can remain blocked after
 a timeout signal; the finalization budget prevents starting the next bounded finalization step after
 its deadline, while leases/reservations stay held until an already-started blocking operation
-drains, so this is not a hard wall-clock guarantee. Durable-files has rollback-journal lock primitives and deliberately
-no WAL/SHM or multiprocess SQLite claim. The pinned Turso 0.7.2 gate failed before producing core
-Wasm, so no SQLite dependency or artifact ships.
+drains, so this is not a hard wall-clock guarantee. Durable-files has rollback-journal lock primitives that no I/O path
+consults: reads, writes, size, truncate, and sync never inspect handle lock state, so the lock table
+is well-formedness bookkeeping rather than an access control. There is still no SHM operation and no
+multiprocess-database claim. A single-instance WAL engine needs neither and runs on these primitives
+unchanged; the out-of-tree `turso-sql` provider ships one, calls `lock` zero times, and opens
+exactly two files.
+The durability boundary is the invocation transaction, not the guest's `sync` — a trap mid-write
+leaves the reopened database at the last committed state.
 
 Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
 automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte

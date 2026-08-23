@@ -124,8 +124,14 @@ out of scope.
 - Complete transport-acceptance receipts and exactly one no-retry record request after acceptance.
 - Separate retained broker-only provider-storage PVC and operator-managed key; optional memory
   component path outside the default scan.
-- Pinned Turso 0.7.2 gate failed on forbidden JS/C/build paths and wasm compilation, so SQLite did
-  not ship. Durable-files remains engine-neutral and makes no WAL/SHM claim.
+- Optional out-of-tree `turso-sql` provider: a pure-Rust SQLite-compatible engine (`turso_core`)
+  compiled to `wasm32-unknown-unknown` from the `dekopon-agents/turso` fork, importing
+  durable-files and nothing else. Indexed reads, aggregation, and schema are what it buys; write
+  throughput is not, and full-text search is absent on this target.
+- The 2026-08-20 gate that failed on forbidden JS/C/build paths tested the crates.io `turso`
+  wrapper, whose SDK-kit dependencies are not reachable from the engine. Durable-files stays
+  engine-neutral and still makes no SHM or multiprocess claim; a single-instance WAL engine needs
+  neither.
 
 Version 0.10.0 adds one bounded inbound listener — the WhatsApp webhook, HMAC-authenticated
 before parsing and behind external TLS — and broker-owned provider storage behind explicit storage
