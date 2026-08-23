@@ -2,9 +2,22 @@
 
 Read [`design.md`](design.md) first for the product model and accepted invariants. This document maps that design to current crate boundaries and the planned deployment topology; it does not make planned components current.
 
-## Published 0.11.0 foundation
+## Published 0.11.1 foundation
 
-The published `0.11.0` release adds `dekopon console`, which opens an attested session against the broker's Unix socket and runs the agent loop locally through one command, `dekopon-tui`, holding a model credential and no broker authority; a `dev.<surface>.<name>` subject service backs it without borrowing a real identity. `dekopon-shell` gained a real bash-script surface — compound commands as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable streams. `dekopon-provider-sdk-testkit` runs a provider component against real storage in-process, without Cedar or the constraint catalog. The `gh` shell builtin and its capabilities moved out of tree to `dekopon-provider-gh`, and `turso-sql`, a SQLite-compatible engine, is now available to providers the same way.
+The published `0.11.1` patch fixes the container image, which failed to publish for `0.11.0`:
+`dekopon`'s console linked two weak-probed `GLIBC_2.39` symbols the distroless Debian 12 runtime
+base (glibc 2.36) does not provide, and glibc's dynamic linker refuses to load a binary naming a
+version node the runtime library lacks at all, weak reference or not. The base moved to Debian 13
+(glibc 2.41). No crate's source changed. It otherwise retains everything `0.11.0` added:
+`dekopon console`, which opens an attested session against the broker's Unix socket and runs the
+agent loop locally through one command, `dekopon-tui`, holding a model credential and no broker
+authority; a `dev.<surface>.<name>` subject service backs it without borrowing a real identity.
+`dekopon-shell` gained a real bash-script surface — compound commands as pipeline stages,
+`[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and
+two script-addressable streams. `dekopon-provider-sdk-testkit` runs a provider component against
+real storage in-process, without Cedar or the constraint catalog. The `gh` shell builtin and its
+capabilities moved out of tree to `dekopon-provider-gh`, and `turso-sql`, a SQLite-compatible
+engine, is now available to providers the same way.
 
 The release otherwise retains the two deliberately separate synchronous execution surfaces introduced in 0.1, the privileged asynchronous host, authorization/evidence/audit libraries, separately deployed authenticated Unix broker, sandboxed one-tool scripting surface, and cross-process OpenTelemetry added in 0.2, and the unprivileged agent daemon `dekopond` added in 0.3, which connects to chat services and submits attested on-behalf-of proposals to the broker. Version 0.4 added distribution through release archives, a container image, a Helm chart, and a Homebrew tap; 0.5 added bounded chat attachments; 0.6 added `dekopon-webui`, a GET-only operational renderer embedded in the broker behind an explicit TCP bind; 0.7 added credential-free gateway self-inspection; 0.8 added Discord Gateway transport; 0.8.1 raised the per-turn tool-call guard from four to ten; 0.9 added opt-in transport-native in-flight activity with authenticated cooperative Stop; and 0.10 added a text-only Meta WhatsApp Cloud API gateway transport, opt-in route-scoped OpenAI image generation, broker-owned namespace-bound provider storage with the optional generated `memory-chat` provider, and a 145-finding deep-review hardening pass. None moved a responsibility between processes. Explicit `dekopon-run broker` commands remain unprivileged clients. The tree still carries the unsupported, mock-only Skylight provider exploration, absent from default catalogs, images, policies, and deployments.
 

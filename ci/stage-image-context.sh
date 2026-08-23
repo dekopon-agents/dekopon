@@ -42,10 +42,10 @@ source_dir=$(cd "$(dirname "$0")/.." && pwd)
 archives="$work/archives"
 context="$work/context"
 
-# The runtime base is Debian 12 (glibc 2.36) while the release archives are built on ubuntu-24.04.
+# The runtime base is Debian 13 (glibc 2.41) while the release archives are built on ubuntu-24.04.
 # Nothing in the release process knows about the image, so the constraint is checked here, before
 # a build can bake in a binary that cannot start.
-max_glibc="2.36"
+max_glibc="2.41"
 
 binaries="dekopon dekopon-run dekopon-brokerd dekopond"
 providers="echo http-probe jsonplaceholder"
