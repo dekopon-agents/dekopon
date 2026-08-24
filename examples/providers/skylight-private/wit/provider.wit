@@ -1,7 +1,0 @@
-package dekopon:skylight-private@0.1.0;
-
-/// Unsupported private Skylight identity and frame reads through broker-mediated HTTP.
-world provider {
-    include dekopon:provider/provider@0.2.0;
-    import dekopon:http/client@1.0.0;
-}
