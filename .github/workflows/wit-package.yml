@@ -26,8 +26,6 @@ on:
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
       - "examples/providers/jsonplaceholder-provider.wasm"
-      - "examples/providers/skylight-private/**"
-      - "examples/providers/skylight-private-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -56,8 +54,6 @@ on:
       - "examples/providers/http-probe-provider.wasm"
       - "examples/providers/jsonplaceholder/**"
       - "examples/providers/jsonplaceholder-provider.wasm"
-      - "examples/providers/skylight-private/**"
-      - "examples/providers/skylight-private-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -72,7 +68,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_VERSION: 1.89.0
   WKG_VERSION: 0.16.0
   WKG_SHA256: 8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a
   WASM_TOOLS_VERSION: 1.236.1
@@ -89,13 +84,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install pinned Rust for provider regeneration
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: clippy,rustfmt
-          targets: wasm32-unknown-unknown
 
       - name: Install pinned component tools
         shell: bash
@@ -174,7 +162,7 @@ jobs:
 
             expected=''
             case "$provider" in
-              http-probe|jsonplaceholder|skylight-private) expected='dekopon:http/client@1.0.0' ;;
+              http-probe|jsonplaceholder) expected='dekopon:http/client@1.0.0' ;;
               memory-chat) expected='dekopon:storage/jsonl@0.1.0' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
             esac
@@ -202,7 +190,6 @@ jobs:
             crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/jsonplaceholder/wit/deps/provider.wit \
-            examples/providers/skylight-private/wit/deps/provider.wit \
             examples/providers/memory-chat/wit/deps/provider.wit \
             examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
@@ -215,8 +202,7 @@ jobs:
           for mirror in \
             crates/dekopon-broker-host/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit \
-            examples/providers/jsonplaceholder/wit/deps/http.wit \
-            examples/providers/skylight-private/wit/deps/http.wit
+            examples/providers/jsonplaceholder/wit/deps/http.wit
           do
             cmp wit/http/http.wit "$mirror"
           done
@@ -501,7 +487,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in http-probe jsonplaceholder skylight-private; do
+          for name in http-probe jsonplaceholder; do
             component="examples/providers/$name-provider.wasm"
             description="target/wit-package/$name.json"
             wasm-tools validate "$component"

@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the in-tree `skylight-private` source workspace and checked component. Its designated
+  standalone destination is
+  [dekopon-agents/dekopon-provider-skylight-private](https://github.com/dekopon-agents/dekopon-provider-skylight-private);
+  publishing this prepared core extraction remains ordered after that repository has a public green
+  `main`, and no provider release is claimed. Generic `http-probe` and `jsonplaceholder` fixtures
+  retain HTTP-import inspection, immediate-host and runner rejection, exact broker-authority
+  refusal with empty pre-dispatch HTTP evidence, independent resource ceilings, sanitized call
+  evidence/redaction, and canonical provider/HTTP WIT mirror coverage.
+
 ## [0.11.1] - 2026-08-23
 
 ### Fixed

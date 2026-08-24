@@ -44,7 +44,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram transports; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving the checked-in `echo`, `storage-probe`, and `memory-chat` components |
-| Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `gh/`, `skylight-private/`, `memory-chat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
+| Rust provider examples | `examples/providers/echo/`, `http-probe/`, `jsonplaceholder/`, `memory-chat/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, injected or loopback mocks, and broker restart/VFS tests |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
@@ -83,7 +83,6 @@ The buffered HTTP WIT package and guest/host copies are also mirrored:
 - `crates/dekopon-broker-host/wit/deps/http.wit`
 - `examples/providers/http-probe/wit/deps/http.wit`
 - `examples/providers/jsonplaceholder/wit/deps/http.wit`
-- `examples/providers/skylight-private/wit/deps/http.wit`
 
 The storage package is mirrored byte-for-byte at:
 
@@ -98,7 +97,6 @@ The broker host and imported guests also mirror the provider package:
 - `crates/dekopon-broker-host/wit/deps/provider.wit`
 - `examples/providers/http-probe/wit/deps/provider.wit`
 - `examples/providers/jsonplaceholder/wit/deps/provider.wit`
-- `examples/providers/skylight-private/wit/deps/provider.wit`
 - `examples/providers/memory-chat/wit/deps/provider.wit`
 - `examples/providers/memory-reservation-probe/wit/deps/provider.wit`
 - `examples/providers/storage-probe/wit/deps/provider.wit`
@@ -116,13 +114,12 @@ The checked-in components are generated:
 | `examples/providers/echo/src/lib.rs` | `examples/providers/echo/build.sh` | `examples/providers/echo-provider.wasm` |
 | `examples/providers/http-probe/src/lib.rs` | `examples/providers/http-probe/build.sh` | `examples/providers/http-probe-provider.wasm` |
 | `examples/providers/jsonplaceholder/src/lib.rs` | `examples/providers/jsonplaceholder/build.sh` | `examples/providers/jsonplaceholder-provider.wasm` |
-| `examples/providers/skylight-private/src/lib.rs` | `examples/providers/skylight-private/build.sh` | `examples/providers/skylight-private-provider.wasm` |
 | `examples/providers/memory-chat/src/lib.rs` | `examples/providers/memory-chat/build.sh` | `examples/providers/memory-chat-provider.wasm` |
 | `examples/providers/memory-reservation-probe/src/lib.rs` | `examples/providers/memory-reservation-probe/build.sh` | `examples/providers/memory-reservation-probe-provider.wasm` |
 | `examples/providers/provider-v0-1-compat/src/lib.rs` | `examples/providers/provider-v0-1-compat/build.sh` | `examples/providers/provider-v0-1-compat-provider.wasm` |
 | `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Publication CI rebuilds every checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection. HTTP-importing components, including the opt-in unsupported `skylight-private` Exploration, decode to exactly one HTTP import. `memory-chat` decodes to JSONL only and three provider exports; `memory-reservation-probe` and the provider-v0.1 compatibility fixture are import-free; `storage-probe` decodes to durable-files only and three provider exports. None may import WASI. Direct-host and `dekopon-run inspect` tests reject every imported component.
+Never edit `.wasm` files directly. Each source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Publication CI rebuilds every checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection. The `http-probe` and `jsonplaceholder` components each decode to exactly one HTTP import. `memory-chat` decodes to JSONL only and three provider exports; `memory-reservation-probe` and the provider-v0.1 compatibility fixture are import-free; `storage-probe` decodes to durable-files only and three provider exports. None may import WASI. Direct-host and `dekopon-run inspect` tests reject every imported component.
 
 ### Dependencies, crates, CI, or releases
 
@@ -222,7 +219,7 @@ OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
 
 ### Provider example workspaces
 
-Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `skylight-private`, `memory-chat`, `memory-reservation-probe`, `provider-v0-1-compat`, and `storage-probe`):
+Run these commands for each affected provider manifest (`echo`, `http-probe`, `jsonplaceholder`, `memory-chat`, `memory-reservation-probe`, `provider-v0-1-compat`, and `storage-probe`):
 
 ```console
 cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
@@ -242,14 +239,11 @@ cargo install wasm-tools --version 1.236.1 --locked
 examples/providers/echo/build.sh
 examples/providers/http-probe/build.sh
 examples/providers/jsonplaceholder/build.sh
-examples/providers/skylight-private/build.sh
 wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools validate examples/providers/jsonplaceholder-provider.wasm
-wasm-tools validate examples/providers/skylight-private-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/jsonplaceholder-provider.wasm
-wasm-tools component wit examples/providers/skylight-private-provider.wasm
 cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked
