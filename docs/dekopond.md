@@ -172,9 +172,10 @@ render as concise Markdown tables:
   identifier, selected provider, description, effect, risk, and idempotency.
 
 That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and
-digests, denied or merely declared capabilities, execution constraints, credential bindings,
-principal/subject/channel/transport identifiers, model endpoints and auth paths, broker paths, and
-all credential names and values are absent. The gateway never receives provider credentials or raw
+digests, denied or merely declared capabilities, execution constraints, legacy credential bindings,
+private secret-map source/selector/use inventory, principal/subject/channel/transport identifiers,
+model endpoints and auth paths, broker paths, and all credential values are absent. Exact standing
+instructions remain visible and may intentionally contain a public inert DRN. The gateway never receives provider credentials or raw
 policy, and the typed view has no field for the chat/model credentials it does hold. Each serialized
 result has a 128 KiB hard ceiling. Calls are repeatable under the prompt loop's shared per-turn tool
 call and model-step bounds; there is no inspection-specific call limit. What a repeat does not do is

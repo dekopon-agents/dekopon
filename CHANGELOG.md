@@ -9,6 +9,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added public inert secret DRNs and an owner-only private secret map. A broker-backed model may
+  propose exact Basic/Bearer use without placing a reference or value in provider JSON/WIT; the
+  broker requires ordinary capability policy, a separate exact Cedar `secret.use` grant, and a
+  private authority/method/canonical-path/query binding before resolving one invocation-pinned
+  snapshot. Current adapters cover strict secure files, Kubernetes projections/API Secret and
+  acknowledged ConfigMap values, 1Password Connect, Vault KV v1/v2, AWS Secrets Manager/SSM, GCP
+  Secret Manager, and Azure Key Vault. Native rendering, binding-swap refusal, injection bounds,
+  and raw/rendered response-reflection refusal keep values out of models, providers, protocol,
+  evidence, audit, traces, and errors. Existing implicit per-capability/per-agent credentials remain
+  compatible.
 - Added an offline provider manager to `dekopon-brokerd`. `provider sync`, `sync --locked`, `list`,
   and `verify` resolve fully qualified exact OCI tag or manifest-digest references, stream the one
   bounded `application/wasm` layer into a content-addressed store, validate the complete proposed

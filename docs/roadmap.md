@@ -164,6 +164,18 @@ though both are weak-probed and safely absent on an older one. No crate's source
   and container-staging adoption remain the ordered follow-ups rather than fields parsed but read by
   nothing.
 
+## Unreleased — public DRNs and private secret sources (implemented)
+
+- Canonical logical DRNs are inert typed proposal values, never provider JSON/WIT or bearer grants.
+  Each use requires the normal capability decision, a separate exact Cedar `secret.use` decision,
+  an owner-only use binding, and native host enforcement.
+- The private map resolves one authorized invocation snapshot from secure files, Kubernetes
+  projections/API objects, 1Password Connect, Vault KV v1/v2, AWS Secrets Manager/SSM, GCP Secret
+  Manager, or Azure Key Vault. Existing implicit credentials remain compatible.
+- Workload-identity bootstrap chains, Vault dynamic leases, custom source CAs, caching/stale
+  fallback, output materialization, arbitrary secret interpolation, and transformed-reflection
+  prevention remain follow-ups rather than parsed-but-unused configuration.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.
@@ -183,7 +195,7 @@ Each of these was raised, deliberately scoped out, and accepted as a follow-up r
 - **Per-principal credential overrides for one capability.** Half of this landed as `credentialByAgent`: a constraint set now binds a default credential plus per-agent overrides, which is what "one token per team, channel, or organization" needs, because a route already binds a transport and a channel match to an agent. What remains open is the principal axis — "approve as the person who asked" — which is a different trade: one entry per human in a file that otherwise declares capabilities and agents, and a per-person token to manage for each.
 - ~~**Conversation memory and multi-turn threads in `dekopond`.** Each message is an independent session with no history. Memory is a new trust surface — text that persists across sessions and is replayed into a prompt — and belongs behind its own design pass.~~ Done: the design pass this item asked for is the [conversation contract](dekopond.md#conversations) and the [trust surface](security-model.md#conversation-memory-as-a-trust-surface) it accepts, and `dekopond` now implements it. History lives in gateway memory, is keyed on the transport, the conversation identity, and the sender's canonical subject, is compacted to question-and-answer pairs inside a sliding window, and is dropped on an idle timeout, an LRU ceiling, or a changed capability grant. Authorization is never cached; what persistence widens is an injected instruction's dwell time, which is why the security model states it rather than the roadmap.
 - **`dekopon policy explain` and `auth can-i` operator commands.** The broker already computes the determining `policy_ids` for every decision; the missing half is an operator path to ask the question without making an effect happen. It is also the first CLI-to-broker integration and inherits that whole boundary discussion.
-- **Cedar context conditioned on provider input.** Deliberately absent: conditioning authorization on untrusted open JSON needs a settled schema treatment before any policy may depend on a caller-supplied value.
+- **Cedar context conditioned on arbitrary provider input.** Deliberately absent: untrusted open JSON still has no settled schema. The public DRN feature is the narrow exception that proves the rule — one strongly typed top-level resource goes through a separate `secret.use` action and can never widen its owner binding.
 - **Actor kind (human versus service) in policy context.** The broker knows it; policy cannot currently read it. Cheap to add and easy to add wrongly, since it invites rules that look like identity checks but are transport facts.
 - **`AuditEvent` field casing.** Variants rename to camelCase while their fields stay snake_case, so a record mixes `attested_subject` with `credentialInjected`. Fixing it breaks the audit chain format, which is worth doing only alongside another change that already does.
 

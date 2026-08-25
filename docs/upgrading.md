@@ -50,6 +50,24 @@ explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
+### After 0.11.1 — optional public DRNs require a private map and second policy
+
+Existing `credentialsPath`, `credential`, and `credentialByAgent` deployments need no migration and
+retain byte-compatible legacy audit serialization. To opt into model-selected DRNs:
+
+1. Install an owner-only `0600` `dekopon.dev/secret-map/v1alpha1` file and set `secretMapPath`.
+2. Keep every binding narrower than the named capability constraint set.
+3. Add a separate Cedar permit for `Dekopon::Action::"secret.use"` over each exact
+   `Dekopon::Secret::"drn:…"`; a capability permit alone intentionally returns `secret-denied`.
+4. Upgrade all clients with the broker. `InvocationRequest.secretUse` is optional and omitted from
+   old calls, but an older strict broker rejects a new request carrying it.
+5. Mount bootstrap/session files only into the broker. No source credential or private map belongs
+   in `dekopond` or direct `dekopon-run`.
+
+Startup validates descriptors without network. Remote source availability is first exercised after
+an authorized invocation. See [`secrets.md`](secrets.md) for exact source fields and current
+bootstrap limitations.
+
 ### 0.2 → 0.3 — the broker configuration is a breaking migration
 
 **This is the one upgrade that silently looks fine and is not.** `broker.yaml` keeps its

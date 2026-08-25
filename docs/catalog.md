@@ -195,7 +195,7 @@ than left to be discovered, because each one reads like it selects a behavior.
 | Field | Looks like | Actually |
 |---|---|---|
 | `spec.policyProfile` (Agent) | Selects a named policy for the agent | Read by `dekopon get`/`describe` and nothing else. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Read by `dekopon get -o wide` and nothing else. Credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) resolved against the broker's `0600` credentials file, neither of which consults the catalog. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
+| `spec.credentialRef` (Provider) | Names the credential the provider will present | Read by `dekopon get -o wide` and nothing else. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
 | `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so `dekopon get capabilities` reports the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Round-tripped through `-o yaml`/`-o json`. Nothing filters, selects, or reports on them. |
 

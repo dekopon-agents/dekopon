@@ -35,7 +35,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service and offline provider manager | `crates/dekopon-brokerd/src/`; provider set/lock, bounded OCI transport, content store, and lifecycle commands in `provider_manager.rs` | Inline strict-config/socket/CLI tests; local mock-registry resolution, locked-sync, offline list/verify, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
+| Authenticated Unix broker service, private secret sources, and offline provider manager | `crates/dekopon-brokerd/src/`; strict public-DRN/private-map adapters in `secrets.rs`; provider set/lock, bounded OCI transport, content store, and lifecycle commands in `provider_manager.rs` | Inline strict-config/socket/CLI tests; secret-map aggregate validation, strict JSON/YAML projection, secure-file and mock-backed 1Password/Vault/AWS/GCP/Azure/Kubernetes adapters; local mock-registry resolution, locked-sync, offline list/verify, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
 | Broker operational web UI | `crates/dekopon-webui/src/`; Wasmtime observations in `crates/dekopon-broker-host/src/{metrics,metadata}.rs` | Router/rendering, escaping/security-header, provider-detail, live-counter, artifact/interface, GET-only, and listener-ceiling tests in `crates/dekopon-webui/tests/dashboard.rs`, request-tracing coverage in `crates/dekopon-webui/tests/request_tracing.rs` (both use the exact fetched standalone echo fixture outside the published package); real bind/redirect coverage in `crates/dekopon-brokerd/tests/server.rs` |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
@@ -153,9 +153,9 @@ Privileged broker path:
 - `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation. Its cloneable metrics handle observes compilation/store/instantiation/invocation/fuel, limiter memory/table requests, and sanitized HTTP byte/count totals; Wasmtime exposes no allocator-wide resident-memory or JIT-cache statistic through this embedding API.
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
-- `dekopon-broker` validates owner-authored constraint sets against loaded routes, host ceilings, and the credential store, reserves invocation IDs before policy evaluation, asks `dekopon-policy` for the decision, creates single-use authorization, and audits only metadata/digests plus `policy_ids`, `policy_digest`, and the selected credential's symbolic name.
+- `dekopon-broker` validates owner-authored constraint sets against loaded routes, host ceilings, and the legacy credential store. A typed DRN proposal additionally passes separate `secret.use` policy and a private binding before one brokerd resolver snapshot is rendered by the native host. It audits only metadata/digests plus policy IDs/digest and the selected symbolic name/DRN.
 - A constraint set may name a default credential and per-agent overrides. Validation covers every credential the set can select, not only the default: each must exist in the store and its destinations must cover every `allowedHosts` entry of that set. Selection happens in `Broker::execute` from the trusted `AuthenticatedContext`, so it can never read a request payload.
-- `dekopon-policy` is startup-fixed: policies parse once, the schema is generated from the declared world, and strict validation runs before the first request. Nothing is parsed per decision. Any evaluation error denies, and policy text never reaches a runtime path — not an error, not an audit field, not `Debug`.
+- `dekopon-policy` is startup-fixed: policies parse once, the schema is generated from declared principals/providers/capabilities and private-map `Secret` entities, and strict validation runs before the first request. Nothing is parsed per decision. Any evaluation error denies, and policy text never reaches a runtime path — not an error, not an audit field, not `Debug`.
 - Every capability a policy references needs a constraint set, or the broker refuses to start; a capability with no constraint set is denied `unconstrained-capability` before Cedar is consulted.
 - `AuthenticatedContext` construction alone is not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes exact chain-prefix checks, and restores replay IDs across restart. `dekopon-brokerd` synchronizes a separately locked atomic checkpoint after each append and requires it to match a verified audit prefix at startup.
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
@@ -304,6 +304,26 @@ wkg get \
 ```
 
 `.github/workflows/wit-package.yml` performs local publish/fetch round trips for all three packages on pull requests. When the relevant files reach `main`, it publishes the immutable packages to GHCR and verifies that fetching each package returns identical bytes.
+
+### Secret references and private source adapters
+
+No provider or HTTP WIT file changes for this feature: the DRN is a typed top-level proposal field
+and the native HTTP host keeps injection broker-owned. Validate the domain, dual policy, shell,
+path/reflection host, broker swap refusal, strict private map, and mock adapters with:
+
+```console
+cargo test -p dekopon-core --locked
+cargo test -p dekopon-policy --locked
+cargo test -p dekopon-shell --locked
+cargo test -p dekopon-broker-protocol --locked
+cargo test -p dekopon-http-host --locked
+cargo test -p dekopon-broker-host --locked
+cargo test -p dekopon-broker --locked
+cargo test -p dekopon-brokerd --locked
+```
+
+No test contacts a public secret manager. Remote adapters use literal-loopback mocks; production
+endpoints require HTTPS. Direct runner/gateway dependency-boundary checks must stay green.
 
 ### Provider manager
 

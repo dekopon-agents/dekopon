@@ -2,6 +2,12 @@
 
 Broker-owned authorization and execution core for Dekopon.
 
+A typed public DRN remains untrusted proposal data. The broker requires both ordinary capability
+policy and a separate exact `secret.use` decision, matches an owner-only `SecretUseBinding`, commits
+the effective narrower scope into authorization/evidence, resolves one invocation snapshot through
+a brokerd-owned `SecretResolver`, and passes only native credential material to the host. Existing
+implicit `CredentialStore` selection remains compatible. See [`../../docs/secrets.md`](../../docs/secrets.md).
+
 This crate binds an authenticated context supplied by a transport to an actor, asks a `dekopon-policy` Cedar engine whether that context may act, binds an allow to the capability's owner-authored constraint set, creates a single-use `AuthorizedInvocation`, executes it through `dekopon-broker-host`, returns bounded public evidence, and records a hash-linked metadata-only audit chain.
 
 Authorization and execution are separate by construction. Cedar decides *who may do what*; a `ConstraintSet` decides *how narrowly the broker then does it* — provider route, trusted effect/risk/idempotency classification, optional symbolic credential, timeout, output ceiling, and exact HTTP authority. Constraint sets are validated at startup against the loaded provider manifest, the component host's independent ceilings, and the credential store, and no policy edit can reach them. A capability with no constraint set is denied `unconstrained-capability` before Cedar is consulted. Under `Leniency::Strict` the broker also refuses to start if any policy could ever permit one; under `Leniency::Tolerant` that becomes a `StartupWarning` so a deployment can ship configuration anticipating a provider it has not dropped in yet. Leniency governs startup only — the invocation-time refusal, which is the part that enforces anything, is identical in both modes.

@@ -70,6 +70,8 @@ policy that can never match.
 | `Dekopon::Provider::"…"` | a loaded provider manifest |
 | `Dekopon::Action::"…"` | a loaded capability, or the fixed `agent.prompt` |
 | `Dekopon::Agent::"…"` | any agent name; the catalog belongs to the gateway, not the broker |
+| `Dekopon::Secret::"drn:…"` | a public DRN declared by the owner-only secret map |
+| `Dekopon::Action::"secret.use"` | fixed separate permission to consume one exact DRN |
 
 Capability actions carry a context of `{ via?, subject?, agent?, effect, risk, idempotency }`;
 `agent.prompt` carries `{ via?, subject?, agent? }`. Every value is derived by the broker from
@@ -228,7 +230,7 @@ Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar st
 Evaluation errors deny.
 
 An optional `credentialsPath` names a second, stricter owner-only file (`0600`, single-link,
-byte-capped) holding provider credentials. The secret values live only there — never in this
+byte-capped) holding legacy implicitly selected provider credentials. The secret values live only there — never in this
 configuration — and a constraint set binds one by symbolic name with `credential:`. Startup fails
 closed if a named credential is missing, the constraint set grants no HTTP authority, or any
 `allowedHosts` entry is absent from the credential's `destinations`; at execution the native
@@ -269,6 +271,25 @@ credentials:
     destinations: [api.github.com]
     secret: github_pat_...
 ```
+
+### Public DRNs and private sources
+
+`secretMapPath` names a separate owner-only `dekopon.dev/secret-map/v1alpha1` document. A model may
+propose one public logical DRN through the sandboxed curl Basic/Bearer forms, but possession grants
+nothing: the broker requires ordinary capability policy, a separate `secret.use` Cedar statement,
+and an exact private binding before one source snapshot is fetched. Providers receive neither DRN
+nor bytes. Current adapters cover secure files, Kubernetes projections/API objects, 1Password
+Connect, Vault KV v1/v2, AWS Secrets Manager/SSM, GCP Secret Manager, and Azure Key Vault.
+
+```yaml
+secretMapPath: /etc/dekopon/secret-map.yaml
+```
+
+Map descriptors are validated without network at startup. Resolution is per authorized invocation,
+with no stale fallback. Basic/Bearer rendering, path/query scope, injection limits and direct
+reflection checks live in the native HTTP host. See [`../../docs/secrets.md`](../../docs/secrets.md)
+for the strict map schema, source fields, bootstrap-file hygiene, policies, examples and current
+non-goals. `credentialsPath` and `secretMapPath` may coexist.
 
 ### One capability, one token per agent
 
