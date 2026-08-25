@@ -9,6 +9,7 @@
 mod checkpoint;
 mod config;
 mod credentials;
+mod provider_manager;
 mod server;
 mod socket;
 
@@ -33,14 +34,24 @@ use thiserror::Error;
 pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
-    IdentityMapping, PeerIdentity, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig,
-    StorageConfig, TelemetryConfig,
+    IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig, ResolvedTelemetry,
+    ServerLimitsConfig, StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
 };
+pub use provider_manager::{
+    HARD_MAX_PROVIDER_COMPONENT_BYTES, HARD_MAX_PROVIDER_MANIFEST_BYTES,
+    HARD_MAX_PROVIDER_STATE_BYTES, HARD_MAX_PROVIDER_STORE_BLOBS, HARD_MAX_PROVIDER_STORE_BYTES,
+    PROVIDER_ARTIFACT_TYPE, PROVIDER_LAYER_MEDIA_TYPE, ProviderLock, ProviderLockApiVersion,
+    ProviderManager, ProviderManagerError, ProviderManagerOptions, ProviderManagerPaths,
+    ProviderSet, ProviderSetApiVersion, ProviderStatus, ProviderSyncReport, ProviderVerifyReport,
+};
 pub use server::{BrokerServer, MappedPeer, ServerError, ServerLimits};
 pub use socket::{SocketError, SocketGuard, current_uid};
+
+/// Maximum provider components in either legacy configuration or a managed lock.
+pub const HARD_MAX_PROVIDERS: usize = 64;
 
 /// Verified durable chain state at clean shutdown.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,13 +202,26 @@ where
             .map(|path| path.display().to_string()),
         "broker provider guest-memory budget"
     );
-    let registry = BrokerProviderRegistry::load_with_options(
-        config.providers,
-        config.host_limits,
-        storage_host,
-        &config.host_options,
-    )
-    .await
+    let registry = match config.locked_providers {
+        Some(sources) => {
+            BrokerProviderRegistry::load_locked_with_options(
+                sources,
+                config.host_limits,
+                storage_host,
+                &config.host_options,
+            )
+            .await
+        }
+        None => {
+            BrokerProviderRegistry::load_with_options(
+                config.providers,
+                config.host_limits,
+                storage_host,
+                &config.host_options,
+            )
+            .await
+        }
+    }
     .map_err(BrokerdError::Host)?;
     let host_metrics = registry.metrics();
     let provider_metadata = registry.loaded_provider_metadata().collect::<Vec<_>>();

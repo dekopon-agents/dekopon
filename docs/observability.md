@@ -367,11 +367,14 @@ one. The span is attached with `Instrument` rather than an entered guard, so a r
 a connection, or a response body never re-parents whatever else the runtime polls on that worker
 thread.
 
-`provider.compile` covers startup component compilation rather than per-invocation work, so it
-answers "why was the broker slow to become ready" rather than "why was that call slow". Its fields
-attribute that time to one component, and each loaded provider also emits one info event carrying
-its identity, artifact digest prefix, artifact bytes, and compile milliseconds. Since components
-compile concurrently, their spans overlap; the compile times sum to more than the wall-clock start.
+`provider.compile` covers component-set validation rather than per-invocation work, so it answers
+"why was the broker slow to become ready" rather than "why was that call slow". The offline
+`dekopon-brokerd provider sync` and `verify` commands reuse that same host validation and can emit the
+span to their stderr subscriber, but they install no OTLP exporter; normal command output remains on
+stdout. Its fields attribute time to one component, and each loaded provider also emits one info
+event carrying its identity, artifact digest prefix, artifact bytes, and compile milliseconds.
+Since components compile concurrently, their spans overlap; the compile times sum to more than the
+wall-clock validation.
 
 `provider.resolve_command` carries the provider and the command word, never the argv. Model-authored
 argv is untrusted content for the same reason `provider.invoke` omits `input`.

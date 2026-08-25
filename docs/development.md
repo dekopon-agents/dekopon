@@ -35,7 +35,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service | `crates/dekopon-brokerd/src/` | Inline strict-config/socket/CLI tests plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
+| Authenticated Unix broker service and offline provider manager | `crates/dekopon-brokerd/src/`; provider set/lock, bounded OCI transport, content store, and lifecycle commands in `provider_manager.rs` | Inline strict-config/socket/CLI tests; local mock-registry resolution, locked-sync, offline list/verify, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, informational reporting, real HTTP listener, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
 | Broker operational web UI | `crates/dekopon-webui/src/`; Wasmtime observations in `crates/dekopon-broker-host/src/{metrics,metadata}.rs` | Router/rendering, escaping/security-header, provider-detail, live-counter, artifact/interface, GET-only, and listener-ceiling tests in `crates/dekopon-webui/tests/dashboard.rs`, request-tracing coverage in `crates/dekopon-webui/tests/request_tracing.rs` (both live outside `src/` because their `echo-provider.wasm` fixture is outside the published package); real bind/redirect coverage in `crates/dekopon-brokerd/tests/server.rs` |
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
@@ -167,6 +167,7 @@ Privileged broker path:
 - `AuthenticatedContext` construction alone is not authentication. `FileAuditLog` exclusively locks, verifies, and synchronizes bounded owner-only JSONL, exposes exact chain-prefix checks, and restores replay IDs across restart. `dekopon-brokerd` synchronizes a separately locked atomic checkpoint after each append and requires it to match a verified audit prefix at startup.
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, rejects unreachable UID mappings, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening. `--http-bind` separately opens the unauthenticated GET-only `dekopon-webui`; absent means no TCP listener.
+- `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The incompatible standard-Wasm-package assumptions in `wasm-pkg-client` are not used; the daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the existing rustls `reqwest` client.
 - The service currently treats one owner UID as a trust domain, has no independently retained, signed, or remote checkpoint anchor, and is not integrated with the operator CLI. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, or `dekopon-brokerd` in the normal dependency tree of both `dekopon-run` and `dekopond`.
 - `dekopond` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded per-sender conversation history in process memory, and attested on-behalf-of proposals. Its `capabilitiesFor` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. It also best-effort reports a content-free normalized agent inventory and provider-reported model usage for the web UI; those values are informational and never feed authorization. See [`dekopond.md`](dekopond.md).
 
@@ -304,6 +305,25 @@ wkg get \
 ```
 
 `.github/workflows/wit-package.yml` performs local publish/fetch round trips for all three packages on pull requests. When the relevant files reach `main`, it publishes the immutable packages to GHCR and verifies that fetching each package returns identical bytes.
+
+### Provider manager
+
+The provider manager is covered by the broker-service package. Its mock registry uses literal
+loopback HTTP only through the same explicit opt-in the CLI exposes; no test contacts a public
+registry.
+
+```console
+cargo test -p dekopon-broker-host --test host --locked
+cargo test -p dekopon-brokerd --locked
+cargo clippy -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd \
+  --all-targets --all-features --locked -- -D warnings
+```
+
+For dependency or MSRV changes, also run the workspace MSRV command and `cargo deny check`. A manual
+public-GHCR smoke test is useful but is not a substitute for the loopback tests and must not be made
+a CI dependency. The existing container staging path remains unchanged until a published release
+contains the manager; do not replace its `gh attestation verify` provenance check with digest-only
+OCI fetching.
 
 ### Container image
 

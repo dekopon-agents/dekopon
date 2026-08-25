@@ -93,6 +93,123 @@ There is no implicit provider search path. The broker loads code, so every direc
 is named in this owner-only file and nowhere else — pointing at a shipped directory is one line,
 and that line is the record of the decision.
 
+## Managed provider sets
+
+**Status: current, exact-reference foundation.** `dekopon-brokerd` also contains its provider
+manager, so resolving an OCI reference, fetching its component, validating it, and serving the
+locked bytes need no `wkg`, ORAS, Docker CLI, shell, or package manager beside the broker binary.
+Provider management is a separate operator mode. It exits after changing local state; normal daemon
+startup remains network-free, deterministic, and startup-fixed.
+
+The operator authors exact references:
+
+```yaml
+# providers.yaml
+apiVersion: dekopon.dev/provider-set/v1alpha1
+providers:
+  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
+  - source: ghcr.io/dekopon-agents/provider-curl@sha256:0123...cdef
+```
+
+A source must carry a fully qualified registry and either an explicit tag or a canonical lowercase
+SHA-256 **manifest** digest. A tag that looks like `1.2.3` is still one exact OCI tag; it is never
+silently interpreted as a SemVer range. An unchanged tag keeps the manifest digest already in the
+lock. To request another resolution, change the authored reference. Explicit SemVer requirements,
+networked outdated checks, and `update` are not in this first format.
+
+Resolve and materialize the set:
+
+```console
+dekopon-brokerd provider sync \
+  --provider-set /etc/dekopon/providers.yaml \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+
+# Recreate missing local bytes from the existing immutable lock, without resolving a tag:
+dekopon-brokerd provider sync --locked \
+  --provider-set /etc/dekopon/providers.yaml \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+
+# Both are offline; list reports byte state/reason, verify also runs complete host validation:
+dekopon-brokerd provider list \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+dekopon-brokerd provider verify \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+```
+
+`--output json` gives deterministic machine-readable command results. Successful lock changes say
+that they apply on the next broker restart; there is no hot reload.
+
+Resolution accepts one OCI image manifest with schema 2, exact artifact type
+`application/vnd.dekopon.provider.v1+wasm`, the standard empty OCI config, and exactly one positive,
+bounded `application/wasm` layer. Manifest, token, error, and component streams have independent
+byte ceilings and deadlines. Public registries use anonymous OCI Bearer challenge flow. Private
+registry credentials and custom certificate roots are deliberately not accepted yet; TLS
+verification cannot be disabled, ambient proxy environment variables are ignored, redirects may
+never downgrade to unapproved plaintext, and plain HTTP is available only through an explicit exact
+literal loopback authority for development and tests.
+
+Fetched bytes land at:
+
+```text
+<store>/blobs/sha256/<component-digest>.wasm
+```
+
+The manager serializes competing store and activation writers with owner-only advisory locks, writes a temporary blob
+on the destination filesystem, bounds and hashes the stream, synchronizes it, publishes without
+clobbering an existing content address, and synchronizes the parent. It validates the **complete**
+proposed set with the broker host before atomically replacing the generated lock. A failed
+multi-provider validation can leave an unreachable blob, but never a partially activated lock.
+The blob directory has a hard lifetime ceiling of 4 GiB and 1,024 files (stale temporaries count),
+checked under the store lock before another download, so repeated failed or changed resolutions
+cannot grow it without bound. There is no `prune` command yet; reaching that ceiling requires
+operator-reviewed cleanup until orphan deletion has its own safe lifecycle contract.
+
+The generated lock is strict, byte-capped, source-sorted, timestamp-free, and records both identities:
+
+```yaml
+apiVersion: dekopon.dev/provider-lock/v1alpha1
+providers:
+  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
+    resolvedVersion: 0.1.0
+    manifestDigest: sha256:...
+    componentDigest: sha256:...
+    componentBytes: 585394
+    providerId: gh
+```
+
+Activate it in daemon configuration instead of `providers`:
+
+```yaml
+providerSet:
+  lockPath: /etc/dekopon/providers.lock.yaml
+  storePath: /var/lib/dekopon/provider-store
+```
+
+`providerSet` and legacy `providers` are mutually exclusive. The lock, store, blob directories, and
+blob files are trusted broker input: they must be owned by the broker UID, have protected parents,
+be regular/single-link where applicable, and not be group/world writable. The daemon derives every
+blob path from the locked component digest and performs no registry request. Most importantly, the
+broker host compares the locked component length and SHA-256 against the **same single read buffer**
+it passes to Wasmtime, then compares the bounded `describe` provider ID with the lock. A preflight
+hash of a different read would not provide that guarantee.
+
+The implementation uses the lower-level OCI reference and bounded HTTP machinery that a package
+tool such as `wkg` is built from, not `wasm-pkg-client` itself. That client models standard
+`namespace:package@version` WIT packages and the standard OCI-Wasm config/layer layout; Dekopon's
+custom provider artifact type and `application/wasm` layer are intentionally different. Embedding
+that higher-level client would accept the wrong package contract while adding another binary solved
+nothing.
+
+A digest proves byte identity, not publisher identity. This manager does **not** yet verify GitHub
+release provenance or OCI attestations. It therefore does not replace the provenance checks in
+`ci/stage-image-context.sh`, and the Dockerfile remains network-free. Container staging may switch
+to `provider sync --locked` only after a published broker binary contains this command and staging
+continues to verify provenance for each downloaded component.
+
 At decision time a capability with no constraint set is denied `unconstrained-capability` before
 Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
 
@@ -394,7 +511,7 @@ The overview includes:
 - host-observed Wasmtime compilation, store, instantiation, invocation, fuel, memory/table limiter, HTTP count/byte statistics, plus every configured host ceiling; and
 - credential-free OTLP endpoint, transport, service name, timeout, and payload mode. Header and resource-attribute **values** are never retained or rendered.
 
-A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The current loader executes local WebAssembly component bytes. If an operator fetched those bytes from an OCI artifact first, it retains the local path and digest but not the remote OCI reference; the UI says so rather than inventing provenance it cannot prove.
+A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The host executes local WebAssembly component bytes and reports the digest of its exact compile buffer. A managed lock separately retains the OCI source and manifest digest, but the UI is not yet given that lock context and says so rather than presenting the component digest as publisher provenance.
 
 Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.turn` for retained accounting.
 

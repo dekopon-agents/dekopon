@@ -4557,7 +4557,13 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         // by a wildcard that would silently absorb a future variant into the wrong public reason.
         BrokerHostError::ConflictingProviders { .. }
         | BrokerHostError::MissingResolveCommand { .. }
-        | BrokerHostError::ResolveCommandSignature { .. } => "provider-configuration",
+        | BrokerHostError::ResolveCommandSignature { .. }
+        | BrokerHostError::InvalidArtifactSize { .. }
+        | BrokerHostError::InvalidArtifactDigest
+        | BrokerHostError::ArtifactTooLarge { .. }
+        | BrokerHostError::ArtifactSizeMismatch { .. }
+        | BrokerHostError::ArtifactDigestMismatch { .. }
+        | BrokerHostError::ProviderIdentityMismatch { .. } => "provider-configuration",
         BrokerHostError::MemoryBudgetExhausted { .. } => "host-memory-budget",
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }

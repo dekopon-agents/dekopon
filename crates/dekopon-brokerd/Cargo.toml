@@ -27,17 +27,25 @@ dekopon-webui.workspace = true
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
+http-auth.workspace = true
 libc.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 dekopon-policy.workspace = true
 tempfile.workspace = true
 # `start_paused` lets the shutdown-drain tests assert a 120 s grace without waiting for one.

@@ -9,7 +9,7 @@ use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
     ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
 };
-use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions};
+use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions, LockedProviderSource};
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
@@ -22,12 +22,14 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
 
+pub use crate::HARD_MAX_PROVIDERS;
+use crate::provider_manager;
+
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/brokerd/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 /// Ceiling on the owner-only Cedar policy file, matching `dekopon-policy`'s own source bound.
 pub const HARD_MAX_POLICY_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_CONNECTIONS: usize = 1_024;
-pub const HARD_MAX_PROVIDERS: usize = 64;
 pub const MINIMUM_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
@@ -54,7 +56,15 @@ pub struct BrokerdConfig {
     /// construction. The secret values live only in that file — never here.
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
+    /// Legacy directly named component files or directories.
+    #[serde(default)]
     pub providers: Vec<PathBuf>,
+    /// Managed provider activation lock and content-addressed store.
+    ///
+    /// Mutually exclusive with `providers`. Registry access is never attempted while this
+    /// configuration is loaded; an offline `dekopon-brokerd provider` command materializes it.
+    #[serde(default)]
+    pub provider_set: Option<ManagedProviderSetConfig>,
     /// Optional broker-owned directory for Wasmtime's persistent compilation cache.
     ///
     /// Absent means Cranelift recompiles every provider at every start, inside whatever startup
@@ -123,6 +133,16 @@ pub struct BrokerdConfig {
     /// Optional OTLP export. Absent means the broker exports no telemetry.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Paths for one generated provider lock and its immutable blob store.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ManagedProviderSetConfig {
+    /// Generated lock consumed as trusted startup input.
+    pub lock_path: PathBuf,
+    /// Store containing `blobs/sha256/<component-digest>.wasm`.
+    pub store_path: PathBuf,
 }
 
 /// Strict broker-owned provider-storage paths and ceilings.
@@ -332,6 +352,8 @@ pub struct ResolvedConfig {
     pub policy_revision: String,
     pub credentials_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
+    /// Expected component identities when providers came from a generated lock.
+    pub locked_providers: Option<Vec<LockedProviderSource>>,
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     pub identity_mappings: Vec<IdentityMapping>,
@@ -361,7 +383,7 @@ pub async fn load(
     let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
-    let mut resolved = resolve(config, path, expected_uid)?;
+    let mut resolved = resolve(config, path, expected_uid).await?;
     // The policy file gets the configuration's own hygiene: owner-owned, single-link, not
     // group/world writable, no symlink following, byte-capped. It is trusted input in exactly the
     // same sense the configuration is, so it is read under exactly the same rules.
@@ -521,12 +543,15 @@ fn expand_provider_entry(path: &Path, expected_uid: u32) -> Result<Vec<PathBuf>,
     Ok(providers)
 }
 
-fn resolve(
+async fn resolve(
     config: BrokerdConfig,
     source: PathBuf,
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
-    if config.providers.is_empty() {
+    if config.provider_set.is_some() && !config.providers.is_empty() {
+        return Err(ConfigError::MixedProviderSources);
+    }
+    if config.provider_set.is_none() && config.providers.is_empty() {
         return Err(ConfigError::NoProviders);
     }
     if config.providers.len() > HARD_MAX_PROVIDERS {
@@ -611,8 +636,44 @@ fn resolve(
             .validate(&storage.limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
     }
+    let managed_provider_paths = config
+        .provider_set
+        .map(|managed| {
+            let unresolved_lock = resolve_path(managed.lock_path);
+            let lock_path = std::fs::canonicalize(&unresolved_lock).map_err(|source| {
+                ConfigError::ResolvePath {
+                    path: unresolved_lock,
+                    source,
+                }
+            })?;
+            let unresolved_store = resolve_path(managed.store_path);
+            let store_path = std::fs::canonicalize(&unresolved_store).map_err(|source| {
+                ConfigError::ResolvePath {
+                    path: unresolved_store,
+                    source,
+                }
+            })?;
+            Ok::<_, ConfigError>((lock_path, store_path))
+        })
+        .transpose()?;
+    let locked_providers = match &managed_provider_paths {
+        Some((lock_path, store_path)) => Some(
+            provider_manager::load_locked_sources(lock_path, store_path, expected_uid)
+                .await
+                .map_err(|source| ConfigError::ProviderLock { source })?,
+        ),
+        None => None,
+    };
     let mut provider_set = BTreeSet::new();
-    let mut providers = Vec::with_capacity(config.providers.len());
+    let mut providers = locked_providers
+        .as_ref()
+        .map(|providers| {
+            providers
+                .iter()
+                .map(|provider| provider.path().to_path_buf())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| Vec::with_capacity(config.providers.len()));
     for entry in config.providers {
         let unresolved = resolve_path(entry);
         let entry =
@@ -651,6 +712,14 @@ fn resolve(
     if let Some(policies_path) = &policies_path {
         reserved.push(policies_path.clone());
     }
+    if let Some((lock_path, store_path)) = &managed_provider_paths {
+        reserved.push(lock_path.clone());
+        if reserved.iter().any(|path| {
+            path == store_path || path.starts_with(store_path) || store_path.starts_with(path)
+        }) {
+            return Err(ConfigError::ProviderStateCollision);
+        }
+    }
     if let Some(storage) = &storage {
         reserved.push(storage.namespace_key_path.clone());
         if audit_path.starts_with(&storage.root_path)
@@ -666,7 +735,14 @@ fn resolve(
             .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path))
             || providers
                 .iter()
-                .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path)))
+                .any(|path| path == &storage.root_path || path.starts_with(&storage.root_path))
+            || managed_provider_paths
+                .as_ref()
+                .is_some_and(|(_, store_path)| {
+                    store_path == &storage.root_path
+                        || store_path.starts_with(&storage.root_path)
+                        || storage.root_path.starts_with(store_path)
+                }))
     {
         // Initialization owns every entry under the root and rejects unknown ones. Refuse this at
         // config resolution rather than letting a future socket or audit file poison the storage
@@ -832,6 +908,7 @@ fn resolve(
         policy_revision: config.policy_revision,
         credentials_path,
         providers,
+        locked_providers,
         strict: config.strict,
         identities: config.identities,
         identity_mappings: config.identity_mappings,
@@ -890,6 +967,16 @@ pub enum ConfigError {
     },
     #[error("broker configuration must name at least one provider")]
     NoProviders,
+    #[error("broker configuration must use either providers or providerSet, not both")]
+    MixedProviderSources,
+    #[error("managed provider lock or store is invalid")]
+    ProviderLock {
+        /// Strict lock, store, or blob hygiene failure.
+        #[source]
+        source: provider_manager::ProviderManagerError,
+    },
+    #[error("managed provider store must be disjoint from broker-owned state paths")]
+    ProviderStateCollision,
     /// A provider directory was group- or world-writable, or owned by another user.
     #[error(
         "provider directory {path} is not owned by this user or is group/world writable; anyone \

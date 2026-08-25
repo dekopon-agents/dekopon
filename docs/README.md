@@ -33,6 +33,7 @@ The complete **[Build and run an import-free Wasm provider with Rust](https://de
 | Import-free local computation | [`echo/src/lib.rs`](../examples/providers/echo/src/lib.rs), [`dekopon-provider-sdk`](../crates/dekopon-provider-sdk/README.md), and [`run.md`](run.md#rust-provider-interface) |
 | Broker-mediated buffered HTTP | [`jsonplaceholder/src/lib.rs`](../examples/providers/jsonplaceholder/src/lib.rs), [`dekopon-provider-http`](../crates/dekopon-provider-http/README.md), and [`broker-http.md`](broker-http.md) |
 | Provider checks and generated components | [`development.md`](development.md#provider-example-workspaces) |
+| Resolve and lock deployed OCI provider bytes | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) |
 | Trust boundaries and limitations | [`security-model.md`](security-model.md) |
 
 The base world exports `describe` and `invoke` and imports nothing. Direct `dekopon-run` accepts only declared read-only capabilities and links no provider host services. Under those interfaces, a component has no API for processes, host files, environment, networking, clock, randomness, or credentials. Wasmtime still executes in the host process; its limits are not a production sandbox claim.
