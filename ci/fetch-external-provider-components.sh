@@ -28,7 +28,23 @@ if [[ ${#providers[@]} -eq 0 ]]; then
   providers=(echo jsonplaceholder memory-chat)
 fi
 
-for command in curl git install mktemp; do
+seen=' '
+for provider in "${providers[@]}"; do
+  case "$provider" in
+    echo|jsonplaceholder|memory-chat) ;;
+    *)
+      echo "error: unknown external provider: $provider" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$seen" == *" $provider "* ]]; then
+    echo "error: duplicate provider requested: $provider" >&2
+    exit 2
+  fi
+  seen+="$provider "
+done
+
+for command in curl git install mktemp mv; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "error: $command is required" >&2
     exit 1
@@ -56,8 +72,14 @@ if [[ "$verify_attestations" == 1 ]]; then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/dekopon-external-providers.XXXXXX")
-trap 'rm -rf "$work"' EXIT
-mkdir -p "$destination"
+publish_temps=()
+cleanup() {
+  rm -rf "$work"
+  if [[ ${#publish_temps[@]} -gt 0 ]]; then
+    rm -f -- "${publish_temps[@]}"
+  fi
+}
+trap cleanup EXIT
 
 fetch_provider() {
   local provider=$1
@@ -129,18 +151,35 @@ fetch_provider() {
       --source-digest "$source_digest" >/dev/null
   fi
 
-  install -m 0644 "$provider_work/$asset" "$destination/$asset"
-  install -m 0644 "$provider_work/$asset.sha256" "$destination/$asset.sha256"
   printf 'verified %s v0.1.0: %s bytes, sha256 %s\n' \
     "$repository" "$size" "$expected_sha"
 }
 
-seen=' '
+publish_provider() {
+  local provider=$1
+  local asset
+  case "$provider" in
+    echo) asset=echo-provider.wasm ;;
+    jsonplaceholder) asset=jsonplaceholder-provider.wasm ;;
+    memory-chat) asset=memory-chat-provider.wasm ;;
+  esac
+
+  local component_temp sidecar_temp
+  component_temp=$(mktemp "$destination/.$asset.XXXXXX")
+  publish_temps+=("$component_temp")
+  sidecar_temp=$(mktemp "$destination/.$asset.sha256.XXXXXX")
+  publish_temps+=("$sidecar_temp")
+  install -m 0644 "$work/$provider/$asset" "$component_temp"
+  install -m 0644 "$work/$provider/$asset.sha256" "$sidecar_temp"
+  mv -f -- "$sidecar_temp" "$destination/$asset.sha256"
+  mv -f -- "$component_temp" "$destination/$asset"
+}
+
+# Do not change the destination until every requested asset has downloaded and verified.
 for provider in "${providers[@]}"; do
-  if [[ "$seen" == *" $provider "* ]]; then
-    echo "error: duplicate provider requested: $provider" >&2
-    exit 2
-  fi
-  seen+="$provider "
   fetch_provider "$provider"
+done
+mkdir -p "$destination"
+for provider in "${providers[@]}"; do
+  publish_provider "$provider"
 done

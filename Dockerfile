@@ -53,10 +53,10 @@ COPY --chmod=0755 \
      dist/${TARGETARCH}/dekopond \
      /usr/local/bin/
 
-# Provider components come from the tagged checkout rather than the archive: they are checked-in
-# artifacts, not build outputs, and the archive ships only `jsonplaceholder`. They are copied
-# verbatim and never regenerated. Durable memory is copied separately under `optional-providers`;
-# it never joins the default scan path.
+# Provider components come from the staging context assembled before this network-free build.
+# Core-owned artifacts and exact pinned standalone releases are copied verbatim and never
+# regenerated here. Durable memory is copied separately under `optional-providers`; it never joins
+# the default scan path.
 #
 # `dekopon-brokerd` refuses to load a provider whose file is not owned by its own euid, is group-
 # or world-writable, or has more than one link, and it stats with `symlink_metadata`, so a symlink
