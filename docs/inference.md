@@ -254,7 +254,7 @@ pixels without generating a new image.
 
 ## Optional durable chat-turn retrieval
 
-The generated `memory-chat` component imports JSONL only and stores versioned `turns.jsonl` and
+The independently released `memory-chat` component imports JSONL only and stores versioned `turns.jsonl` and
 `dedup.jsonl` inside an opaque broker-derived namespace. Scope always includes provider, agent,
 canonical sender, configured transport, channel, and conversation. `authority-bound` (default)
 rotates a persisted random epoch when effective capability metadata, constraints, selected symbolic

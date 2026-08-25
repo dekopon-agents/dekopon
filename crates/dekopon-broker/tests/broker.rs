@@ -2316,7 +2316,7 @@ async fn command_words_are_filtered_by_what_policy_allows() {
     )
     .expect("broker starts");
 
-    // The checked-in echo fixture declares no command words, so both are empty — but the granted
+    // The exact fetched echo fixture declares no command words, so both are empty — but the granted
     // and ungranted contexts must agree on that for the right reason, which the capability lists
     // below establish.
     assert!(broker.command_words(&context("caller")).is_empty());

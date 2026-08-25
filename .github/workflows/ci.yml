@@ -47,6 +47,7 @@ jobs:
                 CHANGELOG.md | .cargo/* | .clippy.toml | .rustfmt.toml | \
                 Cargo.lock | Cargo.toml | clippy.toml | deny.toml | rust-toolchain.toml | rustfmt.toml | \
                 examples/local/dekopon.yaml | \
+                ci/fetch-external-provider-components.sh | \
                 examples/otel-traces/compose.yaml | examples/otel-traces/smoke-test.sh | \
                 examples/providers/*-provider.wasm | wit/http/http.wit | charts/dekopon/*)
                 return 0
@@ -152,6 +153,8 @@ jobs:
           done
           printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
           exit "$status"
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Format, lint, and test Rust provider examples
@@ -196,6 +199,7 @@ jobs:
       - name: Check repository shell scripts
         run: |
           shellcheck \
+            ci/fetch-external-provider-components.sh \
             examples/otel-traces/smoke-test.sh \
             charts/dekopon/ci/verify-init-permissions.sh \
             examples/providers/build-component.sh \
@@ -223,6 +227,8 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
+      - name: Fetch exact standalone echo fixture
+        run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -281,6 +287,8 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: msrv-1.89.0
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
       - name: Test workspace on MSRV
         run: cargo test --workspace --all-features --locked
 
@@ -335,6 +343,8 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build CLIs
         run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+      - name: Fetch exact standalone echo fixture
+        run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Exercise generated help and example commands
         shell: bash
         run: |

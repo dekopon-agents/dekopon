@@ -28,8 +28,8 @@ that one image with two `command`s does not.
 | `/usr/local/bin/dekopon-run` | Direct runner and broker client |
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
-| `/opt/dekopon/providers/*.wasm` | The four existing default components, copied verbatim |
-| `/opt/dekopon/optional-providers/memory-chat-provider.wasm` | Optional durable-memory component; never in the default scan |
+| `/opt/dekopon/providers/*.wasm` | One in-tree conformance fixture plus exact pinned standalone Echo, JSONPlaceholder, and GitHub releases |
+| `/opt/dekopon/optional-providers/memory-chat-provider.wasm` | Exact pinned standalone durable-memory release; never in the default scan |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
 The image runs as UID/GID `65532:65532` — numeric, because Kubernetes `runAsNonRoot` compares a UID
@@ -66,8 +66,8 @@ requires is 2.34.
 
 ## The build context is constructed, not filtered
 
-The image needs three things: the release executables, the checked-in default and optional provider
-components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
+The image needs three things: the release executables, exact checksum- and provenance-verified
+provider components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
 `Dockerfile`, asserts that the result is precisely that sixteen-file set, and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
@@ -82,9 +82,12 @@ updating.
 
 ## Baked provider components
 
-`examples/providers/*.wasm` come from the tagged checkout rather than from the archive: they are
-checked-in artifacts, not build outputs, and the archive ships only `jsonplaceholder`. They are
-copied verbatim and never regenerated.
+Core retains `http-probe` as a checked conformance fixture. Echo, JSONPlaceholder, and memory-chat
+are fetched from their standalone immutable v0.1.0 releases by
+`ci/fetch-external-provider-components.sh`; the script requires the checksum and size pinned in core,
+and image staging additionally verifies GitHub attestations. The GitHub provider follows its own
+pinned standalone-release path. Docker build remains network-free because every download and
+verification happens while constructing the context.
 
 `dekopon-brokerd` refuses a provider path that is not a regular file owned by its own euid, that is
 group- or world-writable, or that has more than one link, and it applies the owner and writability
@@ -99,8 +102,8 @@ The `COPY` that places them uses `--chown` and deliberately no `--chmod`, becaus
 components therefore keep the mode they carry in the staged context, which the staging script
 normalises to `0644`.
 
-Only `echo-provider.wasm` loads on the direct runner. The other default components import HTTP,
-and optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
+Only the fetched `echo-provider.wasm` loads on the direct runner. The other default components import
+HTTP, and fetched optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
 Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
 retention. An operator must name the exact optional file or explicitly scan its directory. The
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
@@ -191,8 +194,8 @@ subject; it does not grant another registry write path.
 Only the release tag is published. There is no `latest`: release tags are immutable here, a moving
 pointer would contradict that, and it would let a prerelease become the default pull.
 
-Pull requests that touch the image inputs — the `Dockerfile`, the staging script, the workflow, a
-licence, or a checked-in component — run every step above against the newest published release and
+Pull requests that touch the image inputs — the `Dockerfile`, either provider fetch/staging script,
+the workflow, a licence, or a repository-owned component — run every step above against the newest published release and
 push nothing. That validates the part a pull request can actually break: the image's layout, the
 provider ownership, and the byte-identity check.
 

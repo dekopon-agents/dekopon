@@ -83,6 +83,9 @@ jobs:
     if: github.event_name == 'push'
     needs: validate
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:
@@ -114,6 +117,13 @@ jobs:
           cache-bin: false
       - name: Build CLIs
         run: cargo build --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
+      - name: Fetch exact attested JSONPlaceholder provider release
+        env:
+          DEKOPON_VERIFY_PROVIDER_ATTESTATIONS: "1"
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ci/fetch-external-provider-components.sh
+          "$RUNNER_TEMP/external-providers" jsonplaceholder
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -128,8 +138,9 @@ jobs:
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
           cp crates/dekopond/README.md "staging/$archive/GATEWAY.md"
-          cp examples/providers/jsonplaceholder-provider.wasm "staging/$archive/providers/"
-          cp examples/providers/jsonplaceholder/README.md \
+          cp "$RUNNER_TEMP/external-providers/jsonplaceholder-provider.wasm" \
+            "staging/$archive/providers/"
+          cp examples/providers/JSONPLACEHOLDER.md \
             "staging/$archive/providers/JSONPLACEHOLDER.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"

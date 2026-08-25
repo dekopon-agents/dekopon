@@ -20,14 +20,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
-- Removed the in-tree `skylight-private` source workspace and checked component. Its designated
-  standalone destination is
+- Removed the in-tree Echo, JSONPlaceholder, and memory-chat source workspaces and checked
+  components after their standalone public v0.1.0 releases. Core tests, release archives, and image
+  staging now fetch exact assets from
+  [dekopon-provider-echo](https://github.com/dekopon-agents/dekopon-provider-echo),
+  [dekopon-provider-jsonplaceholder](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder),
+  and [dekopon-provider-memory-chat](https://github.com/dekopon-agents/dekopon-provider-memory-chat),
+  require checksums pinned in `ci/fetch-external-provider-components.sh`, and keep downloaded Wasm
+  ignored. Generic in-tree probes retain host, WIT, authority, resource, and redaction coverage.
+- Removed the in-tree `skylight-private` source workspace and checked component. Its public
+  standalone source is
   [dekopon-agents/dekopon-provider-skylight-private](https://github.com/dekopon-agents/dekopon-provider-skylight-private);
-  publishing this prepared core extraction remains ordered after that repository has a public green
-  `main`, and no provider release is claimed. Generic `http-probe` and `jsonplaceholder` fixtures
-  retain HTTP-import inspection, immediate-host and runner rejection, exact broker-authority
-  refusal with empty pre-dispatch HTTP evidence, independent resource ceilings, sanitized call
-  evidence/redaction, and canonical provider/HTTP WIT mirror coverage.
+  no provider release is claimed, and it remains absent from default catalogs, images, policies,
+  and deployments.
 
 ## [0.11.1] - 2026-08-23
 

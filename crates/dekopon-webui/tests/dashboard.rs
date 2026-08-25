@@ -1,7 +1,7 @@
 //! Router, rendering, escaping, and listener-ceiling coverage for the informational web UI.
 //!
 //! These live in `tests/` rather than `src/` because their fixture is the workspace's generated
-//! `echo-provider.wasm`, which is deliberately outside the published package: an in-package test
+//! the exact fetched `echo-provider.wasm`, which is deliberately outside the published package: an in-package test
 //! that cannot find its fixture fails for every downstream packager who runs `cargo test`.
 
 use std::{

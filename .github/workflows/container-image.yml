@@ -57,6 +57,7 @@ on:
       - ".github/workflows/container-image.yml"
       - "Dockerfile"
       - "ci/stage-image-context.sh"
+      - "ci/fetch-external-provider-components.sh"
       - "LICENSE-*"
       - "examples/providers/*.wasm"
 
@@ -100,8 +101,8 @@ jobs:
             tag="$REQUESTED_TAG"
             push=true
           else
-            # A pull request has no release of its own. Building its Dockerfile and its
-            # checked-in components against the newest published release proves the part a
+            # A pull request has no release of its own. Building its Dockerfile and exact
+            # provider staging inputs against the newest published release proves the part a
             # pull request can break, before a release depends on it.
             tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             push=false

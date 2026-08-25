@@ -26,7 +26,6 @@ members = [
     "crates/dekopon-webui",
     "crates/dekopond",
 ]
-exclude = ["examples/providers/echo"]
 resolver = "3"
 
 [workspace.package]

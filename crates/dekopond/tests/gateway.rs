@@ -2,7 +2,7 @@
 //! names the *sender's* principal rather than the daemon's.
 //!
 //! Nothing here is stubbed on the authority side. `dekopon-brokerd` runs for real, with its own
-//! owner-controlled configuration, the checked-in echo provider component, an attestor grant, an
+//! owner-controlled configuration, the exact fetched echo provider component, an attestor grant, an
 //! identity mapping, and one `via`-scoped rule. The only mock is the model endpoint, because a
 //! model is the one participant whose answer must be deterministic for a test to assert on it.
 

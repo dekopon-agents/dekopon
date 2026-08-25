@@ -20,9 +20,11 @@ dekopon auth chatgpt <login | status | logout | export>
 Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
-The checked-in Rust echo provider is immediately runnable:
+The standalone Rust echo provider is immediately runnable after fetching its exact v0.1.0 release
+fixture:
 
 ```console
+ci/fetch-external-provider-components.sh examples/providers echo
 cargo run -p dekopon-run -- inspect \
   --provider examples/providers/echo-provider.wasm
 
@@ -244,7 +246,7 @@ The subscription transport receives the prompt, system instruction, the single s
 
 ## Rust provider interface
 
-Provider source implements `dekopon_provider_sdk::Provider` and uses `export_provider!`. See [`../examples/providers/echo/src/lib.rs`](../examples/providers/echo/src/lib.rs).
+Provider source implements `dekopon_provider_sdk::Provider` and uses `export_provider!`. The echo implementation and its release gates live in [`dekopon-provider-echo`](https://github.com/dekopon-agents/dekopon-provider-echo).
 
 The SDK adapter exposes [`../crates/dekopon-provider-sdk/wit/provider.wit`](../crates/dekopon-provider-sdk/wit/provider.wit):
 
@@ -257,7 +259,7 @@ world provider {
 
 The strings carry strictly typed manifest and response JSON. This keeps the first WIT surface deliberately small while the Rust trait and wire model stabilize. The same world is distributed as the `dekopon:provider@0.2.0` WIT package for provider toolchains; the `provider` world has exactly these two exports and zero imports. A second `provider-commands` world adds one export, `resolve-command`, for providers that contribute command words to the sandboxed shell. It is a separate world rather than a third export on the first so a host can require the base contract and treat the rewrite as optional, which is what lets a component built against `0.1.0` keep loading. Providers can use `export_provider_with_bindings!` to retain those exports in a caller-generated world with versioned imports. The checked-in HTTP probe demonstrates that composition, while direct mode deliberately rejects it because distribution and structural imports do not change the empty runtime linker or grant provider authority.
 
-Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT metadata. The echo provider is a separate Cargo workspace, and its checked-in component is generated rather than hand-edited. The [echo-provider README](../examples/providers/echo/README.md) and [`development.md`](development.md) contain exact build and validation commands. A `wasm32-wasip2` build imports WASI and will be rejected because this host intentionally links no guest imports.
+Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT metadata. Echo is independently built, tested, and released by its standalone repository; core pins and fetches its exact v0.1.0 release checksum rather than tracking source or Wasm. [`development.md`](development.md) describes fetched external fixtures and the remaining in-tree conformance workspaces. A `wasm32-wasip2` build imports WASI and will be rejected because this host intentionally links no guest imports.
 
 ## Tracing, logs, and limits
 
