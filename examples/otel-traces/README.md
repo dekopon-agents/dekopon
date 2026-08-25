@@ -53,9 +53,10 @@ For a shared OpenObserve installation, create a dedicated organization ingestion
 
 ## 3. Generate a trace
 
-Run a checked-in provider:
+Fetch and run the exact standalone echo v0.1.0 fixture:
 
 ```console
+ci/fetch-external-provider-components.sh examples/providers echo
 cargo run --locked -p dekopon-run -- \
   invoke \
   --provider examples/providers/echo-provider.wasm \

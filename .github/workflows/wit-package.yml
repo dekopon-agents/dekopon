@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/wit-package.yml"
+      - "ci/fetch-external-provider-components.sh"
       - "crates/dekopon-provider-host/wit/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
@@ -12,10 +13,6 @@ on:
       - "crates/dekopon-provider-sdk/wit/**"
       - "crates/dekopon-provider-storage/**"
       - "crates/dekopon-broker-host/wit/**"
-      - "examples/providers/echo/**"
-      - "examples/providers/echo-provider.wasm"
-      - "examples/providers/memory-chat/**"
-      - "examples/providers/memory-chat-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
@@ -24,8 +21,6 @@ on:
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
-      - "examples/providers/jsonplaceholder/**"
-      - "examples/providers/jsonplaceholder-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -33,6 +28,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/wit-package.yml"
+      - "ci/fetch-external-provider-components.sh"
       - "crates/dekopon-provider-host/wit/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
@@ -40,10 +36,6 @@ on:
       - "crates/dekopon-provider-sdk/wit/**"
       - "crates/dekopon-provider-storage/**"
       - "crates/dekopon-broker-host/wit/**"
-      - "examples/providers/echo/**"
-      - "examples/providers/echo-provider.wasm"
-      - "examples/providers/memory-chat/**"
-      - "examples/providers/memory-chat-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
@@ -52,8 +44,6 @@ on:
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/http-probe/**"
       - "examples/providers/http-probe-provider.wasm"
-      - "examples/providers/jsonplaceholder/**"
-      - "examples/providers/jsonplaceholder-provider.wasm"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -81,6 +71,9 @@ jobs:
   validate:
     name: build and verify
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,7 +109,7 @@ jobs:
           rustup override set "$PROVIDER_RUST_TOOLCHAIN"
           mkdir -p "$RUNNER_TEMP/checked-components" target/wit-package/provider-inspection
           # Derived from the tree, never a list: a provider added without touching this workflow
-          # still has its checked-in component rebuilt and compared.
+          # still has its repository-owned checked component rebuilt and compared.
           shopt -s nullglob
           providers=()
           for script in examples/providers/*/build.sh; do
@@ -126,10 +119,10 @@ jobs:
             echo 'no provider workspaces matched examples/providers/*/build.sh' >&2
             exit 1
           fi
-          # Every checked-in component must come from one of those workspaces, so a component whose
+          # Every repository-owned checked component must come from one of those workspaces, so a component whose
           # source was deleted cannot survive as an unrebuilt binary.
           expected=$(printf 'examples/providers/%s-provider.wasm\n' "${providers[@]}" | sort)
-          present=$(printf '%s\n' examples/providers/*-provider.wasm | sort)
+          present=$(git ls-files 'examples/providers/*-provider.wasm' | sort)
           diff <(printf '%s\n' "$expected") <(printf '%s\n' "$present")
           for provider in "${providers[@]}"; do
             artifact="examples/providers/$provider-provider.wasm"
@@ -162,8 +155,7 @@ jobs:
 
             expected=''
             case "$provider" in
-              http-probe|jsonplaceholder) expected='dekopon:http/client@1.0.0' ;;
-              memory-chat) expected='dekopon:storage/jsonl@0.1.0' ;;
+              http-probe) expected='dekopon:http/client@1.0.0' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
@@ -178,6 +170,12 @@ jobs:
             fi
           done
 
+      - name: Fetch exact attested standalone provider fixtures
+        env:
+          DEKOPON_VERIFY_PROVIDER_ATTESTATIONS: "1"
+          GH_TOKEN: ${{ github.token }}
+        run: ci/fetch-external-provider-components.sh examples/providers
+
       - name: Build the WIT packages
         shell: bash
         run: |
@@ -189,8 +187,6 @@ jobs:
           for mirror in \
             crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
-            examples/providers/jsonplaceholder/wit/deps/provider.wit \
-            examples/providers/memory-chat/wit/deps/provider.wit \
             examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
           do
@@ -201,15 +197,13 @@ jobs:
             crates/dekopon-provider-http/wit/deps/http.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/http.wit \
-            examples/providers/http-probe/wit/deps/http.wit \
-            examples/providers/jsonplaceholder/wit/deps/http.wit
+            examples/providers/http-probe/wit/deps/http.wit
           do
             cmp wit/http/http.wit "$mirror"
           done
           for mirror in \
             crates/dekopon-provider-storage/wit/deps/storage.wit \
             crates/dekopon-broker-host/wit/deps/storage.wit \
-            examples/providers/memory-chat/wit/deps/storage.wit \
             examples/providers/storage-probe/wit/deps/storage.wit
           do
             cmp wit/storage/storage.wit "$mirror"
@@ -398,13 +392,12 @@ jobs:
             ])
           ' target/wit-package/dekopon-storage.json
 
-      - name: Verify the storage facade default feature set imports nothing
+      - name: Verify the exact standalone echo component remains import-free
         shell: bash
         run: |
           set -euo pipefail
           component=examples/providers/echo-provider.wasm
-          description=target/wit-package/echo-default-storage.json
-          grep -q 'name = "dekopon-provider-storage"' examples/providers/echo/Cargo.lock
+          description=target/wit-package/echo-standalone.json
           wasm-tools validate "$component"
           wasm-tools component wit --json "$component" > "$description"
           jq --exit-status '

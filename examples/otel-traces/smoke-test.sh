@@ -75,6 +75,10 @@ test -x "$runner" || {
   echo "dekopon-run is missing; rerun without DEKOPON_OTEL_SKIP_BUILD=1" >&2
   exit 1
 }
+test -f "$provider" || {
+  echo "echo fixture is missing; run ci/fetch-external-provider-components.sh examples/providers echo" >&2
+  exit 1
+}
 
 auth_token="$({ printf '%s:%s' "$OPENOBSERVE_ROOT_EMAIL" "$OPENOBSERVE_ROOT_PASSWORD"; } | base64 | tr -d '\r\n')"
 printf 'Authorization: Basic %s\n' "$auth_token" >"$temporary/openobserve-auth-header"

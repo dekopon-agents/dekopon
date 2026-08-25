@@ -2,7 +2,7 @@
 # Stage a minimal build context for the Dekopon container image, from a published release.
 #
 # The image needs exactly three things: the executables a release already published, the
-# checked-in provider components, and the two licences. Everything else here — twenty-one crates,
+# exact provider release components, and the two licences. Everything else here — twenty-one crates,
 # a Cargo target directory that reaches tens of gigabytes, documentation, examples — is not a
 # build input. Excluding all of it with a `.dockerignore` would be correct only for as long as
 # every file added to the repository afterwards stays matched by it, which is a standing
@@ -15,7 +15,7 @@
 # nobody would run. Verification is not optional here, because reusing the release's binaries
 # instead of compiling them is the whole point of the image.
 #
-# Requires: gh (authenticated), tar, and either sha256sum or shasum.
+# Requires: curl, gh (authenticated), git, install, tar, and either sha256sum or shasum.
 #
 #   work=$(mktemp -d)
 #   ci/stage-image-context.sh v0.3.0 "$work"
@@ -48,8 +48,9 @@ context="$work/context"
 max_glibc="2.41"
 
 binaries="dekopon dekopon-run dekopon-brokerd dekopond"
-providers="echo http-probe jsonplaceholder"
-# Out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful
+providers="http-probe"
+standalone_default_providers="echo jsonplaceholder"
+# Other out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful
 # without assembling a provider set by hand; each one releases on its own schedule.
 external_providers="dekopon-agents/dekopon-provider-gh@v0.1.0"
 
@@ -84,7 +85,8 @@ glibc_exceeds() {
 }
 
 rm -rf "$archives" "$context"
-mkdir -p "$archives" "$context/dist" "$context/providers" "$context/optional-providers" "$work/external"
+mkdir -p "$archives" "$context/dist" "$context/providers" "$context/optional-providers" \
+  "$work/external" "$work/standalone-providers"
 
 # Derive the Linux targets from the release rather than assuming a fixed set: a target added or
 # dropped upstream changes the release, and this follows it.
@@ -131,7 +133,15 @@ for provider in $providers; do
   fi
   cp "$component" "$context/providers/"
 done
-# Out-of-tree providers, pinned by version and verified the same way the release archives are.
+# Echo, JSONPlaceholder, and optional memory are independently released. The shared fetcher pins
+# both v0.1.0 and each expected checksum; image staging additionally requires provenance.
+DEKOPON_VERIFY_PROVIDER_ATTESTATIONS=1 \
+  "$source_dir/ci/fetch-external-provider-components.sh" \
+    "$work/standalone-providers" echo jsonplaceholder memory-chat
+for provider in $standalone_default_providers; do
+  cp "$work/standalone-providers/$provider-provider.wasm" "$context/providers/"
+done
+# Other out-of-tree providers, pinned by version and verified the same way the release archives are.
 #
 # The official image ships a useful default set, but a provider with its own repository has its own
 # release cadence, so it is fetched at a pinned tag rather than vendored. Bump these when a provider
@@ -159,7 +169,7 @@ done
 chmod 0644 "$context/providers"/*.wasm
 # Durable memory is shipped but never joins the default scan directory. An operator must name this
 # exact file or explicitly scan the optional directory.
-cp "$source_dir/examples/providers/memory-chat-provider.wasm" \
+cp "$work/standalone-providers/memory-chat-provider.wasm" \
   "$context/optional-providers/memory-chat-provider.wasm"
 chmod 0644 "$context/optional-providers/memory-chat-provider.wasm"
 
@@ -178,7 +188,9 @@ expected=$(
     for arch in amd64 arm64; do
       for binary in $binaries; do echo "dist/$arch/$binary"; done
     done
-    for provider in $providers; do echo "providers/$provider-provider.wasm"; done
+    for provider in $providers $standalone_default_providers; do
+      echo "providers/$provider-provider.wasm"
+    done
     for entry in $external_providers; do
       name=$(basename "${entry%%@*}")
       echo "providers/${name#dekopon-provider-}-provider.wasm"

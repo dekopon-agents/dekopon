@@ -1,5 +1,14 @@
 /target/
 /examples/providers/*/target/
+
+# Exact standalone-provider fixtures fetched by ci/fetch-external-provider-components.sh.
+# Core owns neither their source nor generated Wasm bytes.
+/examples/providers/echo-provider.wasm
+/examples/providers/echo-provider.wasm.sha256
+/examples/providers/jsonplaceholder-provider.wasm
+/examples/providers/jsonplaceholder-provider.wasm.sha256
+/examples/providers/memory-chat-provider.wasm
+/examples/providers/memory-chat-provider.wasm.sha256
 .DS_Store
 *.swp
 *.swo

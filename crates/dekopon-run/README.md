@@ -14,9 +14,10 @@ One-shot direct execution for read-only Dekopon WebAssembly providers plus an ex
 - `--trace <PATH>` exports Chrome/Perfetto-compatible spans without inputs or outputs, unless `--otel-telemetry-payloads true` opts that file in like any other sink.
 - `--otlp-endpoint <URL>` exports correlated OTLP/HTTP protobuf traces and audit-safe lifecycle logs; standard OTLP header environment variables carry receiver authentication and routing.
 
-Every **direct** provider call uses a fresh bounded Wasmtime store with no WASI or custom imports. The checked-in component is generated from the Rust [`Provider`](../dekopon-provider-sdk/README.md) implementation at [`../../examples/providers/echo/src/lib.rs`](../../examples/providers/echo/src/lib.rs):
+Every **direct** provider call uses a fresh bounded Wasmtime store with no WASI or custom imports. The echo implementation is released independently from [`dekopon-provider-echo`](https://github.com/dekopon-agents/dekopon-provider-echo); fetch core's exact v0.1.0 test fixture first:
 
 ```console
+ci/fetch-external-provider-components.sh examples/providers echo
 cargo run -p dekopon-run -- inspect \
   --provider examples/providers/echo-provider.wasm
 cargo run -p dekopon-run -- invoke \

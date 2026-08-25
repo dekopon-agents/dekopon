@@ -30,13 +30,14 @@ Run `cargo +1.89.0 test --workspace --all-features --locked` for MSRV-sensitive 
 Exercise the affected executable before submitting a CLI, config, or provider-host change:
 
 ```console
+ci/fetch-external-provider-components.sh examples/providers
 cargo run -p dekopon -- --config examples/local/dekopon.yaml validate
 cargo run -p dekopon -- --config examples/local/dekopon.yaml get agents
 cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.wasm
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
-Rust providers under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected provider. If provider source or the guest contract changes, regenerate—not hand-edit—each affected checked-in provider component. Storage work must additionally compare all five `wit/storage/storage.wit` mirrors and inspect generated imports: memory is JSONL-only, the probe is durable-files-only, and neither may import WASI. Runner OTLP, OpenObserve example, or observability CI changes require `examples/otel-traces/smoke-test.sh` against its disposable single-container stack. Exact commands are in [`docs/development.md`](docs/development.md).
+Repository-owned fixtures under `examples/providers/` are excluded from the root workspace and have their own lockfiles. Provider changes require separate format, Clippy, test, and `wasm32-unknown-unknown` checks for every affected in-tree fixture. If fixture source or the guest contract changes, regenerate—not hand-edit—its checked component. Echo, JSONPlaceholder, and memory-chat are standalone repositories; core tests fetch their exact v0.1.0 release bytes with `ci/fetch-external-provider-components.sh`. Storage work must additionally compare the remaining in-tree `wit/storage/storage.wit` mirrors and inspect generated imports: fetched memory is JSONL-only, the probe is durable-files-only, and neither may import WASI. Runner OTLP, OpenObserve example, or observability CI changes require `examples/otel-traces/smoke-test.sh` against its disposable single-container stack. Exact commands are in [`docs/development.md`](docs/development.md).
 
 ## Change guidelines
 

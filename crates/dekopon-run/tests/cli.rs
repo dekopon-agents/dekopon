@@ -1126,7 +1126,7 @@ fn stdout(output: &Output) -> String {
 // Sandboxed shell subcommand
 // ---------------------------------------------------------------------------
 
-/// Runs one script against the checked-in echo provider, returning stdout and the exit code.
+/// Runs one script against the exact fetched echo provider, returning stdout and the exit code.
 fn shell(script: &str, extra: &[&str]) -> (String, i32) {
     let provider = provider_path();
     let mut arguments = vec![

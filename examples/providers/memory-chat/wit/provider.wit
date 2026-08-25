@@ -1,7 +1,0 @@
-package dekopon:memory-chat@0.1.0;
-
-/// Broker-only durable chat memory with curated JSONL storage.
-world provider {
-    include dekopon:provider/provider-commands@0.2.0;
-    import dekopon:storage/jsonl@0.1.0;
-}

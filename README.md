@@ -20,7 +20,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
 - A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
 - An offline `dekopon-brokerd provider` manager for exact fully qualified OCI tags or manifest digests: strict desired and generated-lock files, a synchronized content-addressed component store, complete provider-set validation before atomic activation, offline list/verify, and startup comparison of locked digest/length/provider ID with the exact Wasmtime input buffer. It adds no daemon-startup network path.
-- A checked-in JSONPlaceholder broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
+- An exact standalone JSONPlaceholder v0.1.0 broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
 - `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
 - An unprivileged chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
@@ -74,7 +74,7 @@ New in 0.10.0 — a deep-review hardening pass, and three new surfaces:
 - Opt-in route-scoped OpenAI image generation with bounded generated-PNG replies on Slack, Discord,
   Telegram, and the local development transport.
 - Broker-owned, namespace-bound provider storage with strict quotas and transactional JSONL, plus
-  the generated `memory-chat` provider and on-demand `memory recent` / `memory search` commands.
+  the independently released `memory-chat` provider and on-demand `memory recent` / `memory search` commands.
 - 145 verified review findings landed across the workspace: every broker failure now carries a
   diagnosable cause, the hot paths dropped redundant work — one authorization pass, one audit
   serialization, cached provider compilation — and three recurring failure classes became
@@ -191,7 +191,7 @@ dekopon-run --version
 
 ### Container image
 
-A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published. `v0.4.0` is the first release [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) runs for; `v0.3.0` predates the workflow and has no image. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside the checked-in provider components. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
+A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published. `v0.4.0` is the first release [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) runs for; `v0.3.0` predates the workflow and has no image. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside one repository-owned fixture and exact checksum- and provenance-verified standalone provider releases. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
 
 ### Before running the broker
 
@@ -251,9 +251,12 @@ same attestor grant and identity mapping every other subject needs. See
 
 ## Run a Rust provider immediately
 
-The checked-in component is generated from [`examples/providers/echo/src/lib.rs`](examples/providers/echo/src/lib.rs), which implements `dekopon_provider_sdk::Provider`:
+The import-free echo provider is released from
+[`dekopon-provider-echo`](https://github.com/dekopon-agents/dekopon-provider-echo). Fetch its exact
+v0.1.0 component and checksum before using the historical local fixture path:
 
 ```console
+ci/fetch-external-provider-components.sh examples/providers echo
 cargo run -p dekopon-run -- inspect \
   --provider examples/providers/echo-provider.wasm
 cargo run -p dekopon-run -- invoke \
