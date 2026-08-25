@@ -14,6 +14,7 @@
 //! real network call there, and that is correct rather than a gap. Real broker-backed HTTP arrives
 //! with the broker-backed runner path in a later phase.
 
+use dekopon_core::{SecretDrn, SecretUseProposal};
 use serde_json::{Value, json};
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
@@ -32,7 +33,7 @@ impl Builtin for Curl {
         arguments: &[String],
         _input: Option<Value>,
     ) -> Result<CommandResult, CommandFailure> {
-        let request = parse(arguments)?;
+        let parsed = parse_with_secret_use(arguments)?;
         let Some(capability) = context.curl_capability else {
             return Err(CommandFailure::Status {
                 message: "curl: command not found: no HTTP capability is available to this session"
@@ -41,7 +42,7 @@ impl Builtin for Curl {
             });
         };
         let capability = capability.to_owned();
-        context.invoke_capability(&capability, request)
+        context.invoke_capability_with_secret_use(&capability, parsed.request, parsed.secret_use)
     }
 }
 
@@ -57,11 +58,28 @@ impl Builtin for Curl {
 /// a structured value there is nothing for either to change, so honoring them costs nothing and is
 /// not a claim about behavior that did not happen. `-L` and `-f` stay rejected precisely because
 /// they *would* change what the request means.
+#[cfg(test)]
 pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
+    let parsed = parse_with_secret_use(arguments)?;
+    if parsed.secret_use.is_some() {
+        return Err(CommandFailure::usage(
+            "curl: secret references require broker-backed invocation",
+        ));
+    }
+    Ok(parsed.request)
+}
+
+struct ParsedCurl {
+    request: Value,
+    secret_use: Option<SecretUseProposal>,
+}
+
+fn parse_with_secret_use(arguments: &[String]) -> Result<ParsedCurl, CommandFailure> {
     let mut uri: Option<String> = None;
     let mut method: Option<String> = None;
     let mut headers: Vec<Value> = Vec::new();
     let mut body: Option<String> = None;
+    let mut secret_use: Option<SecretUseProposal> = None;
 
     let mut index = 0;
     while index < arguments.len() {
@@ -73,11 +91,50 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
             }
             "-H" | "--header" => {
                 let value = take_value(arguments, &mut index, argument)?;
+                reject_misplaced_secret_marker(&value)?;
                 headers.push(parse_header(&value)?);
             }
             "-d" | "--data" | "--data-raw" | "--data-binary" => {
                 let value = take_value(arguments, &mut index, argument)?;
+                reject_misplaced_secret_marker(&value)?;
                 body = Some(value);
+            }
+            "-u" | "-U" | "--user" => {
+                let value = take_value(arguments, &mut index, argument)?;
+                if secret_use.is_some() {
+                    return Err(CommandFailure::usage(
+                        "curl: exactly one secret-backed authentication option is supported",
+                    ));
+                }
+                let (username, password) = value.split_once(':').ok_or_else(|| {
+                    CommandFailure::usage(
+                        "curl: --user requires USER:${drn:<authority>:secret:<realm>:<path>}",
+                    )
+                })?;
+                if username.is_empty()
+                    || username.len() > dekopon_core::MAX_SECRET_USERNAME_LENGTH
+                    || username.contains(':')
+                    || username.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err(CommandFailure::usage(
+                        "curl: Basic username is empty, oversized, or contains a control",
+                    ));
+                }
+                secret_use = Some(SecretUseProposal::HttpBasic {
+                    secret: parse_secret_marker(password)?,
+                    username: username.to_owned(),
+                });
+            }
+            "--oauth2-bearer" => {
+                let value = take_value(arguments, &mut index, argument)?;
+                if secret_use.is_some() {
+                    return Err(CommandFailure::usage(
+                        "curl: exactly one secret-backed authentication option is supported",
+                    ));
+                }
+                secret_use = Some(SecretUseProposal::HttpBearer {
+                    secret: parse_secret_marker(&value)?,
+                });
             }
             "--silent" | "--show-error" => index += 1,
             // `-s`, `-S`, and bundles such as `-sS` quiet output that this shell never produced.
@@ -86,6 +143,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
                 return Err(unsupported_flag("curl", flag));
             }
             positional => {
+                reject_misplaced_secret_marker(positional)?;
                 if uri.is_some() {
                     return Err(CommandFailure::usage(
                         "curl: exactly one URL argument is supported",
@@ -121,7 +179,33 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Value, CommandFailure> {
     {
         fields.insert("body".to_owned(), Value::String(body));
     }
-    Ok(request)
+    Ok(ParsedCurl {
+        request,
+        secret_use,
+    })
+}
+
+fn reject_misplaced_secret_marker(value: &str) -> Result<(), CommandFailure> {
+    if value.contains("${drn:") {
+        return Err(CommandFailure::usage(
+            "curl: secret DRNs are accepted only by --oauth2-bearer or --user",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_secret_marker(value: &str) -> Result<SecretDrn, CommandFailure> {
+    let drn = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| {
+            CommandFailure::usage(
+                "curl: credentials must be an exact ${drn:<authority>:secret:<realm>:<path>} reference",
+            )
+        })?;
+    drn.parse().map_err(|error| {
+        CommandFailure::usage(format!("curl: secret reference is not canonical: {error}"))
+    })
 }
 
 /// Reports whether a short-flag bundle contains only the no-op quieting flags.
@@ -168,6 +252,7 @@ fn parse_header(header: &str) -> Result<Value, CommandFailure> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use dekopon_core::SecretUseProposal;
     use serde_json::{Value, json};
 
     use crate::{
@@ -181,6 +266,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingInvoker {
         calls: std::cell::RefCell<Vec<(String, Value)>>,
+        secret_uses: std::cell::RefCell<Vec<SecretUseProposal>>,
     }
 
     impl CapabilityInvoker for RecordingInvoker {
@@ -193,6 +279,18 @@ mod tests {
                 .borrow_mut()
                 .push((capability.to_owned(), input.clone()));
             CapabilityCallResult::Succeeded(json!({"status": 200}))
+        }
+
+        fn invoke_with_secret_use(
+            &self,
+            capability: &str,
+            input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if let Some(secret_use) = secret_use {
+                self.secret_uses.borrow_mut().push(secret_use);
+            }
+            self.invoke(capability, input)
         }
     }
 
@@ -306,6 +404,89 @@ mod tests {
             parse(&arguments(&["https://a.test/", "https://b.test/"])),
             Err(CommandFailure::Status { .. })
         ));
+    }
+
+    #[test]
+    fn basic_secret_marker_stays_typed_and_out_of_provider_json() {
+        let invoker = RecordingInvoker::default();
+        let mut budget = Budget::start(Limits::default());
+        let mut buffers = BTreeMap::new();
+        let mut context = BuiltinContext {
+            invoker: &invoker,
+            budget: &mut budget,
+            buffers: &mut buffers,
+            curl_capability: Some("http-probe.fetch"),
+            allow_clock: false,
+        };
+        Curl.run(
+            &mut context,
+            &arguments(&[
+                "-u",
+                "userA:${drn:com.xrl:secret:prod:api/basic}",
+                "https://example.test/v1/thing",
+            ]),
+            None,
+        )
+        .expect("typed secret proposal succeeds");
+
+        let calls = invoker.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let serialized = calls[0].1.to_string();
+        assert!(!serialized.contains("drn:"), "{serialized}");
+        assert!(!serialized.contains("userA"), "{serialized}");
+        let uses = invoker.secret_uses.borrow();
+        assert!(matches!(
+            &uses[0],
+            SecretUseProposal::HttpBasic { username, secret }
+                if username == "userA"
+                    && secret.as_str() == "drn:com.xrl:secret:prod:api/basic"
+        ));
+    }
+
+    #[test]
+    fn literal_passwords_and_arbitrary_markers_are_refused() {
+        for user in [
+            "userA:literal-password",
+            "userA:prefix-${drn:com.xrl:secret:prod:api/basic}",
+        ] {
+            let invoker = RecordingInvoker::default();
+            let mut budget = Budget::start(Limits::default());
+            let mut buffers = BTreeMap::new();
+            let mut context = BuiltinContext {
+                invoker: &invoker,
+                budget: &mut budget,
+                buffers: &mut buffers,
+                curl_capability: Some("http-probe.fetch"),
+                allow_clock: false,
+            };
+            assert!(
+                Curl.run(
+                    &mut context,
+                    &arguments(&["-u", user, "https://example.test/"]),
+                    None,
+                )
+                .is_err(),
+                "accepted {user}"
+            );
+        }
+        for argv in [
+            vec![
+                "-H",
+                "X-Secret: ${drn:com.xrl:secret:prod:api/basic}",
+                "https://example.test/",
+            ],
+            vec![
+                "-d",
+                "${drn:com.xrl:secret:prod:api/basic}",
+                "https://example.test/",
+            ],
+            vec!["https://example.test/${drn:com.xrl:secret:prod:api/basic}"],
+        ] {
+            assert!(
+                super::parse_with_secret_use(&arguments(&argv)).is_err(),
+                "accepted misplaced marker: {argv:?}"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,8 @@ categories = ["command-line-utilities", "network-programming"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 dekopon-broker.workspace = true
 dekopon-broker-host.workspace = true
@@ -28,6 +30,7 @@ opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 http-auth.workspace = true
 libc.workspace = true
 reqwest.workspace = true
@@ -39,6 +42,7 @@ serde_yaml.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

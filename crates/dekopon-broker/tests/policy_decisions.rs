@@ -217,6 +217,7 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
             .expect("valid trace fixture"),
         trace_parent: None,
         input: json!({"message": "decision table"}),
+        secret_use: None,
     }
 }
 

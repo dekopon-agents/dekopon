@@ -281,6 +281,7 @@ async fn framing_and_audit_failures_name_their_cause() {
         capability: "echo.echo".parse::<CapabilityId>().expect("capability"),
         trace: "trace-brokerd".parse::<TraceId>().expect("valid trace"),
         trace_parent: None,
+        secret_use: None,
         input: json!({"message": "hello through broker"}),
     };
     client

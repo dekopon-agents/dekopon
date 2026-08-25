@@ -104,6 +104,8 @@ pub use limits::{
 };
 pub use parser::ParseError;
 
+use dekopon_core::SecretUseProposal;
+
 /// Model-facing metadata for one capability, used by `cap --describe`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityDescription {
@@ -216,6 +218,24 @@ pub trait CapabilityInvoker {
     /// calling binary's model tool loop is untouched. An implementation that is asynchronous
     /// underneath bridges here itself, which is what `dekopon-run` does from its blocking task.
     fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult;
+
+    /// Invokes one capability with optional typed secret-use intent.
+    ///
+    /// Direct and test invokers keep the safe default: a proposal selecting a DRN is refused. Only
+    /// a broker-backed leg may override this and forward the typed field for fresh authorization.
+    fn invoke_with_secret_use(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        match secret_use {
+            None => self.invoke(capability, input),
+            Some(_) => CapabilityCallResult::Denied {
+                reason: "secret references require a broker-backed capability".to_owned(),
+            },
+        }
+    }
 }
 
 /// A script exit code.

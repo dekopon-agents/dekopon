@@ -8,18 +8,22 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use dekopon_broker::{
     AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits,
     ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld, StartupWarning,
+    InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld, SecretCatalog,
+    SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
     SubjectAttestation, verify_audit_chain,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, Idempotency};
+use dekopon_capability::{
+    EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule, Idempotency,
+};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
-    RiskLevel, TraceId,
+    RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal, TraceId,
 };
 use serde_json::{Value, json};
 
@@ -90,6 +94,7 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
             .expect("valid trace fixture"),
         trace_parent: None,
         input,
+        secret_use: None,
     }
 }
 
@@ -182,6 +187,47 @@ fn http_probe_engine(policies: &str) -> PolicyEngine {
     engine(policies, ["caller"], [("http-probe.fetch", "http-probe")])
 }
 
+fn secret_drn() -> SecretDrn {
+    "drn:com.xrl:secret:test:http-probe/token"
+        .parse()
+        .expect("canonical secret fixture")
+}
+
+fn http_probe_secret_engine(policies: &str) -> PolicyEngine {
+    let world = PolicyWorld::new(
+        [principal("caller")],
+        [(
+            "http-probe.fetch".parse().expect("capability"),
+            "http-probe".parse().expect("provider"),
+        )],
+    )
+    .expect("world")
+    .with_secrets([secret_drn()]);
+    PolicyEngine::new(policies, &world).expect("secret policy validates")
+}
+
+#[derive(Debug)]
+struct StaticSecretResolver(&'static [u8]);
+
+#[async_trait]
+impl SecretResolver for StaticSecretResolver {
+    async fn resolve(&self, _secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
+        Ok(SecretMaterial::new(self.0.to_vec()))
+    }
+}
+
+#[derive(Debug)]
+struct MissingSecretResolver;
+
+#[async_trait]
+impl SecretResolver for MissingSecretResolver {
+    async fn resolve(&self, _secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
+        Err(SecretResolutionError {
+            category: "missing",
+        })
+    }
+}
+
 /// The JSONPlaceholder world, which is the only fixture with two differently classified
 /// capabilities on one provider.
 fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
@@ -236,6 +282,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     }
 }
 
@@ -706,6 +753,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     };
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
@@ -796,6 +844,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     };
     let read_constraints = ExecutionConstraints {
         http: Some(HttpConstraints {
@@ -943,6 +992,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     };
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
@@ -1124,6 +1174,256 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
     let public = serde_json::to_string(&result).expect("result serializes");
     assert!(!public.contains(SECRET), "result leaked the secret");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
+    const SECRET: &[u8] = b"drn-secret-never-visible";
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let (authority, received, server) = mock_http(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let policy = format!(
+        "{}\n{}",
+        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        r#"@id("caller-secret-use")
+           permit(principal == Dekopon::Principal::"caller",
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token")
+           when { context.capability == "http-probe.fetch"
+               && context.provider == "http-probe"
+               && context.sink == "httpBearer" };"#,
+    );
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_secret_engine(&policy),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints(&authority)),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![SecretUseBinding {
+                binding_id: "http-probe-token".to_owned(),
+                secret: secret_drn(),
+                capability: "http-probe.fetch".parse().expect("capability"),
+                sink: SecretSinkKind::HttpBearer,
+                basic_username: None,
+                allowed_hosts: vec![authority.clone()],
+                allowed_methods: vec!["GET".to_owned()],
+                allowed_paths: vec![HttpPathRule::Exact {
+                    path: "/api/v1/thing".to_owned(),
+                }],
+                allow_query: false,
+                max_injections: 1,
+            }],
+            Arc::new(StaticSecretResolver(SECRET)),
+        )
+        .expect("secret catalog"),
+    )
+    .expect("binding fits capability");
+
+    let mut proposal = request(
+        "invoke-drn-secret",
+        "http-probe.fetch",
+        json!({
+            "uri": format!("http://{authority}/api/v1/thing"),
+            "method": "GET"
+        }),
+    );
+    proposal.secret_use = Some(SecretUseProposal::HttpBearer {
+        secret: secret_drn(),
+    });
+    let result = broker
+        .invoke(&context("caller"), proposal)
+        .await
+        .expect("dual-authorized invocation completes");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let wire = String::from_utf8(received.recv().expect("request recorded")).expect("request text");
+    assert!(
+        wire.contains("authorization: Bearer drn-secret-never-visible"),
+        "{wire}"
+    );
+    server.join().expect("server exits");
+
+    let serialized = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    assert!(
+        serialized.contains(secret_drn().as_str()),
+        "DRN is attributable"
+    );
+    assert!(
+        !serialized.contains("drn-secret-never-visible"),
+        "secret leaked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_policy_alone_cannot_authorize_a_drn() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let constraints = loopback_constraints("127.0.0.1:9");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_secret_engine(&direct_http_policy(
+            "caller",
+            "provider-test",
+            "http-probe.fetch",
+        )),
+        catalog([("http-probe.fetch", set("http-probe", constraints))]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![SecretUseBinding {
+                binding_id: "http-probe-token".to_owned(),
+                secret: secret_drn(),
+                capability: "http-probe.fetch".parse().expect("capability"),
+                sink: SecretSinkKind::HttpBearer,
+                basic_username: None,
+                allowed_hosts: vec!["127.0.0.1:9".to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                allowed_paths: vec![HttpPathRule::Exact {
+                    path: "/".to_owned(),
+                }],
+                allow_query: false,
+                max_injections: 1,
+            }],
+            Arc::new(StaticSecretResolver(b"never-resolved")),
+        )
+        .expect("catalog"),
+    )
+    .expect("binding");
+    let mut proposal = request(
+        "invoke-secret-denied",
+        "http-probe.fetch",
+        json!({"uri": "http://127.0.0.1:9/", "method": "GET"}),
+    );
+    proposal.secret_use = Some(SecretUseProposal::HttpBearer {
+        secret: secret_drn(),
+    });
+    let result = broker
+        .invoke(&context("caller"), proposal)
+        .await
+        .expect("denial audited");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(result.error.as_deref(), Some("secret-denied"));
+    let encoded = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    assert!(encoded.contains(secret_drn().as_str()), "{encoded}");
+    assert!(encoded.contains("secret_sink"), "{encoded}");
+    assert!(!encoded.contains("never-resolved"), "{encoded}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguous_gap() {
+    let registry = BrokerProviderRegistry::load(
+        [fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let authority = "127.0.0.1:9";
+    let policy = format!(
+        "{}\n{}",
+        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        r#"permit(principal == Dekopon::Principal::"caller",
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
+    );
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_secret_engine(&policy),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints(authority)),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![SecretUseBinding {
+                binding_id: "missing-token".to_owned(),
+                secret: secret_drn(),
+                capability: "http-probe.fetch".parse().expect("capability"),
+                sink: SecretSinkKind::HttpBearer,
+                basic_username: None,
+                allowed_hosts: vec![authority.to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                allowed_paths: vec![HttpPathRule::Exact {
+                    path: "/".to_owned(),
+                }],
+                allow_query: false,
+                max_injections: 1,
+            }],
+            Arc::new(MissingSecretResolver),
+        )
+        .expect("catalog"),
+    )
+    .expect("binding");
+    let mut proposal = request(
+        "invoke-secret-missing",
+        "http-probe.fetch",
+        json!({"uri": "http://127.0.0.1:9/", "method": "GET"}),
+    );
+    proposal.secret_use = Some(SecretUseProposal::HttpBearer {
+        secret: secret_drn(),
+    });
+    let result = broker
+        .invoke(&context("caller"), proposal)
+        .await
+        .expect("source failure is a normal audited result");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Failed
+    );
+    assert_eq!(result.error.as_deref(), Some("secret-resolution"));
+    let records = audit.records().await;
+    assert_eq!(records.len(), 2, "decision plus terminal failed execution");
+    let AuditEvent::Execution {
+        error, http_calls, ..
+    } = &records[1].event
+    else {
+        panic!("terminal record is execution");
+    };
+    assert_eq!(error.as_deref(), Some("secret-resolution"));
+    assert!(http_calls.is_empty());
 }
 
 /// The per-agent axis, end to end: one capability, one constraint set, two organizations' tokens.
@@ -1394,6 +1694,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
             allow_plaintext_loopback: false,
         }),
         storage: None,
+        secret_use: None,
     };
     let store = || {
         CredentialStore::new([

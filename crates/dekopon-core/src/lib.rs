@@ -20,6 +20,10 @@ pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
+/// Maximum canonical bytes in one public Dekopon resource name for secret material.
+pub const MAX_SECRET_DRN_LENGTH: usize = 512;
+/// Maximum bytes in an HTTP Basic username proposed alongside a secret reference.
+pub const MAX_SECRET_USERNAME_LENGTH: usize = 256;
 
 /// File extension a Dekopon provider component is recognized by.
 ///
@@ -263,6 +267,234 @@ identifier!(
     "A validated authenticated principal identifier."
 );
 
+/// A canonical, public name for broker-held secret material.
+///
+/// A DRN is deliberately inert: knowing or copying one grants no authority. It contains only a
+/// logical naming authority, realm, and path; backend names, physical locators, fields, selectors,
+/// and versions remain in the broker's owner-only secret map.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SecretDrn(String);
+
+impl SecretDrn {
+    /// Returns the canonical DRN.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretDrn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for SecretDrn {
+    type Err = SecretDrnError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_secret_drn(value)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl TryFrom<String> for SecretDrn {
+    type Error = SecretDrnError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_secret_drn(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretDrn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_from(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+fn validate_secret_drn(value: &str) -> Result<(), SecretDrnError> {
+    if value.len() > MAX_SECRET_DRN_LENGTH {
+        return Err(SecretDrnError::TooLong {
+            length: value.len(),
+            maximum: MAX_SECRET_DRN_LENGTH,
+        });
+    }
+    let mut parts = value.splitn(5, ':');
+    if parts.next() != Some("drn")
+        || parts.next().is_none_or(|part| !valid_drn_authority(part))
+        || parts.next() != Some("secret")
+        || parts.next().is_none_or(|part| !valid_drn_component(part))
+    {
+        return Err(SecretDrnError::Malformed);
+    }
+    let path = parts.next().ok_or(SecretDrnError::Malformed)?;
+    if path.is_empty()
+        || path.bytes().any(|byte| {
+            byte.is_ascii_uppercase()
+                || byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'%' | b'?' | b'#' | b'\\')
+        })
+        || path
+            .split('/')
+            .any(|segment| !valid_drn_component(segment) || matches!(segment, "." | ".."))
+    {
+        return Err(SecretDrnError::Malformed);
+    }
+    Ok(())
+}
+
+fn valid_drn_authority(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTIFIER_LENGTH
+        && value
+            .split('.')
+            .all(|segment| valid_drn_component(segment) && !segment.as_bytes().contains(&b'_'))
+}
+
+fn valid_drn_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTIFIER_LENGTH
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+/// Why a public secret DRN is not canonical.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SecretDrnError {
+    /// The value does not match `drn:<authority>:secret:<realm>:<logical-path>`.
+    #[error("secret DRN must be canonical `drn:<authority>:secret:<realm>:<logical-path>`")]
+    Malformed,
+    /// The complete DRN exceeded its wire bound.
+    #[error("secret DRN is {length} bytes; maximum is {maximum}")]
+    TooLong { length: usize, maximum: usize },
+}
+
+/// Opaque secret bytes whose ordinary rendering never reveals content or length.
+///
+/// Broker-private crates use this carrier across trusted layers. It deliberately implements no
+/// serialization and has no public conversion back into an owned byte vector.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// The native sink in which the broker may consume a proposed secret reference.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecretSinkKind {
+    /// `Authorization: Bearer <token>` rendered inside the native HTTP host.
+    HttpBearer,
+    /// `Authorization: Basic base64(username:password)` rendered inside the native HTTP host.
+    HttpBasic,
+}
+
+impl fmt::Display for SecretSinkKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HttpBearer => "httpBearer",
+            Self::HttpBasic => "httpBasic",
+        })
+    }
+}
+
+/// Untrusted, typed intent to use one public secret reference in one native sink.
+///
+/// This value may travel in a proposal. It is never authority and is never passed to a provider;
+/// the broker must separately authorize `secret.use` and match an owner-authored use binding.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SecretUseProposal {
+    HttpBearer {
+        secret: SecretDrn,
+    },
+    HttpBasic {
+        secret: SecretDrn,
+        #[serde(deserialize_with = "deserialize_secret_username")]
+        username: String,
+    },
+}
+
+impl SecretUseProposal {
+    /// Returns the exact proposed DRN.
+    #[must_use]
+    pub const fn secret(&self) -> &SecretDrn {
+        match self {
+            Self::HttpBearer { secret } | Self::HttpBasic { secret, .. } => secret,
+        }
+    }
+
+    /// Returns the proposed native sink kind.
+    #[must_use]
+    pub const fn sink(&self) -> SecretSinkKind {
+        match self {
+            Self::HttpBearer { .. } => SecretSinkKind::HttpBearer,
+            Self::HttpBasic { .. } => SecretSinkKind::HttpBasic,
+        }
+    }
+
+    /// Returns the public Basic username when that sink was proposed.
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Self::HttpBasic { username, .. } => Some(username),
+            Self::HttpBearer { .. } => None,
+        }
+    }
+}
+
+fn deserialize_secret_username<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let username = String::deserialize(deserializer)?;
+    if username.is_empty()
+        || username.len() > MAX_SECRET_USERNAME_LENGTH
+        || username.contains(':')
+        || username
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == 0x7f)
+    {
+        return Err(D::Error::custom(
+            "HTTP Basic username must be nonempty, bounded, colon-free, and contain no controls",
+        ));
+    }
+    Ok(username)
+}
+
 /// The authenticated actor responsible for an operation.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -329,7 +561,9 @@ impl fmt::Display for AgentStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentId, IdentifierError, RiskLevel};
+    use super::{
+        AgentId, IdentifierError, RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal,
+    };
 
     #[test]
     fn accepts_portable_identifiers() {
@@ -369,6 +603,56 @@ mod tests {
     #[test]
     fn display_is_stable() {
         assert_eq!(RiskLevel::High.to_string(), "High");
+    }
+
+    #[test]
+    fn secret_drns_have_one_logical_backend_independent_spelling() {
+        let value = "drn:com.xrl:secret:prod:payments/blah-api-basic";
+        let parsed = value.parse::<SecretDrn>().expect("canonical DRN");
+        assert_eq!(parsed.to_string(), value);
+        let round_trip = serde_json::from_str::<SecretDrn>(
+            &serde_json::to_string(&parsed).expect("serialize DRN"),
+        )
+        .expect("deserialize DRN");
+        assert_eq!(round_trip, parsed);
+    }
+
+    #[test]
+    fn secret_drns_reject_physical_or_ambiguous_spellings() {
+        for value in [
+            "drn::secret:prod:name",
+            "drn:com.xrl:secret:Prod:name",
+            "drn:com.xrl:secret:prod:",
+            "drn:com.xrl:secret:prod:a//b",
+            "drn:com.xrl:secret:prod:a/../b",
+            "drn:com.xrl:secret:prod:a%2fb",
+            "drn:com.xrl:secret:prod:a?version=2",
+            "drn:com..xrl:secret:prod:name",
+            "drn:com_xrl:secret:prod:name",
+        ] {
+            assert!(value.parse::<SecretDrn>().is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn typed_secret_use_rejects_basic_username_confusion() {
+        let valid = serde_json::from_str::<SecretUseProposal>(
+            r#"{"kind":"httpBasic","secret":"drn:com.xrl:secret:prod:api/basic","username":"user-a"}"#,
+        )
+        .expect("valid Basic proposal");
+        assert_eq!(valid.sink(), SecretSinkKind::HttpBasic);
+        assert_eq!(valid.username(), Some("user-a"));
+
+        for username in ["", "user:password", "line\nbreak"] {
+            let document = format!(
+                r#"{{"kind":"httpBasic","secret":"drn:com.xrl:secret:prod:api/basic","username":{}}}"#,
+                serde_json::to_string(username).expect("username JSON")
+            );
+            assert!(
+                serde_json::from_str::<SecretUseProposal>(&document).is_err(),
+                "accepted {username:?}"
+            );
+        }
     }
 }
 

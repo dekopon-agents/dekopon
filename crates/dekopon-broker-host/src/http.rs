@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dekopon_capability::HttpConstraints;
+use dekopon_capability::{HttpConstraints, SecretUseGrant};
 use dekopon_http_host::{
     BufferedHttpClient, ConfigurationError, ErrorCode as NativeErrorCode, Header as NativeHeader,
     HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest,
@@ -8,7 +8,9 @@ use dekopon_http_host::{
 
 use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Request, Response};
 
-pub use dekopon_http_host::{BoundCredential, HttpCallEvidence};
+pub use dekopon_http_host::{
+    BoundCredential, ConfigurationError as HttpConfigurationError, HttpCallEvidence,
+};
 
 pub(crate) type HttpCeilings = HttpHostCeilings;
 
@@ -27,15 +29,26 @@ impl HttpState {
 
     pub(crate) fn invoke(
         grant: Option<HttpConstraints>,
+        secret_grant: Option<SecretUseGrant>,
         credential: Option<BoundCredential>,
         ceilings: HttpCeilings,
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
-        let client = match grant {
-            Some(grant) => BufferedHttpClient::authorized_with_credential(
+        let client = match (grant, secret_grant, credential) {
+            (Some(grant), Some(secret), Some(credential)) => {
+                BufferedHttpClient::authorized_with_secret_credential(
+                    grant, secret, credential, ceilings, timeout,
+                )?
+            }
+            (Some(grant), None, credential) => BufferedHttpClient::authorized_with_credential(
                 grant, credential, ceilings, timeout,
             )?,
-            None => BufferedHttpClient::disabled(ceilings, timeout)?,
+            (None, None, None) => BufferedHttpClient::disabled(ceilings, timeout)?,
+            _ => {
+                return Err(ConfigurationError::InvalidCredential {
+                    reason: "HTTP grant, secret-use grant, and resolved credential disagree",
+                });
+            }
         };
         Ok(Self { client })
     }

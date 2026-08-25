@@ -713,6 +713,7 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
                         capability: capability.clone(),
                         trace: trace_id.clone(),
                         trace_parent: dekopon_agent::current_trace_parent(),
+                        secret_use: None,
                         input,
                     })
                     .await?;

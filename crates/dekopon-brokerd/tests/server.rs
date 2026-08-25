@@ -23,10 +23,12 @@ use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
     CheckpointError, MappedPeer, ServerLimits, current_uid, run, run_with_http,
 };
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
+use dekopon_capability::{
+    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
+};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TraceId,
+    RiskLevel, SecretUseProposal, TraceId,
 };
 use dekopon_webui::ServiceStatus;
 use serde_json::{Value, json};
@@ -138,6 +140,7 @@ fn request(id: &str) -> InvocationRequest {
             .parse::<TraceId>()
             .expect("valid trace fixture"),
         trace_parent: None,
+        secret_use: None,
         input: json!({"message": "hello through broker"}),
     }
 }
@@ -536,6 +539,183 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         BrokerdError::Checkpoint(CheckpointError::AuditMismatch)
     ));
     assert!(!socket_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("service fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure fixture directory");
+    let config_path = directory.path().join("broker.json");
+    let socket_path = directory.path().join("broker.sock");
+    let audit_path = directory.path().join("audit.jsonl");
+    let policies_path = directory.path().join("policies.cedar");
+    let secret_map_path = directory.path().join("secret-map.yaml");
+    let secret_value_path = directory.path().join("api-token");
+    write_owner_only(&secret_value_path, b"brokerd-secret-value");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HTTP fixture");
+    let authority = listener
+        .local_addr()
+        .expect("HTTP fixture address")
+        .to_string();
+    let (wire_send, wire_receive) = oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.expect("read HTTP request");
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        wire_send.send(bytes).expect("record HTTP request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .expect("write HTTP response");
+    });
+
+    let policies = r#"@id("caller-fetch")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"http-probe.fetch",
+       resource == Dekopon::Provider::"http-probe")
+when { context has agent && context.agent == "brokerd-test" }
+unless { context has via };
+
+@id("caller-secret")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"secret.use",
+       resource == Dekopon::Secret::"drn:com.xrl:secret:test:api/token")
+when { context.capability == "http-probe.fetch"
+    && context.provider == "http-probe"
+    && context.sink == "httpBearer" };
+"#;
+    write_owner_only(&policies_path, policies.as_bytes());
+    let secret_map = format!(
+        "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: service-test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: service-token\n        capability: http-probe.fetch\n        sink: httpBearer\n        allowedHosts: [{}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /api/v1/thing }}]\n",
+        secret_value_path.display(),
+        authority
+    );
+    write_owner_only(&secret_map_path, secret_map.as_bytes());
+    let set = ConstraintSet {
+        provider: "http-probe".parse().expect("provider"),
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        idempotency: Idempotency::Idempotent,
+        credential: None,
+        credential_by_agent: BTreeMap::new(),
+        constraints: ExecutionConstraints {
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+            http: Some(HttpConstraints {
+                allowed_hosts: vec![authority.clone()],
+                allowed_methods: vec!["GET".to_owned()],
+                max_requests: 1,
+                max_request_bytes: 64 * 1024,
+                max_response_bytes: 64 * 1024,
+                allow_plaintext_loopback: true,
+            }),
+            storage: None,
+            secret_use: None,
+        },
+    };
+    let document = json!({
+        "apiVersion": CONFIG_API_VERSION,
+        "socketPath": &socket_path,
+        "auditPath": &audit_path,
+        "checkpointPath": directory.path().join("checkpoint.json"),
+        "checkpointLockPath": directory.path().join("checkpoint.lock"),
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "policiesPath": &policies_path,
+        "secretMapPath": &secret_map_path,
+        "providers": [fixture("http-probe-provider.wasm")],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "constraintSets": {
+            "http-probe.fetch": serde_json::to_value(set).expect("constraint set")
+        }
+    });
+    write_owner_only(
+        &config_path,
+        &serde_json::to_vec(&document).expect("config serializes"),
+    );
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let started_config = config_path.clone();
+    let mut service = tokio::spawn(async move {
+        run(started_config, async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a dropped sender is normal test shutdown"
+            )]
+            let _ = stopped.await;
+        })
+        .await
+    });
+    wait_for_socket(&socket_path, &mut service).await;
+    let client = BrokerClient::new(&socket_path, uid, FrameLimits::default()).expect("client");
+    let mut invocation = InvocationRequest {
+        id: "invoke-secret-service".parse().expect("invocation"),
+        capability: "http-probe.fetch".parse().expect("capability"),
+        trace: "trace-secret-service".parse().expect("trace"),
+        trace_parent: None,
+        secret_use: Some(SecretUseProposal::HttpBearer {
+            secret: "drn:com.xrl:secret:test:api/token".parse().expect("DRN"),
+        }),
+        input: json!({
+            "uri": format!("http://{authority}/api/v1/thing"),
+            "method": "GET"
+        }),
+    };
+    let result = client
+        .invoke(invocation.clone())
+        .await
+        .expect("secret invocation succeeds");
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    let wire = String::from_utf8(wire_receive.await.expect("HTTP wire")).expect("wire text");
+    assert!(
+        wire.contains("authorization: Bearer brokerd-secret-value"),
+        "{wire}"
+    );
+    upstream.await.expect("HTTP fixture exits");
+
+    // Wrong path is inside capability authority but outside the secret binding. It may not make a
+    // second network request, and the host rejection is terminal even if the guest catches it.
+    invocation.id = "invoke-secret-wrong-path".parse().expect("invocation");
+    invocation.input = json!({
+        "uri": format!("http://{authority}/api/v1/other"),
+        "method": "GET"
+    });
+    let denied = client
+        .invoke(invocation)
+        .await
+        .expect("host refusal is accounted");
+    assert_eq!(denied.outcome, InvocationOutcome::Failed);
+
+    stop.send(()).expect("stop service");
+    let checkpoint = service
+        .await
+        .expect("service task exits")
+        .expect("service stops");
+    assert_eq!(checkpoint.records, 4);
+    let audit = fs::read_to_string(audit_path).expect("read audit");
+    assert!(audit.contains("drn:com.xrl:secret:test:api/token"));
+    assert!(!audit.contains("brokerd-secret-value"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

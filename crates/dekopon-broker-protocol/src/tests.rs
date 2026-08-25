@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dekopon_core::{CapabilityId, InvocationId, TraceId};
+use dekopon_core::{CapabilityId, InvocationId, SecretUseProposal, TraceId};
 use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
@@ -25,6 +25,7 @@ fn invocation() -> InvocationRequest {
             .parse::<TraceId>()
             .expect("valid trace fixture"),
         trace_parent: None,
+        secret_use: None,
         input: json!({"message": "hello"}),
     }
 }
@@ -345,6 +346,30 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
             }
         }))
         .is_err()
+    );
+}
+
+#[test]
+fn public_drn_is_typed_optional_proposal_data_and_never_provider_input() {
+    let mut request = invocation();
+    request.secret_use = Some(SecretUseProposal::HttpBasic {
+        secret: "drn:com.xrl:secret:test:api/password"
+            .parse()
+            .expect("canonical DRN"),
+        username: "userA".to_owned(),
+    });
+    let value = serde_json::to_value(&request).expect("request serializes");
+    assert_eq!(
+        value["secretUse"]["secret"],
+        "drn:com.xrl:secret:test:api/password"
+    );
+    assert_eq!(value["secretUse"]["kind"], "httpBasic");
+    assert_eq!(value["input"], json!({"message": "hello"}));
+    assert!(!value["input"].to_string().contains("drn:"));
+    let encoded = value.to_string();
+    assert!(
+        !encoded.contains("password\":"),
+        "no resolved password field: {encoded}"
     );
 }
 

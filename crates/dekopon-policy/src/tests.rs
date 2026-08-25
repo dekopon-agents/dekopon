@@ -1,9 +1,9 @@
 use dekopon_capability::{EffectKind, Idempotency};
-use dekopon_core::RiskLevel;
+use dekopon_core::{RiskLevel, SecretSinkKind};
 
 use super::{
     AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, UnresolvedKind,
+    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION, UnresolvedKind,
 };
 
 /// The workflow world: two principals, two echo capabilities.
@@ -27,6 +27,12 @@ fn world() -> PolicyWorld {
     .expect("distinct fixtures build a world")
 }
 
+fn world_with_secret() -> PolicyWorld {
+    world().with_secrets(["drn:com.xrl:secret:prod:api/token"
+        .parse()
+        .expect("canonical secret DRN")])
+}
+
 fn capability_request(principal: &str, capability: &str, context: PolicyContext) -> PolicyRequest {
     PolicyRequest {
         principal: principal.parse().expect("valid principal fixture"),
@@ -46,6 +52,21 @@ fn prompt_request(principal: &str, agent: &str, context: PolicyContext) -> Polic
         principal: principal.parse().expect("valid principal fixture"),
         target: PolicyTarget::AgentPrompt {
             agent: agent.parse().expect("valid agent fixture"),
+        },
+        context,
+    }
+}
+
+fn secret_request(principal: &str, context: PolicyContext) -> PolicyRequest {
+    PolicyRequest {
+        principal: principal.parse().expect("valid principal fixture"),
+        target: PolicyTarget::SecretUse {
+            secret: "drn:com.xrl:secret:prod:api/token"
+                .parse()
+                .expect("canonical secret DRN"),
+            capability: "echo.echo".parse().expect("capability"),
+            provider: "echo".parse().expect("provider"),
+            sink: SecretSinkKind::HttpBearer,
         },
         context,
     }
@@ -502,17 +523,19 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
         PolicyBuildError::DuplicateCapability { .. }
     ));
 
-    let reserved = PolicyWorld::new(
-        ["cpetersen".parse().expect("valid principal fixture")],
-        [(
-            AGENT_PROMPT_ACTION
-                .parse()
-                .expect("agent.prompt is a syntactically valid capability id"),
-            "agent".parse().expect("valid provider fixture"),
-        )],
-    )
-    .expect_err("a capability must not shadow the fixed session action");
-    assert!(matches!(reserved, PolicyBuildError::ReservedAction { .. }));
+    for action in [AGENT_PROMPT_ACTION, SECRET_USE_ACTION] {
+        let reserved = PolicyWorld::new(
+            ["cpetersen".parse().expect("valid principal fixture")],
+            [(
+                action
+                    .parse()
+                    .expect("fixed action is a syntactically valid capability id"),
+                "agent".parse().expect("valid provider fixture"),
+            )],
+        )
+        .expect_err("a capability must not shadow a fixed action");
+        assert!(matches!(reserved, PolicyBuildError::ReservedAction { .. }));
+    }
 }
 
 /// Debug output is reachable from the broker's own `Debug`; it must fingerprint the policy set
@@ -777,4 +800,58 @@ fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
             .allowed,
         "a forbid must override the permit it overlaps"
     );
+}
+
+#[test]
+fn capability_permission_does_not_imply_secret_use() {
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"echo.echo",
+                  resource == Dekopon::Provider::"echo");"#,
+        &world_with_secret(),
+    )
+    .expect("capability-only policy validates");
+    assert!(
+        engine
+            .authorize(capability_request(
+                "cpetersen",
+                "echo.echo",
+                PolicyContext::default()
+            ))
+            .allowed
+    );
+    assert!(
+        !engine
+            .authorize(secret_request("cpetersen", PolicyContext::default()))
+            .allowed
+    );
+}
+
+#[test]
+fn secret_use_is_a_separate_exact_resource_decision() {
+    let engine = PolicyEngine::new(
+        &format!(
+            r#"@id("secret-use")
+               permit(principal == Dekopon::Principal::"cpetersen",
+                      action == Dekopon::Action::"{SECRET_USE_ACTION}",
+                      resource == Dekopon::Secret::"drn:com.xrl:secret:prod:api/token")
+               when {{ context.capability == "echo.echo"
+                    && context.provider == "echo"
+                    && context.sink == "httpBearer" }};"#
+        ),
+        &world_with_secret(),
+    )
+    .expect("secret policy validates");
+    let allowed = engine.authorize(secret_request("cpetersen", PolicyContext::default()));
+    assert!(allowed.allowed, "{allowed:?}");
+    assert_eq!(allowed.determining_policy_ids, ["secret-use"]);
+
+    let unknown = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:com.xrl:secret:prod:api/typo");"#,
+        &world_with_secret(),
+    )
+    .expect_err("unknown DRN refuses startup");
+    assert!(matches!(unknown, PolicyBuildError::UnknownSecret { .. }));
 }

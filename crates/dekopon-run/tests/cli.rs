@@ -441,6 +441,7 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
                         allow_plaintext_loopback: true,
                     }),
                     storage: None,
+                    secret_use: None,
                 },
             )]),
             CredentialStore::empty(),

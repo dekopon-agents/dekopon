@@ -56,6 +56,13 @@ pub struct BrokerdConfig {
     /// construction. The secret values live only in that file — never here.
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
+    /// Optional owner-only public-DRN to private-source map.
+    ///
+    /// It coexists with legacy implicit credentials. Loading validates descriptors without network
+    /// access; one selected source is resolved only after both capability and `secret.use` policy
+    /// decisions allow an invocation.
+    #[serde(default)]
+    pub secret_map_path: Option<PathBuf>,
     /// Legacy directly named component files or directories.
     #[serde(default)]
     pub providers: Vec<PathBuf>,
@@ -351,6 +358,7 @@ pub struct ResolvedConfig {
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
     pub credentials_path: Option<PathBuf>,
+    pub secret_map_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
     /// Expected component identities when providers came from a generated lock.
     pub locked_providers: Option<Vec<LockedProviderSource>>,
@@ -591,6 +599,12 @@ async fn resolve(
         .transpose()
     };
     let credentials_path = canonical(config.credentials_path)?;
+    // Preserve the configured final component so the secret-map loader's O_NOFOLLOW check can
+    // actually reject a symlink rather than receiving the target canonicalization erased it into.
+    let secret_map_path = config
+        .secret_map_path
+        .map(|path| resolve_future_path(resolve_path(path)))
+        .transpose()?;
     let policies_path = canonical(config.policies_path)?;
     // Wasmtime creates the cache directory itself and requires an absolute path, so this resolves
     // the parent rather than requiring the directory to already exist.
@@ -708,6 +722,9 @@ async fn resolve(
     ];
     if let Some(credentials_path) = &credentials_path {
         reserved.push(credentials_path.clone());
+    }
+    if let Some(secret_map_path) = &secret_map_path {
+        reserved.push(secret_map_path.clone());
     }
     if let Some(policies_path) = &policies_path {
         reserved.push(policies_path.clone());
@@ -907,6 +924,7 @@ async fn resolve(
         broker_principal: config.broker_principal,
         policy_revision: config.policy_revision,
         credentials_path,
+        secret_map_path,
         providers,
         locked_providers,
         strict: config.strict,

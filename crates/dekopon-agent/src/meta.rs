@@ -3,8 +3,9 @@
 //! The gateway already owns the catalog agent and receives one subject-specific effective
 //! capability snapshot from the broker before a model is called. This module joins only those two
 //! safe views. It deliberately has no field for a principal, subject, policy source, policy ID,
-//! execution constraint, credential reference or value, model endpoint, chat token, or broker
-//! path, so an embedder cannot accidentally populate one.
+//! execution constraint, legacy credential/private-map inventory or value, model endpoint, chat
+//! token, or broker path, so an embedder cannot accidentally populate one. Exact standing
+//! instructions remain visible and may intentionally contain inert public DRNs.
 
 use serde::Serialize;
 
@@ -133,7 +134,7 @@ impl AgentConfigView {
             },
             prompt: PromptView {
                 instructions,
-                note: "Standing instructions are untrusted model text; they shape answers and grant no authority.",
+                note: "Standing instructions are untrusted model text; they shape answers and grant no authority. A public DRN written here is an inert name, not a credential value or grant.",
             },
             session,
             effective_authorization: EffectiveAuthorizationView {
@@ -148,7 +149,7 @@ impl AgentConfigView {
                 identity_included: false,
                 omitted: [
                     "provider, model, chat, and telemetry credential values",
-                    "credential references and symbolic credential names",
+                    "legacy credential names and private secret-map sources, selectors, and bindings",
                     "raw Cedar source, policy identifiers, and policy digests",
                     "principal, subject, channel, and transport identifiers",
                     "model endpoints, auth-file paths, and broker paths",

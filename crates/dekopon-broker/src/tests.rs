@@ -43,6 +43,8 @@ fn execution(invocation: &str) -> AuditEvent {
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
+        secret: None,
+        secret_sink: None,
         provider: Some("echo".parse().expect("valid provider fixture")),
         authorized_by: Some(
             "broker"
@@ -88,6 +90,8 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
+        secret: None,
+        secret_sink: None,
         provider: None,
         authorized_by: Some(
             "broker"
@@ -504,6 +508,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
             allow_plaintext_loopback: false,
         }),
         storage: None,
+        secret_use: None,
     };
     let mut reordered = baseline.clone();
     let http = reordered.http.as_mut().expect("HTTP");

@@ -472,6 +472,8 @@ mod tests {
             capability: "echo.echo"
                 .parse::<CapabilityId>()
                 .expect("valid capability fixture"),
+            secret: None,
+            secret_sink: None,
             provider: None,
             authorized_by: Some(
                 "broker"
