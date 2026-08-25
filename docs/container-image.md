@@ -106,6 +106,15 @@ retention. An operator must name the exact optional file or explicitly scan its 
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
 the image.
 
+`dekopon-brokerd` now contains an offline provider-manager mode, but this image-staging path does
+not use it yet. A pull request cannot execute a command that exists only in its own unreleased source
+from the older release archives staging deliberately reuses. More importantly, the current external
+provider path verifies GitHub build provenance as well as SHA-256 integrity, while the manager's
+first exact-reference slice proves byte identity only. After a release contains the command,
+staging may use `provider sync --locked` to materialize reviewed OCI digests only if it retains an
+independent `gh attestation verify` (or an equivalent reviewed provenance policy) for every
+component. Docker build itself remains network-free either way.
+
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.
 

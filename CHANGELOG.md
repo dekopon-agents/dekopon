@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added an offline provider manager to `dekopon-brokerd`. `provider sync`, `sync --locked`, `list`,
+  and `verify` resolve fully qualified exact OCI tag or manifest-digest references, stream the one
+  bounded `application/wasm` layer into a content-addressed store, validate the complete proposed
+  provider set, and atomically activate a deterministic strict lock. A managed `providerSet` broker
+  configuration is mutually exclusive with legacy `providers`; daemon startup remains network-free
+  and compares lock digest, length, and provider identity against the exact buffer handed to
+  Wasmtime. Registry provenance verification, private registry credentials, SemVer requirements,
+  update/remove/prune commands, and container-image staging migration remain follow-ups.
+
 ### Removed
 
 - Removed the in-tree `skylight-private` source workspace and checked component. Its designated

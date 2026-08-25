@@ -4,6 +4,7 @@ use dekopon_broker::ConstraintSet;
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 use super::{config, current_uid, server, socket};
 
@@ -161,6 +162,95 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     config::load(&path, uid)
         .await
         .expect("the restored policy file loads");
+}
+
+/// A managed lock resolves only local content-addressed paths, and legacy paths cannot be mixed in.
+#[tokio::test]
+async fn managed_provider_configuration_is_strict_and_network_free() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create managed-provider fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+
+    let component = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/providers/echo-provider.wasm"),
+    )
+    .expect("checked echo component");
+    let digest = Sha256::digest(&component)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        });
+    let store = directory.path().join("store");
+    let blobs = store.join("blobs");
+    let sha = blobs.join("sha256");
+    for directory in [&store, &blobs, &sha] {
+        fs::create_dir(directory).expect("create store directory");
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("private store directory");
+    }
+    let blob = sha.join(format!("{digest}.wasm"));
+    write_owner_only(&blob, &component);
+    let lock = format!(
+        "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/echo:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{digest}\n    componentBytes: {}\n    providerId: echo\n",
+        "1".repeat(64),
+        component.len()
+    );
+    write_owner_only(
+        &directory.path().join("providers.lock.yaml"),
+        lock.as_bytes(),
+    );
+
+    let mut document = attested_document(uid);
+    document
+        .as_object_mut()
+        .expect("config object")
+        .remove("providers");
+    document["providerSet"] = json!({
+        "lockPath": "providers.lock.yaml",
+        "storePath": "store"
+    });
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("managed provider lock resolves locally");
+    assert_eq!(
+        resolved.providers,
+        vec![fs::canonicalize(&blob).expect("canonical blob")]
+    );
+    assert_eq!(resolved.locked_providers.as_ref().map(Vec::len), Some(1));
+
+    let mut runnable = document.clone();
+    runnable["identities"] = json!([document["identities"][0].clone()]);
+    write_config(&path, &runnable);
+    super::run(&path, async {})
+        .await
+        .expect("daemon compiles and describes the exact locked buffer before binding");
+
+    let mut mixed = document.clone();
+    mixed["providers"] = json!(["echo.wasm"]);
+    write_config(&path, &mixed);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("legacy and managed provider sources are mutually exclusive");
+    assert!(matches!(error, config::ConfigError::MixedProviderSources));
+
+    write_config(&path, &document);
+    let second = directory.path().join("blob-hard-link.wasm");
+    fs::hard_link(&blob, &second).expect("hard-link blob");
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a locked blob with another link is not trusted startup input");
+    assert!(matches!(error, config::ConfigError::ProviderLock { .. }));
 }
 
 /// Grants and mappings are owner-controlled identity machinery, so both fail closed on the shapes

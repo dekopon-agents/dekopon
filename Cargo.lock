@@ -1003,6 +1003,7 @@ dependencies = [
 name = "dekopon-brokerd"
 version = "0.11.1"
 dependencies = [
+ "axum",
  "clap",
  "dekopon-broker",
  "dekopon-broker-host",
@@ -1015,18 +1016,24 @@ dependencies = [
  "dekopon-telemetry",
  "dekopon-webui",
  "fs2",
+ "futures-util",
+ "http-auth",
  "libc",
  "opentelemetry",
+ "reqwest",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1796,6 +1803,15 @@ checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
 dependencies = [
  "bytes",
  "itoa",
+]
+
+[[package]]
+name = "http-auth"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "150fa4a9462ef926824cf4519c84ed652ca8f4fbae34cb8af045b5cbcaf98822"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -3888,7 +3904,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

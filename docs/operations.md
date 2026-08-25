@@ -34,6 +34,8 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Question | Read |
 |---|---|
 | What files and directories must exist, and with what ownership and modes? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) |
+| How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
+| Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`broker-http.md` § Startup validation](broker-http.md#startup-validation) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
 | The broker refuses to start naming `dev.*` subjects. | [`dekopon-brokerd` § Development identities](../crates/dekopon-brokerd/README.md#development-identities) — `allowDevelopmentSubjects` is off by default, and the refusal lists every offending entry at once |

@@ -9,8 +9,8 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, HTTP_WIT,
-    PROVIDER_WIT, STORAGE_WIT,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    HARD_MAX_PROVIDER_COMPONENT_BYTES, HTTP_WIT, LockedProviderSource, PROVIDER_WIT, STORAGE_WIT,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation, StorageAccess,
@@ -675,6 +675,150 @@ async fn artifact_digest_describes_the_compiled_buffer() {
     });
     assert_eq!(metadata.artifact_sha256, expected);
     assert_eq!(metadata.artifact_bytes, bytes.len() as u64);
+}
+
+/// A provider lock is compared with the same buffer Wasmtime would compile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
+    let source = fixture("echo-provider.wasm");
+    let bytes = std::fs::read(&source).expect("read artifact");
+    let locked = LockedProviderSource::new(
+        source,
+        bytes.len() as u64,
+        "0".repeat(64),
+        "echo".parse().expect("provider ID"),
+    )
+    .expect("well-formed locked source");
+
+    let error = BrokerProviderRegistry::load_locked_with_options(
+        [locked],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions::default(),
+    )
+    .await
+    .expect_err("a different locked digest must refuse the component");
+    assert!(
+        matches!(error, BrokerHostError::ArtifactDigestMismatch { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("provider lock expects"));
+}
+
+/// The locked descriptor length is enforced against that same compile buffer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
+    let source = fixture("echo-provider.wasm");
+    let bytes = std::fs::read(&source).expect("read artifact");
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        });
+    let locked = LockedProviderSource::new(
+        source,
+        bytes.len() as u64 + 1,
+        digest,
+        "echo".parse().expect("provider ID"),
+    )
+    .expect("well-formed locked source");
+
+    let error = BrokerProviderRegistry::load_locked_with_options(
+        [locked],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions::default(),
+    )
+    .await
+    .expect_err("a different locked length must refuse the component");
+    assert!(
+        matches!(error, BrokerHostError::ArtifactSizeMismatch { .. }),
+        "{error:?}"
+    );
+}
+
+/// A replaced locked file is refused from descriptor metadata before its oversized body is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
+    assert!(matches!(
+        LockedProviderSource::new(
+            "zero.wasm",
+            0,
+            "0".repeat(64),
+            "echo".parse().expect("provider ID")
+        ),
+        Err(BrokerHostError::InvalidArtifactSize { .. })
+    ));
+
+    let directory = tempfile::tempdir().expect("oversized artifact directory");
+    let source = directory.path().join("oversized.wasm");
+    let file = std::fs::File::create(&source).expect("create sparse artifact");
+    file.set_len(HARD_MAX_PROVIDER_COMPONENT_BYTES + 1)
+        .expect("size sparse artifact");
+    let locked = LockedProviderSource::new(
+        source.clone(),
+        1,
+        "0".repeat(64),
+        "echo".parse().expect("provider ID"),
+    )
+    .expect("well-formed locked source");
+
+    let error = BrokerProviderRegistry::load_locked_with_options(
+        [locked],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions::default(),
+    )
+    .await
+    .expect_err("descriptor mismatch refuses before reading the sparse body");
+    assert!(
+        matches!(error, BrokerHostError::ArtifactSizeMismatch { .. }),
+        "{error:?}"
+    );
+
+    let error = BrokerProviderRegistry::load([source], BrokerHostLimits::default())
+        .await
+        .expect_err("legacy paths share the hard source ceiling");
+    assert!(
+        matches!(error, BrokerHostError::ArtifactTooLarge { .. }),
+        "{error:?}"
+    );
+}
+
+/// The provider identity is lock input too, not metadata the component may replace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_provider_identity_is_enforced_after_describe() {
+    let source = fixture("echo-provider.wasm");
+    let bytes = std::fs::read(&source).expect("read artifact");
+    let digest = Sha256::digest(&bytes);
+    let digest = digest.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write as _;
+        write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+        text
+    });
+    let locked = LockedProviderSource::new(
+        source,
+        bytes.len() as u64,
+        digest,
+        "other".parse().expect("provider ID"),
+    )
+    .expect("well-formed locked source");
+
+    let error = BrokerProviderRegistry::load_locked_with_options(
+        [locked],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions::default(),
+    )
+    .await
+    .expect_err("a different locked provider ID must refuse the component");
+    assert!(
+        matches!(error, BrokerHostError::ProviderIdentityMismatch { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("provider lock expects other"));
 }
 
 /// Loading a command-word provider proves the export statically instead of instantiating twice.

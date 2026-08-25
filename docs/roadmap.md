@@ -151,6 +151,19 @@ container image's runtime base from Debian 12 to Debian 13 so it publishes at al
 binary references two symbols glibc's dynamic linker requires the runtime library to name even
 though both are weak-probed and safely absent on an older one. No crate's source changed.
 
+## Unreleased — locked provider-set foundation (implemented)
+
+- `dekopon-brokerd provider sync`, `sync --locked`, `list`, and `verify` keep exact operator-authored
+  OCI references, immutable manifest/component resolutions, and content-addressed installed bytes
+  separate.
+- Managed daemon configuration is mutually exclusive with legacy paths, performs no startup
+  network access, and verifies the generated lock against the exact buffer and bounded provider
+  description the host consumes.
+- The first format deliberately supports exact tags and manifest digests only. SemVer requirements,
+  update/install/remove/prune UX, private registries/custom roots, provenance policy, revocation,
+  and container-staging adoption remain the ordered follow-ups rather than fields parsed but read by
+  nothing.
+
 ## Next milestones
 
 1. Add independent checkpoint retention/export or signing so rollback of both local audit and checkpoint files is detectable outside the broker host.

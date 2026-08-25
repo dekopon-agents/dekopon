@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -66,6 +67,8 @@ pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
 /// Namespace-bound storage package mirrored into the broker host bindings.
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
+/// Hard maximum source bytes for one provider component (64 MiB).
+pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Default maximum linear memory per provider call (64 MiB).
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum elements in each Wasm table.
@@ -174,6 +177,104 @@ pub struct BrokerHostOptions {
     /// `None` leaves the aggregate unbounded, which is only safe when the connection ceiling
     /// multiplied by the per-store ceiling still fits the container.
     pub max_total_memory_bytes: Option<usize>,
+}
+
+/// One content-locked provider component the broker may compile.
+///
+/// The expected identity is checked against the exact buffer passed to Wasmtime, rather than a
+/// separate preflight read. This closes the gap between a generated provider lock and the bytes the
+/// privileged host actually executes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedProviderSource {
+    path: PathBuf,
+    artifact_bytes: u64,
+    artifact_sha256: String,
+    provider_id: ProviderId,
+}
+
+impl LockedProviderSource {
+    /// Creates a locked source after validating the canonical lowercase SHA-256 spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerHostError::InvalidArtifactSize`] when the expected byte length is zero or
+    /// above the hard source ceiling, and [`BrokerHostError::InvalidArtifactDigest`] when
+    /// `artifact_sha256` is not exactly sixty-four lowercase hexadecimal characters.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        artifact_bytes: u64,
+        artifact_sha256: impl Into<String>,
+        provider_id: ProviderId,
+    ) -> Result<Self, BrokerHostError> {
+        let artifact_sha256 = artifact_sha256.into();
+        if artifact_bytes == 0 || artifact_bytes > HARD_MAX_PROVIDER_COMPONENT_BYTES {
+            return Err(BrokerHostError::InvalidArtifactSize {
+                size: artifact_bytes,
+                maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
+            });
+        }
+        if artifact_sha256.len() != 64
+            || !artifact_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(BrokerHostError::InvalidArtifactDigest);
+        }
+        Ok(Self {
+            path: path.into(),
+            artifact_bytes,
+            artifact_sha256,
+            provider_id,
+        })
+    }
+
+    /// Returns the local component path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the expected component byte length.
+    #[must_use]
+    pub const fn artifact_bytes(&self) -> u64 {
+        self.artifact_bytes
+    }
+
+    /// Returns the expected lowercase SHA-256 digest.
+    #[must_use]
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    /// Returns the provider identity the component must describe.
+    #[must_use]
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+}
+
+#[derive(Clone)]
+struct ProviderSource {
+    path: PathBuf,
+    expected: Option<LockedProviderSource>,
+}
+
+impl From<PathBuf> for ProviderSource {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            path,
+            expected: None,
+        }
+    }
+}
+
+impl From<LockedProviderSource> for ProviderSource {
+    fn from(expected: LockedProviderSource) -> Self {
+        Self {
+            path: expected.path.clone(),
+            expected: Some(expected),
+        }
+    }
 }
 
 /// Upper bound on the fuel a store may burn between async yields.
@@ -442,6 +543,7 @@ impl bindings::dekopon::http::client::Host for StoreState {
 /// One provider component after Cranelift, before it has described itself.
 struct CompiledComponent {
     source: PathBuf,
+    expected_provider_id: Option<ProviderId>,
     artifact_bytes: u64,
     artifact_sha256: String,
     compile_ms: u64,
@@ -485,15 +587,86 @@ impl fmt::Debug for BrokerWasmProvider {
 /// time while the socket stays unbound.
 fn compile_component(
     runtime: &Runtime,
-    source: PathBuf,
+    source: ProviderSource,
 ) -> Result<CompiledComponent, BrokerHostError> {
-    // Read once. A digest taken from a second read cannot prove it describes the bytes Cranelift
-    // consumed, and `artifact_sha256` is published as if it did.
-    let bytes = std::fs::read(&source).map_err(|error| BrokerHostError::ArtifactMetadata {
-        path: source.clone(),
-        source: error,
-    })?;
+    // Open and read once. A digest taken from a second read cannot prove it describes the bytes
+    // Cranelift consumed. Locked metadata is checked on this descriptor before allocation, then the
+    // read itself is capped at one byte beyond the applicable limit so concurrent growth cannot
+    // turn a trusted startup input into an unbounded allocation.
+    let file =
+        std::fs::File::open(&source.path).map_err(|error| BrokerHostError::ArtifactMetadata {
+            path: source.path.clone(),
+            source: error,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| BrokerHostError::ArtifactMetadata {
+            path: source.path.clone(),
+            source: error,
+        })?;
+    let maximum = source
+        .expected
+        .as_ref()
+        .map_or(HARD_MAX_PROVIDER_COMPONENT_BYTES, |expected| {
+            expected.artifact_bytes
+        });
+    if let Some(expected) = &source.expected
+        && metadata.len() != expected.artifact_bytes
+    {
+        return Err(BrokerHostError::ArtifactSizeMismatch {
+            path: source.path,
+            expected: expected.artifact_bytes,
+            actual: metadata.len(),
+        });
+    }
+    if metadata.len() > maximum {
+        return Err(BrokerHostError::ArtifactTooLarge {
+            path: source.path,
+            actual: metadata.len(),
+            maximum,
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BrokerHostError::ArtifactMetadata {
+            path: source.path.clone(),
+            source: error,
+        })?;
+    let actual = bytes.len() as u64;
+    if actual > maximum {
+        return match &source.expected {
+            Some(expected) => Err(BrokerHostError::ArtifactSizeMismatch {
+                path: source.path,
+                expected: expected.artifact_bytes,
+                actual,
+            }),
+            None => Err(BrokerHostError::ArtifactTooLarge {
+                path: source.path,
+                actual,
+                maximum,
+            }),
+        };
+    }
     let artifact = identify_bytes(&bytes);
+    if let Some(expected) = &source.expected {
+        if artifact.bytes != expected.artifact_bytes {
+            return Err(BrokerHostError::ArtifactSizeMismatch {
+                path: source.path,
+                expected: expected.artifact_bytes,
+                actual: artifact.bytes,
+            });
+        }
+        if artifact.sha256 != expected.artifact_sha256 {
+            return Err(BrokerHostError::ArtifactDigestMismatch {
+                path: source.path,
+                expected: expected.artifact_sha256.clone(),
+                actual: artifact.sha256,
+            });
+        }
+    }
+    let expected_provider_id = source.expected.map(|expected| expected.provider_id);
+    let source = source.path;
     // Compilation happens once per provider at startup rather than per invocation, so this span
     // answers "why was the broker slow to become ready", not "why was that call slow".
     let compile = tracing::info_span!(
@@ -525,6 +698,7 @@ fn compile_component(
         })?;
     Ok(CompiledComponent {
         source,
+        expected_provider_id,
         artifact_bytes: artifact.bytes,
         artifact_sha256: artifact.sha256,
         compile_ms,
@@ -543,6 +717,7 @@ impl BrokerWasmProvider {
     ) -> Result<Self, BrokerHostError> {
         let CompiledComponent {
             source,
+            expected_provider_id,
             artifact_bytes,
             artifact_sha256,
             compile_ms,
@@ -568,6 +743,15 @@ impl BrokerWasmProvider {
                 }
             })?;
         validate_manifest(&manifest, &source)?;
+        if let Some(expected) = expected_provider_id
+            && manifest.id != expected
+        {
+            return Err(BrokerHostError::ProviderIdentityMismatch {
+                path: source,
+                expected,
+                actual: manifest.id,
+            });
+        }
         // A manifest that promises command words the component cannot rewrite would fail at the
         // first `gh …` a model typed, in a session, hours later. Prove it at load instead — from
         // the component's own type, which distinguishes "no such export" from "wrong signature".
@@ -1021,7 +1205,47 @@ impl BrokerProviderRegistry {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
-        let sources = sources.into_iter().map(Into::into).collect::<Vec<_>>();
+        Self::load_sources(
+            sources
+                .into_iter()
+                .map(|source| ProviderSource::from(source.into())),
+            limits,
+            storage_host,
+            options,
+        )
+        .await
+    }
+
+    /// Compiles content-locked providers and compares each expected digest, length, and provider
+    /// identity with the exact bytes and manifest the host consumes.
+    pub async fn load_locked_with_options<I>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_host: Option<StorageHost>,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = LockedProviderSource>,
+    {
+        Self::load_sources(
+            sources.into_iter().map(ProviderSource::from),
+            limits,
+            storage_host,
+            options,
+        )
+        .await
+    }
+
+    async fn load_sources<I>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_host: Option<StorageHost>,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = ProviderSource>,
+    {
+        let sources = sources.into_iter().collect::<Vec<_>>();
         if sources.is_empty() {
             return Err(BrokerHostError::NoProviders);
         }
@@ -1052,7 +1276,7 @@ impl BrokerProviderRegistry {
             // says which it was — a panic and its message, or a cancellation — so it is kept as
             // the cause rather than replaced.
             let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
-                path: source,
+                path: source.path,
                 source: wasmtime::Error::new(join),
             })??;
             let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
@@ -1611,6 +1835,69 @@ pub enum BrokerHostError {
         /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
+    },
+    /// A generated lock supplied a zero or over-ceiling expected component length.
+    #[error("locked provider artifact is {size} bytes; maximum is {maximum}")]
+    InvalidArtifactSize {
+        /// Locked byte length.
+        size: u64,
+        /// Hard maximum.
+        maximum: u64,
+    },
+    /// A generated lock supplied a malformed expected component digest.
+    #[error("locked provider artifact digest must be sixty-four lowercase hexadecimal characters")]
+    InvalidArtifactDigest,
+    /// An unlocked component exceeded the same hard source-byte ceiling.
+    #[error(
+        "broker provider component {} is {actual} bytes; maximum is {maximum}",
+        path.display()
+    )]
+    ArtifactTooLarge {
+        /// Component path.
+        path: PathBuf,
+        /// Actual descriptor or bounded-read length.
+        actual: u64,
+        /// Hard maximum.
+        maximum: u64,
+    },
+    /// The exact component buffer did not have the locked byte length.
+    #[error(
+        "broker provider component {} is {actual} bytes; provider lock expects {expected}",
+        path.display()
+    )]
+    ArtifactSizeMismatch {
+        /// Component path.
+        path: PathBuf,
+        /// Locked byte length.
+        expected: u64,
+        /// Actual buffer length.
+        actual: u64,
+    },
+    /// The exact component buffer did not have the locked digest.
+    #[error(
+        "broker provider component {} has SHA-256 {actual}; provider lock expects {expected}",
+        path.display()
+    )]
+    ArtifactDigestMismatch {
+        /// Component path.
+        path: PathBuf,
+        /// Locked lowercase SHA-256.
+        expected: String,
+        /// Actual lowercase SHA-256.
+        actual: String,
+    },
+    /// The validated manifest did not describe the provider identity recorded in the lock.
+    #[error(
+        "broker provider component {} describes provider {actual}; provider lock expects {expected}",
+        path.display()
+    )]
+    ProviderIdentityMismatch {
+        /// Component path.
+        path: PathBuf,
+        /// Locked provider identity.
+        expected: ProviderId,
+        /// Manifest provider identity.
+        actual: ProviderId,
     },
     /// Source artifact metadata could not be read for the informational provider view.
     #[error("could not inspect broker provider artifact {}", path.display())]

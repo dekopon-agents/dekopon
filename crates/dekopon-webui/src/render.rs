@@ -164,7 +164,7 @@ pub(crate) fn provider_page(version: &str, provider: &LoadedProviderMetadata) ->
         "Command words",
         &badges(provider.manifest.command_words.iter().map(String::as_str)),
     );
-    content.push_str("</dl></div><p class=muted>The broker currently retains the local Wasm component path and content digest. If an operator pulled those bytes from an OCI artifact before startup, the remote OCI reference is not retained by the current loader.</p></section>");
+    content.push_str("</dl></div><p class=muted>The operational view receives the local Wasm component path and exact compiled-buffer digest. A managed provider lock separately retains its OCI source and manifest digest, but that provenance context is not yet joined into this read-only view.</p></section>");
 
     content.push_str("<section id=interface><h2>Component interface</h2>");
     if provider.interface_truncated {
