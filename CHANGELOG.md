@@ -28,6 +28,15 @@ All notable changes to Dekopon are documented here. The format is based on
   Wasmtime. Registry provenance verification, private registry credentials, SemVer requirements,
   update/remove/prune commands, and container-image staging migration remain follow-ups.
 
+### Changed
+
+- Reworked pull-request CI around measured bottlenecks: stable tests now run concurrently beside
+  quality checks, the MSRV compiles test targets without executing the stable suite twice, CLI path
+  installs share one release target directory, and package/install/dependency/chart work is selected
+  from tested path classes. Default-branch registry and sccache warmers feed restore-only PR jobs
+  instead of uploading multi-gigabyte PR-scoped target archives, while job summaries report cache,
+  network, and target-growth measurements for follow-up tuning.
+
 ### Removed
 
 - Removed the in-tree Echo, JSONPlaceholder, and memory-chat source workspaces and checked
