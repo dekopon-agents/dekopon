@@ -151,6 +151,20 @@ container image's runtime base from Debian 12 to Debian 13 so it publishes at al
 binary references two symbols glibc's dynamic linker requires the runtime library to name even
 though both are weak-probed and safely absent on an older one. No crate's source changed.
 
+## Unreleased — Tokio process lifecycle foundation (implemented)
+
+- `dekopon-process` provides one async operation trait and a one-run/one-node execution boundary.
+  It records private payload-free trace IDs, preserves the typed operation result or Tokio task
+  failure, and transfers the non-interruptible node to a supervisor that joins, records, and
+  delivers it to a required abandonment observer if the outer caller is dropped while the owning
+  runtime remains alive. Normal runner command execution keeps that runtime alive.
+- `dekopon-run shell` is the normal consumer: provider loading and the unchanged synchronous
+  interpreter run as one opaque non-interruptible blocking node.
+- Structured scopes/ports, cooperative cancellation, deadlines, per-stage shell lowering,
+  provider stdin, persistent workflows, and a runtime-component WIT remain later work requiring a
+  real production consumer. The current lifecycle crate contains no broker, policy, credential,
+  provider host, network, filesystem, retry, or audit machinery.
+
 ## Unreleased — locked provider-set foundation (implemented)
 
 - `dekopon-brokerd provider sync`, `sync --locked`, `list`, and `verify` keep exact operator-authored
@@ -201,7 +215,7 @@ Each of these was raised, deliberately scoped out, and accepted as a follow-up r
 
 ## Intended package namespace
 
-`dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
+`dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed by `dekopon-run shell`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-identity`
 - `dekopon-context`

@@ -1449,6 +1449,24 @@ fn shell_exports_one_span_per_command_without_exporting_any_argument() {
         })
         .collect::<Vec<_>>();
 
+    assert!(
+        events.iter().any(|event| event["name"] == "process.run"),
+        "process.run is absent from the Chrome trace"
+    );
+    let terminal_node = events
+        .iter()
+        .find(|event| {
+            event["name"] == "process.node"
+                && text(&event["args"]["process.outcome"]) == "succeeded"
+        })
+        .expect("one terminal process.node event");
+    assert_eq!(text(&terminal_node["args"]["process.kind"]), "legacy-shell");
+    assert_eq!(
+        text(&terminal_node["args"]["process.interruptibility"]),
+        "non-interruptible"
+    );
+    let node_id = text(&terminal_node["args"]["node.id"]);
+
     assert_eq!(
         commands,
         vec![
@@ -1478,6 +1496,46 @@ fn shell_exports_one_span_per_command_without_exporting_any_argument() {
                 "not-found".to_owned()
             ),
         ]
+    );
+
+    // Chrome trace events do not carry an explicit cross-thread parent ID. The blocking bridge does
+    // preserve the active process node on its worker thread, so the shell commands must be
+    // temporally enclosed by one process.node interval carrying the same stable node ID.
+    let command_start = events
+        .iter()
+        .filter(|event| event["name"] == "shell.command")
+        .filter_map(|event| event["ts"].as_f64())
+        .reduce(f64::min)
+        .expect("shell command start time");
+    let command_end = events
+        .iter()
+        .filter(|event| event["name"] == "shell.command")
+        .filter_map(|event| event["ts"].as_f64())
+        .reduce(f64::max)
+        .expect("shell command end time");
+    let enclosing_node = events.iter().any(|start| {
+        if start["name"] != "process.node"
+            || start["ph"] != "B"
+            || text(&start["args"]["node.id"]) != node_id
+        {
+            return false;
+        }
+        let Some(start_time) = start["ts"].as_f64() else {
+            return false;
+        };
+        let thread = &start["tid"];
+        start_time <= command_start
+            && events.iter().any(|end| {
+                end["name"] == "process.node"
+                    && end["ph"] == "E"
+                    && &end["tid"] == thread
+                    && text(&end["args"]["node.id"]) == node_id
+                    && end["ts"].as_f64().is_some_and(|time| time >= command_end)
+            })
+    });
+    assert!(
+        enclosing_node,
+        "shell.command spans are not enclosed by the legacy-shell process node"
     );
 
     // The argument value, the model-authored function name, and the unresolved word all appear in

@@ -32,6 +32,7 @@ use dekopon_model::{
     chatgpt::{ChatGptCodexModel, ChatGptError},
     model::{ChatModel, ModelError, OpenAiChatModel},
 };
+use dekopon_process::{ProcessMetadata, ProcessOutcome, ProcessRun, process_fn};
 use dekopon_provider_host::{
     HostLimits, HostOptions, ProviderHostError, ProviderManifest, ProviderRegistry,
 };
@@ -279,28 +280,28 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             script,
         } => {
             let components = providers.components()?;
-            let span = tracing::info_span!(
+            let provider_count = components.len();
+            let host_limits = host_limits(limits);
+            let host_options = providers.host_options();
+            let interpreter_limits = shell_limits(shell);
+            let curl_capability = curl_capability.as_ref().map(CapabilityId::to_string);
+            let script = script.clone();
+            evaluate_shell(
+                components,
+                host_limits,
+                host_options,
+                interpreter_limits,
+                curl_capability,
+                script,
+                cli.verbose,
+            )
+            .instrument(tracing::info_span!(
                 "runner.shell",
-                provider.count = components.len(),
+                provider.count = provider_count,
                 shell.max_steps = shell.shell_max_steps,
                 shell.max_capability_calls = shell.shell_max_capability_calls
-            );
-            let _entered = span.enter();
-            let registry = ProviderRegistry::load_with_options(
-                components,
-                host_limits(limits),
-                &providers.host_options(),
-            )?;
-            let invoker = RegistryInvoker {
-                registry: &registry,
-            };
-            let outcome = Interpreter::new(shell_limits(shell))
-                .with_curl_capability(curl_capability.as_ref().map(CapabilityId::to_string))
-                .run(script, &invoker);
-            Ok(CommandOutput {
-                text: format_script_outcome(&outcome),
-                exit_code: i32::from(outcome.exit_code.get()),
-            })
+            ))
+            .await
         }
         Command::Broker { command } => evaluate_broker(command).await,
         Command::Prompt {
@@ -367,6 +368,109 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             evaluate_chat(gateway, subject, conversation.clone())
                 .instrument(tracing::info_span!("runner.chat"))
                 .await
+        }
+    }
+}
+
+/// Runs the synchronous immediate shell as one opaque process-lifecycle node.
+///
+/// Provider loading and interpretation are both blocking work. The node is therefore explicitly
+/// non-interruptible after start and is awaited honestly on Tokio's blocking pool. The shell keeps
+/// ownership of its existing value, output, status, tracing, and deadline semantics.
+async fn evaluate_shell(
+    components: Vec<PathBuf>,
+    host_limits: HostLimits,
+    host_options: HostOptions,
+    interpreter_limits: ShellLimits,
+    curl_capability: Option<String>,
+    script: String,
+    verbosity: u8,
+) -> Result<CommandOutput, AppError> {
+    let operation = process_fn(
+        ProcessMetadata::non_interruptible("legacy-shell"),
+        move || async move {
+            let node_span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                node_span.in_scope(|| {
+                    let registry = ProviderRegistry::load_with_options(
+                        components,
+                        host_limits,
+                        &host_options,
+                    )?;
+                    let invoker = RegistryInvoker {
+                        registry: &registry,
+                    };
+                    let outcome = Interpreter::new(interpreter_limits)
+                        .with_curl_capability(curl_capability)
+                        .run(&script, &invoker);
+                    Ok(CommandOutput {
+                        text: format_script_outcome(&outcome),
+                        exit_code: i32::from(outcome.exit_code.get()),
+                    })
+                })
+            })
+            .await
+            .map_err(AppError::ShellTask)?
+        },
+    );
+    match ProcessRun::execute(operation, move |outcome| {
+        observe_unobserved_shell_outcome(outcome, verbosity);
+    })
+    .await
+    {
+        ProcessOutcome::Completed(result) => result,
+        ProcessOutcome::TaskFailed(error) => Err(AppError::ShellProcessTask(error)),
+    }
+}
+
+/// Handles a shell result whose original `execute` caller was dropped.
+///
+/// Lifecycle telemetry carries only fixed categories. The ordinary operator error reporter remains
+/// the sole destination for the complete cause; a successful `CommandOutput` is deliberately not
+/// rendered because its script/provider payload no longer has a caller.
+fn observe_unobserved_shell_outcome(
+    outcome: ProcessOutcome<CommandOutput, AppError>,
+    verbosity: u8,
+) {
+    match outcome {
+        ProcessOutcome::Completed(Ok(_output)) => {
+            tracing::warn!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "runner.shell.unobserved",
+                    command.name = "shell",
+                    outcome = "succeeded",
+                    error.type = "none",
+                },
+                "unobserved shell process completed"
+            );
+        }
+        ProcessOutcome::Completed(Err(error)) => {
+            tracing::error!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "runner.shell.unobserved",
+                    command.name = "shell",
+                    outcome = "operation-error",
+                    error.type = error.telemetry_kind(),
+                },
+                "unobserved shell process failed"
+            );
+            report_error(&error, verbosity);
+        }
+        ProcessOutcome::TaskFailed(error) => {
+            let error = AppError::ShellProcessTask(error);
+            tracing::error!(
+                target: "dekopon_run::audit",
+                {
+                    audit.event = "runner.shell.unobserved",
+                    command.name = "shell",
+                    outcome = "task-failed",
+                    error.type = error.telemetry_kind(),
+                },
+                "unobserved shell process task failed"
+            );
+            report_error(&error, verbosity);
         }
     }
 }
@@ -951,6 +1055,10 @@ enum AppError {
     },
     #[error("the prompt session did not run to completion")]
     PromptTask(#[source] tokio::task::JoinError),
+    #[error("the shell blocking task did not run to completion")]
+    ShellTask(#[source] tokio::task::JoinError),
+    #[error("the shell process task did not run to completion")]
+    ShellProcessTask(#[source] tokio::task::JoinError),
     #[error("broker capability input must be a JSON object")]
     BrokerInputObject,
     #[error(transparent)]
@@ -1017,6 +1125,8 @@ impl AppError {
             #[cfg(unix)]
             Self::BrokerDuplicateCapabilities { .. } => "broker-duplicate-capabilities",
             Self::PromptTask(_) => "prompt-task",
+            Self::ShellTask(_) => "shell-task",
+            Self::ShellProcessTask(_) => "shell-process-task",
             Self::BrokerInputObject => "broker-input-object",
             Self::ChatGpt(_) => "chatgpt",
             Self::Provider(_) => "provider",

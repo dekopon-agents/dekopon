@@ -21,6 +21,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
+dekopon-process.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 opentelemetry.workspace = true

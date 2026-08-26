@@ -1,0 +1,25 @@
+[package]
+name = "dekopon-process"
+description = "Joined Tokio process lifecycle for Dekopon frontends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-process"
+readme = "README.md"
+keywords = ["async", "orchestration", "tokio", "process-lifecycle"]
+categories = ["asynchronous"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -98,6 +98,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-broker-protocol` | Lightweight strict versioned bounded frames and Unix client with identity/authority-free payloads and server peer-UID verification | **Current** shared broker/runner API with no privileged host or native-HTTP dependency |
 | `dekopon-model` | Bounded chat-model contract, OpenAI-compatible transport, ChatGPT/Codex subscription auth and Responses client, plus a fixed-endpoint bounded OpenAI Images client | **Current**, consumed by both CLIs and the gateway |
 | `dekopon-shell` | Sandboxed bash-flavored interpreter whose command words dispatch to capabilities through one abstract seam, with its own step, recursion, output, deadline, and capability-call bounds | **Current**; it links no Wasmtime, broker, HTTP, or filesystem code |
+| `dekopon-process` | Unprivileged one-run/one-node Tokio lifecycle seam whose internal supervisor preserves a typed operation result or Tokio task failure and delivers it to a required abandonment observer if the outer caller is dropped while the runtime remains alive | **Current** library consumed by `dekopon-run shell`, whose runtime lives through normal command completion; scopes, ports, cancellation, deadlines, and stage scheduling remain future |
 | `dekopon-agent` | The shared agent session layer: the bounded scripting prompt loop, optional bounded asset/configuration/image-generation meta tools, the script runtime spending a session-wide capability budget, and a broker-leg facade over the protocol client | **Current**, holding no authority; consumed by `dekopon-run`, `dekopond`, and `dekopon-tui` |
 | `dekopon-telemetry` | OTLP exporter settings and subscriber wiring, with ingest credentials read only from the environment | **Current** library shared by the executables |
 | `dekopon-tui` | The operator console: a terminal view over an attested broker session, observing the agent loop through decorators on the script and capability seams, with render-time redaction and terminal-control sanitisation | **Current**, holding a model credential and no authority; embedded only in `dekopon` |
@@ -165,6 +166,7 @@ parse dekopon-run CLI
   -> compile Wasm components and validate manifests
   -> reject duplicate routes and every non-read-only effect
   -> direct invocation or OpenAI-compatible/ChatGPT-subscription prompt/tool loop
+  -> shell mode moves provider loading plus the synchronous interpreter to one joined blocking process node
   -> fresh bounded store per component call
   -> JSON result/timings and optional local Chrome plus remote OTLP telemetry
 ```

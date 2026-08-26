@@ -35,6 +35,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable streams. `dekopon-run shell` runs one script by hand and `dekopon-run prompt` hands the same interpreter to a model as its only tool, so a multi-step plan is one tool call rather than many round trips.
+- A small unprivileged Tokio lifecycle seam (`dekopon-process`) that runs one typed async operation
+  as one payload-free traced task and joins it before returning. If the outer caller is dropped,
+  its required observer still receives the full outcome while the owning Tokio runtime remains
+  alive; normal runner command execution keeps that runtime alive. The current runner shell path uses
+  one opaque non-interruptible blocking node; structured scopes/ports and stage-level scheduling
+  remain deferred.
 - Generic broker-owned JSONL and durable-file provider storage plus optional on-demand
   durable chat memory. Memory is model-queryable only under an effective all-three grant and is
   recorded once after gateway-attested complete transport acceptance; it is never automatically
