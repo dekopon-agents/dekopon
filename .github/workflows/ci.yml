@@ -93,6 +93,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint all targets
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Path installation uses the debug profile so it can reuse the smoke-test build. Keep a
+      # release-profile compile gate here; tag workflows still perform the final linked builds.
+      - name: Check release CLIs
+        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Detect unused dependencies
         run: cargo machete
       - name: Verify runner excludes privileged broker machinery
@@ -247,15 +251,12 @@ jobs:
           key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
-        with:
-          tool: cargo-nextest@0.9.143
-          fallback: none
       - name: Fetch exact standalone-provider test fixtures
         run: ci/fetch-external-provider-components.sh examples/providers
-      - name: Test workspace concurrently
-        run: cargo nextest run --workspace --all-features --locked
+      # This runner's CPU-heavy integration tests regressed under process-per-test nextest
+      # scheduling. Splitting this Cargo lane from lint/docs supplies the useful parallelism.
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
       - name: Test documentation
         run: cargo test --workspace --all-features --locked --doc
       - name: Finish CI metrics
@@ -432,12 +433,6 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_package != 'false' || needs.changes.outputs.run_release_metadata != 'false') }}
     runs-on: ubuntu-24.04
-    env:
-      SCCACHE_BASEDIRS: ${{ github.workspace }}
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-      SCCACHE_GHA_VERSION: dekopon-v1
-      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -456,11 +451,8 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
-      - name: Configure compiler cache
-        if: ${{ needs.changes.outputs.run_package != 'false' }}
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.17.0
+      # Package verification recompiles unpacked sources under target/package, so its paths do not
+      # match the main-workspace compiler cache. Avoid hashing thousands of guaranteed misses.
       - name: Restore Cargo registry
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         id: cargo-cache
@@ -516,8 +508,6 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Start CI metrics
-        env:
-          CI_EXTRA_TARGETS: ${{ runner.temp }}/dekopon-install-target
         run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
@@ -622,16 +612,16 @@ jobs:
       - name: Verify path installation
         if: ${{ needs.changes.outputs.run_cli_install != 'false' }}
         shell: bash
-        # cargo install otherwise creates four independent temporary release target directories.
-        # One shared directory preserves release/install coverage while compiling common crates once.
+        # Reuse the debug workspace build rather than creating four independent release targets.
+        # The quality lane checks release-profile compilation in one unified dependency graph.
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/dekopon-install-target
+          CARGO_TARGET_DIR: target
         run: |
           set -euo pipefail
-          cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
@@ -641,7 +631,6 @@ jobs:
         env:
           CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
           CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-          CI_EXTRA_TARGETS: ${{ runner.temp }}/dekopon-install-target
         run: |
           if [[ -x .github/scripts/ci_metrics.sh ]]; then
             .github/scripts/ci_metrics.sh finish

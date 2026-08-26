@@ -153,6 +153,8 @@ jobs:
         run: ci/fetch-external-provider-components.sh examples/providers
       - name: Warm stable lint objects
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Warm release CLI objects
+        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Warm stable test objects
         run: cargo test --workspace --all-features --locked --no-run
       - name: Finish CI metrics

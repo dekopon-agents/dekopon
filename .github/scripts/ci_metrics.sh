@@ -41,33 +41,6 @@ tree_files() {
   fi
 }
 
-build_targets() {
-  local -a extra_targets=()
-  printf 'target\n'
-  if [[ -n ${CI_EXTRA_TARGETS:-} ]]; then
-    IFS=: read -r -a extra_targets <<< "$CI_EXTRA_TARGETS"
-    printf '%s\n' "${extra_targets[@]}"
-  fi
-}
-
-build_targets_kib() {
-  local path size total=0
-  while IFS= read -r path; do
-    size=$(tree_kib "$path")
-    total=$(( total + size ))
-  done < <(build_targets)
-  printf '%s\n' "$total"
-}
-
-build_targets_files() {
-  local path count total=0
-  while IFS= read -r path; do
-    count=$(tree_files "$path")
-    total=$(( total + count ))
-  done < <(build_targets)
-  printf '%s\n' "$total"
-}
-
 case "${1:-}" in
   start)
     mkdir -p "$(dirname "$state")"
@@ -76,8 +49,8 @@ case "${1:-}" in
       "$(date +%s)" \
       "$rx_bytes" \
       "$tx_bytes" \
-      "$(build_targets_kib)" \
-      "$(build_targets_files)" \
+      "$(tree_kib target)" \
+      "$(tree_files target)" \
       "$(tree_kib "${CARGO_HOME:-$HOME/.cargo}/registry")" \
       > "$state"
     ;;
@@ -94,8 +67,8 @@ case "${1:-}" in
     elapsed=$(( $(date +%s) - start_epoch ))
     rx_delta=$(( end_rx >= start_rx ? end_rx - start_rx : 0 ))
     tx_delta=$(( end_tx >= start_tx ? end_tx - start_tx : 0 ))
-    end_target_kib=$(build_targets_kib)
-    end_target_files=$(build_targets_files)
+    end_target_kib=$(tree_kib target)
+    end_target_files=$(tree_files target)
     end_registry_kib=$(tree_kib "${CARGO_HOME:-$HOME/.cargo}/registry")
 
     rx_mib=$(awk -v bytes="$rx_delta" 'BEGIN { printf "%.1f", bytes / 1048576 }')
@@ -119,7 +92,7 @@ case "${1:-}" in
       {
         printf '### CI metrics: %s%s%s\n\n' \
           "$markdown_tick" "${GITHUB_JOB:-unknown}" "$markdown_tick"
-        printf '| Elapsed | RX | TX | Build targets MiB | Build target files | Cargo registry MiB | Cache hit |\n'
+        printf '| Elapsed | RX | TX | Target MiB | Target files | Cargo registry MiB | Cache hit |\n'
         printf '|---:|---:|---:|---:|---:|---:|---:|\n'
         printf '| %ss | %s | %s | %s → %s | %s → %s | %s → %s | %s%s%s |\n\n' \
           "$elapsed" "$rx_mib" "$tx_mib" \
