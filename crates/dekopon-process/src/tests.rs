@@ -1,3 +1,5 @@
+//! Behavioral coverage for process lifecycle outcomes and tracing.
+
 use std::{
     collections::HashMap,
     io,
