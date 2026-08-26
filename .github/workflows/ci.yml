@@ -1,7 +1,7 @@
 name: CI
 
-# Branch protection makes this the pre-merge gate. Running the same seven expensive jobs again on
-# the resulting main commit adds no coverage; tag workflows perform only publication work.
+# Branch protection makes this the pre-merge gate. The resulting main commit only warms read-only
+# PR caches; it does not repeat test execution or publication validation.
 on:
   pull_request:
 
@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -21,6 +22,13 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       run_expensive: ${{ steps.classify.outputs.run_expensive }}
+      run_rust: ${{ steps.classify.outputs.run_rust }}
+      run_otel: ${{ steps.classify.outputs.run_otel }}
+      run_package: ${{ steps.classify.outputs.run_package }}
+      run_cli_install: ${{ steps.classify.outputs.run_cli_install }}
+      run_dependencies: ${{ steps.classify.outputs.run_dependencies }}
+      run_release_metadata: ${{ steps.classify.outputs.run_release_metadata }}
+      run_chart: ${{ steps.classify.outputs.run_chart }}
     steps:
       - name: Check out source and pull request history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,69 +42,63 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-
-          is_ci_input() {
-            local path=$1
-            case "$path" in
-              .github/workflows/ci.yml | \
-                .github/release-crates.txt | \
-                .github/scripts/prepare-package-cache.sh | \
-                .github/scripts/test_verify_changelog.py | \
-                .github/scripts/verify-release-metadata.py | \
-                .github/scripts/verify_changelog.py | \
-                CHANGELOG.md | .cargo/* | .clippy.toml | .rustfmt.toml | \
-                Cargo.lock | Cargo.toml | clippy.toml | deny.toml | rust-toolchain.toml | rustfmt.toml | \
-                examples/local/dekopon.yaml | \
-                ci/fetch-external-provider-components.sh | \
-                examples/otel-traces/compose.yaml | examples/otel-traces/smoke-test.sh | \
-                examples/providers/*-provider.wasm | wit/http/http.wit | charts/dekopon/*)
-                return 0
-                ;;
-            esac
-
-            [[ "$path" =~ ^crates/[^/]+/(Cargo\.toml|build\.rs)$ ]] ||
-              [[ "$path" =~ ^crates/[^/]+/(src|tests|examples|benches|wit)/ ]] ||
-              [[ "$path" =~ ^crates/[^/]+/(\.clippy|clippy|\.rustfmt|rustfmt)\.toml$ ]] ||
-              [[ "$path" =~ ^examples/pr-summarizer-linter/[^/]+\.(cedar|yaml|yaml\.example)$ ]] ||
-              [[ "$path" =~ ^examples/providers/[^/]+/(Cargo\.lock|Cargo\.toml|build\.rs)$ ]] ||
-              [[ "$path" =~ ^examples/providers/[^/]+/(src|tests|examples|benches|wit)/ ]] ||
-              [[ "$path" =~ ^examples/providers/[^/]+/(\.clippy|clippy|\.rustfmt|rustfmt)\.toml$ ]]
-          }
-
-          run_expensive=false
-          while IFS= read -r -d '' path; do
-            if is_ci_input "$path"; then
-              printf 'CI input changed: %s\n' "$path"
-              run_expensive=true
-              break
-            fi
-          done < <(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA")
-          echo "run_expensive=$run_expensive" >> "$GITHUB_OUTPUT"
+          git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" \
+            | python3 .github/scripts/classify_ci_changes.py \
+                --github-output "$GITHUB_OUTPUT" \
+                --summary "$GITHUB_STEP_SUMMARY"
 
   # Missing classifier output is not false, so classification failures fall back to full CI.
-  quality:
-    name: quality (stable)
+  quality_checks:
+    name: quality checks (stable)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
           components: clippy,rustfmt
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-machete@0.9.2
+          fallback: none
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint all targets
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Path installation uses the debug profile so it can reuse the smoke-test build. Keep a
+      # release-profile compile gate here; tag workflows still perform the final linked builds.
+      - name: Check release CLIs
+        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Detect unused dependencies
-        run: |
-          cargo install cargo-machete --locked
-          cargo machete
+        run: cargo machete
       - name: Verify runner excludes privileged broker machinery
         shell: bash
         run: |
@@ -153,10 +155,6 @@ jobs:
           done
           printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
           exit "$status"
-      - name: Fetch exact standalone-provider test fixtures
-        run: ci/fetch-external-provider-components.sh examples/providers
-      - name: Test workspace
-        run: cargo test --workspace --all-features --locked
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
@@ -199,20 +197,97 @@ jobs:
       - name: Check repository shell scripts
         run: |
           shellcheck \
+            .github/scripts/ci_metrics.sh \
             ci/fetch-external-provider-components.sh \
             examples/otel-traces/smoke-test.sh \
-            charts/dekopon/ci/verify-init-permissions.sh \
             examples/providers/build-component.sh \
             examples/providers/*/build.sh
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
+
+  stable_tests:
+    name: workspace tests (stable)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
+        with:
+          toolchain: stable
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      # This runner's CPU-heavy integration tests regressed under process-per-test nextest
+      # scheduling. Splitting this Cargo lane from lint/docs supplies the useful parallelism.
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
+      - name: Test documentation
+        run: cargo test --workspace --all-features --locked --doc
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
+
+  # Preserve the required branch-protection context while its two expensive halves run in parallel.
+  quality:
+    name: quality (stable)
+    needs: [changes, quality_checks, stable_tests]
+    if: ${{ always() && !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require stable quality lanes
+        env:
+          CHECKS_RESULT: ${{ needs.quality_checks.result }}
+          TESTS_RESULT: ${{ needs.stable_tests.result }}
+        run: |
+          test "$CHECKS_RESULT" = success
+          test "$TESTS_RESULT" = success
 
   otel-e2e:
     name: OTLP OpenObserve smoke test
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_otel != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Reads the mirrored OpenObserve image from this organization's registry. Narrower than the
@@ -220,19 +295,38 @@ jobs:
     permissions:
       contents: read
       packages: read
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
       - name: Fetch exact standalone echo fixture
         run: ci/fetch-external-provider-components.sh examples/providers echo
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          key: otel-openobserve
       - name: Sign in to the organization registry
         # The example pulls upstream by default; CI pulls the mirror instead, because an anonymous
         # pull from a public registry fails on other people's traffic rather than on this change.
@@ -244,24 +338,55 @@ jobs:
           OPENOBSERVE_PORT: "15080"
           OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
         run: examples/otel-traces/smoke-test.sh
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
 
   msrv:
     name: test (Rust 1.89.0)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
     # rust-toolchain.toml pins `channel = "stable"`, which outranks the `rustup default`
     # the toolchain action sets, so this job silently built on stable until 2026-08.
     # RUSTUP_TOOLCHAIN outranks the toolchain file and is what actually holds the MSRV.
     env:
       RUSTUP_TOOLCHAIN: 1.89.0
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: 1.89.0
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
       - name: Verify the MSRV toolchain is in effect
         shell: bash
         run: |
@@ -283,36 +408,63 @@ jobs:
             printf 'workspace rust-version is %s but this job pins %s; update both\n' "$declared" "$expected" >&2
             exit 1
           fi
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          key: msrv-1.89.0
       - name: Fetch exact standalone-provider test fixtures
         run: ci/fetch-external-provider-components.sh examples/providers
-      - name: Test workspace on MSRV
-        run: cargo test --workspace --all-features --locked
+      # Stable CI executes the tests. This gate proves that the same test targets still compile
+      # and link on the declared minimum toolchain without serially executing the suite twice.
+      - name: Compile workspace tests on MSRV
+        run: cargo test --workspace --all-features --locked --no-run
+      # Cargo cannot compile doctests under --no-run, so execute this small set to retain the
+      # compile-fail authority checks on the minimum toolchain.
+      - name: Test documentation on MSRV
+        run: cargo test --workspace --all-features --locked --doc
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
 
   package:
     name: package crates
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_package != 'false' || needs.changes.outputs.run_release_metadata != 'false') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
+      - name: Test CI path classification
+        run: python3 .github/scripts/test_classify_ci_changes.py
       - name: Test changelog validation
         run: python3 .github/scripts/test_verify_changelog.py
       - name: Test release metadata validation
         run: python3 .github/scripts/test_verify_release_metadata.py
+      - name: Check package shell scripts
+        if: ${{ needs.changes.outputs.run_package != 'false' }}
+        run: shellcheck .github/scripts/prepare-package-cache.sh
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      # Package verification recompiles unpacked sources under target/package, so its paths do not
+      # match the main-workspace compiler cache. Avoid hashing thousands of guaranteed misses.
+      - name: Restore Cargo registry
+        if: ${{ needs.changes.outputs.run_package != 'false' }}
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          shared-key: package
-          cache-bin: false
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
       - name: Verify release metadata
         shell: bash
         run: |
@@ -322,25 +474,60 @@ jobs:
             --metadata "$RUNNER_TEMP/metadata.json" \
             --plan .github/release-crates.txt \
             --changelog CHANGELOG.md
+      # Source-only changes are already compiled and tested from the same explicit src/** package
+      # include sets. Archive verification is reserved for inputs that can change package contents,
+      # dependency rewriting, build scripts, or publication metadata.
       - name: Package every publishable crate
+        if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: cargo package --workspace --locked
-      - name: Prepare package cache for saving
+      - name: Test package-cache cleanup
+        if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: .github/scripts/prepare-package-cache.sh
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
 
   cli-smoke:
     name: CLI smoke tests
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
           toolchain: stable
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
         run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Fetch exact standalone echo fixture
@@ -423,21 +610,36 @@ jobs:
           set -e
           test "$status" -eq 1
       - name: Verify path installation
+        if: ${{ needs.changes.outputs.run_cli_install != 'false' }}
         shell: bash
+        # Reuse the debug workspace build rather than creating four independent release targets.
+        # The quality lane checks release-profile compilation in one unified dependency graph.
+        env:
+          CARGO_TARGET_DIR: target
         run: |
-          cargo install --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
+          set -euo pipefail
+          cargo install --debug --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
+          cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
 
   deny:
     name: dependency policy
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_dependencies != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -451,13 +653,15 @@ jobs:
   chart:
     name: helm chart
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_expensive != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.run_chart != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Show Helm version
         run: helm version
+      - name: Check chart shell scripts
+        run: shellcheck charts/dekopon/ci/verify-init-permissions.sh
       - name: Verify chart changelog
         shell: bash
         run: |

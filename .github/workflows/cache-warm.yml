@@ -1,0 +1,216 @@
+name: Cargo cache warm
+
+# Pull-request jobs consume both caches read-only. Warming on main gives every PR a compatible base
+# without uploading multi-gigabyte, PR-scoped target archives that another PR cannot restore.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/cache-warm.yml"
+      - ".github/workflows/ci.yml"
+      - ".clippy.toml"
+      - "clippy.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "crates/**/Cargo.toml"
+      - "crates/**/build.rs"
+      - "crates/**/src/**"
+      - "crates/**/tests/**"
+      - "crates/**/wit/**"
+      - "examples/providers/**/Cargo.lock"
+      - "examples/providers/**/Cargo.toml"
+      - "examples/providers/**/build.rs"
+      - "examples/providers/**/src/**"
+      - "examples/providers/**/tests/**"
+      - "examples/providers/**/wit/**"
+      - "ci/fetch-external-provider-components.sh"
+      - "wit/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-cache-warm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  registry:
+    name: warm Cargo registry
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
+        with:
+          toolchain: stable
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
+      - name: Fetch every workspace dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          shopt -s nullglob
+          for manifest in examples/providers/*/Cargo.toml; do
+            cargo fetch --locked --manifest-path "$manifest"
+          done
+      - name: Bound Cargo registry cache
+        id: registry-size
+        shell: bash
+        run: |
+          set -euo pipefail
+          size_kib=0
+          for path in \
+            "$HOME/.cargo/registry/index" \
+            "$HOME/.cargo/registry/cache" \
+            "$HOME/.cargo/git/db"; do
+            if [[ -e "$path" ]]; then
+              path_kib=$(du -sk "$path" | awk '{ print $1 }')
+              size_kib=$((size_kib + path_kib))
+            fi
+          done
+          limit_kib=$((512 * 1024))
+          echo "size_kib=$size_kib" >> "$GITHUB_OUTPUT"
+          if (( size_kib <= limit_kib )); then
+            echo 'save=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+            echo "::warning::Cargo registry cache is ${size_kib} KiB; refusing to save above ${limit_kib} KiB"
+          fi
+      - name: Save Cargo registry
+        if: ${{ steps.cargo-cache.outputs.cache-hit != 'true' && steps.registry-size.outputs.save == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
+
+  stable:
+    name: warm stable compiler objects
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      - name: Warm stable lint objects
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Warm release CLI objects
+        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+      - name: Warm stable test objects
+        run: cargo test --workspace --all-features --locked --no-run
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
+
+  msrv:
+    name: warm Rust 1.89.0 compiler objects
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start CI metrics
+        run: .github/scripts/ci_metrics.sh start
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
+        with:
+          toolchain: 1.89.0
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Restore Cargo registry
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-${{ runner.os }}-
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      - name: Warm MSRV test objects
+        run: cargo test --workspace --all-features --locked --no-run
+      - name: Finish CI metrics
+        if: ${{ always() }}
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+        run: |
+          if [[ -x .github/scripts/ci_metrics.sh ]]; then
+            .github/scripts/ci_metrics.sh finish
+          fi
