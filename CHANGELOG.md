@@ -9,6 +9,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added `dekopon-process`, a small unprivileged Tokio lifecycle seam that runs one typed async
+  operation as one payload-free traced task under a self-contained supervisor that keeps joining,
+  recording, and delivering it to a required abandonment observer if the outer caller is dropped
+  while the owning Tokio runtime remains alive. Normal runner execution keeps that runtime alive.
+  `dekopon-run shell` now moves provider loading and the unchanged synchronous interpreter off
+  runtime workers as one opaque non-interruptible blocking node. Structured scopes/ports,
+  cooperative cancellation, per-stage shell lowering, and provider stdin remain follow-ups
+  requiring a real consumer.
 - Added public inert secret DRNs and an owner-only private secret map. A broker-backed model may
   propose exact Basic/Bearer use without placing a reference or value in provider JSON/WIT; the
   broker requires ordinary capability policy, a separate exact Cedar `secret.use` grant, and a

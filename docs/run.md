@@ -45,7 +45,7 @@ The example provider also exposes `echo.reverse`, `echo.upcase`, and `echo.downc
 
 ## Shell mode
 
-`dekopon-run shell` runs one script through [`dekopon-shell`](../crates/dekopon-shell/), a sandboxed bash-flavored interpreter whose command words dispatch to provider capabilities instead of operating-system processes. It contacts no model. The same interpreter backs the single `bash` tool prompt mode offers, so `shell` is the way to develop and replay a script by hand exactly as a model would run it.
+`dekopon-run shell` runs one script through [`dekopon-shell`](../crates/dekopon-shell/), a sandboxed bash-flavored interpreter whose command words dispatch to provider capabilities instead of operating-system processes. It contacts no model. Provider loading and the synchronous interpreter execute on Tokio's blocking pool as one opaque, joined [`dekopon-process`](../crates/dekopon-process/) node. That node is explicitly non-interruptible after start: its own existing shell/provider deadlines still apply, and this lifecycle seam exposes no cancellation path that could return while blocking work continues. If its outer caller is dropped, the supervisor delivers the full result to the runner's abandonment observer while the Tokio runtime remains alive; normal runner command execution keeps that runtime alive, and runtime shutdown is the ownership boundary. Shell pipeline stages are not process nodes yet, so values, variable scope, output, and exit status are unchanged. The same interpreter backs the single `bash` tool prompt mode offers, so `shell` is the way to develop and replay a script by hand exactly as a model would run it.
 
 ```console
 cargo run -p dekopon-run -- shell \

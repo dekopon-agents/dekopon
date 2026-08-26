@@ -587,6 +587,7 @@ A short-lived runner uses batch exporters and explicitly shuts down both provide
 One generated OpenTelemetry trace links the command to spans such as:
 
 - `runner.command`, `runner.prompt`, `runner.shell`, and `prompt.session`;
+- `process.run` and `process.node` at `DEBUG` for process-lifecycle work;
 - `prompt.model_turn` and `model.complete`;
 - `prompt.script`, `shell.script`, and `shell.command`; and
 - `prompt.model_turn` and `model.complete`, with `chatgpt.refresh` nested inside the latter whenever
@@ -595,6 +596,17 @@ One generated OpenTelemetry trace links the command to spans such as:
   `credential.expires_at`, and never any token material;
 - `prompt.script` and `shell.command`; and
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
+
+`process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
+private stable `node.id`, root parent, fixed `process.kind`, `non-interruptible` contract, and
+terminal `process.outcome`. Tokio task IDs, scripts, argv, values, diagnostics, provider payloads,
+and raw operation errors are absent. These spans are `DEBUG` so normal INFO telemetry volume does
+not grow with frontend process nodes; a diagnostic filter may enable them. The current
+`dekopon-run shell` path contributes exactly one `legacy-shell` node and keeps the existing
+`shell.script`/`shell.command` spans beneath it. The runner's trace filter explicitly includes the
+`dekopon_process` target; when a sink disables these DEBUG spans, `Span::or_current` keeps existing
+shell/provider work under the current `runner.shell` parent. No public process IDs, scopes, ports,
+cancellation, or graph telemetry contract exists yet.
 
 The runner's own `provider.invoke` — `dekopon-provider-host`, not the broker host — carries provider,
 capability, component path, `input.bytes`, `output.bytes`, and `fuel.remaining`. Counts and fuel
@@ -644,7 +656,7 @@ capabilities one guess at a time.
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code mapping; flattening them would hide an authorization refusal in the noise of ordinary failures. `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this shell excludes, and an exhausted sandbox budget.
 
-Structured log records use stable `audit.event` attributes. They no longer mirror spans: a command's start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream carries only accounting, refusals, errors, and — when opted in — payloads. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
+Structured log records use stable `audit.event` attributes. They no longer mirror spans: a command's start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream carries only accounting, refusals, errors, and — when opted in — payloads. `runner.shell.unobserved` is the exceptional lifecycle record emitted, while the owning Tokio runtime remains alive, when a dropped `ProcessRun::execute` caller cannot receive its shell outcome: it carries only `command.name`, low-cardinality `outcome`, and `error.type`. A successful abandoned `CommandOutput` is never rendered or logged; an abandoned error's complete cause goes only through the runner's ordinary operator stderr reporter. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
 
 ## Data minimization
 

@@ -18,7 +18,7 @@ use tracing_subscriber::{
 use crate::cli::TelemetryArgs;
 
 /// Crates whose execution spans and lifecycle events belong in runner telemetry.
-const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_agent=trace,dekopon_model=trace,dekopon_provider_host=trace,dekopon_shell=trace";
+const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_agent=trace,dekopon_model=trace,dekopon_process=trace,dekopon_provider_host=trace,dekopon_shell=trace";
 /// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
 /// feed its own export failures back into itself.
 const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_agent=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
@@ -249,11 +249,17 @@ mod tests {
                 tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
                 tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
                 tracing::info!(target: "dekopon_run", "runner event");
+                tracing::debug!(target: "dekopon_process", "process lifecycle span proxy");
             });
 
+            let expected = if filter == TRACE_FILTER {
+                vec!["dekopon_run".to_owned(), "dekopon_process".to_owned()]
+            } else {
+                vec!["dekopon_run".to_owned()]
+            };
             assert_eq!(
                 *recorded.0.lock().expect("target log"),
-                vec!["dekopon_run".to_owned()],
+                expected,
                 "{filter}"
             );
         }

@@ -7,6 +7,7 @@ dekopon-capability
 dekopon-storage-host
 dekopon-model
 dekopon-shell
+dekopon-process
 dekopon-http-host
 dekopon-protocol
 dekopon-provider-sdk
