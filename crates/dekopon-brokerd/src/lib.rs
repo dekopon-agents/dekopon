@@ -10,6 +10,7 @@ mod checkpoint;
 mod config;
 mod credentials;
 mod provider_manager;
+mod secrets;
 mod server;
 mod socket;
 
@@ -40,12 +41,17 @@ pub use config::{
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
 };
+pub use dekopon_broker::MAX_SECRET_BINDINGS as HARD_MAX_SECRET_BINDINGS;
 pub use provider_manager::{
     HARD_MAX_PROVIDER_COMPONENT_BYTES, HARD_MAX_PROVIDER_MANIFEST_BYTES,
     HARD_MAX_PROVIDER_STATE_BYTES, HARD_MAX_PROVIDER_STORE_BLOBS, HARD_MAX_PROVIDER_STORE_BYTES,
     PROVIDER_ARTIFACT_TYPE, PROVIDER_LAYER_MEDIA_TYPE, ProviderLock, ProviderLockApiVersion,
     ProviderManager, ProviderManagerError, ProviderManagerOptions, ProviderManagerPaths,
     ProviderSet, ProviderSetApiVersion, ProviderStatus, ProviderSyncReport, ProviderVerifyReport,
+};
+pub use secrets::{
+    HARD_MAX_SECRET_BYTES, HARD_MAX_SECRET_MAP_BYTES, HARD_MAX_SECRETS, SECRET_MAP_API_VERSION,
+    SecretMapError, SourceError,
 };
 pub use server::{BrokerServer, MappedPeer, ServerError, ServerLimits};
 pub use socket::{SocketError, SocketGuard, current_uid};
@@ -143,6 +149,11 @@ where
         Some(path) => credentials::load(path, uid).await?,
         None => CredentialStore::empty(),
     };
+    let secret_catalog = match &config.secret_map_path {
+        Some(path) => secrets::load(path, uid).await?,
+        None => dekopon_broker::SecretCatalog::empty(),
+    };
+    let secret_drns = secret_catalog.drns().cloned().collect::<Vec<_>>();
 
     let (checkpoint_store, stored_checkpoint) = checkpoint::CheckpointStore::open(
         &config.checkpoint_path,
@@ -262,6 +273,7 @@ where
             .capabilities()
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
+    .map(|world| world.with_secrets(secret_drns))
     .map_err(|source| BrokerdError::Policy { source })?;
     let leniency = if config.strict {
         Leniency::Strict
@@ -306,6 +318,9 @@ where
         replay_ids,
     )
     .map_err(BrokerdError::Broker)?;
+    let broker = broker
+        .with_secret_catalog(secret_catalog)
+        .map_err(BrokerdError::Broker)?;
     let broker = match config.chat_memory {
         Some(memory) => broker
             .with_chat_memory(memory)
@@ -668,6 +683,9 @@ pub enum BrokerdError {
     /// Owner-only credential storage failed hygiene, decoding, or resolution.
     #[error("broker credentials are unavailable or invalid")]
     Credentials(#[from] CredentialsError),
+    /// Owner-only public-DRN to private-source map failed validation.
+    #[error("broker private secret map is unavailable or invalid")]
+    Secrets(#[from] SecretMapError),
     /// Owner-only durable audit could not be opened and verified.
     #[error("broker durable audit is unavailable")]
     Audit(#[source] dekopon_broker::FileAuditError),

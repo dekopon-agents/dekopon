@@ -276,6 +276,7 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
                         trace: "trace-suspended".parse().expect("valid trace fixture"),
                         trace_parent: None,
                         input: serde_json::json!({"message": "denied"}),
+                        secret_use: None,
                     },
                 )
                 .await

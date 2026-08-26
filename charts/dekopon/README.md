@@ -57,7 +57,7 @@ wrong:
 
 | Tier | Applies to | Rule |
 |---|---|---|
-| A | `broker-credentials.yaml`, the audit JSONL, the checkpoint, the checkpoint lock, every socket | rejected if `mode & 0o077 != 0` |
+| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL, the checkpoint, the checkpoint lock, every socket | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
 | C | socket, audit and checkpoint parent directories | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
@@ -131,6 +131,8 @@ files; it does not rewrite configuration.
 | `broker.yaml` | `/etc/dekopon/broker.yaml` | B | init container |
 | `policies.cedar` | `/etc/dekopon/policies.cedar` | B | init container |
 | `broker-credentials.yaml` | `/etc/dekopon/broker-credentials.yaml` | A | init container |
+| private `secret-map.yaml` | `/etc/dekopon/secret-map.yaml` | A | init container; broker only |
+| optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | A + C | the broker, at bind |
 | audit chain | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
@@ -539,24 +541,35 @@ cannot take the audit chain when the claim stops being rendered. See
 
 ## Configuration values
 
-Each of the four operator-supplied files is either inline, in which case the chart writes a Secret,
-or a reference to an object that already exists. Setting both is an error.
+Each operator-supplied file is either inline, in which case the chart writes a Secret, or a reference
+to an object that already exists. Setting both is an error.
 
 | Value | Inline | Existing object |
 |---|---|---|
 | `broker.yaml` | `broker.config.inline` | `broker.config.existingSecret` / `.existingSecretKey` |
 | `policies.cedar` | `broker.policies.inline` | `broker.policies.existingSecret` / `.existingSecretKey` |
 | `broker-credentials.yaml` | `broker.credentials.inline` | `broker.credentials.existingSecret` / `.existingSecretKey` |
+| private secret map | `broker.secretMap.inline` | `broker.secretMap.existingSecret` / `.existingSecretKey` |
 | `dekopond.yaml` | `gateway.config.inline` | `gateway.config.existingSecret` / `.existingSecretKey` |
 | agent catalog | `gateway.catalog.inline` | `gateway.catalog.existingConfigMap` / `.existingConfigMapKey` |
 | ChatGPT credential | `gateway.chatgpt.inline` | `gateway.chatgpt.existingSecret` / `.existingSecretKey` |
 
-Use `existingSecret` for credentials. An inline value is stored in the release, returned by
-`helm get values`, and usually committed.
+Use `existingSecret` for credentials and the private map. An inline value is stored in the release,
+returned by `helm get values`, and usually committed.
+
+`broker.secretBootstrapFiles` copies operator-managed Secret keys through the existing root init
+boundary into `<paths.configDir>/<file>` as broker-UID-owned `0600` files, which is how token/session
+files for 1Password, Vault, AWS, GCP, Azure, or Kubernetes API adapters reach the stock chart.
+`broker.secretSourceVolumes` separately mounts explicitly named Kubernetes volumes read-only into the broker
+and nowhere in the gateway. A Secret/ConfigMap volume keeps its AtomicWriter symlink layout and is
+consumed through `source.kind: kubernetesProjection`; the map's root must equal the corresponding
+`mountPath`. Names, canonical absolute mount paths, required volume maps, and overlap with chart
+paths are checked at template time. Bootstrap tokens requiring the ordinary `0600` loader use `broker.secretBootstrapFiles`; no custom
+init container is needed. See [`../../docs/secrets.md`](../../docs/secrets.md).
 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
-names `policiesPath`, `credentialsPath`, or `constraintSets` with no corresponding value supplied;
+names `policiesPath`, `credentialsPath`, `secretMapPath`, or `constraintSets` with no corresponding value supplied;
 `paths.catalogDir` is inside `paths.configDir`; or `terminationGracePeriodSeconds` is shorter than
 the two drains it has to cover in sequence. When provider storage is enabled, its root and
 key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with

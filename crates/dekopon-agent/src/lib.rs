@@ -158,6 +158,25 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         }
     }
 
+    fn invoke_with_secret_use(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        match secret_use {
+            None => self.invoke(capability, input),
+            Some(secret_use) => match &self.broker {
+                Some(broker) if broker.is_granted(capability) => {
+                    broker.invoke_with_secret_use(capability, input, Some(secret_use))
+                }
+                _ => CapabilityCallResult::Denied {
+                    reason: "secret references require a broker-backed capability".to_owned(),
+                },
+            },
+        }
+    }
+
     fn command_words(&self) -> Vec<String> {
         let mut words = self.direct.command_words();
         if let Some(broker) = &self.broker {
@@ -521,6 +540,15 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+        self.invoke_with_secret_use(capability, input, None)
+    }
+
+    fn invoke_with_secret_use(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };
@@ -546,6 +574,7 @@ impl CapabilityInvoker for BrokerLeg {
             // the script span that actually asked for this capability rather than to the session
             // root.
             trace_parent: current_trace_parent(),
+            secret_use,
             input,
         };
 

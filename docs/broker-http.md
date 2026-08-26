@@ -8,7 +8,7 @@ The immutable `dekopon:http@1.0.0` WIT package, the `dekopon-provider-http` Rust
 
 `dekopon-broker` now binds a separately supplied authenticated context, asks a `dekopon-policy` Cedar engine whether it may act, validates trusted metadata and constraints at startup, rejects invocation-ID reuse across verified durable history and the current process, creates and consumes single-use authorization, returns an inert decision reference plus digest evidence, and appends redacted events to a bounded verifiable in-memory or durable JSONL hash chain. Its integration tests prove deny-before-execution and ensure input, output, URL path/query, headers, and bodies do not enter audit records.
 
-The versioned local wire format, explicit `dekopon-run broker` Unix client commands, `dekopon-brokerd` process, JSONPlaceholder demonstration provider, and atomic local audit checkpoint are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. Broker-owned destination-bound credential resolution is current, per capability and optionally per acting agent, as is broker-side attested identity: owner-configured attestor grants, subject-to-principal mappings, and policy conditioned on `context.via`. The agent half of orchestration integration is current too: `dekopond` drives bounded sessions whose capability calls become attested proposals on this protocol ([`dekopond.md`](dekopond.md)). Independent checkpoint retention/signing, a dedicated gateway UID, and operator-CLI integration remain committed direction.
+The versioned local wire format, explicit `dekopon-run broker` Unix client commands, `dekopon-brokerd` process, JSONPlaceholder demonstration provider, and atomic local audit checkpoint are also current. Frames are length-delimited and deadline-bounded; invocation payloads contain no identity/authority fields; clients verify private socket ownership plus server peer UID; and the listener maps connected peer UID through strict owner-controlled configuration before invoking the core. Broker-owned destination-bound credential resolution is current, per capability and optionally per acting agent. Public logical DRNs and the owner-only private secret map are also current: an exact typed proposal passes a separate `secret.use` decision and native use binding before one source snapshot resolves. Broker-side attested identity remains owner-configured grants, subject-to-principal mappings, and policy conditioned on `context.via`. The agent half of orchestration integration is current too: `dekopond` drives bounded sessions whose capability calls become attested proposals on this protocol ([`dekopond.md`](dekopond.md)). Independent checkpoint retention/signing, a dedicated gateway UID, and operator-CLI integration remain committed direction.
 
 ## Decision
 
@@ -137,6 +137,12 @@ The server logs `broker_outcome_unaudited` with the invocation identifier for ex
 `capacity-exhausted` separates a permanent exhaustion from a momentary one. `broker-unavailable` invites a retry under a fresh invocation identifier; the replay ledger and the audit log are conditions under which that retry can never succeed. Neither structure evicts or rotates, and restart does not clear the ledger — `scan_audit_file` restores an entry for every Decision event in durable history — so a client told `broker-unavailable` would loop against a permanently capped broker. The server logs `broker_capacity_exhausted` alongside the refusal; the fix is an operator raising `brokerLimits.maxReplayIds` or `serverLimits.auditMaxRecords`, or moving the audit file aside, not anything the caller can do.
 
 Size `maxReplayIds` against `auditMaxRecords` rather than below it. The ledger bound is cumulative across restarts for the same reason: one restored identifier per durable Decision event. A denial costs one audit record and one ledger slot, while an executed invocation costs two audit records and one slot, so a denial-heavy history exhausts a ledger sized at half the audit budget *first* — before the designed `AuditError::Full` refusal the audit bound exists to produce. The stock `maxReplayIds` of 100 000 is therefore undersized for the chart's `auditMaxRecords: 200000`; set them equal.
+A DRN refusal is a normal denied invocation with reason `secret-denied`; unknown, unbound,
+wrong-sink/username and Cedar-denied names deliberately share it. A source that is missing,
+malformed, oversized, unavailable or times out after authorization produces a normal failed
+invocation such as `secret-resolution`, plus a terminal execution audit record with zero HTTP
+calls. No provider work began, so retry is safe but useful only after the source condition changes.
+
 A failure response is not the only way to reach that state. Nothing ties a client's `io_timeout` to broker-side execution deadlines, so a client whose response read fails is in the same position: the complete request frame was delivered and the outcome is unknown to it. `ClientError` therefore records which half of the exchange failed — a request-phase framing failure delivered nothing, a response-phase one delivered everything — and `ClientError::may_have_executed` covers both that case and the `outcome-unaudited` code. A caller submitting a write must map it to a non-retryable result: `dekopon-agent` reports it to a script as `denied` (exit `126`) rather than as a generic failure, because a retry carries a fresh invocation identifier and replay rejection cannot recognize it as a duplicate.
 
 Invalid informational reports are also diagnosable server-side without widening the wire: `AgentInventory::validate` and `ModelUsageReport::validate` name the offending agent and the exact bound, `dekopon-brokerd` logs that as `broker_agent_inventory_rejected` / `broker_model_usage_rejected`, and the response stays the generic `invalid-request`.
@@ -174,7 +180,7 @@ Before performing a request, the broker host validates all of the following agai
 
 The native client does not inherit proxy configuration from the environment, does not follow redirects, and disables automatic decompression. DNS results are checked against destination rules and pinned into the client before connection, so a later resolver answer or redirect cannot escape that decision. Response headers and bodies, host calls, Wasm memory and fuel, serialized input/output, and wall-clock duration are bounded. Timing out an invocation drops the async Wasmtime/HTTP operation and releases its fresh store.
 
-Provider credentials remain broker-owned, and the credential resolver is now current. An owner-only credentials file (strict `dekopon.dev/broker-credentials/v1alpha1`, mode `0600`, single-link, byte-capped) resolves symbolic names into destination-bound `authorization` values held in `Redacted` wrappers. A constraint set binds a default name with `credential:` and optional per-agent overrides with `credentialByAgent:`; construction fails closed for *every* name the set can select unless it exists, the set grants HTTP authority, and every `allowedHosts` entry appears verbatim in that credential's `destinations` — which makes a runtime destination mismatch unreachable. The native engine injects the header strictly after guest-header validation (a guest-supplied `authorization` is still rejected, never overwritten), only for requests whose resolved authority falls inside the binding, refusing rather than sending unauthenticated otherwise. The injected header counts against neither guest byte grants nor public evidence sizes; evidence and audit record only `credentialInjected: true`. Raw credentials are never returned to the provider, model, client, trace, evidence, or normal audit fields, and destination binding plus redaction are independently tested at the engine, broker, and service layers.
+Provider credentials remain broker-owned. Two selection paths are current: legacy implicit credentials, and separately authorized public DRNs. An owner-only credentials file (strict `dekopon.dev/broker-credentials/v1alpha1`, mode `0600`, single-link, byte-capped) resolves symbolic names into destination-bound `authorization` values held in `Redacted` wrappers. A constraint set binds a default name with `credential:` and optional per-agent overrides with `credentialByAgent:`; construction fails closed for *every* name the set can select unless it exists, the set grants HTTP authority, and every `allowedHosts` entry appears verbatim in that credential's `destinations` — which makes a runtime destination mismatch unreachable. The native engine injects the header strictly after guest-header validation (a guest-supplied `authorization` is still rejected, never overwritten), only for requests whose resolved authority falls inside the binding, refusing rather than sending unauthenticated otherwise. The injected header counts against neither guest byte grants nor public evidence sizes; evidence and audit record only `credentialInjected: true`. Raw credentials are never returned to the provider, model, client, trace, evidence, or normal audit fields, and destination binding plus redaction are independently tested at the engine, broker, and service layers. A DRN-backed call additionally commits the exact sink/use binding into authorization; the host refuses a swapped credential and direct raw/rendered reflection.
 
 ### Selecting a credential per agent
 
@@ -182,7 +188,24 @@ One capability presents one credential to everyone by default. `credentialByAgen
 
 Selection keys on the agent because that is the identity the deployment already partitions on — a route binds a transport and a match to an agent, so per-agent credentials are per-workspace and per-channel scoping for free. It is trusted input rather than a caller claim: the agent name arrives in the `AuthenticatedContext` the broker itself derived from an owner-configured attestor grant and identity mapping, never from an invocation payload, and the map that interprets it is owner-authored configuration in the same file as the rest of the execution bounds. A caller carrying no agent at all — a direct `dekopon-run` peer with `Actor::Service` — matches no override and takes the default. A set with no default and no matching override keeps the original meaning of an absent credential: the capability transacts unauthenticated.
 
-Cedar still cannot reach any of it. A policy edit can broaden who may drive an agent; it can never bind a credential, and it cannot make an agent present a token the constraint set did not already give it.
+Cedar still cannot reach any of the legacy selection map. A policy edit can broaden who may drive an agent; it can never bind a legacy credential, and it cannot make an agent present a token the constraint set did not already give it.
+
+### Model-selected public DRNs
+
+A DRN is the deliberately different path. The model selects an inert logical name in a typed
+top-level proposal, never provider JSON. The broker first permits the capability, then asks Cedar a
+second question: may this authenticated principal use exactly this `Dekopon::Secret` for the named
+capability/provider/native sink? An owner-only `SecretUseBinding` must independently match and is
+narrower than the capability's HTTP constraints. The resulting `SecretUseGrant` binds DRN, sink,
+binding ID, authority, method, canonical exact/segment-prefix path, query policy and injection count
+into the authorization serialized for evidence.
+
+Only after durable decision audit does `dekopon-brokerd` resolve one invocation-pinned snapshot from
+the private source. `dekopon-broker-host` equality-checks the resolved credential against the grant,
+and `dekopon-http-host` renders strict Bearer or Basic at the final boundary. No provider or HTTP WIT
+change is involved. Existing implicit credentials remain the right choice when a model has no reason
+to select among secrets. [`secrets.md`](secrets.md) defines DRN grammar, map schema, all current
+adapters, path matching, rotation and reflection limitations.
 
 ## Authorization policy
 
@@ -208,15 +231,17 @@ consulting policy, and refuses to start if any policy could ever permit it.
 ### The entity model
 
 Everything is in the `Dekopon` namespace: `Dekopon::Principal`, `Dekopon::Provider`,
-`Dekopon::Agent`, one `Dekopon::Action::"<capability-id>"` per loaded capability, and the fixed
-`Dekopon::Action::"agent.prompt"`. Capability actions apply to a `Principal` over a `Provider`;
-`agent.prompt` applies to a `Principal` over an `Agent`. No entity carries attributes.
+`Dekopon::Agent`, `Dekopon::Secret`, one `Dekopon::Action::"<capability-id>"` per loaded capability,
+and the fixed `agent.prompt` and `secret.use` actions. Capability actions apply to a `Principal`
+over a `Provider`; `agent.prompt` applies over an `Agent`; `secret.use` applies over one exact DRN.
+No entity carries attributes.
 
 Capability actions carry a context of `{ via?, subject?, agent?, effect, risk, idempotency }`;
-`agent.prompt` carries `{ via?, subject?, agent? }`. Every value is rendered by the broker from
-authenticated transport state or owner-controlled configuration. Message content and provider input
-are deliberately absent: conditioning authorization on untrusted JSON needs a settled schema
-treatment first, so until then no policy can be made to depend on a value the caller supplies.
+`agent.prompt` carries `{ via?, subject?, agent? }`. Those values come from authenticated transport
+state or owner-controlled configuration. Message content and arbitrary provider input remain absent.
+`secret.use` is the one settled caller-supplied exception: its resource is a strongly validated
+public DRN and its fixed context names capability, provider and sink; it still grants nothing without
+the owner-authored execution binding.
 
 `agent.prompt` is the session gate. Permitting a principal to drive an agent is now its own
 explicit statement, checked before `capabilitiesFor` answers and before `invokeFor` authorizes
@@ -267,7 +292,7 @@ a per-request channel for policy source.
 
 The current core appends one decision event for every decoded invocation from a mapped peer and a terminal execution event after each completed authorized attempt. Events correlate authenticated principal, actor, authorizing broker, invocation and trace identifiers, capability, provider, policy decision, determining policy identifiers, policy-set digest, effect/risk/idempotency classification, the symbolic name of the selected credential, timing, outcome, output digest, and bounded HTTP metadata. Public results carry the same decision linkage and digest evidence. Request input, provider output, URL paths/queries, headers, bodies, cookies, credentials, and model text are not written to audit fields.
 
-The credential's *name* is deliberately in that list and its value is deliberately not. The name is owner-authored configuration that already sits in `broker.yaml`; once one capability can present two credentials, a record omitting it makes two external writes to two different organizations indistinguishable, and "which authority did this write use" is exactly what an auditor is reconstructing. `credentialInjected` in the per-call HTTP evidence still reports whether a given call presented one. The field is absent when an invocation selected no credential, so a record written before per-agent selection existed decodes and re-serializes to the same bytes it hashed over.
+A legacy credential's *name* is deliberately in that list and its value is deliberately not. A DRN-backed decision/execution instead carries optional public `secret` and `secret_sink` fields; the legacy `credential` field stays absent. The name is owner-authored configuration that already sits in `broker.yaml`; once one capability can present two credentials, a record omitting it makes two external writes to two different organizations indistinguishable, and "which authority did this write use" is exactly what an auditor is reconstructing. `credentialInjected` in the per-call HTTP evidence still reports whether a given call presented one. The field is absent when an invocation selected no credential, so a record written before per-agent selection existed decodes and re-serializes to the same bytes it hashed over.
 
 The bounded in-memory implementation hash-links events for tests. `FileAuditLog` persists exclusively writer-locked owner-only bounded JSONL, verifies the complete existing chain before append, synchronizes every decision/outcome, rejects partial writes, reconstructs replay IDs on restart, and can verify an exact count/head prefix. `dekopon-brokerd` maintains that count/head in a separate strict owner-only checkpoint under its own writer lock. It writes audit first, then synchronizes and atomically replaces the checkpoint; startup fails if a non-empty audit has no checkpoint or the checkpoint is not an exact verified prefix. A valid checkpoint exactly one record behind the audit is the recoverable crash window and is advanced before listening; a larger gap fails closed.
 

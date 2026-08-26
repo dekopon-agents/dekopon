@@ -26,9 +26,10 @@ Everything lives in the `Dekopon` namespace.
 | `Dekopon::Principal` | enumerated from peer identities and subject mappings | principal of every action |
 | `Dekopon::Provider` | enumerated from loaded provider manifests | resource of every capability action |
 | `Dekopon::Agent` | **not** enumerated; matched by UID | resource of `agent.prompt` |
+| `Dekopon::Secret` | public DRNs from the owner-only private map | resource of `secret.use` |
 
 Actions are one `Dekopon::Action::"<capability-id>"` per loaded capability, plus the fixed
-`Dekopon::Action::"agent.prompt"`. None of the entities carry attributes: a policy matches them
+`agent.prompt` and `secret.use` actions. None of the entities carry attributes: a policy matches them
 with `==` and `in`, and there is no entity data for an expression to read.
 
 Agents are the one type whose instances are not declared, because the agent catalog belongs to the
@@ -55,9 +56,9 @@ denied `unconstrained-capability` before Cedar is consulted.
 ## Context
 
 Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`. `agent.prompt`
-carries `{ via?, subject?, agent? }` — it has no capability to classify, and strict validation
-turns a policy that reads `context.effect` there into a startup error rather than a per-request
-evaluation failure.
+carries `{ via?, subject?, agent? }`. `secret.use` carries those routing fields plus the exact
+capability, provider and native sink the public DRN was proposed for. Strict validation prevents a
+field from being read on an action that never carries it.
 
 Every value is rendered by the broker from authenticated transport state or owner-controlled
 configuration:
@@ -69,9 +70,10 @@ configuration:
 - `effect` / `risk` / `idempotency` — the trusted classification the broker will execute under,
   matched byte for byte against the loaded manifest at startup.
 
-Message content and provider input are deliberately **not** context. Conditioning authorization on
-untrusted input is a plausible future addition, but it needs a settled schema treatment for open
-JSON first; until then no policy can be made to depend on a value the caller supplies.
+Message content and arbitrary provider input are deliberately **not** context. A public DRN is the
+one narrow caller-supplied exception: it is a strongly validated resource on a separate action and
+remains inert without an independently validated owner binding. Open JSON still has no policy
+schema and cannot influence a decision.
 
 ## Determinism and bounds
 

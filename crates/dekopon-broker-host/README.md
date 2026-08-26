@@ -36,7 +36,7 @@ A denied destination or method cannot be hidden by provider code: the host marks
 
 ## Deliberate limitations
 
-This crate does not authenticate callers, evaluate policy, construct authorization, resolve credentials, or write audit records. Those responsibilities belong to the broker layer. A broker-resolved destination-bound credential may ride alongside an authorized invocation (never inside it); the native engine injects it after guest-header validation, and the guest never observes it. It supports buffered HTTP request/response exchanges, not CONNECT tunnels, upgrades, WebSockets, streaming guest handles, redirects, cookies, or ambient proxy configuration.
+This crate does not authenticate callers, evaluate policy, construct authorization, resolve credentials, or write audit records. Those responsibilities belong to the broker layer. A broker-resolved destination-bound credential may ride alongside an authorized invocation (never inside serializable secret material); the native engine injects it after guest-header validation, and the guest never observes it. For public DRNs, authorization itself commits the inert DRN, sink and binding scope, while the resolved bytes still ride separately; the host refuses any credential whose identity does not match that commitment. It supports buffered HTTP request/response exchanges, not CONNECT tunnels, upgrades, WebSockets, streaming guest handles, redirects, cookies, or ambient proxy configuration.
 
 ## Provider storage
 

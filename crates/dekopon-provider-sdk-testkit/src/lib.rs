@@ -529,6 +529,7 @@ impl FakeBroker {
                     access,
                     namespace: StorageNamespace::Chat,
                 }),
+            secret_use: None,
         }
     }
 }

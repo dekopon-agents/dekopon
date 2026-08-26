@@ -15,8 +15,9 @@ use std::{
     time::Duration,
 };
 
-use dekopon_capability::{HttpConstraints, HttpConstraintsError};
-use dekopon_core::Redacted;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use dekopon_capability::{HttpConstraints, HttpConstraintsError, SecretUseGrant};
+use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
 use futures_util::StreamExt as _;
 use reqwest::{
     Method, Url,
@@ -179,6 +180,12 @@ pub enum ConfigurationError {
     /// Execution deadline could not be represented by the runtime clock.
     #[error("HTTP execution deadline is too large")]
     TimeoutOverflow,
+    /// A broker-produced secret-use grant failed its shared structural validation.
+    #[error("secret-use grant is invalid")]
+    InvalidSecretGrant {
+        #[source]
+        source: dekopon_capability::SecretUseGrantError,
+    },
     /// A bound credential failed structural validation.
     ///
     /// The reason names the invalid *field*, never any part of the secret value.
@@ -209,6 +216,13 @@ pub enum ConfigurationError {
 pub struct BoundCredential {
     header_value: Redacted<String>,
     destinations: Vec<String>,
+    secret_binding: Option<SecretBindingIdentity>,
+    reflection_needles: Vec<SecretBytes>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SecretBindingIdentity {
+    grant: SecretUseGrant,
 }
 
 impl fmt::Debug for BoundCredential {
@@ -217,6 +231,8 @@ impl fmt::Debug for BoundCredential {
             .debug_struct("BoundCredential")
             .field("header_value", &self.header_value)
             .field("destinations", &self.destinations)
+            .field("secret_binding", &self.secret_binding.is_some())
+            .field("reflection_needles", &self.reflection_needles)
             .finish()
     }
 }
@@ -262,6 +278,91 @@ impl BoundCredential {
         Ok(Self {
             header_value,
             destinations,
+            secret_binding: None,
+            reflection_needles: Vec::new(),
+        })
+    }
+
+    /// Builds a DRN-bound Bearer credential for one separately authorized use grant.
+    pub fn secret_bearer(
+        secret: SecretBytes,
+        grant: &SecretUseGrant,
+    ) -> Result<Self, ConfigurationError> {
+        if grant.sink != SecretSinkKind::HttpBearer || grant.basic_username.is_some() {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Bearer material does not match the secret-use sink",
+            });
+        }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "Utf8Error carries the secret-derived invalid byte offset and valid prefix length; the fixed structural refusal must not expose either"
+        )]
+        let token = std::str::from_utf8(secret.expose()).map_err(|_| {
+            ConfigurationError::InvalidCredential {
+                reason: "Bearer secret must be UTF-8",
+            }
+        })?;
+        if token.is_empty()
+            || token.len() > MAX_CREDENTIAL_BYTES
+            || token
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Bearer secret must be a bounded token without whitespace or controls",
+            });
+        }
+        let rendered = format!("Bearer {token}");
+        Ok(Self {
+            header_value: Redacted::new(rendered.clone()),
+            destinations: grant.allowed_hosts.clone(),
+            secret_binding: Some(SecretBindingIdentity {
+                grant: grant.clone(),
+            }),
+            reflection_needles: vec![secret, SecretBytes::new(rendered.into_bytes())],
+        })
+    }
+
+    /// Builds a DRN-bound HTTP Basic credential entirely inside the native broker boundary.
+    pub fn secret_basic(
+        password: SecretBytes,
+        grant: &SecretUseGrant,
+    ) -> Result<Self, ConfigurationError> {
+        let Some(username) = grant.basic_username.as_deref() else {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Basic secret use requires a fixed username",
+            });
+        };
+        if grant.sink != SecretSinkKind::HttpBasic
+            || username.is_empty()
+            || username.contains(':')
+            || username.bytes().any(|byte| byte.is_ascii_control())
+            || password.expose().is_empty()
+            || password.expose().len() > MAX_CREDENTIAL_BYTES
+            || password.expose().contains(&b'\n')
+            || password.expose().contains(&b'\r')
+        {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Basic credential fields are structurally invalid",
+            });
+        }
+        let mut pair = Vec::with_capacity(username.len() + 1 + password.expose().len());
+        pair.extend_from_slice(username.as_bytes());
+        pair.push(b':');
+        pair.extend_from_slice(password.expose());
+        let encoded = STANDARD.encode(&pair);
+        let rendered = format!("Basic {encoded}");
+        Ok(Self {
+            header_value: Redacted::new(rendered.clone()),
+            destinations: grant.allowed_hosts.clone(),
+            secret_binding: Some(SecretBindingIdentity {
+                grant: grant.clone(),
+            }),
+            reflection_needles: vec![
+                password,
+                SecretBytes::new(encoded.into_bytes()),
+                SecretBytes::new(rendered.into_bytes()),
+            ],
         })
     }
 
@@ -284,6 +385,28 @@ impl BoundCredential {
         self.destinations
             .iter()
             .any(|destination| authority_matches(destination, host, port, scheme))
+    }
+
+    /// Whether this resolved value belongs to the exact grant committed into authorization.
+    #[must_use]
+    pub fn matches_secret_grant(&self, grant: Option<&SecretUseGrant>) -> bool {
+        match (&self.secret_binding, grant) {
+            (None, None) => true,
+            (Some(identity), Some(grant)) => &identity.grant == grant,
+            _ => false,
+        }
+    }
+
+    fn reflected_in(&self, response: &Response) -> bool {
+        self.reflection_needles.iter().any(|needle| {
+            let needle = needle.expose();
+            !needle.is_empty()
+                && (contains_bytes(&response.body, needle)
+                    || response
+                        .headers
+                        .iter()
+                        .any(|header| contains_bytes(&header.value, needle)))
+        })
     }
 
     /// Renders the header value, marked sensitive so the transport never debugs it.
@@ -354,14 +477,43 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn secret_raw_path_is_ambiguous(uri: &str) -> bool {
+    let Some((_, authority_and_path)) = uri.split_once("://") else {
+        return true;
+    };
+    if authority_and_path.contains('\\') {
+        return true;
+    }
+    let raw_path = authority_and_path
+        .find('/')
+        .map_or("/", |index| &authority_and_path[index..]);
+    let raw_path = raw_path.split_once('?').map_or(raw_path, |(path, _)| path);
+    let raw_path = raw_path.split_once('#').map_or(raw_path, |(path, _)| path);
+    raw_path.contains('%')
+        || raw_path.contains("//")
+        || raw_path
+            .split('/')
+            .skip(1)
+            .any(|segment| matches!(segment, "." | ".."))
+}
+
 /// Per-invocation buffered HTTP execution context.
 #[derive(Debug)]
 pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
+    secret_grant: Option<SecretUseGrant>,
     credential: Option<BoundCredential>,
     ceilings: HttpHostCeilings,
     deadline: Instant,
     calls: u32,
+    secret_injections: u32,
     attempted: bool,
     policy_violation: Option<&'static str>,
     evidence: Vec<HttpCallEvidence>,
@@ -387,7 +539,7 @@ impl BufferedHttpClient {
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         validate_configuration(None, &ceilings, timeout)?;
-        Self::new(None, None, ceilings, timeout)
+        Self::new(None, None, None, ceilings, timeout)
     }
 
     /// Creates a context constrained by one broker-produced HTTP grant.
@@ -397,7 +549,7 @@ impl BufferedHttpClient {
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         validate_configuration(Some(&grant), &ceilings, timeout)?;
-        Self::new(Some(grant), None, ceilings, timeout)
+        Self::new(Some(grant), None, None, ceilings, timeout)
     }
 
     /// Creates an authorized context that additionally presents one destination-bound credential.
@@ -412,11 +564,46 @@ impl BufferedHttpClient {
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
         validate_configuration(Some(&grant), &ceilings, timeout)?;
-        Self::new(Some(grant), credential, ceilings, timeout)
+        if credential
+            .as_ref()
+            .is_some_and(|credential| !credential.matches_secret_grant(None))
+        {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "DRN-bound credential requires an authorization-bound secret grant",
+            });
+        }
+        Self::new(Some(grant), None, credential, ceilings, timeout)
+    }
+
+    /// Creates an authorized context for one exact separately authorized DRN use.
+    pub fn authorized_with_secret_credential(
+        grant: HttpConstraints,
+        secret_grant: SecretUseGrant,
+        credential: BoundCredential,
+        ceilings: HttpHostCeilings,
+        timeout: Duration,
+    ) -> Result<Self, ConfigurationError> {
+        validate_configuration(Some(&grant), &ceilings, timeout)?;
+        secret_grant
+            .validate()
+            .map_err(|source| ConfigurationError::InvalidSecretGrant { source })?;
+        if !credential.matches_secret_grant(Some(&secret_grant)) {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "resolved credential does not match the authorization-bound secret grant",
+            });
+        }
+        Self::new(
+            Some(grant),
+            Some(secret_grant),
+            Some(credential),
+            ceilings,
+            timeout,
+        )
     }
 
     fn new(
         grant: Option<HttpConstraints>,
+        secret_grant: Option<SecretUseGrant>,
         credential: Option<BoundCredential>,
         ceilings: HttpHostCeilings,
         timeout: Duration,
@@ -426,10 +613,12 @@ impl BufferedHttpClient {
             .ok_or(ConfigurationError::TimeoutOverflow)?;
         Ok(Self {
             grant,
+            secret_grant,
             credential,
             ceilings,
             deadline,
             calls: 0,
+            secret_injections: 0,
             attempted: false,
             policy_violation: None,
             evidence: Vec::new(),
@@ -571,6 +760,12 @@ impl BufferedHttpClient {
         }
         self.calls = self.calls.saturating_add(1);
 
+        if self.secret_grant.is_some() && secret_raw_path_is_ambiguous(&request.uri) {
+            return Err(http_error(
+                ErrorCode::Denied,
+                "secret-bearing request path uses prohibited encoding or separators",
+            ));
+        }
         let mut prepared = self.prepare(request, &grant).await?;
         // Injection happens strictly after `prepare`, so every guest-facing rule has already run:
         // a guest-supplied `authorization` header was rejected (never overwritten), and the
@@ -578,6 +773,40 @@ impl BufferedHttpClient {
         // and fails closed — a credentialed context refuses to send an unauthenticated request to
         // an allowed-but-unbound destination, because "quietly missing auth" reads as an outage
         // at best and an unauthenticated write at worst.
+        if let Some(secret) = &self.secret_grant {
+            let path_allowed = secret
+                .allowed_paths
+                .iter()
+                .any(|rule| rule.matches(prepared.url.path()));
+            let method_allowed = secret
+                .allowed_methods
+                .iter()
+                .any(|method| method == prepared.method.as_str());
+            let port = prepared
+                .url
+                .port_or_known_default()
+                .unwrap_or(DEFAULT_HTTPS_PORT);
+            let host_allowed = secret.allowed_hosts.iter().any(|authority| {
+                authority_matches(authority, &prepared.host, port, prepared.url.scheme())
+            });
+            if !path_allowed
+                || !method_allowed
+                || !host_allowed
+                || (!secret.allow_query && prepared.url.query().is_some())
+            {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    "request is outside this secret's authorized HTTP scope",
+                ));
+            }
+            if self.secret_injections >= secret.max_injections {
+                return Err(http_error(
+                    ErrorCode::HostCallLimit,
+                    "the authorized secret injection limit is exhausted",
+                ));
+            }
+        }
+
         let credential_header = self.credential.as_ref().map(|credential| {
             let port = prepared
                 .url
@@ -608,14 +837,31 @@ impl BufferedHttpClient {
         if let Some(header) = credential_header {
             prepared.headers.insert(AUTHORIZATION, header?);
             self.evidence[evidence_index].credential_injected = true;
+            if self.secret_grant.is_some() {
+                self.secret_injections = self.secret_injections.saturating_add(1);
+            }
         }
 
-        let result = self.execute(prepared, &grant).await;
-        if let Ok((response, response_bytes)) = &result {
+        let executed = self.execute(prepared, &grant).await;
+        if let Ok((response, response_bytes)) = &executed {
             let evidence = &mut self.evidence[evidence_index];
             evidence.status = Some(response.status);
             evidence.response_bytes = *response_bytes;
         }
+        let result = executed.and_then(|(response, bytes)| {
+            if self
+                .credential
+                .as_ref()
+                .is_some_and(|credential| credential.reflected_in(&response))
+            {
+                Err(http_error(
+                    ErrorCode::Denied,
+                    "credential-bearing response reflected protected material",
+                ))
+            } else {
+                Ok((response, bytes))
+            }
+        });
         result.map(|(response, _bytes)| response)
     }
 
@@ -1271,8 +1517,8 @@ mod tests {
         time::Duration,
     };
 
-    use dekopon_capability::{HttpConstraints, HttpConstraintsError};
-    use dekopon_core::Redacted;
+    use dekopon_capability::{HttpConstraints, HttpConstraintsError, HttpPathRule, SecretUseGrant};
+    use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
 
     use super::{
         BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
@@ -1699,6 +1945,30 @@ mod tests {
         assert!(!error.message.contains("api.example.test"), "{error}");
     }
 
+    fn secret_grant(
+        authority: &str,
+        sink: SecretSinkKind,
+        username: Option<&str>,
+        path: &str,
+    ) -> SecretUseGrant {
+        SecretUseGrant {
+            secret: "drn:com.xrl:secret:test:api/credential"
+                .parse()
+                .expect("canonical DRN"),
+            sink,
+            basic_username: username.map(str::to_owned),
+            allowed_hosts: vec![authority.to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            allowed_paths: vec![HttpPathRule::Exact {
+                path: path.to_owned(),
+            }],
+            allow_query: false,
+            max_injections: 1,
+            binding_id: "api-credential".to_owned(),
+            map_revision: None,
+        }
+    }
+
     fn credential_for(authority: &str) -> BoundCredential {
         BoundCredential::bearer(
             "Bearer",
@@ -1743,6 +2013,35 @@ mod tests {
         )
         .expect_err("control bytes are refused");
         assert!(!error.to_string().contains("tell-nobody"), "{error}");
+    }
+
+    #[test]
+    fn drn_credential_identity_commits_the_complete_effective_scope() {
+        let original = secret_grant(
+            "api.example.test",
+            SecretSinkKind::HttpBearer,
+            None,
+            "/v1/allowed",
+        );
+        let credential =
+            BoundCredential::secret_bearer(SecretBytes::new(b"fixture-token".to_vec()), &original)
+                .expect("credential");
+        let mut swapped = original;
+        swapped.allowed_paths = vec![HttpPathRule::Exact {
+            path: "/v1/other".to_owned(),
+        }];
+        let error = BufferedHttpClient::authorized_with_secret_credential(
+            grant("api.example.test".to_owned(), "GET"),
+            swapped,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect_err("same DRN and binding id cannot hide a swapped scope");
+        assert!(matches!(
+            error,
+            ConfigurationError::InvalidCredential { .. }
+        ));
     }
 
     #[test]
@@ -1825,6 +2124,123 @@ mod tests {
 
         plain_server.join().expect("plain fixture exits");
         server.join().expect("fixture server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drn_bound_basic_auth_is_rendered_only_for_the_exact_path() {
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let (authority, recorded, server) = mock_http(response);
+        let secret = secret_grant(
+            &authority,
+            SecretSinkKind::HttpBasic,
+            Some("userA"),
+            "/api/v1/thing",
+        );
+        let credential =
+            BoundCredential::secret_basic(SecretBytes::new(b"fixture-password".to_vec()), &secret)
+                .expect("valid Basic credential");
+        let mut client = BufferedHttpClient::authorized_with_secret_credential(
+            grant(authority.clone(), "GET"),
+            secret,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid secret authorization");
+        client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}/api/v1/thing"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect("exact path succeeds");
+        let request = String::from_utf8(recorded.recv().expect("recorded request"))
+            .expect("request is UTF-8");
+        assert!(
+            request.contains("authorization: Basic dXNlckE6Zml4dHVyZS1wYXNzd29yZA=="),
+            "{request}"
+        );
+        server.join().expect("server exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_scope_denies_path_prefix_confusion_and_queries_before_connection() {
+        let secret = secret_grant(
+            "127.0.0.1:9",
+            SecretSinkKind::HttpBearer,
+            None,
+            "/api/v1/thing",
+        );
+        for uri in [
+            "http://127.0.0.1:9/api/v1/things",
+            "http://127.0.0.1:9/api/v1/thing?reflect=authorization",
+            "http://127.0.0.1:9/api/v1/other",
+            "http://127.0.0.1:9/api/v1/%74hing",
+            "http://127.0.0.1:9\\api\\v1\\thing",
+            "http://127.0.0.1:9/api/v1/x/../thing",
+            "http://127.0.0.1:9/api//v1/thing",
+        ] {
+            let credential = BoundCredential::secret_bearer(
+                SecretBytes::new(b"fixture-token".to_vec()),
+                &secret,
+            )
+            .expect("credential");
+            let mut client = BufferedHttpClient::authorized_with_secret_credential(
+                grant("127.0.0.1:9".to_owned(), "GET"),
+                secret.clone(),
+                credential,
+                HttpHostCeilings::default(),
+                Duration::from_secs(1),
+            )
+            .expect("context");
+            let error = client
+                .send(Request {
+                    method: "GET".to_owned(),
+                    uri: uri.to_owned(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect_err("scope confusion is denied");
+            assert_eq!(error.code, ErrorCode::Denied, "{uri}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_credential_reflection_is_discarded() {
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nfixture-token";
+        let (authority, _recorded, server) = mock_http(response);
+        let secret = secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/reflect");
+        let credential =
+            BoundCredential::secret_bearer(SecretBytes::new(b"fixture-token".to_vec()), &secret)
+                .expect("credential");
+        let mut client = BufferedHttpClient::authorized_with_secret_credential(
+            grant(authority.clone(), "GET"),
+            secret,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("context");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}/reflect"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("reflected token is never returned");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(!error.message.contains("fixture-token"), "{error}");
+        let evidence = client.into_evidence();
+        assert_eq!(evidence[0].status, Some(200));
+        assert!(evidence[0].response_bytes > 0);
+        server.join().expect("server exits");
     }
 
     #[tokio::test(flavor = "multi_thread")]

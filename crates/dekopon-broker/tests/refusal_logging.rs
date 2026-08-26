@@ -306,6 +306,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         trace: "trace-refusal".parse().expect("valid trace fixture"),
         trace_parent: None,
         input: serde_json::json!({"message": "refused"}),
+        secret_use: None,
     };
     let refused = broker
         .invoke_for(

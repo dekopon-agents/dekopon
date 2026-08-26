@@ -2,7 +2,7 @@
 
 Versioned, length-delimited local broker messages and an unprivileged Unix-socket client.
 
-The authority-bearing half of the wire carries only capability inspection requests and untrusted `InvocationRequest` values. It has no principal, actor, policy, constraint, credential, or `AuthorizedInvocation` field. A broker server must derive `AuthenticatedContext` from operating-system peer credentials and trusted workload mapping.
+The authority-bearing half of the wire carries only capability inspection requests and untrusted `InvocationRequest` values. It has no principal, actor, policy, constraint, credential **value**, or `AuthorizedInvocation` field. An optional `secretUse` is an inert canonical public DRN plus native sink intent; possession grants nothing, and providers never receive it. A broker server must derive `AuthenticatedContext` from operating-system peer credentials and trusted workload mapping, then separately authorize and bind any DRN use.
 
 `ResolveCommand` (`resolveCommand`) is the one authority-bearing operation deliberately **not** gated on the caller's grants. It rewrites one provider-declared shell command word and its arguments into a capability proposal by calling the declaring component's pure, import-free, fuel- and timeout-bounded `resolve-command` export. What comes back is a proposal, authorized on exactly the path every other proposal takes, so a caller who rewrites a word they may not use receives a denial one step later having learned nothing they could not learn by naming the capability directly. A guest failure is the stable `provider-error` code with a deliberately opaque message; a provider that declines the argv is a usage error carrying the provider's own text.
 

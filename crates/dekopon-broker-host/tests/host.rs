@@ -95,6 +95,7 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     }
 }
 
@@ -1002,6 +1003,7 @@ fn constraints_5s() -> ExecutionConstraints {
         max_output_bytes: 4_096,
         http: None,
         storage: None,
+        secret_use: None,
     }
 }
 
@@ -1169,6 +1171,7 @@ fn conditional_write_constraints(
             allow_plaintext_loopback: true,
         }),
         storage: None,
+        secret_use: None,
     }
 }
 
@@ -1325,6 +1328,7 @@ async fn an_actual_provider_v0_1_component_remains_compatible() {
                     max_output_bytes: 4_096,
                     http: None,
                     storage: None,
+                    secret_use: None,
                 },
             ),
             None,
@@ -1552,6 +1556,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 access,
                 namespace: StorageNamespace::Chat,
             }),
+            secret_use: None,
         };
         let grant = storage
             .grant(StorageGrantRequest::new(

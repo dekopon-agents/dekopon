@@ -171,6 +171,34 @@ broker:
     existingSecret: ""
     existingSecretKey: broker-credentials.yaml
 
+  # Optional owner-only public-DRN/private-source map. The map contains no values but does contain
+  # sensitive physical inventory. Prefer an existing Secret. The init container copies it into the
+  # broker-only 0600 config directory; it is never mounted into the gateway.
+  secretMap:
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: secret-map.yaml
+
+  # Optional broker-only read-only mounts for secret-map sources and bootstrap files. Each entry is
+  # a Kubernetes volume plus its mount path; the gateway never receives these mounts. A Secret or
+  # ConfigMap volume retains its AtomicWriter symlink layout and is consumed with
+  # source.kind=kubernetesProjection. Bootstrap tokens needing the ordinary 0600 loader use
+  # broker.secretBootstrapFiles below.
+  # - name: api-secret
+  #   mountPath: /var/run/dekopon-secrets/api
+  #   volume:
+  #     secret:
+  #       secretName: api-secret
+  secretSourceVolumes: []
+
+  # Owner-managed bootstrap/session files copied by the existing root init boundary into the
+  # broker-only 0700 config tmpfs as UID 65532, mode 0600. Secret-map adapters reference
+  # <paths.configDir>/<file>. Values never enter Helm values or the gateway.
+  # - file: vault-token
+  #   existingSecret: dekopon-vault-bootstrap
+  #   existingSecretKey: token
+  secretBootstrapFiles: []
+
   resources:
     requests:
       cpu: 100m

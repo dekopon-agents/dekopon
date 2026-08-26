@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use dekopon_core::SecretUseProposal;
 use serde_json::Value;
 
 use crate::{
@@ -150,9 +151,21 @@ impl BuiltinContext<'_> {
         capability: &str,
         input: Value,
     ) -> Result<CommandResult, CommandFailure> {
+        self.invoke_capability_with_secret_use(capability, input, None)
+    }
+
+    /// Charges the capability-call budget and invokes one capability with typed secret intent.
+    pub(crate) fn invoke_capability_with_secret_use(
+        &mut self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<SecretUseProposal>,
+    ) -> Result<CommandResult, CommandFailure> {
         self.budget.charge_capability_call()?;
         self.budget.check_deadline()?;
-        let result = self.invoker.invoke(capability, input);
+        let result = self
+            .invoker
+            .invoke_with_secret_use(capability, input, secret_use);
         self.budget.check_deadline()?;
         let status = ExitCode::from_capability_result(&result);
         Ok(match result {

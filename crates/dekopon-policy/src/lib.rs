@@ -31,19 +31,18 @@
 //! - `Dekopon::Agent::"<agent-id>"` — the resource type of [`AGENT_PROMPT_ACTION`]. Instances are
 //!   matched by UID and are deliberately not enumerated, because the agent catalog belongs to the
 //!   gateway rather than the broker.
-//! - `Dekopon::Action::"<capability-id>"` — one action per loaded capability, applying to
-//!   `Principal` over `Provider`, plus the fixed `Dekopon::Action::"agent.prompt"` applying to
-//!   `Principal` over `Agent`.
+//! - `Dekopon::Secret::"drn:..."` — canonical public DRNs from the owner-only private map; the
+//!   resource of [`SECRET_USE_ACTION`].
+//! - `Dekopon::Action::"<capability-id>"` — one action per loaded capability, plus fixed
+//!   `agent.prompt` and, when secrets exist, `secret.use` actions.
 //!
 //! # Context
 //!
 //! Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`;
-//! `agent.prompt` carries `{ via?, subject?, agent? }`. Every value is rendered from the broker's
-//! own trusted state — never from a payload.
-//!
-//! Message content and provider input are deliberately absent. Conditioning authorization on
-//! untrusted input is a possible future addition, but it needs a settled schema treatment for open
-//! JSON first; until then a policy cannot accidentally depend on a value the caller controls.
+//! `agent.prompt` carries routing fields only. `secret.use` adds exact capability/provider/sink
+//! fields beside the authenticated routing context. The public DRN is strongly typed untrusted
+//! proposal data and remains inert without an owner binding; message content and arbitrary provider
+//! JSON remain absent from policy.
 //!
 //! ```
 //! use dekopon_core::{CapabilityId, PrincipalId, ProviderId};
@@ -92,7 +91,10 @@ use cedar_policy::{
     PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use dekopon_capability::{EffectKind, Idempotency};
-use dekopon_core::{AgentId, CapabilityId, IdentifierError, PrincipalId, ProviderId, RiskLevel};
+use dekopon_core::{
+    AgentId, CapabilityId, IdentifierError, PrincipalId, ProviderId, RiskLevel, SecretDrn,
+    SecretSinkKind,
+};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -101,6 +103,8 @@ use thiserror::Error;
 pub const NAMESPACE: &str = "Dekopon";
 /// The one action that is not a capability: permission for a principal to drive an agent session.
 pub const AGENT_PROMPT_ACTION: &str = "agent.prompt";
+/// Separate permission to consume one public DRN in a broker-native sink.
+pub const SECRET_USE_ACTION: &str = "secret.use";
 /// Maximum accepted policy-source bytes.
 pub const MAX_POLICY_BYTES: usize = 1024 * 1024;
 /// Maximum accepted static policies in one engine.
@@ -111,6 +115,7 @@ pub const MAX_POLICY_ID_BYTES: usize = 128;
 const PRINCIPAL_TYPE: &str = "Dekopon::Principal";
 const PROVIDER_TYPE: &str = "Dekopon::Provider";
 const AGENT_TYPE: &str = "Dekopon::Agent";
+const SECRET_TYPE: &str = "Dekopon::Secret";
 const ACTION_TYPE: &str = "Dekopon::Action";
 const DIGEST_DOMAIN: &[u8] = b"dekopon-policy-v1\0";
 
@@ -125,6 +130,8 @@ pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
+    /// Public logical secret resources declared by the owner-only private map.
+    secrets: BTreeSet<SecretDrn>,
     /// Capability names a policy referenced that no loaded provider routes. See
     /// [`PolicyWorld::with_phantoms`].
     phantom_capabilities: BTreeSet<CapabilityId>,
@@ -154,7 +161,7 @@ impl PolicyWorld {
             world.principals.insert(principal);
         }
         for (capability, provider) in capabilities {
-            if capability.as_str() == AGENT_PROMPT_ACTION {
+            if matches!(capability.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
                 return Err(PolicyBuildError::ReservedAction { capability });
             }
             world.providers.insert(provider.clone());
@@ -182,6 +189,18 @@ impl PolicyWorld {
     /// Iterates the declared capability routes in identifier order.
     pub fn capabilities(&self) -> impl Iterator<Item = (&CapabilityId, &ProviderId)> {
         self.capabilities.iter()
+    }
+
+    /// Adds the public DRNs policies may name as `Dekopon::Secret` resources.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: impl IntoIterator<Item = SecretDrn>) -> Self {
+        self.secrets.extend(secrets);
+        self
+    }
+
+    /// Iterates declared secret resources in canonical DRN order.
+    pub fn secrets(&self) -> impl Iterator<Item = &SecretDrn> {
+        self.secrets.iter()
     }
 
     /// Returns the provider a declared capability routes to.
@@ -260,6 +279,21 @@ impl PolicyWorld {
                 "conversation": { "type": "String", "required": false },
             }
         });
+        let secret_context = json!({
+            "type": "Record",
+            "attributes": {
+                "via": { "type": "String", "required": false },
+                "subject": { "type": "String", "required": false },
+                "agent": { "type": "String", "required": false },
+                "transportKind": { "type": "String", "required": false },
+                "transport": { "type": "String", "required": false },
+                "channel": { "type": "String", "required": false },
+                "conversation": { "type": "String", "required": false },
+                "capability": { "type": "String" },
+                "provider": { "type": "String" },
+                "sink": { "type": "String" },
+            }
+        });
 
         // Phantom capabilities are indistinguishable from routed ones *here*, and only here: the
         // schema is what strict validation checks a policy against, so a phantom is what lets a
@@ -291,14 +325,31 @@ impl PolicyWorld {
                 }
             }),
         );
+        let mut entity_types = serde_json::Map::from_iter([
+            ("Principal".to_owned(), entity_shape.clone()),
+            ("Provider".to_owned(), entity_shape.clone()),
+            ("Agent".to_owned(), entity_shape),
+        ]);
+        if !self.secrets.is_empty() {
+            actions.insert(
+                SECRET_USE_ACTION.to_owned(),
+                json!({
+                    "appliesTo": {
+                        "principalTypes": ["Principal"],
+                        "resourceTypes": ["Secret"],
+                        "context": secret_context,
+                    }
+                }),
+            );
+            entity_types.insert(
+                "Secret".to_owned(),
+                json!({ "shape": { "type": "Record", "attributes": {} } }),
+            );
+        }
 
         json!({
             NAMESPACE: {
-                "entityTypes": {
-                    "Principal": entity_shape,
-                    "Provider": entity_shape,
-                    "Agent": entity_shape,
-                },
+                "entityTypes": entity_types,
                 "actions": actions,
             }
         })
@@ -331,6 +382,13 @@ pub enum PolicyTarget {
         /// The agent being driven, which is the Cedar resource.
         agent: AgentId,
     },
+    /// Permission to consume one exact DRN in one broker-native sink for one capability.
+    SecretUse {
+        secret: SecretDrn,
+        capability: CapabilityId,
+        provider: ProviderId,
+        sink: SecretSinkKind,
+    },
 }
 
 impl PolicyTarget {
@@ -340,6 +398,7 @@ impl PolicyTarget {
         match self {
             Self::Capability { capability, .. } => capability.as_str(),
             Self::AgentPrompt { .. } => AGENT_PROMPT_ACTION,
+            Self::SecretUse { .. } => SECRET_USE_ACTION,
         }
     }
 }
@@ -483,6 +542,7 @@ struct EntityTypes {
     action: EntityTypeName,
     provider: EntityTypeName,
     agent: EntityTypeName,
+    secret: EntityTypeName,
 }
 
 impl EntityTypes {
@@ -492,6 +552,7 @@ impl EntityTypes {
             action: entity_type_name(ACTION_TYPE)?,
             provider: entity_type_name(PROVIDER_TYPE)?,
             agent: entity_type_name(AGENT_TYPE)?,
+            secret: entity_type_name(SECRET_TYPE)?,
         })
     }
 }
@@ -717,6 +778,28 @@ impl PolicyEngine {
                 entity_uid(&self.entity_types.agent, agent.as_str()),
                 Vec::new(),
             ),
+            PolicyTarget::SecretUse {
+                secret,
+                capability,
+                provider,
+                sink,
+            } => (
+                entity_uid(&self.entity_types.secret, secret.as_str()),
+                vec![
+                    (
+                        "capability".to_owned(),
+                        RestrictedExpression::new_string(capability.to_string()),
+                    ),
+                    (
+                        "provider".to_owned(),
+                        RestrictedExpression::new_string(provider.to_string()),
+                    ),
+                    (
+                        "sink".to_owned(),
+                        RestrictedExpression::new_string(sink.to_string()),
+                    ),
+                ],
+            ),
         };
         // Moved, not cloned: `authorize` owns the request and nothing reads it afterwards.
         for (name, value) in [
@@ -891,8 +974,23 @@ fn classify_policies(
                         });
                     }
                 }
+                SECRET_TYPE => {
+                    let secret = value.parse::<SecretDrn>().map_err(|source| {
+                        PolicyBuildError::MalformedSecret {
+                            policy: id.clone(),
+                            secret: value.clone(),
+                            source,
+                        }
+                    })?;
+                    if !world.secrets.contains(&secret) {
+                        return Err(PolicyBuildError::UnknownSecret {
+                            policy: id.clone(),
+                            secret: value,
+                        });
+                    }
+                }
                 ACTION_TYPE => {
-                    if value == AGENT_PROMPT_ACTION {
+                    if matches!(value.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
                         continue;
                     }
                     let parsed = value.parse::<CapabilityId>().ok();
@@ -954,6 +1052,14 @@ fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, Poli
                 .iter()
                 .chain(world.phantom_providers.iter())
                 .map(ProviderId::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            SECRET_TYPE,
+            world
+                .secrets
+                .iter()
+                .map(SecretDrn::as_str)
                 .collect::<Vec<_>>(),
         ),
     ] {
@@ -1020,6 +1126,10 @@ fn policy_digest(
         hasher.update(format!("{PROVIDER_TYPE}::{:?}", provider.as_str()).as_bytes());
         hasher.update([0]);
     }
+    for secret in &world.secrets {
+        hasher.update(format!("{SECRET_TYPE}::{:?}", secret.as_str()).as_bytes());
+        hasher.update([0]);
+    }
     hasher.update(b"actions\0");
     let mut actions = world
         .capabilities
@@ -1027,6 +1137,9 @@ fn policy_digest(
         .map(|capability| capability.as_str())
         .collect::<Vec<_>>();
     actions.push(AGENT_PROMPT_ACTION);
+    if !world.secrets.is_empty() {
+        actions.push(SECRET_USE_ACTION);
+    }
     actions.sort_unstable();
     for action in actions {
         hasher.update(action.as_bytes());
@@ -1128,6 +1241,17 @@ pub enum PolicyBuildError {
         /// Why it is not a valid principal identifier.
         #[source]
         source: IdentifierError,
+    },
+    /// A policy named a secret DRN the private map does not declare.
+    #[error("policy {policy} names undeclared secret {secret:?}")]
+    UnknownSecret { policy: String, secret: String },
+    /// A policy named a non-canonical secret DRN.
+    #[error("policy {policy} names malformed secret DRN {secret:?}")]
+    MalformedSecret {
+        policy: String,
+        secret: String,
+        #[source]
+        source: dekopon_core::SecretDrnError,
     },
     /// A policy named a provider the world does not declare.
     #[error("policy {policy} names undeclared provider {provider:?}")]

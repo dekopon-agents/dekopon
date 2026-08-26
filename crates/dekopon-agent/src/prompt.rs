@@ -991,8 +991,10 @@ fn agent_config_tool() -> ModelTool {
                       instructions, route/session bounds, and only the capabilities Cedar \
                       currently grants this sender through this agent. Present it as concise \
                       Markdown tables unless raw JSON was requested. Raw Cedar source, policy \
-                      identifiers, principals, subjects, endpoints, paths, credential names, and \
-                      all credential values are intentionally omitted."
+                      identifiers, principals, subjects, endpoints, paths, legacy credential \
+                      names, private secret-map inventory, and all credential values are \
+                      intentionally omitted. A public DRN may appear only when the operator put \
+                      that inert name in the standing instructions."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -1482,6 +1484,12 @@ which opens no socket of its own but assembles a request for whichever HTTP capa
 was given; and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A \
 provider may contribute further command words, which behave the same way and are authorized \
 identically; any this session has are listed at the end of this description.
+
+A public secret DRN supplied in your instructions is a name, not a value or grant. Use it only in \
+exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or \
+`curl -u 'USER:${drn:...}' URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN \
+concatenation are rejected. The provider never receives the DRN, and the broker independently \
+authorizes every use.
 
 Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
 a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand of `==` inside `[[ ]]`, and a \

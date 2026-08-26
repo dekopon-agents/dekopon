@@ -14,6 +14,7 @@ categories = ["web-programming::http-client"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+base64.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 futures-util.workspace = true

@@ -17,7 +17,8 @@ use std::{
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, TraceId, TransportId,
+    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
+    TransportId,
 };
 use dekopon_provider_sdk::ProviderCapability;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -278,6 +279,11 @@ pub struct InvocationRequest {
     /// replay input. A malformed value is a decode failure rather than a silent `None`, because
     /// attaching broker spans to a trace that does not exist is worse than sending none.
     pub trace_parent: Option<TraceParent>,
+    /// Optional typed, untrusted intent to use a public DRN in a broker-native sink.
+    ///
+    /// The field is proposal data, not a credential or bearer grant. Providers never receive it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_use: Option<SecretUseProposal>,
     /// Capability-specific untrusted input.
     pub input: Value,
 }

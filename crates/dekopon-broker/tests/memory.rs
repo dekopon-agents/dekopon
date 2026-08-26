@@ -95,6 +95,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                         access,
                         namespace: StorageNamespace::Chat,
                     }),
+                    secret_use: None,
                 },
             },
         )
@@ -118,6 +119,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                     access: StorageAccess::ReadWrite,
                     namespace: StorageNamespace::Chat,
                 }),
+                secret_use: None,
             },
         },
     ));
@@ -143,6 +145,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                         allow_plaintext_loopback: true,
                     }),
                     storage: None,
+                    secret_use: None,
                 },
             },
         ));
@@ -614,6 +617,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
                         .expect("trace"),
                     trace_parent: None,
                     input: json!({}),
+                    secret_use: None,
                 },
             )
             .await
@@ -664,6 +668,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
                 trace: "trace-malicious-chat".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({}),
+                secret_use: None,
             },
         )
         .await
@@ -692,6 +697,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
                 trace: "trace-malicious-attested".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({}),
+                secret_use: None,
             },
         )
         .await
@@ -805,6 +811,7 @@ fn memory_constraint(
                 access,
                 namespace: StorageNamespace::Chat,
             }),
+            secret_use: None,
         },
     }
 }
@@ -875,6 +882,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 .expect("trace"),
             trace_parent: None,
             input: json!({}),
+            secret_use: None,
         };
         let result = if attested {
             broker
@@ -950,6 +958,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 trace: "trace-generic-record".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({}),
+                secret_use: None,
             },
         )
         .await
@@ -1022,6 +1031,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 trace: "trace-recent".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({"last": 1}),
+                secret_use: None,
             },
         )
         .await
@@ -1577,6 +1587,7 @@ async fn query_memory_result_in(
                 trace: format!("trace-{invocation}").parse().expect("trace"),
                 trace_parent: None,
                 input,
+                secret_use: None,
             },
         )
         .await
@@ -1987,6 +1998,7 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
                 trace: format!("trace-{invocation}").parse().expect("trace"),
                 trace_parent: None,
                 input: json!({"mode": "quota-denial"}),
+                secret_use: None,
             },
         )
         .await

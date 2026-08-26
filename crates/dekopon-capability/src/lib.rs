@@ -52,7 +52,10 @@
 
 use std::fmt;
 
-use dekopon_core::{Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, TraceId};
+use dekopon_core::{
+    Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, SecretDrn, SecretSinkKind,
+    SecretUseProposal, TraceId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -137,6 +140,12 @@ pub struct ProposedInvocation {
     pub actor: Actor,
     /// End-to-end trace identifier.
     pub trace: TraceId,
+    /// Optional typed intent to use one public secret reference in a broker-native sink.
+    ///
+    /// This is untrusted proposal data, never provider input or authority. Omitted serialization
+    /// preserves the exact bytes of every legacy authorization/evidence record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_use: Option<SecretUseProposal>,
     /// Capability-specific, untrusted arguments.
     pub input: Value,
 }
@@ -156,8 +165,16 @@ impl ProposedInvocation {
             capability,
             actor,
             trace,
+            secret_use: None,
             input,
         }
+    }
+
+    /// Attaches typed, untrusted secret-use intent without placing it in provider JSON.
+    #[must_use]
+    pub fn with_secret_use(mut self, secret_use: Option<SecretUseProposal>) -> Self {
+        self.secret_use = secret_use;
+        self
     }
 }
 
@@ -311,6 +328,165 @@ pub enum HttpConstraintsError {
     ZeroLimit,
 }
 
+/// One canonical path rule for a secret-bearing HTTP request.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "match", rename_all = "camelCase", deny_unknown_fields)]
+pub enum HttpPathRule {
+    Exact { path: String },
+    SegmentPrefix { path: String },
+}
+
+impl HttpPathRule {
+    /// Validates the deliberately restrictive path grammar shared with the native host.
+    pub fn validate(&self) -> Result<(), SecretUseGrantError> {
+        let path = self.path();
+        if !canonical_secret_path(path) {
+            return Err(SecretUseGrantError::InvalidPath {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the configured canonical path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Exact { path } | Self::SegmentPrefix { path } => path,
+        }
+    }
+
+    /// Matches the canonical path produced by the HTTP host's URL parser.
+    #[must_use]
+    pub fn matches(&self, candidate: &str) -> bool {
+        match self {
+            Self::Exact { path } => candidate == path,
+            Self::SegmentPrefix { path } if path == "/" => candidate.starts_with('/'),
+            Self::SegmentPrefix { path } => {
+                candidate == path
+                    || candidate
+                        .strip_prefix(path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+        }
+    }
+}
+
+fn canonical_secret_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 4096
+        && !path.contains(['%', '\\', '?', '#'])
+        && !path.contains("//")
+        && !path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        && path
+            .split('/')
+            .skip(1)
+            .all(|segment| !matches!(segment, "." | ".."))
+}
+
+/// Effective owner-authored scope attached to authorization for one proposed DRN use.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SecretUseGrant {
+    pub secret: SecretDrn,
+    pub sink: SecretSinkKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_username: Option<String>,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_paths: Vec<HttpPathRule>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_query: bool,
+    pub max_injections: u32,
+    /// Stable owner-authored binding identifier committed into authorization and evidence.
+    pub binding_id: String,
+    /// Owner-authored private-map revision selecting the physical source semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_revision: Option<String>,
+}
+
+impl SecretUseGrant {
+    /// Validates exact bounded scope independently of any capability's broader HTTP grant.
+    pub fn validate(&self) -> Result<(), SecretUseGrantError> {
+        if self.allowed_hosts.is_empty()
+            || self.allowed_methods.is_empty()
+            || self.allowed_paths.is_empty()
+        {
+            return Err(SecretUseGrantError::EmptyScope);
+        }
+        if self.max_injections == 0 {
+            return Err(SecretUseGrantError::ZeroInjections);
+        }
+        if self.binding_id.is_empty()
+            || self.binding_id.len() > 128
+            || !self
+                .binding_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(SecretUseGrantError::InvalidBindingId);
+        }
+        if self.map_revision.as_ref().is_some_and(|revision| {
+            revision.is_empty()
+                || revision.len() > 128
+                || revision.trim() != revision
+                || revision.bytes().any(|byte| byte.is_ascii_control())
+        }) {
+            return Err(SecretUseGrantError::InvalidMapRevision);
+        }
+        if self.allowed_hosts.len() > MAX_HTTP_SCOPE_ENTRIES
+            || self.allowed_methods.len() > MAX_HTTP_SCOPE_ENTRIES
+            || self.allowed_paths.len() > MAX_HTTP_SCOPE_ENTRIES
+            || self
+                .allowed_hosts
+                .iter()
+                .any(|value| !is_authority_scope(value))
+            || self
+                .allowed_methods
+                .iter()
+                .any(|value| value.len() > MAX_HTTP_METHOD_BYTES || !is_http_token(value))
+        {
+            return Err(SecretUseGrantError::InvalidScope);
+        }
+        for path in &self.allowed_paths {
+            path.validate()?;
+        }
+        match (self.sink, self.basic_username.as_deref()) {
+            (SecretSinkKind::HttpBasic, Some(username))
+                if !username.is_empty()
+                    && username.len() <= dekopon_core::MAX_SECRET_USERNAME_LENGTH
+                    && !username.contains(':')
+                    && !username.bytes().any(|byte| byte.is_ascii_control()) => {}
+            (SecretSinkKind::HttpBearer, None) => {}
+            _ => return Err(SecretUseGrantError::InvalidUsername),
+        }
+        Ok(())
+    }
+}
+
+/// Why a secret-use grant is not exact enough to enforce.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SecretUseGrantError {
+    #[error("secret use requires nonempty host, method, and path scopes")]
+    EmptyScope,
+    #[error("secret use scopes are oversized or structurally invalid")]
+    InvalidScope,
+    #[error("secret path {path:?} is not canonical")]
+    InvalidPath { path: String },
+    #[error("secret use maximum injections must be greater than zero")]
+    ZeroInjections,
+    #[error("secret use binding identifier is invalid")]
+    InvalidBindingId,
+    #[error("secret use private-map revision is invalid")]
+    InvalidMapRevision,
+    #[error("secret sink and Basic username do not agree")]
+    InvalidUsername,
+}
+
 /// Exact component storage interface selected for one capability.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -370,6 +546,9 @@ pub struct ExecutionConstraints {
     /// Optional exact storage grant. HTTP and storage cannot coexist in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConstraints>,
+    /// Optional effective scope for one separately authorized public DRN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_use: Option<SecretUseGrant>,
 }
 
 impl Default for ExecutionConstraints {
@@ -379,6 +558,7 @@ impl Default for ExecutionConstraints {
             max_output_bytes: 1_048_576,
             http: None,
             storage: None,
+            secret_use: None,
         }
     }
 }
@@ -551,6 +731,12 @@ pub enum AuthorizationError {
     /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHttpAndStorage,
+    /// Proposed DRN/sink intent and the effective broker grant disagreed.
+    #[error("authorization secret-use proposal does not match its effective grant")]
+    SecretUseMismatch,
+    /// Effective secret-use scope was structurally invalid.
+    #[error(transparent)]
+    InvalidSecretUse(#[from] SecretUseGrantError),
 }
 
 /// Broker-only authority transition.
@@ -615,6 +801,22 @@ pub mod broker {
             }
             if let Some(http) = &constraints.http {
                 http.validate()?;
+            }
+            if let Some(secret) = &constraints.secret_use {
+                secret.validate()?;
+            }
+            let secret_matches = match (&proposal.secret_use, &constraints.secret_use) {
+                (None, None) => true,
+                (Some(proposal), Some(grant)) => {
+                    proposal.secret() == &grant.secret
+                        && proposal.sink() == grant.sink
+                        && proposal.username() == grant.basic_username.as_deref()
+                        && constraints.http.is_some()
+                }
+                _ => false,
+            };
+            if !secret_matches {
+                return Err(AuthorizationError::SecretUseMismatch);
             }
 
             Ok(AuthorizedInvocation {

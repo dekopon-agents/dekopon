@@ -41,6 +41,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+use async_trait::async_trait;
 use dekopon_broker_host::{
     BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, HttpCallEvidence,
     ProviderCapability,
@@ -53,11 +54,12 @@ pub use dekopon_broker_protocol::{
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
     HttpConstraintsError, Idempotency, InvocationOutcome, InvocationResult, ProposedInvocation,
-    StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
+    SecretUseGrant, StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, SubjectError, SubjectService, TraceId,
+    RiskLevel, SecretBytes, SecretDrn, SecretSinkKind, SecretUseProposal, SubjectError,
+    SubjectService, TraceId,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
@@ -79,6 +81,8 @@ use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
+/// Maximum owner-authored secret-use bindings one broker retains.
+pub const MAX_SECRET_BINDINGS: usize = 1024;
 const AUDIT_HASH_DOMAIN: &[u8] = b"dekopon-audit-record-v1\0";
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
@@ -753,6 +757,263 @@ impl CredentialStore {
     }
 }
 
+/// One owner-authored executable binding for a public DRN.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretUseBinding {
+    pub binding_id: String,
+    pub secret: SecretDrn,
+    pub capability: CapabilityId,
+    pub sink: SecretSinkKind,
+    pub basic_username: Option<String>,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_paths: Vec<dekopon_capability::HttpPathRule>,
+    pub allow_query: bool,
+    pub max_injections: u32,
+}
+
+impl SecretUseBinding {
+    /// Validates the binding's native sink and complete exact scope.
+    pub fn validate(&self) -> Result<(), dekopon_capability::SecretUseGrantError> {
+        self.grant().validate()
+    }
+
+    fn grant(&self) -> SecretUseGrant {
+        SecretUseGrant {
+            secret: self.secret.clone(),
+            sink: self.sink,
+            basic_username: self.basic_username.clone(),
+            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_methods: self.allowed_methods.clone(),
+            allowed_paths: self.allowed_paths.clone(),
+            allow_query: self.allow_query,
+            max_injections: self.max_injections,
+            binding_id: self.binding_id.clone(),
+            map_revision: None,
+        }
+    }
+
+    fn proposal(&self) -> SecretUseProposal {
+        match self.sink {
+            SecretSinkKind::HttpBearer => SecretUseProposal::HttpBearer {
+                secret: self.secret.clone(),
+            },
+            SecretSinkKind::HttpBasic => SecretUseProposal::HttpBasic {
+                secret: self.secret.clone(),
+                username: self
+                    .basic_username
+                    .clone()
+                    .expect("validated Basic binding always carries a username"),
+            },
+        }
+    }
+
+    fn matches(&self, capability: &CapabilityId, proposal: &SecretUseProposal) -> bool {
+        &self.capability == capability
+            && &self.secret == proposal.secret()
+            && self.sink == proposal.sink()
+            && self.basic_username.as_deref() == proposal.username()
+    }
+}
+
+/// Bounded secret bytes returned only inside the broker process.
+#[derive(Clone)]
+pub struct SecretMaterial(SecretBytes);
+
+impl SecretMaterial {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(SecretBytes::new(bytes))
+    }
+
+    fn into_secret_bytes(self) -> SecretBytes {
+        self.0
+    }
+}
+
+impl fmt::Debug for SecretMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretMaterial([REDACTED])")
+    }
+}
+
+/// A private-map adapter that resolves one already-authorized DRN snapshot.
+#[async_trait]
+pub trait SecretResolver: Send + Sync + fmt::Debug {
+    async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError>;
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("secret source resolution failed ({category})")]
+pub struct SecretResolutionError {
+    pub category: &'static str,
+}
+
+#[derive(Debug)]
+struct EmptySecretResolver;
+
+#[async_trait]
+impl SecretResolver for EmptySecretResolver {
+    async fn resolve(&self, _secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
+        Err(SecretResolutionError {
+            category: "missing",
+        })
+    }
+}
+
+/// Private-map bindings plus the broker-owned resolver that can materialize them.
+pub struct SecretCatalog {
+    bindings: Vec<SecretUseBinding>,
+    resolver: Arc<dyn SecretResolver>,
+    authority_revision: Option<String>,
+}
+
+impl fmt::Debug for SecretCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretCatalog")
+            .field("bindings", &self.bindings.len())
+            .field("resolver", &"[BROKER-PRIVATE]")
+            .field("authority_revision", &self.authority_revision)
+            .finish()
+    }
+}
+
+impl Default for SecretCatalog {
+    fn default() -> Self {
+        Self {
+            bindings: Vec::new(),
+            resolver: Arc::new(EmptySecretResolver),
+            authority_revision: None,
+        }
+    }
+}
+
+impl SecretCatalog {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn new(
+        bindings: Vec<SecretUseBinding>,
+        resolver: Arc<dyn SecretResolver>,
+    ) -> Result<Self, BrokerBuildError> {
+        if bindings.len() > MAX_SECRET_BINDINGS {
+            return Err(BrokerBuildError::TooManySecretBindings {
+                count: bindings.len(),
+                maximum: MAX_SECRET_BINDINGS,
+            });
+        }
+        let mut ids = BTreeSet::new();
+        let mut tuples = BTreeSet::new();
+        for binding in &bindings {
+            binding.grant().validate().map_err(|source| {
+                BrokerBuildError::InvalidSecretBinding {
+                    binding: binding.binding_id.clone(),
+                    source,
+                }
+            })?;
+            if !ids.insert(binding.binding_id.clone()) {
+                return Err(BrokerBuildError::DuplicateSecretBinding {
+                    binding: binding.binding_id.clone(),
+                });
+            }
+            let tuple = (
+                binding.secret.clone(),
+                binding.capability.clone(),
+                binding.sink,
+                binding.basic_username.clone(),
+            );
+            if !tuples.insert(tuple) {
+                return Err(BrokerBuildError::ConflictingSecretBinding {
+                    secret: binding.secret.clone(),
+                    capability: binding.capability.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            bindings,
+            resolver,
+            authority_revision: None,
+        })
+    }
+
+    pub fn drns(&self) -> impl Iterator<Item = &SecretDrn> {
+        self.bindings.iter().map(|binding| &binding.secret)
+    }
+
+    /// Attaches the owner-authored private-map revision used by authority-bound continuity.
+    pub fn with_authority_revision(mut self, revision: String) -> Result<Self, BrokerBuildError> {
+        if revision.is_empty()
+            || revision.len() > 128
+            || revision.trim() != revision
+            || revision.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(BrokerBuildError::InvalidSecretMapRevision);
+        }
+        self.authority_revision = Some(revision);
+        Ok(self)
+    }
+
+    fn grant(&self, binding: &SecretUseBinding) -> SecretUseGrant {
+        let mut grant = binding.grant();
+        grant.map_revision = self.authority_revision.clone();
+        grant
+    }
+
+    fn authority_revision(&self) -> Option<&str> {
+        self.authority_revision.as_deref()
+    }
+
+    fn authority_bindings(&self) -> Vec<&SecretUseBinding> {
+        let mut bindings = self.bindings.iter().collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+        bindings
+    }
+
+    fn validate(&self, constraints: &ConstraintCatalog) -> Result<(), BrokerBuildError> {
+        for binding in &self.bindings {
+            let set = constraints.get(&binding.capability).ok_or_else(|| {
+                BrokerBuildError::SecretBindingUnknownCapability {
+                    binding: binding.binding_id.clone(),
+                    capability: binding.capability.clone(),
+                }
+            })?;
+            let http = set.constraints.http.as_ref().ok_or_else(|| {
+                BrokerBuildError::SecretBindingWithoutHttp {
+                    binding: binding.binding_id.clone(),
+                }
+            })?;
+            if binding.max_injections > http.max_requests
+                || binding
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| !http.allowed_hosts.contains(host))
+                || binding
+                    .allowed_methods
+                    .iter()
+                    .any(|method| !http.allowed_methods.contains(method))
+            {
+                return Err(BrokerBuildError::SecretBindingExceedsCapability {
+                    binding: binding.binding_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn binding(
+        &self,
+        capability: &CapabilityId,
+        proposal: &SecretUseProposal,
+    ) -> Option<&SecretUseBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.matches(capability, proposal))
+    }
+}
+
 /// Explicit breadth of one owner-authored chat-scope grant.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
@@ -1137,6 +1398,7 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
     let constraints = &set.constraints;
     if constraints.timeout_ms == 0
         || constraints.max_output_bytes == 0
+        || constraints.secret_use.is_some()
         || (constraints.http.is_some() && constraints.storage.is_some())
     {
         return Err(BrokerBuildError::InvalidPolicyConstraints);
@@ -1420,6 +1682,32 @@ pub enum BrokerBuildError {
         /// Duplicated symbolic name.
         name: String,
     },
+    #[error("configuration contains {count} secret bindings; broker maximum is {maximum}")]
+    TooManySecretBindings { count: usize, maximum: usize },
+    #[error("private secret map revision is invalid")]
+    InvalidSecretMapRevision,
+    #[error("secret binding {binding:?} is invalid")]
+    InvalidSecretBinding {
+        binding: String,
+        #[source]
+        source: dekopon_capability::SecretUseGrantError,
+    },
+    #[error("secret binding identifier {binding:?} is duplicated")]
+    DuplicateSecretBinding { binding: String },
+    #[error("secret {secret} has conflicting bindings for capability {capability}")]
+    ConflictingSecretBinding {
+        secret: SecretDrn,
+        capability: CapabilityId,
+    },
+    #[error("secret binding {binding:?} names capability {capability} with no constraint set")]
+    SecretBindingUnknownCapability {
+        binding: String,
+        capability: CapabilityId,
+    },
+    #[error("secret binding {binding:?} names a capability with no HTTP authority")]
+    SecretBindingWithoutHttp { binding: String },
+    #[error("secret binding {binding:?} exceeds its capability HTTP constraints")]
+    SecretBindingExceedsCapability { binding: String },
     /// An attestor grant named an empty, overbroad, or non-canonical namespace.
     #[error("attestor namespace scope {scope:?} is not a canonical subject prefix")]
     InvalidAttestorScope {
@@ -1475,6 +1763,12 @@ pub enum AuditEvent {
         attested_subject: Option<ExternalSubject>,
         /// Requested capability.
         capability: CapabilityId,
+        /// Public DRN proposed for separate authorization, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<SecretDrn>,
+        /// Native sink proposed with the public DRN.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_sink: Option<SecretSinkKind>,
         /// Selected provider when a rule matched.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
@@ -1529,6 +1823,12 @@ pub enum AuditEvent {
         attested_subject: Option<ExternalSubject>,
         /// Executed capability.
         capability: CapabilityId,
+        /// Separately authorized public DRN, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<SecretDrn>,
+        /// Native sink in which the DRN was consumed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_sink: Option<SecretSinkKind>,
         /// Trusted selected provider; omitted for storage-backed records.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
@@ -2265,6 +2565,7 @@ pub struct Broker<A> {
     policy_digest: String,
     constraints: ConstraintCatalog,
     credentials: CredentialStore,
+    secrets: SecretCatalog,
     identities: IdentityDirectory,
     broker_principal: PrincipalId,
     gate: AuthorizationGate,
@@ -2431,6 +2732,7 @@ where
                 policy_revision,
                 constraints,
                 credentials,
+                secrets: SecretCatalog::empty(),
                 identities,
                 broker_principal,
                 gate: AuthorizationGate::new(),
@@ -2443,6 +2745,14 @@ where
             },
             warnings,
         ))
+    }
+
+    /// Installs the owner-only private secret map after validating every binding against the
+    /// already validated capability constraint catalog.
+    pub fn with_secret_catalog(mut self, secrets: SecretCatalog) -> Result<Self, BrokerBuildError> {
+        secrets.validate(&self.constraints)?;
+        self.secrets = secrets;
+        Ok(self)
     }
 
     /// The fingerprint of the policy set every decision by this broker is evaluated against.
@@ -2578,6 +2888,26 @@ where
                 effect: set.effect,
                 risk: set.risk,
                 idempotency: set.idempotency,
+            },
+            context: policy_context(context),
+        })
+    }
+
+    /// Separately asks policy whether this context may use one exact public DRN.
+    fn authorize_secret_use(
+        &self,
+        context: &AuthenticatedContext,
+        capability: &CapabilityId,
+        set: &ConstraintSet,
+        proposal: &SecretUseProposal,
+    ) -> PolicyDecision {
+        self.policy.authorize(PolicyRequest {
+            principal: context.principal().clone(),
+            target: PolicyTarget::SecretUse {
+                secret: proposal.secret().clone(),
+                capability: capability.clone(),
+                provider: set.provider.clone(),
+                sink: proposal.sink(),
             },
             context: policy_context(context),
         })
@@ -3112,6 +3442,7 @@ where
                 .expect("reserved memory capability is valid"),
             trace: turn.trace,
             trace_parent: turn.trace_parent,
+            secret_use: None,
             input: serde_json::json!({
                 "delivery": turn.delivery,
                 "user": turn.user,
@@ -3266,6 +3597,10 @@ where
                     && self.authorize_capability(context, capability, set).allowed
             })
             .collect::<Vec<_>>();
+        let effective_capabilities = effective
+            .iter()
+            .map(|(capability, _)| (*capability).clone())
+            .collect::<BTreeSet<_>>();
         encoded.number("capabilityCount", effective.len() as u128);
         for (capability, set) in effective {
             encoded.text("capability", capability.as_str());
@@ -3279,6 +3614,72 @@ where
                 .get(&set.provider)
                 .ok_or(BrokerError::MemoryUnavailable)?;
             encoded.text("providerArtifactSha256", digest);
+        }
+
+        let secret_bindings = self
+            .secrets
+            .authority_bindings()
+            .into_iter()
+            .filter(|binding| {
+                effective_capabilities.contains(&binding.capability)
+                    && self
+                        .constraints
+                        .get(&binding.capability)
+                        .is_some_and(|set| {
+                            self.authorize_secret_use(
+                                context,
+                                &binding.capability,
+                                set,
+                                &binding.proposal(),
+                            )
+                            .allowed
+                        })
+            })
+            .collect::<Vec<_>>();
+        if !secret_bindings.is_empty() {
+            encoded.number("secretBindingCount", secret_bindings.len() as u128);
+            encoded.optional_text("secretMapRevision", self.secrets.authority_revision());
+        }
+        for binding in secret_bindings {
+            encoded.text("secretBinding", &binding.binding_id);
+            encoded.text("secretDrn", binding.secret.as_str());
+            encoded.text("secretCapability", binding.capability.as_str());
+            encoded.text("secretSink", &binding.sink.to_string());
+            encoded.optional_text("secretBasicUsername", binding.basic_username.as_deref());
+            let mut hosts = binding.allowed_hosts.clone();
+            hosts.sort();
+            hosts.dedup();
+            encoded.number("secretHostCount", hosts.len() as u128);
+            for host in hosts {
+                encoded.text("secretHost", &host);
+            }
+            let mut methods = binding.allowed_methods.clone();
+            methods.sort();
+            methods.dedup();
+            encoded.number("secretMethodCount", methods.len() as u128);
+            for method in methods {
+                encoded.text("secretMethod", &method);
+            }
+            let mut paths = binding
+                .allowed_paths
+                .iter()
+                .map(|rule| match rule {
+                    dekopon_capability::HttpPathRule::Exact { path } => {
+                        format!("exact:{path}")
+                    }
+                    dekopon_capability::HttpPathRule::SegmentPrefix { path } => {
+                        format!("segment-prefix:{path}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            encoded.number("secretPathCount", paths.len() as u128);
+            for path in paths {
+                encoded.text("secretPath", &path);
+            }
+            encoded.boolean("secretAllowQuery", binding.allow_query);
+            encoded.number("secretMaxInjections", u128::from(binding.max_injections));
         }
 
         encode_host_limits(&mut encoded, self.registry.host_limits());
@@ -3498,7 +3899,7 @@ where
             // under `Leniency::Tolerant` the startup check is only a warning, so this *is* the
             // enforcement — a capability a policy anticipates but no provider routes dies here.
             // Do not weaken it into an assertion or fold it into the policy decision.
-            let Some(set) = self.constraints.get(&request.capability).cloned() else {
+            let Some(mut set) = self.constraints.get(&request.capability).cloned() else {
                 authorize.record("outcome", "unconstrained-capability");
                 return self
                     .deny(context, &request, "unconstrained-capability", Vec::new())
@@ -3551,11 +3952,50 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
+            let mut policy_ids = decision.determining_policy_ids;
+            if let Some(secret_use) = request.secret_use.as_ref() {
+                let Some(binding) = self
+                    .secrets
+                    .binding(&request.capability, secret_use)
+                    .cloned()
+                else {
+                    authorize.record("outcome", "secret-denied");
+                    return self
+                        .deny(context, &request, "secret-denied", policy_ids)
+                        .await
+                        .map(ControlFlow::Break);
+                };
+                let secret_decision =
+                    self.authorize_secret_use(context, &request.capability, &set, secret_use);
+                authorize.record(
+                    "policy.errors_present",
+                    decision.errors_present || secret_decision.errors_present,
+                );
+                policy_ids.extend(secret_decision.determining_policy_ids.clone());
+                policy_ids.sort();
+                policy_ids.dedup();
+                if !secret_decision.allowed {
+                    authorize.record("outcome", "secret-denied");
+                    if secret_decision.errors_present {
+                        tracing::warn!(
+                            event = "broker_policy_evaluation_error",
+                            invocation = %request.id,
+                            policy.target = "secret",
+                        );
+                    }
+                    return self
+                        .deny(context, &request, "secret-denied", policy_ids)
+                        .await
+                        .map(ControlFlow::Break);
+                }
+                set.constraints.secret_use = Some(self.secrets.grant(&binding));
+            } else {
+                // Secret grants are derived only from a typed proposal after the second policy
+                // decision; owner-authored constraint YAML cannot make one ambient.
+                set.constraints.secret_use = None;
+            }
             authorize.record("outcome", "allowed");
-            Ok(ControlFlow::Continue((
-                set,
-                decision.determining_policy_ids,
-            )))
+            Ok(ControlFlow::Continue((set, policy_ids)))
         }
         .instrument(authorize.clone())
         .await?;
@@ -3583,7 +4023,9 @@ where
         // The symbolic name only, exactly as the audit record carries it: once one capability can
         // present two credentials, a trace that names neither cannot say which organization a
         // write reached. `Redacted` keeps the value itself out of both.
-        if let Some(credential) = set.credential_for(context.actor()) {
+        if let Some(secret) = request.secret_use.as_ref() {
+            execute.record("credential", secret.secret().as_str());
+        } else if let Some(credential) = set.credential_for(context.actor()) {
             execute.record("credential", credential);
         }
         self.execute(context, request, set, policy_ids)
@@ -3608,6 +4050,7 @@ where
             via: context.via(),
             attested_subject: context.attested_subject(),
             capability: &request.capability,
+            secret_use: request.secret_use.as_ref(),
             provider: None,
             authorized_by: &self.broker_principal,
             policy_revision: &self.policy_revision,
@@ -3641,6 +4084,17 @@ where
                     .then(|| context.attested_subject().cloned())
                     .flatten(),
                 capability: request.capability.clone(),
+                secret: (!storage_backed)
+                    .then(|| {
+                        request
+                            .secret_use
+                            .as_ref()
+                            .map(|secret| secret.secret().clone())
+                    })
+                    .flatten(),
+                secret_sink: (!storage_backed)
+                    .then(|| request.secret_use.as_ref().map(SecretUseProposal::sink))
+                    .flatten(),
                 provider: None,
                 authorized_by: (!storage_backed).then(|| self.broker_principal.clone()),
                 decision_id: decision_id.clone(),
@@ -3674,6 +4128,63 @@ where
                 media_type: POLICY_EVIDENCE_MEDIA_TYPE.to_owned(),
                 uri: None,
             }],
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the terminal record takes the exact authorization identity and policy material already in scope; bundling it would create a second partial invocation type"
+    )]
+    async fn fail_authorized_before_provider(
+        &self,
+        context: &AuthenticatedContext,
+        invocation: &InvocationId,
+        trace: &TraceId,
+        capability: &CapabilityId,
+        decision_id: &str,
+        decision: DecisionReference,
+        set: &ConstraintSet,
+        credential: Option<&str>,
+        policy_ids: &[String],
+        policy_evidence: Evidence,
+        reason: &'static str,
+    ) -> Result<InvocationResult, BrokerError> {
+        let event = execution_event(
+            context,
+            invocation,
+            trace,
+            capability,
+            decision_id,
+            &self.policy_revision,
+            policy_ids,
+            &self.policy_digest,
+            &self.broker_principal,
+            set,
+            credential,
+            InvocationOutcome::Failed,
+            0,
+            Some(reason.to_owned()),
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let execution = tracing::Span::current();
+        execution.record("outcome", "failed");
+        execution.record("error", reason);
+        self.audit.append(event).await.map_err(|source| {
+            execution.record("outcome", "authorized-failure-unaudited");
+            execution.record("error", source.category());
+            report_audit_failure("authorized-failure", invocation, &source);
+            BrokerError::AuthorizedFailureAudit { source }
+        })?;
+        Ok(InvocationResult {
+            invocation: invocation.clone(),
+            decision,
+            outcome: InvocationOutcome::Failed,
+            output: None,
+            error: Some(reason.to_owned()),
+            evidence: vec![policy_evidence],
         })
     }
 
@@ -3753,13 +4264,15 @@ where
         let invocation_id = request.id.clone();
         let trace = request.trace.clone();
         let capability = request.capability.clone();
+        let secret_use = request.secret_use.take();
         let proposal = ProposedInvocation::new(
             request.id,
             request.capability,
             context.actor().clone(),
             request.trace,
             request.input,
-        );
+        )
+        .with_secret_use(secret_use);
         let authorized = self
             .gate
             .authorize(
@@ -3804,6 +4317,16 @@ where
                     .then(|| context.attested_subject().cloned())
                     .flatten(),
                 capability: capability.clone(),
+                secret: authorized
+                    .proposal()
+                    .secret_use
+                    .as_ref()
+                    .map(|secret| secret.secret().clone()),
+                secret_sink: authorized
+                    .proposal()
+                    .secret_use
+                    .as_ref()
+                    .map(SecretUseProposal::sink),
                 provider: storage_scope_commitment
                     .is_none()
                     .then(|| set.provider.clone()),
@@ -3846,17 +4369,100 @@ where
             ),
         };
 
-        // Selected by the acting agent, falling back to the set's default; construction proved
-        // every name the set can select exists and that every allowed host sits inside that
-        // credential's destination binding. The agent comes from the trusted context the broker
-        // derived, so this is owner-controlled configuration selecting on owner-controlled
-        // identity — a caller cannot ask for a different token by changing its payload. The secret
-        // itself never enters the authorization, the audit chain, or the wire: it travels only
-        // from the store into the native HTTP boundary for this one invocation.
-        let credential_name = set.credential_for(context.actor());
-        let credential = credential_name
-            .and_then(|name| self.credentials.get(name))
-            .cloned();
+        // Legacy credentials remain owner-selected by capability/agent. A public DRN is different:
+        // it was untrusted proposal data, passed a separate Cedar decision, matched an owner binding,
+        // and is now resolved exactly once for this invocation. The provider receives neither name
+        // nor bytes; only the native HTTP context receives the rendered credential beside the
+        // authorization that commits to the same DRN/sink/binding.
+        let proposed_secret = authorized.proposal().secret_use.clone();
+        let legacy_credential_name = set.credential_for(context.actor()).map(str::to_owned);
+        let audit_credential = proposed_secret
+            .is_none()
+            .then_some(legacy_credential_name.as_deref())
+            .flatten();
+        let credential = if let Some(proposal) = proposed_secret {
+            let material = match self.secrets.resolver.resolve(proposal.secret()).await {
+                Ok(material) => material,
+                Err(source) => {
+                    tracing::warn!(
+                        event = "broker_secret_resolution_failed",
+                        invocation = %invocation_id,
+                        category = source.category,
+                    );
+                    return self
+                        .fail_authorized_before_provider(
+                            context,
+                            &invocation_id,
+                            &trace,
+                            &capability,
+                            &decision_id,
+                            decision,
+                            &set,
+                            audit_credential,
+                            &policy_ids,
+                            policy_evidence,
+                            "secret-resolution",
+                        )
+                        .await;
+                }
+            };
+            let Some(grant) = authorized.constraints().secret_use.as_ref() else {
+                return self
+                    .fail_authorized_before_provider(
+                        context,
+                        &invocation_id,
+                        &trace,
+                        &capability,
+                        &decision_id,
+                        decision,
+                        &set,
+                        audit_credential,
+                        &policy_ids,
+                        policy_evidence,
+                        "secret-authorization",
+                    )
+                    .await;
+            };
+            let built = match proposal.sink() {
+                SecretSinkKind::HttpBearer => {
+                    BoundCredential::secret_bearer(material.into_secret_bytes(), grant)
+                }
+                SecretSinkKind::HttpBasic => {
+                    BoundCredential::secret_basic(material.into_secret_bytes(), grant)
+                }
+            };
+            match built {
+                Ok(credential) => Some(credential),
+                Err(source) => {
+                    tracing::warn!(
+                        event = "broker_secret_credential_failed",
+                        invocation = %invocation_id,
+                        category = "invalid-material",
+                        cause_type = std::any::type_name_of_val(&source),
+                    );
+                    return self
+                        .fail_authorized_before_provider(
+                            context,
+                            &invocation_id,
+                            &trace,
+                            &capability,
+                            &decision_id,
+                            decision,
+                            &set,
+                            audit_credential,
+                            &policy_ids,
+                            policy_evidence,
+                            "secret-credential",
+                        )
+                        .await;
+                }
+            }
+        } else {
+            legacy_credential_name
+                .as_deref()
+                .and_then(|name| self.credentials.get(name))
+                .cloned()
+        };
         let started = Instant::now();
         let execution = self
             .registry
@@ -3926,7 +4532,7 @@ where
                     &self.policy_digest,
                     &self.broker_principal,
                     &set,
-                    credential_name,
+                    audit_credential,
                     InvocationOutcome::Succeeded,
                     duration_ms,
                     None,
@@ -3983,7 +4589,7 @@ where
                     &self.policy_digest,
                     &self.broker_principal,
                     &set,
-                    credential_name,
+                    audit_credential,
                     InvocationOutcome::Failed,
                     duration_ms,
                     Some(error.clone()),
@@ -4439,6 +5045,16 @@ fn execution_event(
             .then(|| context.attested_subject().cloned())
             .flatten(),
         capability: capability.clone(),
+        secret: set
+            .constraints
+            .secret_use
+            .as_ref()
+            .map(|secret| secret.secret.clone()),
+        secret_sink: set
+            .constraints
+            .secret_use
+            .as_ref()
+            .map(|secret| secret.sink),
         provider: (!storage_backed).then(|| set.provider.clone()),
         authorized_by: (!storage_backed).then(|| authorized_by.clone()),
         decision_id: decision_id.to_owned(),
@@ -4475,6 +5091,8 @@ struct DecisionMaterial<'a> {
     via: Option<&'a PrincipalId>,
     attested_subject: Option<&'a ExternalSubject>,
     capability: &'a CapabilityId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_use: Option<&'a SecretUseProposal>,
     provider: Option<&'a ProviderId>,
     authorized_by: &'a PrincipalId,
     policy_revision: &'a str,
@@ -4548,6 +5166,9 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::MissingStorageGrant
         | BrokerHostError::UnexpectedStorageGrant
         | BrokerHostError::StorageGrantMismatch
+        | BrokerHostError::InvalidSecretAuthorization { .. }
+        | BrokerHostError::SecretAuthorizationExceedsHttp
+        | BrokerHostError::SecretCredentialMismatch
         | BrokerHostError::HttpConfiguration { .. } => "authorization-constraint",
         BrokerHostError::UnknownCapability { .. }
         | BrokerHostError::ProviderDoesNotImplement { .. }
@@ -4691,6 +5312,12 @@ pub enum BrokerError {
         #[source]
         source: AuditError,
     },
+    /// An authorized pre-provider failure could not append its terminal failed record.
+    #[error("broker could not audit an authorized pre-provider failure")]
+    AuthorizedFailureAudit {
+        #[source]
+        source: AuditError,
+    },
     /// Terminal evidence could not be hashed after provider work ended.
     #[error("broker could not serialize terminal evidence for {invocation}")]
     OutcomeEvidence {
@@ -4757,6 +5384,9 @@ impl BrokerError {
             Self::ReplayLedgerFull { .. } => Some("capacity-exhausted"),
             Self::DecisionAudit {
                 source: AuditError::Full { .. },
+            }
+            | Self::AuthorizedFailureAudit {
+                source: AuditError::Full { .. },
             } => Some("capacity-exhausted"),
             Self::MemoryUnavailable
             | Self::InvalidMemoryInput
@@ -4765,6 +5395,7 @@ impl BrokerError {
             | Self::Authorization { .. }
             | Self::DecisionEvidence { .. }
             | Self::DecisionAudit { .. }
+            | Self::AuthorizedFailureAudit { .. }
             | Self::OutcomeEvidence { .. }
             | Self::StorageOutcome { .. }
             | Self::OutcomeAudit { .. } => None,
@@ -4795,7 +5426,8 @@ impl BrokerError {
             | Self::StorageTask { .. }
             | Self::Authorization { .. }
             | Self::DecisionEvidence { .. }
-            | Self::DecisionAudit { .. } => None,
+            | Self::DecisionAudit { .. }
+            | Self::AuthorizedFailureAudit { .. } => None,
         }
     }
 }

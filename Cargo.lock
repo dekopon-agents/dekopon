@@ -947,6 +947,7 @@ dependencies = [
 name = "dekopon-broker"
 version = "0.11.1"
 dependencies = [
+ "async-trait",
  "dekopon-broker-host",
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -1003,7 +1004,9 @@ dependencies = [
 name = "dekopon-brokerd"
 version = "0.11.1"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "clap",
  "dekopon-broker",
  "dekopon-broker-host",
@@ -1017,6 +1020,7 @@ dependencies = [
  "dekopon-webui",
  "fs2",
  "futures-util",
+ "hmac",
  "http-auth",
  "libc",
  "opentelemetry",
@@ -1029,6 +1033,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
@@ -1075,6 +1080,7 @@ dependencies = [
 name = "dekopon-http-host"
 version = "0.11.1"
 dependencies = [
+ "base64 0.23.1",
  "dekopon-capability",
  "dekopon-core",
  "futures-util",

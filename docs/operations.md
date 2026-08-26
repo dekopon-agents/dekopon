@@ -52,7 +52,9 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 |---|---|
 | Who may drive which agent, and where is that written? | [`dekopon-brokerd` § Policy](../crates/dekopon-brokerd/README.md#policy) |
 | How narrowly does an authorized invocation actually run? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) |
-| Where do provider credentials live, and how are they bound to a destination? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
+| Where do legacy provider credentials live, and how are they bound to a destination? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
+| How may an agent name a secret without seeing it, and which stores can back it? | [`secrets.md`](secrets.md) — DRNs, dual policy, private bindings, source adapters, path scope, bootstrap, rotation and reflection limits |
+| Why did a DRN return `secret-denied`? | The same document: unknown, unbound, wrong-sink/username and policy-denied names intentionally share one result; inspect broker-side policy/map validation rather than probing names. |
 | A grant looks right and every session is denied. | Check the agent name. [`broker-http.md` § Startup validation](broker-http.md#startup-validation) — agent literals are the one class that is not proved at startup |
 | What does an agent's catalog entry actually decide? | [`catalog.md`](catalog.md) |
 | How do I get a ChatGPT credential onto a host or into a pod? | [`chatgpt-credential.md`](chatgpt-credential.md), and [`1password-eso.md`](1password-eso.md) for the secret store |
@@ -72,7 +74,7 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 |---|---|
 | Kubernetes | [`charts/dekopon/README.md`](../charts/dekopon/README.md) |
 | The container image — what is in it and what does it assume? | [`container-image.md`](container-image.md) |
-| Getting a secret into a pod as a file the daemons will open | [`1password-eso.md`](1password-eso.md) |
+| Getting an ordinary daemon file or a projection-backed DRN source into a pod | [`1password-eso.md`](1password-eso.md) and [`secrets.md` § `kubernetesProjection`](secrets.md#kubernetesprojection) |
 | Optional provider storage and durable chat memory | [`dekopon-brokerd` § Optional provider storage and chat memory](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory) |
 
 ## The boundaries an operator must not paper over

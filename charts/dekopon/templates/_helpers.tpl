@@ -97,8 +97,12 @@ Whether each optional file has a source at all.
 {{- if or .Values.broker.credentials.inline .Values.broker.credentials.existingSecret -}}true{{- end -}}
 {{- end -}}
 
+{{- define "dekopon.hasSecretMap" -}}
+{{- if or .Values.broker.secretMap.inline .Values.broker.secretMap.existingSecret -}}true{{- end -}}
+{{- end -}}
+
 {{- define "dekopon.hasInlineConfig" -}}
-{{- if or .Values.broker.config.inline .Values.broker.policies.inline (and .Values.gateway.enabled .Values.gateway.config.inline) -}}true{{- end -}}
+{{- if or .Values.broker.config.inline .Values.broker.policies.inline .Values.broker.secretMap.inline (and .Values.gateway.enabled .Values.gateway.config.inline) -}}true{{- end -}}
 {{- end -}}
 
 {{- define "dekopon.chatgptSecretName" -}}
@@ -148,6 +152,16 @@ cannot drift apart.
 - file: broker-credentials.yaml
   secret: {{ default (include "dekopon.credentialsSecretName" .) .Values.broker.credentials.existingSecret }}
   key: {{ if .Values.broker.credentials.existingSecret }}{{ .Values.broker.credentials.existingSecretKey }}{{ else }}broker-credentials.yaml{{ end }}
+{{- end }}
+{{- if include "dekopon.hasSecretMap" . }}
+- file: secret-map.yaml
+  secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.secretMap.existingSecret }}
+  key: {{ if .Values.broker.secretMap.existingSecret }}{{ .Values.broker.secretMap.existingSecretKey }}{{ else }}secret-map.yaml{{ end }}
+{{- end }}
+{{- range .Values.broker.secretBootstrapFiles }}
+- file: {{ .file }}
+  secret: {{ .existingSecret }}
+  key: {{ .existingSecretKey }}
 {{- end }}
 {{- if .Values.gateway.enabled }}
 - file: dekopond.yaml
@@ -209,6 +223,9 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if and .Values.broker.credentials.inline .Values.broker.credentials.existingSecret -}}
 {{- fail "broker.credentials.inline and broker.credentials.existingSecret are mutually exclusive" -}}
 {{- end -}}
+{{- if and .Values.broker.secretMap.inline .Values.broker.secretMap.existingSecret -}}
+{{- fail "broker.secretMap.inline and broker.secretMap.existingSecret are mutually exclusive" -}}
+{{- end -}}
 
 {{/* Only inline configuration can be inspected; an existing Secret is opaque here. */}}
 {{- if .Values.broker.config.inline -}}
@@ -217,6 +234,9 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- if and (regexMatch "(?m)^[[:space:]]*credentialsPath:" .Values.broker.config.inline) (not (include "dekopon.hasCredentials" .)) -}}
 {{- fail "broker.config.inline names credentialsPath but no credentials were supplied; set broker.credentials.inline or broker.credentials.existingSecret" -}}
+{{- end -}}
+{{- if and (regexMatch "(?m)^[[:space:]]*secretMapPath:" .Values.broker.config.inline) (not (include "dekopon.hasSecretMap" .)) -}}
+{{- fail "broker.config.inline names secretMapPath but no secret map was supplied; set broker.secretMap.inline or broker.secretMap.existingSecret" -}}
 {{- end -}}
 {{- if and (regexMatch "(?m)^[[:space:]]*constraintSets:" .Values.broker.config.inline) (not (include "dekopon.hasPolicies" .)) -}}
 {{- fail "broker.config.inline declares constraintSets but no policy set was supplied; dekopon-brokerd refuses to start with executable capabilities and no policy" -}}
@@ -307,6 +327,65 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- range $rightName, $rightPath := $chartPaths -}}
 {{- if and (ne $leftName $rightName) (or (eq (clean $leftPath) (clean $rightPath)) (hasPrefix (printf "%s/" (clean $leftPath)) (clean $rightPath)) (hasPrefix (printf "%s/" (clean $rightPath)) (clean $leftPath))) -}}
 {{- fail (printf "%s (%s) and %s (%s) must not overlap; separate volume mounts would shadow files" $leftName $leftPath $rightName $rightPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "dekopond.yaml" true -}}
+{{- if include "dekopon.chatgptEnabled" . -}}
+{{- $_ := set $bootstrapNames .Values.gateway.chatgpt.fileName true -}}
+{{- end -}}
+{{- range .Values.broker.secretBootstrapFiles -}}
+{{- if or (not .file) (not .existingSecret) (not .existingSecretKey) -}}
+{{- fail "each broker.secretBootstrapFiles entry requires file, existingSecret, and existingSecretKey" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" .file)) (eq .file ".") (eq .file "..") -}}
+{{- fail (printf "broker secret bootstrap file %q must be one non-dot path segment" .file) -}}
+{{- end -}}
+{{- if hasKey $bootstrapNames .file -}}
+{{- fail (printf "broker secret bootstrap file %q collides with another managed file" .file) -}}
+{{- end -}}
+{{- $_ := set $bootstrapNames .file true -}}
+{{- end -}}
+
+{{- $secretSourceNames := dict "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "provider-storage-key" true "provider-storage-key-source" true -}}
+{{- range .Values.broker.secretSourceVolumes -}}
+{{- $source := . -}}
+{{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
+{{- fail "each broker.secretSourceVolumes entry requires name, mountPath, and a volume map" -}}
+{{- end -}}
+{{- if hasKey $secretSourceNames .name -}}
+{{- fail (printf "broker.secretSourceVolumes duplicates name %q" .name) -}}
+{{- end -}}
+{{- $_ := set $secretSourceNames .name true -}}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" .name)) (gt (len .name) 63) -}}
+{{- fail (printf "broker.secretSourceVolumes name %q is not a DNS label" .name) -}}
+{{- end -}}
+{{- if or (not (hasPrefix "/" .mountPath)) (ne (clean .mountPath) .mountPath) -}}
+{{- fail (printf "broker secret source mountPath must be canonical absolute, got %q" .mountPath) -}}
+{{- end -}}
+{{- range $pathName, $path := $chartPaths -}}
+{{- if or (eq (clean $source.mountPath) (clean $path)) (hasPrefix (printf "%s/" (clean $source.mountPath)) (clean $path)) (hasPrefix (printf "%s/" (clean $path)) (clean $source.mountPath)) -}}
+{{- fail (printf "broker secret source %s mountPath %s overlaps %s (%s)" $source.name $source.mountPath $pathName $path) -}}
+{{- end -}}
+{{- end -}}
+{{- range $pathName, $path := dict "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- if or (eq (clean $source.mountPath) $path) (hasPrefix (printf "%s/" (clean $source.mountPath)) $path) (hasPrefix (printf "%s/" $path) (clean $source.mountPath)) -}}
+{{- fail (printf "broker secret source %s mountPath %s overlaps chart/image-owned %s (%s)" $source.name $source.mountPath $pathName $path) -}}
+{{- end -}}
+{{- end -}}
+{{- if $.Values.providerStorage.enabled -}}
+{{- range $pathName, $path := dict "providerStorage.rootPath" $.Values.providerStorage.rootPath "providerStorage.keyDir" $.Values.providerStorage.keyDir -}}
+{{- if or (eq (clean $source.mountPath) (clean $path)) (hasPrefix (printf "%s/" (clean $source.mountPath)) (clean $path)) (hasPrefix (printf "%s/" (clean $path)) (clean $source.mountPath)) -}}
+{{- fail (printf "broker secret source %s mountPath %s overlaps %s (%s)" $source.name $source.mountPath $pathName $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $leftIndex, $left := .Values.broker.secretSourceVolumes -}}
+{{- range $rightIndex, $right := $.Values.broker.secretSourceVolumes -}}
+{{- if and (lt $leftIndex $rightIndex) (or (eq (clean $left.mountPath) (clean $right.mountPath)) (hasPrefix (printf "%s/" (clean $left.mountPath)) (clean $right.mountPath)) (hasPrefix (printf "%s/" (clean $right.mountPath)) (clean $left.mountPath))) -}}
+{{- fail (printf "broker secret source mounts %s (%s) and %s (%s) must not overlap" $left.name $left.mountPath $right.name $right.mountPath) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -408,6 +487,11 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ $.Values.paths.runtimeDir }}
     - name: state
       mountPath: {{ $.Values.paths.stateDir }}
+{{- range $.Values.broker.secretSourceVolumes }}
+    - name: {{ .name }}
+      mountPath: {{ .mountPath }}
+      readOnly: true
+{{- end }}
 {{- if $.Values.providerStorage.enabled }}
     - name: provider-storage
       mountPath: {{ $.Values.providerStorage.rootPath }}

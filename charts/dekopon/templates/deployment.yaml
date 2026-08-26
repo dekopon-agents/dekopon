@@ -341,6 +341,11 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.runtime }}
+{{- range .Values.broker.secretSourceVolumes }}
+        # Broker-only source for the owner-authored private secret map; never mounted by gateway.
+        - name: {{ .name }}
+          {{- toYaml .volume | nindent 10 }}
+{{- end }}
         - name: tmp
           emptyDir:
             medium: Memory

@@ -38,7 +38,7 @@ mod http;
 mod metadata;
 mod metrics;
 mod storage;
-pub use http::{BoundCredential, HttpCallEvidence};
+pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError};
 use http::{HttpCeilings, HttpState};
 pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
 use metadata::{
@@ -919,6 +919,7 @@ impl BrokerWasmProvider {
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
         let http = match HttpState::invoke(
             constraints.http.clone(),
+            constraints.secret_use.clone(),
             credential,
             self.runtime.http_ceilings(),
             operation_timeout,
@@ -1530,6 +1531,14 @@ impl BrokerProviderRegistry {
             }
             .into());
         }
+        let secret_grant = authorized.constraints().secret_use.as_ref();
+        if credential
+            .as_ref()
+            .is_some_and(|credential| !credential.matches_secret_grant(secret_grant))
+            || (secret_grant.is_some() && credential.is_none())
+        {
+            return Err(BrokerHostError::SecretCredentialMismatch.into());
+        }
         let storage_transaction = match (&authorized.constraints().storage, storage_grant) {
             (None, None) => None,
             (None, Some(_)) => return Err(BrokerHostError::UnexpectedStorageGrant.into()),
@@ -1697,6 +1706,26 @@ fn validate_authorized_constraints(
     if constraints.http.is_some() && constraints.storage.is_some() {
         return Err(BrokerHostError::MixedHostAuthorization);
     }
+    if let Some(secret) = &constraints.secret_use {
+        secret
+            .validate()
+            .map_err(|source| BrokerHostError::InvalidSecretAuthorization { source })?;
+        let Some(http) = &constraints.http else {
+            return Err(BrokerHostError::SecretAuthorizationExceedsHttp);
+        };
+        if secret.max_injections > http.max_requests
+            || secret
+                .allowed_hosts
+                .iter()
+                .any(|host| !http.allowed_hosts.contains(host))
+            || secret
+                .allowed_methods
+                .iter()
+                .any(|method| !http.allowed_methods.contains(method))
+        {
+            return Err(BrokerHostError::SecretAuthorizationExceedsHttp);
+        }
+    }
     if let Some(http) = &constraints.http {
         if http.allowed_hosts.is_empty()
             || http.allowed_methods.is_empty()
@@ -1790,6 +1819,18 @@ pub enum BrokerHostError {
     /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHostAuthorization,
+    /// Secret-use authorization was structurally invalid.
+    #[error("secret-use authorization is invalid")]
+    InvalidSecretAuthorization {
+        #[source]
+        source: dekopon_capability::SecretUseGrantError,
+    },
+    /// Secret-use scope exceeded the surrounding HTTP authorization.
+    #[error("secret-use authorization exceeds HTTP authority")]
+    SecretAuthorizationExceedsHttp,
+    /// Resolved secret material did not match the DRN/sink/binding committed into authorization.
+    #[error("resolved secret credential does not match authorized secret use")]
+    SecretCredentialMismatch,
     /// Storage was constrained but no native storage engine is configured.
     #[error("provider storage is disabled")]
     StorageDisabled,

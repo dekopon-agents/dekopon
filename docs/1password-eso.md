@@ -2,7 +2,7 @@
 
 This document traces one path end to end: a credential typed into 1Password, pulled into a Kubernetes cluster by the External Secrets Operator, and turned into a file that `dekopon-brokerd` will actually open. It is both the runbook for the two steps a human performs by hand and the explanation of what each layer in that path does and, more usefully, does not do.
 
-**Status.** The cluster-side plumbing — an Argo CD `AppProject`, the operator, and a `ClusterSecretStore` pointed at the 1Password `Dekopon` vault — is deployed and is quoted here from the manifests that are merged in the cluster repository, `xrl/rpi-homelab`. Nothing consumes it yet: there is no `ExternalSecret` for Dekopon, and this guide stops one step short of a running pod. The last link in the chain, materializing a projected Secret into a file the broker's hygiene checks accept, is not something External Secrets can do at all; [what ESO does not solve](#what-eso-does-not-solve) is the part of this document worth reading twice.
+**Status.** The cluster-side plumbing — an Argo CD `AppProject`, the operator, and a `ClusterSecretStore` pointed at the 1Password `Dekopon` vault — is deployed and is quoted here from the manifests merged in `xrl/rpi-homelab`. No `ExternalSecret` for Dekopon exists yet. For legacy whole-file daemon configuration, ESO still stops one step short: the projected symlink farm cannot satisfy the ordinary owner-only file loader. The public-DRN private map now adds a separate, deliberately projection-aware source adapter for individual secret values; [`secrets.md`](secrets.md) states that boundary.
 
 ## The path
 
@@ -256,7 +256,7 @@ When that change lands it will need to state two things this document cannot sta
 
 ## What ESO does not solve
 
-External Secrets is a *provisioning* mechanism. It ends at a Kubernetes `Secret`, and **a Kubernetes Secret is not a file `dekopon-brokerd` will open.**
+External Secrets is a *provisioning* mechanism. It ends at a Kubernetes `Secret`, and **a projected Kubernetes Secret is still not a legacy whole-file `broker-credentials.yaml`, broker/gateway config, or policy file the ordinary loader will open.** A private secret-map entry may instead opt into the separate `kubernetesProjection` reader for one bounded value.
 
 ### The checks
 
@@ -282,9 +282,9 @@ A Kubernetes `Secret` mounted as a volume is not a directory of files. It is a s
 
 That third row is the one that catches people: `fsGroup` is the standard fix for "the container cannot read its mounted Secret", it makes the file group-readable, and group-readable is exactly what the credentials file refuses. The fix for the general problem is the cause of the specific one.
 
-**So no Kubernetes volume can present a file either daemon will read.** The answer is an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards — with the projected source visible only to that init container and never to the daemons. The current [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential. ESO can create the source Secret; the chart still owns the separate file-hygiene step.
+**So no Kubernetes volume can present one of the ordinary daemon files directly.** The answer for broker/gateway configuration, Cedar policy, legacy credentials, storage keys, and writable credentials remains an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards. Public-DRN secret values are the scoped exception: `kubernetesProjection` snapshots kubelet's `..data` generation and opens one configured key without following the user-visible key symlink; it does not relax the ordinary loader or make a projected whole-file config valid. The current [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential. ESO can create the source Secret; the chart still owns the separate file-hygiene step.
 
-**ESO solves provisioning, not file hygiene.** Adopting it removes the question of how a secret gets into the cluster and leaves the question of how it becomes a file entirely untouched.
+**ESO solves provisioning, not authority.** An init copy remains required for ordinary daemon files. A projection-aware DRN source can read a value without that copy, but capability policy, separate `secret.use` policy, the private sink binding, source bootstrap, path scope, and rotation behavior remain Dekopon responsibilities.
 
 ### The provider-storage namespace key is retained authority
 
