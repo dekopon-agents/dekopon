@@ -69,6 +69,20 @@ class ClassifyCiChangesTests(unittest.TestCase):
     def test_package_cache_helper_selects_package_validation(self) -> None:
         self.assert_selected([".github/scripts/prepare-package-cache.sh"], "run_package")
 
+    def test_load_bearing_examples_and_provider_helper_run_rust(self) -> None:
+        for path in (
+            "examples/conditional-write/broker.yaml",
+            "examples/slack/manifest-agent.yaml",
+            "examples/providers/build-component.sh",
+        ):
+            with self.subTest(path=path):
+                self.assert_selected(
+                    [path],
+                    "run_rust",
+                    "run_otel",
+                    "run_cli_install",
+                )
+
     def test_otel_fixture_preserves_rust_and_smoke_coverage(self) -> None:
         self.assert_selected(
             ["examples/otel-traces/smoke-test.sh"],

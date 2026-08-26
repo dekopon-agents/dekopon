@@ -105,7 +105,11 @@ def classify_path(path: str) -> dict[str, bool]:
     if PROVIDER_INPUT.fullmatch(path):
         flags["run_rust"] = True
 
-    if re.fullmatch(r"examples/pr-summarizer-linter/[^/]+\.(?:cedar|yaml|yaml\.example)", path):
+    if (
+        path.startswith("examples/conditional-write/")
+        or re.fullmatch(r"examples/slack/[^/]+\.yaml", path)
+        or path == "examples/providers/build-component.sh"
+    ):
         flags["run_rust"] = True
 
     if re.fullmatch(r"examples/providers/[^/]+-provider\.wasm", path):
