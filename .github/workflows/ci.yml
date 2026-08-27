@@ -126,6 +126,8 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify documentation has no stale duplicate entries
+        run: python3 .github/scripts/check_docs_duplicates.py docs
       - name: Verify emitted audit events are documented
         shell: bash
         run: |
