@@ -2715,13 +2715,11 @@ mod tests {
         );
     }
 
-    fn walk(path: &Path) -> Vec<std::path::PathBuf> {
-        let mut paths = vec![path.to_path_buf()];
-        if path.is_dir() {
-            for entry in fs::read_dir(path).expect("read directory") {
-                paths.extend(walk(&entry.expect("entry").path()));
-            }
-        }
-        paths
+    /// Every path under `root`, absolute, so a test can read or remove what it finds.
+    fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+        dekopon_test_support::snapshot_tree(root)
+            .into_iter()
+            .map(|entry| root.join(entry.relative))
+            .collect()
     }
 }

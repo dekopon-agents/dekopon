@@ -1,12 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
-    net::TcpListener,
-    path::PathBuf,
-    sync::{Arc, mpsc},
-    thread,
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_broker::{
@@ -25,16 +17,11 @@ use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
     RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal, TraceId,
 };
+use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::{Value, json};
 
 /// The canonical subject every attestation fixture stands for.
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
 
 fn principal(name: &str) -> PrincipalId {
     name.parse::<PrincipalId>()
@@ -349,7 +336,7 @@ fn directory<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Ident
 }
 
 async fn echo_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
-    BrokerProviderRegistry::load([fixture("echo-provider.wasm")], limits)
+    BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
         .await
         .expect("echo provider fixture loads")
 }
@@ -382,61 +369,6 @@ async fn attested_broker(
         BrokerLimits::default(),
     )
     .expect("attested policy is coherent")
-}
-
-fn mock_http(response: &[u8]) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-    mock_http_serving(response, 1)
-}
-
-/// A loopback server answering exactly `calls` connections with the same response.
-///
-/// Requests arrive on the channel in the order they were served, which is the order the broker
-/// dispatched them: the tests below await one invocation at a time.
-fn mock_http_serving(
-    response: &[u8],
-    calls: usize,
-) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-    let response = response.to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-    let address = listener.local_addr().expect("fixture address");
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        for _ in 0..calls {
-            let (mut stream, _) = listener.accept().expect("accept fixture request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set fixture timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                if let Some(header_end) =
-                    request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let body_length = String::from_utf8_lossy(&request[..header_end + 4])
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + 4 + body_length {
-                        break;
-                    }
-                }
-                let read = stream.read(&mut buffer).expect("read fixture request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            sender.send(request).expect("record fixture request");
-            stream.write_all(&response).expect("write fixture response");
-            stream.flush().expect("flush fixture response");
-        }
-    });
-    (format!("127.0.0.1:{}", address.port()), receiver, handle)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -691,7 +623,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     assert!(matches!(error, BrokerBuildError::HostConstraint { .. }));
 
     let registry = BrokerProviderRegistry::load(
-        [fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("jsonplaceholder-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -733,14 +665,15 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
 #[tokio::test(flavor = "multi_thread")]
 async fn http_audit_contains_only_sanitized_call_metadata() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider fixture loads");
-    let (authority, received, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
+    let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
@@ -796,9 +729,9 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(result.evidence.len(), 3);
-    let wire = received.recv().expect("fixture request recorded");
+    let wire = server.request();
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
-    server.join().expect("fixture server exits");
+    server.join();
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
@@ -820,7 +753,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 #[tokio::test(flavor = "multi_thread")]
 async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_content() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("jsonplaceholder-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -831,7 +764,8 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
         response_body.len(),
         String::from_utf8_lossy(response_body)
     );
-    let (authority, received, server) = mock_http(response.as_bytes());
+    let server = LoopbackServer::once(response.as_bytes());
+    let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
@@ -942,7 +876,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
         result.output.as_ref().expect("write returns output")["post"]["id"],
         101
     );
-    let wire = received.recv().expect("fixture POST recorded");
+    let wire = server.request();
     assert!(wire.starts_with(b"POST /posts HTTP/1.1\r\n"));
     let body_offset = wire
         .windows(4)
@@ -953,7 +887,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
         serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
         json!({"userId": 3, "title": "private title", "body": "private body"})
     );
-    server.join().expect("fixture server exits");
+    server.join();
 
     let records = audit.records().await;
     assert_eq!(records.len(), 3);
@@ -970,16 +904,17 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_execution_audits_the_external_write_that_already_landed() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("jsonplaceholder-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("JSONPlaceholder provider fixture loads");
     // The POST is accepted by the server — the non-idempotent effect happens — but the body is
     // not a post, so the guest reports its own failure after the external write has landed.
-    let (authority, received, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
     );
+    let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
@@ -1041,12 +976,12 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         .await
         .expect("a failing provider is still durably accounted");
 
-    let wire = received.recv().expect("fixture POST recorded");
+    let wire = server.request();
     assert!(
         wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
         "the external write must have left the host before the failure"
     );
-    server.join().expect("fixture server exits");
+    server.join();
 
     assert_eq!(
         result.outcome,
@@ -1092,14 +1027,15 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
 async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them() {
     const SECRET: &str = "audit-must-never-see-this";
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider fixture loads");
-    let (authority, received, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
+    let authority = server.authority().to_owned();
     let constraints = loopback_constraints(&authority);
     let credentials = CredentialStore::new([(
         "fetch-token".to_owned(),
@@ -1154,13 +1090,12 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     );
 
     // The wire is the only place the secret may appear, exactly once, as the injected header.
-    let wire = String::from_utf8(received.recv().expect("fixture request recorded"))
-        .expect("fixture request is UTF-8");
+    let wire = server.request_text();
     assert!(
         wire.contains(&format!("authorization: Bearer {SECRET}")),
         "{wire}"
     );
-    server.join().expect("fixture server exits");
+    server.join();
 
     // Presence is recorded; the value is not — not in audit, not in the public result.
     let records = audit.records().await;
@@ -1180,14 +1115,15 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
 async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
     const SECRET: &[u8] = b"drn-secret-never-visible";
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider fixture loads");
-    let (authority, received, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
+    let authority = server.authority().to_owned();
     let policy = format!(
         "{}\n{}",
         direct_http_policy("caller", "provider-test", "http-probe.fetch"),
@@ -1256,12 +1192,12 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
         result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    let wire = String::from_utf8(received.recv().expect("request recorded")).expect("request text");
+    let wire = server.request_text();
     assert!(
         wire.contains("authorization: Bearer drn-secret-never-visible"),
         "{wire}"
     );
-    server.join().expect("server exits");
+    server.join();
 
     let serialized = serde_json::to_string(&audit.records().await).expect("audit serializes");
     assert!(
@@ -1277,7 +1213,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
 #[tokio::test(flavor = "multi_thread")]
 async fn capability_policy_alone_cannot_authorize_a_drn() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -1347,7 +1283,7 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguous_gap() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -1437,15 +1373,16 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     const DEFAULT_SECRET: &str = "dekopon-agents-token";
     const OVERRIDE_SECRET: &str = "scientist-hq-token";
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider fixture loads");
-    let (authority, received, server) = mock_http_serving(
+    let server = LoopbackServer::serving(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
         3,
     );
+    let authority = server.authority().to_owned();
     let credentials = CredentialStore::new([
         (
             "github-pat".to_owned(),
@@ -1534,10 +1471,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     // A direct peer such as `dekopon-run` is an `Actor::Service`: no agent, no override, default.
     fetch("invoke-direct", service_context("direct-peer")).await;
 
-    let wire = || {
-        String::from_utf8(received.recv().expect("fixture request recorded"))
-            .expect("fixture request is UTF-8")
-    };
+    let wire = || server.request_text();
     for (index, (present, absent)) in [
         (OVERRIDE_SECRET, DEFAULT_SECRET),
         (DEFAULT_SECRET, OVERRIDE_SECRET),
@@ -1556,7 +1490,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
             "request {index} leaked the other organization's token: {request}"
         );
     }
-    server.join().expect("fixture server exits");
+    server.join();
 
     // Which authority a write used is exactly what an auditor needs; the value still is not.
     let records = audit.records().await;
@@ -1586,15 +1520,16 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
 async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
     const SECRET: &str = "scientist-hq-token";
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider fixture loads");
-    let (authority, received, server) = mock_http_serving(
+    let server = LoopbackServer::serving(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
         2,
     );
+    let authority = server.authority().to_owned();
     let credentials = CredentialStore::new([(
         "github-pat-scientist-hq".to_owned(),
         BoundCredential::bearer(
@@ -1650,10 +1585,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
             .expect("the authorized request is accounted");
     }
 
-    let wire = || {
-        String::from_utf8(received.recv().expect("fixture request recorded"))
-            .expect("fixture request is UTF-8")
-    };
+    let wire = || server.request_text();
     assert!(wire().contains(&format!("authorization: Bearer {SECRET}")));
     let unauthenticated = wire();
     assert!(
@@ -1662,7 +1594,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
             .contains("authorization"),
         "an unmatched agent must send no credential at all: {unauthenticated}"
     );
-    server.join().expect("fixture server exits");
+    server.join();
 
     let records = audit.records().await;
     verify_audit_chain(&records).expect("audit chain verifies");
@@ -1724,7 +1656,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
         async move {
             let registry = BrokerProviderRegistry::load(
-                [fixture("http-probe-provider.wasm")],
+                [provider_fixture("http-probe-provider.wasm")],
                 registry_limits,
             )
             .await

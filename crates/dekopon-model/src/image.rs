@@ -286,16 +286,12 @@ impl ImageGenerationError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead as _, BufReader, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
-        sync::{Arc, Mutex},
-        thread,
-        time::Duration,
-    };
+    use std::time::Duration;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
+
+    use crate::mock::{MockResponse, MockServer};
 
     use super::{
         GeneratedImage, ImageGenerationError, ImageGenerator as _, MAX_GENERATED_IMAGE_BYTES,
@@ -323,7 +319,7 @@ mod tests {
             "data": [{"b64_json": STANDARD.encode(png())}],
             "usage": {"total_tokens": 100}
         });
-        let mock = MockServer::start(response);
+        let mock = MockServer::start(vec![MockResponse::json(response)]);
         let generator = OpenAiImageGenerator::with_endpoint(
             format!("{}/images/generations", mock.base_url()),
             "gpt-image-1",
@@ -337,7 +333,7 @@ mod tests {
             .expect("one generated image");
         assert_eq!(image.bytes(), png());
 
-        let request = mock.request();
+        let request = mock.requests().remove(0);
         let request_lower = request.to_ascii_lowercase();
         assert!(request_lower.contains("authorization: bearer image-secret"));
         let body = request.split("\r\n\r\n").nth(1).expect("request body");
@@ -394,7 +390,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base64_png_count_status_and_oversized_images() {
-        let invalid = MockServer::start(json!({"data": [{"b64_json": "%%%"}]}));
+        let invalid = MockServer::start(vec![MockResponse::json(
+            json!({"data": [{"b64_json": "%%%"}]}),
+        )]);
         let generator = OpenAiImageGenerator::with_endpoint(
             invalid.base_url(),
             "gpt-image-1",
@@ -407,9 +405,9 @@ mod tests {
             ImageGenerationError::InvalidEncoding
         );
 
-        let invalid_png = MockServer::start(json!({
+        let invalid_png = MockServer::start(vec![MockResponse::json(json!({
             "data": [{"b64_json": STANDARD.encode(b"not a png")}]
-        }));
+        }))]);
         let generator = OpenAiImageGenerator::with_endpoint(
             invalid_png.base_url(),
             "gpt-image-1",
@@ -422,12 +420,12 @@ mod tests {
             ImageGenerationError::InvalidImage
         );
 
-        let multiple = MockServer::start(json!({
+        let multiple = MockServer::start(vec![MockResponse::json(json!({
             "data": [
                 {"b64_json": STANDARD.encode(png())},
                 {"b64_json": STANDARD.encode(png())}
             ]
-        }));
+        }))]);
         let generator = OpenAiImageGenerator::with_endpoint(
             multiple.base_url(),
             "gpt-image-1",
@@ -440,7 +438,10 @@ mod tests {
             ImageGenerationError::Response
         );
 
-        let refused = MockServer::start_with_status(429, json!({"error": "secret detail"}));
+        let refused = MockServer::start(vec![MockResponse::failure(
+            429,
+            json!({"error": "secret detail"}),
+        )]);
         let generator = OpenAiImageGenerator::with_endpoint(
             refused.base_url(),
             "gpt-image-1",
@@ -454,7 +455,9 @@ mod tests {
         );
 
         let encoded = "A".repeat(MAX_GENERATED_IMAGE_BYTES.div_ceil(3) * 4 + 1);
-        let oversized = MockServer::start(json!({"data": [{"b64_json": encoded}]}));
+        let oversized = MockServer::start(vec![MockResponse::json(
+            json!({"data": [{"b64_json": encoded}]}),
+        )]);
         let generator = OpenAiImageGenerator::with_endpoint(
             oversized.base_url(),
             "gpt-image-1",
@@ -466,82 +469,5 @@ mod tests {
             generator.generate("cat").expect_err("oversized image"),
             ImageGenerationError::TooLarge
         );
-    }
-
-    struct MockServer {
-        address: String,
-        request: Arc<Mutex<Option<String>>>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl MockServer {
-        fn start(response: Value) -> Self {
-            Self::start_with_status(200, response)
-        }
-
-        fn start_with_status(status: u16, response: Value) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
-            let address = listener.local_addr().expect("mock address").to_string();
-            let request = Arc::new(Mutex::new(None));
-            let recorded = Arc::clone(&request);
-            let body = response.to_string();
-            let handle = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept request");
-                *recorded.lock().expect("request lock") = Some(read_request(&mut stream));
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .expect("write response");
-            });
-            Self {
-                address,
-                request,
-                handle: Some(handle),
-            }
-        }
-
-        fn base_url(&self) -> String {
-            format!("http://{}", self.address)
-        }
-
-        fn request(&self) -> String {
-            self.request
-                .lock()
-                .expect("request lock")
-                .clone()
-                .expect("request recorded")
-        }
-    }
-
-    impl Drop for MockServer {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("mock server thread");
-            }
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut request = String::new();
-        let mut length = 0_usize;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read request line");
-            request.push_str(&line);
-            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                length = value.trim().parse().expect("content length");
-            }
-            if line == "\r\n" {
-                break;
-            }
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).expect("read request body");
-        request.push_str(&String::from_utf8(body).expect("UTF-8 request"));
-        request
     }
 }

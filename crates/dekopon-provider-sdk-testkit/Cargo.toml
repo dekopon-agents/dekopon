@@ -25,6 +25,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+dekopon-test-support = { path = "../dekopon-test-support" }
 tokio.workspace = true
 
 [lints]

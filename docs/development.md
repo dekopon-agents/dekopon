@@ -45,10 +45,13 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving exact fetched `echo`/`memory-chat` releases plus the checked `storage-probe` fixture |
 | Rust provider fixtures | `examples/providers/http-probe/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, loopback mocks, and broker/VFS tests; exact standalone echo/JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
+| Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
 Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory remains a map to package-owned suites; the repository-level observability smoke test lives with its runnable example under `examples/otel-traces/`.
+
+Scaffolding that more than one suite needs lives in `dekopon-test-support` instead of being copied: the provider-fixture path, loopback HTTP servers, the `tracing` capture layer, and the directory-tree snapshot. It is `publish = false`, depends on no other crate in this workspace, and is added only under `[dev-dependencies]` as a path entry with no version — Cargo strips that from a published manifest, so it stays out of `.github/release-crates.txt`, out of every `cargo package` archive, and out of the dependency tree CI checks for broker crates inside `dekopond`. Anything that is genuinely one suite's own — a bespoke subscriber keyed by span id, a transport mock driven by a handler closure — stays with that suite.
 
 ## Change maps
 

@@ -11,11 +11,7 @@
 //! global dispatcher, so a sibling test hitting these callsites with no subscriber installed can
 //! disable them for the whole process.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
     AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation,
@@ -28,6 +24,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, Invocati
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel, TransportId,
 };
+use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -60,66 +57,6 @@ forbid(principal == Dekopon::Principal::"cpetersen",
        resource == Dekopon::Agent::"forbidden-agent");
 "#;
 
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<String>>);
-
-impl Captured {
-    fn take(&self) -> String {
-        let mut sink = self.0.lock().expect("capture sink");
-        std::mem::take(&mut sink)
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
-    /// These tests compile a real component, and Wasmtime's own trace instrumentation would
-    /// otherwise be captured event by event. Only this project's events are the subject here.
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if metadata.target().starts_with("dekopon") {
-            tracing::subscriber::Interest::always()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
-    }
-
-    /// `Layer::enabled` is what actually turns a callsite off when the inner subscriber is a
-    /// registry, so the filter has to live here rather than only in `register_callsite`.
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target().starts_with("dekopon")
-    }
-
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.0.lock().expect("capture sink");
-        sink.push_str(event.metadata().level().as_str());
-        event.record(&mut Visitor(&mut sink));
-        sink.push('\n');
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-}
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
-
 fn principal(name: &str) -> PrincipalId {
     name.parse().expect("valid principal fixture")
 }
@@ -150,10 +87,12 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
 }
 
 async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo provider fixture loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider fixture loads");
     let world = PolicyWorld::new(
         [principal("cpetersen"), principal("gateway")],
         [(
@@ -225,7 +164,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> ChatSessionClaim {
 /// Four refusals that answer identically on the wire must not be one refusal in the logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_inspection_refusal_names_its_class_and_its_subject() {
-    let captured = Captured::default();
+    let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker().await;
 
@@ -240,7 +179,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let ungranted = captured.take();
+    let ungranted = captured.take_events();
     assert!(
         ungranted.contains("broker_capabilities_refused"),
         "{ungranted}"
@@ -264,7 +203,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    assert!(captured.take().contains("attestation-denied"));
+    assert!(captured.take_events().contains("attestation-denied"));
 
     // The bootstrap case: a sender no `identityMapping` names yet. The canonical subject in this
     // event is the whole point — it is the value an operator has to copy into configuration.
@@ -278,7 +217,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let unmapped = captured.take();
+    let unmapped = captured.take_events();
     assert!(unmapped.contains("unmapped-subject"), "{unmapped}");
     assert!(unmapped.contains(UNMAPPED_SUBJECT), "{unmapped}");
 
@@ -293,7 +232,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let denied = captured.take();
+    let denied = captured.take_events();
     assert!(denied.contains("agent-denied"), "{denied}");
     assert!(denied.contains("other-agent"), "{denied}");
 
@@ -310,7 +249,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let erroring = captured.take();
+    let erroring = captured.take_events();
     assert!(erroring.contains("policy-error"), "{erroring}");
     assert!(!erroring.contains("agent-denied"), "{erroring}");
 
@@ -326,7 +265,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let forbidden = captured.take();
+    let forbidden = captured.take_events();
     assert!(forbidden.contains("agent-denied"), "{forbidden}");
     assert!(forbidden.contains("forbidden-gate"), "{forbidden}");
 
@@ -348,7 +287,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         .expect("a refused agent is still an accounted decision");
     assert_eq!(refused.outcome, InvocationOutcome::Denied);
     assert_eq!(refused.error.as_deref(), Some("policy-error"));
-    let _ = captured.take();
+    captured.clear();
 
     // The chat surface the gateway actually opens takes the same path and reports the same way.
     assert!(
@@ -360,7 +299,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_none()
     );
-    let chat = captured.take();
+    let chat = captured.take_events();
     assert!(chat.contains("broker_capabilities_refused"), "{chat}");
     assert!(chat.contains("unmapped-subject"), "{chat}");
     assert!(chat.contains(UNMAPPED_SUBJECT), "{chat}");
@@ -380,7 +319,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             .await
             .is_err()
     );
-    let command = captured.take();
+    let command = captured.take_events();
     assert!(command.contains("broker_capabilities_refused"), "{command}");
     assert!(command.contains("unmapped-subject"), "{command}");
     assert!(command.contains(UNMAPPED_SUBJECT), "{command}");
@@ -462,7 +401,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         assert_eq!(decision.0.as_deref(), Some(reason), "{agent_id}");
         assert_eq!(decision.1, policies, "{agent_id}");
     }
-    let _ = captured.take();
+    captured.clear();
 
     // An honored session stays silent: this event marks refusals, not traffic.
     assert!(
@@ -475,7 +414,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             )
             .is_some()
     );
-    let allowed = captured.take();
+    let allowed = captured.take_events();
     assert!(
         !allowed.contains("broker_capabilities_refused"),
         "{allowed}"

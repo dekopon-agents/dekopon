@@ -1,0 +1,20 @@
+[package]
+name = "dekopon-test-support"
+description = "Shared scaffolding for Dekopon's own tests; never published and never a normal dependency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Test scaffolding, not product surface. It is reachable only as a path `[dev-dependencies]` entry,
+# so it stays out of `.github/release-crates.txt`, out of every published archive, and out of the
+# dependency tree CI checks for broker crates inside `dekopond`.
+publish = false
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -10,11 +10,7 @@
 //! This lives in its own test binary because `tracing` resolves per-callsite interest against the
 //! global dispatcher, and because the interleaving it depends on needs a single-threaded runtime.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
     AuditError, AuditEvent, AuditLog, AuditRecord, AuthenticatedContext, Broker, BrokerLimits,
@@ -24,6 +20,7 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{Actor, CapabilityId, PrincipalId, ProviderId, RiskLevel};
+use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -33,130 +30,6 @@ permit(principal == Dekopon::Principal::"caller",
        action == Dekopon::Action::"echo.reverse",
        resource == Dekopon::Provider::"echo");
 "#;
-
-/// Every captured event, with the span the subscriber would attribute it to.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<Record>>>);
-
-#[derive(Clone, Debug)]
-enum Record {
-    Event {
-        fields: String,
-        parent: Option<String>,
-    },
-    Span {
-        name: &'static str,
-        fields: String,
-    },
-}
-
-impl Captured {
-    fn events(&self) -> Vec<(String, Option<String>)> {
-        self.0
-            .lock()
-            .expect("capture sink")
-            .iter()
-            .filter_map(|record| match record {
-                Record::Event { fields, parent } => Some((fields.clone(), parent.clone())),
-                Record::Span { .. } => None,
-            })
-            .collect()
-    }
-
-    fn spans(&self) -> Vec<(&'static str, String)> {
-        self.0
-            .lock()
-            .expect("capture sink")
-            .iter()
-            .filter_map(|record| match record {
-                Record::Span { name, fields } => Some((*name, fields.clone())),
-                Record::Event { .. } => None,
-            })
-            .collect()
-    }
-}
-
-impl<S> tracing_subscriber::Layer<S> for Captured
-where
-    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-{
-    /// This test compiles a real component, and Wasmtime's own trace instrumentation would
-    /// otherwise be captured event by event.
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if metadata.target().starts_with("dekopon") {
-            tracing::subscriber::Interest::always()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
-    }
-
-    /// `Layer::enabled` is what actually turns a callsite off when the inner subscriber is a
-    /// registry, so the filter has to live here rather than only in `register_callsite`.
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target().starts_with("dekopon")
-    }
-
-    fn on_new_span(
-        &self,
-        attributes: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut fields = String::new();
-        attributes.record(&mut Visitor(&mut fields));
-        self.0.lock().expect("capture sink").push(Record::Span {
-            name: attributes.metadata().name(),
-            fields,
-        });
-    }
-
-    fn on_record(
-        &self,
-        id: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let Some(span) = context.span(id) else {
-            return;
-        };
-        let mut fields = String::new();
-        values.record(&mut Visitor(&mut fields));
-        self.0.lock().expect("capture sink").push(Record::Span {
-            name: span.metadata().name(),
-            fields,
-        });
-    }
-
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut fields = String::new();
-        event.record(&mut Visitor(&mut fields));
-        self.0.lock().expect("capture sink").push(Record::Event {
-            fields,
-            parent: context
-                .event_span(event)
-                .map(|span| span.metadata().name().to_owned()),
-        });
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-}
 
 /// An audit log that parks inside `append` until the test lets it finish.
 ///
@@ -181,12 +54,6 @@ impl AuditLog for GatedAudit {
     }
 }
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
-
 fn principal(name: &str) -> PrincipalId {
     name.parse().expect("valid principal fixture")
 }
@@ -209,10 +76,12 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
 }
 
 async fn broker(audit: Arc<GatedAudit>) -> Broker<GatedAudit> {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo provider fixture loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider fixture loads");
     let world = PolicyWorld::new(
         [principal("caller")],
         [(
@@ -248,7 +117,7 @@ fn caller() -> AuthenticatedContext {
 /// A denial suspended mid-audit must not adopt whatever the runtime polls next.
 #[tokio::test]
 async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
-    let captured = Captured::default();
+    let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
     let (entered, mut entered_rx) = mpsc::unbounded_channel();

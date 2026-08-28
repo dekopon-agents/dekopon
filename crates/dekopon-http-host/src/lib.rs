@@ -1510,12 +1510,11 @@ fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
-        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
-        sync::mpsc::{self, Receiver},
-        thread,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         time::Duration,
     };
+
+    use dekopon_test_support::LoopbackServer;
 
     use dekopon_capability::{HttpConstraints, HttpConstraintsError, HttpPathRule, SecretUseGrant};
     use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
@@ -1535,113 +1534,6 @@ mod tests {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }
-    }
-
-    fn mock_http(response: &[u8]) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-        mock_http_on("127.0.0.1:0", response).expect("bind loopback fixture")
-    }
-
-    /// Serves one request on one connection. Returns `None` when the fixture address family is
-    /// unavailable on this host, which is the only reason binding a loopback port can fail.
-    fn mock_http_on(
-        bind: &str,
-        response: &[u8],
-    ) -> Option<(String, Receiver<Vec<u8>>, thread::JoinHandle<()>)> {
-        let response = response.to_vec();
-        let listener = TcpListener::bind(bind).ok()?;
-        let address = listener.local_addr().expect("fixture address");
-        let (sender, receiver) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept fixture request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set fixture timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            let mut expected = None;
-            loop {
-                if let Some(header_end) =
-                    request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let complete = header_end + 4 + content_length(&request[..header_end + 4]);
-                    expected = Some(complete);
-                    if request.len() >= complete {
-                        break;
-                    }
-                }
-                let read = stream.read(&mut buffer).expect("read fixture request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            if let Some(expected) = expected {
-                request.truncate(expected);
-            }
-            sender.send(request).expect("record fixture request");
-            stream.write_all(&response).expect("write fixture response");
-            stream.flush().expect("flush fixture response");
-        });
-        // `SocketAddr`'s rendering is the authority grammar the grant uses, brackets included.
-        Some((address.to_string(), receiver, handle))
-    }
-
-    /// Serves `count` requests, across however many connections the client opens to reach them.
-    ///
-    /// A pinned client reuses the same `reqwest::Client`/pool deterministically (`pinned_client`
-    /// compares `(host, addresses)` with no I/O involved), but whether the underlying hyper pool
-    /// has already checked a connection back in as idle by the time the next request starts is
-    /// decided by a background task driving that connection's I/O on its own schedule — a race
-    /// this crate does not control or observe. Losing it closes the first connection rather than
-    /// hanging it, so this fixture accepts a follow-up connection instead of treating that EOF as
-    /// a fixture failure.
-    fn mock_http_pooled(count: usize) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-        let address = listener.local_addr().expect("fixture address");
-        let handle = thread::spawn(move || {
-            let mut served = 0;
-            while served < count {
-                let (mut stream, _) = listener.accept().expect("accept fixture connection");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set fixture timeout");
-                let mut pending = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                'connection: while served < count {
-                    let end = loop {
-                        if let Some(end) =
-                            pending.windows(4).position(|window| window == b"\r\n\r\n")
-                        {
-                            break end + 4;
-                        }
-                        let read = stream.read(&mut buffer).expect("read fixture request");
-                        if read == 0 {
-                            break 'connection;
-                        }
-                        pending.extend_from_slice(&buffer[..read]);
-                    };
-                    pending.drain(..end);
-                    stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                        .expect("write fixture response");
-                    stream.flush().expect("flush fixture response");
-                    served += 1;
-                }
-            }
-        });
-        (address.to_string(), handle)
-    }
-
-    fn content_length(headers: &[u8]) -> usize {
-        String::from_utf8_lossy(headers)
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0)
     }
 
     #[test]
@@ -1808,9 +1700,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn sends_extension_methods_duplicate_headers_and_buffered_bodies() {
-        let (authority, recorded, server) = mock_http(
+        let server = LoopbackServer::once(
             b"HTTP/1.1 200 OK\r\nX-Value: one\r\nX-Value: two\r\nSet-Cookie: secret=session\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         );
+        let authority = server.authority().to_owned();
         let mut client = BufferedHttpClient::authorized(
             grant(authority.clone(), "PROPFIND"),
             HttpHostCeilings::default(),
@@ -1852,13 +1745,13 @@ mod tests {
                 .iter()
                 .all(|header| header.name != "set-cookie")
         );
-        let request = recorded.recv().expect("request recorded");
+        let request = server.request();
         assert!(request.starts_with(b"PROPFIND /items?private=no HTTP/1.1\r\n"));
         assert!(request.ends_with(b"\r\n\r\npayload"));
         let evidence = client.into_evidence();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].authority, authority);
-        server.join().expect("fixture server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2059,8 +1952,10 @@ mod tests {
         // Twin requests, one credentialed and one not, so the accounting assertion below compares
         // like with like: the injected header must change neither the guest-authored byte count
         // nor anything else the evidence reports.
-        let (plain_authority, plain_recorded, plain_server) = mock_http(response);
-        let (authority, recorded, server) = mock_http(response);
+        let plain_server = LoopbackServer::once(response);
+        let plain_authority = plain_server.authority().to_owned();
+        let server = LoopbackServer::once(response);
+        let authority = server.authority().to_owned();
 
         let request_to = |authority: &str| Request {
             method: "GET".to_owned(),
@@ -2095,14 +1990,13 @@ mod tests {
             .await
             .expect("credentialed request succeeds");
 
-        let plain_request = String::from_utf8(plain_recorded.recv().expect("plain recorded"))
-            .expect("fixture request is UTF-8");
+        let plain_request =
+            String::from_utf8(plain_server.request()).expect("fixture request is UTF-8");
         assert!(
             !plain_request.to_ascii_lowercase().contains("authorization"),
             "{plain_request}"
         );
-        let request = String::from_utf8(recorded.recv().expect("request recorded"))
-            .expect("fixture request is UTF-8");
+        let request = String::from_utf8(server.request()).expect("fixture request is UTF-8");
         assert!(
             request.contains("authorization: Bearer fixture-secret-value"),
             "{request}"
@@ -2122,15 +2016,16 @@ mod tests {
             plain_evidence[0].request_bytes as i64
         );
 
-        plain_server.join().expect("plain fixture exits");
-        server.join().expect("fixture server exits");
+        plain_server.join();
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn drn_bound_basic_auth_is_rendered_only_for_the_exact_path() {
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-        let (authority, recorded, server) = mock_http(response);
+        let server = LoopbackServer::once(response);
+        let authority = server.authority().to_owned();
         let secret = secret_grant(
             &authority,
             SecretSinkKind::HttpBasic,
@@ -2157,13 +2052,12 @@ mod tests {
             })
             .await
             .expect("exact path succeeds");
-        let request = String::from_utf8(recorded.recv().expect("recorded request"))
-            .expect("request is UTF-8");
+        let request = String::from_utf8(server.request()).expect("request is UTF-8");
         assert!(
             request.contains("authorization: Basic dXNlckE6Zml4dHVyZS1wYXNzd29yZA=="),
             "{request}"
         );
-        server.join().expect("server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2213,7 +2107,8 @@ mod tests {
     async fn direct_credential_reflection_is_discarded() {
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nfixture-token";
-        let (authority, _recorded, server) = mock_http(response);
+        let server = LoopbackServer::once(response);
+        let authority = server.authority().to_owned();
         let secret = secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/reflect");
         let credential =
             BoundCredential::secret_bearer(SecretBytes::new(b"fixture-token".to_vec()), &secret)
@@ -2240,7 +2135,7 @@ mod tests {
         let evidence = client.into_evidence();
         assert_eq!(evidence[0].status, Some(200));
         assert!(evidence[0].response_bytes > 0);
-        server.join().expect("server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2328,7 +2223,8 @@ mod tests {
             body.len(),
             body
         );
-        let (authority, _recorded, server) = mock_http(oversized.as_bytes());
+        let server = LoopbackServer::once(oversized.as_bytes());
+        let authority = server.authority().to_owned();
         let mut limited_grant = grant(authority.clone(), "GET");
         limited_grant.max_response_bytes = 128;
         let mut client = BufferedHttpClient::authorized(
@@ -2348,11 +2244,12 @@ mod tests {
             .expect_err("response bound must stop buffering");
         assert_eq!(error.code, ErrorCode::ResponseTooLarge);
         assert_eq!(client.policy_violation(), Some("byte-limit"));
-        server.join().expect("fixture server exits");
+        server.join();
 
-        let (authority, _recorded, server) = mock_http(
+        let server = LoopbackServer::once(
             b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
+        let authority = server.authority().to_owned();
         let mut client = BufferedHttpClient::authorized(
             grant(authority.clone(), "GET"),
             HttpHostCeilings::default(),
@@ -2370,18 +2267,19 @@ mod tests {
             .expect("redirect response is returned without following");
         assert_eq!(response.status, 302);
         assert_eq!(client.into_evidence().len(), 1);
-        server.join().expect("fixture server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reaches_ipv6_literal_loopback_destinations() {
-        let Some((authority, recorded, server)) = mock_http_on(
+        let Some(server) = LoopbackServer::bound(
             "[::1]:0",
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         ) else {
             // A host without an IPv6 loopback cannot exercise this path.
             return;
         };
+        let authority = server.authority().to_owned();
         assert!(authority.starts_with("[::1]:"), "{authority}");
 
         let mut client = BufferedHttpClient::authorized(
@@ -2401,11 +2299,11 @@ mod tests {
             .expect("an IPv6 literal loopback destination is reachable");
 
         assert_eq!(response.status, 200);
-        let request = recorded.recv().expect("request recorded");
+        let request = server.request();
         assert!(request.starts_with(b"GET /items HTTP/1.1\r\n"));
         let evidence = client.into_evidence();
         assert_eq!(evidence[0].authority, authority);
-        server.join().expect("fixture server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2413,8 +2311,9 @@ mod tests {
         // `pinned_client` hands both calls the same `reqwest::Client`/pool deterministically;
         // whether hyper's pool actually reuses one TCP connection for them is a background-task
         // race this crate doesn't control, so the fixture tolerates (without requiring) a second
-        // connection — see `mock_http_pooled`.
-        let (authority, server) = mock_http_pooled(2);
+        // connection — see `LoopbackServer::pooled`.
+        let server = LoopbackServer::pooled(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 2);
+        let authority = server.authority().to_owned();
         let mut client = BufferedHttpClient::authorized(
             grant(authority.clone(), "GET"),
             HttpHostCeilings::default(),
@@ -2434,7 +2333,7 @@ mod tests {
             assert_eq!(response.status, 200);
         }
         assert_eq!(client.into_evidence().len(), 2);
-        server.join().expect("fixture server exits");
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2443,8 +2342,10 @@ mod tests {
         // context must each be reached through a client pinned to their own addresses.
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-        let (first, first_recorded, first_server) = mock_http(response);
-        let (second, second_recorded, second_server) = mock_http(response);
+        let first_server = LoopbackServer::once(response);
+        let first = first_server.authority().to_owned();
+        let second_server = LoopbackServer::once(response);
+        let second = second_server.authority().to_owned();
 
         let mut grant = grant(first.clone(), "GET");
         grant.allowed_hosts.push(second.clone());
@@ -2468,22 +2369,20 @@ mod tests {
         }
 
         assert!(
-            first_recorded
-                .recv()
-                .expect("first request recorded")
+            first_server
+                .request()
                 .starts_with(b"GET /first HTTP/1.1\r\n")
         );
         assert!(
-            second_recorded
-                .recv()
-                .expect("second request recorded")
+            second_server
+                .request()
                 .starts_with(b"GET /second HTTP/1.1\r\n")
         );
         let evidence = client.into_evidence();
         assert_eq!(evidence[0].authority, first);
         assert_eq!(evidence[1].authority, second);
-        first_server.join().expect("first fixture exits");
-        second_server.join().expect("second fixture exits");
+        first_server.join();
+        second_server.join();
     }
 
     #[test]

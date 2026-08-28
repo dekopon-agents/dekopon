@@ -184,7 +184,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #19 — TEST_SUITE_BLOAT — crates/*/tests/*.rs (no `tests/common/` anywhere)
+## [x] #19 — TEST_SUITE_BLOAT — crates/*/tests/*.rs (no `tests/common/` anywhere)
 
 **Finding:** ~900 LOC of copy-pasted test scaffolding across the workspace: `fn fixture(name)` ×9 (7 byte-identical), 13 hand-rolled HTTP/1.1 loopback parsers across 8 files (`content_length` byte-identical twice), 9 `tracing` capture layers with byte-identical `record_debug` (~400 LOC), 6 tree-snapshot walkers, 12 identical `#[allow(let_underscore_must_use, reason = "a dropped sender…")]` server-spawn blocks in `brokerd/tests/server.rs`. Copies have already drifted (`mock_http` truncates to content-length in broker-host, not in broker; `refusal_logging.rs`'s layer has the `register_callsite` override, `span_redaction.rs`'s does not). Also: `dekopon-model/src/image.rs:476` re-implements `src/mock.rs`'s `MockServer` minus its unwedge, and dekopond's Telegram tests have 11 inline constructors while Slack has a helper. (raw: C2, C1)
 **Blast radius:** HIGH  **Confidence:** HIGH

@@ -23,6 +23,7 @@ members = [
     "crates/dekopon-shell",
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
+    "crates/dekopon-test-support",
     "crates/dekopon-webui",
     "crates/dekopond",
 ]

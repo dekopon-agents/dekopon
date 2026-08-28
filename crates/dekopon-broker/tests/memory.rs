@@ -24,14 +24,8 @@ use dekopon_core::{
     Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, Redacted, RiskLevel, TransportId,
 };
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
+use dekopon_test_support::provider_fixture;
 use serde_json::json;
-
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("examples/providers")
-        .join(name)
-}
 
 fn memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
@@ -212,12 +206,12 @@ async fn build_broker_with_principal(
 ) -> Broker<InMemoryAuditLog> {
     let storage = StorageHost::open(root, key, storage_limits).expect("storage host");
     let mut providers = vec![
-        fixture("memory-chat-provider.wasm"),
-        fixture("echo-provider.wasm"),
-        fixture("storage-probe-provider.wasm"),
+        provider_fixture("memory-chat-provider.wasm"),
+        provider_fixture("echo-provider.wasm"),
+        provider_fixture("storage-probe-provider.wasm"),
     ];
     if authority_credential.is_some() {
-        providers.push(fixture("http-probe-provider.wasm"));
+        providers.push(provider_fixture("http-probe-provider.wasm"));
     }
     if reverse_provider_order {
         providers.reverse();
@@ -520,7 +514,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
 #[tokio::test(flavor = "multi_thread")]
 async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("memory-reservation-probe-provider.wasm")],
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -719,7 +713,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
-        [fixture("memory-reservation-probe-provider.wasm")],
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
         Some(storage),
     )

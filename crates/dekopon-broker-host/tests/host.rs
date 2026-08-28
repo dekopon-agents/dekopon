@@ -1,10 +1,6 @@
 use std::{
-    io::{Read, Write},
-    net::TcpListener,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
     time::Duration,
 };
 
@@ -18,14 +14,9 @@ use dekopon_capability::{
 };
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
+use dekopon_test_support::{LoopbackServer, provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
 
 fn host_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -99,86 +90,6 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     }
 }
 
-fn mock_http(response: &[u8]) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-    let response = response.to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-    let address = listener.local_addr().expect("fixture address");
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fixture request");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set fixture timeout");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        let mut expected = None;
-        loop {
-            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                let body_bytes = content_length(&request[..header_end + 4]);
-                let complete = header_end + 4 + body_bytes;
-                expected = Some(complete);
-                if request.len() >= complete {
-                    break;
-                }
-            }
-            let read = stream.read(&mut buffer).expect("read fixture request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-        }
-        if let Some(expected) = expected {
-            request.truncate(expected);
-        }
-        sender.send(request).expect("record fixture request");
-        stream.write_all(&response).expect("write fixture response");
-        stream.flush().expect("flush fixture response");
-    });
-    (format!("127.0.0.1:{}", address.port()), receiver, handle)
-}
-
-/// Accepts one request, records it, and never answers, so the call is dispatched but unresolved.
-fn mock_http_stalled() -> (String, Receiver<Vec<u8>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-    let address = listener.local_addr().expect("fixture address");
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fixture request");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set fixture timeout");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        while request.windows(4).all(|window| window != b"\r\n\r\n") {
-            match stream.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => request.extend_from_slice(&buffer[..read]),
-            }
-        }
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "this fixture exists to hang rather than to be read; a test that gave up on \
-                      the channel and dropped the receiver is a normal way for this send to fail"
-        )]
-        let _ = sender.send(request);
-        // Hold the connection open past the invocation deadline without ever responding.
-        thread::sleep(Duration::from_secs(5));
-    });
-    (format!("127.0.0.1:{}", address.port()), receiver)
-}
-
-fn content_length(headers: &[u8]) -> usize {
-    String::from_utf8_lossy(headers)
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_generic_wasi_imports() {
     let error = BrokerProviderRegistry::load(
@@ -202,15 +113,16 @@ async fn rejects_generic_wasi_imports() {
 #[tokio::test(flavor = "multi_thread")]
 async fn loads_http_provider_and_executes_one_authorized_request() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider loads without host calls during describe");
     let metrics = registry.metrics();
-    let (authority, request, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Value: one\r\nX-Value: two\r\nSet-Cookie: secret=session\r\nWWW-Authenticate: secret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
+    let authority = server.authority().to_owned();
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
@@ -256,7 +168,7 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     assert!(stats.http_response_bytes > 0);
     assert_eq!(stats.active_stores, 0);
     assert!(stats.fuel_consumed > 0);
-    let request = request.recv().expect("fixture request recorded");
+    let request = server.request();
     assert!(request.starts_with(b"PATCH /resource?visible=no HTTP/1.1\r\n"));
     assert!(request.ends_with(b"\r\n\r\npayload"));
     assert_eq!(
@@ -266,13 +178,13 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
             .count(),
         2
     );
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("jsonplaceholder-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -284,7 +196,8 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
         get_body.len(),
         String::from_utf8_lossy(get_body)
     );
-    let (get_authority, get_request, get_server) = mock_http(get_response.as_bytes());
+    let get_server = LoopbackServer::once(get_response.as_bytes());
+    let get_authority = get_server.authority().to_owned();
     let get = registry
         .invoke(
             authorized(
@@ -305,12 +218,11 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     assert_eq!(get.http_calls.len(), 1);
     assert_eq!(get.http_calls[0].method, "GET");
     assert!(
-        get_request
-            .recv()
-            .expect("GET request recorded")
+        get_server
+            .request()
             .starts_with(b"GET /posts/7 HTTP/1.1\r\n")
     );
-    get_server.join().expect("GET fixture server exits");
+    get_server.join();
 
     let create_body = br#"{"userId":3,"id":101,"title":"created title","body":"created body"}"#;
     let create_response = format!(
@@ -318,7 +230,8 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
         create_body.len(),
         String::from_utf8_lossy(create_body)
     );
-    let (create_authority, create_request, create_server) = mock_http(create_response.as_bytes());
+    let create_server = LoopbackServer::once(create_response.as_bytes());
+    let create_authority = create_server.authority().to_owned();
     let create = registry
         .invoke(
             authorized(
@@ -340,7 +253,7 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     assert_eq!(create.output["post"]["id"], 101);
     assert_eq!(create.http_calls.len(), 1);
     assert_eq!(create.http_calls[0].method, "POST");
-    let request = create_request.recv().expect("POST request recorded");
+    let request = create_server.request();
     assert!(request.starts_with(b"POST /posts HTTP/1.1\r\n"));
     let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
     assert!(!request_text.contains("authorization:"));
@@ -354,13 +267,13 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
         serde_json::from_slice::<Value>(&request[body_offset..]).expect("POST body is JSON"),
         json!({"userId": 3, "title": "created title", "body": "created body"})
     );
-    create_server.join().expect("POST fixture server exits");
+    create_server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn denies_http_when_authorization_has_no_http_grant() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -393,7 +306,7 @@ async fn denies_http_when_authorization_has_no_http_grant() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_a_destination_outside_the_exact_authority_grant() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -429,7 +342,7 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_guest_control_of_authorization_headers() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -465,7 +378,7 @@ async fn rejects_guest_control_of_authorization_headers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn guest_code_cannot_mask_a_policy_rejection() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -501,7 +414,7 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn enforces_response_bytes_while_streaming() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -512,7 +425,8 @@ async fn enforces_response_bytes_while_streaming() {
         body.len(),
         body
     );
-    let (authority, _request, server) = mock_http(response.as_bytes());
+    let server = LoopbackServer::once(response.as_bytes());
+    let authority = server.authority().to_owned();
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
@@ -542,20 +456,21 @@ async fn enforces_response_bytes_while_streaming() {
             ..
         }
     ));
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn returns_redirects_without_following_them() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider loads");
-    let (authority, _request, server) = mock_http(
+    let server = LoopbackServer::once(
         b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
+    let authority = server.authority().to_owned();
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
@@ -573,15 +488,17 @@ async fn returns_redirects_without_following_them() {
 
     assert_eq!(output.output["status"], 302);
     assert_eq!(output.http_calls.len(), 1);
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_host_also_runs_import_free_components() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("import-free provider loads in the broker linker");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("import-free provider loads in the broker linker");
     let capability = "echo.echo".parse().expect("valid capability fixture");
     let output = registry
         .invoke(
@@ -601,10 +518,12 @@ async fn broker_host_also_runs_import_free_components() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_authorization_bound_to_a_different_provider() {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo provider loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider loads");
     let capability = "echo.echo".parse().expect("valid capability fixture");
     let error = registry
         .invoke(
@@ -644,7 +563,7 @@ async fn rejects_zero_wasm_resource_ceilings() {
         max_memories: 0,
         ..BrokerHostLimits::default()
     };
-    let error = BrokerProviderRegistry::load([fixture("echo-provider.wasm")], limits)
+    let error = BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
         .await
         .expect_err("zero store ceiling must fail");
     assert!(matches!(
@@ -658,7 +577,7 @@ async fn rejects_zero_wasm_resource_ceilings() {
 /// The published artifact digest describes the exact buffer Cranelift compiled.
 #[tokio::test(flavor = "multi_thread")]
 async fn artifact_digest_describes_the_compiled_buffer() {
-    let source = fixture("echo-provider.wasm");
+    let source = provider_fixture("echo-provider.wasm");
     let registry = BrokerProviderRegistry::load([source.clone()], BrokerHostLimits::default())
         .await
         .expect("provider loads");
@@ -681,7 +600,7 @@ async fn artifact_digest_describes_the_compiled_buffer() {
 /// A provider lock is compared with the same buffer Wasmtime would compile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
-    let source = fixture("echo-provider.wasm");
+    let source = provider_fixture("echo-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let locked = LockedProviderSource::new(
         source,
@@ -709,7 +628,7 @@ async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
 /// The locked descriptor length is enforced against that same compile buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
-    let source = fixture("echo-provider.wasm");
+    let source = provider_fixture("echo-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let digest = Sha256::digest(&bytes)
         .iter()
@@ -791,7 +710,7 @@ async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
 /// The provider identity is lock input too, not metadata the component may replace.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_provider_identity_is_enforced_after_describe() {
-    let source = fixture("echo-provider.wasm");
+    let source = provider_fixture("echo-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let digest = Sha256::digest(&bytes);
     let digest = digest.iter().fold(String::new(), |mut text, byte| {
@@ -826,7 +745,7 @@ async fn a_locked_provider_identity_is_enforced_after_describe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_provider_is_instantiated_once_at_load() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("memory-reservation-probe-provider.wasm")],
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -850,7 +769,7 @@ async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
         ..BrokerHostOptions::default()
     };
     let error = BrokerProviderRegistry::load_with_options(
-        [fixture("echo-provider.wasm")],
+        [provider_fixture("echo-provider.wasm")],
         limits,
         None,
         &options,
@@ -879,7 +798,7 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
     };
     let registry = std::sync::Arc::new(
         BrokerProviderRegistry::load_with_options(
-            [fixture("http-probe-provider.wasm")],
+            [provider_fixture("http-probe-provider.wasm")],
             limits,
             None,
             &options,
@@ -888,7 +807,8 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
         .expect("provider loads under an aggregate ceiling"),
     );
 
-    let (authority, request) = mock_http_stalled();
+    let stalled = LoopbackServer::stalled();
+    let authority = stalled.authority().to_owned();
     let mut constraints = http_constraints(authority.clone(), "GET");
     constraints.timeout_ms = 2_000;
     let holding = tokio::spawn({
@@ -909,9 +829,11 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
     });
     // The request bytes only arrive once the guest is inside its host call, which proves the first
     // store is alive and holding the whole reservation.
-    request
-        .recv_timeout(Duration::from_secs(5))
-        .expect("stalled fixture receives the first request");
+    let first = stalled.request();
+    assert!(
+        first.starts_with(b"GET /stalled "),
+        "the stalled fixture receives the first request"
+    );
 
     let error = registry
         .invoke(
@@ -958,7 +880,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
         ..BrokerHostOptions::default()
     };
     let cold = BrokerProviderRegistry::load_with_options(
-        [fixture("echo-provider.wasm")],
+        [provider_fixture("echo-provider.wasm")],
         BrokerHostLimits::default(),
         None,
         &options,
@@ -972,7 +894,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
         .artifact_sha256;
 
     let warm = BrokerProviderRegistry::load_with_options(
-        [fixture("echo-provider.wasm")],
+        [provider_fixture("echo-provider.wasm")],
         BrokerHostLimits::default(),
         None,
         &options,
@@ -1013,7 +935,7 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
         max_timeout: Duration::from_millis(100),
         ..BrokerHostLimits::default()
     };
-    let registry = BrokerProviderRegistry::load([fixture("echo-provider.wasm")], limits)
+    let registry = BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
         .await
         .expect("provider loads beneath valid host ceilings");
     let capability = "echo.echo".parse().expect("valid capability fixture");
@@ -1043,12 +965,13 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("HTTP provider loads");
-    let (authority, received) = mock_http_stalled();
+    let stalled = LoopbackServer::stalled();
+    let authority = stalled.authority().to_owned();
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
@@ -1068,7 +991,7 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
         .await
         .expect_err("an unanswered request cannot succeed");
 
-    let wire = received.recv().expect("fixture request recorded");
+    let wire = stalled.request();
     assert!(
         wire.starts_with(b"GET /"),
         "the request must have left the host before the failure"
@@ -1084,53 +1007,6 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
         failure.http_calls[0].status, None,
         "a call that never received a response records no status"
     );
-}
-
-/// Serves a fixed sequence of responses, one connection each, recording every request.
-///
-/// A conditional write is a two-call capability (a pre-read pins the etag the write then carries),
-/// so a single-response mock cannot exercise one. Responses carry `Connection: close`, forcing the
-/// client onto a fresh connection per call.
-fn mock_http_sequence(
-    responses: Vec<Vec<u8>>,
-) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-    let address = listener.local_addr().expect("fixture address");
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        for response in responses {
-            let (mut stream, _) = listener.accept().expect("accept fixture request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set fixture timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            let mut expected = None;
-            loop {
-                if let Some(header_end) =
-                    request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let complete = header_end + 4 + content_length(&request[..header_end + 4]);
-                    expected = Some(complete);
-                    if request.len() >= complete {
-                        break;
-                    }
-                }
-                let read = stream.read(&mut buffer).expect("read fixture request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            if let Some(expected) = expected {
-                request.truncate(expected);
-            }
-            sender.send(request).expect("record fixture request");
-            stream.write_all(&response).expect("write fixture response");
-            stream.flush().expect("flush fixture response");
-        }
-    });
-    (format!("127.0.0.1:{}", address.port()), receiver, handle)
 }
 
 fn json_http_response(body: &serde_json::Value) -> Vec<u8> {
@@ -1183,15 +1059,16 @@ fn conditional_write_constraints(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_two_request_capability_leaves_two_evidence_entries() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("the probe loads without host calls during describe");
-    let (authority, recorded, server) = mock_http_sequence(vec![
+    let server = LoopbackServer::sequence(vec![
         etagged_response("\"v1\""),
         json_http_response(&json!({"written": true})),
     ]);
+    let authority = server.authority().to_owned();
 
     let output = registry
         .invoke(
@@ -1214,25 +1091,24 @@ async fn a_two_request_capability_leaves_two_evidence_entries() {
     assert_eq!(output.http_calls.len(), 2);
     assert_eq!(output.http_calls[0].method, "GET");
     assert_eq!(output.http_calls[1].method, "POST");
-    let pre_read = String::from_utf8(recorded.recv().expect("pre-read recorded"))
-        .expect("fixture request is UTF-8");
+    let pre_read = server.request_text();
     assert!(pre_read.starts_with("GET /resource "), "{pre_read}");
-    let write = String::from_utf8(recorded.recv().expect("write recorded"))
-        .expect("fixture request is UTF-8");
+    let write = server.request_text();
     assert!(write.starts_with("POST /resource "), "{write}");
     assert!(write.contains("if-match: \"v1\""), "{write}");
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("the probe loads");
-    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
+    let server = LoopbackServer::sequence(vec![etagged_response("\"v1\"")]);
+    let authority = server.authority().to_owned();
 
     let failure = registry
         .invoke(
@@ -1259,19 +1135,19 @@ async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
     ));
     assert_eq!(failure.http_calls.len(), 1);
     assert_eq!(failure.http_calls[0].method, "GET");
-    drop(recorded);
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("http-probe-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("the probe loads");
-    let (authority, recorded, server) = mock_http_sequence(vec![etagged_response("\"v1\"")]);
+    let server = LoopbackServer::sequence(vec![etagged_response("\"v1\"")]);
+    let authority = server.authority().to_owned();
 
     let failure = registry
         .invoke(
@@ -1295,8 +1171,7 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
         }
     ));
     assert_eq!(failure.http_calls.len(), 1);
-    drop(recorded);
-    server.join().expect("fixture server exits");
+    server.join();
 }
 
 /// A component generated against the immutable `dekopon:provider@0.1.0` two-export world loads,
@@ -1304,7 +1179,7 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
 #[tokio::test(flavor = "multi_thread")]
 async fn an_actual_provider_v0_1_component_remains_compatible() {
     let registry = BrokerProviderRegistry::load(
-        [fixture("provider-v0-1-compat-provider.wasm")],
+        [provider_fixture("provider-v0-1-compat-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -1351,7 +1226,10 @@ async fn an_actual_provider_v0_1_component_remains_compatible() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conflicting_providers_are_all_reported_in_one_failure() {
     let error = BrokerProviderRegistry::load(
-        [fixture("echo-provider.wasm"), fixture("echo-provider.wasm")],
+        [
+            provider_fixture("echo-provider.wasm"),
+            provider_fixture("echo-provider.wasm"),
+        ],
         BrokerHostLimits::default(),
     )
     .await
@@ -1455,7 +1333,7 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
     let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
-        .component(fixture("storage-probe-provider.wasm"))
+        .component(provider_fixture("storage-probe-provider.wasm"))
         .provider("storage-probe")
         .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
         .build()
@@ -1538,7 +1416,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
         )
         .expect("storage host");
         let registry = BrokerProviderRegistry::load_with_storage(
-            [fixture("storage-probe-provider.wasm")],
+            [provider_fixture("storage-probe-provider.wasm")],
             BrokerHostLimits::default(),
             Some(storage.clone()),
         )
@@ -1609,32 +1487,10 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
     }
 }
 
+/// Every entry under `root` with the mode, length, and contents a provisional write would change.
 fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
-    fn visit(root: &Path, path: &Path, output: &mut Vec<(PathBuf, u32, u64, Vec<u8>)>) {
-        let mut entries = std::fs::read_dir(path)
-            .expect("snapshot directory")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("snapshot entries");
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).expect("snapshot metadata");
-            let relative = path
-                .strip_prefix(root)
-                .expect("relative path")
-                .to_path_buf();
-            let contents = if metadata.is_file() {
-                std::fs::read(&path).expect("snapshot file")
-            } else {
-                Vec::new()
-            };
-            output.push((relative, metadata.mode(), metadata.len(), contents));
-            if metadata.is_dir() {
-                visit(root, &path, output);
-            }
-        }
-    }
-    let mut output = Vec::new();
-    visit(root, root, &mut output);
-    output
+    snapshot_tree(root)
+        .into_iter()
+        .map(|entry| (entry.relative, entry.mode, entry.len, entry.contents))
+        .collect()
 }

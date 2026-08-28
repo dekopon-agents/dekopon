@@ -28,6 +28,8 @@ use dekopon_brokerd::{BrokerServer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, Idempotency};
 #[cfg(unix)]
 use dekopon_core::{Actor, AgentId, PrincipalId, RiskLevel};
+#[cfg(unix)]
+use dekopon_test_support::LoopbackServer;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use tokio::{net::UnixListener, sync::oneshot};
@@ -329,57 +331,6 @@ async fn explicit_broker_mode_uses_authenticated_client_without_loading_componen
         .expect("server drains cleanly");
 }
 
-/// Serves `requests` plaintext HTTP requests on loopback, returning the paths it was asked for.
-///
-/// The provider reaches this through the broker's HTTP host, so a request arriving here is proof
-/// the whole chain ran: script, broker authorization, Wasm provider, real socket.
-#[cfg(unix)]
-fn mock_http_target(requests: usize) -> (String, thread::JoinHandle<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback target binds");
-    let authority = format!(
-        "127.0.0.1:{}",
-        listener.local_addr().expect("target address").port()
-    );
-    let handle = thread::spawn(move || {
-        let mut paths = Vec::new();
-        for _ in 0..requests {
-            let (mut stream, _) = listener.accept().expect("target accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("target read timeout configures");
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            while find_bytes(&bytes, b"\r\n\r\n").is_none() {
-                let count = stream.read(&mut buffer).expect("target request reads");
-                if count == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buffer[..count]);
-            }
-            let request = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some(line) = request.lines().next() {
-                paths.push(
-                    line.split_whitespace()
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-            }
-            let body = br#"{"ok":true}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("target headers write");
-            stream.write_all(body).expect("target body writes");
-            stream.flush().expect("target response flushes");
-        }
-        paths
-    });
-    (authority, handle)
-}
-
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
@@ -387,7 +338,13 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
     // cannot perform I/O, so an HTTP-capable capability is reachable only over the broker. One
     // model-authored script drives both legs: `http-probe.fetch` and `curl` go through the broker,
     // `echo.upcase` stays local, and none of it involves a tool schema per capability.
-    let (authority, target) = mock_http_target(3);
+    // The provider reaches this through the broker's HTTP host, so a request arriving here is
+    // proof the whole chain ran: script, broker authorization, Wasm provider, real socket.
+    let target = LoopbackServer::serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        3,
+    );
+    let authority = target.authority().to_owned();
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("temporary broker directory");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
@@ -551,8 +508,18 @@ async fn prompt_reaches_http_capabilities_through_the_broker_leg() {
     );
 
     // The requests genuinely left the process through the broker's HTTP host.
-    let paths = target.join().expect("loopback target completes");
+    let paths = (0..3)
+        .map(|_| {
+            let request = target.request_text();
+            let line = request.lines().next().expect("a request line").to_owned();
+            line.split_whitespace()
+                .nth(1)
+                .expect("a request target")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(paths, vec!["/alpha", "/beta", "/gamma"]);
+    target.join();
 
     // ...and the broker durably audited each one: an authorization decision plus a terminal
     // execution record per invocation, three invocations, six records.

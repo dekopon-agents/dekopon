@@ -4866,6 +4866,37 @@ fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Val
 }
 
 /// One Slack transport pointed at loopback mocks.
+fn telegram(endpoint: &str) -> crate::transport::telegram::TelegramTransport {
+    telegram_with(endpoint, ActivityMode::Off)
+}
+
+fn telegram_with(
+    endpoint: &str,
+    activity: ActivityMode,
+) -> crate::transport::telegram::TelegramTransport {
+    crate::transport::telegram::TelegramTransport::new(
+        "tg".to_owned(),
+        endpoint.to_owned(),
+        "12345:test-token".to_owned(),
+        activity,
+    )
+    .expect("telegram transport builds")
+}
+
+/// The Bot API mock every polling test needs: one fixed `getMe`, one batch of updates on the
+/// first poll, and an empty result after it.
+fn telegram_handler(updates: Vec<Value>) -> impl Fn(&str, &str) -> Value + Send + Sync + 'static {
+    move |path, _body| {
+        if path.contains("getMe") {
+            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+        }
+        if path.contains("offset=0") {
+            return json!({"ok": true, "result": updates.clone()});
+        }
+        json!({"ok": true, "result": []})
+    }
+}
+
 fn slack(endpoint: &str) -> crate::transport::slack::SlackTransport {
     slack_with(
         endpoint,
@@ -5982,14 +6013,7 @@ async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses()
             br#"{"ok":true,"result":{"message_id":7,"chat":{"id":42}}}"#.to_vec(),
         )
     });
-    let telegram = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        telegram_http.base,
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport")
-    .replier();
+    let telegram = telegram(&telegram_http.base).replier();
     assert!(
         telegram
             .reply(
@@ -7160,26 +7184,12 @@ fn telegram_chat_message(
 async fn telegram_acknowledges_by_advancing_its_offset() {
     // There is no ack call: the next poll's offset is the acknowledgment, and it has to advance
     // past updates the daemon chose not to route or the same bot message returns forever.
-    let http = spawn_http_mock(move |path, _body| {
-        if path.contains("getMe") {
-            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
-        }
-        if path.contains("offset=0") {
-            return json!({"ok": true, "result": [
-                {"update_id": 100, "message": telegram_message(7, true, 1, "a bot said this")},
-                {"update_id": 101, "message": telegram_message(16034700182_i64, false, 2, "a person asked this")}
-            ]});
-        }
-        json!({"ok": true, "result": []})
-    });
+    let http = spawn_http_mock(telegram_handler(vec![
+        json!({"update_id": 100, "message": telegram_message(7, true, 1, "a bot said this")}),
+        json!({"update_id": 101, "message": telegram_message(16034700182_i64, false, 2, "a person asked this")}),
+    ]));
 
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     let identity = transport
         .connect()
         .await
@@ -7216,35 +7226,21 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
     // A photo arrives as the same image at several sizes, smallest first, and its words live in
     // `caption` rather than `text`. Reading only `text` made the whole message invisible; taking
     // the first size would hand a model a thumbnail it cannot read.
-    let http = spawn_http_mock(move |path, _body| {
-        if path.contains("getMe") {
-            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+    let http = spawn_http_mock(telegram_handler(vec![json!({
+        "update_id": 300,
+        "message": {
+            "message_id": 9,
+            "from": {"id": 16034700182_i64, "is_bot": false},
+            "chat": {"id": 4242, "type": "private"},
+            "caption": "what does this say?",
+            "photo": [
+                {"file_id": "thumb", "file_size": 900},
+                {"file_id": "full", "file_size": 214_000}
+            ]
         }
-        if path.contains("offset=0") {
-            return json!({"ok": true, "result": [{
-                "update_id": 300,
-                "message": {
-                    "message_id": 9,
-                    "from": {"id": 16034700182_i64, "is_bot": false},
-                    "chat": {"id": 4242, "type": "private"},
-                    "caption": "what does this say?",
-                    "photo": [
-                        {"file_id": "thumb", "file_size": 900},
-                        {"file_id": "full", "file_size": 214_000}
-                    ]
-                }
-            }]});
-        }
-        json!({"ok": true, "result": []})
-    });
+    })]));
 
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     transport.connect().await.expect("telegram connects");
 
     let message = next_message(&mut transport).await;
@@ -7266,36 +7262,22 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
 async fn a_telegram_document_keeps_its_own_name_and_media_type() {
     // Unlike a photo, a document is passed through rather than re-encoded, so Telegram reports
     // both and neither has to be inferred.
-    let http = spawn_http_mock(move |path, _body| {
-        if path.contains("getMe") {
-            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
+    let http = spawn_http_mock(telegram_handler(vec![json!({
+        "update_id": 301,
+        "message": {
+            "message_id": 10,
+            "from": {"id": 16034700182_i64, "is_bot": false},
+            "chat": {"id": 4242, "type": "private"},
+            "document": {
+                "file_id": "doc-1",
+                "file_name": "spec.pdf",
+                "mime_type": "application/pdf",
+                "file_size": 5000
+            }
         }
-        if path.contains("offset=0") {
-            return json!({"ok": true, "result": [{
-                "update_id": 301,
-                "message": {
-                    "message_id": 10,
-                    "from": {"id": 16034700182_i64, "is_bot": false},
-                    "chat": {"id": 4242, "type": "private"},
-                    "document": {
-                        "file_id": "doc-1",
-                        "file_name": "spec.pdf",
-                        "mime_type": "application/pdf",
-                        "file_size": 5000
-                    }
-                }
-            }]});
-        }
-        json!({"ok": true, "result": []})
-    });
+    })]));
 
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     transport.connect().await.expect("telegram connects");
 
     // No caption: the attachment is the whole message, and dropping it would be silence.
@@ -7386,13 +7368,7 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
         }
         json!({"ok": true, "result": []})
     });
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Native,
-    )
-    .expect("Telegram transport builds");
+    let mut transport = telegram_with(&http.base, ActivityMode::Native);
     transport.connect().await.expect("Telegram connects");
     let message = next_message(&mut transport).await;
 
@@ -7458,13 +7434,7 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
         }
         json!({"ok": true, "result": []})
     });
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     transport.connect().await.expect("Telegram connects");
     let message = next_message(&mut transport).await;
 
@@ -7548,27 +7518,13 @@ fn an_empty_answer_still_becomes_one_post() {
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
     // chat: consecutive messages continue one exchange, and a group is not the private chat.
-    let http = spawn_http_mock(move |path, _body| {
-        if path.contains("getMe") {
-            return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
-        }
-        if path.contains("offset=0") {
-            return json!({"ok": true, "result": [
-                {"update_id": 200, "message": telegram_message(16034700182_i64, false, 1, "first")},
-                {"update_id": 201, "message": telegram_message(16034700182_i64, false, 2, "second")},
-                {"update_id": 202, "message": telegram_chat_message(-1001, "supergroup", 16034700182_i64, false, 3, "over here")}
-            ]});
-        }
-        json!({"ok": true, "result": []})
-    });
+    let http = spawn_http_mock(telegram_handler(vec![
+        json!({"update_id": 200, "message": telegram_message(16034700182_i64, false, 1, "first")}),
+        json!({"update_id": 201, "message": telegram_message(16034700182_i64, false, 2, "second")}),
+        json!({"update_id": 202, "message": telegram_chat_message(-1001, "supergroup", 16034700182_i64, false, 3, "over here")}),
+    ]));
 
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     transport
         .connect()
         .await
@@ -7617,13 +7573,7 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
         }
         json!({"ok": true, "result": []})
     });
-    let mut transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("telegram transport builds");
+    let mut transport = telegram(&http.base);
     transport.connect().await.expect("telegram connects");
     let message = next_message(&mut transport).await;
     assert_eq!(message.conversation_id, "-1001:topic:77");
@@ -7658,13 +7608,7 @@ async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() 
             }
         })
     });
-    let transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("Telegram transport builds");
+    let transport = telegram(&http.base);
 
     transport
         .replier()
@@ -7717,13 +7661,7 @@ async fn telegram_splits_long_generated_image_text_without_losing_it() {
             })
         }
     });
-    let transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("Telegram transport builds");
+    let transport = telegram(&http.base);
     let text = format!("{}\n{}", "a".repeat(4_000), "b".repeat(1_000));
 
     transport
@@ -7775,13 +7713,7 @@ async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_
             json!({"ok": false, "description": "message rejected"})
         }
     });
-    let transport = crate::transport::telegram::TelegramTransport::new(
-        "tg".to_owned(),
-        http.base.clone(),
-        "12345:test-token".to_owned(),
-        ActivityMode::Off,
-    )
-    .expect("Telegram transport builds");
+    let transport = telegram(&http.base);
 
     let error = transport
         .replier()

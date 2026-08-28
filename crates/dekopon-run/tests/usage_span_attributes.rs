@@ -7,47 +7,13 @@
 //! for every later thread-local subscriber. Sharing a binary with other tests that call
 //! `run_prompt` would make this assertion depend on execution order.
 
-use std::sync::{Arc, Mutex};
-
 use dekopon_model::model::{
     AssistantTurn, ChatModel, ModelError, ModelMessage, ModelTool, ModelUsage,
 };
 use dekopon_run::prompt::{PromptLimits, ScriptRuntime, run_prompt};
 use dekopon_shell::ScriptOutcome;
+use dekopon_test_support::CaptureLayer;
 use tracing_subscriber::layer::SubscriberExt as _;
-
-/// Renders every field recorded on a live span as `name=value`, prefixed with the span's name.
-struct SpanFieldLayer {
-    fields: Arc<Mutex<String>>,
-}
-
-impl<S> tracing_subscriber::Layer<S> for SpanFieldLayer
-where
-    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-{
-    fn on_record(
-        &self,
-        id: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let Some(span) = context.span(id) else {
-            return;
-        };
-        let mut sink = self.fields.lock().expect("field sink");
-        sink.push_str(span.name());
-        values.record(&mut Visitor(&mut sink));
-        sink.push('\n');
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-}
 
 /// A model that answers immediately, reporting usage for its single billed call.
 struct AccountedModel;
@@ -83,9 +49,8 @@ impl ScriptRuntime for NoScripts {
 
 #[test]
 fn usage_is_recorded_on_the_model_turn_span() {
-    let fields = Arc::new(Mutex::new(String::new()));
-    let recorded = Arc::clone(&fields);
-    let subscriber = tracing_subscriber::registry().with(SpanFieldLayer { fields: recorded });
+    let captured = CaptureLayer::new();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
         run_prompt(
@@ -101,7 +66,7 @@ fn usage_is_recorded_on_the_model_turn_span() {
         .expect("prompt session succeeds");
     });
 
-    let fields = fields.lock().expect("field sink");
+    let fields = captured.spans_text();
     for usage in [
         "prompt.model_turn usage.input_tokens=41",
         "prompt.model_turn usage.cached_input_tokens=17",

@@ -8,7 +8,6 @@ use std::{
     collections::BTreeSet,
     io::{Read as _, Write as _},
     net::TcpStream,
-    path::PathBuf,
     time::Duration,
 };
 
@@ -20,19 +19,19 @@ use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, LoadedProvid
 use dekopon_broker_protocol::{
     AgentInventory, ModelUsageReport, Permission, ReportedAgent, ReportedAgentCapability,
 };
+use dekopon_test_support::provider_fixture;
 use dekopon_webui::{
     Dashboard, OtelSummary, ServiceStatus, WebUiLimits, router, serve_with_limits,
 };
 use tower::ServiceExt as _;
 
-fn echo_provider() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/providers/echo-provider.wasm")
-}
-
 async fn loaded() -> (Vec<LoadedProviderMetadata>, Dashboard) {
-    let registry = BrokerProviderRegistry::load([echo_provider()], BrokerHostLimits::default())
-        .await
-        .expect("echo provider loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider loads");
     let metrics = registry.metrics();
     let providers: Vec<_> = registry.loaded_provider_metadata().collect();
     let status = ServiceStatus::default();
