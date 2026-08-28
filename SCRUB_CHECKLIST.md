@@ -48,7 +48,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #2 — VERSION_DRIFT_RISK — crates/dekopon-model/src/chatgpt.rs:90 (+ :301, image.rs:135, model.rs:395)
+## [x] #2 — VERSION_DRIFT_RISK — crates/dekopon-model/src/chatgpt.rs:90 (+ :301, image.rs:135, model.rs:395)
 
 **Finding:** All four `ureq::Agent` builders inherit ureq's default `proxy: Proxy::try_from_env()`, so the ChatGPT bearer token, the OAuth device-flow exchange, and every prompt follow an ambient `HTTPS_PROXY`/`ALL_PROXY` — while `dekopon-http-host` (same binary) explicitly sets `.no_proxy()` and `docs/architecture.md` states "disables ambient proxies" as a global property. (raw: E)
 **Blast radius:** HIGH  **Confidence:** HIGH

@@ -132,13 +132,8 @@ impl OpenAiImageGenerator {
                 "image generation endpoint must not be empty".to_owned(),
             ));
         }
-        let config = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build();
         Ok(Self {
-            agent: config.into(),
+            agent: crate::agent(timeout),
             endpoint,
             model,
             api_key: Redacted::new(api_key),
