@@ -14,11 +14,10 @@ use std::path::{Path, PathBuf};
 
 use dekopon_broker::{BrokerBuildError, CredentialStore};
 use dekopon_broker_host::BoundCredential;
-use dekopon_core::Redacted;
+use dekopon_core::{FileHygieneError, FileTier, Redacted, read_trusted_file};
 use dekopon_http_host::ConfigurationError;
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt as _;
 
 /// Strict `apiVersion` accepted by the credentials file.
 pub const CREDENTIALS_API_VERSION: &str = "dekopon.dev/broker-credentials/v1alpha1";
@@ -73,56 +72,33 @@ pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
 ) -> Result<CredentialStore, CredentialsError> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(path)
-        .await
-        .map_err(|source| CredentialsError::Read {
+    // Private, not merely unwritable: this file holds provider secrets, so anyone who can read it
+    // has already taken them.
+    let owned = path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        read_trusted_file(
+            &owned,
+            expected_uid,
+            FileTier::Private,
+            HARD_MAX_CREDENTIALS_BYTES,
+        )
+    })
+    .await
+    .map_err(|join| CredentialsError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(join),
+    })?
+    .map_err(|error| match error {
+        FileHygieneError::NotRegular { path, .. } => CredentialsError::NotRegular { path },
+        FileHygieneError::TooLarge {
+            length, maximum, ..
+        } => CredentialsError::TooLarge { length, maximum },
+        FileHygieneError::Io { path, source } => CredentialsError::Read { path, source },
+        insecure => CredentialsError::InsecureFile {
             path: path.to_path_buf(),
-            source,
-        })?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|source| CredentialsError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !metadata.file_type().is_file() {
-        return Err(CredentialsError::NotRegular {
-            path: path.to_path_buf(),
-        });
-    }
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(CredentialsError::InsecureFile {
-            path: path.to_path_buf(),
-        });
-    }
-    if metadata.len() > HARD_MAX_CREDENTIALS_BYTES as u64 {
-        return Err(CredentialsError::TooLarge {
-            length: metadata.len(),
-            maximum: HARD_MAX_CREDENTIALS_BYTES,
-        });
-    }
-    let mut bytes = Vec::new();
-    file.take((HARD_MAX_CREDENTIALS_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| CredentialsError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() > HARD_MAX_CREDENTIALS_BYTES {
-        return Err(CredentialsError::TooLarge {
-            length: bytes.len() as u64,
-            maximum: HARD_MAX_CREDENTIALS_BYTES,
-        });
-    }
+            source: insecure,
+        },
+    })?;
     let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes)
         .map_err(|source| CredentialsError::Decode { source })?;
     resolve(parsed)
@@ -171,7 +147,13 @@ pub enum CredentialsError {
     #[error(
         "broker credentials must be single-link, owned by the server UID, and unreadable by group and world: {path}"
     )]
-    InsecureFile { path: PathBuf },
+    InsecureFile {
+        /// The refused path.
+        path: PathBuf,
+        /// Which hygiene check refused it.
+        #[source]
+        source: FileHygieneError,
+    },
     #[error("broker credentials are {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
     #[error("broker credentials are not strict valid YAML/JSON")]

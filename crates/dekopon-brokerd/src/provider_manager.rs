@@ -20,7 +20,9 @@ use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
     LoadedProviderMetadata, LockedProviderSource,
 };
-use dekopon_core::ProviderId;
+use dekopon_core::{
+    FileHygieneError, FileTier, ProviderId, check_trusted_metadata, read_trusted_file,
+};
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
 use reqwest::{
@@ -1743,6 +1745,10 @@ async fn verify_component_file(
     Ok(())
 }
 
+/// Reads one owner-authored provider-state file: the operator-authored set or the generated lock.
+///
+/// Not private: an operator group reads these the same way it reads `broker.yaml`. They name
+/// providers this broker will compile, so the bar is that nobody else can rewrite them.
 async fn read_secure_file(
     path: &Path,
     expected_uid: u32,
@@ -1750,41 +1756,27 @@ async fn read_secure_file(
 ) -> Result<Vec<u8>, ProviderManagerError> {
     let path = absolute(path)?;
     validate_file_parent(&path, expected_uid)?;
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(&path)
-        .await
-        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), source))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), source))?;
-    validate_file_metadata(&metadata, &path, expected_uid, false)?;
-    if metadata.len() > maximum as u64 {
-        return Err(ProviderManagerError::config_detail(
+    let owned = path.clone();
+    tokio::task::spawn_blocking(move || {
+        read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum)
+    })
+    .await
+    .map_err(|join| {
+        ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), io::Error::other(join))
+    })?
+    .map_err(|error| match error {
+        // The absent-state case is matched on by `kind()` upstream, so the original error travels.
+        FileHygieneError::Io { path, source } => {
+            ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source)
+        }
+        FileHygieneError::TooLarge {
+            length, maximum, ..
+        } => ProviderManagerError::config_detail(
             STATE_TOO_LARGE,
-            format!(
-                "provider state is {} bytes; maximum is {maximum}",
-                metadata.len()
-            ),
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
-    if bytes.len() > maximum {
-        return Err(ProviderManagerError::config_detail(
-            STATE_TOO_LARGE,
-            format!(
-                "provider state is {} bytes; maximum is {maximum}",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(bytes)
+            format!("provider state is {length} bytes; maximum is {maximum}"),
+        ),
+        insecure => ProviderManagerError::file_hygiene(path, insecure),
+    })
 }
 
 fn validate_file_metadata(
@@ -1793,18 +1785,13 @@ fn validate_file_metadata(
     expected_uid: u32,
     private: bool,
 ) -> Result<(), ProviderManagerError> {
-    let forbidden = if private { 0o077 } else { 0o022 };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & forbidden != 0
-        || metadata.nlink() != 1
-    {
-        return Err(ProviderManagerError::insecure(
-            "provider state must be regular, single-link, owned by this UID, and not group/world writable",
-            path,
-        ));
-    }
-    Ok(())
+    let tier = if private {
+        FileTier::Private
+    } else {
+        FileTier::NotWorldWritable
+    };
+    check_trusted_metadata(path, metadata, expected_uid, tier)
+        .map_err(|source| ProviderManagerError::file_hygiene(path, source))
 }
 
 fn validate_file_parent(path: &Path, expected_uid: u32) -> Result<(), ProviderManagerError> {
@@ -2338,6 +2325,15 @@ impl ProviderManagerError {
             reason,
             path: path.into(),
             source: None,
+        }
+    }
+
+    /// Refuses provider state the shared trusted-file predicate rejected, naming which check.
+    fn file_hygiene(path: impl Into<PathBuf>, source: FileHygieneError) -> Self {
+        Self::FileSecurity {
+            reason: "provider state must be regular, single-link, owned by this UID, and not group/world writable",
+            path: path.into(),
+            source: Some(Box::new(source)),
         }
     }
 

@@ -14,13 +14,13 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
 use dekopon_core::{
-    Actor, CapabilityId, ExternalSubject, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
+    Actor, CapabilityId, ExternalSubject, FileHygieneError, FileTier, PROVIDER_COMPONENT_EXTENSION,
+    PrincipalId, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt as _;
 
 pub use crate::HARD_MAX_PROVIDERS;
 use crate::provider_manager;
@@ -393,59 +393,43 @@ pub async fn load(
 }
 
 /// Reads one owner-only, single-link, byte-capped regular file without following symlinks.
+///
+/// `broker.yaml` and the policy file are authored configuration: an operator group may read them,
+/// so the tier is not-world-writable rather than private.
 async fn read_owner_only(
     path: &Path,
     expected_uid: u32,
     maximum: usize,
 ) -> Result<Vec<u8>, ConfigError> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(path)
-        .await
-        .map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let metadata = file.metadata().await.map_err(|source| ConfigError::Read {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum)
+    })
+    .await
+    .map_err(|join| ConfigError::Read {
         path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(ConfigError::NotRegular {
+        source: io::Error::other(join),
+    })?
+    .map_err(|error| trusted_read_error(path, error))
+}
+
+/// Maps one file-hygiene refusal onto this crate's configuration errors.
+///
+/// The three-way split an operator acts on — wrong kind of file, wrong permissions or owner, too
+/// big — is preserved; the specific check that failed rides along as the source rather than being
+/// dropped into one opaque message.
+fn trusted_read_error(path: &Path, error: FileHygieneError) -> ConfigError {
+    match error {
+        FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },
+        FileHygieneError::TooLarge {
+            length, maximum, ..
+        } => ConfigError::TooLarge { length, maximum },
+        FileHygieneError::Io { path, source } => ConfigError::Read { path, source },
+        insecure => ConfigError::InsecureFile {
             path: path.to_path_buf(),
-        });
+            source: insecure,
+        },
     }
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(ConfigError::InsecureFile {
-            path: path.to_path_buf(),
-        });
-    }
-    if metadata.len() > maximum as u64 {
-        return Err(ConfigError::TooLarge {
-            length: metadata.len(),
-            maximum,
-        });
-    }
-    let mut bytes = Vec::new();
-    file.take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() > maximum {
-        return Err(ConfigError::TooLarge {
-            length: bytes.len() as u64,
-            maximum,
-        });
-    }
-    Ok(bytes)
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -928,7 +912,13 @@ pub enum ConfigError {
     #[error(
         "broker configuration must be single-link, owned by the server UID, and not group/world writable: {path}"
     )]
-    InsecureFile { path: PathBuf },
+    InsecureFile {
+        /// The refused path.
+        path: PathBuf,
+        /// Which hygiene check refused it.
+        #[source]
+        source: FileHygieneError,
+    },
     #[error("broker configuration is {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
     #[error("broker configuration is not strict valid YAML/JSON")]

@@ -1,17 +1,17 @@
 use std::{
     fs::Metadata,
     io,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use dekopon_broker::{AuditError, AuditEvent, AuditLog, AuditRecord, FileAuditLog};
+use dekopon_core::{FileHygieneError, FileTier, check_trusted_metadata, read_trusted_file};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::AsyncWriteExt as _,
     sync::Mutex,
 };
 
@@ -308,26 +308,34 @@ async fn read_checkpoint(
     path: &Path,
     expected_uid: u32,
 ) -> Result<Option<StoredCheckpoint>, CheckpointError> {
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = match options.open(path).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(CheckpointError::Io { source }),
+    let owned = path.to_path_buf();
+    let read = tokio::task::spawn_blocking(move || {
+        read_trusted_file(
+            &owned,
+            expected_uid,
+            FileTier::Private,
+            HARD_MAX_CHECKPOINT_BYTES,
+        )
+    })
+    .await
+    .map_err(|join| CheckpointError::Io {
+        source: io::Error::other(join),
+    })?;
+    let mut bytes = match read {
+        Ok(bytes) => bytes,
+        // No checkpoint yet is the first-start case, not a refusal.
+        Err(FileHygieneError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(FileHygieneError::Io { source, .. }) => return Err(CheckpointError::Io { source }),
+        Err(FileHygieneError::TooLarge { .. }) => return Err(CheckpointError::TooLarge),
+        Err(insecure) => {
+            return Err(CheckpointError::InsecureFile {
+                path: path.to_path_buf(),
+                source: insecure,
+            });
+        }
     };
-    validate_metadata(
-        &file.metadata().await.map_err(io_error)?,
-        path,
-        expected_uid,
-    )?;
-    let mut bytes = Vec::new();
-    file.take((HARD_MAX_CHECKPOINT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| CheckpointError::Io { source })?;
-    if bytes.len() > HARD_MAX_CHECKPOINT_BYTES {
-        return Err(CheckpointError::TooLarge);
-    }
     if bytes.last() != Some(&b'\n') || bytes[..bytes.len().saturating_sub(1)].contains(&b'\n') {
         return Err(CheckpointError::InvalidEncoding);
     }
@@ -350,21 +358,19 @@ async fn remove_stale_temporary(path: &Path, expected_uid: u32) -> Result<(), Ch
         .map_err(|source| CheckpointError::Io { source })
 }
 
+/// The checkpoint and its temporary are private: they record how far the audit chain is verified,
+/// so anyone who can read one learns the chain head and anyone who can write one can rewind it.
 fn validate_metadata(
     metadata: &Metadata,
     path: &Path,
     expected_uid: u32,
 ) -> Result<(), CheckpointError> {
-    if !metadata.file_type().is_file()
-        || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(CheckpointError::InsecureFile {
+    check_trusted_metadata(path, metadata, expected_uid, FileTier::Private).map_err(|source| {
+        CheckpointError::InsecureFile {
             path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+            source,
+        }
+    })
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -395,7 +401,13 @@ pub enum CheckpointError {
     #[error(
         "checkpoint or lock file is not private, server-owned, regular, and single-link: {path}"
     )]
-    InsecureFile { path: PathBuf },
+    InsecureFile {
+        /// The refused path.
+        path: PathBuf,
+        /// Which hygiene check refused it.
+        #[source]
+        source: FileHygieneError,
+    },
     #[error("checkpoint lock is already held by another broker")]
     Lock {
         #[source]
