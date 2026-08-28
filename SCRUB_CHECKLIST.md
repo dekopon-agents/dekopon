@@ -248,7 +248,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: DEFER**
 
-## [ ] #27 — SIDE_QUEST / PREMATURE_GENERALIZATION — crates/dekopon-model/src/image.rs + crates/dekopond/src/config.rs:360 + session.rs image paths
+## [x] #27 — SIDE_QUEST / PREMATURE_GENERALIZATION — crates/dekopon-model/src/image.rs + crates/dekopond/src/config.rs:360 + session.rs image paths
 
 **Finding:** Route-scoped image generation — a 552-LOC OpenAI Images client, a one-variant tagged `ImageGeneratorConfig` enum with four match-accessors, a name-keyed `HashMap<String, Arc<dyn ImageGenerator>>` over one impl, upload paths in three transports, `ChatReply::with_image`, five config error variants, and an authority paragraph in `design.md:113` — is configured in zero examples, chart values, or deployments (`imageGenerators` occurs only in `dekopond/src/tests.rs` and two docs). (raw: B1, A1, B2)
 **Blast radius:** MEDIUM  **Confidence:** HIGH

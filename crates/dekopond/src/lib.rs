@@ -66,7 +66,7 @@ use crate::{
     routes::RoutingTable,
     session::{
         ConfiguredModels, ImageGeneratorStartupError, ModelCache, ModelCredentialError,
-        STOPPED_REPLY, SessionGate, SessionRunner, configured_image_generators, model_bearer_token,
+        STOPPED_REPLY, SessionGate, SessionRunner, configured_image_generator, model_bearer_token,
     },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
@@ -145,13 +145,9 @@ where
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
     // Resolve model credentials and construct the fixed-endpoint clients before a chat transport
     // accepts work. A route naming image generation must not start as a tool that can only fail.
-    let referenced_image_generators = config
-        .routes
-        .iter()
-        .filter_map(|route| route.image_generator.clone())
-        .collect::<BTreeSet<_>>();
-    let image_generators =
-        configured_image_generators(&config.image_generators, &referenced_image_generators)
+    let image_generator_referenced = config.routes.iter().any(|route| route.image_generator);
+    let image_generator =
+        configured_image_generator(config.image_generator.as_ref(), image_generator_referenced)
             .map_err(DekopondError::ImageGenerator)?;
     // The model credential resolves here too. This process cannot see a variable exported after it
     // started, so an unset or blank `apiKeyEnv` that only surfaced as a 401 on the first user's
@@ -248,7 +244,7 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
-        image_generators,
+        image_generator,
         activities,
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),

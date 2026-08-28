@@ -96,47 +96,34 @@ pub(crate) trait ModelFactory: Send + Sync {
 /// The real factory: whatever `models:` configured, constructed exactly as `dekopon-run` does.
 pub(crate) struct ConfiguredModels;
 
-/// Builds each route-referenced image generator once at startup, resolving only credentials that
-/// a bound route can actually use before any transport begins accepting messages.
-pub(crate) fn configured_image_generators(
-    configured: &[ImageGeneratorConfig],
-    referenced: &BTreeSet<String>,
-) -> Result<HashMap<String, Arc<dyn ImageGenerator>>, ImageGeneratorStartupError> {
-    configured
-        .iter()
-        .filter(|generator| referenced.contains(generator.name()))
-        .map(|generator| {
-            let variable = generator.api_key_env();
-            let credential =
-                image_credential(generator.name(), variable, std::env::var_os(variable))?;
-            let client = match generator {
-                ImageGeneratorConfig::OpenaiImages {
-                    model, timeout_ms, ..
-                } => OpenAiImageGenerator::new(
-                    model,
-                    credential,
-                    std::time::Duration::from_millis(*timeout_ms),
-                )?,
-            };
-            Ok((
-                generator.name().to_owned(),
-                Arc::new(client) as Arc<dyn ImageGenerator>,
-            ))
-        })
-        .collect()
+/// Builds the gateway's image generator once at startup, reading its credential only when a bound
+/// route actually opts in, and before any transport begins accepting messages.
+pub(crate) fn configured_image_generator(
+    configured: Option<&ImageGeneratorConfig>,
+    referenced: bool,
+) -> Result<Option<Arc<dyn ImageGenerator>>, ImageGeneratorStartupError> {
+    let Some(generator) = configured.filter(|_| referenced) else {
+        return Ok(None);
+    };
+    let variable = generator.api_key_env.as_str();
+    let credential = image_credential(variable, std::env::var_os(variable))?;
+    let client = OpenAiImageGenerator::new(
+        &generator.model,
+        credential,
+        std::time::Duration::from_millis(generator.timeout_ms),
+    )?;
+    Ok(Some(Arc::new(client) as Arc<dyn ImageGenerator>))
 }
 
-/// Resolves one image generator's credential, keeping which of the three problems it was.
+/// Resolves the image generator's credential, keeping which of the three problems it was.
 ///
 /// Split from the environment read so the rule is reachable without a test mutating this process's
 /// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
 pub(crate) fn image_credential(
-    generator: &str,
     variable: &str,
     value: Option<std::ffi::OsString>,
 ) -> Result<String, ImageGeneratorStartupError> {
     credential_from(variable, value).map_err(|source| ImageGeneratorStartupError::Credential {
-        generator: generator.to_owned(),
         variable: variable.to_owned(),
         source,
     })
@@ -535,9 +522,9 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
-    /// Named model-credential image generators, built once at startup. A route receives one only
-    /// when it explicitly names it.
-    pub image_generators: HashMap<String, Arc<dyn ImageGenerator>>,
+    /// The gateway's model-credential image generator, built once at startup. A route reaches it
+    /// only when it explicitly opts in.
+    pub image_generator: Option<Arc<dyn ImageGenerator>>,
     /// Optional service-native in-flight activity, by transport name.
     pub activities: HashMap<String, Arc<dyn ChatActivity>>,
     /// Bounded transport-owned Slack Agent thread claims, by transport name.
@@ -785,19 +772,17 @@ async fn session(
 
     let memory_surface = leg.chat_memory_surface().cloned();
     let chat_claim = chat_claim(route, message).ok();
-    let image_generator = match &route.image_generator {
-        Some(name) => match runner.image_generators.get(name) {
-            Some(generator) => Some(Arc::clone(generator)),
-            None => {
-                tracing::error!(
-                    event = "gateway_session_failed",
-                    category = "image-generator-unavailable"
-                );
-                answer(replier, message, FAILURE_REPLY).await;
-                return "failed";
-            }
-        },
-        None => None,
+    let image_generator = match (route.image_generator, runner.image_generator.as_ref()) {
+        (false, _) => None,
+        (true, Some(generator)) => Some(Arc::clone(generator)),
+        (true, None) => {
+            tracing::error!(
+                event = "gateway_session_failed",
+                category = "image-generator-unavailable"
+            );
+            answer(replier, message, FAILURE_REPLY).await;
+            return "failed";
+        }
     };
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
@@ -1320,14 +1305,12 @@ async fn deliver(
     }
 }
 
-/// Startup failure while resolving one named image generator.
+/// Startup failure while resolving the configured image generator.
 #[derive(Debug, Error)]
 pub enum ImageGeneratorStartupError {
     /// The named variable is unset, blank, or not UTF-8; the source says which.
-    #[error("image generator {generator:?} credential environment variable {variable} is unusable")]
+    #[error("image generator credential environment variable {variable} is unusable")]
     Credential {
-        /// Owner-authored generator name.
-        generator: String,
         /// Owner-authored variable name, never its value.
         variable: String,
         #[source]

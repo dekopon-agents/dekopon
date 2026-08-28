@@ -221,9 +221,9 @@ Grant-set invalidation has one known limit: it compares capability identifiers. 
 
 ## Outbound image generation
 
-A route can name one entry from `imageGenerators`. That explicit reference adds a gateway-owned
-`generate_image` meta tool to the existing chat model; no reference means no tool, no image
-credential read, and byte-identical text-only replies. The generator is a separate model client so
+A route can set `imageGenerator: true` against the gateway's single `imageGenerator:` block. That
+explicit opt-in adds a gateway-owned `generate_image` meta tool to the existing chat model; no
+opt-in means no tool, no image credential read, and byte-identical text-only replies. The generator is a separate model client so
 the existing OpenAI-compatible Chat Completions and undocumented ChatGPT/Codex subscription
 endpoints remain only the orchestrators they already are. Dekopon does not claim either contract
 natively emits generated images.

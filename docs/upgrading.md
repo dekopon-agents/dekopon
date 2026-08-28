@@ -238,6 +238,44 @@ release section here when that release is tagged.
   is the usage error it was before 0.11.0 rather than a full-screen view. Nothing loses authority:
   the console never held any.
 
+### `imageGenerators:` becomes one `imageGenerator:` block
+
+A gateway configures at most one image generator, so the named list is now a single optional object
+and a route opts in with a flag instead of a name. `deny_unknown_fields` means the old shape does not
+decode: `dekopond` refuses to start rather than ignoring the block. In `dekopond.yaml`:
+
+```yaml
+# before
+imageGenerators:
+  - name: openai-images
+    kind: openaiImages
+    model: gpt-image-1
+    apiKeyEnv: OPENAI_IMAGE_API_KEY
+    timeoutMs: 120000
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    imageGenerator: openai-images
+
+# after
+imageGenerator:
+  model: gpt-image-1
+  apiKeyEnv: OPENAI_IMAGE_API_KEY
+  timeoutMs: 120000
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    imageGenerator: true
+```
+
+Drop `name:` and `kind:` — the endpoint was already fixed to OpenAI's public Images API and the name
+had one referent. Deployments that configured more than one generator keep the one their routes
+actually named. Nothing else changes: the credential is still an environment variable name read only
+when a route opts in, and pairing an opted-in route with a `whatsappCloudApi` transport is still a
+startup refusal.
+
 ## Related documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the authoritative record of what each release contains.
