@@ -39,9 +39,9 @@ use crate::{
     asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ActivityMode, ConversationPolicy, ConversationWindow, ImageGeneratorConfig,
-        ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch, SlackActivityConfig,
-        SlackActivityFallback, SlackExperience,
+        self, ActivityMode, ConfigError, ConversationPolicy, ConversationWindow,
+        ImageGeneratorConfig, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
+        SlackActivityConfig, SlackActivityFallback, SlackExperience,
     },
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
@@ -118,6 +118,13 @@ async fn load(
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure config fixture");
     config::load(&path, crate::current_uid()).await
 }
+
+/// One refused configuration: what it is called, the document, and which refusal it must be.
+///
+/// The predicate is the whole point of the tuple. `is_err()` alone passes when a fixture typo trips
+/// strict decoding before it ever reaches the check the case is named after, and it keeps passing
+/// if the check stops being called at all.
+type RefusalCase = (&'static str, Value, fn(&ConfigError) -> bool);
 
 fn temporary() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -381,9 +388,12 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
     ));
 
     document["transports"][0]["activity"]["unexpected"] = json!(true);
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("unknown cosmetic settings still fail strict decoding");
     assert!(
-        load(directory.path(), &document).await.is_err(),
-        "unknown cosmetic settings still fail strict decoding"
+        matches!(error, ConfigError::Decode { .. }),
+        "an unknown field is a decode refusal, not a later check: {error:?}"
     );
 }
 
@@ -418,24 +428,50 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
             && endpoint == config::WHATSAPP_GRAPH_ENDPOINT
     ));
 
-    for (field, invalid) in [
-        ("appSecretEnv", json!("pasted secret")),
-        ("bind", json!("127.0.0.1:0")),
-        ("callbackPath", json!("relative")),
-        ("callbackPath", json!("/webhooks/{wildcard}")),
-        ("callbackPath", json!("/webhooks//whatsapp")),
-        ("callbackPath", json!("/webhooks/whatsapp/")),
-        ("wabaId", json!("0123")),
-        ("graphApiVersion", json!("latest")),
-        ("graphApiVersion", json!("v01.0")),
-        ("graphApiVersion", json!("v23.1")),
-        ("graphEndpoint", json!("https://evil.example")),
-    ] {
+    let invalid: [RefusalCase; 11] = [
+        ("appSecretEnv", json!("pasted secret"), |error| {
+            matches!(error, ConfigError::InvalidEnvironmentName { .. })
+        }),
+        ("bind", json!("127.0.0.1:0"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappBind { .. })
+        }),
+        ("callbackPath", json!("relative"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+        }),
+        ("callbackPath", json!("/webhooks/{wildcard}"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+        }),
+        ("callbackPath", json!("/webhooks//whatsapp"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+        }),
+        ("callbackPath", json!("/webhooks/whatsapp/"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+        }),
+        ("wabaId", json!("0123"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappScope { .. })
+        }),
+        ("graphApiVersion", json!("latest"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+        }),
+        ("graphApiVersion", json!("v01.0"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+        }),
+        ("graphApiVersion", json!("v23.1"), |error| {
+            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+        }),
+        ("graphEndpoint", json!("https://evil.example"), |error| {
+            matches!(error, ConfigError::UnsupportedEndpoint { .. })
+        }),
+    ];
+    for (field, value, expected) in invalid {
         let mut invalid_document = document.clone();
-        invalid_document["transports"][0][field] = invalid;
+        invalid_document["transports"][0][field] = value;
+        let error = load(directory.path(), &invalid_document)
+            .await
+            .expect_err(&format!("invalid {field} must fail closed"));
         assert!(
-            load(directory.path(), &invalid_document).await.is_err(),
-            "invalid {field} must fail closed"
+            expected(&error),
+            "invalid {field} failed closed for the wrong reason: {error:?}"
         );
     }
 
@@ -452,6 +488,10 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
     let error = load(directory.path(), &with_images)
         .await
         .expect_err("a text-only transport cannot carry a generated image");
+    assert!(
+        matches!(error, ConfigError::UnsupportedRouteImageGenerator { .. }),
+        "the refusal must name the transport pairing: {error:?}"
+    );
     assert!(
         error.to_string().contains("text-only"),
         "the refusal names why: {error}"
@@ -514,30 +554,34 @@ async fn invalid_configurations_fail_closed_at_startup() {
         document
     };
 
-    let cases: Vec<(&str, Value)> = vec![
+    let cases: Vec<RefusalCase> = vec![
         (
             "unknown top-level field",
             mutate(|document| {
                 document["unexpected"] = json!(true);
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "unknown field inside a transport",
             mutate(|document| {
                 document["transports"][0]["socketpath"] = json!("/tmp/typo.sock");
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "unknown transport kind",
             mutate(|document| {
                 document["transports"][0]["kind"] = json!("carrierPigeon");
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "unknown field inside a model",
             mutate(|document| {
                 document["models"][0]["temperature"] = json!(0.7);
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "unknown field inside the image generator",
@@ -549,6 +593,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "https://attacker.example"
                 });
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "image generator with a blank model",
@@ -559,6 +604,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 120_000
                 });
             }),
+            |error| matches!(error, ConfigError::UnnamedImageModel),
         ),
         (
             "invalid image credential environment name",
@@ -569,6 +615,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 120_000
                 });
             }),
+            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
         ),
         (
             "zero image generator timeout",
@@ -579,18 +626,21 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 0
                 });
             }),
+            |error| matches!(error, ConfigError::InvalidImageGeneratorTimeout),
         ),
         (
             "route enables image generation with none configured",
             mutate(|document| {
                 document["routes"][0]["imageGenerator"] = json!(true);
             }),
+            |error| matches!(error, ConfigError::UnconfiguredRouteImageGenerator { .. }),
         ),
         (
             "unknown route match kind",
             mutate(|document| {
                 document["routes"][0]["match"] = json!({"kind": "semaphore"});
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             // serde's internally tagged *unit* variants accept and discard every key beside the
@@ -602,6 +652,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["match"] =
                     json!({"kind": "directMessage", "channel": "c0123abc"});
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "duplicate transport name",
@@ -612,6 +663,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     .expect("transports array")
                     .push(duplicate);
             }),
+            |error| matches!(error, ConfigError::DuplicateTransport { .. }),
         ),
         (
             "duplicate model name",
@@ -622,36 +674,42 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     .expect("models array")
                     .push(duplicate);
             }),
+            |error| matches!(error, ConfigError::DuplicateModel { .. }),
         ),
         (
             "route names an unknown transport",
             mutate(|document| {
                 document["routes"][0]["transport"] = json!("nowhere");
             }),
+            |error| matches!(error, ConfigError::UnknownRouteTransport { .. }),
         ),
         (
             "route names an unknown model",
             mutate(|document| {
                 document["routes"][0]["model"] = json!("gpt-nonexistent");
             }),
+            |error| matches!(error, ConfigError::UnknownRouteModel { .. }),
         ),
         (
             "zero step budget",
             mutate(|document| {
                 document["routes"][0]["limits"] = json!({"maxSteps": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidRouteLimits { .. }),
         ),
         (
             "zero concurrency",
             mutate(|document| {
                 document["sessions"] = json!({"maxConcurrent": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidSessionLimits),
         ),
         (
             "unknown conversation mode",
             mutate(|document| {
                 document["routes"][0]["conversation"] = json!({"mode": "amnesiac"});
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "zero idle timeout on a persistent route",
@@ -659,6 +717,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "idleTimeoutMs": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
         ),
         (
             "zero turn window on a persistent route",
@@ -666,6 +725,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "maxTurns": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
         ),
         (
             "zero byte window on a persistent route",
@@ -673,6 +733,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "maxBytes": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
         ),
         (
             // A window bound that can never take effect is far more likely a mode typo than an
@@ -682,6 +743,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
             mutate(|document| {
                 document["routes"][0]["conversation"] = json!({"mode": "oneShot", "maxTurns": 12});
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "an idle timeout on a oneShot route",
@@ -689,18 +751,21 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "oneShot", "idleTimeoutMs": 900_000});
             }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "zero conversation ceiling",
             mutate(|document| {
                 document["sessions"] = json!({"maxConversations": 0});
             }),
+            |error| matches!(error, ConfigError::InvalidMaxConversations),
         ),
         (
             "no transports at all",
             mutate(|document| {
                 document["transports"] = json!([]);
             }),
+            |error| matches!(error, ConfigError::NoTransports),
         ),
         (
             // A secret in the field that names a variable is the mistake this rejects loudest: it
@@ -714,12 +779,14 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "botTokenEnv": "12345:AAH-actual-secret-value"
                 });
             }),
+            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
         ),
         (
             "model API key variable that is not a variable name",
             mutate(|document| {
                 document["models"][0]["apiKeyEnv"] = json!("sk-live-not-a-variable");
             }),
+            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
         ),
         (
             "a Slack reaction fallback while activity is off",
@@ -732,6 +799,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "activity": {"mode": "off", "classicFallback": "reaction"}
                 });
             }),
+            |error| matches!(error, ConfigError::InvalidSlackActivity { .. }),
         ),
         (
             "classic native Slack activity with no visible fallback",
@@ -745,6 +813,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "activity": {"mode": "native", "classicFallback": "none"}
                 });
             }),
+            |error| matches!(error, ConfigError::InvalidSlackActivity { .. }),
         ),
         (
             "a Slack endpoint that is neither production nor loopback",
@@ -757,6 +826,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "https://slack.evil.test"
                 });
             }),
+            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
         ),
         (
             "a Discord endpoint that is neither production nor loopback",
@@ -768,6 +838,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "https://discord.evil.test"
                 });
             }),
+            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
         ),
         (
             // Userinfo makes the authority read as loopback while the socket connects elsewhere.
@@ -781,13 +852,17 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "http://127.0.0.1@slack.evil.test"
                 });
             }),
+            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
         ),
     ];
 
-    for (name, document) in cases {
+    for (name, document, expected) in cases {
+        let error = load(directory.path(), &document)
+            .await
+            .expect_err(&format!("{name} must fail closed"));
         assert!(
-            load(directory.path(), &document).await.is_err(),
-            "{name} must fail closed"
+            expected(&error),
+            "{name} failed closed for the wrong reason: {error:?}"
         );
     }
 }
