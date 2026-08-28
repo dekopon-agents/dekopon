@@ -4,9 +4,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, ConstraintCatalog,
-    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, CapabilityRoute,
+    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -78,6 +78,7 @@ when { context has via && context.via == "caller"
 
 fn echo_constraint_set() -> ConstraintSet {
     ConstraintSet {
+        route: CapabilityRoute::Generic,
         provider: "echo"
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
@@ -570,6 +571,7 @@ when { context.capability == "http-probe.fetch"
     );
     write_owner_only(&secret_map_path, secret_map.as_bytes());
     let set = ConstraintSet {
+        route: CapabilityRoute::Generic,
         provider: "http-probe".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,

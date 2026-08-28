@@ -91,7 +91,7 @@ The reasoning is that the export is a **pure rewrite** and what it returns is a 
 
 Everything that is not a rewrite collapses into one opaque answer. A word no loaded provider declares, a guest that traps or reaches for a host import, and a resolution the broker cannot decode all return the stable `provider-error` code with a fixed message; the guest's own failure text is provider-controlled and never reaches a caller through this path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases apart from the audit stream that a caller deliberately cannot. A provider that simply *declines* the arguments is not a failure at all: that is a usage error, and the provider's own message travels back for the model to read.
 
-Reserved words are unreachable through this path regardless of the provider that declares them: the broker refuses `memory` and any word belonging to the trusted memory provider, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. `resolveCommandForChat` is the chat-scoped twin, which *is* bound to an attested claim.
+Reserved words are unreachable through this path, and what reserves them is the deployment's own `constraintSets`: every word belonging to the provider a chat-memory `route:` names is refused here, and so is any resolution that lands on a chat-memory-routed capability. Reservation therefore follows what an operator declared rather than how a provider or capability happens to be spelled, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. `resolveCommandForChat` is the chat-scoped twin, which *is* bound to an attested claim.
 
 ### Attested on-behalf-of operations
 
@@ -306,7 +306,7 @@ namespace; combining HTTP and storage is refused. The broker derives every opaqu
 the authorized context, consumes a host-instance/invocation/capability/provider-bound grant, and
 commits only a valid `Succeeded` response. Stable public classes are `storage-quota`,
 `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io`, and
-`outcome-unaudited`. The trusted memory provider additionally allowlists only
+`outcome-unaudited`. A chat-memory-routed capability additionally allowlists only
 `memory-corrupt`, `result-too-large`, `dedup-conflict`, and `dedup-capacity`; arbitrary provider
 messages remain `provider-failure`.
 

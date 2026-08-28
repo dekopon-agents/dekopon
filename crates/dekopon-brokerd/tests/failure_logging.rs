@@ -15,8 +15,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
+    AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -106,6 +107,7 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
     let catalog = ConstraintCatalog::new([(
         "echo.echo".parse::<CapabilityId>().expect("capability"),
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: "echo".parse::<ProviderId>().expect("provider"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,

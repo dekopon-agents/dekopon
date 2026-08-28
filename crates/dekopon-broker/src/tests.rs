@@ -14,10 +14,10 @@ use dekopon_core::{
 
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, BrokerBuildError, ChatMemoryConfig,
-    ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError,
-    FileAuditLog, InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints,
-    encode_host_limits, encode_memory_config, encode_storage_limits, is_reserved_memory_route,
+    AuditRecord, AuthenticatedContext, AuthorityEncoder, BrokerBuildError, CapabilityRoute,
+    ChatMemoryConfig, ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet,
+    ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog, canonical_chat_scope,
+    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
     verify_audit_chain,
 };
 
@@ -111,28 +111,47 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
 }
 
 #[test]
-fn the_complete_memory_prefix_and_provider_are_reserved() {
-    let provider_route = ConstraintSet {
-        provider: "memory-chat".parse().expect("provider"),
-        effect: dekopon_capability::EffectKind::ReadOnly,
-        risk: dekopon_core::RiskLevel::Low,
-        idempotency: dekopon_capability::Idempotency::Idempotent,
-        credential: None,
-        credential_by_agent: Default::default(),
-        constraints: ExecutionConstraints::default(),
-    };
-    assert!(is_reserved_memory_route(
-        &"memory.chat.export".parse().expect("capability"),
-        None,
-    ));
-    assert!(is_reserved_memory_route(
-        &"unrelated.extra".parse().expect("capability"),
-        Some(&provider_route),
-    ));
-    assert!(!is_reserved_memory_route(
-        &"ordinary.read".parse().expect("capability"),
-        None,
-    ));
+fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
+    // An operator-chosen `memory.chat.export` on a provider named `memory-chat`, with no route:
+    // reserved-looking in every spelling and generic in the only place that decides.
+    let authored = serde_json::json!({
+        "provider": "memory-chat",
+        "effect": "read-only",
+        "risk": "Low",
+        "idempotency": "idempotent",
+        "constraints": {"timeoutMs": 1000, "maxOutputBytes": 1024},
+    });
+    let generic: ConstraintSet =
+        serde_json::from_value(authored.clone()).expect("route may be omitted");
+    assert_eq!(generic.route, CapabilityRoute::Generic);
+    assert!(generic.route.is_generic() && !generic.route.is_chat_memory());
+    assert!(
+        !serde_json::to_value(&generic)
+            .expect("serialize")
+            .as_object()
+            .expect("object")
+            .contains_key("route"),
+        "the default route stays out of serialized configuration"
+    );
+
+    let mut declared = authored;
+    declared["route"] = serde_json::json!("chatMemoryRecord");
+    let routed: ConstraintSet =
+        serde_json::from_value(declared).expect("route parses from its camelCase name");
+    assert_eq!(routed.route, CapabilityRoute::ChatMemoryRecord);
+    assert!(routed.route.is_chat_memory() && !routed.route.is_chat_memory_retrieval());
+    assert_eq!(
+        serde_json::to_value(&routed).expect("serialize")["route"],
+        serde_json::json!("chatMemoryRecord")
+    );
+
+    for route in CapabilityRoute::CHAT_MEMORY {
+        assert!(route.is_chat_memory());
+        assert_eq!(route.to_string(), route.as_str());
+    }
+    assert!(CapabilityRoute::ChatMemoryRecent.is_chat_memory_retrieval());
+    assert!(CapabilityRoute::ChatMemorySearch.is_chat_memory_retrieval());
+    assert_eq!(CapabilityRoute::default(), CapabilityRoute::Generic);
 }
 
 #[test]
@@ -1057,6 +1076,7 @@ async fn durable_audit_rejects_non_private_permissions() {
 fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: "echo".parse().expect("provider"),
             effect: dekopon_capability::EffectKind::ReadOnly,
             risk: dekopon_core::RiskLevel::Low,

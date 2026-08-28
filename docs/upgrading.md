@@ -232,6 +232,18 @@ release section here when that release is tagged.
   it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
   by default and no chart release could set it, so a deployment that never opted in has nothing to
   edit — and no persisted audit chain can carry a `dev.*` subject.
+- **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
+  memory used to be recognized by name: any capability spelled `memory.chat.*` and any provider
+  called `memory-chat` was reserved, and renaming the shipped provider silently dropped that
+  reservation. It is now the owner's declaration. Add `route: chatMemoryRecord`,
+  `route: chatMemoryRecent`, and `route: chatMemorySearch` to the three `constraintSets` entries
+  that make up the surface — exactly one set per role, all naming one provider, each already
+  declaring `jsonl` chat storage at its role's access. Without them the sets are ordinary
+  capabilities, `chatMemory` refuses to compose, and the broker fails to start rather than serving a
+  memory surface nothing reserves. Startup reports every route conflict at once. Deployments with no
+  chat memory have nothing to edit: `route:` is optional, defaults to `generic`, and a set that
+  omits it means exactly what it meant before. The wire protocol and audit record shapes are
+  unchanged.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
   now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`

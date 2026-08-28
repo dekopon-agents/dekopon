@@ -12,10 +12,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation, ChatScopeClaim,
-    ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
-    SubjectAttestation,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ChatAttestation,
+    ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld, SubjectAttestation,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -152,6 +152,7 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
     (
         capability(capability_id),
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: provider(),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,

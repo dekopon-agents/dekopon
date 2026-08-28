@@ -148,6 +148,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
                 "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576}
             },
             "memory.chat.record": {
+                "route": "chatMemoryRecord",
                 "provider": "memory-chat", "effect": "local-write", "risk": "Medium",
                 "idempotency": "conditional",
                 "constraints": {
@@ -156,6 +157,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
                 }
             },
             "memory.chat.recent": {
+                "route": "chatMemoryRecent",
                 "provider": "memory-chat", "effect": "read-only", "risk": "High",
                 "idempotency": "idempotent",
                 "constraints": {
@@ -164,6 +166,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
                 }
             },
             "memory.chat.search": {
+                "route": "chatMemorySearch",
                 "provider": "memory-chat", "effect": "read-only", "risk": "High",
                 "idempotency": "idempotent",
                 "constraints": {

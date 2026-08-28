@@ -3,10 +3,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dekopon_broker::{
     AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits,
-    ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld, SecretCatalog,
-    SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
-    SubjectAttestation, verify_audit_chain,
+    CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
+    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
+    StartupWarning, SubjectAttestation, verify_audit_chain,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
@@ -104,6 +104,7 @@ fn set_with_metadata(
     constraints: ExecutionConstraints,
 ) -> ConstraintSet {
     ConstraintSet {
+        route: CapabilityRoute::Generic,
         provider: provider
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
@@ -1062,6 +1063,7 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 credential: Some("fetch-token".to_owned()),
                 ..set("http-probe", constraints)
             },
@@ -1422,6 +1424,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 credential: Some("github-pat".to_owned()),
                 credential_by_agent: BTreeMap::from([(
                     agent("nestedset-github"),
@@ -1553,6 +1556,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 credential: None,
                 credential_by_agent: BTreeMap::from([(
                     agent("nestedset-github"),
@@ -1679,6 +1683,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let build = |credential: String, constraints: ExecutionConstraints, store: CredentialStore| {
         build_set(
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 credential: Some(credential),
                 ..set("http-probe", constraints)
             },
@@ -1688,6 +1693,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let build_override = |credential: String, constraints: ExecutionConstraints| {
         build_set(
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 credential: Some("fetch-token".to_owned()),
                 credential_by_agent: BTreeMap::from([(agent("nestedset-github"), credential)]),
                 ..set("http-probe", constraints)
