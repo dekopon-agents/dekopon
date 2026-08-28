@@ -240,8 +240,10 @@ release section here when that release is tagged.
   that make up the surface — exactly one set per role, all naming one provider, each already
   declaring `jsonl` chat storage at its role's access. Without them the sets are ordinary
   capabilities, `chatMemory` refuses to compose, and the broker fails to start rather than serving a
-  memory surface nothing reserves. Startup reports every route conflict at once. Deployments with no
-  chat memory have nothing to edit: `route:` is optional, defaults to `generic`, and a set that
+  memory surface nothing reserves. That refusal names the work: it lists every role no constraint
+  set declares `route:` for, names all three, and says exactly one set must declare each. Startup
+  reports every route conflict at once for the same reason. Deployments with no chat memory have
+  nothing to edit: `route:` is optional, defaults to `generic`, and a set that
   omits it means exactly what it meant before. The wire protocol and audit record shapes are
   unchanged.
 - **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables

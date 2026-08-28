@@ -2518,6 +2518,122 @@ fn walk(path: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// An upgrade that adds `chatMemory:` and forgets `route:` must be told which lines to write.
+///
+/// This is the shape of a real deployment mid-upgrade: the three `memory.chat.*` capabilities and
+/// the `chatMemory:` block were already there and composed by name, and nothing in the constraint
+/// sets was edited. `validate_routes` has nothing to say — there are no declared routes to
+/// conflict — so this refusal is the operator's only signal, and the composition message it used
+/// to be named neither `route:` nor any of the roles.
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_memory_without_routes_names_every_missing_role() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let key = directory.join("storage-key.yaml");
+    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [provider_fixture("memory-chat-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("memory fixture loads with storage");
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().expect("caller")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    // Exactly the pre-upgrade catalog: the right three capabilities, the right storage authority,
+    // and no `route:` anywhere. `route` defaults to `generic`, so this is what omitting it means.
+    let unrouted = |effect, risk, idempotency, access| {
+        let mut set = memory_constraint(
+            CapabilityRoute::ChatMemoryRecord,
+            effect,
+            risk,
+            idempotency,
+            access,
+        );
+        set.route = CapabilityRoute::Generic;
+        set
+    };
+    let constraints = ConstraintCatalog::new([
+        (
+            MEMORY_RECORD.parse().expect("capability"),
+            unrouted(
+                EffectKind::LocalWrite,
+                RiskLevel::Medium,
+                Idempotency::Conditional,
+                StorageAccess::ReadWrite,
+            ),
+        ),
+        (
+            MEMORY_RECENT.parse().expect("capability"),
+            unrouted(
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                Idempotency::Idempotent,
+                StorageAccess::ReadOnly,
+            ),
+        ),
+        (
+            "memory.chat.search".parse().expect("capability"),
+            unrouted(
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                Idempotency::Idempotent,
+                StorageAccess::ReadOnly,
+            ),
+        ),
+    ])
+    .expect("an unrouted catalog is a valid catalog");
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "unrouted-memory-policy".to_owned(),
+        PolicyEngine::new("", &world).expect("empty policy"),
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("a deployment with no declared routes still starts");
+    let Err(error) = broker.with_chat_memory(memory_config()) else {
+        panic!("chatMemory must not compose with an unrouted catalog");
+    };
+    let rendered = error.to_string();
+    let BrokerBuildError::UnroutedChatMemory { roles } = error else {
+        panic!("an unrouted catalog must be its own build error: {rendered}");
+    };
+    assert_eq!(
+        roles,
+        vec![
+            CapabilityRoute::ChatMemoryRecord,
+            CapabilityRoute::ChatMemoryRecent,
+            CapabilityRoute::ChatMemorySearch,
+        ],
+        "every missing role is reported at once, not the first: {rendered}"
+    );
+    for fragment in [
+        "route:",
+        "chatMemoryRecord",
+        "chatMemoryRecent",
+        "chatMemorySearch",
+        "exactly one constraint set",
+        "docs/upgrading.md",
+    ] {
+        assert!(
+            rendered.contains(fragment),
+            "the refusal must name {fragment}: {rendered}"
+        );
+    }
+}
+
 /// Route mistakes are reported together, because a route file is edited as a whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_declared_route_conflict_is_reported_at_startup() {

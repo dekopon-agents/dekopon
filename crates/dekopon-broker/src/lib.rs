@@ -1955,6 +1955,24 @@ pub enum BrokerBuildError {
     /// Chat-memory bounds or their composition with storage ceilings are invalid.
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
+    /// `chatMemory:` is configured but the constraint sets do not route the whole surface.
+    ///
+    /// Its own variant because it is the one chat-memory refusal an upgrade earns by *not* editing
+    /// a file: a deployment that already had `memory.chat.*` capabilities and a `chatMemory:` block
+    /// composed fine until routes replaced name matching. [`Self::InvalidChatMemory`] means
+    /// declared roles whose bounds do not compose; this one means there is nothing declared to
+    /// compose with, and the fix is `route:` lines rather than a bound to widen.
+    #[error(
+        "chatMemory is configured but no constraint set declares route: {}; the surface is all \
+         three roles — chatMemoryRecord, chatMemoryRecent, chatMemorySearch — with exactly one \
+         constraint set declaring each and all of them naming one provider; see \
+         docs/upgrading.md",
+        roles.iter().map(|role| role.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    UnroutedChatMemory {
+        /// Every chat-memory role no constraint set declares, in role order.
+        roles: Vec<CapabilityRoute>,
+    },
     /// Declared capability routes were ambiguous or under-declared.
     ///
     /// Carries every conflict rather than the first, because a route file is edited as a whole.
@@ -3027,12 +3045,24 @@ where
                 Idempotency::Idempotent,
             ),
         ];
+        // Every unrouted role at once, and before the shape checks. A deployment upgrading with
+        // `memory.chat.*` capabilities and a `chatMemory:` block but no `route:` on its constraint
+        // sets is missing all three, and the composition refusal below names none of them: it
+        // would send an operator looking at bounds when the fix is three lines of routing.
+        let unrouted = expected
+            .iter()
+            .map(|(route, ..)| *route)
+            .filter(|route| self.constraints.routed(*route).is_none())
+            .collect::<Vec<_>>();
+        if !unrouted.is_empty() {
+            return Err(BrokerBuildError::UnroutedChatMemory { roles: unrouted });
+        }
         let mut routed = BTreeSet::new();
         for (route, effect, risk, idempotency) in expected {
             let (capability, set) = self
                 .constraints
                 .routed(route)
-                .ok_or(BrokerBuildError::InvalidChatMemory)?;
+                .expect("every chat-memory role was proved routed above");
             routed.insert(capability.as_str());
             if set.effect != effect
                 || set.risk != risk
