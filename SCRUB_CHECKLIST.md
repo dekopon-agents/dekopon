@@ -299,6 +299,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 **Suggested fix:** Either add the `o`/`r` arms with the per-call/per-field cursor they need (preserving per-field, per-keystroke, never-a-mode reveal semantics and the scrollback notice `App::reveal` emits), or delete `toggle_call`/`reveal`/`is_revealed`/`expanded_call`/`revealed`, the `expanded` render branch, the hint, the two help rows, and the two doc sentences. Drop `EnableMouseCapture`/`DisableMouseCapture` either way. If #22 moves the crate out of tree, this travels with it.
 
 **Decision: MODIFY: do it as part of #22's extraction so the moved crate lands working: add the `o`/`r` arms with the per-call/per-field cursor they need (per-field, per-keystroke, never-a-mode reveal, keep the scrollback notice `App::reveal` emits) and drop `EnableMouseCapture`/`DisableMouseCapture`.**
+**Landed in:** dekopon-agents/dekopon-console @ adfe0560f90b45d0f5d4d93435915eec27258cd2 (crates/dekopon-tui/src/run.rs:218-219; mouse capture removed).
 
 ## [x] #33 — COMMENT_ROT — README.md:5,136,311; docs/design.md:174; docs/security-model.md:299; docs/broker-http.md:11,60; docs/development.md:166; crates/dekopon/README.md:3 (+3 other stale facts)
 
