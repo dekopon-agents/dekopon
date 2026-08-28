@@ -316,7 +316,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE (CLI branch): add `dekopon-brokerd audit verify --audit-path …` beside `provider list|verify` and keep `verify_audit_chain` pub; everything else as listed.**
 
-## [ ] #35 — DEAD_CODE — crates/dekopon-provider-sdk-testkit/src/lib.rs:259,266,276,283
+## [x] #35 — DEAD_CODE — crates/dekopon-provider-sdk-testkit/src/lib.rs:259,266,276,283
 
 **Finding:** Four of `FakeBrokerBuilder`'s eleven methods are called by no test in the repo — `storage_limits`, `host_limits`, `compile_cache`, `continuity` — while the crate's README makes `.compile_cache(dir)` a headline recommendation and builds its strongest claim ("a quota a test trips here is a quota production would have tripped") on `storage_limits`. This crate is the public testing contract for out-of-tree provider authors, and six of its documented affordances have never executed once. (raw: D1)
 **Blast radius:** MEDIUM  **Confidence:** HIGH
