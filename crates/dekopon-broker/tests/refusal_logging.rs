@@ -18,15 +18,15 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatScopeClaim, ChatSessionClaim,
-    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, SubjectAttestation,
+    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation,
+    ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld, SubjectAttestation,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TransportId,
+    Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel, TransportId,
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -53,6 +53,11 @@ permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"broken-agent")
 when { 9223372036854775807 + 1 == 0 };
+
+@id("forbidden-gate")
+forbid(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"forbidden-agent");
 "#;
 
 #[derive(Clone, Default)]
@@ -144,7 +149,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     )
 }
 
-async fn broker() -> Broker<InMemoryAuditLog> {
+async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let registry =
         BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
             .await
@@ -157,7 +162,8 @@ async fn broker() -> Broker<InMemoryAuditLog> {
         )],
     )
     .expect("the refusal world builds");
-    Broker::new(
+    let audit = Arc::new(InMemoryAuditLog::new(64).expect("valid audit bound"));
+    let broker = Broker::new(
         registry,
         principal("broker-test"),
         "refusal-logging".to_owned(),
@@ -166,10 +172,11 @@ async fn broker() -> Broker<InMemoryAuditLog> {
         CredentialStore::empty(),
         IdentityDirectory::new([(subject(MAPPED_SUBJECT), principal("cpetersen"))])
             .expect("one mapping builds a directory"),
-        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        Arc::clone(&audit),
         BrokerLimits::default(),
     )
-    .expect("the broker starts")
+    .expect("the broker starts");
+    (broker, audit)
 }
 
 fn gateway() -> AuthenticatedContext {
@@ -186,6 +193,17 @@ fn grant() -> AttestorGrant {
     AttestorGrant {
         namespaces: vec!["slack.t0123abc".to_owned()],
         chat_scopes: Vec::new(),
+    }
+}
+
+fn proposal(id: &str) -> InvocationRequest {
+    InvocationRequest {
+        id: id.parse().expect("valid invocation fixture"),
+        capability: "echo.reverse".parse().expect("valid capability fixture"),
+        trace: "trace-refusal".parse().expect("valid trace fixture"),
+        trace_parent: None,
+        input: serde_json::json!({"message": "refused"}),
+        secret_use: None,
     }
 }
 
@@ -209,7 +227,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> ChatSessionClaim {
 async fn every_inspection_refusal_names_its_class_and_its_subject() {
     let captured = Captured::default();
     tracing_subscriber::registry().with(captured.clone()).init();
-    let broker = broker().await;
+    let (broker, audit) = broker().await;
 
     // No attestor authority at all.
     assert!(
@@ -296,18 +314,25 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(erroring.contains("policy-error"), "{erroring}");
     assert!(!erroring.contains("agent-denied"), "{erroring}");
 
+    // A refusal a `forbid` rule determined is the case where the identifiers are not empty, and
+    // they are the only route from the class back to the rule that reached it.
+    assert!(
+        broker
+            .capabilities_for(
+                &gateway(),
+                Some(&grant()),
+                &subject(MAPPED_SUBJECT),
+                &agent("forbidden-agent")
+            )
+            .is_none()
+    );
+    let forbidden = captured.take();
+    assert!(forbidden.contains("agent-denied"), "{forbidden}");
+    assert!(forbidden.contains("forbidden-gate"), "{forbidden}");
+
     // The same distinction reaches the durable decision record, where a denial that was really a
     // broken policy used to be filed as an ordinary refusal.
-    let proposal = InvocationRequest {
-        id: "invoke-policy-error"
-            .parse::<InvocationId>()
-            .expect("valid invocation fixture"),
-        capability: "echo.reverse".parse().expect("valid capability fixture"),
-        trace: "trace-refusal".parse().expect("valid trace fixture"),
-        trace_parent: None,
-        input: serde_json::json!({"message": "refused"}),
-        secret_use: None,
-    };
+    let denied = proposal("invoke-policy-error");
     let refused = broker
         .invoke_for(
             &gateway(),
@@ -315,9 +340,9 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             &SubjectAttestation {
                 subject: subject(MAPPED_SUBJECT),
                 agent: agent("broken-agent"),
-                invocation: proposal.id.clone(),
+                invocation: denied.id.clone(),
             },
-            proposal,
+            denied,
         )
         .await
         .expect("a refused agent is still an accounted decision");
@@ -339,6 +364,105 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(chat.contains("broker_capabilities_refused"), "{chat}");
     assert!(chat.contains("unmapped-subject"), "{chat}");
     assert!(chat.contains(UNMAPPED_SUBJECT), "{chat}");
+
+    // A command word a refused session may not reach answers `UnknownCommandWord` whatever went
+    // wrong — naming the word would disclose the surface the refusal withheld — so this event is
+    // the only place the class exists at all.
+    assert!(
+        broker
+            .resolve_command_for_chat(
+                &gateway(),
+                Some(&grant()),
+                &chat_claim(UNMAPPED_SUBJECT, "some-agent"),
+                "echo",
+                &[],
+            )
+            .await
+            .is_err()
+    );
+    let command = captured.take();
+    assert!(command.contains("broker_capabilities_refused"), "{command}");
+    assert!(command.contains("unmapped-subject"), "{command}");
+    assert!(command.contains(UNMAPPED_SUBJECT), "{command}");
+
+    // The chat invocation path carries all four live transports, and it used to file every one of
+    // these classes as a single `chat-attestation-denied` with no policy identifiers at all.
+    for (index, (attestor, canonical, agent_id, reason, policies)) in [
+        (
+            None,
+            MAPPED_SUBJECT,
+            "some-agent",
+            "attestation-denied",
+            &[][..],
+        ),
+        (
+            Some(grant()),
+            UNMAPPED_SUBJECT,
+            "some-agent",
+            "unmapped-subject",
+            &[][..],
+        ),
+        (
+            Some(grant()),
+            MAPPED_SUBJECT,
+            "other-agent",
+            "agent-denied",
+            &[][..],
+        ),
+        (
+            Some(grant()),
+            MAPPED_SUBJECT,
+            "forbidden-agent",
+            "agent-denied",
+            &["forbidden-gate"][..],
+        ),
+        (
+            Some(grant()),
+            MAPPED_SUBJECT,
+            "broken-agent",
+            "policy-error",
+            &[][..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = proposal(&format!("invoke-chat-{index}"));
+        let identifier = request.id.clone();
+        let refused = broker
+            .invoke_for_chat(
+                &gateway(),
+                attestor.as_ref(),
+                &ChatAttestation {
+                    subject: subject(canonical),
+                    agent: agent(agent_id),
+                    scope: chat_claim(canonical, agent_id).scope,
+                    invocation: identifier.clone(),
+                },
+                request,
+            )
+            .await
+            .expect("a refused chat proposal is still an accounted decision");
+        assert_eq!(refused.outcome, InvocationOutcome::Denied);
+        assert_eq!(refused.error.as_deref(), Some(reason), "{agent_id}");
+
+        let records = audit.records().await;
+        let decision = records
+            .iter()
+            .find_map(|record| match &record.event {
+                AuditEvent::Decision {
+                    invocation,
+                    reason,
+                    policy_ids,
+                    ..
+                } if *invocation == identifier => Some((reason.clone(), policy_ids.clone())),
+                _ => None,
+            })
+            .expect("the refusal is durably recorded");
+        assert_eq!(decision.0.as_deref(), Some(reason), "{agent_id}");
+        assert_eq!(decision.1, policies, "{agent_id}");
+    }
+    let _ = captured.take();
 
     // An honored session stays silent: this event marks refusals, not traffic.
     assert!(

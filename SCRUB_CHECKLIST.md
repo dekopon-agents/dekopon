@@ -72,7 +72,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #5 — SILENT_FAILURE_MODE — crates/dekopon-broker/src/lib.rs:3367 / :3418 / :3304
+## [x] #5 — SILENT_FAILURE_MODE — crates/dekopon-broker/src/lib.rs:3367 / :3418 / :3304
 
 **Finding:** `resolve_chat_claim` returns four refusal classes (`attestation-denied`, `unmapped-subject`, `agent-denied`, `policy-error`); three of its four callers discard them for a hardcoded `"chat-attestation-denied"` with empty `policy_ids` — on the chat path that carries all four live transports — and `:3304` returns `UnknownCommandWord` with no audit record and no `report_inspection_refusal`. Both discarding sites call the helper twice, so every chat invocation runs Cedar twice. The non-chat path (`:3197`) preserves both fields. (raw: D2)
 **Blast radius:** HIGH  **Confidence:** HIGH
