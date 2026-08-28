@@ -25,6 +25,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }
+libc.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber.workspace = true
 
