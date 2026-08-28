@@ -49,6 +49,15 @@ dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 
 The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. The direct `dekopon-run` host remains empty and rejects such components; see the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
 
+## Host feature
+
+Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build
+never compiles it. The optional `host` feature adds `dekopon_provider_sdk::host`: the Wasmtime
+plumbing `dekopon-provider-host` and `dekopon-broker-host` both need — manifest validation behind an
+effect gate, the report a whole conflicting provider set fails with, the bounds on one store, and
+the engine constructor. It pulls in Wasmtime. Each host still owns its own linker and its own way of
+interrupting a guest that runs too long.
+
 ## WIT package
 
 The same import-free world is published as `dekopon:provider@0.2.0`, alongside a `provider-commands` world adding the optional `resolve-command` export. Fetch it through Dekopon's public registry metadata:

@@ -7,9 +7,9 @@ use dekopon_broker_protocol::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, Frame
 use dekopon_core::{
     CapabilityId, ExternalSubject, InvocationId, PROVIDER_COMPONENT_EXTENSION, TraceId,
 };
-use dekopon_provider_host::{
-    DEFAULT_FUEL, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_TIMEOUT, HostOptions,
+use dekopon_provider_host::{DEFAULT_FUEL, DEFAULT_TIMEOUT, HostOptions};
+use dekopon_provider_sdk::host::{
+    DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
 };
 use dekopon_shell::{
     DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES as DEFAULT_SHELL_MAX_OUTPUT_BYTES,

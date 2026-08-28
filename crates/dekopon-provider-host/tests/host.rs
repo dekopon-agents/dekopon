@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use dekopon_provider_host::{
+    HostLimits, HostOptions, PROVIDER_WIT, ProviderHostError, ProviderRegistry,
+};
+use dekopon_provider_sdk::host::{
     DEFAULT_MAX_INSTANCES, DEFAULT_MAX_MEMORIES, DEFAULT_MAX_MEMORY_BYTES,
-    DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES, HostLimits, HostOptions, PROVIDER_WIT,
-    ProviderHostError, ProviderRegistry,
+    DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES,
 };
 use serde_json::json;
 

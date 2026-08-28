@@ -1059,6 +1059,8 @@ dependencies = [
  "dekopon-core",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
+ "wasmtime",
  "wit-bindgen 0.44.0",
 ]
 
@@ -1098,6 +1100,7 @@ dependencies = [
  "dekopon-model",
  "dekopon-process",
  "dekopon-provider-host",
+ "dekopon-provider-sdk",
  "dekopon-shell",
  "dekopon-telemetry",
  "opentelemetry",

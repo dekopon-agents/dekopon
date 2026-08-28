@@ -144,7 +144,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #14 — DUPLICATED_LOGIC — crates/dekopon-provider-host/src/lib.rs:427,150 vs crates/dekopon-broker-host/src/lib.rs:1102,419
+## [x] #14 — DUPLICATED_LOGIC — crates/dekopon-provider-host/src/lib.rs:427,150 vs crates/dekopon-broker-host/src/lib.rs:1102,419
 
 **Finding:** The two Wasmtime hosts copy verbatim: `ProviderConflicts` + `Display`, `validate_manifest`/`invalid_manifest`, `validate_limits`, the registry conflict loop (comment included), seven identical `DEFAULT_MAX_*` constants, the `CacheConfig`/`Cache::new` block, and the five-call `StoreLimitsBuilder` chain; `HostLimits`/`BrokerHostLimits` repeat eight fields with the same doc text. The hard part (`command_word_conflicts`) was already extracted to `dekopon-core` — the extraction stopped halfway. Operator-visible text has already drifted; the #79 Wasmtime 36→40 bump must be reviewed twice. The crate split itself is correct and CI-enforced. (raw: A4, D2, E)
 **Blast radius:** HIGH  **Confidence:** HIGH

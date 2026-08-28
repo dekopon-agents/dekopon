@@ -61,7 +61,7 @@ Crate boundaries are:
 - `dekopon-capability`: capability metadata and proposal/authorization invocation states.
 - `dekopon-protocol`: strict `dekopon.dev/v1alpha1` resources and list responses.
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
-- `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and adapters for its default or a caller-generated provider world.
+- `dekopon-provider-sdk`: typed Rust guest trait, manifest/response wire types, and adapters for its default or a caller-generated provider world. Its optional non-default `host` feature additionally holds the Wasmtime plumbing both hosts run on, so neither keeps a second copy of the manifest rules, the conflict report, the store bounds, or the engine constructor; a guest build never enables it.
 - `dekopon-provider-http`: guest-only Rust facade for the published buffered HTTP interface.
 - `dekopon-provider-storage`: feature-gated guest-only JSONL and durable-files bindings with no
   namespace/path/authority API.

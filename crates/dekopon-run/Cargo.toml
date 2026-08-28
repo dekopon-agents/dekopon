@@ -21,6 +21,8 @@ dekopon-broker-protocol.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
+# The three shared store/IO defaults its --max-* flags advertise live with the host plumbing.
+dekopon-provider-sdk = { workspace = true, features = ["host"] }
 dekopon-process.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true

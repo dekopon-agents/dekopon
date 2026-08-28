@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     io::Read as _,
     path::{Path, PathBuf},
@@ -20,7 +20,9 @@ use std::{
 };
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
-use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
+use dekopon_core::{CapabilityId, ProviderId};
+pub use dekopon_provider_sdk::host::ProviderConflicts;
+use dekopon_provider_sdk::host::{self, ConflictScan, ConflictWording, EngineError, StoreLimits};
 pub use dekopon_provider_sdk::{
     CommandResolution, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
     ProviderManifest,
@@ -32,7 +34,7 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Cache, CacheConfig, Config, Engine, Store, StoreLimitsBuilder};
+use wasmtime::{Engine, Store};
 
 mod http;
 mod metadata;
@@ -69,20 +71,27 @@ pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
 /// Hard maximum source bytes for one provider component (64 MiB).
 pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Default maximum linear memory per provider call (64 MiB).
-pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Default maximum size of each linear memory in one store (64 MiB).
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_MEMORY_BYTES: usize = host::DEFAULT_MAX_MEMORY_BYTES;
 /// Default maximum elements in each Wasm table.
-pub const DEFAULT_MAX_TABLE_ELEMENTS: usize = 100_000;
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_TABLE_ELEMENTS: usize = host::DEFAULT_MAX_TABLE_ELEMENTS;
 /// Default maximum core instances in one store.
-pub const DEFAULT_MAX_INSTANCES: usize = 64;
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_INSTANCES: usize = host::DEFAULT_MAX_INSTANCES;
 /// Default maximum tables in one store.
-pub const DEFAULT_MAX_TABLES: usize = 16;
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_TABLES: usize = host::DEFAULT_MAX_TABLES;
 /// Default maximum linear memories in one store.
-pub const DEFAULT_MAX_MEMORIES: usize = 4;
-/// Default maximum serialized provider input (1 MiB).
-pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
-/// Default maximum serialized manifest or provider output (1 MiB).
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_MEMORIES: usize = host::DEFAULT_MAX_MEMORIES;
+/// Default maximum serialized provider input size (1 MiB).
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_INPUT_BYTES: usize = host::DEFAULT_MAX_INPUT_BYTES;
+/// Default maximum serialized provider output or manifest size (1 MiB).
+#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = host::DEFAULT_MAX_OUTPUT_BYTES;
 /// Default maximum HTTP calls in one invocation.
 pub const DEFAULT_MAX_HTTP_REQUESTS: u32 = 32;
 /// Default maximum accounted HTTP request bytes (1 MiB).
@@ -139,13 +148,13 @@ pub struct BrokerHostLimits {
 impl Default for BrokerHostLimits {
     fn default() -> Self {
         Self {
-            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
-            max_table_elements: DEFAULT_MAX_TABLE_ELEMENTS,
-            max_instances: DEFAULT_MAX_INSTANCES,
-            max_tables: DEFAULT_MAX_TABLES,
-            max_memories: DEFAULT_MAX_MEMORIES,
-            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_memory_bytes: host::DEFAULT_MAX_MEMORY_BYTES,
+            max_table_elements: host::DEFAULT_MAX_TABLE_ELEMENTS,
+            max_instances: host::DEFAULT_MAX_INSTANCES,
+            max_tables: host::DEFAULT_MAX_TABLES,
+            max_memories: host::DEFAULT_MAX_MEMORIES,
+            max_input_bytes: host::DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: host::DEFAULT_MAX_OUTPUT_BYTES,
             max_http_requests: DEFAULT_MAX_HTTP_REQUESTS,
             max_http_request_bytes: DEFAULT_MAX_HTTP_REQUEST_BYTES,
             max_http_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
@@ -297,6 +306,17 @@ impl BrokerHostLimits {
             MAX_FUEL_YIELD_INTERVAL
         }
     }
+
+    /// The subset of these ceilings Wasmtime enforces on one fresh store.
+    fn store_bounds(&self) -> StoreLimits {
+        StoreLimits {
+            max_memory_bytes: self.max_memory_bytes,
+            max_table_elements: self.max_table_elements,
+            max_instances: self.max_instances,
+            max_tables: self.max_tables,
+            max_memories: self.max_memories,
+        }
+    }
 }
 
 /// Failed broker-provider invocation and the evidence for calls that already executed.
@@ -416,21 +436,18 @@ impl Runtime {
             });
         }
         let metrics = BrokerHostMetrics::new(limits.clone());
-        let mut config = Config::new();
-        config.wasm_component_model(true);
+        let mut config = host::config();
+        // Asynchronous execution: the guest yields on a fuel interval so a Tokio deadline can
+        // cancel it without a process-wide epoch interrupt.
         config.async_support(true);
-        config.consume_fuel(true);
-        if let Some(directory) = &options.compile_cache_dir {
-            let mut cache = CacheConfig::new();
-            cache.with_directory(directory);
-            config.cache(Some(Cache::new(cache).map_err(|source| {
-                BrokerHostError::CompileCache {
-                    path: directory.clone(),
-                    source,
+        let engine = host::engine(config, options.compile_cache_dir.as_deref()).map_err(
+            |error| match error {
+                EngineError::CompileCache { path, source } => {
+                    BrokerHostError::CompileCache { path, source }
                 }
-            })?));
-        }
-        let engine = Engine::new(&config).map_err(|source| BrokerHostError::Engine { source })?;
+                EngineError::Engine { source } => BrokerHostError::Engine { source },
+            },
+        )?;
         let mut linker = Linker::new(&engine);
         bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|source| BrokerHostError::Linker { source })?;
@@ -462,13 +479,7 @@ impl Runtime {
             )?),
             None => None,
         };
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(self.limits.max_memory_bytes)
-            .table_elements(self.limits.max_table_elements)
-            .instances(self.limits.max_instances)
-            .tables(self.limits.max_tables)
-            .memories(self.limits.max_memories)
-            .build();
+        let limits = self.limits.store_bounds().store_limits();
         let active = self.metrics.enter_store();
         let mut store = Store::new(
             &self.engine,
@@ -1093,76 +1104,14 @@ impl BrokerWasmProvider {
     }
 }
 
-/// Everything wrong with one provider set, gathered so an operator sees it once.
+/// How this host addresses an operator in a conflict report.
 ///
-/// Ambiguity is fatal in a way absence is not: a word or capability two providers both claim has no
-/// meaning the broker can pick without silently choosing for the operator. This reports rather than
-/// resolves, and reports *all of it* — fixing a provider directory should take one restart.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderConflicts {
-    /// Provider identities declared by more than one component.
-    pub providers: Vec<ProviderId>,
-    /// Capability identifiers declared by more than one component.
-    pub capabilities: Vec<CapabilityId>,
-    /// Command words that cannot be granted to the providers claiming them.
-    pub command_words: Vec<CommandWordConflict>,
-}
-
-impl ProviderConflicts {
-    /// Reports how many distinct conflicts this covers.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.providers.len() + self.capabilities.len() + self.command_words.len()
-    }
-
-    /// Reports whether there is nothing to complain about.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl fmt::Display for ProviderConflicts {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            formatter,
-            "refusing to start \u{2014} {} provider conflict(s)",
-            self.len()
-        )?;
-        for provider in &self.providers {
-            writeln!(formatter, "\n  provider {provider}")?;
-            writeln!(formatter, "    declared by more than one component")?;
-            writeln!(
-                formatter,
-                "    fix: remove one, or drop it from the provider search path"
-            )?;
-        }
-        for capability in &self.capabilities {
-            writeln!(formatter, "\n  capability {capability}")?;
-            writeln!(formatter, "    declared by more than one component")?;
-            writeln!(
-                formatter,
-                "    fix: rename it in one provider, or drop that provider"
-            )?;
-        }
-        for conflict in &self.command_words {
-            writeln!(formatter, "\n  command word `{}`", conflict.word)?;
-            for claimant in &conflict.claimants {
-                writeln!(formatter, "    claimed by  {claimant}")?;
-            }
-            writeln!(formatter, "    {}", conflict.kind.explanation())?;
-            writeln!(formatter, "    fix: {}", conflict.kind.remedy())?;
-        }
-        if !self.command_words.is_empty() {
-            write!(
-                formatter,
-                "\nReserved words: {}",
-                dekopon_core::RESERVED_COMMAND_WORDS.join(" ")
-            )?;
-        }
-        Ok(())
-    }
-}
+/// The broker starts from a configured provider directory; the immediate host loads a component set
+/// named on the command line. Everything else in the report is shared.
+const CONFLICT_WORDING: ConflictWording = ConflictWording {
+    refusing_to: "start",
+    duplicate_provider_remedy: "remove one, or drop it from the provider search path",
+};
 
 /// Deterministic capability registry owned by a privileged broker.
 #[derive(Debug)]
@@ -1264,13 +1213,9 @@ impl BrokerProviderRegistry {
             })
             .collect::<Vec<_>>();
         let mut providers = Vec::with_capacity(sources.len());
-        let mut routes = BTreeMap::new();
         // Every conflict, then one failure. Returning on the first would make fixing a provider
         // directory take one restart per mistake; an operator should see the whole picture once.
-        let mut duplicate_providers = BTreeSet::new();
-        let mut duplicate_capabilities = BTreeSet::new();
-        let mut provider_ids = BTreeSet::new();
-        let mut declared_words = Vec::new();
+        let mut scan = ConflictScan::new(CONFLICT_WORDING);
         for (source, compiling) in sources.into_iter().zip(compiling) {
             // A compilation task that panicked used to report itself as a fabricated "did not
             // complete", sending an operator to look for a truncated artifact. The join failure
@@ -1281,38 +1226,15 @@ impl BrokerProviderRegistry {
                 source: wasmtime::Error::new(join),
             })??;
             let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
-            if !provider_ids.insert(provider.manifest.id.clone()) {
-                duplicate_providers.insert(provider.manifest.id.clone());
-            }
-            declared_words.push((
-                provider.manifest.id.to_string(),
-                provider.manifest.command_words.clone(),
-            ));
-            let provider_index = providers.len();
-            for capability in &provider.manifest.capabilities {
-                if routes
-                    .insert(capability.id.clone(), provider_index)
-                    .is_some()
-                {
-                    duplicate_capabilities.insert(capability.id.clone());
-                }
-            }
+            scan.record(&provider.manifest, providers.len());
             providers.push(provider);
         }
 
-        let command_words = dekopon_core::command_word_conflicts(&declared_words);
-        if !duplicate_providers.is_empty()
-            || !duplicate_capabilities.is_empty()
-            || !command_words.is_empty()
-        {
-            return Err(BrokerHostError::ConflictingProviders {
-                report: Box::new(ProviderConflicts {
-                    providers: duplicate_providers.into_iter().collect(),
-                    capabilities: duplicate_capabilities.into_iter().collect(),
-                    command_words,
-                }),
-            });
-        }
+        let routes = scan
+            .finish()
+            .map_err(|report| BrokerHostError::ConflictingProviders {
+                report: Box::new(report),
+            })?;
         Ok(Self {
             providers,
             routes,
@@ -1653,36 +1575,30 @@ async fn describe_component(
 }
 
 fn validate_limits(limits: &BrokerHostLimits) -> Result<(), BrokerHostError> {
-    for (name, value) in [
-        ("max_memory_bytes", limits.max_memory_bytes as u128),
-        ("max_table_elements", limits.max_table_elements as u128),
-        ("max_instances", limits.max_instances as u128),
-        ("max_tables", limits.max_tables as u128),
-        ("max_memories", limits.max_memories as u128),
-        ("max_input_bytes", limits.max_input_bytes as u128),
-        ("max_output_bytes", limits.max_output_bytes as u128),
-        ("max_http_requests", u128::from(limits.max_http_requests)),
-        (
-            "max_http_request_bytes",
-            u128::from(limits.max_http_request_bytes),
-        ),
-        (
-            "max_http_response_bytes",
-            u128::from(limits.max_http_response_bytes),
-        ),
-        ("max_http_headers", limits.max_http_headers as u128),
-        (
-            "max_http_header_bytes",
-            limits.max_http_header_bytes as u128,
-        ),
-        ("fuel", u128::from(limits.fuel)),
-        ("max_timeout", limits.max_timeout.as_nanos()),
-    ] {
-        if value == 0 {
-            return Err(BrokerHostError::InvalidLimit { name });
-        }
-    }
-    Ok(())
+    host::validate_limits(
+        &limits.store_bounds(),
+        &[
+            ("max_input_bytes", limits.max_input_bytes as u128),
+            ("max_output_bytes", limits.max_output_bytes as u128),
+            ("max_http_requests", u128::from(limits.max_http_requests)),
+            (
+                "max_http_request_bytes",
+                u128::from(limits.max_http_request_bytes),
+            ),
+            (
+                "max_http_response_bytes",
+                u128::from(limits.max_http_response_bytes),
+            ),
+            ("max_http_headers", limits.max_http_headers as u128),
+            (
+                "max_http_header_bytes",
+                limits.max_http_header_bytes as u128,
+            ),
+            ("fuel", u128::from(limits.fuel)),
+            ("max_timeout", limits.max_timeout.as_nanos()),
+        ],
+    )
+    .map_err(|zero| BrokerHostError::InvalidLimit { name: zero.name })
 }
 
 fn validate_authorized_constraints(
@@ -1746,46 +1662,10 @@ fn validate_authorized_constraints(
 }
 
 fn validate_manifest(manifest: &ProviderManifest, source: &Path) -> Result<(), BrokerHostError> {
-    if manifest.description.trim().is_empty() {
-        return Err(invalid_manifest(source, "description must not be empty"));
-    }
-    if manifest.capabilities.is_empty() {
-        return Err(invalid_manifest(
-            source,
-            "at least one capability is required",
-        ));
-    }
-    let mut capabilities = BTreeSet::new();
-    for capability in &manifest.capabilities {
-        if !capabilities.insert(capability.id.clone()) {
-            return Err(invalid_manifest(
-                source,
-                format!("capability {} is declared more than once", capability.id),
-            ));
-        }
-        if capability.description.trim().is_empty() {
-            return Err(invalid_manifest(
-                source,
-                format!("capability {} has an empty description", capability.id),
-            ));
-        }
-        let Some(schema) = capability.input_schema.as_object() else {
-            return Err(invalid_manifest(
-                source,
-                format!("capability {} inputSchema must be an object", capability.id),
-            ));
-        };
-        if schema.get("type").and_then(Value::as_str) != Some("object") {
-            return Err(invalid_manifest(
-                source,
-                format!(
-                    "capability {} inputSchema must declare type object",
-                    capability.id
-                ),
-            ));
-        }
-    }
-    Ok(())
+    // No effect gate: the broker authorizes an effect per invocation, so a manifest declaring an
+    // external write is loadable here and refused by policy, not by the loader.
+    host::validate_manifest(manifest, None)
+        .map_err(|rejection| invalid_manifest(source, rejection.to_string()))
 }
 
 fn invalid_manifest(source: &Path, message: impl Into<String>) -> BrokerHostError {

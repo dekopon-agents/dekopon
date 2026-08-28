@@ -13,6 +13,12 @@ keywords = ["agents", "wasm", "components", "capabilities", "sdk"]
 categories = ["wasm", "api-bindings"]
 include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
+[features]
+default = []
+# Host-side plumbing shared by `dekopon-provider-host` and `dekopon-broker-host`. It pulls in
+# Wasmtime, so it is off by default and no `wasm32-unknown-unknown` guest build enables it.
+host = ["dep:thiserror", "dep:wasmtime"]
+
 [dependencies]
 # Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel); a wasm guest
 # never calls a JsonSchema impl, and their `schemars` feature is opt-in, so schemars stays out.
@@ -20,6 +26,8 @@ dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror = { workspace = true, optional = true }
+wasmtime = { workspace = true, optional = true }
 wit-bindgen.workspace = true
 
 [lints]
