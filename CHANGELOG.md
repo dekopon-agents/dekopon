@@ -60,8 +60,11 @@ All notable changes to Dekopon are documented here. The format is based on
 - The local broker protocol is now `dekopon.dev/broker/v1alpha2`: attestation is one optional
   field on one operation per verb (`capabilities`, `resolveCommand`, `invoke`,
   `recordDeliveredTurn`) instead of eleven shape-specific operations, and a mixed broker/client
-  pair refuses on the first frame in either direction instead of failing on a response. Broker and
-  gateway upgrade in lockstep; see `docs/upgrading.md`. (#20)
+  pair now fails at the envelope in both directions. The broker answers an `apiVersion` it does not
+  know with `invalid-request` on the first request frame, before anything is authorized, accounted,
+  or audited; a client never emits that code, so an older client against a newer broker cannot
+  decode the refusal and reports the outcome as unknown rather than as refused. Broker and gateway
+  upgrade in lockstep; see `docs/upgrading.md`. (#20)
 - The interactive console moved out of this repository to `dekopon-agents/dekopon-console`, taking
   `ratatui`, `crossterm`, five duplicate-version `deny.toml` exemptions, the `dev.<surface>.<name>`
   subject service, and the broker's `allowDevelopmentSubjects` field with it. (#22, #32)
@@ -106,11 +109,42 @@ All notable changes to Dekopon are documented here. The format is based on
   [dekopon-agents/dekopon-provider-skylight-private](https://github.com/dekopon-agents/dekopon-provider-skylight-private);
   no provider release is claimed, and it remains absent from default catalogs, images, policies,
   and deployments.
+- Removed the shape-specific broker seam. `dekopon-broker-protocol` drops the six
+  `RequestEnvelope` constructors `capabilities_for`, `capabilities_for_chat`, `invoke_for`,
+  `invoke_for_chat`, `resolve_command_for_chat`, and `record_delivered_turn_for_chat`, and the six
+  `BrokerClient` methods `session_surface_for`, `session_surface_for_chat`, `invoke_for`,
+  `invoke_for_chat`, `resolve_command_for_chat`, and `record_delivered_turn_for_chat`;
+  `dekopon-broker` drops the six `Broker` entry points `capabilities_for`, `capabilities_for_chat`,
+  `invoke_for`, `invoke_for_chat`, `resolve_command_for_chat`, and
+  `record_delivered_turn_for_chat`; and `dekopon-agent` drops `BrokerLeg::connect_attested` and
+  `BrokerLeg::connect_chat`. The three claim types `ChatAttestation`, `ChatSessionClaim`, and
+  `SubjectAttestation` are replaced by one `Attestation`, which the surviving calls take as an
+  argument where the shape used to pick the method. (#20)
+- `dekopon-brokerd`'s public `ProviderManagerError` lost 63 of its 73 variants. The ten that remain
+  — `Configuration`, `StateConflicts`, `FileSecurity`, `Registry`, `DigestMismatch`,
+  `LockMismatch`, `StoreFull`, `OperationInProgress`, `Host`, and `Io` — each name the check that
+  refused, so a caller branches on the ten instead of matching a variant per message. (#21)
+- `dekopon-broker` no longer exports `MEMORY_PROVIDER`, `MEMORY_WORD`, `MEMORY_RECENT`, or
+  `MEMORY_SEARCH`, and `MEMORY_RECORD` is private. The chat-memory surface is identified by the
+  typed `route:` on a constraint set, so there is nothing left for an outside caller to match
+  against. (#12)
+- `ProviderConflicts` is no longer defined in `dekopon-broker-host` or `dekopon-provider-host`; it
+  lives in `dekopon_provider_sdk::host`, and both hosts re-export it at the old paths. It gained a
+  public `wording: ConflictWording` field and is not `#[non_exhaustive]`, so a downstream
+  struct-literal construction must name the new field. (#14)
+- `CapabilityInvoker::invoke_with_secret_use` is gone from `dekopon-shell`.
+  `CapabilityInvoker::invoke` takes `(capability, input, secret_use)` itself, so an implementor can
+  no longer forward an invocation while silently dropping the secret binding. (#8)
 - A batch of unreferenced public items (`script_outcome_label`, `provider_for`, `header_values`,
-  testkit `storage_evidence`/`temporary_dir`, the `_assert_private_path` stub). (#34)
+  testkit `storage_evidence`/`temporary_dir`, the `_assert_private_path` stub), and `truthy`,
+  `is_bare_command_substitution`, and `History::from_turns`, which had only test callers and are
+  no longer public. (#34)
 
 ### Fixed
 
+- `dekopond` reports every problem in a gateway configuration, every unsatisfiable route, and every
+  unusable credential in a single startup refusal, and resolves all chat, model, and
+  image-generator credentials before any transport authenticates. (#11)
 - A chat refusal is audited with its real class (`attestation-denied`, `unmapped-subject`,
   `agent-denied`, `policy-error`) and the policies that determined it, instead of one flattened
   `chat-attestation-denied`, and each chat message evaluates the `agent.prompt` policy once instead

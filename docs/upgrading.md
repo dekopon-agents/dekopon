@@ -253,14 +253,25 @@ release section here when that release is tagged.
   `recordDeliveredTurnForChat`) are gone rather than aliased: an alias would have had to carry the
   old field shapes too, and a mixed pair would then half-work. There is nothing to edit — no
   configuration file, policy, catalog, or audit record shape changes, and no persisted state is
-  touched — but a mixed set of binaries now refuses on the **first frame in either direction** with
-  `invalid-request`, before anything is authorized, accounted, or audited. Under `v1alpha1` an older
-  client against a newer broker failed on the *response* instead, which for a submitted proposal is
-  an unknown outcome rather than a clean refusal; that half is what this closes. The restart order
-  in [Restart the broker first and stop it last](#restart-the-broker-first-and-stop-it-last) is
+  touched — but a mixed set of binaries now fails at the **envelope, in both directions**: the
+  broker answers an `apiVersion` it does not know with `invalid-request` on the first request frame,
+  before anything is authorized, accounted, or audited. A client never emits that code. An older
+  client against a newer broker therefore fails on the *response* frame, cannot decode the refusal,
+  and reports the outcome as unknown — but under `v1alpha1` that same failure came after the
+  request had been decoded and run, so the proposal really had an unknown outcome; now nothing ran.
+  That half is what this closes. The restart order in
+  [Restart the broker first and stop it last](#restart-the-broker-first-and-stop-it-last) is
   unchanged and is what keeps the window shut: stop `dekopond`, drain and stop `dekopon-brokerd`,
   replace **all four** binaries, start the broker, then start the gateway. Do not roll one process
   at a time.
+
+  A fifth broker client lives outside this repository:
+  [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
+  `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
+  `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
+  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
+  0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
+  that lands, and do not run the console against an upgraded broker.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
   now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`
