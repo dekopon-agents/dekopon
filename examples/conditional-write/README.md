@@ -124,6 +124,7 @@ surprise at 2 a.m.
 ```console
 export DEKOPOND_SLACK_APP_TOKEN=xapp-...
 export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
+export OPENAI_IMAGE_API_KEY=sk-...
 dekopond --config dekopond.yaml
 ```
 
@@ -283,7 +284,7 @@ the broker verifies the entire chain on every start.
 | Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
 | Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |
 | Broker exits: `constraint set for X allows host "…" outside credential "api-token" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
-| Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN` or `DEKOPOND_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
+| Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN`, `DEKOPOND_SLACK_BOT_TOKEN`, or `OPENAI_IMAGE_API_KEY` is unset — reported by name, never by value. Delete the `imageGenerator:` block and the route's `imageGenerator: true` if you do not want the third one | startup |
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 
 The split matters when you are debugging: a session refused *before* it starts leaves a gateway log

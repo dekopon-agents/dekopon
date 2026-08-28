@@ -62,8 +62,22 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             ..
         }
     ));
+    // The example configures one image generator and one route that opts into it. A gateway holds
+    // at most one, so the route's opt-in is a flag rather than a name to keep in step with a list.
+    let generator = config
+        .image_generator
+        .as_ref()
+        .expect("the example configures the gateway's image generator");
+    assert_eq!(generator.model, "gpt-image-1");
+    assert_eq!(generator.api_key_env, "OPENAI_IMAGE_API_KEY");
+    assert_eq!(generator.timeout_ms, 120_000);
+
     let route = config.routes.first().expect("one route");
     assert_eq!(route.transport, transport.name());
+    assert!(
+        route.image_generator,
+        "the walkthrough's route opts into image generation"
+    );
     assert_eq!(route.limits.max_steps, 8);
     assert_eq!(route.limits.max_capability_calls, 16);
     // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to

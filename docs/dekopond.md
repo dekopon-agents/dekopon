@@ -87,12 +87,10 @@ models:
     classes: [reasoning]
     modalities: [image]                       # optional; default none. This is image INPUT only.
 
-imageGenerators:                              # optional; absent means no route can create images
-  - name: openai-images
-    kind: openaiImages                        # fixed public OpenAI Images endpoint
-    model: gpt-image-1
-    apiKeyEnv: OPENAI_IMAGE_API_KEY            # required environment variable NAME, never value
-    timeoutMs: 120000
+imageGenerator:                               # optional; absent means no route can create images
+  model: gpt-image-1                          # fixed public OpenAI Images endpoint
+  apiKeyEnv: OPENAI_IMAGE_API_KEY             # required environment variable NAME, never value
+  timeoutMs: 120000
 
 routes:                                       # first match wins, so order these deliberately
   - transport: scientist-slack
@@ -108,7 +106,7 @@ routes:                                       # first match wins, so order these
     match: { kind: directMessage }
     agent: xaviers-conditional-writer
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
-    imageGenerator: openai-images              # optional; adds one bounded generate_image attempt
+    imageGenerator: true                      # optional; adds one bounded generate_image attempt
     limits: { maxSteps: 8, maxCapabilityCalls: 16 }
     conversation:                             # optional; default { mode: oneShot }
       mode: persistent                        # oneShot | persistent
@@ -196,8 +194,9 @@ as a secret from its users.
 
 Image input and image output are deliberately separate. `modalities: [image]` says a chat model may
 be shown an inbound screenshot; it does not imply that Chat Completions or the private
-ChatGPT/Codex subscription endpoint can draw. Outbound generation exists only when a route names one
-entry from `imageGenerators`, and startup fails if the name or its credential cannot be resolved.
+ChatGPT/Codex subscription endpoint can draw. Outbound generation exists only when a route sets
+`imageGenerator: true` against the gateway's one `imageGenerator:` block, and startup fails if that
+block is absent or its credential cannot be resolved.
 
 That route's authorized sessions receive `generate_image({prompt})`. The prompt is model-authored
 and bounded to 4 KiB. The generator endpoint, model credential, filename, PNG media type, and chat

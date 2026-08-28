@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt as _,
@@ -48,7 +48,7 @@ use crate::{
     session::{
         BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
         ModelFactory, SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
-        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, configured_image_generators, image_credential,
+        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, configured_image_generator, image_credential,
         memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
@@ -135,8 +135,8 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 
     assert_eq!(resolved.transports.len(), 1);
     assert_eq!(resolved.routes.len(), 1);
-    assert!(resolved.image_generators.is_empty());
-    assert!(resolved.routes[0].image_generator.is_none());
+    assert!(resolved.image_generator.is_none());
+    assert!(!resolved.routes[0].image_generator);
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
     assert_eq!(resolved.routes[0].limits.max_steps, 8);
@@ -151,37 +151,34 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 }
 
 #[tokio::test]
-async fn image_generation_is_named_and_route_opt_in() {
+async fn image_generation_is_configured_once_and_route_opt_in() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["imageGenerators"] = json!([{
-        "name": "openai-images",
-        "kind": "openaiImages",
+    document["imageGenerator"] = json!({
         "model": "gpt-image-1",
         "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
         "timeoutMs": 120_000
-    }]);
-    document["routes"][0]["imageGenerator"] = json!("openai-images");
+    });
+    document["routes"][0]["imageGenerator"] = json!(true);
 
     let resolved = load(directory.path(), &document)
         .await
-        .expect("an explicitly bound image generator resolves");
+        .expect("an explicitly enabled image generator resolves");
 
-    assert_eq!(resolved.image_generators.len(), 1);
-    assert_eq!(resolved.image_generators[0].name(), "openai-images");
-    assert_eq!(
-        resolved.routes[0].image_generator.as_deref(),
-        Some("openai-images")
-    );
+    let generator = resolved
+        .image_generator
+        .as_ref()
+        .expect("the gateway configures one generator");
+    assert_eq!(generator.model, "gpt-image-1");
+    assert_eq!(generator.api_key_env, "OPENAI_IMAGE_API_KEY");
+    assert!(resolved.routes[0].image_generator);
     let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
-        .expect("the route binds its named generator");
-    assert_eq!(
+        .expect("the route binds the configured generator");
+    assert!(
         routes
             .route("dev", &ConversationKind::DirectMessage)
             .expect("route matches")
             .image_generator
-            .as_deref(),
-        Some("openai-images")
     );
 }
 
@@ -192,14 +189,12 @@ fn a_missing_image_model_credential_fails_before_chat_starts() {
         std::env::var_os(variable).is_none(),
         "fixture must stay unset"
     );
-    let configured = [ImageGeneratorConfig::OpenaiImages {
-        name: "pictures".to_owned(),
+    let configured = ImageGeneratorConfig {
         model: "gpt-image-1".to_owned(),
         api_key_env: variable.to_owned(),
         timeout_ms: 120_000,
-    }];
-    let referenced = BTreeSet::from(["pictures".to_owned()]);
-    let error = match configured_image_generators(&configured, &referenced) {
+    };
+    let error = match configured_image_generator(Some(&configured), true) {
         Err(error) => error,
         Ok(_) => panic!("a named credential is required at startup"),
     };
@@ -212,11 +207,10 @@ fn a_missing_image_model_credential_fails_before_chat_starts() {
         }
     ));
     let diagnostic = error.to_string();
-    assert!(diagnostic.contains("pictures"));
     assert!(diagnostic.contains(variable));
 
     // Exported but blank is the same refusal, not a generator that starts with a blank key.
-    let blank = image_credential("pictures", variable, Some(OsString::from("   ")))
+    let blank = image_credential(variable, Some(OsString::from("   ")))
         .expect_err("a blank credential is the absence of one presented as presence");
     assert!(matches!(
         &blank,
@@ -226,9 +220,9 @@ fn a_missing_image_model_credential_fails_before_chat_starts() {
         }
     ));
 
-    let unused = configured_image_generators(&configured, &BTreeSet::new())
+    let unused = configured_image_generator(Some(&configured), false)
         .expect("an unreferenced generator reads no credential");
-    assert!(unused.is_empty());
+    assert!(unused.is_none());
 }
 
 /// The cancellation boundary must not narrow what a proposal may carry.
@@ -449,14 +443,12 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
     // for a PNG this transport has no way to deliver, so the pair is refused at startup rather
     // than dropped at reply time.
     let mut with_images = document.clone();
-    with_images["imageGenerators"] = json!([{
-        "name": "openai-images",
-        "kind": "openaiImages",
+    with_images["imageGenerator"] = json!({
         "model": "gpt-image-1",
         "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
         "timeoutMs": 120_000
-    }]);
-    with_images["routes"][0]["imageGenerator"] = json!("openai-images");
+    });
+    with_images["routes"][0]["imageGenerator"] = json!(true);
     let error = load(directory.path(), &with_images)
         .await
         .expect_err("a text-only transport cannot carry a generated image");
@@ -548,59 +540,50 @@ async fn invalid_configurations_fail_closed_at_startup() {
             }),
         ),
         (
-            "unknown field inside an image generator",
+            "unknown field inside the image generator",
             mutate(|document| {
-                document["imageGenerators"] = json!([{
-                    "name": "pictures",
-                    "kind": "openaiImages",
+                document["imageGenerator"] = json!({
                     "model": "gpt-image-1",
                     "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
                     "timeoutMs": 120_000,
                     "endpoint": "https://attacker.example"
-                }]);
+                });
             }),
         ),
         (
-            "duplicate image generator name",
+            "image generator with a blank model",
             mutate(|document| {
-                let generator = json!({
-                    "name": "pictures",
-                    "kind": "openaiImages",
-                    "model": "gpt-image-1",
+                document["imageGenerator"] = json!({
+                    "model": "  ",
                     "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
                     "timeoutMs": 120_000
                 });
-                document["imageGenerators"] = json!([generator.clone(), generator]);
             }),
         ),
         (
             "invalid image credential environment name",
             mutate(|document| {
-                document["imageGenerators"] = json!([{
-                    "name": "pictures",
-                    "kind": "openaiImages",
+                document["imageGenerator"] = json!({
                     "model": "gpt-image-1",
                     "apiKeyEnv": "sk-live-secret-not-a-name",
                     "timeoutMs": 120_000
-                }]);
+                });
             }),
         ),
         (
             "zero image generator timeout",
             mutate(|document| {
-                document["imageGenerators"] = json!([{
-                    "name": "pictures",
-                    "kind": "openaiImages",
+                document["imageGenerator"] = json!({
                     "model": "gpt-image-1",
                     "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
                     "timeoutMs": 0
-                }]);
+                });
             }),
         ),
         (
-            "route names an unknown image generator",
+            "route enables image generation with none configured",
             mutate(|document| {
-                document["routes"][0]["imageGenerator"] = json!("missing");
+                document["routes"][0]["imageGenerator"] = json!(true);
             }),
         ),
         (
@@ -1871,7 +1854,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         model_class: Some("reasoning".to_owned()),
         instructions: Some("Answer briefly.".to_owned()),
         model: Arc::new(model),
-        image_generator: None,
+        image_generator: false,
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -2044,7 +2027,7 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
-        image_generators: HashMap::new(),
+        image_generator: None,
         activities: HashMap::new(),
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
@@ -2196,10 +2179,9 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
     let mut runner = runner(broker, Arc::clone(&models), 4);
     Arc::get_mut(&mut runner)
         .expect("runner is uniquely owned")
-        .image_generators
-        .insert("openai-images".to_owned(), Arc::new(TestImageGenerator));
+        .image_generator = Some(Arc::new(TestImageGenerator));
     let mut route = route(model_config());
-    route.image_generator = Some("openai-images".to_owned());
+    route.image_generator = true;
 
     run_session(
         runner,
