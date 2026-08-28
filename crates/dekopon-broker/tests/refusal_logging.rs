@@ -336,8 +336,11 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(command.contains("unmapped-subject"), "{command}");
     assert!(command.contains(UNMAPPED_SUBJECT), "{command}");
 
-    // The chat invocation path carries all four live transports, and it used to file every one of
-    // these classes as a single `chat-attestation-denied` with no policy identifiers at all.
+    // The chat invocation path carries all four live transports. Every one of these classes used
+    // to be filed as a single `chat-attestation-denied` with no policy identifiers at all, and the
+    // wire answer must stay exactly that literal: the class and its policies belong to the audit
+    // record, and a peer that could read them off its own denial would learn from a refusal which
+    // subjects the directory maps and which agents a principal may drive.
     for (index, (attestor, canonical, agent_id, reason, policies)) in [
         (
             None,
@@ -390,7 +393,11 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             .await
             .expect("a refused chat proposal is still an accounted decision");
         assert_eq!(refused.outcome, InvocationOutcome::Denied);
-        assert_eq!(refused.error.as_deref(), Some(reason), "{agent_id}");
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("chat-attestation-denied"),
+            "the wire answer is the same literal for every class ({agent_id})"
+        );
 
         let records = audit.records().await;
         let decision = records

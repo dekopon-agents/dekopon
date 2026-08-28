@@ -3437,6 +3437,12 @@ where
     /// `agent-denied` under the *attested* context: the attestation itself was honored, and the
     /// refusal is about who may drive this agent.
     ///
+    /// Those classes are the audit record's. A chat-scoped claim's refusal answers the peer with
+    /// the single literal [`CHAT_REFUSAL`] instead, because a session peer able to tell the
+    /// classes apart would read the subject directory and the agent grants out of its own
+    /// denials; an attested non-chat proposal still carries its class on the wire, as it did
+    /// before the class was typed.
+    ///
     /// The chat-memory routes are reachable only from a chat-scoped claim, and the record route is
     /// reachable from no proposal at all — [`Broker::record_delivered_turn`] is its only entrance.
     pub async fn invoke(
@@ -3454,11 +3460,18 @@ where
             None => (peer.clone(), None),
         };
         let chat = attestation.filter(|claim| claim.scope.is_some());
+        // The class the claim earned belongs to the operator, not to the caller. A chat peer that
+        // could separate `unmapped-subject` from `agent-denied` would read the subject directory
+        // and the agent grants out of its own refusals, so every one of them answers with the same
+        // literal; the audit record and `broker.authorize` keep the class and its policies.
+        if chat.is_some() {
+            refusal = refusal.map(Refusal::opaque);
+        }
         if let Some(claim) = chat
             && refusal.is_none()
             && !claim.binds(&request.id)
         {
-            refusal = Some(unevaluated_refusal("chat-attestation-denied"));
+            refusal = Some(unevaluated_refusal(CHAT_REFUSAL));
         }
         // First refusal wins. The claim decided who this is, so a route check that overwrote it
         // would report the shape of the capability instead of the reason the caller was refused.
@@ -3503,9 +3516,11 @@ where
         // Resolved once, exactly as the generic path is: the refusal the claim produced is the
         // most specific one there is, so the later checks only run when the claim held.
         let (context, claim_refusal) = self.resolve_context(peer, grant, attestation);
-        let refusal = claim_refusal.or_else(|| {
+        // This entrance is chat-only, so a claim refusal answers exactly as the chat `invoke` path
+        // answers: one fixed literal on the wire, the real class in the audit record.
+        let refusal = claim_refusal.map(Refusal::opaque).or_else(|| {
             if !attestation.binds(&turn.id) {
-                Some(unevaluated_refusal("chat-attestation-denied"))
+                Some(unevaluated_refusal(CHAT_REFUSAL))
             } else if self.memory_surface(&context, &attestation.agent).is_none() {
                 Some(unevaluated_refusal("memory-unavailable"))
             } else if !turn.is_bounded()
@@ -3557,9 +3572,12 @@ where
     /// the `agent.prompt` policy reached is attributed to the attested context it was about.
     ///
     /// The refusal exists so a caller can report or audit it once; the wire answer stays the same
-    /// opaque nothing it was. It carries the determining `policy_ids` alongside the class, because
-    /// an `agent-denied` or `policy-error` a caller flattens into a bare class is a denial with no
-    /// route back to the rule that made it.
+    /// opaque nothing it was. The inspection callers answer `None` and an unknown command word,
+    /// and both chat invocation paths collapse the class into [`CHAT_REFUSAL`] before it can reach
+    /// a peer — only an attested non-chat proposal carries the class outward, as it did before
+    /// this refusal was typed. The refusal carries the determining `policy_ids` alongside the
+    /// class, because an `agent-denied` or `policy-error` a caller flattens into a bare class is a
+    /// denial with no route back to the rule that made it.
     fn resolve_context(
         &self,
         peer: &AuthenticatedContext,
@@ -3984,7 +4002,11 @@ where
             if !self.replay.reserve(&request.id).await? {
                 authorize.record("outcome", "replayed-invocation");
                 return self
-                    .deny(context, &request, "replayed-invocation", Vec::new())
+                    .deny(
+                        context,
+                        &request,
+                        unevaluated_refusal("replayed-invocation"),
+                    )
                     .await
                     .map(ControlFlow::Break);
             }
@@ -3994,7 +4016,7 @@ where
             if let Some(refusal) = refusal {
                 authorize.record("outcome", refusal.reason);
                 return self
-                    .deny(context, &request, refusal.reason, refusal.policy_ids)
+                    .deny(context, &request, refusal)
                     .await
                     .map(ControlFlow::Break);
             }
@@ -4006,14 +4028,22 @@ where
             let Some(mut set) = self.constraints.get(&request.capability).cloned() else {
                 authorize.record("outcome", "unconstrained-capability");
                 return self
-                    .deny(context, &request, "unconstrained-capability", Vec::new())
+                    .deny(
+                        context,
+                        &request,
+                        unevaluated_refusal("unconstrained-capability"),
+                    )
                     .await
                     .map(ControlFlow::Break);
             };
             if set.constraints.storage.is_some() && context.chat_scope().is_none() {
                 authorize.record("outcome", "chat-scope-required");
                 return self
-                    .deny(context, &request, "chat-scope-required", Vec::new())
+                    .deny(
+                        context,
+                        &request,
+                        unevaluated_refusal("chat-scope-required"),
+                    )
                     .await
                     .map(ControlFlow::Break);
             }
@@ -4052,7 +4082,11 @@ where
                     );
                 }
                 return self
-                    .deny(context, &request, reason, decision.determining_policy_ids)
+                    .deny(
+                        context,
+                        &request,
+                        determined_refusal(reason, decision.determining_policy_ids),
+                    )
                     .await
                     .map(ControlFlow::Break);
             }
@@ -4065,7 +4099,11 @@ where
                 else {
                     authorize.record("outcome", "secret-denied");
                     return self
-                        .deny(context, &request, "secret-denied", policy_ids)
+                        .deny(
+                            context,
+                            &request,
+                            determined_refusal("secret-denied", policy_ids),
+                        )
                         .await
                         .map(ControlFlow::Break);
                 };
@@ -4088,7 +4126,11 @@ where
                         );
                     }
                     return self
-                        .deny(context, &request, "secret-denied", policy_ids)
+                        .deny(
+                            context,
+                            &request,
+                            determined_refusal("secret-denied", policy_ids),
+                        )
                         .await
                         .map(ControlFlow::Break);
                 }
@@ -4137,13 +4179,21 @@ where
             .await
     }
 
+    /// Records the refusal's true class durably and answers the peer with `refusal.wire`.
+    ///
+    /// The two differ only on the chat paths, where every claim refusal answers with one fixed
+    /// literal so a peer cannot read the class off its own denial.
     async fn deny(
         &self,
         context: &AuthenticatedContext,
         request: &InvocationRequest,
-        reason: &'static str,
-        policy_ids: Vec<String>,
+        refusal: Refusal,
     ) -> Result<InvocationResult, BrokerError> {
+        let Refusal {
+            reason,
+            wire,
+            policy_ids,
+        } = refusal;
         let decision_id = format!("deny-{}", request.id);
         let decision = self.decision_reference(&decision_id);
         let material = DecisionMaterial {
@@ -4225,7 +4275,7 @@ where
             decision,
             outcome: InvocationOutcome::Denied,
             output: None,
-            error: Some(reason.to_owned()),
+            error: Some(wire.to_owned()),
             evidence: vec![Evidence {
                 kind: "policy-decision".to_owned(),
                 digest,
@@ -5062,19 +5112,47 @@ fn encode_storage_limits(
     }
 }
 
+/// The one answer a refused chat caller receives, whatever class the broker recorded.
+///
+/// A peer able to tell `unmapped-subject` from `agent-denied` apart would learn from its own
+/// denials whether the broker maps a subject and which agents a principal may drive — the two
+/// facts the opaque answer exists to withhold. The class reaches the operator through the audit
+/// record, `broker.authorize`, and `broker_capabilities_refused` instead.
+const CHAT_REFUSAL: &str = "chat-attestation-denied";
+
 /// A refusal decided before the capability decision, carried into the audited denial.
 struct Refusal {
     /// The stable class an operator reads in the audit record and in the refusal event.
     reason: &'static str,
+    /// What the refused peer is told, which on the chat paths is deliberately less than `reason`.
+    wire: &'static str,
     /// The policies that determined it, empty for a refusal reached before any evaluation.
     policy_ids: Vec<String>,
+}
+
+impl Refusal {
+    /// Collapses the peer-visible answer to [`CHAT_REFUSAL`], leaving the audited class intact.
+    fn opaque(mut self) -> Self {
+        self.wire = CHAT_REFUSAL;
+        self
+    }
 }
 
 /// A refusal reached before any policy ran, so no policy identifier can explain it.
 const fn unevaluated_refusal(reason: &'static str) -> Refusal {
     Refusal {
         reason,
+        wire: reason,
         policy_ids: Vec::new(),
+    }
+}
+
+/// A refusal whose determining policies are in hand and whose class is also the peer's answer.
+fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal {
+    Refusal {
+        reason,
+        wire: reason,
+        policy_ids,
     }
 }
 
@@ -5083,10 +5161,10 @@ const fn unevaluated_refusal(reason: &'static str) -> Refusal {
 /// Dropping the identifiers here would make a denied session the one decision in the broker that
 /// records its class without recording which rule reached it.
 fn decided_refusal(decision: PolicyDecision, denied: &'static str) -> Refusal {
-    Refusal {
-        reason: denial_reason(&decision, denied),
-        policy_ids: decision.determining_policy_ids,
-    }
+    determined_refusal(
+        denial_reason(&decision, denied),
+        decision.determining_policy_ids,
+    )
 }
 
 /// Separates a policy that could not be evaluated from one that simply did not match.
