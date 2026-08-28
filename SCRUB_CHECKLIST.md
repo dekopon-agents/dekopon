@@ -300,7 +300,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: do it as part of #22's extraction so the moved crate lands working: add the `o`/`r` arms with the per-call/per-field cursor they need (per-field, per-keystroke, never-a-mode reveal, keep the scrollback notice `App::reveal` emits) and drop `EnableMouseCapture`/`DisableMouseCapture`.**
 
-## [ ] #33 — COMMENT_ROT — README.md:5,136,311; docs/design.md:174; docs/security-model.md:299; docs/broker-http.md:11,60; docs/development.md:166; crates/dekopon/README.md:3 (+3 other stale facts)
+## [x] #33 — COMMENT_ROT — README.md:5,136,311; docs/design.md:174; docs/security-model.md:299; docs/broker-http.md:11,60; docs/development.md:166; crates/dekopon/README.md:3 (+3 other stale facts)
 
 **Finding:** "The operator CLI is not integrated with the broker" is asserted in nine places — including the README status blockquote and the threat model's own "what this project does not have" list — and `dekopon console` (#164) made it false; the same two documents describe the console as an attested broker client a few lines away. Three more stale facts: `docs/dekopond.md:462` cites a 180 s pod grace the chart now *refuses* to render (`terminationGracePeriodSeconds: 270`, and the chart README uses 180 as its rejected example); `docs/catalog.md:10` says "two reserved names" while `:192` says "four fields"; `.gitignore:21-23`'s rationale comment describes the walkthrough that left in #155 (covered by #1). (raw: D1)
 **Blast radius:** HIGH  **Confidence:** HIGH
