@@ -1165,7 +1165,50 @@ mod tests {
 
     #[cfg(unix)]
     use super::{AppError, BrokerSocketDiscovery, resolve_broker_server_uid};
-    use super::{InvocationReport, TimingSamples, read_input};
+    use super::{
+        CapabilityCallResult, CapabilityInvoker, HostLimits, InvocationReport, ProviderRegistry,
+        RegistryInvoker, TimingSamples, read_input,
+    };
+
+    /// The direct leg has no authorizer and no credential store, so a DRN cannot be proven here.
+    ///
+    /// Dropping the field and running the call anyway is the one thing it must not do: the caller
+    /// asked for a credential this leg cannot show it may use. The refusal is the shared wording
+    /// from `dekopon_shell::secret_use_unsupported`, so an operator reading it in immediate mode
+    /// and in a session sees one message rather than two spellings of the same limit.
+    #[test]
+    fn the_direct_leg_refuses_a_secret_use_proposal_it_cannot_authorize() {
+        let registry = ProviderRegistry::load(
+            [dekopon_test_support::provider_fixture("echo-provider.wasm")],
+            HostLimits::default(),
+        )
+        .expect("echo provider loads");
+        let invoker = RegistryInvoker {
+            registry: &registry,
+        };
+        let proposal = dekopon_core::SecretUseProposal::HttpBearer {
+            secret: "drn:com.xrl:secret:prod:api/token"
+                .parse::<dekopon_core::SecretDrn>()
+                .expect("canonical DRN"),
+        };
+
+        // The control: the same capability, the same input, no secret named.
+        assert!(matches!(
+            invoker.invoke("echo.echo", json!({"message": "hello"}), None),
+            CapabilityCallResult::Succeeded(_)
+        ));
+
+        assert_eq!(
+            invoker.invoke("echo.echo", json!({"message": "hello"}), Some(proposal)),
+            dekopon_shell::secret_use_unsupported()
+        );
+        assert_eq!(
+            dekopon_shell::secret_use_unsupported(),
+            CapabilityCallResult::Denied {
+                reason: "secret references require a broker-backed capability".to_owned(),
+            }
+        );
+    }
 
     #[test]
     fn defaults_direct_invocations_to_an_empty_object() {

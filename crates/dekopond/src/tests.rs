@@ -325,6 +325,63 @@ fn a_secret_use_proposal_reaches_the_broker_leg_through_the_cancellation_boundar
     );
 }
 
+/// Dispatch asks the wrapper, not the leg, and a defaulted method it forgets answers "nothing".
+///
+/// `command_words` defaults to an empty list and `is_granted` to a scan of `granted`, so a
+/// forwarder that omits either turns a session's `gh` command word into "command not found" and a
+/// leg's cheaper membership answer into a wrong one. That is the same defect class the secret-use
+/// argument was, one method over, and nothing else in this crate pins it.
+#[test]
+fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answering_them() {
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
+
+    /// Every answer here is one the trait default cannot give for this `granted` list.
+    struct CommandLeg;
+
+    impl CapabilityInvoker for CommandLeg {
+        fn granted(&self) -> Vec<String> {
+            vec!["echo.echo".to_owned()]
+        }
+
+        fn is_granted(&self, capability: &str) -> bool {
+            capability == "gh.pr-view"
+        }
+
+        fn grants_namespace(&self, namespace: &str) -> bool {
+            namespace == "gh"
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["gh".to_owned()]
+        }
+
+        fn has_command_word(&self, word: &str) -> bool {
+            word == "gh"
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            _secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+
+    let invoker = CancelAwareInvoker {
+        inner: CommandLeg,
+        cancellation: SessionCancellation::new(),
+    };
+
+    assert_eq!(invoker.command_words(), vec!["gh".to_owned()]);
+    assert!(invoker.has_command_word("gh"));
+    // Absent from `granted`, so the default scan would refuse both.
+    assert!(invoker.is_granted("gh.pr-view"));
+    assert!(invoker.grants_namespace("gh"));
+    assert_eq!(invoker.granted(), vec!["echo.echo".to_owned()]);
+}
+
 /// `apiKeyEnv` has three meanings and they used to have one outcome.
 ///
 /// Absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not. Unset

@@ -459,7 +459,136 @@ pub fn abandoned_filter_workers() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityCallResult, ExitCode};
+    use std::sync::{Arc, Mutex};
+
+    use dekopon_core::{SecretDrn, SecretUseProposal};
+    use serde_json::{Value, json};
+
+    use super::{CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode};
+
+    /// An invoker that overrides every defaulted method with an answer the default cannot give.
+    ///
+    /// Each override answers for something absent from `granted` or `command_words`, so a caller
+    /// that reached the trait default instead of this implementation answers `false`, `None`, or
+    /// an empty list — which is exactly the shape of the defect this fixture exists to catch.
+    #[derive(Default)]
+    struct RecordingInvoker {
+        secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
+    }
+
+    impl CapabilityInvoker for RecordingInvoker {
+        fn granted(&self) -> Vec<String> {
+            vec!["echo.echo".to_owned()]
+        }
+
+        fn is_granted(&self, capability: &str) -> bool {
+            capability == "gh.pr-view"
+        }
+
+        fn grants_namespace(&self, namespace: &str) -> bool {
+            namespace == "gh"
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["gh".to_owned()]
+        }
+
+        fn has_command_word(&self, word: &str) -> bool {
+            word == "gh-extra"
+        }
+
+        fn resolve_command(
+            &self,
+            word: &str,
+            argv: &[String],
+        ) -> Option<Result<(String, Value), String>> {
+            Some(Ok((word.to_owned(), json!({ "argv": argv }))))
+        }
+
+        fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
+            Some(CapabilityDescription {
+                capability: capability.to_owned(),
+                description: "recorded".to_owned(),
+                input_schema: json!({"type": "object"}),
+            })
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            self.secret_uses
+                .lock()
+                .expect("recorded secret uses")
+                .push(secret_use);
+            CapabilityCallResult::Succeeded(input)
+        }
+    }
+
+    fn proposal() -> SecretUseProposal {
+        SecretUseProposal::HttpBearer {
+            secret: "drn:com.xrl:secret:prod:api/token"
+                .parse::<SecretDrn>()
+                .expect("canonical DRN"),
+        }
+    }
+
+    /// The pointer is what lets one broker leg be held by a shell pane and by that session's
+    /// dispatch at once, so a proposal crossing it has to arrive whole.
+    ///
+    /// A hand-written forwarder here once dropped the secret-use argument it could not see, and
+    /// the DRN a `curl --user USER:${drn:…}` produced was refused inside the process that made it.
+    /// The `Arc` blanket replaced that forwarder; nothing but this test now holds it to the same
+    /// standard, its last other consumer having left with `dekopon-tui`.
+    #[test]
+    fn an_arc_hands_a_secret_use_proposal_to_the_invoker_behind_it_unchanged() {
+        let inner = Arc::new(RecordingInvoker::default());
+        let shared: Arc<dyn CapabilityInvoker> = Arc::clone(&inner) as Arc<dyn CapabilityInvoker>;
+
+        assert_eq!(
+            shared.invoke("http-probe.fetch", json!({"url": "https://x"}), None),
+            CapabilityCallResult::Succeeded(json!({"url": "https://x"}))
+        );
+        assert_eq!(
+            shared.invoke("http-probe.fetch", json!({}), Some(proposal())),
+            CapabilityCallResult::Succeeded(json!({}))
+        );
+
+        assert_eq!(
+            *inner.secret_uses.lock().expect("recorded secret uses"),
+            vec![None, Some(proposal())],
+            "the pointer altered a proposal on its way to the invoker behind it"
+        );
+    }
+
+    /// Six of this trait's methods have defaults, and a forwarder that omits one silently answers
+    /// with the default instead of the invoker's own answer.
+    ///
+    /// Every override here answers for something the default would have to say `false`, `None`, or
+    /// "nothing" about, so an omission fails rather than coinciding.
+    #[test]
+    fn an_arc_forwards_the_defaulted_methods_instead_of_inheriting_their_defaults() {
+        let shared: Arc<dyn CapabilityInvoker> = Arc::new(RecordingInvoker::default());
+
+        assert_eq!(shared.granted(), vec!["echo.echo".to_owned()]);
+        // Not in `granted`: the default scan would refuse it.
+        assert!(shared.is_granted("gh.pr-view"));
+        assert!(shared.grants_namespace("gh"));
+        // The default is an empty list and, through it, an empty membership test.
+        assert_eq!(shared.command_words(), vec!["gh".to_owned()]);
+        assert!(shared.has_command_word("gh-extra"));
+        // Both default to `None`.
+        assert_eq!(
+            shared.resolve_command("gh", &["pr".to_owned()]),
+            Some(Ok(("gh".to_owned(), json!({"argv": ["pr"]}))))
+        );
+        assert_eq!(
+            shared.describe("gh.pr-view").map(|it| it.description),
+            Some("recorded".to_owned())
+        );
+    }
 
     #[test]
     fn exit_codes_follow_the_documented_mapping() {
