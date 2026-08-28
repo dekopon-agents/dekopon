@@ -200,7 +200,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #21 — REINVENTED_WHEEL — crates/dekopon-brokerd/src/provider_manager.rs:694-1361 (+ :1983-2478)
+## [x] #21 — REINVENTED_WHEEL — crates/dekopon-brokerd/src/provider_manager.rs:694-1361 (+ :1983-2478)
 
 **Finding:** ~670 lines hand-roll an OCI Distribution v2 client (reference grammar, Bearer-challenge parsing via a new `http-auth` dep, token cache, manifest/blob pull, descriptor structs) inside the privileged broker, tested only against an `axum` mock the same PR wrote; `oci-client` + `oci-spec` own all of it. The same file carries a 73-variant `ProviderManagerError` (495 lines, 20% of the file) that no consumer matches on — both live uses are `#[source]` in a thiserror wrapper. **Auditors disagree:** F says replace with a ~120-line wrapper preserving the controls; E rejected the finding because the controls (byte-bounded reads, loopback-only plaintext redirect policy, `no_proxy`/`http1_only`, exact-tag-or-digest only, no client at startup, registry URLs stripped from errors) are the point and `oci-client` does not expose them. (raw: F, E, B1)
 **Blast radius:** HIGH  **Confidence:** MEDIUM
