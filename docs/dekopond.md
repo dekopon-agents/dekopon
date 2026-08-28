@@ -74,7 +74,8 @@ models:
     kind: openaiCompatible
     endpoint: http://127.0.0.1:11434/v1
     model: qwen3
-    apiKeyEnv: OPENAI_API_KEY                 # optional
+    apiKeyEnv: OPENAI_API_KEY                 # optional; absent means the endpoint needs no key.
+                                              # Named but unset or blank is a startup failure.
     timeoutMs: 120000
     classes: [reasoning, analysis]
   - name: subscription
@@ -134,7 +135,7 @@ The `conversation:` block is tagged on `mode`, and both halves are strict: an un
 
 ### No secrets in this file
 
-Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
+Transports, chat models, and image generators name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**, and all three read them through one definition, so a model credential fails exactly the way a chat credential does. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
 
 ### Startup fails closed
 
@@ -146,7 +147,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a zero step budget, a zero capability budget, or zero concurrency;
 - a transport endpoint override that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
-- a missing or blank chat or named image-generator credential environment variable;
+- a missing or blank chat, named image-generator, or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
 - a route naming an image generator on a text-only transport, which today means `whatsappCloudApi`;
 - an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
   Slack activity with a reaction fallback, or classic native activity with no reaction fallback,

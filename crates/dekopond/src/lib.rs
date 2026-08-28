@@ -65,8 +65,8 @@ use crate::{
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
-        ConfiguredModels, ImageGeneratorStartupError, ModelCache, STOPPED_REPLY, SessionGate,
-        SessionRunner, configured_image_generators,
+        ConfiguredModels, ImageGeneratorStartupError, ModelCache, ModelCredentialError,
+        STOPPED_REPLY, SessionGate, SessionRunner, configured_image_generators, model_bearer_token,
     },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
@@ -153,6 +153,12 @@ where
     let image_generators =
         configured_image_generators(&config.image_generators, &referenced_image_generators)
             .map_err(DekopondError::ImageGenerator)?;
+    // The model credential resolves here too. This process cannot see a variable exported after it
+    // started, so an unset or blank `apiKeyEnv` that only surfaced as a 401 on the first user's
+    // message is a startup refusal naming the variable instead.
+    for model in routes.bound_models() {
+        model_bearer_token(model).map_err(DekopondError::ModelCredential)?;
+    }
     let inventory = agent_inventory(&catalog);
     let heartbeat_inventory = inventory.clone();
 
@@ -925,6 +931,9 @@ pub enum DekopondError {
     /// A named image generator could not resolve its model credential or client.
     #[error("configured image generator is unavailable")]
     ImageGenerator(#[source] ImageGeneratorStartupError),
+    /// A bound route's model names a credential variable nothing usable can be read from.
+    #[error("configured model credential is unavailable")]
+    ModelCredential(#[source] ModelCredentialError),
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),

@@ -64,7 +64,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #4 — SILENT_FAILURE_MODE — crates/dekopond/src/session.rs:148-150 (+ :109, model.rs:403)
+## [x] #4 — SILENT_FAILURE_MODE — crates/dekopond/src/session.rs:148-150 (+ :109, model.rs:403)
 
 **Finding:** `api_key_env` is read with `std::env::var(name).ok()`, so a missing, non-UTF-8, or exported-but-empty model API key becomes "no bearer token" and the gateway starts clean, then 401s on the first user message; `ModelCache::client` caches that tokenless client for process life, so exporting the key later needs a restart — contradicting its own docstring at `session.rs:180-184`. Every chat-transport credential in the same file fails closed at startup via `transport::read_credential`. (raw: D2)
 **Blast radius:** HIGH  **Confidence:** HIGH

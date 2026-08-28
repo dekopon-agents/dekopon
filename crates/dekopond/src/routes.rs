@@ -4,7 +4,7 @@
 //! with no reachable model is a configuration mistake, and finding it when the daemon starts beats
 //! finding it in a chat reply an hour later.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use dekopon_agent::prompt::PromptLimits;
 use dekopon_config::LocalCatalog;
@@ -124,6 +124,20 @@ impl RoutingTable {
             });
         }
         Ok(Self { routes })
+    }
+
+    /// The distinct models bound routes can actually reach, in declaration order.
+    ///
+    /// Startup resolves each one's credential before any transport accepts work. A configured
+    /// model no route reaches is not a reason to refuse to start, which is the same rule the
+    /// referenced-image-generator set follows.
+    pub fn bound_models(&self) -> Vec<&ModelConfig> {
+        let mut seen = BTreeSet::new();
+        self.routes
+            .iter()
+            .filter(|route| seen.insert(route.model.name().to_owned()))
+            .map(|route| route.model.as_ref())
+            .collect()
     }
 
     /// First route claiming this conversation, or `None` for ambient traffic.

@@ -390,11 +390,11 @@ pub(crate) trait AssetFetcher: Send + Sync {
 /// of them carries a credential, and the daemon logs the category rather than the message.
 #[derive(Debug, Error)]
 pub enum TransportError {
-    #[error("transport credential environment variable {name} is not set")]
+    #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
-    #[error("transport credential environment variable {name} is set to an empty value")]
+    #[error("credential environment variable {name} is set to an empty value")]
     EmptyCredential { name: String },
-    #[error("transport credential environment variable {name} is not UTF-8")]
+    #[error("credential environment variable {name} is not UTF-8")]
     NonUtf8Credential { name: String },
     #[error("chat service request failed")]
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -444,7 +444,18 @@ impl TransportError {
 
 /// Reads one credential by variable name, reporting the *name* and never the value.
 pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
-    let value = std::env::var_os(name).ok_or_else(|| TransportError::MissingCredential {
+    credential_from(name, std::env::var_os(name))
+}
+
+/// Decides what a named credential variable holds, given what the environment holds for it.
+///
+/// Split from the read so the rule is reachable without a test mutating this process's
+/// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
+pub(crate) fn credential_from(
+    name: &str,
+    value: Option<std::ffi::OsString>,
+) -> Result<String, TransportError> {
+    let value = value.ok_or_else(|| TransportError::MissingCredential {
         name: name.to_owned(),
     })?;
     #[allow(
@@ -464,8 +475,8 @@ pub(crate) fn read_credential(name: &str) -> Result<String, TransportError> {
 ///
 /// A blank value is not a weak token, it is the absence of one presented as presence: an empty HMAC
 /// key verifies signatures anybody can compute, and an empty bearer token is still sent as a header.
-/// One definition here rather than per transport, because every transport reads its credentials
-/// through [`read_credential`].
+/// One definition here rather than per reader, because every chat transport, the model client, and
+/// the image generator read an owner-named credential variable through [`read_credential`].
 pub(crate) fn credential_value(name: &str, value: String) -> Result<String, TransportError> {
     if value.trim().is_empty() {
         return Err(TransportError::EmptyCredential {
