@@ -14,8 +14,8 @@ categories = ["data-structures", "encoding"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [features]
-default = ["schemars"]
-# `JsonSchema` derives for every public type, including the types they embed.
+default = []
+# `JsonSchema` derives for every public type, including the types they embed. Opt-in.
 schemars = ["dep:schemars", "dekopon-capability/schemars", "dekopon-core/schemars"]
 
 [dependencies]
