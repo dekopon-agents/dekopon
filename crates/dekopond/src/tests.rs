@@ -17,9 +17,9 @@ use dekopon_agent::prompt::{
     HistoryLimits, IMAGE_GENERATION_TOOL_NAME, PromptLimits,
 };
 use dekopon_broker_protocol::{
-    AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface, FrameLimits,
-    InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
-    write_frame,
+    Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
+    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
+    read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
@@ -2394,16 +2394,16 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
     inbound.reply = ReplyTarget::WhatsApp {
         recipient: "16034700182".to_owned(),
     };
-    let claim = dekopon_broker_protocol::ChatSessionClaim {
-        subject: inbound.subject.clone(),
-        agent: "reviewer".parse().expect("agent"),
-        scope: dekopon_broker_protocol::ChatScopeClaim {
+    let claim = dekopon_broker_protocol::Attestation::for_chat(
+        inbound.subject.clone(),
+        "reviewer".parse().expect("agent"),
+        dekopon_broker_protocol::ChatScopeClaim {
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
             channel: inbound.channel.clone(),
             conversation: inbound.conversation_id.clone(),
         },
-    };
+    );
     let delivery = crate::session::delivery_identity(&inbound, &claim)
         .expect("WhatsApp replies can be recorded after transport acceptance");
     assert_eq!(
@@ -2414,7 +2414,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
             message: "wamid.delivery".to_owned(),
         }
     );
-    assert!(delivery.is_canonical_for(&claim.scope));
+    assert!(delivery.is_canonical_for(&claim.scope.expect("chat scope")));
 }
 
 fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
@@ -2605,12 +2605,15 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     // The gateway asked on the sender's behalf, not its own: the broker sees a subject and an
     // agent, and maps the subject to a principal itself.
     let request = observed.recv().await.expect("stub broker saw one request");
-    let BrokerRequest::CapabilitiesForChat { claim } = request.request else {
+    let BrokerRequest::Capabilities {
+        attestation: Some(claim),
+    } = request.request
+    else {
         panic!("a session must open a chat-scoped attested leg: {request:?}");
     };
     assert_eq!(claim.subject.canonical(), SUBJECT);
     assert_eq!(claim.agent.as_str(), "reviewer");
-    assert_eq!(claim.scope.transport.as_str(), "dev");
+    assert_eq!(claim.scope.expect("chat scope").transport.as_str(), "dev");
 }
 
 struct TestImageGenerator;
@@ -2816,7 +2819,9 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             .await
             .expect("authorization request")
             .request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -2856,7 +2861,9 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             .await
             .expect("authorization request")
             .request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(matches!(
         observed
@@ -2864,7 +2871,10 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             .await
             .expect("capability invocation")
             .request,
-        BrokerRequest::InvokeForChat { .. }
+        BrokerRequest::Invoke {
+            attestation: Some(Attestation { scope: Some(_), .. }),
+            ..
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -2902,10 +2912,12 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     assert_eq!(replier.replies(), ["The exact accepted answer."]);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     let record = observed.recv().await.expect("one record request");
-    let BrokerRequest::RecordDeliveredTurnForChat { turn, attestation } = record.request else {
+    let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
         panic!("expected hidden record operation: {record:?}");
     };
     assert_eq!(turn.user, "the exact sender text");
@@ -2920,7 +2932,7 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
             sequence: 1,
         }
     );
-    assert_eq!(turn.id, attestation.invocation);
+    assert_eq!(Some(turn.id), attestation.invocation);
     assert!(
         observed.try_recv().is_err(),
         "outcome-unknown must never trigger a retry"
@@ -3035,11 +3047,13 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
         );
         assert!(matches!(
             observed.recv().await.expect("surface request").request,
-            BrokerRequest::CapabilitiesForChat { .. }
+            BrokerRequest::Capabilities {
+                attestation: Some(Attestation { scope: Some(_), .. })
+            }
         ));
         assert!(matches!(
             observed.recv().await.expect("record request").request,
-            BrokerRequest::RecordDeliveredTurnForChat { .. }
+            BrokerRequest::RecordDeliveredTurn { .. }
         ));
         assert!(
             observed.try_recv().is_err(),
@@ -3068,7 +3082,9 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
     assert_eq!(replier.replies(), [FAILURE_REPLY]);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -3091,7 +3107,9 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
     .await;
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -3327,7 +3345,9 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     );
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -3380,7 +3400,9 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         .expect("authorization request was sent");
     assert!(matches!(
         first.request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
 
     session.abort();
@@ -3475,7 +3497,9 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     let request = observed.recv().await.expect("one capability listing");
     assert!(matches!(
         request.request,
-        BrokerRequest::CapabilitiesForChat { .. }
+        BrokerRequest::Capabilities {
+            attestation: Some(Attestation { scope: Some(_), .. })
+        }
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -3771,13 +3795,18 @@ fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
 /// Every broker request the stub saw, asserting each one was a capability listing.
 ///
 /// The count is the assertion that matters: `stub_broker` serves one connection per response, so
-/// "N messages produced N `capabilitiesFor` envelopes" is what proves authorization is asked again
+/// "N messages produced N attested `capabilities` envelopes" is what proves authorization is asked again
 /// per message rather than remembered with the conversation.
 fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> usize {
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
         assert!(
-            matches!(request.request, BrokerRequest::CapabilitiesForChat { .. }),
+            matches!(
+                request.request,
+                BrokerRequest::Capabilities {
+                    attestation: Some(Attestation { scope: Some(_), .. })
+                }
+            ),
             "every session opens a chat-scoped attested leg: {request:?}"
         );
         count += 1;

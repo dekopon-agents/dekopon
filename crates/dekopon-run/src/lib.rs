@@ -703,7 +703,7 @@ async fn connect_prompt_broker(
         return Ok(None);
     }
     let (client, socket_tier) = broker_client(connection)?;
-    let leg = BrokerLeg::connect(client, "dekopon-run-prompt")
+    let leg = BrokerLeg::connect(client, "dekopon-run-prompt", None)
         .await
         .map_err(|error| match error {
             BrokerLegError::Client(source) => AppError::BrokerClient(source),
@@ -822,14 +822,17 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
                     return Err(AppError::BrokerInputObject);
                 }
                 let result = client
-                    .invoke(InvocationRequest {
-                        id: invocation_id.clone(),
-                        capability: capability.clone(),
-                        trace: trace_id.clone(),
-                        trace_parent: dekopon_agent::current_trace_parent(),
-                        secret_use: None,
-                        input,
-                    })
+                    .invoke(
+                        None,
+                        InvocationRequest {
+                            id: invocation_id.clone(),
+                            capability: capability.clone(),
+                            trace: trace_id.clone(),
+                            trace_parent: dekopon_agent::current_trace_parent(),
+                            secret_use: None,
+                            input,
+                        },
+                    )
                     .await?;
                 let exit_code = if result.outcome == InvocationOutcome::Succeeded {
                     0

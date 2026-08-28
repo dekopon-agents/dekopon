@@ -192,7 +192,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #20 — WRONG_ABSTRACTION — crates/dekopon-broker-protocol/src/lib.rs:1279 (BrokerRequest) + dekopon-broker/src/lib.rs entry points
+## [x] #20 — WRONG_ABSTRACTION — crates/dekopon-broker-protocol/src/lib.rs:1279 (BrokerRequest) + dekopon-broker/src/lib.rs entry points
 
 **Finding:** Attestation shape is a type-level axis — direct / attested / chat-attested — multiplied across 11 `BrokerRequest` variants, 13 client methods, 11 server dispatch arms (four invoke arms repeating ~30 lines each), and 9 `Broker` entry points, while the only consumer (`dekopon-agent/src/lib.rs:241`) already models it as one `Option<Attestation { scope: Option<..> }>` and re-explodes it at every call. The matrix is ragged: there is no `ResolveCommandFor`, so `dekopon console`'s attested leg resolves command words through the unattested path. This multiplication is why #5 and #12 had to be written three times. (raw: A2)
 **Blast radius:** HIGH  **Confidence:** HIGH

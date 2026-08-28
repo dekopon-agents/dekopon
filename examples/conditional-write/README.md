@@ -150,7 +150,7 @@ a config file.
 The session:
 
 1. **Attestation.** `dekopond` derives the canonical subject `slack.t0123abcd.u0123abcd` from the
-   authenticated Slack envelope and opens a broker leg with `capabilitiesFor(subject, agent)`. The
+   authenticated Slack envelope and opens a broker leg with `capabilities(subject, agent)`. The
    broker checks its attestor grant covers that namespace, maps the subject to `cpetersen`, checks
    `agent.prompt` on `Dekopon::Agent::"xaviers-conditional-writer"`, and answers with two
    capabilities. A sender who fails any of those steps gets `You're not authorized to use this

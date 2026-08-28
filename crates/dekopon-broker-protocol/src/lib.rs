@@ -32,8 +32,8 @@ use tokio::{
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-/// Initial local broker protocol identifier.
-pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha1";
+/// Current local broker protocol identifier.
+pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha2";
 /// Default complete request/response frame bound (2 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Hard ceiling accepted for any configured frame bound (16 MiB).
@@ -94,11 +94,17 @@ pub const ERROR_STORAGE_IO: &str = "storage-io";
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 /// Exact protocol version carried by every envelope.
+///
+/// One variant, so there is no negotiation: every envelope is strict-decoded and any other string
+/// fails to deserialize. That is the seam. `v1alpha2` replaced `v1alpha1` when the per-attestation
+/// operations collapsed into one operation per verb carrying an optional [`Attestation`]; a mixed
+/// pair now refuses at the envelope in *both* directions instead of only when a client is older
+/// than the operation it names.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolVersion {
-    /// Initial strict JSON protocol.
-    #[serde(rename = "dekopon.dev/broker/v1alpha1")]
-    V1Alpha1,
+    /// Strict JSON protocol with one operation per verb.
+    #[serde(rename = "dekopon.dev/broker/v1alpha2")]
+    V1Alpha2,
 }
 
 /// W3C `traceparent`, carrying the client's OpenTelemetry span as a remote parent.
@@ -401,34 +407,91 @@ where
     deserializer.deserialize_string(Visitor::<MAXIMUM>)
 }
 
-/// Subject, agent, and transport scope claimed for a chat session.
+/// One on-behalf-of claim accompanying an operation, absent when a peer speaks as itself.
+///
+/// Attestation shape is one axis, not one operation per shape. A subject-only claim carries no
+/// `scope` and derives the legacy attested context; a chat claim adds the transport scope that
+/// invocation-bound chat authority is checked against. Both are the same claim about the same two
+/// things — which authenticated external identity the peer is relaying, and which agent is
+/// orchestrating for it — so both travel in this one structure and every operation takes it
+/// optionally.
+///
+/// It is a *claim*, never authority. It carries no principal, because the subject-to-principal
+/// mapping is owner-controlled broker state; the broker honors the claim only when the connected
+/// peer's configuration grants attestor authority over the subject's namespace, and the broker
+/// alone performs the mapping. It is a separate structure rather than fields on
+/// [`InvocationRequest`] so that an invocation payload stays identity-free whether or not one
+/// accompanies it.
+///
+/// `invocation` is present exactly for the operations that carry a proposal, where it must equal
+/// that proposal's identifier. The two already travel in one frame, so this is defense in depth
+/// against a future refactor separating them; a disagreement — or an identifier on an operation
+/// with no proposal to bind to — is a decode-level protocol error rather than a policy decision.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ChatSessionClaim {
+pub struct Attestation {
+    /// The transport-authenticated external subject the operation is made on behalf of.
     pub subject: ExternalSubject,
+    /// The named agent orchestrating on the subject's behalf.
     pub agent: AgentId,
-    pub scope: ChatScopeClaim,
+    /// The claimed chat transport scope; absent for a subject-only attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ChatScopeClaim>,
+    /// The proposal identifier this claim is bound to; absent when no proposal accompanies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<InvocationId>,
 }
 
-impl fmt::Debug for ChatSessionClaim {
+impl fmt::Debug for Attestation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ChatSessionClaim([REDACTED])")
+        formatter.write_str("Attestation([REDACTED])")
     }
 }
 
-/// Invocation-bound chat attestation. The broker validates it against owner-authored scope grants.
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ChatAttestation {
-    pub subject: ExternalSubject,
-    pub agent: AgentId,
-    pub scope: ChatScopeClaim,
-    pub invocation: InvocationId,
-}
+impl Attestation {
+    /// Builds a subject-only claim for an operation that carries no proposal.
+    #[must_use]
+    pub const fn for_subject(subject: ExternalSubject, agent: AgentId) -> Self {
+        Self {
+            subject,
+            agent,
+            scope: None,
+            invocation: None,
+        }
+    }
 
-impl fmt::Debug for ChatAttestation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ChatAttestation([REDACTED])")
+    /// Builds a chat-scoped claim for an operation that carries no proposal.
+    #[must_use]
+    pub const fn for_chat(subject: ExternalSubject, agent: AgentId, scope: ChatScopeClaim) -> Self {
+        Self {
+            subject,
+            agent,
+            scope: Some(scope),
+            invocation: None,
+        }
+    }
+
+    /// The same claim bound to the proposal it accompanies.
+    #[must_use]
+    pub fn bound_to(&self, invocation: InvocationId) -> Self {
+        Self {
+            invocation: Some(invocation),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the claimed scope, if any, is inside the defensive wire bounds.
+    ///
+    /// Structural only: it consults no grant and decides nothing about authority.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.scope.as_ref().is_none_or(ChatScopeClaim::is_bounded)
+    }
+
+    /// Whether this claim is bound to exactly the proposal it travelled with.
+    #[must_use]
+    pub fn binds(&self, invocation: &InvocationId) -> bool {
+        self.invocation.as_ref() == Some(invocation)
     }
 }
 
@@ -1120,29 +1183,6 @@ pub enum UsageReportError {
     },
 }
 
-/// One attested on-behalf-of claim accompanying a gateway's proposal.
-///
-/// This is deliberately a separate typed structure rather than fields on
-/// [`InvocationRequest`]: the invocation payload stays identity-free, and an attestation is a
-/// *claim* the server honors only when the connected peer's owner-controlled configuration
-/// grants it attestor authority over the subject's namespace. The subject itself is canonical
-/// routing metadata (`slack.t0123abc.u9xyz`), never message content, and the mapping from
-/// subject to principal happens on the broker side alone.
-///
-/// `invocation` must equal the accompanying proposal's identifier. The two already travel in one
-/// frame, so this is defense in depth against a future refactor separating them; a mismatch is a
-/// decode-level protocol error.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SubjectAttestation {
-    /// The transport-authenticated external subject the proposal is made on behalf of.
-    pub subject: ExternalSubject,
-    /// The named agent orchestrating on the subject's behalf.
-    pub agent: AgentId,
-    /// The proposal identifier this attestation is bound to.
-    pub invocation: InvocationId,
-}
-
 /// One strict untrusted client request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -1154,103 +1194,53 @@ pub struct RequestEnvelope {
 }
 
 impl RequestEnvelope {
-    /// Creates a capability-inspection request.
+    /// Creates a capability-inspection request for the peer, or for one attested context.
     #[must_use]
-    pub const fn capabilities() -> Self {
+    pub const fn capabilities(attestation: Option<Attestation>) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::Capabilities,
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::Capabilities { attestation },
         }
     }
 
     /// Creates a command-word rewrite request.
     #[must_use]
-    pub const fn resolve_command(word: String, argv: Vec<String>) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::ResolveCommand { word, argv },
-        }
-    }
-
-    /// Creates an untrusted invocation proposal request.
-    #[must_use]
-    pub const fn invoke(invocation: InvocationRequest) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::Invoke { invocation },
-        }
-    }
-
-    /// Creates an attested capability-inspection request.
-    #[must_use]
-    pub const fn capabilities_for(subject: ExternalSubject, agent: AgentId) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::CapabilitiesFor { subject, agent },
-        }
-    }
-
-    /// Creates an attested on-behalf-of proposal request.
-    #[must_use]
-    pub const fn invoke_for(
-        invocation: InvocationRequest,
-        attestation: SubjectAttestation,
-    ) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::InvokeFor {
-                invocation,
-                attestation,
-            },
-        }
-    }
-
-    /// Creates a bounded chat-scoped capability request.
-    #[must_use]
-    pub const fn capabilities_for_chat(claim: ChatSessionClaim) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::CapabilitiesForChat { claim },
-        }
-    }
-
-    /// Creates a bounded chat-scoped command rewrite request.
-    #[must_use]
-    pub const fn resolve_command_for_chat(
-        claim: ChatSessionClaim,
+    pub const fn resolve_command(
+        attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::ResolveCommandForChat { claim, word, argv },
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::ResolveCommand {
+                attestation,
+                word,
+                argv,
+            },
         }
     }
 
-    /// Creates a bounded chat-scoped generic proposal.
+    /// Creates an invocation proposal request, optionally attested on behalf of a subject.
     #[must_use]
-    pub const fn invoke_for_chat(
-        invocation: InvocationRequest,
-        attestation: ChatAttestation,
-    ) -> Self {
+    pub const fn invoke(attestation: Option<Attestation>, invocation: InvocationRequest) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::InvokeForChat {
-                invocation,
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::Invoke {
                 attestation,
+                invocation,
             },
         }
     }
 
     /// Creates the dedicated model-hidden post-acceptance record proposal.
     #[must_use]
-    pub const fn record_delivered_turn_for_chat(
+    pub const fn record_delivered_turn(
+        attestation: Attestation,
         turn: DeliveredTurnRequest,
-        attestation: ChatAttestation,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
-            request: BrokerRequest::RecordDeliveredTurnForChat { turn, attestation },
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::RecordDeliveredTurn { attestation, turn },
         }
     }
 
@@ -1258,7 +1248,7 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::PublishAgentInventory { inventory },
         }
     }
@@ -1267,59 +1257,33 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn publish_model_usage(usage: ModelUsageReport) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::PublishModelUsage { usage },
         }
     }
 }
 
 /// Operations accepted by the local broker.
+///
+/// One operation per verb. Whether a caller speaks as its own authenticated peer, on behalf of an
+/// external subject, or inside a bounded chat scope is [`Attestation`] — a field on the operation,
+/// not a separate operation per shape. The `operation` tag stays strict-decoded, so an operation a
+/// broker does not know is a clean protocol error rather than a misread proposal.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerRequest {
-    /// Lists capabilities allowed for the authenticated peer context.
-    Capabilities,
-    /// Submits one untrusted invocation proposal.
-    Invoke {
-        /// Proposal fields without principal or actor claims.
-        invocation: InvocationRequest,
-    },
-    /// Lists capabilities for an attested on-behalf-of context.
+    /// Lists the capabilities and command words allowed for this context.
     ///
-    /// Honored only for peers whose owner-controlled configuration carries an attestor grant
-    /// covering the subject's namespace; any other peer receives a stable refusal. The
-    /// `operation` tag is the version seam: a broker without attestation support strict-decodes
-    /// this variant into a clean protocol error rather than misreading it.
-    CapabilitiesFor {
-        /// The transport-authenticated external subject.
-        subject: ExternalSubject,
-        /// The named agent that would orchestrate on the subject's behalf.
-        agent: AgentId,
-    },
-    /// Submits one proposal attested on behalf of an external subject.
-    InvokeFor {
-        /// Proposal fields without principal or actor claims.
-        invocation: InvocationRequest,
-        /// The gateway's on-behalf-of claim, honored only under an attestor grant.
-        attestation: SubjectAttestation,
-    },
-    /// Lists the chat surface after invocation-bound scope authority is validated.
-    CapabilitiesForChat { claim: ChatSessionClaim },
-    /// Rewrites a command only inside a freshly authorized chat scope.
-    ResolveCommandForChat {
-        claim: ChatSessionClaim,
-        word: String,
-        argv: Vec<String>,
-    },
-    /// Submits a recent/search proposal under invocation-bound chat attestation.
-    InvokeForChat {
-        invocation: InvocationRequest,
-        attestation: ChatAttestation,
-    },
-    /// Dedicated model-hidden recording operation after transport acceptance.
-    RecordDeliveredTurnForChat {
-        turn: DeliveredTurnRequest,
-        attestation: ChatAttestation,
+    /// Without an attestation this is the authenticated peer's own listing, which is never
+    /// refused. With one it is the attested context's, honored only for peers whose
+    /// owner-controlled configuration carries an attestor grant covering the subject's namespace
+    /// — and any other peer receives a stable refusal that discloses nothing, not even whether
+    /// the subject is mapped. A chat-scoped claim additionally answers with the durable-memory
+    /// surface when all three of its grants are effective.
+    Capabilities {
+        /// The on-behalf-of claim, or `None` to speak as the connected peer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     /// Rewrites one command word's arguments into a capability proposal.
     ///
@@ -1327,8 +1291,13 @@ pub enum BrokerRequest {
     /// declaring component — no imports, bounded by fuel and timeout — and what it returns is a
     /// *proposal*, authorized on exactly the path any other proposal takes. Gating it would add a
     /// principal check to a function that grants nothing; what stops an unauthorized caller is the
-    /// authorization of the invocation that follows, not the arithmetic that shaped it.
+    /// authorization of the invocation that follows, not the arithmetic that shaped it. An
+    /// attestation, when one is supplied, is still validated as a claim: a caller cannot rewrite
+    /// under a subject or scope the broker refuses it.
     ResolveCommand {
+        /// The on-behalf-of claim, or `None` to speak as the connected peer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
         /// The command word, which must belong to a loaded provider.
         word: String,
         /// Arguments as the script supplied them, **without** the word itself.
@@ -1337,6 +1306,25 @@ pub enum BrokerRequest {
         /// it before the guest runs, so repeating it here would give the guest a second, editable
         /// copy of a routing decision already made.
         argv: Vec<String>,
+    },
+    /// Submits one untrusted invocation proposal.
+    Invoke {
+        /// The on-behalf-of claim, bound to `invocation.id`, or `None` for a direct proposal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        /// Proposal fields without principal or actor claims.
+        invocation: InvocationRequest,
+    },
+    /// Dedicated model-hidden recording operation after transport acceptance.
+    ///
+    /// Its own operation on purpose: the chat-memory record route is unreachable through
+    /// [`BrokerRequest::Invoke`] and through [`BrokerRequest::ResolveCommand`] whatever
+    /// attestation accompanies them, so recording cannot be reached by a proposal a model shaped.
+    RecordDeliveredTurn {
+        /// The chat-scoped claim, bound to `turn.id`. A subject-only claim cannot record.
+        attestation: Attestation,
+        /// Typed post-acceptance fields the broker turns into the proposal itself.
+        turn: DeliveredTurnRequest,
     },
     /// Replaces the broker's in-memory informational view of the gateway catalog.
     ///
@@ -1371,7 +1359,7 @@ impl ResponseEnvelope {
         command_words: Vec<String>,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
@@ -1388,7 +1376,7 @@ impl ResponseEnvelope {
         chat_memory: Option<ChatMemorySurface>,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
@@ -1401,7 +1389,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn command_resolution(capability: CapabilityId, input: serde_json::Value) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::CommandResolution {
                 capability: Some(capability),
                 input: Some(input),
@@ -1414,7 +1402,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn command_declined(message: String) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::CommandResolution {
                 capability: None,
                 input: None,
@@ -1427,7 +1415,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn invocation(result: InvocationResult) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Invocation { result },
         }
     }
@@ -1436,7 +1424,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn acknowledged() -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Acknowledged,
         }
     }
@@ -1445,7 +1433,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha1,
+            api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Error {
                 code: code.into(),
                 message: message.into(),
@@ -1771,77 +1759,20 @@ impl BrokerClient {
         })
     }
 
-    /// Rewrites one command word's arguments into a capability proposal.
+    /// Returns the capabilities, command words, and chat-memory surface visible to one context.
     ///
-    /// `Ok(Ok((capability, input)))` is a proposal to submit; `Ok(Err(message))` is the provider
-    /// declining, which the caller reports to the model as a usage error.
-    pub async fn resolve_command(
-        &self,
-        word: String,
-        argv: Vec<String>,
-    ) -> Result<Result<(CapabilityId, serde_json::Value), String>, ClientError> {
-        match self
-            .exchange(RequestEnvelope::resolve_command(word, argv))
-            .await?
-        {
-            BrokerResponse::CommandResolution {
-                capability: Some(capability),
-                input: Some(input),
-                ..
-            } => Ok(Ok((capability, input))),
-            BrokerResponse::CommandResolution {
-                message: Some(message),
-                ..
-            } => Ok(Err(message)),
-            BrokerResponse::CommandResolution { .. } => Err(ClientError::UnexpectedResponse),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Returns capabilities and command words visible to this authenticated peer.
+    /// Without an attestation this is the connected peer's own listing. With one it is the
+    /// attested context's, and `Err(ClientError::Remote { code: ERROR_UNAUTHENTICATED, .. })` is
+    /// the opaque refusal: this client's peer identity carries no matching attestor grant, the
+    /// subject is not mapped, or policy does not let that principal drive that agent. The three
+    /// are deliberately indistinguishable here — the broker names the class on its own side of
+    /// the socket — so a refused caller cannot learn whether the subject exists.
+    ///
+    /// The memory surface is present only for a chat-scoped attestation whose three durable-memory
+    /// grants are all effective.
     pub async fn session_surface(
         &self,
-    ) -> Result<(Vec<AvailableCapability>, Vec<String>), ClientError> {
-        match self.exchange(RequestEnvelope::capabilities()).await? {
-            BrokerResponse::Capabilities {
-                capabilities,
-                command_words,
-                ..
-            } => Ok((capabilities, command_words)),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Returns capabilities and command words for one attested on-behalf-of context.
-    ///
-    /// The claim is honored only when this client's peer identity carries a matching attestor
-    /// grant in the broker's owner-controlled configuration; otherwise the broker refuses with a
-    /// stable code and no capability information.
-    pub async fn session_surface_for(
-        &self,
-        subject: ExternalSubject,
-        agent: AgentId,
-    ) -> Result<(Vec<AvailableCapability>, Vec<String>), ClientError> {
-        match self
-            .exchange(RequestEnvelope::capabilities_for(subject, agent))
-            .await?
-        {
-            BrokerResponse::Capabilities {
-                capabilities,
-                command_words,
-                ..
-            } => Ok((capabilities, command_words)),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Returns the freshly authorized capability, command, and optional memory chat surface.
-    pub async fn session_surface_for_chat(
-        &self,
-        claim: ChatSessionClaim,
+        attestation: Option<Attestation>,
     ) -> Result<
         (
             Vec<AvailableCapability>,
@@ -1851,7 +1782,7 @@ impl BrokerClient {
         ClientError,
     > {
         match self
-            .exchange(RequestEnvelope::capabilities_for_chat(claim))
+            .exchange(RequestEnvelope::capabilities(attestation))
             .await?
         {
             BrokerResponse::Capabilities {
@@ -1860,19 +1791,34 @@ impl BrokerClient {
                 chat_memory,
             } => Ok((capabilities, command_words, chat_memory)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 
-    /// Rewrites one command under the same bounded chat scope used for later invocation.
-    pub async fn resolve_command_for_chat(
+    /// Returns the capabilities exact policy makes visible to this authenticated peer.
+    ///
+    /// The same `capabilities` exchange as [`BrokerClient::session_surface`] with no attestation,
+    /// for a caller with no use for command words or a memory surface.
+    pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
+        Ok(self.session_surface(None).await?.0)
+    }
+
+    /// Rewrites one command word's arguments into a capability proposal.
+    ///
+    /// `Ok(Ok((capability, input)))` is a proposal to submit; `Ok(Err(message))` is the provider
+    /// declining, which the caller reports to the model as a usage error. An attestation, when
+    /// supplied, must be honored before any word resolves; a refused claim answers exactly as an
+    /// unknown word does, because naming the word would disclose the surface the refusal withheld.
+    pub async fn resolve_command(
         &self,
-        claim: ChatSessionClaim,
+        attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
     ) -> Result<Result<(CapabilityId, serde_json::Value), String>, ClientError> {
         match self
-            .exchange(RequestEnvelope::resolve_command_for_chat(claim, word, argv))
+            .exchange(RequestEnvelope::resolve_command(attestation, word, argv))
             .await?
         {
             BrokerResponse::CommandResolution {
@@ -1886,24 +1832,26 @@ impl BrokerClient {
             } => Ok(Err(message)),
             BrokerResponse::CommandResolution { .. } => Err(ClientError::UnexpectedResponse),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 
-    /// Returns capabilities exact policy makes visible to this authenticated peer.
+    /// Submits one invocation proposal, optionally on behalf of an external subject.
     ///
-    /// The same `capabilities` exchange as [`BrokerClient::session_surface`], for a caller with no
-    /// use for command words.
-    pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
-        Ok(self.session_surface().await?.0)
-    }
-
-    /// Submits untrusted invocation fields without any identity or authority claim.
+    /// The attestation binds to the proposal's own identifier here, so a caller cannot construct a
+    /// frame whose claim and proposal disagree.
     pub async fn invoke(
         &self,
+        attestation: Option<Attestation>,
         request: InvocationRequest,
     ) -> Result<InvocationResult, ClientError> {
-        match self.exchange(RequestEnvelope::invoke(request)).await? {
+        let attestation = attestation.map(|claim| claim.bound_to(request.id.clone()));
+        match self
+            .exchange(RequestEnvelope::invoke(attestation, request))
+            .await?
+        {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
@@ -1912,50 +1860,22 @@ impl BrokerClient {
         }
     }
 
-    /// Submits recent/search under invocation-bound chat attestation.
-    pub async fn invoke_for_chat(
-        &self,
-        request: InvocationRequest,
-        claim: ChatSessionClaim,
-    ) -> Result<InvocationResult, ClientError> {
-        let attestation = ChatAttestation {
-            subject: claim.subject,
-            agent: claim.agent,
-            scope: claim.scope,
-            invocation: request.id.clone(),
-        };
-        match self
-            .exchange(RequestEnvelope::invoke_for_chat(request, attestation))
-            .await?
-        {
-            BrokerResponse::Invocation { result } => Ok(result),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
     /// Submits exactly one model-hidden post-acceptance record request.
-    pub async fn record_delivered_turn_for_chat(
+    pub async fn record_delivered_turn(
         &self,
+        attestation: Attestation,
         turn: DeliveredTurnRequest,
-        claim: ChatSessionClaim,
     ) -> Result<InvocationResult, ClientError> {
-        let attestation = ChatAttestation {
-            subject: claim.subject,
-            agent: claim.agent,
-            scope: claim.scope,
-            invocation: turn.id.clone(),
-        };
+        let attestation = attestation.bound_to(turn.id.clone());
         match self
-            .exchange(RequestEnvelope::record_delivered_turn_for_chat(
-                turn,
-                attestation,
-            ))
+            .exchange(RequestEnvelope::record_delivered_turn(attestation, turn))
             .await?
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1973,7 +1893,9 @@ impl BrokerClient {
         {
             BrokerResponse::Acknowledged => Ok(()),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandResolution { .. }
+            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1985,34 +1907,9 @@ impl BrokerClient {
         {
             BrokerResponse::Acknowledged => Ok(()),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Submits one proposal attested on behalf of an external subject.
-    ///
-    /// The attestation binds to the proposal's own identifier here, so a caller cannot construct
-    /// a frame whose claim and proposal disagree.
-    pub async fn invoke_for(
-        &self,
-        request: InvocationRequest,
-        subject: ExternalSubject,
-        agent: AgentId,
-    ) -> Result<InvocationResult, ClientError> {
-        let attestation = SubjectAttestation {
-            subject,
-            agent,
-            invocation: request.id.clone(),
-        };
-        match self
-            .exchange(RequestEnvelope::invoke_for(request, attestation))
-            .await?
-        {
-            BrokerResponse::Invocation { result } => Ok(result),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -2175,8 +2072,8 @@ impl ClientError {
     /// Reports whether the broker may have executed the request this failure ended.
     ///
     /// `true` means the complete request frame was delivered and this client could not establish
-    /// the outcome. For an operation that writes — `invoke`, `invokeFor`, `invokeForChat`,
-    /// `recordDeliveredTurnForChat` — the external effect may already have taken place, so the
+    /// the outcome. For an operation that writes — `invoke`, attested or not, and
+    /// `recordDeliveredTurn` — the external effect may already have taken place, so the
     /// caller must surface a non-retryable failure rather than resubmit under a fresh identifier.
     /// For a read-only operation it is informational and re-asking is harmless.
     #[must_use]
@@ -2197,7 +2094,7 @@ impl fmt::Display for ProtocolVersion {
         // Matched rather than written from the constant so a second variant cannot silently
         // inherit the first one's identifier while serializing correctly.
         formatter.write_str(match self {
-            Self::V1Alpha1 => PROTOCOL_VERSION,
+            Self::V1Alpha2 => PROTOCOL_VERSION,
         })
     }
 }

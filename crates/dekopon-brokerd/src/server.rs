@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_host::CommandResolution;
 use dekopon_broker_protocol::{
-    BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError,
-    RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    Attestation, BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED,
+    ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED,
+    FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope, ResponseEnvelope, TraceParent,
+    read_frame, write_frame,
 };
 use dekopon_core::{
     ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, TraceId, retryable_accept_error,
@@ -32,7 +33,7 @@ pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: &TraceId
 ///
 /// The grant lives beside the context rather than inside it because it is authority *about
 /// identity derivation*, not identity: a peer with a grant still acts as itself on direct
-/// operations, and only `invokeFor`/`capabilitiesFor` consult the grant at all.
+/// operations, and only an attested operation consults the grant at all.
 #[derive(Clone, Debug)]
 pub struct MappedPeer {
     /// The peer's own authenticated context.
@@ -254,6 +255,87 @@ fn report_command_resolve_failure(word: &str, error: &dekopon_broker_host::Broke
     );
 }
 
+/// Whether a claim is structurally usable, before any grant is consulted.
+///
+/// Attestation shape is one axis, so this is one check for every operation that can carry one.
+/// `proposal` is the identifier the claim must bind to; `None` names an operation with no proposal,
+/// where a bound claim is itself malformed because there is nothing for it to bind to. Neither
+/// half is an authorization decision — the broker still refuses a well-formed claim it does not
+/// honor — and a request that fails here is answered `invalid-request` with nothing authorized,
+/// accounted, or audited.
+fn claim_is_valid(attestation: Option<&Attestation>, proposal: Option<&InvocationId>) -> bool {
+    attestation.is_none_or(|claim| {
+        claim.is_well_formed()
+            && proposal.map_or_else(|| claim.invocation.is_none(), |id| claim.binds(id))
+    })
+}
+
+/// Answers a malformed claim with the stable protocol code and ends the connection.
+///
+/// The message stays generic on purpose: which half of the claim was malformed is a property of a
+/// frame the peer built, and a client that cannot bind its own attestation cannot act on detail.
+async fn refuse_invalid_claim(
+    stream: &mut UnixStream,
+    limits: FrameLimits,
+) -> Result<(), ConnectionError> {
+    write_frame(
+        stream,
+        &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "attestation is invalid"),
+        limits,
+    )
+    .await
+    .map_err(ConnectionError::Write)?;
+    Err(ConnectionError::InvalidRequest)
+}
+
+/// The invocation span, carrying the attested subject and agent only when a claim named them.
+///
+/// A storage-routed proposal drops the capability as well, because the chat-memory routes make the
+/// capability identifier itself a statement about the sender.
+fn invocation_span(
+    request: &InvocationRequest,
+    attestation: Option<&Attestation>,
+    storage: bool,
+) -> tracing::Span {
+    if storage {
+        return storage_invocation_span(&request.id, &request.trace);
+    }
+    match attestation {
+        Some(claim) => tracing::info_span!(
+            "broker.invocation",
+            invocation = %request.id,
+            capability = %request.capability,
+            trace = %request.trace,
+            subject = %claim.subject,
+            agent = %claim.agent,
+        ),
+        None => tracing::info_span!(
+            "broker.invocation",
+            invocation = %request.id,
+            capability = %request.capability,
+            trace = %request.trace,
+        ),
+    }
+}
+
+/// Joins the span to the client's trace when it offered one.
+///
+/// An untrusted client chooses this parent. It reaches telemetry correlation and nothing else:
+/// policy, replay rejection, and audit never read it. Losing the correlation is not losing the
+/// invocation either — the span still records, just as its own root — so a rejected `traceparent`
+/// is a debug event rather than a failure.
+fn adopt_trace_parent(span: &tracing::Span, parent: Option<TraceParent>) {
+    if let Some(parent) = parent
+        && let Err(error) = span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
+            trace_id: parent.trace_id(),
+            span_id: parent.parent_id(),
+            flags: parent.flags(),
+        }))
+    {
+        tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
+    }
+}
+
 async fn handle<A>(
     mut stream: UnixStream,
     broker: &Broker<A>,
@@ -301,14 +383,13 @@ where
     };
     let context = &peer.context;
     let response = match request.request {
-        BrokerRequest::Capabilities => {
-            let (capabilities, command_words) = broker.capability_view(context);
-            ResponseEnvelope::capabilities(capabilities, command_words)
-        }
-        BrokerRequest::CapabilitiesFor { subject, agent } => {
-            match broker.capabilities_for(context, peer.attestor.as_ref(), &subject, &agent) {
-                Some((capabilities, command_words)) => {
-                    ResponseEnvelope::capabilities(capabilities, command_words)
+        BrokerRequest::Capabilities { attestation } => {
+            if !claim_is_valid(attestation.as_ref(), None) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            match broker.capability_surface(context, peer.attestor.as_ref(), attestation.as_ref()) {
+                Some((capabilities, command_words, chat_memory)) => {
+                    ResponseEnvelope::chat_capabilities(capabilities, command_words, chat_memory)
                 }
                 // A refused attestation discloses nothing about what the attested context could
                 // have seen — not even whether the subject is mapped.
@@ -318,47 +399,24 @@ where
                 ),
             }
         }
-        BrokerRequest::CapabilitiesForChat { claim } => {
-            if !claim.scope.is_bounded() {
-                ResponseEnvelope::error(ERROR_INVALID_REQUEST, "chat scope is invalid")
-            } else {
-                match broker.capabilities_for_chat(context, peer.attestor.as_ref(), &claim) {
-                    Some((capabilities, command_words, memory)) => {
-                        ResponseEnvelope::chat_capabilities(capabilities, command_words, memory)
-                    }
-                    None => ResponseEnvelope::error(
-                        ERROR_UNAUTHENTICATED,
-                        "chat attestation was refused",
-                    ),
-                }
+        BrokerRequest::ResolveCommand {
+            attestation,
+            word,
+            argv,
+        } => {
+            if !claim_is_valid(attestation.as_ref(), None) {
+                return refuse_invalid_claim(&mut stream, limits).await;
             }
-        }
-        BrokerRequest::ResolveCommandForChat { claim, word, argv } => {
-            if !claim.scope.is_bounded() {
-                ResponseEnvelope::error(ERROR_INVALID_REQUEST, "chat scope is invalid")
-            } else {
-                match broker
-                    .resolve_command_for_chat(context, peer.attestor.as_ref(), &claim, &word, &argv)
-                    .await
-                {
-                    Ok(CommandResolution::Resolved { capability, input }) => {
-                        ResponseEnvelope::command_resolution(capability, input)
-                    }
-                    Ok(CommandResolution::Failed { error }) => {
-                        ResponseEnvelope::command_declined(error.message)
-                    }
-                    Err(error) => {
-                        report_command_resolve_failure(&word, &error);
-                        ResponseEnvelope::error(
-                            ERROR_PROVIDER,
-                            "command word could not be rewritten",
-                        )
-                    }
-                }
-            }
-        }
-        BrokerRequest::ResolveCommand { word, argv } => {
-            match broker.resolve_command(&word, &argv).await {
+            match broker
+                .resolve_command(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    &word,
+                    &argv,
+                )
+                .await
+            {
                 Ok(CommandResolution::Resolved { capability, input }) => {
                     ResponseEnvelope::command_resolution(capability, input)
                 }
@@ -371,6 +429,59 @@ where
                     report_command_resolve_failure(&word, &error);
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be rewritten")
                 }
+            }
+        }
+        BrokerRequest::Invoke {
+            attestation,
+            invocation,
+        } => {
+            // Structural binding is already one frame; this check is defense in depth and makes a
+            // mismatched or malformed claim a protocol error rather than a policy decision.
+            if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            // Correlation identifiers only. Input, output, and every provider-facing value stay
+            // out of this span for the same reason they stay out of audit records: telemetry is a
+            // second egress path and must not carry what the audit chain deliberately redacts.
+            let span = invocation_span(
+                &invocation,
+                attestation.as_ref(),
+                broker.capability_uses_storage(&invocation.capability),
+            );
+            adopt_trace_parent(&span, invocation.trace_parent);
+            match broker
+                .invoke(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    invocation,
+                )
+                .instrument(span)
+                .await
+            {
+                Ok(result) => ResponseEnvelope::invocation(result),
+                Err(error) => return write_broker_failure(&mut stream, limits, error).await,
+            }
+        }
+        BrokerRequest::RecordDeliveredTurn { attestation, turn } => {
+            if !claim_is_valid(Some(&attestation), Some(&turn.id))
+                || !turn.is_bounded()
+                || !attestation
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
+            {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            let span = storage_invocation_span(&turn.id, &turn.trace);
+            adopt_trace_parent(&span, turn.trace_parent);
+            match broker
+                .record_delivered_turn(context, peer.attestor.as_ref(), &attestation, turn)
+                .instrument(span)
+                .await
+            {
+                Ok(result) => ResponseEnvelope::invocation(result),
+                Err(error) => return write_broker_failure(&mut stream, limits, error).await,
             }
         }
         BrokerRequest::PublishAgentInventory { inventory } => {
@@ -410,167 +521,6 @@ where
                     model.call.count = usage.model_calls
                 );
                 ResponseEnvelope::acknowledged()
-            }
-        }
-        BrokerRequest::InvokeForChat {
-            invocation,
-            attestation,
-        } => {
-            if attestation.invocation != invocation.id || !attestation.scope.is_bounded() {
-                ResponseEnvelope::error(ERROR_INVALID_REQUEST, "chat attestation is invalid")
-            } else {
-                let storage = broker.capability_uses_storage(&invocation.capability);
-                let span = if storage {
-                    storage_invocation_span(&invocation.id, &invocation.trace)
-                } else {
-                    tracing::info_span!(
-                        "broker.invocation", invocation = %invocation.id,
-                        capability = %invocation.capability, trace = %invocation.trace,
-                        subject = %attestation.subject, agent = %attestation.agent,
-                    )
-                };
-                if let Some(parent) = invocation.trace_parent
-                    && let Err(error) =
-                        span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
-                            trace_id: parent.trace_id(),
-                            span_id: parent.parent_id(),
-                            flags: parent.flags(),
-                        }))
-                {
-                    tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
-                }
-                match broker
-                    .invoke_for_chat(context, peer.attestor.as_ref(), &attestation, invocation)
-                    .instrument(span)
-                    .await
-                {
-                    Ok(result) => ResponseEnvelope::invocation(result),
-                    Err(error) => return write_broker_failure(&mut stream, limits, error).await,
-                }
-            }
-        }
-        BrokerRequest::RecordDeliveredTurnForChat { turn, attestation } => {
-            if attestation.invocation != turn.id
-                || !attestation.scope.is_bounded()
-                || !turn.is_bounded()
-                || !turn.delivery.is_canonical_for(&attestation.scope)
-            {
-                ResponseEnvelope::error(
-                    ERROR_INVALID_REQUEST,
-                    "delivered turn attestation is invalid",
-                )
-            } else {
-                let span = storage_invocation_span(&turn.id, &turn.trace);
-                if let Some(parent) = turn.trace_parent
-                    && let Err(error) =
-                        span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
-                            trace_id: parent.trace_id(),
-                            span_id: parent.parent_id(),
-                            flags: parent.flags(),
-                        }))
-                {
-                    tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
-                }
-                match broker
-                    .record_delivered_turn_for_chat(
-                        context,
-                        peer.attestor.as_ref(),
-                        &attestation,
-                        turn,
-                    )
-                    .instrument(span)
-                    .await
-                {
-                    Ok(result) => ResponseEnvelope::invocation(result),
-                    Err(error) => return write_broker_failure(&mut stream, limits, error).await,
-                }
-            }
-        }
-        BrokerRequest::InvokeFor {
-            invocation,
-            attestation,
-        } => {
-            // Structural binding is already one frame; this check is defense in depth and makes
-            // a mismatched claim a protocol error rather than a policy decision.
-            if attestation.invocation != invocation.id {
-                write_frame(
-                    &mut stream,
-                    &ResponseEnvelope::error(
-                        ERROR_INVALID_REQUEST,
-                        "attestation is not bound to its proposal",
-                    ),
-                    limits,
-                )
-                .await
-                .map_err(ConnectionError::Write)?;
-                return Err(ConnectionError::InvalidRequest);
-            }
-            let span = if broker.capability_uses_storage(&invocation.capability) {
-                storage_invocation_span(&invocation.id, &invocation.trace)
-            } else {
-                tracing::info_span!(
-                    "broker.invocation",
-                    invocation = %invocation.id,
-                    capability = %invocation.capability,
-                    trace = %invocation.trace,
-                    subject = %attestation.subject,
-                    agent = %attestation.agent,
-                )
-            };
-            if let Some(parent) = invocation.trace_parent
-                && let Err(error) =
-                    span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
-                        trace_id: parent.trace_id(),
-                        span_id: parent.parent_id(),
-                        flags: parent.flags(),
-                    }))
-            {
-                tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
-            }
-            match broker
-                .invoke_for(context, peer.attestor.as_ref(), &attestation, invocation)
-                .instrument(span)
-                .await
-            {
-                Ok(result) => ResponseEnvelope::invocation(result),
-                Err(error) => {
-                    return write_broker_failure(&mut stream, limits, error).await;
-                }
-            }
-        }
-        BrokerRequest::Invoke { invocation } => {
-            // Correlation identifiers only. Input, output, and every provider-facing value stay
-            // out of this span for the same reason they stay out of audit records: telemetry is a
-            // second egress path and must not carry what the audit chain deliberately redacts.
-            let span = if broker.capability_uses_storage(&invocation.capability) {
-                storage_invocation_span(&invocation.id, &invocation.trace)
-            } else {
-                tracing::info_span!(
-                    "broker.invocation",
-                    invocation = %invocation.id,
-                    capability = %invocation.capability,
-                    trace = %invocation.trace,
-                )
-            };
-            // An untrusted client chooses this parent. It reaches telemetry correlation and
-            // nothing else: policy, replay rejection, and audit never read it.
-            if let Some(parent) = invocation.trace_parent
-                && let Err(error) =
-                    span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
-                        trace_id: parent.trace_id(),
-                        span_id: parent.parent_id(),
-                        flags: parent.flags(),
-                    }))
-            {
-                // Losing correlation is not losing the invocation: the span still records, just as
-                // its own root, and the durable audit is unaffected either way.
-                tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
-            }
-            match broker.invoke(context, invocation).instrument(span).await {
-                Ok(result) => ResponseEnvelope::invocation(result),
-                Err(error) => {
-                    return write_broker_failure(&mut stream, limits, error).await;
-                }
             }
         }
     };

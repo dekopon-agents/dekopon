@@ -4,7 +4,7 @@
 edit, in what order to restart, and which releases require a configuration change rather than a
 binary swap. The changelog records *what changed*; this records *what you have to do about it*.
 
-Dekopon is pre-1.0 and the local broker protocol is `v1alpha1`. There is no compatibility promise
+Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no compatibility promise
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
@@ -244,6 +244,23 @@ release section here when that release is tagged.
   chat memory have nothing to edit: `route:` is optional, defaults to `generic`, and a set that
   omits it means exactly what it meant before. The wire protocol and audit record shapes are
   unchanged.
+- **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables
+  in one step.** The eleven request operations collapsed into six — `capabilities`,
+  `resolveCommand`, `invoke`, `recordDeliveredTurn`, `publishAgentInventory`, `publishModelUsage` —
+  because whether a caller speaks as its own peer, on behalf of a subject, or inside a chat scope is
+  now an optional `attestation` field rather than a separate operation per shape. The retired tags
+  (`capabilitiesFor`, `capabilitiesForChat`, `invokeFor`, `invokeForChat`, `resolveCommandForChat`,
+  `recordDeliveredTurnForChat`) are gone rather than aliased: an alias would have had to carry the
+  old field shapes too, and a mixed pair would then half-work. There is nothing to edit — no
+  configuration file, policy, catalog, or audit record shape changes, and no persisted state is
+  touched — but a mixed set of binaries now refuses on the **first frame in either direction** with
+  `invalid-request`, before anything is authorized, accounted, or audited. Under `v1alpha1` an older
+  client against a newer broker failed on the *response* instead, which for a submitted proposal is
+  an unknown outcome rather than a clean refusal; that half is what this closes. The restart order
+  in [Restart the broker first and stop it last](#restart-the-broker-first-and-stop-it-last) is
+  unchanged and is what keeps the window shut: stop `dekopond`, drain and stop `dekopon-brokerd`,
+  replace **all four** binaries, start the broker, then start the gateway. Do not roll one process
+  at a time.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
   now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`

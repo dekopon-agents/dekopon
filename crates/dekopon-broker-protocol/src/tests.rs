@@ -5,13 +5,32 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    AgentInventory, BrokerRequest, ChatAttestation, ChatScopeClaim, ChatSessionClaim,
-    ChatTransportKind, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InventoryError,
-    InvocationRequest, MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS,
-    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission,
-    ProtocolError, ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
-    ResponseEnvelope, TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
+    AgentInventory, Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind,
+    DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InventoryError, InvocationRequest,
+    MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS, MAX_REPORTED_TEXT_BYTES,
+    MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission, ProtocolError,
+    ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope,
+    TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
 };
+
+fn subject() -> dekopon_core::ExternalSubject {
+    "slack.t0123abc.u9xyz"
+        .parse()
+        .expect("valid subject fixture")
+}
+
+fn agent() -> dekopon_core::AgentId {
+    "reviewer".parse().expect("valid agent fixture")
+}
+
+fn scope() -> ChatScopeClaim {
+    ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("valid transport fixture"),
+        kind: ChatTransportKind::Slack,
+        channel: "c0123abc".to_owned(),
+        conversation: "c0123abc:1712345678.000100".to_owned(),
+    }
+}
 
 fn invocation() -> InvocationRequest {
     InvocationRequest {
@@ -124,7 +143,7 @@ async fn round_trips_one_strict_bounded_frame() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let expected = RequestEnvelope::invoke(invocation());
+    let expected = RequestEnvelope::invoke(None, invocation());
     let (mut writer, mut reader) = duplex(8 * 1024);
     let write = tokio::spawn({
         let expected = expected.clone();
@@ -262,7 +281,7 @@ async fn one_frame_reaches_the_socket_in_one_write() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let request = RequestEnvelope::invoke(invocation());
+    let request = RequestEnvelope::invoke(None, invocation());
     let mut writer = CountingWriter::default();
     write_frame(&mut writer, &request, limits)
         .await
@@ -319,8 +338,8 @@ async fn serialization_stops_at_the_frame_bound() {
 
 #[test]
 fn wire_invocation_contains_no_identity_or_authority_fields() {
-    let value =
-        serde_json::to_value(RequestEnvelope::invoke(invocation())).expect("request serializes");
+    let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation()))
+        .expect("request serializes");
     let encoded = serde_json::to_string(&value).expect("request JSON renders");
     for prohibited in [
         "principal",
@@ -333,7 +352,7 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
     }
     assert!(
         serde_json::from_value::<RequestEnvelope>(json!({
-            "apiVersion": "dekopon.dev/broker/v1alpha1",
+            "apiVersion": "dekopon.dev/broker/v1alpha2",
             "request": {
                 "operation": "invoke",
                 "invocation": {
@@ -479,7 +498,10 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
         let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
             .await
             .expect("server decodes request");
-        assert!(matches!(request.request, BrokerRequest::Capabilities));
+        assert!(matches!(
+            request.request,
+            BrokerRequest::Capabilities { attestation: None }
+        ));
         write_frame(
             &mut stream,
             &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
@@ -541,7 +563,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     });
     let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
     let lost = client
-        .invoke(invocation())
+        .invoke(None, invocation())
         .await
         .expect_err("a lost response must fail");
     server.await.expect("server fixture exits");
@@ -568,7 +590,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     };
     let client = BrokerClient::new(&unread, uid, tight).expect("valid client limits");
     let oversized = client
-        .invoke(invocation())
+        .invoke(None, invocation())
         .await
         .expect_err("an oversized proposal must fail");
     drop(listener);
@@ -735,17 +757,17 @@ fn inventory_and_usage_validation_name_the_offending_agent_and_bound() {
 #[test]
 fn protocol_version_constant_wire_form_and_display_agree() {
     assert_eq!(
-        serde_json::to_value(ProtocolVersion::V1Alpha1).expect("version serializes"),
+        serde_json::to_value(ProtocolVersion::V1Alpha2).expect("version serializes"),
         json!(PROTOCOL_VERSION)
     );
-    assert_eq!(ProtocolVersion::V1Alpha1.to_string(), PROTOCOL_VERSION);
+    assert_eq!(ProtocolVersion::V1Alpha2.to_string(), PROTOCOL_VERSION);
     assert_eq!(
         serde_json::from_value::<ProtocolVersion>(json!(PROTOCOL_VERSION))
             .expect("version decodes"),
-        ProtocolVersion::V1Alpha1
+        ProtocolVersion::V1Alpha2
     );
     assert_eq!(
-        serde_json::to_value(RequestEnvelope::capabilities())
+        serde_json::to_value(RequestEnvelope::capabilities(None))
             .expect("envelope serializes")
             .get("apiVersion"),
         Some(&json!(PROTOCOL_VERSION))
@@ -760,17 +782,12 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
         channel: "c0123abc".to_owned(),
         conversation: "c0123abc:1712345678.000100".to_owned(),
     };
-    let session = ChatSessionClaim {
-        subject: "slack.t0123abc.u9xyz".parse().expect("subject"),
-        agent: "reviewer".parse().expect("agent"),
-        scope: scope.clone(),
-    };
-    let attestation = ChatAttestation {
-        subject: session.subject.clone(),
-        agent: session.agent.clone(),
-        scope: scope.clone(),
-        invocation: "invoke-chat".parse().expect("invocation"),
-    };
+    let session = Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "reviewer".parse().expect("agent"),
+        scope.clone(),
+    );
+    let attestation = session.bound_to("invoke-chat".parse().expect("invocation"));
     let turn = DeliveredTurnRequest {
         id: "invoke-chat".parse().expect("invocation"),
         trace: "trace-chat".parse().expect("trace"),
@@ -1093,4 +1110,245 @@ mod broker_socket_discovery {
         assert_eq!(BrokerSocketTier::Home.label(), "home");
         assert_eq!(BrokerSocketTier::Home.to_string(), "home");
     }
+}
+
+/// One operation per verb, with the attestation as a field rather than an operation of its own.
+///
+/// The `operation` tag is the compatibility seam, so what each verb is spelled on the wire — and
+/// that a subject-only claim, a chat claim and no claim at all reach the *same* tag — is the part
+/// that has to be pinned rather than inferred.
+#[test]
+fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
+    let turn = DeliveredTurnRequest {
+        id: "invoke-chat".parse().expect("valid invocation fixture"),
+        trace: "trace-chat".parse().expect("valid trace fixture"),
+        trace_parent: None,
+        delivery: DeliveryIdentity::Slack {
+            channel: "c0123abc".to_owned(),
+            timestamp: "1712345678.000100".to_owned(),
+        },
+        user: "hello".to_owned(),
+        assistant: "hi".to_owned(),
+    };
+    let unattested = Attestation::for_subject(subject(), agent());
+    let chat = Attestation::for_chat(subject(), agent(), scope());
+    for (expected, envelope) in [
+        ("capabilities", RequestEnvelope::capabilities(None)),
+        (
+            "capabilities",
+            RequestEnvelope::capabilities(Some(unattested.clone())),
+        ),
+        (
+            "capabilities",
+            RequestEnvelope::capabilities(Some(chat.clone())),
+        ),
+        (
+            "resolveCommand",
+            RequestEnvelope::resolve_command(None, "memory".to_owned(), Vec::new()),
+        ),
+        (
+            "resolveCommand",
+            RequestEnvelope::resolve_command(
+                Some(chat.clone()),
+                "memory".to_owned(),
+                vec!["recent".to_owned()],
+            ),
+        ),
+        ("invoke", RequestEnvelope::invoke(None, invocation())),
+        (
+            "invoke",
+            RequestEnvelope::invoke(Some(unattested.bound_to(invocation().id)), invocation()),
+        ),
+        (
+            "invoke",
+            RequestEnvelope::invoke(Some(chat.bound_to(invocation().id)), invocation()),
+        ),
+        (
+            "recordDeliveredTurn",
+            RequestEnvelope::record_delivered_turn(chat.bound_to(turn.id.clone()), turn),
+        ),
+        (
+            "publishModelUsage",
+            RequestEnvelope::publish_model_usage(ModelUsageReport {
+                model_calls: 1,
+                ..ModelUsageReport::default()
+            }),
+        ),
+    ] {
+        let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(
+            encoded["request"]["operation"],
+            json!(expected),
+            "{encoded}"
+        );
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(encoded.clone()).expect("envelope decodes"),
+            envelope,
+            "{encoded}"
+        );
+    }
+}
+
+/// The version seam refuses a mixed pair in both directions, loudly, before anything is authorized.
+///
+/// The previous protocol spelled the attestation shape into the operation tag — `capabilitiesFor`,
+/// `invokeForChat` — so a broker of this version reading an older client's frame would otherwise
+/// have to guess. It does not: the `apiVersion` fails first, and the retired tags fail after it.
+#[test]
+fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_decode() {
+    let previous = json!({
+        "apiVersion": "dekopon.dev/broker/v1alpha1",
+        "request": {"operation": "capabilities"}
+    });
+    assert!(serde_json::from_value::<RequestEnvelope>(previous).is_err());
+    assert!(
+        serde_json::from_value::<ResponseEnvelope>(json!({
+            "apiVersion": "dekopon.dev/broker/v1alpha1",
+            "response": {"type": "acknowledged"}
+        }))
+        .is_err()
+    );
+
+    for retired in [
+        json!({"operation": "capabilitiesFor", "subject": "slack.t0123abc.u9xyz", "agent": "reviewer"}),
+        json!({"operation": "capabilitiesForChat", "claim": {}}),
+        json!({"operation": "resolveCommandForChat", "claim": {}, "word": "memory", "argv": []}),
+        json!({"operation": "invokeFor", "invocation": {}, "attestation": {}}),
+        json!({"operation": "invokeForChat", "invocation": {}, "attestation": {}}),
+        json!({"operation": "recordDeliveredTurnForChat", "turn": {}, "attestation": {}}),
+    ] {
+        assert!(
+            serde_json::from_value::<RequestEnvelope>(json!({
+                "apiVersion": PROTOCOL_VERSION,
+                "request": retired,
+            }))
+            .is_err(),
+            "{retired} decoded under the current version"
+        );
+    }
+}
+
+/// A claim is bound to the proposal it travels with, and carries no identifier without one.
+///
+/// The binding is redundant inside a single frame by construction, which is the point: it is
+/// defense in depth against a future refactor separating the claim from the proposal, and the
+/// client fills it in so a caller cannot build a frame whose two halves disagree.
+#[test]
+fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
+    let identifier = invocation().id;
+    let unbound = Attestation::for_chat(subject(), agent(), scope());
+    assert!(unbound.invocation.is_none());
+    assert!(!unbound.binds(&identifier));
+
+    let bound = unbound.bound_to(identifier.clone());
+    assert!(bound.binds(&identifier));
+    assert!(!bound.binds(&"invoke-other".parse().expect("valid invocation fixture")));
+    assert_eq!(bound.subject, unbound.subject);
+    assert_eq!(bound.scope, unbound.scope);
+
+    // Structural bounds are checked before any grant is consulted, and a subject-only claim has no
+    // scope to bound.
+    assert!(Attestation::for_subject(subject(), agent()).is_well_formed());
+    assert!(unbound.is_well_formed());
+    assert!(
+        !Attestation::for_chat(
+            subject(),
+            agent(),
+            ChatScopeClaim {
+                channel: "x".repeat(257),
+                ..scope()
+            }
+        )
+        .is_well_formed()
+    );
+}
+
+/// Recording stays reachable only through its own operation, whatever attestation accompanies one.
+///
+/// `RecordDeliveredTurn` is the only variant that carries a [`DeliveredTurnRequest`] at all, and
+/// every variant is `deny_unknown_fields`, so a proposal cannot smuggle a turn into `invoke` and
+/// an attestation cannot promote one.
+#[test]
+fn recording_is_reachable_only_through_its_own_operation() {
+    let turn = json!({
+        "id": "invoke-chat",
+        "trace": "trace-chat",
+        "delivery": {"kind": "slack", "channel": "c0123abc", "timestamp": "1712345678.000100"},
+        "user": "hello",
+        "assistant": "hi",
+    });
+    for smuggled in [
+        json!({"operation": "invoke", "invocation": {
+            "id": "invoke-chat", "capability": "echo.echo", "trace": "trace-chat", "input": {},
+        }, "turn": turn.clone()}),
+        json!({"operation": "resolveCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
+        json!({"operation": "capabilities", "turn": turn}),
+    ] {
+        assert!(
+            serde_json::from_value::<RequestEnvelope>(json!({
+                "apiVersion": PROTOCOL_VERSION,
+                "request": smuggled,
+            }))
+            .is_err(),
+            "{smuggled} decoded a delivered turn onto an operation that must not carry one"
+        );
+    }
+}
+
+/// A refused attested inspection reaches the client as an opaque failure, never as an empty list.
+///
+/// Answering with an empty capability list would tell an ungranted caller that the subject is
+/// mapped. The client must therefore surface the stable failure code and nothing else — no
+/// capability, no command word, no memory surface.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_answer() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use tokio::net::UnixListener;
+
+    use super::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client fixture");
+        let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
+            .await
+            .expect("server decodes request");
+        let BrokerRequest::Capabilities {
+            attestation: Some(claim),
+        } = request.request
+        else {
+            panic!("an attested surface must reach the one capabilities operation");
+        };
+        assert!(claim.scope.is_some());
+        assert!(claim.invocation.is_none());
+        write_frame(
+            &mut stream,
+            &ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "attestation refused"),
+            limits,
+        )
+        .await
+        .expect("server writes refusal");
+    });
+
+    let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
+    let refused = client
+        .session_surface(Some(Attestation::for_chat(subject(), agent(), scope())))
+        .await
+        .expect_err("a refused attestation is not an answer");
+    server.await.expect("server fixture exits");
+    let ClientError::Remote { code, .. } = refused else {
+        panic!("expected a stable remote refusal, got {refused}");
+    };
+    assert_eq!(code, ERROR_UNAUTHENTICATED);
 }

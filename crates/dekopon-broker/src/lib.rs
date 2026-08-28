@@ -47,9 +47,8 @@ use dekopon_broker_host::{
     ProviderCapability,
 };
 pub use dekopon_broker_protocol::{
-    AvailableCapability, ChatAttestation, ChatMemorySurface, ChatScopeClaim, ChatSessionClaim,
-    ChatTransportKind, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
-    SubjectAttestation,
+    Attestation, AvailableCapability, ChatMemorySurface, ChatScopeClaim, ChatTransportKind,
+    DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
 };
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
@@ -3218,16 +3217,49 @@ where
     /// may not use receives a denial one step later, having learned nothing they could not learn
     /// by asking for the capability directly.
     ///
+    /// An `attestation` is not a gate on the rewrite either, but it is still a claim, and a claim
+    /// the broker refuses buys nothing: the word answers `UnknownCommandWord` exactly as an
+    /// undeclared word does, because naming it would disclose the surface the refusal withheld.
+    /// The class lands on the broker's own side through `broker_capabilities_refused` instead.
+    ///
+    /// The chat-memory words are offered only to a chat-scoped session whose three memory grants
+    /// are effective; every other caller finds them reserved, and a resolution that lands on a
+    /// chat-memory route is refused whatever word produced it. Recording stays unreachable from
+    /// any word.
+    ///
     /// # Errors
     ///
     /// Returns a host error when no loaded provider declares the word, when the guest traps, or
     /// when the rewrite reaches for a host import.
     pub async fn resolve_command(
         &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: Option<&Attestation>,
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        if self.is_chat_memory_word(word) {
+        let attested = match attestation {
+            Some(claim) => {
+                let (context, refusal) = self.resolve_context(peer, grant, claim);
+                if let Some(refusal) = refusal {
+                    report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+                    return Err(BrokerHostError::UnknownCommandWord {
+                        word: word.to_owned(),
+                    });
+                }
+                Some((context, claim))
+            }
+            None => None,
+        };
+        let memory_word = self.is_chat_memory_word(word);
+        // Evaluated only for a word that needs the answer: the surface costs three capability
+        // decisions, and every other word a session runs must not pay for them.
+        if memory_word
+            && !attested.is_some_and(|(context, claim)| {
+                self.memory_surface(&context, &claim.agent).is_some()
+            })
+        {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
@@ -3235,7 +3267,10 @@ where
         let resolution = self.registry.resolve_command(word, argv).await?;
         if matches!(
             &resolution,
-            CommandResolution::Resolved { capability, .. } if self.route(capability).is_chat_memory()
+            CommandResolution::Resolved { capability, .. } if {
+                let route = self.route(capability);
+                if memory_word { !route.is_chat_memory_retrieval() } else { route.is_chat_memory() }
+            }
         ) {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
@@ -3335,145 +3370,43 @@ where
         })
     }
 
-    /// Evaluates and, when allowed, executes one authenticated proposal exactly once.
-    pub async fn invoke(
-        &self,
-        context: &AuthenticatedContext,
-        request: InvocationRequest,
-    ) -> Result<InvocationResult, BrokerError> {
-        let refusal = self
-            .route(&request.capability)
-            .is_chat_memory()
-            .then_some(Refusal {
-                reason: "chat-scope-required",
-                policy_ids: Vec::new(),
-            });
-        self.invoke_inner(context, request, refusal).await
-    }
-
-    /// Evaluates one proposal attested on behalf of an external subject.
+    /// Returns the capability listing, command words, and chat-memory surface for one context.
     ///
-    /// `peer` is the connected transport identity and `grant` is that peer's owner-configured
-    /// attestor authority, or `None` when it has none. The broker — never the peer — performs
-    /// the subject-to-principal mapping. Every refusal is an audited, replay-consuming denial
-    /// under the peer's own identity with a stable reason (`attestation-denied` for a missing or
-    /// out-of-scope grant, `unmapped-subject` for a subject the directory does not name), so a
-    /// compromised or misconfigured gateway leaves a decision trail rather than a silent error.
-    /// A denied `agent.prompt` is reported as `agent-denied` under the attested context: the
-    /// attestation itself was honored, and the refusal is about who may drive this agent.
-    pub async fn invoke_for(
-        &self,
-        peer: &AuthenticatedContext,
-        grant: Option<&AttestorGrant>,
-        attestation: &SubjectAttestation,
-        request: InvocationRequest,
-    ) -> Result<InvocationResult, BrokerError> {
-        let (context, refusal) = self.resolve_attestation(peer, grant, attestation);
-        let refusal = match refusal {
-            Some(reason) => Some(Refusal {
-                reason,
-                policy_ids: Vec::new(),
-            }),
-            None if self.route(&request.capability).is_chat_memory() => Some(Refusal {
-                reason: "chat-scope-required",
-                policy_ids: Vec::new(),
-            }),
-            None => {
-                let decision = self.authorize_agent_prompt(&context, &attestation.agent);
-                (!decision.allowed).then(|| decided_refusal(decision, "agent-denied"))
-            }
-        };
-        self.invoke_inner(&context, request, refusal).await
-    }
-
-    /// Returns capabilities visible to one attested on-behalf-of context.
-    ///
-    /// `None` means the request was refused — no grant, out-of-scope subject, unmapped subject, or
-    /// a policy that does not let this principal drive this agent at all — which callers must not
-    /// conflate with "allowed to ask, granted nothing" (`Some` with an empty list). Answering a
-    /// refused caller with an empty list would tell it whether the subject is mapped.
+    /// Without an `attestation` this is the connected peer's own answer, and it is never refused.
+    /// With one, `None` means the request was refused — no grant, out-of-scope subject, unmapped
+    /// subject, or a policy that does not let this principal drive this agent at all — which
+    /// callers must not conflate with "allowed to ask, granted nothing" (`Some` with an empty
+    /// list). Answering a refused caller with an empty list would tell it whether the subject is
+    /// mapped.
     ///
     /// The bare `Option` keeps the wire answer opaque, so the refusal class is reported here
     /// instead: one `broker_capabilities_refused` event names the class and the canonical subject
     /// on the broker's own side of the socket, where a session that never invokes would otherwise
     /// leave no trace of why it saw nothing.
+    ///
+    /// The memory surface is present only for a chat-scoped claim whose three durable-memory
+    /// grants are all effective; the two retrieval capabilities and the reserved words join the
+    /// listing exactly when it is.
     #[must_use]
-    pub fn capabilities_for(
+    pub fn capability_surface(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
-        subject: &ExternalSubject,
-        agent: &AgentId,
-    ) -> Option<(Vec<AvailableCapability>, Vec<String>)> {
-        if !grant.is_some_and(|grant| grant.permits(subject)) {
-            report_inspection_refusal(
-                &unevaluated_refusal("attestation-denied"),
-                peer,
-                subject,
-                agent,
-            );
-            return None;
-        }
-        let Some(principal) = self.identities.resolve(subject) else {
-            report_inspection_refusal(
-                &unevaluated_refusal("unmapped-subject"),
-                peer,
-                subject,
-                agent,
-            );
-            return None;
-        };
-        let context = match AuthenticatedContext::attested(
-            principal.clone(),
-            Actor::Agent {
-                agent: agent.clone(),
-            },
-            peer.principal().clone(),
-            subject.clone(),
-        ) {
-            Ok(context) => context,
-            Err(_) => {
-                report_inspection_refusal(
-                    &unevaluated_refusal("attestation-denied"),
-                    peer,
-                    subject,
-                    agent,
-                );
-                return None;
-            }
-        };
-        let decision = self.authorize_agent_prompt(&context, agent);
-        if !decision.allowed {
-            report_inspection_refusal(
-                &decided_refusal(decision, "agent-denied"),
-                peer,
-                subject,
-                agent,
-            );
-            return None;
-        }
-        Some(self.capability_view(&context))
-    }
-
-    /// Returns a freshly authorized chat surface. Scope refusal reveals no mapping or namespace.
-    #[must_use]
-    pub fn capabilities_for_chat(
-        &self,
-        peer: &AuthenticatedContext,
-        grant: Option<&AttestorGrant>,
-        claim: &ChatSessionClaim,
+        attestation: Option<&Attestation>,
     ) -> Option<(
         Vec<AvailableCapability>,
         Vec<String>,
         Option<ChatMemorySurface>,
     )> {
-        let context = match self.resolve_chat_claim(peer, grant, claim) {
-            Ok(context) => context,
-            Err(refusal) => {
-                report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
-                return None;
-            }
+        let Some(claim) = attestation else {
+            let (capabilities, words) = self.capability_view(peer);
+            return Some((capabilities, words, None));
         };
+        let (context, refusal) = self.resolve_context(peer, grant, claim);
+        if let Some(refusal) = refusal {
+            report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+            return None;
+        }
         let (mut capabilities, mut words) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
@@ -3492,132 +3425,95 @@ where
         Some((capabilities, words, memory))
     }
 
-    /// Resolves a provider command only after chat-scope and all-three memory authority checks.
-    pub async fn resolve_command_for_chat(
+    /// Evaluates and, when allowed, executes one proposal exactly once.
+    ///
+    /// `peer` is the connected transport identity, `grant` is that peer's owner-configured
+    /// attestor authority (`None` when it has none), and `attestation` is the on-behalf-of claim —
+    /// absent when the peer proposes as itself. The broker — never the peer — performs the
+    /// subject-to-principal mapping. Every refusal is an audited, replay-consuming denial with a
+    /// stable class (`attestation-denied` for a missing or out-of-scope grant, `unmapped-subject`
+    /// for a subject the directory does not name), so a compromised or misconfigured gateway
+    /// leaves a decision trail rather than a silent error. A denied `agent.prompt` is reported as
+    /// `agent-denied` under the *attested* context: the attestation itself was honored, and the
+    /// refusal is about who may drive this agent.
+    ///
+    /// The chat-memory routes are reachable only from a chat-scoped claim, and the record route is
+    /// reachable from no proposal at all — [`Broker::record_delivered_turn`] is its only entrance.
+    pub async fn invoke(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
-        claim: &ChatSessionClaim,
-        word: &str,
-        argv: &[String],
-    ) -> Result<CommandResolution, BrokerHostError> {
-        // The word stays unknown on the wire — telling a refused caller that it exists would
-        // leak the surface the refusal withheld — so the class lands on the broker's own side
-        // instead of nowhere at all.
-        let context = match self.resolve_chat_claim(peer, grant, claim) {
-            Ok(context) => context,
-            Err(refusal) => {
-                report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
-                return Err(BrokerHostError::UnknownCommandWord {
-                    word: word.to_owned(),
-                });
-            }
-        };
-        // A chat-memory word is offered only to a session the surface is authorized for; every
-        // other word must not resolve onto the surface, and the surface's own words must resolve
-        // only onto its two retrieval routes. Recording stays unreachable from any word.
-        let memory_word = self.is_chat_memory_word(word);
-        if memory_word && self.memory_surface(&context, &claim.agent).is_none() {
-            return Err(BrokerHostError::UnknownCommandWord {
-                word: word.to_owned(),
-            });
-        }
-        let resolution = self.registry.resolve_command(word, argv).await?;
-        if matches!(
-            &resolution,
-            CommandResolution::Resolved { capability, .. } if {
-                let route = self.route(capability);
-                if memory_word { !route.is_chat_memory_retrieval() } else { route.is_chat_memory() }
-            }
-        ) {
-            return Err(BrokerHostError::UnknownCommandWord {
-                word: word.to_owned(),
-            });
-        }
-        Ok(resolution)
-    }
-
-    /// Executes one generic proposal under invocation-bound chat authority.
-    pub async fn invoke_for_chat(
-        &self,
-        peer: &AuthenticatedContext,
-        grant: Option<&AttestorGrant>,
-        attestation: &ChatAttestation,
+        attestation: Option<&Attestation>,
         mut request: InvocationRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        let claim = ChatSessionClaim {
-            subject: attestation.subject.clone(),
-            agent: attestation.agent.clone(),
-            scope: attestation.scope.clone(),
+        // Resolved once. The claim decides the context and the refusal together, so a second call
+        // would re-evaluate the `agent.prompt` policy for the same message and throw the class
+        // away in favour of a single flattened reason.
+        let (context, mut refusal) = match attestation {
+            Some(claim) => self.resolve_context(peer, grant, claim),
+            None => (peer.clone(), None),
         };
-        // Resolved once. The claim decides the context and the refusal together, so a second
-        // call would re-evaluate the `agent.prompt` policy for the same message and throw the
-        // class away in favour of a single flattened reason.
-        let (context, mut refusal) = match self.resolve_chat_claim(peer, grant, &claim) {
-            Ok(context) => (
-                context,
-                (attestation.invocation != request.id)
-                    .then(|| unevaluated_refusal("chat-attestation-denied")),
-            ),
-            Err(refusal) => (
-                peer.with_refused_subject(attestation.subject.clone()),
-                Some(refusal),
-            ),
-        };
+        let chat = attestation.filter(|claim| claim.scope.is_some());
+        if let Some(claim) = chat
+            && refusal.is_none()
+            && !claim.binds(&request.id)
+        {
+            refusal = Some(unevaluated_refusal("chat-attestation-denied"));
+        }
+        // First refusal wins. The claim decided who this is, so a route check that overwrote it
+        // would report the shape of the capability instead of the reason the caller was refused.
         let route = self.route(&request.capability);
-        match route {
-            CapabilityRoute::Generic => {}
-            CapabilityRoute::ChatMemoryRecord => {
-                refusal = Some(Refusal {
-                    reason: "record-operation-required",
-                    policy_ids: Vec::new(),
-                });
-            }
-            CapabilityRoute::ChatMemoryRecent | CapabilityRoute::ChatMemorySearch => {
-                if self.memory_surface(&context, &attestation.agent).is_none() {
-                    refusal = Some(Refusal {
-                        reason: "memory-unavailable",
-                        policy_ids: Vec::new(),
-                    });
-                } else if let Err(reason) = self.curate_memory_input(route, &mut request) {
-                    refusal = Some(Refusal {
-                        reason,
-                        policy_ids: Vec::new(),
-                    });
+        if refusal.is_none() {
+            if let Some(claim) = chat {
+                match route {
+                    CapabilityRoute::Generic => {}
+                    // Recording is reachable only through `record_delivered_turn`, whatever a
+                    // proposal names and whatever attestation carries it.
+                    CapabilityRoute::ChatMemoryRecord => {
+                        refusal = Some(unevaluated_refusal("record-operation-required"));
+                    }
+                    CapabilityRoute::ChatMemoryRecent | CapabilityRoute::ChatMemorySearch => {
+                        if self.memory_surface(&context, &claim.agent).is_none() {
+                            refusal = Some(unevaluated_refusal("memory-unavailable"));
+                        } else if let Err(reason) = self.curate_memory_input(route, &mut request) {
+                            refusal = Some(unevaluated_refusal(reason));
+                        }
+                    }
                 }
+            } else if route.is_chat_memory() {
+                // No chat scope was claimed at all, so the whole durable-memory surface is
+                // structurally out of reach whether or not the caller attested a subject.
+                refusal = Some(unevaluated_refusal("chat-scope-required"));
             }
         }
         self.invoke_inner(&context, request, refusal).await
     }
 
     /// Constructs the hidden record proposal from typed post-acceptance fields only.
-    pub async fn record_delivered_turn_for_chat(
+    ///
+    /// Its own entry point on purpose: the record route is refused on [`Broker::invoke`] whatever
+    /// attestation accompanies the proposal, so nothing a model shaped can reach it.
+    pub async fn record_delivered_turn(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
-        attestation: &ChatAttestation,
+        attestation: &Attestation,
         turn: DeliveredTurnRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        let claim = ChatSessionClaim {
-            subject: attestation.subject.clone(),
-            agent: attestation.agent.clone(),
-            scope: attestation.scope.clone(),
-        };
-        // Resolved once, exactly as the generic chat path is: the refusal the claim produced is
-        // the most specific one there is, so the later checks only run when the claim held.
-        let (context, claim_refusal) = match self.resolve_chat_claim(peer, grant, &claim) {
-            Ok(context) => (context, None),
-            Err(refusal) => (
-                peer.with_refused_subject(attestation.subject.clone()),
-                Some(refusal),
-            ),
-        };
+        // Resolved once, exactly as the generic path is: the refusal the claim produced is the
+        // most specific one there is, so the later checks only run when the claim held.
+        let (context, claim_refusal) = self.resolve_context(peer, grant, attestation);
         let refusal = claim_refusal.or_else(|| {
-            if attestation.invocation != turn.id {
+            if !attestation.binds(&turn.id) {
                 Some(unevaluated_refusal("chat-attestation-denied"))
             } else if self.memory_surface(&context, &attestation.agent).is_none() {
                 Some(unevaluated_refusal("memory-unavailable"))
-            } else if !turn.is_bounded() || !turn.delivery.is_canonical_for(&attestation.scope) {
+            } else if !turn.is_bounded()
+                || !attestation
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
+            {
                 Some(unevaluated_refusal("invalid-turn"))
             } else {
                 None
@@ -3651,68 +3547,77 @@ where
         self.invoke_inner(&context, request, refusal).await
     }
 
-    /// Derives the chat context, or the refusal that stopped it.
+    /// Derives the context one attested operation is evaluated — or refused — under.
+    ///
+    /// This is the single place attestation shape is interpreted. A claim with no `scope` derives
+    /// the legacy attested context; a chat claim additionally binds the transport scope that the
+    /// durable-memory surface is checked against. Both answer with the same refusal classes, and
+    /// the context always comes back: a refusal reached before the subject-to-principal mapping is
+    /// attributed to the connecting peer annotated with the subject it claimed, while a refusal
+    /// the `agent.prompt` policy reached is attributed to the attested context it was about.
     ///
     /// The refusal exists so a caller can report or audit it once; the wire answer stays the same
     /// opaque nothing it was. It carries the determining `policy_ids` alongside the class, because
     /// an `agent-denied` or `policy-error` a caller flattens into a bare class is a denial with no
     /// route back to the rule that made it.
-    fn resolve_chat_claim(
+    fn resolve_context(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
-        claim: &ChatSessionClaim,
-    ) -> Result<AuthenticatedContext, Refusal> {
-        let grant = grant.ok_or_else(|| unevaluated_refusal("attestation-denied"))?;
-        let principal = self
-            .identities
-            .resolve(&claim.subject)
-            .ok_or_else(|| unevaluated_refusal("unmapped-subject"))?;
+        claim: &Attestation,
+    ) -> (AuthenticatedContext, Option<Refusal>) {
+        let refused = || peer.with_refused_subject(claim.subject.clone());
+        let Some(grant) = grant else {
+            return (refused(), Some(unevaluated_refusal("attestation-denied")));
+        };
+        let Some(principal) = self.identities.resolve(&claim.subject) else {
+            return (refused(), Some(unevaluated_refusal("unmapped-subject")));
+        };
+        let actor = Actor::Agent {
+            agent: claim.agent.clone(),
+        };
         // `chatScopes` was added for storage namespace authority. An existing subject-only
         // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
-        // using the chat operations. It receives the legacy context with no trusted chat scope,
-        // which makes the complete durable-memory surface structurally unavailable. Once any
-        // chat scope is authored, the service-specific canonical checks and exact grant apply.
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "this function answers with a stable refusal class rather than an error, so \
-                      that the wire answer stays the opaque nothing it was; a ContextError here \
-                      means the broker's own trusted state disagreed with itself, and it has \
-                      nowhere to go that would not tell a refused caller what it must not learn"
-        )]
-        let context = if grant.chat_scopes.is_empty() {
-            if !grant.permits(&claim.subject) {
-                return Err(unevaluated_refusal("attestation-denied"));
+        // claiming a scope. It receives the legacy context with no trusted chat scope, which makes
+        // the complete durable-memory surface structurally unavailable. Once any chat scope is
+        // authored, the service-specific canonical checks and exact grant apply.
+        let derived = match &claim.scope {
+            Some(scope) if !grant.chat_scopes.is_empty() => {
+                if !grant.permits_chat(&claim.subject, scope) {
+                    return (refused(), Some(unevaluated_refusal("attestation-denied")));
+                }
+                AuthenticatedContext::attested_chat(
+                    principal.clone(),
+                    actor,
+                    peer.principal().clone(),
+                    claim.subject.clone(),
+                    scope.clone(),
+                )
             }
-            AuthenticatedContext::attested(
-                principal.clone(),
-                Actor::Agent {
-                    agent: claim.agent.clone(),
-                },
-                peer.principal().clone(),
-                claim.subject.clone(),
-            )
-            .map_err(|_| unevaluated_refusal("attestation-denied"))?
-        } else {
-            if !grant.permits_chat(&claim.subject, &claim.scope) {
-                return Err(unevaluated_refusal("attestation-denied"));
+            Some(_) | None => {
+                if !grant.permits(&claim.subject) {
+                    return (refused(), Some(unevaluated_refusal("attestation-denied")));
+                }
+                AuthenticatedContext::attested(
+                    principal.clone(),
+                    actor,
+                    peer.principal().clone(),
+                    claim.subject.clone(),
+                )
             }
-            AuthenticatedContext::attested_chat(
-                principal.clone(),
-                Actor::Agent {
-                    agent: claim.agent.clone(),
-                },
-                peer.principal().clone(),
-                claim.subject.clone(),
-                claim.scope.clone(),
-            )
-            .map_err(|_| unevaluated_refusal("attestation-denied"))?
+        };
+        // A `ContextError` here means the broker's own trusted state disagreed with itself — it is
+        // unreachable while agent actors carry no principal — and it has nowhere to go that would
+        // not tell a refused caller what it must not learn. It becomes the same stable class every
+        // other unhonored claim gets.
+        let Ok(context) = derived else {
+            return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
         let decision = self.authorize_agent_prompt(&context, &claim.agent);
         if decision.allowed {
-            Ok(context)
+            (context, None)
         } else {
-            Err(decided_refusal(decision, "agent-denied"))
+            (context, Some(decided_refusal(decision, "agent-denied")))
         }
     }
 
@@ -4027,43 +3932,6 @@ where
             }
         };
         Ok(())
-    }
-
-    /// Derives the context an attested proposal is evaluated — or refused — under.
-    fn resolve_attestation(
-        &self,
-        peer: &AuthenticatedContext,
-        grant: Option<&AttestorGrant>,
-        attestation: &SubjectAttestation,
-    ) -> (AuthenticatedContext, Option<&'static str>) {
-        if !grant.is_some_and(|grant| grant.permits(&attestation.subject)) {
-            return (
-                peer.with_refused_subject(attestation.subject.clone()),
-                Some("attestation-denied"),
-            );
-        }
-        let Some(principal) = self.identities.resolve(&attestation.subject) else {
-            return (
-                peer.with_refused_subject(attestation.subject.clone()),
-                Some("unmapped-subject"),
-            );
-        };
-        match AuthenticatedContext::attested(
-            principal.clone(),
-            Actor::Agent {
-                agent: attestation.agent.clone(),
-            },
-            peer.principal().clone(),
-            attestation.subject.clone(),
-        ) {
-            Ok(context) => (context, None),
-            // Unreachable while agent actors carry no principal, but a refusal is the only
-            // acceptable fallback if that invariant ever changes.
-            Err(_) => (
-                peer.with_refused_subject(attestation.subject.clone()),
-                Some("attestation-denied"),
-            ),
-        }
     }
 
     async fn invoke_inner(
@@ -4452,7 +4320,7 @@ where
                 clippy::map_err_ignore,
                 reason = "not wire input: every externally reachable entry point refuses \
                           the record route, so the only proposal reaching here is the one \
-                          `record_delivered_turn_for_chat` builds from a typed DeliveryIdentity \
+                          `record_delivered_turn` builds from a typed DeliveryIdentity \
                           — this is that value's own round trip, and serde has no malformed \
                           input to name"
             )]

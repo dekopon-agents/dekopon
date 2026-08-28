@@ -8,11 +8,11 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerError,
-    BrokerLimits, CapabilityRoute, ChatAttestation, ChatMemoryConfig, ChatScopeGrant,
-    ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
-    DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
-    PolicyWorld, RouteConflict, SubjectAttestation,
+    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
+    BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatScopeGrant,
+    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, DeliveredTurnRequest,
+    DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    RouteConflict,
 };
 
 /// Capability identifiers the shipped `memory-chat` provider declares.
@@ -339,23 +339,23 @@ fn gateway() -> dekopon_broker::AuthenticatedContext {
     .expect("context")
 }
 
-fn claim() -> ChatSessionClaim {
+fn claim() -> Attestation {
     claim_for("c0123abc:1712345678.000100")
 }
 
-fn claim_for(conversation: &str) -> ChatSessionClaim {
-    ChatSessionClaim {
-        subject: "slack.t0123abc.u9xyz"
+fn claim_for(conversation: &str) -> Attestation {
+    Attestation::for_chat(
+        "slack.t0123abc.u9xyz"
             .parse::<ExternalSubject>()
             .expect("subject"),
-        agent: "reviewer".parse::<AgentId>().expect("agent"),
-        scope: ChatScopeClaim {
+        "reviewer".parse::<AgentId>().expect("agent"),
+        ChatScopeClaim {
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             channel: "c0123abc".to_owned(),
             conversation: conversation.to_owned(),
         },
-    }
+    )
 }
 
 fn grant() -> AttestorGrant {
@@ -413,15 +413,10 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
     let attestor = grant();
     let session = claim();
     let error = broker
-        .record_delivered_turn_for_chat(
+        .record_delivered_turn(
             &gateway(),
             Some(&attestor),
-            &ChatAttestation {
-                subject: session.subject,
-                agent: session.agent,
-                scope: session.scope,
-                invocation: id.clone(),
-            },
+            &session.bound_to(id.clone()),
             DeliveredTurnRequest {
                 id,
                 trace: "trace-audit-full-record".parse().expect("trace"),
@@ -498,12 +493,14 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
         namespaces: vec!["slack.t0123abc".to_owned()],
         chat_scopes: Vec::new(),
     };
-    let (legacy_capabilities, legacy_words) = broker
-        .capabilities_for(
+    let (legacy_capabilities, legacy_words, _memory) = broker
+        .capability_surface(
             &gateway(),
             Some(&legacy_grant),
-            &session.subject,
-            &session.agent,
+            Some(&Attestation::for_subject(
+                session.subject.clone(),
+                session.agent.clone(),
+            )),
         )
         .expect("legacy subject-only chat remains authorized");
     assert!(
@@ -514,7 +511,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     assert!(!legacy_words.iter().any(|word| word == storage_word));
 
     let (scoped_capabilities, scoped_words, _) = broker
-        .capabilities_for_chat(&gateway(), Some(&grant()), &session)
+        .capability_surface(&gateway(), Some(&grant()), Some(&session))
         .expect("scoped chat is authorized");
     assert!(
         scoped_capabilities
@@ -612,7 +609,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
     assert_eq!(broker.command_words(&caller), ["recall"]);
     broker
-        .resolve_command("recall", &[])
+        .resolve_command(&caller, None, None, "recall", &[])
         .await
         .expect("the word of a provider that owns no route resolves normally");
 
@@ -623,6 +620,8 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         let result = broker
             .invoke(
                 &caller,
+                None,
+                None,
                 InvocationRequest {
                     id: format!("unrouted-direct-{index}")
                         .parse()
@@ -651,31 +650,33 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         chat_scopes: Vec::new(),
     };
     let claim = claim();
-    let (listed, _) = broker
-        .capabilities_for(&gateway, Some(&grant), &claim.subject, &claim.agent)
+    let (listed, _, _) = broker
+        .capability_surface(
+            &gateway,
+            Some(&grant),
+            Some(&Attestation::for_subject(
+                claim.subject.clone(),
+                claim.agent.clone(),
+            )),
+        )
         .expect("legacy attestation is honored");
     assert_eq!(listed.len(), 2, "the attested listing reserves nothing");
     let (listed, words, memory) = broker
-        .capabilities_for_chat(&gateway, Some(&grant), &claim)
+        .capability_surface(&gateway, Some(&grant), Some(&claim))
         .expect("ordinary chat remains available");
     assert_eq!(listed.len(), 2);
     assert_eq!(words, ["recall"]);
     assert!(memory.is_none(), "no route means no memory surface");
     broker
-        .resolve_command_for_chat(&gateway, Some(&grant), &claim, "recall", &[])
+        .resolve_command(&gateway, Some(&grant), Some(&claim), "recall", &[])
         .await
         .expect("chat resolution reserves nothing either");
     let chat_id = "unrouted-chat".parse::<InvocationId>().expect("invocation");
     let chat_result = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway,
             Some(&grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: chat_id.clone(),
-            },
+            Some(&claim.bound_to(chat_id.clone())),
             InvocationRequest {
                 id: chat_id,
                 capability: "ordinary.escape".parse().expect("capability"),
@@ -697,14 +698,10 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         .parse::<InvocationId>()
         .expect("invocation");
     let result = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&grant),
-            &SubjectAttestation {
-                subject: claim.subject,
-                agent: claim.agent,
-                invocation: id.clone(),
-            },
+            Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
             InvocationRequest {
                 id,
                 capability: "ordinary.escape".parse().expect("capability"),
@@ -910,7 +907,10 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     assert!(broker.capabilities(&caller).is_empty());
     assert!(broker.command_words(&caller).is_empty());
     assert!(
-        broker.resolve_command("storageprobe", &[]).await.is_err(),
+        broker
+            .resolve_command(&caller, None, None, "storageprobe", &[])
+            .await
+            .is_err(),
         "the routed provider's word is reserved even though nothing about it says memory"
     );
 
@@ -920,6 +920,8 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     let result = broker
         .invoke(
             &caller,
+            None,
+            None,
             InvocationRequest {
                 id: direct,
                 capability: "storage-probe.run".parse().expect("capability"),
@@ -940,32 +942,34 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     let gateway = gateway();
     let grant = grant();
     let claim = claim();
-    let (listed, words) = broker
-        .capabilities_for(&gateway, Some(&grant), &claim.subject, &claim.agent)
+    let (listed, words, _memory) = broker
+        .capability_surface(
+            &gateway,
+            Some(&grant),
+            Some(&Attestation::for_subject(
+                claim.subject.clone(),
+                claim.agent.clone(),
+            )),
+        )
         .expect("legacy attestation is honored");
     assert!(listed.is_empty() && words.is_empty());
     let (listed, words, memory) = broker
-        .capabilities_for_chat(&gateway, Some(&grant), &claim)
+        .capability_surface(&gateway, Some(&grant), Some(&claim))
         .expect("ordinary chat remains available");
     assert!(listed.is_empty() && words.is_empty() && memory.is_none());
     assert!(
         broker
-            .resolve_command_for_chat(&gateway, Some(&grant), &claim, "storageprobe", &[])
+            .resolve_command(&gateway, Some(&grant), Some(&claim), "storageprobe", &[])
             .await
             .is_err()
     );
 
     let chat_id = "renamed-chat".parse::<InvocationId>().expect("invocation");
     let chat_result = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway,
             Some(&grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: chat_id.clone(),
-            },
+            Some(&claim.bound_to(chat_id.clone())),
             InvocationRequest {
                 id: chat_id,
                 capability: "storage-probe.run".parse().expect("capability"),
@@ -991,14 +995,10 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
         .parse::<InvocationId>()
         .expect("invocation");
     let result = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&grant),
-            &SubjectAttestation {
-                subject: claim.subject,
-                agent: claim.agent,
-                invocation: id.clone(),
-            },
+            Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
             InvocationRequest {
                 id,
                 capability: "storage-probe.run".parse().expect("capability"),
@@ -1072,7 +1072,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let claim = claim();
     let grant = grant();
     let (capabilities, words, memory) = broker
-        .capabilities_for_chat(&gateway(), Some(&grant), &claim)
+        .capability_surface(&gateway(), Some(&grant), Some(&claim))
         .expect("chat scope accepted");
     assert_eq!(
         capabilities
@@ -1098,7 +1098,10 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             .all(|word| word != "memory")
     );
     assert!(
-        broker.resolve_command("memory", &[]).await.is_err(),
+        broker
+            .resolve_command(&gateway(), None, None, "memory", &[])
+            .await
+            .is_err(),
         "legacy command resolution never enters the memory provider"
     );
     // A routed capability on the two legacy paths: reserved, denied, and audited without the
@@ -1119,19 +1122,18 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         };
         let result = if attested {
             broker
-                .invoke_for(
+                .invoke(
                     &gateway(),
                     Some(&grant),
-                    &SubjectAttestation {
-                        subject: claim.subject.clone(),
-                        agent: claim.agent.clone(),
-                        invocation: id,
-                    },
+                    Some(
+                        &Attestation::for_subject(claim.subject.clone(), claim.agent.clone())
+                            .bound_to(id),
+                    ),
                     request,
                 )
                 .await
         } else {
-            broker.invoke(&gateway(), request).await
+            broker.invoke(&gateway(), None, None, request).await
         }
         .expect("reserved route denial is audited");
         assert_eq!(
@@ -1142,16 +1144,18 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 
     let mut swaps = Vec::new();
     let mut swapped = claim.clone();
-    swapped.scope.channel = "c999999".to_owned();
+    swapped.scope.as_mut().expect("chat scope").channel = "c999999".to_owned();
     swaps.push(swapped);
     let mut swapped = claim.clone();
-    swapped.scope.conversation = "c0123abc:1712345678.999999".to_owned();
+    swapped.scope.as_mut().expect("chat scope").conversation =
+        "c0123abc:1712345678.999999".to_owned();
     swaps.push(swapped);
     let mut swapped = claim.clone();
-    swapped.scope.transport = "other-slack".parse().expect("transport");
+    swapped.scope.as_mut().expect("chat scope").transport =
+        "other-slack".parse().expect("transport");
     swaps.push(swapped);
     let mut swapped = claim.clone();
-    swapped.scope.kind = ChatTransportKind::Discord;
+    swapped.scope.as_mut().expect("chat scope").kind = ChatTransportKind::Discord;
     swaps.push(swapped);
     let mut swapped = claim.clone();
     swapped.agent = "other-agent".parse().expect("agent");
@@ -1159,7 +1163,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     for swapped in swaps {
         assert!(
             broker
-                .capabilities_for_chat(&gateway(), Some(&grant), &swapped)
+                .capability_surface(&gateway(), Some(&grant), Some(&swapped))
                 .is_none(),
             "every independently swapped scope field denies"
         );
@@ -1176,15 +1180,10 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         .parse::<InvocationId>()
         .expect("invocation");
     let generic = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway(),
             Some(&grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: generic_id.clone(),
-            },
+            Some(&claim.bound_to(generic_id.clone())),
             InvocationRequest {
                 id: generic_id,
                 capability: "memory.chat.record".parse().expect("capability"),
@@ -1204,15 +1203,10 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 
     let record_id = "record-1".parse::<InvocationId>().expect("invocation");
     let record = broker
-        .record_delivered_turn_for_chat(
+        .record_delivered_turn(
             &gateway(),
             Some(&grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: record_id.clone(),
-            },
+            &claim.bound_to(record_id.clone()),
             DeliveredTurnRequest {
                 id: record_id,
                 trace: "trace-memory".parse().expect("trace"),
@@ -1249,15 +1243,10 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let broker = build_broker(&root, &key, audit_after_restart).await;
     let recent_id = "recent-1".parse::<InvocationId>().expect("invocation");
     let recent = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway(),
             Some(&grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: recent_id.clone(),
-            },
+            Some(&claim.bound_to(recent_id.clone())),
             InvocationRequest {
                 id: recent_id,
                 capability: "memory.chat.recent".parse().expect("capability"),
@@ -1737,7 +1726,7 @@ async fn record_turn(
 )]
 async fn record_turn_in(
     broker: &Broker<InMemoryAuditLog>,
-    claim: &ChatSessionClaim,
+    claim: &Attestation,
     grant: &AttestorGrant,
     invocation: &str,
     timestamp: &str,
@@ -1746,15 +1735,10 @@ async fn record_turn_in(
 ) -> dekopon_capability::InvocationResult {
     let id = invocation.parse::<InvocationId>().expect("invocation");
     broker
-        .record_delivered_turn_for_chat(
+        .record_delivered_turn(
             &gateway(),
             Some(grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: id.clone(),
-            },
+            &claim.bound_to(id.clone()),
             DeliveredTurnRequest {
                 id,
                 trace: format!("trace-{invocation}").parse().expect("trace"),
@@ -1797,7 +1781,7 @@ async fn query_memory_result(
 
 async fn query_memory_result_in(
     broker: &Broker<InMemoryAuditLog>,
-    claim: &ChatSessionClaim,
+    claim: &Attestation,
     grant: &AttestorGrant,
     invocation: &str,
     capability: &str,
@@ -1805,15 +1789,10 @@ async fn query_memory_result_in(
 ) -> dekopon_capability::InvocationResult {
     let id = invocation.parse::<InvocationId>().expect("invocation");
     broker
-        .invoke_for_chat(
+        .invoke(
             &gateway(),
             Some(grant),
-            &ChatAttestation {
-                subject: claim.subject.clone(),
-                agent: claim.agent.clone(),
-                scope: claim.scope.clone(),
-                invocation: id.clone(),
-            },
+            Some(&claim.bound_to(id.clone())),
             InvocationRequest {
                 id,
                 capability: capability.parse().expect("capability"),
@@ -1829,7 +1808,7 @@ async fn query_memory_result_in(
 
 async fn query_memory_in(
     broker: &Broker<InMemoryAuditLog>,
-    claim: &ChatSessionClaim,
+    claim: &Attestation,
     grant: &AttestorGrant,
     invocation: &str,
     capability: &str,
@@ -2216,15 +2195,10 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
     let session = claim();
     let id = invocation.parse::<InvocationId>().expect("invocation");
     let result = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway(),
             Some(&grant()),
-            &ChatAttestation {
-                subject: session.subject,
-                agent: session.agent,
-                scope: session.scope,
-                invocation: id.clone(),
-            },
+            Some(&session.bound_to(id.clone())),
             InvocationRequest {
                 id,
                 capability: "storage-probe.run".parse().expect("capability"),

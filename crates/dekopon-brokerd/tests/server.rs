@@ -10,10 +10,10 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    AgentInventory, BrokerClient, BrokerResponse, ClientError, ERROR_BROKER_UNAVAILABLE,
-    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED, FrameLimits,
-    ModelUsageReport, ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope,
-    SubjectAttestation, read_frame, write_frame,
+    AgentInventory, Attestation, BrokerClient, BrokerResponse, ClientError,
+    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ReportedAgent, ReportedAgentCapability,
+    RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
@@ -306,7 +306,7 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability.id.as_str(), "echo.echo");
     let result = client
-        .invoke(request("invoke-brokerd"))
+        .invoke(None, request("invoke-brokerd"))
         .await
         .expect("invoke");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
@@ -453,7 +453,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create service client");
     let result = client
-        .invoke(request("invoke-durable-service"))
+        .invoke(None, request("invoke-durable-service"))
         .await
         .expect("first invocation completes");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
@@ -471,7 +471,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create restarted service client");
     let replay = client
-        .invoke(request("invoke-durable-service"))
+        .invoke(None, request("invoke-durable-service"))
         .await
         .expect("replay receives an accounted denial");
     assert_eq!(replay.outcome, InvocationOutcome::Denied);
@@ -646,7 +646,7 @@ when { context.capability == "http-probe.fetch"
         }),
     };
     let result = client
-        .invoke(invocation.clone())
+        .invoke(None, invocation.clone())
         .await
         .expect("secret invocation succeeds");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
@@ -665,7 +665,7 @@ when { context.capability == "http-probe.fetch"
         "method": "GET"
     });
     let denied = client
-        .invoke(invocation)
+        .invoke(None, invocation)
         .await
         .expect("host refusal is accounted");
     assert_eq!(denied.outcome, InvocationOutcome::Failed);
@@ -847,7 +847,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let ran = client
-        .invoke(request("invoke-outcome-unaudited"))
+        .invoke(None, request("invoke-outcome-unaudited"))
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
     let ClientError::Remote { code, message } = ran else {
@@ -862,7 +862,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     assert_eq!(audit.records().await.len(), 1);
 
     let never_ran = client
-        .invoke(request("invoke-never-ran"))
+        .invoke(None, request("invoke-never-ran"))
         .await
         .expect_err("a full audit cannot authorize");
     let ClientError::Remote {
@@ -923,13 +923,13 @@ async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let first = client
-        .invoke(request("invoke-fills-the-ledger"))
+        .invoke(None, request("invoke-fills-the-ledger"))
         .await
         .expect("the first invocation reserves the only slot");
     assert_eq!(first.outcome, InvocationOutcome::Succeeded);
 
     let full = client
-        .invoke(request("invoke-past-the-ledger"))
+        .invoke(None, request("invoke-past-the-ledger"))
         .await
         .expect_err("a full replay ledger cannot reserve");
     let ClientError::Remote { code, message } = full else {
@@ -959,7 +959,7 @@ async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
 /// maps it, and the invocation runs under the attested context. The peer never names a principal
 /// at any point — that mapping is not something the wire can express.
 #[tokio::test(flavor = "multi_thread")]
-async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
+async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create server fixture");
     let socket_path = directory.path().join("broker.sock");
@@ -980,10 +980,9 @@ async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
-        .invoke_for(
+        .invoke(
+            Some(Attestation::for_subject(subject(), agent("chat-agent"))),
             request("invoke-attested-socket"),
-            subject(),
-            agent("chat-agent"),
         )
         .await
         .expect("attested invocation completes");
@@ -1010,7 +1009,7 @@ async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
 /// transport failure. The difference is the audit record: a denial is a decision the broker made
 /// and retained, and an error would leave the attempt with nothing accounting for it.
 #[tokio::test(flavor = "multi_thread")]
-async fn invoke_for_from_a_peer_without_a_grant_is_denied_not_erred() {
+async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create server fixture");
     let socket_path = directory.path().join("broker.sock");
@@ -1031,10 +1030,9 @@ async fn invoke_for_from_a_peer_without_a_grant_is_denied_not_erred() {
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
-        .invoke_for(
+        .invoke(
+            Some(Attestation::for_subject(subject(), agent("chat-agent"))),
             request("invoke-ungranted-socket"),
-            subject(),
-            agent("chat-agent"),
         )
         .await
         .expect("a refused attestation is still a completed invocation response");
@@ -1083,15 +1081,18 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
     let mut stream = UnixStream::connect(&socket_path)
         .await
         .expect("connect to the fixture socket");
-    let envelope = RequestEnvelope::invoke_for(
-        request("invoke-bound-identifier"),
-        SubjectAttestation {
+    let envelope = RequestEnvelope::invoke(
+        Some(Attestation {
             subject: subject(),
             agent: agent("chat-agent"),
-            invocation: "invoke-some-other-proposal"
-                .parse::<InvocationId>()
-                .expect("valid invocation fixture"),
-        },
+            scope: None,
+            invocation: Some(
+                "invoke-some-other-proposal"
+                    .parse::<InvocationId>()
+                    .expect("valid invocation fixture"),
+            ),
+        }),
+        request("invoke-bound-identifier"),
     );
     write_frame(&mut stream, &envelope, limits.frame)
         .await
@@ -1139,8 +1140,11 @@ async fn capabilities_for_over_the_socket() {
     let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let (capabilities, _) = client
-        .session_surface_for(subject(), agent("chat-agent"))
+    let (capabilities, _, _) = client
+        .session_surface(Some(Attestation::for_subject(
+            subject(),
+            agent("chat-agent"),
+        )))
         .await
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
@@ -1177,7 +1181,10 @@ async fn capabilities_for_over_the_socket() {
 
     let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
     let refused = client
-        .session_surface_for(subject(), agent("chat-agent"))
+        .session_surface(Some(Attestation::for_subject(
+            subject(),
+            agent("chat-agent"),
+        )))
         .await
         .expect_err("a peer without attestor authority is refused");
     let ClientError::Remote { code, .. } = refused else {

@@ -12,10 +12,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ChatAttestation,
-    ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld, SubjectAttestation,
+    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -219,7 +218,7 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
     }
 }
 
-/// The eight capability rows, evaluated through `invoke`/`invoke_for` rather than the policy
+/// The eight capability rows, evaluated through `invoke` attested and unattested rather than the policy
 /// engine directly, so the assertion covers the whole decision path.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_workflow_decision_table_holds_end_to_end() {
@@ -236,7 +235,7 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                 )
                 .expect("direct context binds");
                 broker
-                    .invoke(&context, request)
+                    .invoke(&context, None, None, request)
                     .await
                     .expect("the proposal is accounted")
             }
@@ -248,19 +247,16 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                     },
                 )
                 .expect("gateway context binds");
-                let attestation = SubjectAttestation {
-                    subject: subject(),
-                    agent: agent(row.agent),
-                    invocation: request.id.clone(),
-                };
+                let attestation = Attestation::for_subject(subject(), agent(row.agent))
+                    .bound_to(request.id.clone());
                 broker
-                    .invoke_for(
+                    .invoke(
                         &peer,
                         Some(&AttestorGrant {
                             namespaces: vec!["slack.t0123abc".to_owned()],
                             chat_scopes: Vec::new(),
                         }),
-                        &attestation,
+                        Some(&attestation),
                         request,
                     )
                     .await
@@ -295,24 +291,28 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
 
     assert!(
         broker
-            .capabilities_for(&gateway, Some(&grant), &subject(), &agent("some-agent"))
+            .capability_surface(
+                &gateway,
+                Some(&grant),
+                Some(&Attestation::for_subject(subject(), agent("some-agent"))),
+            )
             .is_some(),
         "the permitted agent may be driven"
     );
     let (capabilities, _words, memory) = broker
-        .capabilities_for_chat(
+        .capability_surface(
             &gateway,
             Some(&grant),
-            &ChatSessionClaim {
-                subject: subject(),
-                agent: agent("some-agent"),
-                scope: ChatScopeClaim {
+            Some(&Attestation::for_chat(
+                subject(),
+                agent("some-agent"),
+                ChatScopeClaim {
                     transport: "scientist-slack".parse::<TransportId>().expect("transport"),
                     kind: ChatTransportKind::Slack,
                     channel: "c0123abc".to_owned(),
                     conversation: "c0123abc:1712345678.000100".to_owned(),
                 },
-            },
+            )),
         )
         .expect("legacy subject-only attestor remains compatible with chat operations");
     assert!(!capabilities.is_empty());
@@ -323,20 +323,22 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
 
     let ordinary = request(98, "echo.reverse");
     let ordinary_result = broker
-        .invoke_for_chat(
+        .invoke(
             &gateway,
             Some(&grant),
-            &ChatAttestation {
-                subject: subject(),
-                agent: agent("some-agent"),
-                scope: ChatScopeClaim {
-                    transport: "scientist-slack".parse::<TransportId>().expect("transport"),
-                    kind: ChatTransportKind::Slack,
-                    channel: "c0123abc".to_owned(),
-                    conversation: "c0123abc:1712345678.000100".to_owned(),
-                },
-                invocation: ordinary.id.clone(),
-            },
+            Some(
+                &Attestation::for_chat(
+                    subject(),
+                    agent("some-agent"),
+                    ChatScopeClaim {
+                        transport: "scientist-slack".parse::<TransportId>().expect("transport"),
+                        kind: ChatTransportKind::Slack,
+                        channel: "c0123abc".to_owned(),
+                        conversation: "c0123abc:1712345678.000100".to_owned(),
+                    },
+                )
+                .bound_to(ordinary.id.clone()),
+            ),
             ordinary,
         )
         .await
@@ -345,7 +347,11 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
 
     assert!(
         broker
-            .capabilities_for(&gateway, Some(&grant), &subject(), &agent("other-agent"))
+            .capability_surface(
+                &gateway,
+                Some(&grant),
+                Some(&Attestation::for_subject(subject(), agent("other-agent"))),
+            )
             .is_none(),
         "an agent no policy names is refused exactly like an unhonored attestation"
     );
@@ -354,14 +360,13 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
     // attestation was honored, so `attestation-denied` would misattribute what was refused.
     let proposal = request(99, "echo.reverse");
     let refused = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&grant),
-            &SubjectAttestation {
-                subject: subject(),
-                agent: agent("other-agent"),
-                invocation: proposal.id.clone(),
-            },
+            Some(
+                &Attestation::for_subject(subject(), agent("other-agent"))
+                    .bound_to(proposal.id.clone()),
+            ),
             proposal,
         )
         .await

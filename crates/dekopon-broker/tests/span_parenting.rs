@@ -138,6 +138,8 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
             broker
                 .invoke(
                     &caller(),
+                    None,
+                    None,
                     InvocationRequest {
                         id: "invoke-suspended"
                             .parse()

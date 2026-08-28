@@ -38,9 +38,10 @@ authoritative copy of each:
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
   through to a broker leg.
 - `BrokerLeg` — a synchronous `CapabilityInvoker` facade over the asynchronous
-  `dekopon-broker-protocol` client, valid only on a blocking task; `connect_attested`
-  additionally proposes on behalf of a transport-authenticated external subject, which
-  the broker honors only under an owner-configured attestor grant. Its fresh capability
+  `dekopon-broker-protocol` client, valid only on a blocking task. `BrokerLeg::connect`
+  takes an optional `Attestation`: `None` speaks as the connected peer, and a claim
+  proposes on behalf of a transport-authenticated external subject, which the broker
+  honors only under an owner-configured attestor grant. Its fresh capability
   snapshot also supplies trusted effect/risk/idempotency metadata for self-inspection,
   never policy source, identity, constraints, or credentials.
 - `IdSequence` — collision-free trace and invocation identifiers under a caller-chosen
@@ -74,7 +75,8 @@ when the embedding binary opts into payload telemetry.
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
 `docs/design.md` for the authority model this crate deliberately sits outside of.
 
-A gateway may use `BrokerLeg::connect_chat` to snapshot an invocation-bound chat surface. Only that
-leg can receive the broker-derived durable-memory prompt note or dispatch chat-scoped command/
-invocation operations. It still owns no storage grant or recording authority; the gateway performs
-the dedicated post-acceptance record request on a fresh client outside the model's capability seam.
+A gateway passes a chat-scoped `Attestation` to `BrokerLeg::connect` to snapshot an
+invocation-bound chat surface. Only that leg can receive the broker-derived durable-memory prompt
+note or reach the memory retrieval routes. It still owns no storage grant or recording authority;
+the gateway performs the dedicated post-acceptance record request on a fresh client outside the
+model's capability seam.
