@@ -127,7 +127,7 @@ pub struct StorageTransaction {
     lease: Option<File>,
     finalized: bool,
     #[cfg(test)]
-    post_marker_faults: BTreeSet<PostMarkerFault>,
+    post_marker_faults: Vec<(PostMarkerFault, StorageHostError)>,
     #[cfg(test)]
     post_marker_delay: Option<Duration>,
 }
@@ -239,7 +239,7 @@ impl StorageTransaction {
             lease: Some(lease),
             finalized: false,
             #[cfg(test)]
-            post_marker_faults: BTreeSet::new(),
+            post_marker_faults: Vec::new(),
             #[cfg(test)]
             post_marker_delay: None,
         })
@@ -601,7 +601,18 @@ impl StorageTransaction {
 
     #[cfg(test)]
     pub(crate) fn inject_post_marker_fault(&mut self, fault: PostMarkerFault) {
-        self.post_marker_faults.insert(fault);
+        self.inject_post_marker_error(fault, StorageHostError::Io);
+    }
+
+    /// Injects a post-marker failure of a chosen class, so a test can distinguish the causes an
+    /// unaudited outcome now carries rather than only the input/output one.
+    #[cfg(test)]
+    pub(crate) fn inject_post_marker_error(
+        &mut self,
+        fault: PostMarkerFault,
+        error: StorageHostError,
+    ) {
+        self.post_marker_faults.push((fault, error));
     }
 
     #[cfg(test)]
@@ -611,10 +622,13 @@ impl StorageTransaction {
 
     #[cfg(test)]
     fn fail_post_marker(&mut self, fault: PostMarkerFault) -> Result<(), StorageHostError> {
-        if self.post_marker_faults.remove(&fault) {
-            Err(StorageHostError::Io)
-        } else {
-            Ok(())
+        match self
+            .post_marker_faults
+            .iter()
+            .position(|(candidate, _)| *candidate == fault)
+        {
+            Some(index) => Err(self.post_marker_faults.remove(index).1),
+            None => Ok(()),
         }
     }
 
@@ -726,7 +740,7 @@ impl StorageTransaction {
         })();
         if let Err(error) = before_marker {
             if marker_started {
-                return self.post_marker_failure();
+                return self.post_marker_failure(&error);
             }
             // Move a partial manifest/stage set atomically out of the recovery directory before
             // deleting it. A failed recursive unlink can then leave only bounded trash, never an
@@ -849,7 +863,7 @@ impl StorageTransaction {
                 self.lease.take();
                 Ok(evidence)
             }
-            Err(_) => self.post_marker_failure(),
+            Err(source) => self.post_marker_failure(&source),
         }
     }
 
@@ -988,7 +1002,10 @@ impl StorageTransaction {
                   recovery gives `finalized.pending` precedence of unknown over `finalized`, so a \
                   failed removal reaches the same outcome this function returns"
     )]
-    fn post_marker_failure(mut self) -> Result<StorageEvidence, StorageHostError> {
+    fn post_marker_failure(
+        mut self,
+        cause: &StorageHostError,
+    ) -> Result<StorageEvidence, StorageHostError> {
         if let Some(retired) = &self.retired_transaction
             && let Ok(directory) = self.trash_root.open_directory(retired)
         {
@@ -1013,7 +1030,11 @@ impl StorageTransaction {
         }
         self.finalized = true;
         self.lease.take();
-        Err(StorageHostError::OutcomeUnaudited)
+        // The outcome stays unknown, but which kind of thing made it unknown does not have to be:
+        // a full filesystem and an exhausted quota are different operator actions.
+        Err(StorageHostError::OutcomeUnaudited {
+            cause: cause.class(),
+        })
     }
 
     fn close_all_handles(&mut self) {
@@ -1920,9 +1941,73 @@ mod tests {
         file_commitment, is_commitment, verify_manifest,
     };
     use crate::{
-        ContinuityPolicy, OpenOptions, StorageGrantRequest, StorageHost, StorageHostError,
-        StorageLimits,
+        ContinuityPolicy, OpenOptions, StorageFailureClass, StorageGrantRequest, StorageHost,
+        StorageHostError, StorageLimits,
     };
+
+    /// An unknown outcome that cannot say what made it unknown is an operator dead end.
+    ///
+    /// Every post-marker failure answers the guest with the same opaque mapped error, so the cause
+    /// has nowhere to live except this discriminant and the message that renders it. A quota and a
+    /// filesystem failure are different actions — raise the limit, or free the disk — and before
+    /// this they were the same fieldless variant.
+    #[test]
+    fn an_unaudited_outcome_names_the_class_of_the_failure_that_caused_it() {
+        let mut causes = Vec::new();
+        for injected in [StorageHostError::QuotaExceeded, StorageHostError::Io] {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let directory = temporary.path().canonicalize().expect("canonical tempdir");
+            let root = directory.join("storage");
+            let key = directory.join("key.yaml");
+            fs::write(
+                &key,
+                "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            )
+            .expect("write key");
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+            let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+            let grant = host
+                .grant(StorageGrantRequest::new(
+                    "cause-probe".parse().expect("invocation"),
+                    "memory.chat.record".parse().expect("capability"),
+                    "memory-chat".parse().expect("provider"),
+                    StorageInterface::Jsonl,
+                    StorageAccess::ReadWrite,
+                    StorageNamespace::Chat,
+                    "reviewer".parse().expect("agent"),
+                    "slack.t0123abc.u9xyz".parse().expect("subject"),
+                    "slack",
+                    "scientist-slack",
+                    "c0123abc",
+                    "c0123abc:1712345678.000100",
+                    ContinuityPolicy::Stable,
+                    b"authority".to_vec(),
+                ))
+                .expect("grant");
+            let mut transaction = host.begin(grant).expect("transaction");
+            transaction
+                .jsonl_append("turns.jsonl", 0, br#"{"durable":true}"#)
+                .expect("append");
+            transaction.inject_post_marker_error(PostMarkerFault::Accounting, injected);
+            let error = transaction
+                .commit()
+                .expect_err("a post-marker failure is never a success");
+            let StorageHostError::OutcomeUnaudited { cause } = error else {
+                panic!("a post-marker failure is an unaudited outcome, got {error:?}");
+            };
+            // The rendered message is what an operator reads through the broker's error chain.
+            assert!(
+                error.to_string().contains(cause.label()),
+                "{error} does not name its cause"
+            );
+            causes.push(cause);
+        }
+        assert_eq!(
+            causes,
+            vec![StorageFailureClass::Quota, StorageFailureClass::Io],
+            "two different causes must not collapse into one discriminant"
+        );
+    }
 
     #[test]
     fn every_post_marker_failure_is_outcome_unaudited_poisoned_and_recoverable() {
@@ -1990,7 +2075,9 @@ mod tests {
             }
             assert!(matches!(
                 transaction.commit(),
-                Err(StorageHostError::OutcomeUnaudited)
+                Err(StorageHostError::OutcomeUnaudited {
+                    cause: StorageFailureClass::Io
+                })
             ));
             assert_eq!(
                 walk(&root).iter().any(|path| path.ends_with("poisoned")),
@@ -2140,7 +2227,9 @@ mod tests {
         transaction.inject_post_marker_fault(PostMarkerFault::Apply);
         assert!(matches!(
             transaction.commit(),
-            Err(StorageHostError::OutcomeUnaudited)
+            Err(StorageHostError::OutcomeUnaudited {
+                cause: StorageFailureClass::Io
+            })
         ));
 
         let transaction = fs::read_dir(root.join("transactions"))
@@ -2232,9 +2321,13 @@ mod tests {
             .jsonl_append("turns.jsonl", 0, br#"{"budget":true}"#)
             .expect("append");
         transaction.inject_post_marker_delay(Duration::from_millis(300));
+        // A blown finalization budget is an unaudited outcome with a different cause than a failed
+        // write, which is exactly the distinction an operator clearing the namespace needs.
         assert!(matches!(
             transaction.commit(),
-            Err(StorageHostError::OutcomeUnaudited)
+            Err(StorageHostError::OutcomeUnaudited {
+                cause: StorageFailureClass::Timeout
+            })
         ));
         drop(host);
 

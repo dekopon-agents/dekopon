@@ -408,6 +408,7 @@ only place the cause exists. These events carry it:
 | `broker_secret_resolution_failed` / `broker_secret_credential_failed` | warn | `dekopon-broker` | `invocation` and low-cardinality source/material `category`; structural credential errors are fixed value-free text. No DRN, locator, revision, value, or value-derived length. |
 | `secret_source_resolution_failed` / `secret_projection_failed` | warn | `dekopon-brokerd` | adapter `source_kind` and low-cardinality `category`; no DRN, locator, response body, bootstrap credential, selector, or value |
 | `secret_source_cause_classified` / `secret_source_configuration_cause` | debug | `dekopon-brokerd` | safe cause classification behind the stable warn category: I/O kind/errno, HTTP timeout/connect/status, JSON class/line/column, or dependency-error type; URL parsing uses its fixed parser reason. Never endpoint/locator or secret-derived bytes/offsets. |
+| `broker_storage_outcome_unaudited` | error | `dekopon-broker` | `invocation`, `cause` (`quota`, `timeout`, `corrupt`, `denied`, `io`), and the storage failure's source chain |
 | `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `authorized-failure`, `outcome`), `category` (`full`, `poisoned`, `record-too-large`, `sequence-overflow`, `serialize`, `io`), `invocation`, and the error's source chain |
 | `broker_request_frame_invalid` | warn | `dekopon-brokerd` | `error.kind` (`timeout`, `io`, `empty-frame`, `frame-too-large`, `deserialize`, …) and the bounded protocol message |
 | `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
@@ -436,6 +437,11 @@ the bytes that failed to decode.
 about which failures a socket recovers from. The web UI's loop cannot abort — `axum`'s `Listener`
 trait has no error path — so `error.kind=unrecoverable` is what `EBADF` looks like there: named on
 every attempt at the 1 s ceiling rather than retried in silence, which is what it used to be.
+
+`broker_storage_outcome_unaudited` is the storage half of that same distinction. The guest receives
+the opaque mapped WIT error whatever ended finalization, and the client receives `outcome-unaudited`,
+so the `cause` here is the only thing that separates "free the disk" from "raise the quota" for the
+operator who has to clear the poisoned namespace.
 
 `broker_capacity_exhausted` and `broker_accept_retried` are the two events that report a condition
 outside any one request. The first says a bounded broker resource — the replay ledger or the audit

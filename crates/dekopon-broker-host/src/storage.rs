@@ -148,7 +148,9 @@ impl StorageState {
             && terminal(error)
             && let Self::Active { violation, .. } = self
         {
-            *violation = Some(public_reason(error));
+            // The class lives on the error itself so the guest-visible reason and the cause an
+            // unaudited outcome records are drawn from one vocabulary rather than two copies.
+            *violation = Some(error.class().label());
         }
         result
     }
@@ -568,18 +570,6 @@ fn terminal(error: &StorageHostError) -> bool {
             | StorageHostError::Busy
     )
 }
-fn public_reason(error: &StorageHostError) -> &'static str {
-    match error {
-        StorageHostError::QuotaExceeded | StorageHostError::Arithmetic => "quota",
-        StorageHostError::Timeout => "timeout",
-        StorageHostError::Corrupt { .. }
-        | StorageHostError::CorruptLayout
-        | StorageHostError::KeyMismatch => "corrupt",
-        StorageHostError::PermissionDenied | StorageHostError::GrantHostMismatch => "denied",
-        _ => "io",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{

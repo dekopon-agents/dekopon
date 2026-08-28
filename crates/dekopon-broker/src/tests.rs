@@ -653,6 +653,48 @@ async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_cate
     );
 }
 
+/// `storage-outcome-unaudited` used to be the one broker failure with no cause anywhere.
+///
+/// The wire code says the effect may already have happened; the fieldless `OutcomeUnaudited`
+/// behind it said nothing about what made the outcome unknown, and the variant carried no
+/// `#[source]`, so the chain stopped at "storage outcome is unaudited". An operator holding a
+/// poisoned namespace could not tell a full filesystem from an exhausted quota.
+#[test]
+fn an_unaudited_storage_outcome_carries_the_cause_that_ended_finalization() {
+    let invocation = "invoke-unaudited"
+        .parse::<InvocationId>()
+        .expect("valid invocation fixture");
+    let mut rendered = Vec::new();
+    for cause in [
+        dekopon_storage_host::StorageFailureClass::Quota,
+        dekopon_storage_host::StorageFailureClass::Io,
+    ] {
+        let error = super::BrokerError::StorageOutcome {
+            invocation: invocation.clone(),
+            source: dekopon_storage_host::StorageHostError::OutcomeUnaudited { cause },
+        };
+        assert_eq!(
+            error.unaudited_outcome(),
+            Some(&invocation),
+            "naming the cause must not change what the client is told about resubmission"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the storage failure is not reachable as a source"
+        );
+        let chain = super::error_chain(&error);
+        assert!(
+            chain.contains(cause.label()),
+            "{chain} does not name its cause"
+        );
+        rendered.push(chain);
+    }
+    assert_ne!(
+        rendered[0], rendered[1],
+        "a quota failure and an I/O failure must not render identically"
+    );
+}
+
 /// `localSubjectService` is the one chat-scope field that is free-form operator text rather than
 /// a structural rule, and a typo in it used to produce "attestor chat scope is invalid" — the
 /// same sentence four other rejections produce. The refusal now carries the parse failure, which
