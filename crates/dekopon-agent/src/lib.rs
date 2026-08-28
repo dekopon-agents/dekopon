@@ -148,32 +148,29 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         })
     }
 
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
-        if self.direct.is_granted(capability) {
-            return self.direct.invoke(capability, input);
-        }
-        match &self.broker {
-            Some(broker) => broker.invoke(capability, input),
-            None => CapabilityCallResult::NotFound,
-        }
-    }
-
-    fn invoke_with_secret_use(
+    fn invoke(
         &self,
         capability: &str,
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
-        match secret_use {
-            None => self.invoke(capability, input),
-            Some(secret_use) => match &self.broker {
+        // A DRN reaches only the broker leg, and only for a capability that leg already holds.
+        // The direct leg is read-only and import-free; it has no authorizer to prove the use
+        // against, so a proposal naming one is refused rather than run without it.
+        if secret_use.is_some() {
+            return match &self.broker {
                 Some(broker) if broker.is_granted(capability) => {
-                    broker.invoke_with_secret_use(capability, input, Some(secret_use))
+                    broker.invoke(capability, input, secret_use)
                 }
-                _ => CapabilityCallResult::Denied {
-                    reason: "secret references require a broker-backed capability".to_owned(),
-                },
-            },
+                _ => dekopon_shell::secret_use_unsupported(),
+            };
+        }
+        if self.direct.is_granted(capability) {
+            return self.direct.invoke(capability, input, None);
+        }
+        match &self.broker {
+            Some(broker) => broker.invoke(capability, input, None),
+            None => CapabilityCallResult::NotFound,
         }
     }
 
@@ -539,11 +536,7 @@ impl CapabilityInvoker for BrokerLeg {
         }
     }
 
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
-        self.invoke_with_secret_use(capability, input, None)
-    }
-
-    fn invoke_with_secret_use(
+    fn invoke(
         &self,
         capability: &str,
         input: Value,
@@ -738,6 +731,8 @@ mod tests {
         capability: &'static str,
         marker: &'static str,
         invoked: std::sync::Mutex<Vec<String>>,
+        /// Every secret-use field this leg was handed, in call order.
+        secret_uses: std::sync::Mutex<Vec<Option<dekopon_core::SecretUseProposal>>>,
     }
 
     impl FakeLeg {
@@ -746,6 +741,7 @@ mod tests {
                 capability,
                 marker,
                 invoked: std::sync::Mutex::new(Vec::new()),
+                secret_uses: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -763,7 +759,12 @@ mod tests {
             })
         }
 
-        fn invoke(&self, capability: &str, _input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            capability: &str,
+            _input: Value,
+            secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
             if capability != self.capability {
                 return CapabilityCallResult::NotFound;
             }
@@ -771,6 +772,10 @@ mod tests {
                 .lock()
                 .expect("invocation lock")
                 .push(capability.to_owned());
+            self.secret_uses
+                .lock()
+                .expect("invocation lock")
+                .push(secret_use);
             CapabilityCallResult::Succeeded(json!({ "leg": self.marker }))
         }
     }
@@ -787,7 +792,7 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke("shared.capability", json!({})),
+            invoker.invoke("shared.capability", json!({}), None),
             CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
         );
     }
@@ -800,7 +805,7 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke("http-probe.fetch", json!({})),
+            invoker.invoke("http-probe.fetch", json!({}), None),
             CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
         );
         assert!(invoker.is_granted("http-probe.fetch"));
@@ -852,8 +857,49 @@ mod tests {
         assert_eq!(invoker.granted(), vec!["echo.echo".to_owned()]);
         assert!(!invoker.is_granted("http-probe.fetch"));
         assert_eq!(
-            invoker.invoke("http-probe.fetch", json!({})),
+            invoker.invoke("http-probe.fetch", json!({}), None),
             CapabilityCallResult::NotFound
+        );
+    }
+
+    /// A DRN reaches the broker and nothing else, through the one invocation method.
+    ///
+    /// The composite used to answer this on a separate defaulted method while every wrapper around
+    /// it forwarded the other one, so the field a `curl --user USER:${drn:...}` produced was
+    /// dropped between the shell and this decision. There is one method now, and the deny for the
+    /// direct leg is a branch inside it rather than a default a wrapper can inherit by accident.
+    #[test]
+    fn a_secret_use_proposal_reaches_only_a_broker_backed_capability() {
+        let proposal = dekopon_core::SecretUseProposal::HttpBearer {
+            secret: "drn:com.xrl:secret:prod:api/token"
+                .parse::<dekopon_core::SecretDrn>()
+                .expect("canonical DRN"),
+        };
+        let broker = Box::new(FakeLeg::new("http-probe.fetch", "broker"));
+        let invoker = SessionInvoker {
+            direct: FakeLeg::new("echo.echo", "direct"),
+            broker: Some(broker),
+        };
+
+        assert_eq!(
+            invoker.invoke("http-probe.fetch", json!({}), Some(proposal.clone())),
+            CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
+        );
+
+        // Deny-by-default on the direct leg: immediate mode has no authorizer, so a capability it
+        // owns cannot carry a secret even though the call itself would succeed without one.
+        assert_eq!(
+            invoker.invoke("echo.echo", json!({}), Some(proposal)),
+            dekopon_shell::secret_use_unsupported()
+        );
+        assert!(
+            invoker
+                .direct
+                .secret_uses
+                .lock()
+                .expect("invocation lock")
+                .is_empty(),
+            "the direct leg was handed a proposal it cannot authorize"
         );
     }
 
@@ -1001,9 +1047,11 @@ mod tests {
         /// Runs one dispatch the way an embedding binary does: from a blocking thread, never a
         /// worker.
         async fn invoke(leg: BrokerLeg, capability: &'static str) -> CapabilityCallResult {
-            tokio::task::spawn_blocking(move || leg.invoke(capability, json!({"uri": "http://x/"})))
-                .await
-                .expect("blocking dispatch completes")
+            tokio::task::spawn_blocking(move || {
+                leg.invoke(capability, json!({"uri": "http://x/"}), None)
+            })
+            .await
+            .expect("blocking dispatch completes")
         }
 
         #[tokio::test(flavor = "multi_thread")]

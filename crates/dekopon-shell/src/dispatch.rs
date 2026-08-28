@@ -222,7 +222,15 @@ mod tests {
             ]
         }
 
-        fn invoke(&self, _capability: &str, input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _capability: &str,
+            input: Value,
+            secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if secret_use.is_some() {
+                return crate::secret_use_unsupported();
+            }
             CapabilityCallResult::Succeeded(input)
         }
     }
@@ -292,7 +300,15 @@ mod tests {
             word == "deploy" || word == "echo.echo"
         }
 
-        fn invoke(&self, _capability: &str, input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _capability: &str,
+            input: Value,
+            secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if secret_use.is_some() {
+                return crate::secret_use_unsupported();
+            }
             CapabilityCallResult::Succeeded(input)
         }
     }

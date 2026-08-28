@@ -1,6 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use dekopon_agent::prompt::ScriptRuntime;
+use dekopon_core::{SecretDrn, SecretUseProposal};
 use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode, ScriptOutcome,
 };
@@ -11,7 +15,11 @@ use super::{CallOutcome, RecordingInvoker, RecordingRuntime, Sequence, SessionEv
 
 /// A leg that answers from a fixed table, so a test asserts on what the decorator reported rather
 /// than on what a broker happened to be doing.
-struct FixedInvoker;
+#[derive(Default)]
+struct FixedInvoker {
+    /// Every secret-use field this leg was handed, in call order.
+    secret_uses: Mutex<Vec<Option<dekopon_core::SecretUseProposal>>>,
+}
 
 impl CapabilityInvoker for FixedInvoker {
     fn granted(&self) -> Vec<String> {
@@ -26,7 +34,18 @@ impl CapabilityInvoker for FixedInvoker {
         })
     }
 
-    fn invoke(&self, capability: &str, _input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        capability: &str,
+        _input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        // Records what the decorator forwarded, so the assertion is about the wrapper rather than
+        // about a broker that happened to accept the proposal.
+        self.secret_uses
+            .lock()
+            .expect("recorded secret uses")
+            .push(secret_use);
         match capability {
             "gh.issue.list" => CapabilityCallResult::Succeeded(json!([{"number": 7}])),
             "gh.pull-request.merge" => CapabilityCallResult::Denied {
@@ -45,9 +64,9 @@ struct FixedRuntime<'invoker> {
 impl ScriptRuntime for FixedRuntime<'_> {
     fn run_script(&self, _script: &str, _max_capability_calls: u32) -> ScriptOutcome {
         self.invoker
-            .invoke("gh.issue.list", json!({"state": "open"}));
+            .invoke("gh.issue.list", json!({"state": "open"}), None);
         self.invoker
-            .invoke("gh.pull-request.merge", json!({"number": 7}));
+            .invoke("gh.pull-request.merge", json!({"number": 7}), None);
         ScriptOutcome {
             output: "two calls\n".to_owned(),
             exit_code: ExitCode::SUCCESS,
@@ -74,7 +93,7 @@ fn drain(receiver: &mut UnboundedReceiver<SessionEvent>) -> Vec<SessionEvent> {
 fn reports_a_script_and_every_call_inside_it_in_order() {
     let (sender, mut receiver) = unbounded_channel();
     let sequence = Sequence::default();
-    let invoker = RecordingInvoker::new(FixedInvoker, sender.clone(), sequence.clone());
+    let invoker = RecordingInvoker::new(FixedInvoker::default(), sender.clone(), sequence.clone());
     let runtime = RecordingRuntime::new(FixedRuntime { invoker: &invoker }, sender, sequence);
 
     let outcome = runtime.run_script("gh issue list", 8);
@@ -133,7 +152,7 @@ fn reports_a_script_and_every_call_inside_it_in_order() {
 #[test]
 fn forwards_every_query_without_reporting_it() {
     let (sender, mut receiver) = unbounded_channel();
-    let invoker = RecordingInvoker::new(FixedInvoker, sender, Sequence::default());
+    let invoker = RecordingInvoker::new(FixedInvoker::default(), sender, Sequence::default());
 
     assert_eq!(invoker.granted(), ["gh.issue.list"]);
     assert!(invoker.is_granted("gh.issue.list"));
@@ -149,14 +168,46 @@ fn forwards_every_query_without_reporting_it() {
 #[test]
 fn a_closed_console_does_not_stop_a_session() {
     let (sender, receiver) = unbounded_channel();
-    let invoker = RecordingInvoker::new(FixedInvoker, sender, Sequence::default());
+    let invoker = RecordingInvoker::new(FixedInvoker::default(), sender, Sequence::default());
     drop(receiver);
 
     // A call the broker has already accepted is not something an observer may abort, so a torn-down
     // console must not change the result the session sees.
     assert_eq!(
-        CallOutcome::from(&invoker.invoke("gh.issue.list", json!({}))),
+        CallOutcome::from(&invoker.invoke("gh.issue.list", json!({}), None)),
         CallOutcome::Succeeded(json!([{"number": 7}]))
+    );
+}
+
+/// The decorator observes a call; it must not narrow what the call may carry.
+///
+/// It used to forward eight trait methods and inherit the ninth's deny-by-default, so a `curl
+/// --user USER:${drn:...}` in a console session was refused inside the console — the proposal never
+/// left the process, and the broker never saw the `secret.use` decision it exists to make.
+#[test]
+fn a_secret_use_proposal_reaches_the_wrapped_leg() {
+    let (sender, mut receiver) = unbounded_channel();
+    let inner = Arc::new(FixedInvoker::default());
+    let proposal = SecretUseProposal::HttpBearer {
+        secret: "drn:com.xrl:secret:prod:api/token"
+            .parse::<SecretDrn>()
+            .expect("canonical DRN"),
+    };
+    let invoker = RecordingInvoker::new(Arc::clone(&inner), sender, Sequence::default());
+
+    assert_eq!(
+        invoker.invoke("gh.issue.list", json!({}), Some(proposal.clone())),
+        CapabilityCallResult::Succeeded(json!([{"number": 7}]))
+    );
+    assert_eq!(
+        inner.secret_uses.lock().expect("recorded")[0],
+        Some(proposal),
+        "the wrapper dropped the proposal on its way to the leg"
+    );
+    assert_eq!(
+        drain(&mut receiver).len(),
+        1,
+        "a secret-carrying call is still one reported call"
     );
 }
 
@@ -171,8 +222,8 @@ fn outcome_labels_are_stable() {
 #[test]
 fn elapsed_is_measured_around_the_seam() {
     let (sender, mut receiver) = unbounded_channel();
-    let invoker = RecordingInvoker::new(FixedInvoker, sender, Sequence::default());
-    invoker.invoke("gh.issue.list", json!({}));
+    let invoker = RecordingInvoker::new(FixedInvoker::default(), sender, Sequence::default());
+    invoker.invoke("gh.issue.list", json!({}), None);
 
     let events = drain(&mut receiver);
     let SessionEvent::Capability(call) = &events[0] else {

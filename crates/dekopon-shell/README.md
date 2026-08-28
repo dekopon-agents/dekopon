@@ -11,7 +11,12 @@ pub trait CapabilityInvoker {
     fn granted(&self) -> Vec<String>;
     fn is_granted(&self, capability: &str) -> bool { /* ... */ }
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> { /* ... */ }
-    fn invoke(&self, capability: &str, input: serde_json::Value) -> CapabilityCallResult;
+    fn invoke(
+        &self,
+        capability: &str,
+        input: serde_json::Value,
+        secret_use: Option<SecretUseProposal>,
+    ) -> CapabilityCallResult;
 }
 ```
 

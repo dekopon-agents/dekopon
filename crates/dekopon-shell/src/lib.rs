@@ -72,7 +72,15 @@
 //!         vec!["echo.echo".to_owned()]
 //!     }
 //!
-//!     fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+//!     fn invoke(
+//!         &self,
+//!         capability: &str,
+//!         input: Value,
+//!         secret_use: Option<dekopon_core::SecretUseProposal>,
+//!     ) -> CapabilityCallResult {
+//!         if secret_use.is_some() {
+//!             return dekopon_shell::secret_use_unsupported();
+//!         }
 //!         assert_eq!(capability, "echo.echo");
 //!         CapabilityCallResult::Succeeded(input)
 //!     }
@@ -85,6 +93,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
+
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -212,29 +222,87 @@ pub trait CapabilityInvoker {
         None
     }
 
-    /// Invokes one capability synchronously.
+    /// Invokes one capability synchronously, carrying the optional typed secret-use intent.
+    ///
+    /// One method rather than two. A defaulted `invoke_with_secret_use` used to sit beside a
+    /// two-argument `invoke`, and every wrapper forwarded the argument it could see: three of them
+    /// forwarded `invoke` and inherited the other's deny-by-default, so a DRN proposal a
+    /// broker-backed console or gateway session made was refused inside the process that made it
+    /// and never reached the broker. There is now one method to forward, and forgetting it is a
+    /// compile error rather than a refusal nobody asked for.
+    ///
+    /// An invoker with no authorizer behind it answers a `Some` proposal with
+    /// [`secret_use_unsupported`]. Dropping the field and running the call anyway is the one thing
+    /// it must not do: the caller asked for a credential the callee cannot prove it may use.
     ///
     /// This is deliberately synchronous: this crate carries no async runtime dependency, and the
     /// calling binary's model tool loop is untouched. An implementation that is asynchronous
     /// underneath bridges here itself, which is what `dekopon-run` does from its blocking task.
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult;
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<SecretUseProposal>,
+    ) -> CapabilityCallResult;
+}
 
-    /// Invokes one capability with optional typed secret-use intent.
-    ///
-    /// Direct and test invokers keep the safe default: a proposal selecting a DRN is refused. Only
-    /// a broker-backed leg may override this and forward the typed field for fresh authorization.
-    fn invoke_with_secret_use(
+/// The refusal an invoker with no authorizer behind it owes a secret-use proposal.
+///
+/// A public DRN names a secret only the broker may resolve. An invoker that cannot reach one — a
+/// direct Wasm registry, an empty local leg, a test fixture — refuses rather than dropping the
+/// field and running the call as though it had never been asked for.
+#[must_use]
+pub fn secret_use_unsupported() -> CapabilityCallResult {
+    CapabilityCallResult::Denied {
+        reason: "secret references require a broker-backed capability".to_owned(),
+    }
+}
+
+/// Forwards every method to the shared invoker behind the pointer.
+///
+/// This is what lets one broker leg be held by a console's shell pane and handed to that session's
+/// dispatch at the same time. It replaced a hand-written forwarder that had to be kept in step with
+/// the trait by hand and was not.
+impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
+    fn granted(&self) -> Vec<String> {
+        self.as_ref().granted()
+    }
+
+    fn is_granted(&self, capability: &str) -> bool {
+        self.as_ref().is_granted(capability)
+    }
+
+    fn grants_namespace(&self, namespace: &str) -> bool {
+        self.as_ref().grants_namespace(namespace)
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        self.as_ref().command_words()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.as_ref().has_command_word(word)
+    }
+
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, Value), String>> {
+        self.as_ref().resolve_command(word, argv)
+    }
+
+    fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
+        self.as_ref().describe(capability)
+    }
+
+    fn invoke(
         &self,
         capability: &str,
         input: Value,
         secret_use: Option<SecretUseProposal>,
     ) -> CapabilityCallResult {
-        match secret_use {
-            None => self.invoke(capability, input),
-            Some(_) => CapabilityCallResult::Denied {
-                reason: "secret references require a broker-backed capability".to_owned(),
-            },
-        }
+        self.as_ref().invoke(capability, input, secret_use)
     }
 }
 

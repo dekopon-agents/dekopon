@@ -664,7 +664,17 @@ impl CapabilityInvoker for RegistryInvoker<'_> {
             })
     }
 
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        // Deny-by-default on the direct leg: immediate mode has no authorizer and no credential
+        // store, so a proposal naming a DRN is refused here rather than run without it.
+        if secret_use.is_some() {
+            return dekopon_shell::secret_use_unsupported();
+        }
         let Ok(capability) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };

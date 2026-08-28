@@ -216,11 +216,16 @@ impl<I: CapabilityInvoker> CapabilityInvoker for RecordingInvoker<I> {
         self.inner.describe(capability)
     }
 
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
         let sequence = self.sequence.next();
         let recorded = input.clone();
         let started = Instant::now();
-        let result = self.inner.invoke(capability, input);
+        let result = self.inner.invoke(capability, input, secret_use);
         emit(
             &self.events,
             SessionEvent::Capability(Box::new(CapabilityCall {

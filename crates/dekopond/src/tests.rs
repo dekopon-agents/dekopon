@@ -22,7 +22,7 @@ use dekopon_broker_protocol::{
     write_frame,
 };
 use dekopon_config::LocalCatalog;
-use dekopon_core::ExternalSubject;
+use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
 use dekopon_model::{
     image::{GeneratedImage, ImageGenerationError, ImageGenerator},
     model::{
@@ -46,9 +46,9 @@ use crate::{
     conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache, ModelFactory,
-        SessionError, SessionGate, SessionRunner, SharedModel, UNAUTHORIZED_REPLY,
-        UNREPORTED_WORK_REPLY, configured_image_generators, image_credential,
+        BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
+        ModelFactory, SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
+        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, configured_image_generators, image_credential,
         memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
@@ -229,6 +229,74 @@ fn a_missing_image_model_credential_fails_before_chat_starts() {
     let unused = configured_image_generators(&configured, &BTreeSet::new())
         .expect("an unreferenced generator reads no credential");
     assert!(unused.is_empty());
+}
+
+/// The cancellation boundary must not narrow what a proposal may carry.
+///
+/// This wrapper forwarded eight of the trait's nine methods and inherited the ninth's
+/// deny-by-default, so a `curl --user USER:${drn:...}` in a gateway session was refused inside
+/// `dekopond` — the proposal never reached the broker, which is the only thing that can decide
+/// `secret.use` at all. Cancellation still applies to it, exactly as it does to a plain call.
+#[test]
+fn a_secret_use_proposal_reaches_the_broker_leg_through_the_cancellation_boundary() {
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
+
+    /// Records what it was handed, so the assertion is about the wrapper rather than a broker.
+    #[derive(Default)]
+    struct RecordingLeg {
+        secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
+    }
+
+    impl CapabilityInvoker for RecordingLeg {
+        fn granted(&self) -> Vec<String> {
+            vec!["http-probe.fetch".to_owned()]
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            self.secret_uses
+                .lock()
+                .expect("recorded secret uses")
+                .push(secret_use);
+            CapabilityCallResult::Succeeded(json!({"status": 200}))
+        }
+    }
+
+    let proposal = SecretUseProposal::HttpBearer {
+        secret: "drn:com.xrl:secret:prod:api/token"
+            .parse::<SecretDrn>()
+            .expect("canonical DRN"),
+    };
+    let leg = Arc::new(RecordingLeg::default());
+    let cancellation = SessionCancellation::new();
+    let invoker = CancelAwareInvoker {
+        inner: Arc::clone(&leg),
+        cancellation: cancellation.clone(),
+    };
+
+    assert_eq!(
+        invoker.invoke("http-probe.fetch", json!({}), Some(proposal.clone())),
+        CapabilityCallResult::Succeeded(json!({"status": 200}))
+    );
+    assert_eq!(
+        leg.secret_uses.lock().expect("recorded secret uses")[0],
+        Some(proposal.clone()),
+        "the wrapper dropped the proposal on its way to the leg"
+    );
+
+    // A stopped session refuses it like any other call, rather than letting a secret-carrying one
+    // through the boundary a plain one cannot cross.
+    assert!(cancellation.cancel());
+    assert_eq!(
+        invoker.invoke("http-probe.fetch", json!({}), Some(proposal)),
+        CapabilityCallResult::Denied {
+            reason: "session-cancelled".to_owned(),
+        }
+    );
 }
 
 /// `apiKeyEnv` has three meanings and they used to have one outcome.

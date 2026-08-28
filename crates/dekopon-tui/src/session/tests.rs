@@ -104,7 +104,7 @@ fn the_empty_local_leg_claims_nothing() {
     assert!(!direct.has_command_word("gh"));
     assert!(direct.describe("gh.issue.list").is_none());
     assert!(matches!(
-        direct.invoke("gh.issue.list", json!({})),
+        direct.invoke("gh.issue.list", json!({}), None),
         dekopon_shell::CapabilityCallResult::NotFound
     ));
 }

@@ -163,9 +163,7 @@ impl BuiltinContext<'_> {
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.charge_capability_call()?;
         self.budget.check_deadline()?;
-        let result = self
-            .invoker
-            .invoke_with_secret_use(capability, input, secret_use);
+        let result = self.invoker.invoke(capability, input, secret_use);
         self.budget.check_deadline()?;
         let status = ExitCode::from_capability_result(&result);
         Ok(match result {
@@ -297,7 +295,12 @@ pub(crate) mod test_support {
             Vec::new()
         }
 
-        fn invoke(&self, _capability: &str, _input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
