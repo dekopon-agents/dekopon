@@ -7,7 +7,7 @@ this document covers the schema and, for every field, what actually consumes it 
 
 That last part is the reason this document exists. The catalog looks like a permission system and is
 not one. Two of its fields decide how an agent behaves, several are validated cross-references, and
-two are reserved names that no shipped component reads. Authoring one correctly means knowing which
+four are reserved names that no shipped component reads. Authoring one correctly means knowing which
 is which.
 
 ## Who reads it
