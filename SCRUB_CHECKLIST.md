@@ -88,7 +88,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #7 — SILENT_FAILURE_MODE — crates/dekopon-webui/src/listener.rs:50-94
+## [x] #7 — SILENT_FAILURE_MODE — crates/dekopon-webui/src/listener.rs:50-94
 
 **Finding:** The webui accept loop logs `webui_accept_failed` with no error field and retries forever at 1 s on `EBADF`/`EINVAL`, while the broker's own accept loop 400 lines away (`brokerd/src/server.rs:145-158`) classifies errno via `retryable_accept_error`, logs `error_chain`, backs off 100 ms→1 s, and aborts on non-retryable errors. A third fixed-100 ms copy lives in `dekopond/src/transport/whatsapp.rs:55`. (raw: D2)
 **Blast radius:** HIGH  **Confidence:** HIGH

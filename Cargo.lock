@@ -1070,6 +1070,7 @@ dependencies = [
 name = "dekopon-core"
 version = "0.11.1"
 dependencies = [
+ "libc",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -1304,6 +1305,7 @@ dependencies = [
  "axum",
  "dekopon-broker-host",
  "dekopon-broker-protocol",
+ "dekopon-core",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

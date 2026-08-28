@@ -413,6 +413,7 @@ only place the cause exists. These events carry it:
 | `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
+| `webui_accept_failed` | debug for `error.kind=connection`, warn otherwise | `dekopon-webui` | `error.kind` (the same names as `broker_accept_retried`, plus `connection` and `unrecoverable`), `backoff_ms`, and the errno's chain |
 | `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
@@ -428,6 +429,12 @@ The source chain is the diagnosable half. `ConnectionError::Broker` renders as "
 filesystem shared with anything else — lives one or two levels down, and these events render the
 whole chain as one `a: b: c` line. Frame contents never join it: a decode failure names its kind, not
 the bytes that failed to decode.
+
+`broker_accept_retried` and `webui_accept_failed` classify with one shared table,
+`dekopon_core::retryable_accept_error`, so the two listeners in the broker process cannot disagree
+about which failures a socket recovers from. The web UI's loop cannot abort — `axum`'s `Listener`
+trait has no error path — so `error.kind=unrecoverable` is what `EBADF` looks like there: named on
+every attempt at the 1 s ceiling rather than retried in silence, which is what it used to be.
 
 `broker_capacity_exhausted` and `broker_accept_retried` are the two events that report a condition
 outside any one request. The first says a bounded broker resource — the replay ledger or the audit

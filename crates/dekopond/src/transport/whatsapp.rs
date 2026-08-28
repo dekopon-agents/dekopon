@@ -52,7 +52,10 @@ const MAX_WHATSAPP_TEXT_CHARS: usize = 4096;
 /// One refusal reason is reported at most this often, with the count it stands for.
 const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// How long the accept loop waits after running out of descriptors or socket buffers.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+///
+/// Shared with the broker's two accept loops so a wait tuned in one place is not silently
+/// different here.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(dekopon_core::ACCEPT_BACKOFF_MS);
 
 pub(crate) struct WhatsappTransport {
     name: String,

@@ -7,7 +7,9 @@ use dekopon_broker_protocol::{
     ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolError,
     RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
-use dekopon_core::{InvocationId, TraceId};
+use dekopon_core::{
+    ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, TraceId, retryable_accept_error,
+};
 use dekopon_telemetry::TraceContextParts;
 use dekopon_webui::ServiceStatus;
 use thiserror::Error;
@@ -21,34 +23,6 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
-
-/// First pause after a retryable `accept` failure.
-const ACCEPT_BACKOFF_MS: u64 = 100;
-/// Ceiling that pause doubles to, so a condition that persists cannot become a hot log loop.
-const MAX_ACCEPT_BACKOFF_MS: u64 = 1_000;
-
-/// Stable, low-cardinality name for an `accept` failure the loop can survive, or `None` if fatal.
-///
-/// Exiting is the expensive answer here. This is the privileged daemon: the process ends, the
-/// container restarts, every provider recompiles under Cranelift before the socket rebinds, and
-/// durable audit state waits through all of it — minutes, against a five-minute startup probe.
-/// Descriptor exhaustion (which the unauthenticated `--http-bind` listener can cause on its own),
-/// kernel buffer exhaustion, a client that vanished between its connect and this accept, and a
-/// signal interruption are all conditions the next accept can succeed through. None of them say
-/// the listener is broken, and none of them are worth a cold start.
-pub(crate) fn retryable_accept_error(error: &io::Error) -> Option<&'static str> {
-    match error.raw_os_error()? {
-        libc::EMFILE => Some("process-descriptor-limit"),
-        libc::ENFILE => Some("system-descriptor-limit"),
-        // `accept` reports the same kernel-memory pressure under either name depending on the
-        // platform and the allocation that failed.
-        libc::ENOBUFS | libc::ENOMEM => Some("kernel-memory"),
-        libc::ECONNABORTED => Some("connection-aborted"),
-        libc::ECONNRESET => Some("connection-reset"),
-        libc::EINTR => Some("interrupted"),
-        _ => None,
-    }
-}
 
 pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: &TraceId) -> tracing::Span {
     tracing::info_span!("broker.invocation", invocation = %invocation, trace = %trace)

@@ -40,6 +40,13 @@ write, and HTTP/1 keep-alive reuse — bounds it. Sixteen is generous for pages 
 stylesheet and load no subresources, so a browser needs one connection per view. `serve` applies
 these defaults; `serve_with_limits` takes them explicitly and refuses a zero on either.
 
+A failed `accept` is classified by `dekopon_core::retryable_accept_error`, the same table the
+broker's Unix socket uses, and logged as `webui_accept_failed` carrying `error.kind` and the
+error's source chain. A peer that vanished before the handover is retried immediately; anything
+else waits, doubling from 100 ms to a 1 s ceiling. `axum`'s `Listener` trait has no error path, so
+this loop cannot exit the way the broker's does on a dead descriptor — an unrecoverable errno is
+named on every attempt at the ceiling wait instead of being retried in silence.
+
 Agent and token data remain owned by the unprivileged gateway. `dekopond` sends bounded
 informational reports over the authenticated Unix broker protocol; the broker retains them only in
 memory and never consults them for Cedar policy, constraints, credentials, routing, evidence, or

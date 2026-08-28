@@ -24,6 +24,11 @@ schemars = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 
+# The `accept()` classification is a table of Unix `errno` values; no other platform has one, and a
+# wasm guest never listens, so the dependency stays off every non-Unix build of this crate.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 

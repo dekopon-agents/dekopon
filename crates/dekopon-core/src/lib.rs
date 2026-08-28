@@ -3,9 +3,14 @@
 //! Identifiers are validated at construction and during deserialization. This prevents
 //! malformed resource references from leaking into the rest of the workspace while
 //! keeping transport, command-line, async-runtime, and policy concerns out of this crate.
+//!
+//! It also holds the pure helpers that separate processes must not disagree about — the `accept()`
+//! retry classification and `error_chain` — because a fact split across two loops drifts.
 
 #![forbid(unsafe_code)]
 
+mod accept;
+mod diagnostics;
 mod redaction;
 mod subject;
 mod telemetry_payloads;
@@ -15,6 +20,8 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
+pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
+pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};

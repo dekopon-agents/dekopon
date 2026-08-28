@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_core::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, error_chain, retryable_accept_error};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -30,6 +31,7 @@ pub(crate) struct BoundedListener {
     listener: TcpListener,
     permits: Arc<Semaphore>,
     connection_timeout: Duration,
+    accept_backoff_ms: u64,
 }
 
 impl BoundedListener {
@@ -38,6 +40,7 @@ impl BoundedListener {
             listener,
             permits: Arc::new(Semaphore::new(limits.max_connections)),
             connection_timeout: limits.connection_timeout,
+            accept_backoff_ms: ACCEPT_BACKOFF_MS,
         }
     }
 }
@@ -49,14 +52,46 @@ impl axum::serve::Listener for BoundedListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             let (stream, address) = match self.listener.accept().await {
-                Ok(accepted) => accepted,
+                Ok(accepted) => {
+                    self.accept_backoff_ms = ACCEPT_BACKOFF_MS;
+                    accepted
+                }
                 Err(error) => {
-                    // A descriptor-table or memory failure recurs on the very next call, so a
-                    // bare `continue` would spin this task at full CPU inside the broker.
-                    if !is_connection_error(&error) {
-                        tracing::warn!(event = "webui_accept_failed", category = "accept");
-                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    // One peer that vanished between its connect and this accept says nothing
+                    // about the listener, so retrying immediately is correct and a wait would be
+                    // a stall. It still names its cause once.
+                    if is_connection_error(&error) {
+                        tracing::debug!(
+                            event = "webui_accept_failed",
+                            category = "accept",
+                            error.kind = "connection",
+                            error = %error_chain(&error),
+                        );
+                        continue;
                     }
+                    // A descriptor-table or memory failure recurs on the very next call, so a
+                    // bare `continue` would spin this task at full CPU inside the broker. Unlike
+                    // the broker's own accept loop this one cannot abort — `axum`'s `Listener`
+                    // trait has no error path — so an unrecoverable errno waits at the ceiling
+                    // and is named on every attempt rather than retried in silence.
+                    let kind = retryable_accept_error(&error);
+                    let backoff_ms = if kind.is_some() {
+                        self.accept_backoff_ms
+                    } else {
+                        MAX_ACCEPT_BACKOFF_MS
+                    };
+                    tracing::warn!(
+                        event = "webui_accept_failed",
+                        category = "accept",
+                        error.kind = kind.unwrap_or("unrecoverable"),
+                        backoff_ms,
+                        error = %error_chain(&error),
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    self.accept_backoff_ms = self
+                        .accept_backoff_ms
+                        .saturating_mul(2)
+                        .min(MAX_ACCEPT_BACKOFF_MS);
                     continue;
                 }
             };
@@ -81,8 +116,6 @@ impl axum::serve::Listener for BoundedListener {
         self.listener.local_addr()
     }
 }
-
-const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
 fn is_connection_error(error: &io::Error) -> bool {
     matches!(
