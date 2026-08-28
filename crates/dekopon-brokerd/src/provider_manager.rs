@@ -239,10 +239,9 @@ impl ProviderManager {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
         let desired = load_provider_set(
-            self.paths
-                .provider_set
-                .as_deref()
-                .ok_or(ProviderManagerError::MissingProviderSetPath)?,
+            self.paths.provider_set.as_deref().ok_or_else(|| {
+                ProviderManagerError::config("provider sync requires a provider-set path")
+            })?,
             uid,
         )
         .await?;
@@ -296,10 +295,9 @@ impl ProviderManager {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
         let desired = load_provider_set(
-            self.paths
-                .provider_set
-                .as_deref()
-                .ok_or(ProviderManagerError::MissingProviderSetPath)?,
+            self.paths.provider_set.as_deref().ok_or_else(|| {
+                ProviderManagerError::config("provider sync requires a provider-set path")
+            })?,
             uid,
         )
         .await?;
@@ -335,22 +333,26 @@ impl ProviderManager {
             // filesystem or registry text; `verify` retains the full error chain when requested.
             let (local_status, local_reason) = match verify_blob(&path, &provider, uid).await {
                 Ok(()) => ("verified", None),
-                Err(ProviderManagerError::ReadFile { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
+                Err(ProviderManagerError::Io { reason, source, .. })
+                    if reason == READ_PROVIDER_STATE
+                        && source.kind() == io::ErrorKind::NotFound =>
                 {
                     ("missing", Some("not-installed"))
                 }
-                Err(
-                    ProviderManagerError::FileSecurity(_)
-                    | ProviderManagerError::InsecureFile { .. },
-                ) => ("invalid", Some("insecure-metadata")),
-                Err(ProviderManagerError::BlobSizeMismatch { .. }) => {
+                Err(ProviderManagerError::FileSecurity { .. }) => {
+                    ("invalid", Some("insecure-metadata"))
+                }
+                Err(ProviderManagerError::DigestMismatch { reason, .. })
+                    if reason == BLOB_SIZE_MISMATCH =>
+                {
                     ("invalid", Some("size-mismatch"))
                 }
-                Err(ProviderManagerError::BlobDigestMismatch { .. }) => {
+                Err(ProviderManagerError::DigestMismatch { .. }) => {
                     ("invalid", Some("digest-mismatch"))
                 }
-                Err(ProviderManagerError::ReadFile { .. }) => ("invalid", Some("unreadable")),
+                Err(ProviderManagerError::Io { reason, .. }) if reason == READ_PROVIDER_STATE => {
+                    ("invalid", Some("unreadable"))
+                }
                 Err(_) => ("invalid", Some("verification-failed")),
             };
             statuses.push(ProviderStatus {
@@ -392,7 +394,7 @@ pub(crate) async fn load_locked_sources(
     let sources = lock.sources(&store)?;
     for source in &sources {
         socket::validate_owned_file(source.path(), expected_uid)
-            .map_err(ProviderManagerError::FileSecurity)?;
+            .map_err(|error| ProviderManagerError::file_security(source.path(), error))?;
     }
     Ok(sources)
 }
@@ -450,30 +452,37 @@ async fn validate_candidates(
     let mut providers = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let path = store.blob_path(&candidate.component_digest)?;
-        let loaded = metadata
-            .get(&path)
-            .ok_or_else(|| ProviderManagerError::MissingValidatedProvider { path: path.clone() })?;
+        let loaded = metadata.get(&path).ok_or_else(|| {
+            ProviderManagerError::lock_detail(
+                "validated provider set omitted a component",
+                path.display().to_string(),
+            )
+        })?;
         if loaded.artifact_bytes != candidate.component_bytes {
-            return Err(ProviderManagerError::BlobSizeMismatch {
-                expected: candidate.component_bytes,
-                actual: loaded.artifact_bytes,
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_SIZE_MISMATCH,
+                candidate.component_bytes.to_string(),
+                loaded.artifact_bytes.to_string(),
+            ));
         }
         let expected_digest = digest_hex(&candidate.component_digest)?;
         if loaded.artifact_sha256 != expected_digest {
-            return Err(ProviderManagerError::BlobDigestMismatch {
-                expected: candidate.component_digest,
-                actual: format!("sha256:{}", loaded.artifact_sha256),
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_DIGEST_MISMATCH,
+                candidate.component_digest,
+                format!("sha256:{}", loaded.artifact_sha256),
+            ));
         }
         if let Some(expected) = candidate.expected_provider_id
             && loaded.manifest.id != expected
         {
-            return Err(ProviderManagerError::LockedProviderIdentity {
-                reference: candidate.source,
-                expected,
-                actual: loaded.manifest.id.clone(),
-            });
+            return Err(ProviderManagerError::lock_detail(
+                "locked provider identity does not match the component description",
+                format!(
+                    "{}: locked {expected}, described {}",
+                    candidate.source, loaded.manifest.id
+                ),
+            ));
         }
         providers.push(LockedProvider {
             source: candidate.source,
@@ -528,7 +537,9 @@ fn require_desired_lock_match(
         .map(|provider| provider.source.as_str())
         .collect::<BTreeSet<_>>();
     if desired != locked {
-        return Err(ProviderManagerError::LockedStateChanged);
+        return Err(ProviderManagerError::lock(
+            "provider set changed relative to the lock; rerun without --locked to resolve it",
+        ));
     }
     Ok(())
 }
@@ -538,15 +549,19 @@ async fn load_provider_set(
     expected_uid: u32,
 ) -> Result<ProviderSet, ProviderManagerError> {
     let bytes = read_secure_file(path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES).await?;
-    let mut set = serde_yaml::from_slice::<ProviderSet>(&bytes)
-        .map_err(|source| ProviderManagerError::DecodeProviderSet { source })?;
+    let mut set = serde_yaml::from_slice::<ProviderSet>(&bytes).map_err(|source| {
+        ProviderManagerError::config_source("provider set is not strict valid YAML", source)
+    })?;
     if set.providers.is_empty() {
-        return Err(ProviderManagerError::NoProviders);
+        return Err(ProviderManagerError::config(
+            "provider set must contain at least one provider",
+        ));
     }
     if set.providers.len() > HARD_MAX_PROVIDERS {
-        return Err(ProviderManagerError::TooManyProviders {
-            maximum: HARD_MAX_PROVIDERS,
-        });
+        return Err(ProviderManagerError::config_detail(
+            "provider set has too many providers",
+            format!("maximum is {HARD_MAX_PROVIDERS}"),
+        ));
     }
     let mut repositories = BTreeSet::new();
     let mut sources = BTreeSet::new();
@@ -563,7 +578,7 @@ async fn load_provider_set(
         }
     }
     if !conflicts.is_empty() {
-        return Err(ProviderManagerError::ProviderStateConflicts {
+        return Err(ProviderManagerError::StateConflicts {
             problems: conflicts.into_iter().collect(),
         });
     }
@@ -578,8 +593,8 @@ async fn load_optional_lock(
 ) -> Result<Option<ProviderLock>, ProviderManagerError> {
     match read_secure_file(path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES).await {
         Ok(bytes) => decode_lock(&bytes).map(Some),
-        Err(ProviderManagerError::ReadFile { source, .. })
-            if source.kind() == io::ErrorKind::NotFound =>
+        Err(ProviderManagerError::Io { reason, source, .. })
+            if reason == READ_PROVIDER_STATE && source.kind() == io::ErrorKind::NotFound =>
         {
             Ok(None)
         }
@@ -593,8 +608,9 @@ async fn load_lock(path: &Path, expected_uid: u32) -> Result<ProviderLock, Provi
 }
 
 fn decode_lock(bytes: &[u8]) -> Result<ProviderLock, ProviderManagerError> {
-    let mut lock = serde_yaml::from_slice::<ProviderLock>(bytes)
-        .map_err(|source| ProviderManagerError::DecodeLock { source })?;
+    let mut lock = serde_yaml::from_slice::<ProviderLock>(bytes).map_err(|source| {
+        ProviderManagerError::config_source("provider lock is not strict valid YAML", source)
+    })?;
     lock.providers
         .sort_by(|left, right| left.source.cmp(&right.source));
     validate_lock_shape(&lock)?;
@@ -603,12 +619,15 @@ fn decode_lock(bytes: &[u8]) -> Result<ProviderLock, ProviderManagerError> {
 
 fn validate_lock_shape(lock: &ProviderLock) -> Result<(), ProviderManagerError> {
     if lock.providers.is_empty() {
-        return Err(ProviderManagerError::NoProviders);
+        return Err(ProviderManagerError::config(
+            "provider set must contain at least one provider",
+        ));
     }
     if lock.providers.len() > HARD_MAX_PROVIDERS {
-        return Err(ProviderManagerError::TooManyProviders {
-            maximum: HARD_MAX_PROVIDERS,
-        });
+        return Err(ProviderManagerError::config_detail(
+            "provider set has too many providers",
+            format!("maximum is {HARD_MAX_PROVIDERS}"),
+        ));
     }
     let mut sources = BTreeSet::new();
     let mut repositories = BTreeSet::new();
@@ -617,10 +636,10 @@ fn validate_lock_shape(lock: &ProviderLock) -> Result<(), ProviderManagerError> 
     for provider in &lock.providers {
         let parsed = ParsedSource::parse(&provider.source)?;
         if parsed.canonical != provider.source {
-            return Err(ProviderManagerError::NonCanonicalSource {
-                reference: provider.source.clone(),
-                canonical: parsed.canonical,
-            });
+            return Err(ProviderManagerError::lock_detail(
+                "provider lock source is not canonical",
+                format!("{}; expected {}", provider.source, parsed.canonical),
+            ));
         }
         if !sources.insert(provider.source.clone()) {
             conflicts.insert(format!("duplicate source {}", provider.source));
@@ -637,33 +656,39 @@ fn validate_lock_shape(lock: &ProviderLock) -> Result<(), ProviderManagerError> 
         if let Some(expected) = parsed.reference.digest()
             && provider.manifest_digest != expected
         {
-            return Err(ProviderManagerError::ManifestDigestMismatch {
-                expected: expected.to_owned(),
-                actual: provider.manifest_digest.clone(),
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                MANIFEST_DIGEST_MISMATCH,
+                expected,
+                provider.manifest_digest.clone(),
+            ));
         }
         let resolved_version = parsed
             .reference
             .tag()
             .and_then(|tag| tag.parse::<Version>().ok());
         if provider.resolved_version != resolved_version {
-            return Err(ProviderManagerError::ResolvedVersionMismatch {
-                reference: provider.source.clone(),
-                expected: resolved_version,
-                actual: provider.resolved_version.clone(),
-            });
+            return Err(ProviderManagerError::lock_detail(
+                RESOLVED_VERSION_MISMATCH,
+                format!(
+                    "{}; exact tag implies {resolved_version:?}, lock records {:?}",
+                    provider.source, provider.resolved_version
+                ),
+            ));
         }
         if provider.component_bytes == 0
             || provider.component_bytes > HARD_MAX_PROVIDER_COMPONENT_BYTES
         {
-            return Err(ProviderManagerError::ComponentSize {
-                size: provider.component_bytes,
-                maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
-            });
+            return Err(ProviderManagerError::config_detail(
+                COMPONENT_SIZE,
+                format!(
+                    "provider component is {} bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}",
+                    provider.component_bytes
+                ),
+            ));
         }
     }
     if !conflicts.is_empty() {
-        return Err(ProviderManagerError::ProviderStateConflicts {
+        return Err(ProviderManagerError::StateConflicts {
             problems: conflicts.into_iter().collect(),
         });
     }
@@ -676,16 +701,21 @@ fn encode_lock(lock: &ProviderLock) -> Result<Vec<u8>, ProviderManagerError> {
         .sort_by(|left, right| left.source.cmp(&right.source));
     validate_lock_shape(&lock)?;
     let mut bytes = serde_yaml::to_string(&lock)
-        .map_err(|source| ProviderManagerError::EncodeLock { source })?
+        .map_err(|source| {
+            ProviderManagerError::config_source("could not encode provider lock", source)
+        })?
         .into_bytes();
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
     if bytes.len() > HARD_MAX_PROVIDER_STATE_BYTES {
-        return Err(ProviderManagerError::StateTooLarge {
-            length: bytes.len(),
-            maximum: HARD_MAX_PROVIDER_STATE_BYTES,
-        });
+        return Err(ProviderManagerError::config_detail(
+            STATE_TOO_LARGE,
+            format!(
+                "provider state is {} bytes; maximum is {HARD_MAX_PROVIDER_STATE_BYTES}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(bytes)
 }
@@ -701,42 +731,35 @@ struct OciReference {
 impl OciReference {
     fn parse(source: &str) -> Result<Self, ProviderManagerError> {
         if source.is_empty() || source.len() > 512 || source.contains("://") {
-            return Err(ProviderManagerError::InvalidSource {
-                reference: source.to_owned(),
-                reason: "expected a bounded OCI reference rather than a URL".to_owned(),
-            });
+            return Err(ProviderManagerError::config_detail(
+                "expected a bounded OCI reference rather than a URL",
+                source,
+            ));
         }
         let (name, tag, digest) = if let Some((name, digest)) = source.rsplit_once('@') {
             if name.contains('@') || digest.is_empty() {
-                return Err(ProviderManagerError::InvalidSource {
-                    reference: source.to_owned(),
-                    reason: "invalid manifest-digest selector".to_owned(),
-                });
+                return Err(ProviderManagerError::config_detail(
+                    "invalid manifest-digest selector",
+                    source,
+                ));
             }
             validate_digest(digest)?;
             (name, None, Some(digest.to_owned()))
         } else {
-            let slash =
-                source
-                    .rfind('/')
-                    .ok_or_else(|| ProviderManagerError::UnqualifiedSource {
-                        reference: source.to_owned(),
-                    })?;
+            let slash = source
+                .rfind('/')
+                .ok_or_else(|| ProviderManagerError::config_detail(UNQUALIFIED_SOURCE, source))?;
             let colon = source[slash + 1..]
                 .rfind(':')
                 .map(|relative| slash + 1 + relative)
-                .ok_or_else(|| ProviderManagerError::MissingSelector {
-                    reference: source.to_owned(),
-                })?;
+                .ok_or_else(|| ProviderManagerError::config_detail(MISSING_SELECTOR, source))?;
             let tag = &source[colon + 1..];
             validate_tag(tag, source)?;
             (&source[..colon], Some(tag.to_owned()), None)
         };
-        let (registry, repository) =
-            name.split_once('/')
-                .ok_or_else(|| ProviderManagerError::UnqualifiedSource {
-                    reference: source.to_owned(),
-                })?;
+        let (registry, repository) = name
+            .split_once('/')
+            .ok_or_else(|| ProviderManagerError::config_detail(UNQUALIFIED_SOURCE, source))?;
         validate_registry(registry, source)?;
         validate_repository(repository, source)?;
         Ok(Self {
@@ -790,10 +813,10 @@ fn validate_registry(registry: &str, source: &str) -> Result<(), ProviderManager
         })
         || registry.matches(':').count() > 1
     {
-        return Err(ProviderManagerError::InvalidSource {
-            reference: source.to_owned(),
-            reason: "registry authority is not canonical lowercase host[:port]".to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(
+            "registry authority is not canonical lowercase host[:port]",
+            source,
+        ));
     }
     let (host, port) = registry
         .rsplit_once(':')
@@ -809,9 +832,10 @@ fn validate_registry(registry: &str, source: &str) -> Result<(), ProviderManager
         || port.is_some_and(|port| port.parse::<u16>().is_err())
         || !(host == "localhost" || host.contains('.') || port.is_some())
     {
-        return Err(ProviderManagerError::UnqualifiedSource {
-            reference: source.to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(
+            UNQUALIFIED_SOURCE,
+            source,
+        ));
     }
     Ok(())
 }
@@ -836,10 +860,10 @@ fn validate_repository(repository: &str, source: &str) -> Result<(), ProviderMan
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
     {
-        return Err(ProviderManagerError::InvalidSource {
-            reference: source.to_owned(),
-            reason: "repository is not a canonical lowercase OCI name".to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(
+            "repository is not a canonical lowercase OCI name",
+            source,
+        ));
     }
     Ok(())
 }
@@ -855,10 +879,10 @@ fn validate_tag(tag: &str, source: &str) -> Result<(), ProviderManagerError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
     {
-        return Err(ProviderManagerError::InvalidSource {
-            reference: source.to_owned(),
-            reason: "tag is not a canonical OCI tag".to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(
+            "tag is not a canonical OCI tag",
+            source,
+        ));
     }
     Ok(())
 }
@@ -945,7 +969,10 @@ impl RegistryClient {
         let mut allowed = BTreeSet::new();
         for registry in plaintext {
             if !is_literal_loopback_registry(&registry) {
-                return Err(ProviderManagerError::PlaintextRegistryNotLoopback { registry });
+                return Err(ProviderManagerError::config_detail(
+                    "plaintext OCI registry must be a literal loopback authority",
+                    registry,
+                ));
             }
             allowed.insert(registry);
         }
@@ -956,7 +983,12 @@ impl RegistryClient {
             .redirect(registry_redirect_policy(allowed.clone()))
             .user_agent(concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|source| ProviderManagerError::RegistryClient { source })?;
+            .map_err(|source| {
+                ProviderManagerError::registry_source(
+                    "could not initialize bounded OCI registry client",
+                    source,
+                )
+            })?;
         Ok(Self {
             client,
             plaintext: allowed,
@@ -970,9 +1002,7 @@ impl RegistryClient {
             .reference
             .digest()
             .or_else(|| parsed.reference.tag())
-            .ok_or_else(|| ProviderManagerError::MissingSelector {
-                reference: source.to_owned(),
-            })?;
+            .ok_or_else(|| ProviderManagerError::config_detail(MISSING_SELECTOR, source))?;
         let url = self.registry_url(&parsed.reference, &format!("manifests/{selector}"))?;
         let response = self
             .get_authorized(
@@ -989,9 +1019,10 @@ impl RegistryClient {
             .and_then(|value| value.split(';').next())
             .map(str::trim);
         if content_type != Some(OCI_MANIFEST_MEDIA_TYPE) {
-            return Err(ProviderManagerError::InvalidManifestContentType {
-                actual: content_type.unwrap_or("missing").to_owned(),
-            });
+            return Err(ProviderManagerError::registry_detail(
+                "OCI manifest response content type is not the image manifest media type",
+                content_type.unwrap_or("missing"),
+            ));
         }
         let bytes =
             bounded_response_bytes(response, HARD_MAX_PROVIDER_MANIFEST_BYTES, "manifest").await?;
@@ -999,25 +1030,34 @@ impl RegistryClient {
         if let Some(expected) = parsed.reference.digest()
             && manifest_digest != expected
         {
-            return Err(ProviderManagerError::ManifestDigestMismatch {
-                expected: expected.to_owned(),
-                actual: manifest_digest,
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                MANIFEST_DIGEST_MISMATCH,
+                expected,
+                manifest_digest,
+            ));
         }
         if let Some(header) = headers.get(DOCKER_CONTENT_DIGEST) {
-            let header = header
-                .to_str()
-                .map_err(|source| ProviderManagerError::InvalidDigestHeader { source })?;
+            let header = header.to_str().map_err(|source| {
+                ProviderManagerError::registry_source(
+                    "OCI registry manifest digest header is invalid",
+                    source,
+                )
+            })?;
             validate_digest(header)?;
             if header != manifest_digest {
-                return Err(ProviderManagerError::ManifestDigestMismatch {
-                    expected: header.to_owned(),
-                    actual: manifest_digest,
-                });
+                return Err(ProviderManagerError::digest_mismatch(
+                    MANIFEST_DIGEST_MISMATCH,
+                    header,
+                    manifest_digest,
+                ));
             }
         }
-        let manifest = serde_json::from_slice::<OciProviderManifest>(&bytes)
-            .map_err(|source| ProviderManagerError::DecodeManifest { source })?;
+        let manifest = serde_json::from_slice::<OciProviderManifest>(&bytes).map_err(|source| {
+            ProviderManagerError::registry_source(
+                "OCI provider manifest is not strict valid JSON",
+                source,
+            )
+        })?;
         let layer = validate_manifest(&manifest)?;
         let resolved_version = parsed
             .reference
@@ -1038,10 +1078,13 @@ impl RegistryClient {
         output: &mut tokio::fs::File,
     ) -> Result<(), ProviderManagerError> {
         if descriptor.size == 0 || descriptor.size > HARD_MAX_PROVIDER_COMPONENT_BYTES {
-            return Err(ProviderManagerError::ComponentSize {
-                size: descriptor.size,
-                maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
-            });
+            return Err(ProviderManagerError::registry_detail(
+                COMPONENT_SIZE,
+                format!(
+                    "provider component is {} bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}",
+                    descriptor.size
+                ),
+            ));
         }
         let parsed = ParsedSource::parse(source)?;
         let url = self.registry_url(&parsed.reference, &format!("blobs/{}", descriptor.digest))?;
@@ -1051,49 +1094,55 @@ impl RegistryClient {
         if let Some(length) = response.content_length()
             && length != descriptor.size
         {
-            return Err(ProviderManagerError::BlobSizeMismatch {
-                expected: descriptor.size,
-                actual: length,
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_SIZE_MISMATCH,
+                descriptor.size.to_string(),
+                length.to_string(),
+            ));
         }
         let mut stream = response.bytes_stream();
         let mut digest = Sha256::new();
         let mut length = 0_u64;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|source| ProviderManagerError::RegistryRead {
-                operation: "blob",
-                source: source.without_url(),
+            let chunk = chunk.map_err(|source| {
+                ProviderManagerError::registry_transport(
+                    REGISTRY_STREAM_FAILED,
+                    "blob",
+                    source.without_url(),
+                )
             })?;
-            length = length.checked_add(chunk.len() as u64).ok_or(
-                ProviderManagerError::ComponentSize {
-                    size: u64::MAX,
-                    maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
-                },
-            )?;
+            length = length.checked_add(chunk.len() as u64).ok_or_else(|| {
+                ProviderManagerError::registry_detail(
+                    COMPONENT_SIZE,
+                    format!("provider component exceeds {HARD_MAX_PROVIDER_COMPONENT_BYTES} bytes"),
+                )
+            })?;
             if length > descriptor.size || length > HARD_MAX_PROVIDER_COMPONENT_BYTES {
-                return Err(ProviderManagerError::BlobSizeMismatch {
-                    expected: descriptor.size,
-                    actual: length,
-                });
+                return Err(ProviderManagerError::digest_mismatch(
+                    BLOB_SIZE_MISMATCH,
+                    descriptor.size.to_string(),
+                    length.to_string(),
+                ));
             }
             digest.update(&chunk);
-            output
-                .write_all(&chunk)
-                .await
-                .map_err(|source| ProviderManagerError::WriteBlob { source })?;
+            output.write_all(&chunk).await.map_err(|source| {
+                ProviderManagerError::io("could not write provider blob", source)
+            })?;
         }
         if length != descriptor.size {
-            return Err(ProviderManagerError::BlobSizeMismatch {
-                expected: descriptor.size,
-                actual: length,
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_SIZE_MISMATCH,
+                descriptor.size.to_string(),
+                length.to_string(),
+            ));
         }
         let actual = format!("sha256:{}", hex_digest(digest.finalize().as_slice()));
         if actual != descriptor.digest {
-            return Err(ProviderManagerError::BlobDigestMismatch {
-                expected: descriptor.digest.clone(),
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_DIGEST_MISMATCH,
+                descriptor.digest.clone(),
                 actual,
-            });
+            ));
         }
         Ok(())
     }
@@ -1113,7 +1162,9 @@ impl RegistryClient {
             "{scheme}://{registry}/v2/{}/{suffix}",
             reference.repository()
         ))
-        .map_err(|source| ProviderManagerError::RegistryUrl { source })
+        .map_err(|source| {
+            ProviderManagerError::registry_source("could not construct OCI registry URL", source)
+        })
     }
 
     async fn get_authorized(
@@ -1136,9 +1187,14 @@ impl RegistryClient {
             let challenge = response
                 .headers()
                 .get(WWW_AUTHENTICATE)
-                .ok_or(ProviderManagerError::MissingRegistryChallenge)?
+                .ok_or_else(|| ProviderManagerError::registry(MISSING_CHALLENGE))?
                 .to_str()
-                .map_err(|source| ProviderManagerError::InvalidRegistryChallengeHeader { source })?
+                .map_err(|source| {
+                    ProviderManagerError::registry_source(
+                        "OCI registry authentication challenge header is invalid",
+                        source,
+                    )
+                })?
                 .to_owned();
             // Bound and discard the unauthenticated response before retrying. Registry text is
             // untrusted and never enters the surfaced error or ordinary logs.
@@ -1150,7 +1206,10 @@ impl RegistryClient {
         if !response.status().is_success() {
             let status = response.status();
             bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
-            return Err(ProviderManagerError::RegistryStatus { operation, status });
+            return Err(ProviderManagerError::registry_detail(
+                REGISTRY_STATUS,
+                format!("{operation}: HTTP {status}"),
+            ));
         }
         Ok(response)
     }
@@ -1168,16 +1227,21 @@ impl RegistryClient {
         }
         if let Some(token) = token {
             let value = HeaderValue::from_str(&format!("Bearer {}", token.0))
-                .map_err(|source| ProviderManagerError::InvalidAuthorizationHeader { source })?;
+                .map_err(|source| {
+                    ProviderManagerError::registry_source(
+                        "OCI registry returned a token that cannot form an HTTP authorization header",
+                        source,
+                    )
+                })?;
             request = request.header(AUTHORIZATION, value);
         }
-        request
-            .send()
-            .await
-            .map_err(|source| ProviderManagerError::RegistryRequest {
+        request.send().await.map_err(|source| {
+            ProviderManagerError::registry_transport(
+                REGISTRY_REQUEST_FAILED,
                 operation,
-                source: source.without_url(),
-            })
+                source.without_url(),
+            )
+        })
     }
 
     async fn fetch_token(
@@ -1186,12 +1250,18 @@ impl RegistryClient {
         challenge: &str,
     ) -> Result<RegistryToken, ProviderManagerError> {
         let challenge = parse_bearer_challenge(challenge)?;
-        let mut realm = Url::parse(&challenge.realm)
-            .map_err(|source| ProviderManagerError::RegistryTokenUrl { source })?;
+        let mut realm = Url::parse(&challenge.realm).map_err(|source| {
+            ProviderManagerError::registry_source(
+                "OCI registry token realm is not a valid URL",
+                source,
+            )
+        })?;
         if realm.scheme() != "https" {
             let authority = url_authority(&realm)?;
             if realm.scheme() != "http" || !self.plaintext.contains(&authority) {
-                return Err(ProviderManagerError::InsecureTokenRealm { realm: authority });
+                return Err(ProviderManagerError::registry(
+                    "OCI registry token realm may not use plaintext HTTP",
+                ));
             }
         }
         {
@@ -1213,29 +1283,43 @@ impl RegistryClient {
             .timeout(REGISTRY_OPERATION_TIMEOUT)
             .send()
             .await
-            .map_err(|source| ProviderManagerError::RegistryRequest {
-                operation: "token",
-                source: source.without_url(),
+            .map_err(|source| {
+                ProviderManagerError::registry_transport(
+                    REGISTRY_REQUEST_FAILED,
+                    "token",
+                    source.without_url(),
+                )
             })?;
         if !response.status().is_success() {
             let status = response.status();
             bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, "token").await?;
-            return Err(ProviderManagerError::RegistryStatus {
-                operation: "token",
-                status,
-            });
+            return Err(ProviderManagerError::registry_detail(
+                REGISTRY_STATUS,
+                format!("token: HTTP {status}"),
+            ));
         }
         let bytes = bounded_response_bytes(response, HARD_MAX_TOKEN_BYTES, "token").await?;
-        let document = serde_json::from_slice::<TokenDocument>(&bytes)
-            .map_err(|source| ProviderManagerError::DecodeRegistryToken { source })?;
+        let document = serde_json::from_slice::<TokenDocument>(&bytes).map_err(|source| {
+            ProviderManagerError::registry_source("OCI registry token response is invalid", source)
+        })?;
         let token = match (document.token, document.access_token) {
             (Some(token), None) | (None, Some(token)) => token,
             (Some(token), Some(access)) if token == access => token,
-            (Some(_), Some(_)) => return Err(ProviderManagerError::AmbiguousRegistryToken),
-            (None, None) => return Err(ProviderManagerError::MissingRegistryToken),
+            (Some(_), Some(_)) => {
+                return Err(ProviderManagerError::registry(
+                    "OCI registry token response supplied conflicting token fields",
+                ));
+            }
+            (None, None) => {
+                return Err(ProviderManagerError::registry(
+                    "OCI registry token response omitted token",
+                ));
+            }
         };
         if token.is_empty() || token.len() > HARD_MAX_TOKEN_BYTES {
-            return Err(ProviderManagerError::InvalidRegistryToken);
+            return Err(ProviderManagerError::registry(
+                "OCI registry token is blank or exceeds its hard byte ceiling",
+            ));
         }
         Ok(RegistryToken(token))
     }
@@ -1259,7 +1343,9 @@ struct BearerChallenge {
 fn parse_bearer_challenge(value: &str) -> Result<BearerChallenge, ProviderManagerError> {
     for parsed in ChallengeParser::new(value) {
         let Ok(parsed) = parsed else {
-            return Err(ProviderManagerError::InvalidRegistryChallenge);
+            return Err(ProviderManagerError::registry(
+                "OCI registry authentication challenge is invalid",
+            ));
         };
         if !parsed.scheme.eq_ignore_ascii_case("Bearer") {
             continue;
@@ -1276,30 +1362,38 @@ fn parse_bearer_challenge(value: &str) -> Result<BearerChallenge, ProviderManage
             }
         }
         return Ok(BearerChallenge {
-            realm: realm.ok_or(ProviderManagerError::MissingTokenRealm)?,
+            realm: realm.ok_or_else(|| {
+                ProviderManagerError::registry("OCI registry Bearer challenge omitted realm")
+            })?,
             service,
             scope,
         });
     }
-    Err(ProviderManagerError::MissingRegistryChallenge)
+    Err(ProviderManagerError::registry(MISSING_CHALLENGE))
 }
 
 fn validate_manifest(
     manifest: &OciProviderManifest,
 ) -> Result<LayerDescriptor, ProviderManagerError> {
     if manifest.schema_version != 2 || manifest.media_type != OCI_MANIFEST_MEDIA_TYPE {
-        return Err(ProviderManagerError::InvalidManifestType {
-            schema: manifest.schema_version,
-            media_type: manifest.media_type.clone(),
-        });
+        return Err(ProviderManagerError::registry_detail(
+            "OCI provider manifest is not one OCI v1 image manifest",
+            format!(
+                "schema {}, media type {}",
+                manifest.schema_version, manifest.media_type
+            ),
+        ));
     }
     if manifest.artifact_type != PROVIDER_ARTIFACT_TYPE {
-        return Err(ProviderManagerError::InvalidArtifactType {
-            actual: manifest.artifact_type.clone(),
-        });
+        return Err(ProviderManagerError::registry_detail(
+            "OCI artifact type is not the Dekopon provider type",
+            manifest.artifact_type.clone(),
+        ));
     }
     if manifest.subject.is_some() {
-        return Err(ProviderManagerError::ManifestHasSubject);
+        return Err(ProviderManagerError::registry(
+            "OCI provider manifest must not carry a subject",
+        ));
     }
     validate_digest(&manifest.config.digest)?;
     if manifest.config.media_type != OCI_EMPTY_CONFIG_MEDIA_TYPE
@@ -1318,37 +1412,47 @@ fn validate_manifest(
             .is_some_and(|urls| !urls.is_empty())
         || manifest.config.artifact_type.is_some()
     {
-        return Err(ProviderManagerError::InvalidConfigDescriptor);
+        return Err(ProviderManagerError::registry(
+            "OCI provider config descriptor is invalid or too large",
+        ));
     }
     if manifest.layers.len() != 1 {
-        return Err(ProviderManagerError::LayerCount {
-            actual: manifest.layers.len(),
-        });
+        return Err(ProviderManagerError::registry_detail(
+            "OCI provider manifest must carry exactly one layer",
+            format!("{} layers", manifest.layers.len()),
+        ));
     }
     let layer = &manifest.layers[0];
     if layer.media_type != PROVIDER_LAYER_MEDIA_TYPE {
-        return Err(ProviderManagerError::InvalidLayerMediaType {
-            actual: layer.media_type.clone(),
-        });
+        return Err(ProviderManagerError::registry_detail(
+            "OCI provider layer media type is not application/wasm",
+            layer.media_type.clone(),
+        ));
     }
     if layer.urls.as_ref().is_some_and(|urls| !urls.is_empty())
         || layer.artifact_type.is_some()
         || layer.data.is_some()
     {
-        return Err(ProviderManagerError::InvalidLayerDescriptor);
+        return Err(ProviderManagerError::registry(
+            "OCI provider layer descriptor contains unsupported indirection",
+        ));
     }
     validate_digest(&layer.digest)?;
     let Ok(size) = u64::try_from(layer.size) else {
-        return Err(ProviderManagerError::ComponentSize {
-            size: 0,
-            maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
-        });
+        return Err(ProviderManagerError::registry_detail(
+            COMPONENT_SIZE,
+            format!(
+                "provider component is 0 bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}"
+            ),
+        ));
     };
     if size == 0 || size > HARD_MAX_PROVIDER_COMPONENT_BYTES {
-        return Err(ProviderManagerError::ComponentSize {
-            size,
-            maximum: HARD_MAX_PROVIDER_COMPONENT_BYTES,
-        });
+        return Err(ProviderManagerError::registry_detail(
+            COMPONENT_SIZE,
+            format!(
+                "provider component is {size} bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}"
+            ),
+        ));
     }
     // OCI annotations are accepted by the strict decoder but remain bounded incidental metadata;
     // they are never trusted for filenames, identity, authorization, or I/O.
@@ -1373,7 +1477,7 @@ impl ProviderStore {
             ensure_private_directory(&root.join("blobs/sha256"), expected_uid)?;
         }
         let root = fs::canonicalize(&root)
-            .map_err(|source| ProviderManagerError::StorePath { path: root, source })?;
+            .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, root, source))?;
         validate_directory(&root, expected_uid, true)?;
         let blobs = root.join("blobs");
         validate_directory(&blobs, expected_uid, true)?;
@@ -1411,8 +1515,8 @@ impl ProviderStore {
         let path = self.blob_path(&locked.component_digest)?;
         match verify_blob(&path, locked, self.uid).await {
             Ok(()) => return Ok(false),
-            Err(ProviderManagerError::ReadFile { source, .. })
-                if source.kind() == io::ErrorKind::NotFound => {}
+            Err(ProviderManagerError::Io { reason, source, .. })
+                if reason == READ_PROVIDER_STATE && source.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         let descriptor = LayerDescriptor {
@@ -1439,73 +1543,77 @@ impl ProviderStore {
         let temporary = tempfile::Builder::new()
             .prefix(".provider-")
             .tempfile_in(&self.sha256)
-            .map_err(|source| ProviderManagerError::CreateTemporaryBlob { source })?;
-        let std_file = temporary
-            .reopen()
-            .map_err(|source| ProviderManagerError::CreateTemporaryBlob { source })?;
+            .map_err(|source| {
+                ProviderManagerError::io_at(
+                    "could not create provider blob temporary file",
+                    &self.sha256,
+                    source,
+                )
+            })?;
+        let std_file = temporary.reopen().map_err(|source| {
+            ProviderManagerError::io_at(
+                "could not create provider blob temporary file",
+                &self.sha256,
+                source,
+            )
+        })?;
         let mut file = tokio::fs::File::from_std(std_file);
         registry
             .download_blob(source, descriptor, &mut file)
             .await?;
         file.flush()
             .await
-            .map_err(|source| ProviderManagerError::WriteBlob { source })?;
-        file.sync_all()
-            .await
-            .map_err(|source| ProviderManagerError::SyncBlob { source })?;
+            .map_err(|source| ProviderManagerError::io("could not write provider blob", source))?;
+        file.sync_all().await.map_err(|source| {
+            ProviderManagerError::io("could not synchronize provider blob", source)
+        })?;
         drop(file);
         temporary.persist_noclobber(&destination).map_err(|error| {
-            ProviderManagerError::PublishBlob {
-                path: destination.clone(),
-                source: error.error,
-            }
+            ProviderManagerError::io_at(
+                "could not atomically publish provider blob",
+                destination.clone(),
+                error.error,
+            )
         })?;
         sync_directory(&self.sha256)?;
         socket::validate_owned_file(&destination, self.uid)
-            .map_err(ProviderManagerError::FileSecurity)?;
+            .map_err(|error| ProviderManagerError::file_security(&destination, error))?;
         Ok(true)
     }
 
     fn ensure_capacity(&self, requested: u64) -> Result<(), ProviderManagerError> {
         let mut blobs = 0_usize;
         let mut bytes = 0_u64;
-        let entries =
-            fs::read_dir(&self.sha256).map_err(|source| ProviderManagerError::StoreScan {
-                path: self.sha256.clone(),
-                source,
-            })?;
+        let entries = fs::read_dir(&self.sha256).map_err(|source| {
+            ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, &self.sha256, source)
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|source| ProviderManagerError::StoreScan {
-                path: self.sha256.clone(),
-                source,
+            let entry = entry.map_err(|source| {
+                ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, &self.sha256, source)
             })?;
             let path = entry.path();
             socket::validate_owned_file(&path, self.uid)
-                .map_err(ProviderManagerError::FileSecurity)?;
-            let metadata = entry
-                .metadata()
-                .map_err(|source| ProviderManagerError::StoreScan {
-                    path: path.clone(),
-                    source,
-                })?;
+                .map_err(|error| ProviderManagerError::file_security(&path, error))?;
+            let metadata = entry.metadata().map_err(|source| {
+                ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, path.clone(), source)
+            })?;
             blobs = blobs.saturating_add(1);
-            bytes =
-                bytes
-                    .checked_add(metadata.len())
-                    .ok_or(ProviderManagerError::StoreCapacity {
-                        blobs,
-                        bytes: u64::MAX,
-                        requested,
-                        maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
-                        maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
-                    })?;
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or(ProviderManagerError::StoreFull {
+                    blobs,
+                    bytes: u64::MAX,
+                    requested,
+                    maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
+                    maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
+                })?;
         }
         if blobs >= HARD_MAX_PROVIDER_STORE_BLOBS
             || bytes
                 .checked_add(requested)
                 .is_none_or(|total| total > HARD_MAX_PROVIDER_STORE_BYTES)
         {
-            return Err(ProviderManagerError::StoreCapacity {
+            return Err(ProviderManagerError::StoreFull {
                 blobs,
                 bytes,
                 requested,
@@ -1543,17 +1651,11 @@ fn open_operation_lock(
         .custom_flags(libc::O_NOFOLLOW);
     let file = options
         .open(path)
-        .map_err(|source| ProviderManagerError::OperationLock {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(|source| ProviderManagerError::io_at(LOCK_STORE_OPERATION, path, source))?;
     validate_file_metadata(
         &file
             .metadata()
-            .map_err(|source| ProviderManagerError::OperationLock {
-                path: path.to_path_buf(),
-                source,
-            })?,
+            .map_err(|source| ProviderManagerError::io_at(LOCK_STORE_OPERATION, path, source))?,
         path,
         expected_uid,
         true,
@@ -1564,10 +1666,7 @@ fn open_operation_lock(
                 path: path.to_path_buf(),
             }
         } else {
-            ProviderManagerError::OperationLock {
-                path: path.to_path_buf(),
-                source,
-            }
+            ProviderManagerError::io_at(LOCK_STORE_OPERATION, path, source)
         }
     })?;
     Ok(ProviderOperationLock { _file: file })
@@ -1593,62 +1692,55 @@ async fn verify_component_file(
     component_bytes: u64,
     expected_uid: u32,
 ) -> Result<(), ProviderManagerError> {
-    fs::symlink_metadata(path).map_err(|source| ProviderManagerError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    socket::validate_owned_file(path, expected_uid).map_err(ProviderManagerError::FileSecurity)?;
+    fs::symlink_metadata(path)
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
+    socket::validate_owned_file(path, expected_uid)
+        .map_err(|error| ProviderManagerError::file_security(path, error))?;
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
     let mut file = options
         .open(path)
         .await
-        .map_err(|source| ProviderManagerError::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
     let metadata = file
         .metadata()
         .await
-        .map_err(|source| ProviderManagerError::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
     if metadata.len() != component_bytes {
-        return Err(ProviderManagerError::BlobSizeMismatch {
-            expected: component_bytes,
-            actual: metadata.len(),
-        });
+        return Err(ProviderManagerError::digest_mismatch(
+            BLOB_SIZE_MISMATCH,
+            component_bytes.to_string(),
+            metadata.len().to_string(),
+        ));
     }
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut length = 0_u64;
     loop {
-        let read =
-            file.read(&mut buffer)
-                .await
-                .map_err(|source| ProviderManagerError::ReadFile {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
         if read == 0 {
             break;
         }
         length += read as u64;
         if length > component_bytes || length > HARD_MAX_PROVIDER_COMPONENT_BYTES {
-            return Err(ProviderManagerError::BlobSizeMismatch {
-                expected: component_bytes,
-                actual: length,
-            });
+            return Err(ProviderManagerError::digest_mismatch(
+                BLOB_SIZE_MISMATCH,
+                component_bytes.to_string(),
+                length.to_string(),
+            ));
         }
         digest.update(&buffer[..read]);
     }
     let actual = format!("sha256:{}", hex_digest(digest.finalize().as_slice()));
     if actual != component_digest {
-        return Err(ProviderManagerError::BlobDigestMismatch {
-            expected: component_digest.to_owned(),
+        return Err(ProviderManagerError::digest_mismatch(
+            BLOB_DIGEST_MISMATCH,
+            component_digest,
             actual,
-        });
+        ));
     }
     Ok(())
 }
@@ -1665,34 +1757,34 @@ async fn read_secure_file(
     let file = options
         .open(&path)
         .await
-        .map_err(|source| ProviderManagerError::ReadFile {
-            path: path.clone(),
-            source,
-        })?;
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), source))?;
     let metadata = file
         .metadata()
         .await
-        .map_err(|source| ProviderManagerError::ReadFile {
-            path: path.clone(),
-            source,
-        })?;
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), source))?;
     validate_file_metadata(&metadata, &path, expected_uid, false)?;
     if metadata.len() > maximum as u64 {
-        return Err(ProviderManagerError::StateTooLarge {
-            length: metadata.len() as usize,
-            maximum,
-        });
+        return Err(ProviderManagerError::config_detail(
+            STATE_TOO_LARGE,
+            format!(
+                "provider state is {} bytes; maximum is {maximum}",
+                metadata.len()
+            ),
+        ));
     }
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
         .await
-        .map_err(|source| ProviderManagerError::ReadFile { path, source })?;
+        .map_err(|source| ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source))?;
     if bytes.len() > maximum {
-        return Err(ProviderManagerError::StateTooLarge {
-            length: bytes.len(),
-            maximum,
-        });
+        return Err(ProviderManagerError::config_detail(
+            STATE_TOO_LARGE,
+            format!(
+                "provider state is {} bytes; maximum is {maximum}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(bytes)
 }
@@ -1709,23 +1801,20 @@ fn validate_file_metadata(
         || metadata.permissions().mode() & forbidden != 0
         || metadata.nlink() != 1
     {
-        return Err(ProviderManagerError::InsecureFile {
-            path: path.to_path_buf(),
-        });
+        return Err(ProviderManagerError::insecure(
+            "provider state must be regular, single-link, owned by this UID, and not group/world writable",
+            path,
+        ));
     }
     Ok(())
 }
 
 fn validate_file_parent(path: &Path, expected_uid: u32) -> Result<(), ProviderManagerError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ProviderManagerError::MissingParent {
-            path: path.to_path_buf(),
-        })?;
-    let parent = fs::canonicalize(parent).map_err(|source| ProviderManagerError::StorePath {
-        path: parent.to_path_buf(),
-        source,
+    let parent = path.parent().ok_or_else(|| {
+        ProviderManagerError::config_detail(PATH_HAS_NO_PARENT, path.display().to_string())
     })?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, parent, source))?;
     validate_directory(&parent, expected_uid, false)
 }
 
@@ -1735,19 +1824,17 @@ fn validate_directory(
     private: bool,
 ) -> Result<(), ProviderManagerError> {
     validate_ancestors(path)?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|source| ProviderManagerError::StorePath {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, path, source))?;
     let forbidden = if private { 0o077 } else { 0o022 };
     if !metadata.file_type().is_dir()
         || metadata.uid() != expected_uid
         || metadata.permissions().mode() & forbidden != 0
     {
-        return Err(ProviderManagerError::InsecureDirectory {
-            path: path.to_path_buf(),
-        });
+        return Err(ProviderManagerError::insecure(
+            "provider directory is not protected and owned by this UID",
+            path,
+        ));
     }
     Ok(())
 }
@@ -1755,21 +1842,17 @@ fn validate_directory(
 fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
     // Intermediate aliases such as macOS's `/var -> /private/var` are resolved before the walk;
     // the final entry itself is still inspected with `symlink_metadata` by the caller.
-    let canonical = fs::canonicalize(path).map_err(|source| ProviderManagerError::StorePath {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, path, source))?;
     for ancestor in canonical.ancestors() {
-        let metadata =
-            fs::symlink_metadata(ancestor).map_err(|source| ProviderManagerError::StorePath {
-                path: ancestor.to_path_buf(),
-                source,
-            })?;
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, ancestor, source))?;
         let mode = metadata.permissions().mode();
         if !metadata.file_type().is_dir() || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
-            return Err(ProviderManagerError::InsecureAncestor {
-                path: ancestor.to_path_buf(),
-            });
+            return Err(ProviderManagerError::insecure(
+                "provider path ancestor permits unprotected group/world writes",
+                ancestor,
+            ));
         }
     }
     Ok(())
@@ -1779,11 +1862,9 @@ fn ensure_private_directory(path: &Path, expected_uid: u32) -> Result<(), Provid
     match fs::symlink_metadata(path) {
         Ok(_) => validate_directory(path, expected_uid, true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .ok_or_else(|| ProviderManagerError::MissingParent {
-                    path: path.to_path_buf(),
-                })?;
+            let parent = path.parent().ok_or_else(|| {
+                ProviderManagerError::config_detail(PATH_HAS_NO_PARENT, path.display().to_string())
+            })?;
             validate_directory(parent, expected_uid, false)?;
             let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
@@ -1791,19 +1872,21 @@ fn ensure_private_directory(path: &Path, expected_uid: u32) -> Result<(), Provid
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(source) => {
-                    return Err(ProviderManagerError::CreateStore {
-                        path: path.to_path_buf(),
+                    return Err(ProviderManagerError::io_at(
+                        "could not create protected provider store directory",
+                        path,
                         source,
-                    });
+                    ));
                 }
             }
             validate_directory(path, expected_uid, true)?;
             sync_directory(parent)
         }
-        Err(source) => Err(ProviderManagerError::StorePath {
-            path: path.to_path_buf(),
+        Err(source) => Err(ProviderManagerError::io_at(
+            INSPECT_STORE_PATH,
+            path,
             source,
-        }),
+        )),
     }
 }
 
@@ -1813,28 +1896,33 @@ fn atomic_write(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<(), Prov
     if let Ok(metadata) = fs::symlink_metadata(&path) {
         validate_file_metadata(&metadata, &path, expected_uid, false)?;
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| ProviderManagerError::MissingParent { path: path.clone() })?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|source| ProviderManagerError::CreateTemporaryState { source })?;
+    let parent = path.parent().ok_or_else(|| {
+        ProviderManagerError::config_detail(PATH_HAS_NO_PARENT, path.display().to_string())
+    })?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
+        ProviderManagerError::io_at(
+            "could not create provider-lock temporary file",
+            parent,
+            source,
+        )
+    })?;
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|source| ProviderManagerError::WriteState { source })?;
+        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
     temporary
         .write_all(bytes)
-        .map_err(|source| ProviderManagerError::WriteState { source })?;
-    temporary
-        .as_file_mut()
-        .sync_all()
-        .map_err(|source| ProviderManagerError::SyncState { source })?;
-    temporary
-        .persist(&path)
-        .map_err(|error| ProviderManagerError::PublishState {
-            path: path.clone(),
-            source: error.error,
-        })?;
+        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
+    temporary.as_file_mut().sync_all().map_err(|source| {
+        ProviderManagerError::io("could not synchronize provider-lock temporary file", source)
+    })?;
+    temporary.persist(&path).map_err(|error| {
+        ProviderManagerError::io_at(
+            "could not atomically publish provider lock",
+            path.clone(),
+            error.error,
+        )
+    })?;
     sync_directory(parent)?;
     Ok(())
 }
@@ -1842,9 +1930,8 @@ fn atomic_write(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<(), Prov
 fn sync_directory(path: &Path) -> Result<(), ProviderManagerError> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|source| ProviderManagerError::SyncDirectory {
-            path: path.to_path_buf(),
-            source,
+        .map_err(|source| {
+            ProviderManagerError::io_at("could not synchronize provider directory", path, source)
         })
 }
 
@@ -1859,22 +1946,31 @@ async fn bounded_response_bytes(
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
         if length.is_some_and(|length| length > maximum as u64) {
-            return Err(ProviderManagerError::RegistryResponseTooLarge { operation, maximum });
+            return Err(ProviderManagerError::registry_detail(
+                RESPONSE_TOO_LARGE,
+                format!("{operation}: maximum is {maximum} bytes"),
+            ));
         }
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| ProviderManagerError::RegistryRead {
-            operation,
-            source: source.without_url(),
+        let chunk = chunk.map_err(|source| {
+            ProviderManagerError::registry_transport(
+                REGISTRY_STREAM_FAILED,
+                operation,
+                source.without_url(),
+            )
         })?;
         if bytes
             .len()
             .checked_add(chunk.len())
             .is_none_or(|length| length > maximum)
         {
-            return Err(ProviderManagerError::RegistryResponseTooLarge { operation, maximum });
+            return Err(ProviderManagerError::registry_detail(
+                RESPONSE_TOO_LARGE,
+                format!("{operation}: maximum is {maximum} bytes"),
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -1888,18 +1984,14 @@ fn validate_digest(digest: &str) -> Result<(), ProviderManagerError> {
 
 fn digest_hex(digest: &str) -> Result<&str, ProviderManagerError> {
     let Some(hex) = digest.strip_prefix("sha256:") else {
-        return Err(ProviderManagerError::InvalidDigest {
-            digest: digest.to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(INVALID_DIGEST, digest));
     };
     if hex.len() != 64
         || !hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(ProviderManagerError::InvalidDigest {
-            digest: digest.to_owned(),
-        });
+        return Err(ProviderManagerError::config_detail(INVALID_DIGEST, digest));
     }
     Ok(hex)
 }
@@ -1924,7 +2016,9 @@ fn absolute(path: &Path) -> Result<PathBuf, ProviderManagerError> {
     }
     std::env::current_dir()
         .map(|directory| directory.join(path))
-        .map_err(|source| ProviderManagerError::CurrentDirectory { source })
+        .map_err(|source| {
+            ProviderManagerError::io("could not determine the current directory", source)
+        })
 }
 
 fn registry_redirect_policy(plaintext: BTreeSet<String>) -> reqwest::redirect::Policy {
@@ -1970,7 +2064,7 @@ fn is_literal_loopback_registry(registry: &str) -> bool {
 fn url_authority(url: &Url) -> Result<String, ProviderManagerError> {
     let host = url
         .host_str()
-        .ok_or(ProviderManagerError::InvalidTokenRealm)?;
+        .ok_or_else(|| ProviderManagerError::registry("OCI registry token realm is invalid"))?;
     Ok(match url.port() {
         Some(port) if host.contains(':') => format!("[{host}]:{port}"),
         Some(port) => format!("{host}:{port}"),
@@ -1978,138 +2072,89 @@ fn url_authority(url: &Url) -> Result<String, ProviderManagerError> {
     })
 }
 
+/// Reason recorded when reading trusted provider state from disk fails.
+///
+/// `list`, `load_optional_lock`, and `ensure_locked_blob` treat an absent state file differently
+/// from every other filesystem failure, so this one check stays identifiable by name.
+const READ_PROVIDER_STATE: &str = "could not read provider state";
+/// Reason recorded when a store path cannot be resolved or inspected.
+const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
+/// Reason recorded when the blob directory cannot be scanned under the store lock.
+const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";
+/// Reason recorded when the manager operation lock cannot be opened or acquired.
+const LOCK_STORE_OPERATION: &str = "could not lock provider store operation";
+/// Reason recorded when the provider-lock temporary file cannot be written.
+const WRITE_LOCK_TEMPORARY: &str = "could not write provider-lock temporary file";
+/// Reason recorded when a state file exceeds its hard byte ceiling.
+const STATE_TOO_LARGE: &str = "provider state exceeds its hard byte ceiling";
+/// Reason recorded when a component length is zero or over its hard ceiling.
+const COMPONENT_SIZE: &str = "provider component size is outside its hard bounds";
+/// Reason recorded when a digest is not canonical SHA-256.
+const INVALID_DIGEST: &str =
+    "provider digest must be sha256 followed by sixty-four lowercase hexadecimal characters";
+/// Reason recorded when a source omits its explicit registry.
+const UNQUALIFIED_SOURCE: &str =
+    "provider source must be fully qualified with an explicit registry";
+/// Reason recorded when a source omits both an explicit tag and a manifest digest.
+const MISSING_SELECTOR: &str = "provider source must name an explicit tag or manifest digest";
+/// Reason recorded when a path used for trusted state has no parent directory.
+const PATH_HAS_NO_PARENT: &str = "path has no parent";
+/// Reason recorded when installed bytes do not match the descriptor length.
+///
+/// `list` reports length and content mismatches as different remedies, so both stay named.
+const BLOB_SIZE_MISMATCH: &str = "provider blob length does not match its descriptor";
+/// Reason recorded when installed bytes do not hash to the descriptor digest.
+const BLOB_DIGEST_MISMATCH: &str = "provider blob digest does not match its descriptor";
+/// Reason recorded when raw manifest bytes do not match the selected or returned digest.
+const MANIFEST_DIGEST_MISMATCH: &str = "OCI manifest digest does not match the selected digest";
+/// Reason recorded when a lock's informational SemVer disagrees with its exact tag.
+const RESOLVED_VERSION_MISMATCH: &str =
+    "provider lock resolvedVersion does not match its exact tag";
+/// Reason recorded when a registry request fails before a response.
+const REGISTRY_REQUEST_FAILED: &str = "OCI registry request failed";
+/// Reason recorded when a registry response fails while streaming.
+const REGISTRY_STREAM_FAILED: &str = "OCI registry response failed while streaming";
+/// Reason recorded when a registry returns a non-success status.
+const REGISTRY_STATUS: &str = "OCI registry returned an unsuccessful HTTP status";
+/// Reason recorded when a registry response exceeds its independent byte bound.
+const RESPONSE_TOO_LARGE: &str = "OCI registry response exceeds its byte ceiling";
+/// Reason recorded when an authentication challenge header is absent.
+const MISSING_CHALLENGE: &str =
+    "OCI registry required authentication without a WWW-Authenticate challenge";
+
+/// Renders the optional bounded detail a refusal carries after its fixed reason.
+fn detail_suffix(detail: &Option<String>) -> String {
+    detail
+        .as_ref()
+        .map_or_else(String::new, |detail| format!(": {detail}"))
+}
+
+/// Renders the optional path a filesystem failure names after its fixed reason.
+fn path_suffix(path: &Option<PathBuf>) -> String {
+    path.as_ref()
+        .map_or_else(String::new, |path| format!(" at {}", path.display()))
+}
+
 /// Provider resolution, store, lock, or validation failure.
+///
+/// Variants classify a refusal on the axis a caller acts on; `reason` names the exact check that
+/// refused and is drawn from a fixed vocabulary rather than composed at runtime. Registry URLs,
+/// authentication challenges, tokens, and credential bytes never reach `Display` or `Debug`
+/// through any variant: transport failures are recorded with their URL already stripped, and
+/// registry-controlled text is admitted only as a bounded media or artifact type.
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
-    /// Current working directory could not be determined for a relative path.
-    #[error("could not determine the current directory")]
-    CurrentDirectory {
-        /// Filesystem failure.
+    /// Operator-authored provider state, manager arguments, or exact source references were
+    /// rejected before any registry was contacted.
+    #[error("{reason}{}", detail_suffix(detail))]
+    Configuration {
+        /// Fixed description of the check that refused.
+        reason: &'static str,
+        /// Bounded operator-authored context, such as the offending reference.
+        detail: Option<String>,
+        /// Strict decode or encode failure when the refusal came from serialization.
         #[source]
-        source: io::Error,
-    },
-    /// A sync command omitted its desired provider-set path.
-    #[error("provider sync requires a provider-set path")]
-    MissingProviderSetPath,
-    /// A state path has no parent directory.
-    #[error("path has no parent: {}", path.display())]
-    MissingParent {
-        /// Offending path.
-        path: PathBuf,
-    },
-    /// Provider state could not be read.
-    #[error("could not read provider state at {}", path.display())]
-    ReadFile {
-        /// State path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Trusted state file hygiene failed.
-    #[error(
-        "provider state must be regular, single-link, owned by this UID, and not group/world writable: {}",
-        path.display()
-    )]
-    InsecureFile {
-        /// Offending path.
-        path: PathBuf,
-    },
-    /// Trusted state or store directory hygiene failed.
-    #[error("provider directory is not protected and owned by this UID: {}", path.display())]
-    InsecureDirectory {
-        /// Offending path.
-        path: PathBuf,
-    },
-    /// A path ancestor permits unprotected writes.
-    #[error("provider path ancestor permits unprotected group/world writes: {}", path.display())]
-    InsecureAncestor {
-        /// Offending ancestor.
-        path: PathBuf,
-    },
-    /// Store path could not be resolved or inspected.
-    #[error("could not inspect provider store path {}", path.display())]
-    StorePath {
-        /// Store path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Store directory could not be created.
-    #[error("could not create protected provider store directory {}", path.display())]
-    CreateStore {
-        /// Directory path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Desired state is not strict valid YAML.
-    #[error("provider set is not strict valid YAML")]
-    DecodeProviderSet {
-        /// YAML failure.
-        #[source]
-        source: serde_yaml::Error,
-    },
-    /// Generated lock is not strict valid YAML.
-    #[error("provider lock is not strict valid YAML")]
-    DecodeLock {
-        /// YAML failure.
-        #[source]
-        source: serde_yaml::Error,
-    },
-    /// Generated lock could not be encoded.
-    #[error("could not encode provider lock")]
-    EncodeLock {
-        /// YAML failure.
-        #[source]
-        source: serde_yaml::Error,
-    },
-    /// A provider state file exceeded its hard byte ceiling.
-    #[error("provider state is {length} bytes; maximum is {maximum}")]
-    StateTooLarge {
-        /// Actual bytes.
-        length: usize,
-        /// Hard maximum.
-        maximum: usize,
-    },
-    /// At least one provider is required.
-    #[error("provider set must contain at least one provider")]
-    NoProviders,
-    /// Provider count exceeded the common broker ceiling.
-    #[error("provider set has too many providers; maximum is {maximum}")]
-    TooManyProviders {
-        /// Hard maximum.
-        maximum: usize,
-    },
-    /// OCI source omitted an explicit registry.
-    #[error("provider source must be fully qualified with an explicit registry: {reference}")]
-    UnqualifiedSource {
-        /// Authored source.
-        reference: String,
-    },
-    /// OCI source silently relied on `latest`.
-    #[error("provider source must name an explicit tag or manifest digest: {reference}")]
-    MissingSelector {
-        /// Authored source.
-        reference: String,
-    },
-    /// OCI source could not be parsed or violated exact-reference rules.
-    #[error("invalid provider source {reference}: {reason}")]
-    InvalidSource {
-        /// Authored source.
-        reference: String,
-        /// Parse or semantic reason.
-        reason: String,
-    },
-    /// Generated lock source spelling was not canonical.
-    #[error("provider lock source {reference} is not canonical; expected {canonical}")]
-    NonCanonicalSource {
-        /// Locked source.
-        reference: String,
-        /// Canonical source.
-        canonical: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     /// Desired or locked state contained one or more ambiguous duplicate identities.
     #[error(
@@ -2117,240 +2162,55 @@ pub enum ProviderManagerError {
         problems.len(),
         problems.join("; ")
     )]
-    ProviderStateConflicts {
+    StateConflicts {
         /// Deterministically sorted bounded conflict descriptions.
         problems: Vec<String>,
     },
-    /// Informational SemVer did not match the exact authored tag.
-    #[error(
-        "provider lock resolvedVersion for {reference} is {actual:?}; exact tag implies {expected:?}"
-    )]
-    ResolvedVersionMismatch {
-        /// Exact source reference.
-        reference: String,
-        /// Version implied by its tag.
-        expected: Option<Version>,
-        /// Version recorded in the lock.
-        actual: Option<Version>,
-    },
-    /// Digest was not canonical SHA-256.
-    #[error(
-        "provider digest must be sha256 followed by sixty-four lowercase hexadecimal characters: {digest}"
-    )]
-    InvalidDigest {
-        /// Invalid digest.
-        digest: String,
-    },
-    /// Component descriptor size was zero or over the hard ceiling.
-    #[error("provider component is {size} bytes; maximum is {maximum}")]
-    ComponentSize {
-        /// Descriptor size.
-        size: u64,
-        /// Hard maximum.
-        maximum: u64,
-    },
-    /// Plain HTTP was requested for a non-loopback registry.
-    #[error("plaintext OCI registry must be a literal loopback authority: {registry}")]
-    PlaintextRegistryNotLoopback {
-        /// Rejected registry authority.
-        registry: String,
-    },
-    /// HTTP client construction failed.
-    #[error("could not initialize bounded OCI registry client")]
-    RegistryClient {
-        /// HTTP client failure.
-        #[source]
-        source: reqwest::Error,
-    },
-    /// Registry URL construction failed.
-    #[error("could not construct OCI registry URL")]
-    RegistryUrl {
-        /// URL parse failure.
-        #[source]
-        source: url::ParseError,
-    },
-    /// Registry request failed before a response.
-    #[error("OCI registry {operation} request failed")]
-    RegistryRequest {
-        /// Low-cardinality operation.
-        operation: &'static str,
-        /// HTTP failure.
-        #[source]
-        source: reqwest::Error,
-    },
-    /// Registry response body failed while streaming.
-    #[error("OCI registry {operation} response failed while streaming")]
-    RegistryRead {
-        /// Low-cardinality operation.
-        operation: &'static str,
-        /// HTTP failure.
-        #[source]
-        source: reqwest::Error,
-    },
-    /// Registry returned a non-success status.
-    #[error("OCI registry {operation} returned HTTP {status}")]
-    RegistryStatus {
-        /// Low-cardinality operation.
-        operation: &'static str,
-        /// HTTP status.
-        status: StatusCode,
-    },
-    /// Registry response exceeded its independent byte bound.
-    #[error("OCI registry {operation} response exceeds {maximum} bytes")]
-    RegistryResponseTooLarge {
-        /// Low-cardinality operation.
-        operation: &'static str,
-        /// Hard maximum.
-        maximum: usize,
-    },
-    /// Authentication challenge header was absent.
-    #[error("OCI registry required authentication without a WWW-Authenticate challenge")]
-    MissingRegistryChallenge,
-    /// Authentication challenge header was not valid text.
-    #[error("OCI registry authentication challenge header is invalid")]
-    InvalidRegistryChallengeHeader {
-        /// Header failure.
-        #[source]
-        source: reqwest::header::ToStrError,
-    },
-    /// Authentication challenge could not be parsed.
-    #[error("OCI registry authentication challenge is invalid")]
-    InvalidRegistryChallenge,
-    /// Bearer challenge omitted its realm.
-    #[error("OCI registry Bearer challenge omitted realm")]
-    MissingTokenRealm,
-    /// Token realm was not a valid URL.
-    #[error("OCI registry token realm is not a valid URL")]
-    RegistryTokenUrl {
-        /// URL parse failure.
-        #[source]
-        source: url::ParseError,
-    },
-    /// Token realm lacked a host.
-    #[error("OCI registry token realm is invalid")]
-    InvalidTokenRealm,
-    /// Token realm attempted plaintext outside the explicit loopback registry.
-    #[error("OCI registry token realm may not use plaintext HTTP: {realm}")]
-    InsecureTokenRealm {
-        /// Realm authority.
-        realm: String,
-    },
-    /// Registry token response was not valid JSON.
-    #[error("OCI registry token response is invalid")]
-    DecodeRegistryToken {
-        /// JSON failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Registry token response omitted both token field spellings.
-    #[error("OCI registry token response omitted token")]
-    MissingRegistryToken,
-    /// Registry token response supplied conflicting token spellings.
-    #[error("OCI registry token response supplied conflicting token fields")]
-    AmbiguousRegistryToken,
-    /// Registry token was blank or unreasonably large.
-    #[error("OCI registry token is blank or exceeds its hard byte ceiling")]
-    InvalidRegistryToken,
-    /// Authorization header could not be represented.
-    #[error("OCI registry returned a token that cannot form an HTTP authorization header")]
-    InvalidAuthorizationHeader {
-        /// Header failure.
-        #[source]
-        source: reqwest::header::InvalidHeaderValue,
-    },
-    /// Manifest digest header was malformed.
-    #[error("OCI registry manifest digest header is invalid")]
-    InvalidDigestHeader {
-        /// Header failure.
-        #[source]
-        source: reqwest::header::ToStrError,
-    },
-    /// Raw manifest bytes did not match the selected or returned digest.
-    #[error("OCI manifest digest mismatch: expected {expected}, got {actual}")]
-    ManifestDigestMismatch {
-        /// Selected or header digest.
-        expected: String,
-        /// Digest of bounded raw bytes.
-        actual: String,
-    },
-    /// Registry did not label the response as an OCI image manifest.
-    #[error("OCI manifest response content type is {actual}; expected {OCI_MANIFEST_MEDIA_TYPE}")]
-    InvalidManifestContentType {
-        /// Actual or `missing` content type.
-        actual: String,
-    },
-    /// OCI manifest JSON was malformed or contained unknown fields.
-    #[error("OCI provider manifest is not strict valid JSON")]
-    DecodeManifest {
-        /// JSON failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Manifest was not one OCI v1 image manifest.
-    #[error("OCI provider manifest has schema {schema} and media type {media_type}")]
-    InvalidManifestType {
-        /// Schema version.
-        schema: u8,
-        /// Manifest media type.
-        media_type: String,
-    },
-    /// Manifest artifact type was not Dekopon's provider type.
-    #[error("OCI artifact type is {actual}; expected {PROVIDER_ARTIFACT_TYPE}")]
-    InvalidArtifactType {
-        /// Actual artifact type.
-        actual: String,
-    },
-    /// Provider artifact unexpectedly attached itself to a subject.
-    #[error("OCI provider manifest must not carry a subject")]
-    ManifestHasSubject,
-    /// Config descriptor was not the small inline-free artifact config convention.
-    #[error("OCI provider config descriptor is invalid or too large")]
-    InvalidConfigDescriptor,
-    /// Manifest did not carry exactly one component layer.
-    #[error("OCI provider manifest has {actual} layers; expected exactly one")]
-    LayerCount {
-        /// Actual layer count.
-        actual: usize,
-    },
-    /// Layer media type was not `application/wasm`.
-    #[error("OCI provider layer media type is {actual}; expected {PROVIDER_LAYER_MEDIA_TYPE}")]
-    InvalidLayerMediaType {
-        /// Actual layer media type.
-        actual: String,
-    },
-    /// Layer descriptor attempted an alternate URL, inline data, or nested artifact type.
-    #[error("OCI provider layer descriptor contains unsupported indirection")]
-    InvalidLayerDescriptor,
-    /// Blob response byte count differed from the descriptor.
-    #[error("OCI provider blob is {actual} bytes; descriptor expects {expected}")]
-    BlobSizeMismatch {
-        /// Descriptor bytes.
-        expected: u64,
-        /// Actual bytes.
-        actual: u64,
-    },
-    /// Blob response digest differed from the descriptor.
-    #[error("OCI provider blob digest mismatch: expected {expected}, got {actual}")]
-    BlobDigestMismatch {
-        /// Descriptor digest.
-        expected: String,
-        /// Actual digest.
-        actual: String,
-    },
-    /// Store directory could not be scanned under the operation lock.
-    #[error("could not inspect provider store directory {}", path.display())]
-    StoreScan {
-        /// Store directory or entry.
+    /// Trusted file, directory, or ancestor hygiene failed.
+    #[error("{reason}: {}", path.display())]
+    FileSecurity {
+        /// Fixed description of the hygiene rule that refused.
+        reason: &'static str,
+        /// Offending path.
         path: PathBuf,
-        /// Filesystem failure.
+        /// Shared broker file-security failure when the refusal came from `socket`.
         #[source]
-        source: io::Error,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// Registry transport, authentication, manifest, or descriptor validation failed.
+    #[error("{reason}{}", detail_suffix(detail))]
+    Registry {
+        /// Fixed description of the check that refused.
+        reason: &'static str,
+        /// Low-cardinality operation, status, or bounded media type; never a URL or token.
+        detail: Option<String>,
+        /// Transport, header, or decode failure carrying no registry URL.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// Content-addressed bytes did not match the length or digest that selected them.
+    #[error("{reason}: expected {expected}, got {actual}")]
+    DigestMismatch {
+        /// Fixed description of the comparison that failed.
+        reason: &'static str,
+        /// Selected, locked, or descriptor value.
+        expected: String,
+        /// Value observed in the bytes actually read.
+        actual: String,
+    },
+    /// The generated lock disagreed with the desired set, the component, or its own grammar.
+    #[error("{reason}{}", detail_suffix(detail))]
+    LockMismatch {
+        /// Fixed description of the comparison that failed.
+        reason: &'static str,
+        /// Bounded locked reference and the expectation it violated.
+        detail: Option<String>,
     },
     /// Retained blobs and stale temporaries reached the hard lifetime ceiling.
     #[error(
         "provider store holds {blobs} file(s) and {bytes} bytes; adding {requested} bytes would exceed {maximum_blobs} files or {maximum_bytes} bytes"
     )]
-    StoreCapacity {
+    StoreFull {
         /// Current file count.
         blobs: usize,
         /// Current logical bytes.
@@ -2362,117 +2222,166 @@ pub enum ProviderManagerError {
         /// Hard logical-byte ceiling.
         maximum_bytes: u64,
     },
-    /// Temporary blob could not be created.
-    #[error("could not create provider blob temporary file")]
-    CreateTemporaryBlob {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Blob could not be written.
-    #[error("could not write provider blob")]
-    WriteBlob {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Blob could not be synchronized.
-    #[error("could not synchronize provider blob")]
-    SyncBlob {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Blob could not be atomically published.
-    #[error("could not atomically publish provider blob at {}", path.display())]
-    PublishBlob {
-        /// Destination path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Lock temporary file could not be created.
-    #[error("could not create provider-lock temporary file")]
-    CreateTemporaryState {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Lock temporary file could not be written.
-    #[error("could not write provider-lock temporary file")]
-    WriteState {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Lock temporary file could not be synchronized.
-    #[error("could not synchronize provider-lock temporary file")]
-    SyncState {
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Lock could not be atomically activated.
-    #[error("could not atomically publish provider lock at {}", path.display())]
-    PublishState {
-        /// Lock path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Parent directory could not be synchronized.
-    #[error("could not synchronize provider directory {}", path.display())]
-    SyncDirectory {
-        /// Directory path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Manager operation lock could not be opened or acquired.
-    #[error("could not lock provider store operation at {}", path.display())]
-    OperationLock {
-        /// Lock path.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
     /// Another manager currently owns the operation lock.
     #[error("another provider-manager operation is in progress at {}", path.display())]
     OperationInProgress {
         /// Lock path.
         path: PathBuf,
     },
-    /// Broker provider file hygiene failed.
-    #[error("provider blob failed broker file-security validation")]
-    FileSecurity(#[source] socket::SocketError),
     /// Complete provider-host validation failed.
     #[error("provider set failed broker-host validation")]
     Host(#[source] BrokerHostError),
-    /// Host metadata unexpectedly omitted one candidate path.
-    #[error("validated provider set omitted component {}", path.display())]
-    MissingValidatedProvider {
-        /// Component path.
-        path: PathBuf,
+    /// A filesystem operation on trusted state or the content store failed.
+    #[error("{reason}{}", path_suffix(path))]
+    Io {
+        /// Fixed description of the operation that failed.
+        reason: &'static str,
+        /// Path the operation named, when it had one.
+        path: Option<PathBuf>,
+        /// Filesystem failure.
+        #[source]
+        source: io::Error,
     },
-    /// Existing lock identity disagreed with a fresh bounded description.
-    #[error(
-        "locked source {reference} expects provider {expected}, but component describes {actual}"
-    )]
-    LockedProviderIdentity {
-        /// Exact source.
-        reference: String,
-        /// Locked identity.
-        expected: ProviderId,
-        /// Described identity.
-        actual: ProviderId,
-    },
-    /// Desired state no longer matches the immutable lock in `--locked` mode.
-    #[error("provider set changed relative to the lock; rerun without --locked to resolve it")]
-    LockedStateChanged,
+}
+
+impl ProviderManagerError {
+    /// Refuses authored state or arguments without further context.
+    fn config(reason: &'static str) -> Self {
+        Self::Configuration {
+            reason,
+            detail: None,
+            source: None,
+        }
+    }
+
+    /// Refuses authored state or arguments, naming the bounded offending value.
+    fn config_detail(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::Configuration {
+            reason,
+            detail: Some(detail.into()),
+            source: None,
+        }
+    }
+
+    /// Refuses authored state, retaining the strict serialization failure that reported it.
+    fn config_source(
+        reason: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Configuration {
+            reason,
+            detail: None,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Refuses a registry interaction without further context.
+    fn registry(reason: &'static str) -> Self {
+        Self::Registry {
+            reason,
+            detail: None,
+            source: None,
+        }
+    }
+
+    /// Refuses a registry interaction, naming bounded non-secret context.
+    fn registry_detail(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::Registry {
+            reason,
+            detail: Some(detail.into()),
+            source: None,
+        }
+    }
+
+    /// Refuses a registry interaction, retaining the underlying failure.
+    fn registry_source(
+        reason: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Registry {
+            reason,
+            detail: None,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Refuses a registry transport failure, naming the low-cardinality operation.
+    fn registry_transport(
+        reason: &'static str,
+        operation: &'static str,
+        source: reqwest::Error,
+    ) -> Self {
+        Self::Registry {
+            reason,
+            detail: Some(operation.to_owned()),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Refuses a lock that disagrees with the desired set or the component it names.
+    fn lock(reason: &'static str) -> Self {
+        Self::LockMismatch {
+            reason,
+            detail: None,
+        }
+    }
+
+    /// Refuses a lock disagreement, naming the bounded locked reference.
+    fn lock_detail(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::LockMismatch {
+            reason,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// Refuses a path whose own metadata failed a hygiene rule.
+    fn insecure(reason: &'static str, path: impl Into<PathBuf>) -> Self {
+        Self::FileSecurity {
+            reason,
+            path: path.into(),
+            source: None,
+        }
+    }
+
+    /// Refuses a path the shared broker file-security check rejected.
+    fn file_security(path: impl Into<PathBuf>, source: socket::SocketError) -> Self {
+        Self::FileSecurity {
+            reason: "provider blob failed broker file-security validation",
+            path: path.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Refuses bytes that do not match the length or digest that selected them.
+    fn digest_mismatch(
+        reason: &'static str,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self::DigestMismatch {
+            reason,
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    /// Reports a filesystem failure that named no path.
+    fn io(reason: &'static str, source: io::Error) -> Self {
+        Self::Io {
+            reason,
+            path: None,
+            source,
+        }
+    }
+
+    /// Reports a filesystem failure on a named path.
+    fn io_at(reason: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            reason,
+            path: Some(path.into()),
+            source,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2845,10 +2754,7 @@ mod tests {
             )
             .await
             .expect_err("redirect loop reaches the hard hop ceiling");
-        assert!(matches!(
-            error,
-            ProviderManagerError::RegistryRequest { .. }
-        ));
+        assert!(matches!(error, ProviderManagerError::Registry { .. }));
         loop_task.abort();
         assert!(
             loop_task
@@ -2906,7 +2812,7 @@ mod tests {
             providers: vec![provider.clone(), provider],
         };
         let error = validate_lock_shape(&lock).expect_err("duplicates conflict");
-        let ProviderManagerError::ProviderStateConflicts { problems } = error else {
+        let ProviderManagerError::StateConflicts { problems } = error else {
             panic!("unexpected error: {error}");
         };
         assert_eq!(problems.len(), 3, "{problems:?}");
@@ -2939,7 +2845,7 @@ mod tests {
         };
         assert!(matches!(
             validate_lock_shape(&lock),
-            Err(ProviderManagerError::ManifestDigestMismatch { .. })
+            Err(ProviderManagerError::DigestMismatch { reason, .. }) if reason == MANIFEST_DIGEST_MISMATCH
         ));
 
         let mut tagged = base;
@@ -2952,7 +2858,7 @@ mod tests {
         };
         assert!(matches!(
             validate_lock_shape(&lock),
-            Err(ProviderManagerError::ResolvedVersionMismatch { .. })
+            Err(ProviderManagerError::LockMismatch { reason, .. }) if reason == RESOLVED_VERSION_MISMATCH
         ));
     }
 
@@ -3077,7 +2983,7 @@ providers:
         assert_eq!(status[0].local_reason.as_deref(), Some("insecure-metadata"));
         assert!(matches!(
             manager.verify().await,
-            Err(ProviderManagerError::FileSecurity(_))
+            Err(ProviderManagerError::FileSecurity { .. })
         ));
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o600)).expect("restore blob");
 
@@ -3085,7 +2991,7 @@ providers:
         fs::hard_link(&blob, &hard_link).expect("hard-link blob");
         assert!(matches!(
             manager.verify().await,
-            Err(ProviderManagerError::FileSecurity(_))
+            Err(ProviderManagerError::FileSecurity { .. })
         ));
         fs::remove_file(&hard_link).expect("remove hard link");
 
@@ -3096,7 +3002,7 @@ providers:
         symlink(&target, &blob).expect("symlink blob");
         assert!(matches!(
             manager.verify().await,
-            Err(ProviderManagerError::FileSecurity(_))
+            Err(ProviderManagerError::FileSecurity { .. })
         ));
         fs::remove_file(&blob).expect("remove symlink");
         fs::write(&blob, &bytes).expect("restore blob");
@@ -3109,8 +3015,8 @@ providers:
         assert_eq!(status[0].local_reason.as_deref(), Some("not-installed"));
         assert!(matches!(
             manager.verify().await,
-            Err(ProviderManagerError::ReadFile { source, .. })
-                if source.kind() == io::ErrorKind::NotFound
+            Err(ProviderManagerError::Io { reason, source, .. })
+                if reason == READ_PROVIDER_STATE && source.kind() == io::ErrorKind::NotFound
         ));
 
         registry.stop().await;
@@ -3179,7 +3085,7 @@ providers:
         fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).expect("secure orphan");
         assert!(matches!(
             store.ensure_capacity(1),
-            Err(ProviderManagerError::StoreCapacity { .. })
+            Err(ProviderManagerError::StoreFull { .. })
         ));
     }
 
