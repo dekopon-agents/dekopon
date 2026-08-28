@@ -887,6 +887,14 @@ pub(crate) fn lifecycle_timestamp(
     Ok(Some(timestamp))
 }
 
+/// Takes a lease, polling until another holder releases it or `timeout_ms` elapses.
+///
+/// # Errors
+///
+/// [`StorageHostError::Timeout`] when another holder still has the lease at the deadline, and
+/// [`StorageHostError::Io`] when the lock could not be attempted at all. The two are not
+/// interchangeable: contention is transient and worth retrying, while a filesystem that fails or
+/// refuses advisory locks will refuse the next attempt too.
 pub(crate) fn lock_exclusive(file: &File, timeout_ms: u64) -> Result<(), StorageHostError> {
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))
@@ -894,14 +902,25 @@ pub(crate) fn lock_exclusive(file: &File, timeout_ms: u64) -> Result<(), Storage
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Err(StorageHostError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(TryLockError::Error(_)) => return Err(StorageHostError::Io),
+            Err(error) => match lease_lock_failure(error, Instant::now() >= deadline) {
+                Some(failure) => return Err(failure),
+                None => std::thread::sleep(Duration::from_millis(5)),
+            },
         }
+    }
+}
+
+/// Classifies one failed `try_lock`; `None` means "another holder, and there is still time".
+///
+/// Separated from the wait loop for the same reason `writer_lock_failure` is: a filesystem that
+/// fails or refuses advisory locks cannot be produced on demand from a test — `flock` refuses a
+/// pipe on one platform this builds for and accepts it on another — and reporting one as `Timeout`
+/// would tell a caller to keep retrying something that will never succeed.
+fn lease_lock_failure(error: TryLockError, expired: bool) -> Option<StorageHostError> {
+    match error {
+        TryLockError::WouldBlock if !expired => None,
+        TryLockError::WouldBlock => Some(StorageHostError::Timeout),
+        TryLockError::Error(_) => Some(StorageHostError::Io),
     }
 }
 
@@ -923,4 +942,68 @@ pub(crate) fn is_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::{File, TryLockError},
+        io::{Error, ErrorKind},
+        time::{Duration, Instant},
+    };
+
+    use super::{lease_lock_failure, lock_exclusive};
+    use crate::StorageHostError;
+
+    /// A lease another holder has is contention, which is what `Timeout` means to a caller.
+    ///
+    /// Reporting it as `Io` would turn a namespace someone else is finalizing into a storage
+    /// failure the guest sees, and nothing anywhere would say the lease was merely busy.
+    #[test]
+    fn a_lease_another_holder_still_has_reports_timeout_rather_than_io() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("base.lock");
+        let held = File::create(&path).expect("lease file");
+        held.try_lock().expect("the first holder takes the lease");
+
+        // A second open file description, which is what a second holder of this lease is.
+        let contender = File::open(&path).expect("a second handle on the same lease");
+        let started = Instant::now();
+        let refused = lock_exclusive(&contender, 30);
+
+        assert!(
+            matches!(refused, Err(StorageHostError::Timeout)),
+            "{refused:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "the deadline was reported without being waited out"
+        );
+
+        // The control: releasing the lease makes the same call succeed, so the refusal above was
+        // the other holder rather than anything about the file.
+        held.unlock().expect("the first holder releases the lease");
+        lock_exclusive(&contender, 30).expect("an uncontended lease is taken");
+    }
+
+    /// A filesystem that fails or refuses advisory locks is not another conforming writer.
+    ///
+    /// Both failures reach a caller as "the lease was not taken", and only the classification
+    /// tells it whether waiting is worth anything. A `Timeout` here would be an infinite retry.
+    #[test]
+    fn a_lock_failure_that_is_not_contention_is_io_at_either_side_of_the_deadline() {
+        assert!(lease_lock_failure(TryLockError::WouldBlock, false).is_none());
+        assert!(matches!(
+            lease_lock_failure(TryLockError::WouldBlock, true),
+            Some(StorageHostError::Timeout)
+        ));
+
+        for expired in [false, true] {
+            let failure = lease_lock_failure(
+                TryLockError::Error(Error::from(ErrorKind::Unsupported)),
+                expired,
+            );
+            assert!(matches!(failure, Some(StorageHostError::Io)), "{failure:?}");
+        }
+    }
 }
