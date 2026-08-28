@@ -46,7 +46,8 @@ use crate::{
     routes::BoundRoute,
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
-        ReplyTarget, SessionStop, ThreadOwnership, bound_inbound, bound_outbound,
+        ReplyTarget, SessionStop, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
+        credential_from,
     },
 };
 
@@ -106,18 +107,8 @@ pub(crate) fn configured_image_generators(
         .filter(|generator| referenced.contains(generator.name()))
         .map(|generator| {
             let variable = generator.api_key_env();
-            let credential = std::env::var(variable).map_err(|error| match error {
-                std::env::VarError::NotPresent => ImageGeneratorStartupError::MissingCredential {
-                    generator: generator.name().to_owned(),
-                    variable: variable.to_owned(),
-                },
-                std::env::VarError::NotUnicode(_) => {
-                    ImageGeneratorStartupError::NonUtf8Credential {
-                        generator: generator.name().to_owned(),
-                        variable: variable.to_owned(),
-                    }
-                }
-            })?;
+            let credential =
+                image_credential(generator.name(), variable, std::env::var_os(variable))?;
             let client = match generator {
                 ImageGeneratorConfig::OpenaiImages {
                     model, timeout_ms, ..
@@ -135,6 +126,54 @@ pub(crate) fn configured_image_generators(
         .collect()
 }
 
+/// Resolves one image generator's credential, keeping which of the three problems it was.
+///
+/// Split from the environment read so the rule is reachable without a test mutating this process's
+/// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
+pub(crate) fn image_credential(
+    generator: &str,
+    variable: &str,
+    value: Option<std::ffi::OsString>,
+) -> Result<String, ImageGeneratorStartupError> {
+    credential_from(variable, value).map_err(|source| ImageGeneratorStartupError::Credential {
+        generator: generator.to_owned(),
+        variable: variable.to_owned(),
+        source,
+    })
+}
+
+/// The bearer token a configured model's `apiKeyEnv` names, when it names one.
+///
+/// Absent is not missing. A loopback llama.cpp needs no key and leaving the field out is how an
+/// operator says so, which is why this answers `None` rather than refusing. Exported-but-blank is
+/// missing: an empty bearer token is still sent as a header. Both used to read `env::var(..).ok()`
+/// and become "no bearer token", so the gateway started clean and 401'd on the first message with
+/// nothing anywhere naming the variable.
+pub(crate) fn model_bearer_token(
+    model: &ModelConfig,
+) -> Result<Option<String>, ModelCredentialError> {
+    let ModelConfig::OpenaiCompatible { api_key_env, .. } = model else {
+        return Ok(None);
+    };
+    let Some(variable) = api_key_env.as_deref() else {
+        return Ok(None);
+    };
+    model_credential(model.name(), variable, std::env::var_os(variable)).map(Some)
+}
+
+/// Split from the environment read for the same reason [`image_credential`] is.
+pub(crate) fn model_credential(
+    model: &str,
+    variable: &str,
+    value: Option<std::ffi::OsString>,
+) -> Result<String, ModelCredentialError> {
+    credential_from(variable, value).map_err(|source| ModelCredentialError {
+        model: model.to_owned(),
+        variable: variable.to_owned(),
+        source,
+    })
+}
+
 impl ModelFactory for ConfiguredModels {
     fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
         match model {
@@ -147,7 +186,8 @@ impl ModelFactory for ConfiguredModels {
             } => {
                 let bearer_token = api_key_env
                     .as_deref()
-                    .and_then(|name| std::env::var(name).ok());
+                    .map(|variable| model_credential(model, variable, std::env::var_os(variable)))
+                    .transpose()?;
                 Ok(Arc::new(OpenAiChatModel::new(
                     endpoint,
                     model,
@@ -180,8 +220,11 @@ impl ModelFactory for ConfiguredModels {
 /// Keyed by the configured model name, which the loader has already proved unique, so two routes
 /// naming one endpoint share its pool and two endpoints never share a client.
 ///
-/// A build failure is not cached: an absent credential file or an unset key is the kind of thing an
-/// operator repairs while the daemon runs, and the next message should find it repaired.
+/// A build failure is not cached, because the two remaining ones are repairable without a restart:
+/// a credential file an operator writes, and a model endpoint that was not listening. An `apiKeyEnv`
+/// naming an unset or blank variable is not among them — this process cannot see a variable exported
+/// after it started — so startup resolves every bound route's model credential before any transport
+/// accepts work, and the daemon refuses to start rather than answering with a tokenless client.
 pub(crate) struct ModelCache {
     factory: Arc<dyn ModelFactory>,
     clients: Mutex<HashMap<String, SharedModel>>,
@@ -1275,14 +1318,35 @@ async fn deliver(
 /// Startup failure while resolving one named image generator.
 #[derive(Debug, Error)]
 pub enum ImageGeneratorStartupError {
-    #[error("image generator {generator:?} credential environment variable {variable} is not set")]
-    MissingCredential { generator: String, variable: String },
-    #[error(
-        "image generator {generator:?} credential environment variable {variable} is not UTF-8"
-    )]
-    NonUtf8Credential { generator: String, variable: String },
+    /// The named variable is unset, blank, or not UTF-8; the source says which.
+    #[error("image generator {generator:?} credential environment variable {variable} is unusable")]
+    Credential {
+        /// Owner-authored generator name.
+        generator: String,
+        /// Owner-authored variable name, never its value.
+        variable: String,
+        #[source]
+        source: TransportError,
+    },
     #[error("image generator client configuration is invalid")]
     Client(#[from] ImageGenerationError),
+}
+
+/// The credential one configured model names could not be resolved.
+///
+/// Its own type rather than a [`SessionError`] variant alone, because startup resolves it before
+/// any transport accepts work and a session resolves it again when it builds the client. One
+/// definition, two readers: a pre-flight that could accept what the enforcing path rejects would be
+/// worse than no pre-flight.
+#[derive(Debug, Error)]
+#[error("model {model:?} credential environment variable {variable} is unusable")]
+pub struct ModelCredentialError {
+    /// Owner-authored model name.
+    pub model: String,
+    /// Owner-authored variable name, never its value.
+    pub variable: String,
+    #[source]
+    source: TransportError,
 }
 
 /// A session that could not run to completion.
@@ -1296,6 +1360,8 @@ pub enum SessionError {
     TransportId(#[source] dekopon_core::IdentifierError),
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error(transparent)]
+    ModelCredential(#[from] ModelCredentialError),
     #[error(transparent)]
     ChatGpt(#[from] dekopon_model::chatgpt::ChatGptError),
     #[error(transparent)]
@@ -1313,6 +1379,7 @@ impl SessionError {
             Self::BrokerLeg(_) => "broker-leg",
             Self::TransportId(_) => "transport-id",
             Self::Model(_) => "model",
+            Self::ModelCredential(_) => "model-credential",
             Self::ChatGpt(_) => "chatgpt",
             Self::Prompt(error) => error.telemetry_kind(),
         }

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -47,8 +48,8 @@ use crate::{
     session::{
         BUSY_REPLY, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache, ModelFactory,
         SessionError, SessionGate, SessionRunner, SharedModel, UNAUTHORIZED_REPLY,
-        UNREPORTED_WORK_REPLY, configured_image_generators, memory_record_outcome_category,
-        run_session,
+        UNREPORTED_WORK_REPLY, configured_image_generators, image_credential,
+        memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
         ActivityTarget, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
@@ -204,16 +205,88 @@ fn a_missing_image_model_credential_fails_before_chat_starts() {
     };
 
     assert!(matches!(
-        error,
-        ImageGeneratorStartupError::MissingCredential { .. }
+        &error,
+        ImageGeneratorStartupError::Credential {
+            source: TransportError::MissingCredential { .. },
+            ..
+        }
     ));
     let diagnostic = error.to_string();
     assert!(diagnostic.contains("pictures"));
     assert!(diagnostic.contains(variable));
 
+    // Exported but blank is the same refusal, not a generator that starts with a blank key.
+    let blank = image_credential("pictures", variable, Some(OsString::from("   ")))
+        .expect_err("a blank credential is the absence of one presented as presence");
+    assert!(matches!(
+        &blank,
+        ImageGeneratorStartupError::Credential {
+            source: TransportError::EmptyCredential { .. },
+            ..
+        }
+    ));
+
     let unused = configured_image_generators(&configured, &BTreeSet::new())
         .expect("an unreferenced generator reads no credential");
     assert!(unused.is_empty());
+}
+
+/// `apiKeyEnv` has three meanings and they used to have one outcome.
+///
+/// Absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not. Unset
+/// and exported-but-blank became "no bearer token" too: the gateway started clean, every answer came
+/// back 401, and nothing anywhere named the variable. The cached client made it survive until a
+/// restart, so exporting the key afterwards did not help either.
+#[test]
+fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
+    let variable = "DEKOPOND_TEST_MODEL_KEY_4F1A62";
+    let model = |api_key_env: Option<&str>| ModelConfig::OpenaiCompatible {
+        name: "fast".to_owned(),
+        endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
+        model: "qwen3".to_owned(),
+        api_key_env: api_key_env.map(ToOwned::to_owned),
+        timeout_ms: 60_000,
+        classes: vec!["fast".to_owned()],
+        modalities: Vec::new(),
+    };
+
+    // No field at all is a deliberate configuration, not a missing credential.
+    assert!(
+        model_bearer_token(&model(None))
+            .expect("an endpoint that needs no key is not a startup failure")
+            .is_none()
+    );
+
+    // A set variable is the token, unchanged.
+    assert_eq!(
+        model_credential("fast", variable, Some(OsString::from("sk-live-1")))
+            .expect("a set variable is the token"),
+        "sk-live-1"
+    );
+
+    // Both failures name the variable and the model, never the value, and keep which problem it
+    // was: "export it" and "you exported nothing" are different operator actions.
+    for (value, problem) in [
+        (None, "is not set"),
+        (Some(OsString::from("   ")), "is set to an empty value"),
+    ] {
+        let error = model_credential("fast", variable, value)
+            .expect_err("a model that cannot present its key must not start");
+        let rendered = error.to_string();
+        assert!(rendered.contains(variable), "{rendered}");
+        assert!(rendered.contains("fast"), "{rendered}");
+        let cause = std::error::Error::source(&error).expect("the credential problem is the cause");
+        assert!(cause.to_string().contains(problem), "{cause}");
+    }
+
+    // A named field pointing at an unset variable refuses through the startup entry point too.
+    assert!(
+        std::env::var_os(variable).is_none(),
+        "fixture must stay unset"
+    );
+    let error = model_bearer_token(&model(Some(variable)))
+        .expect_err("a named but unset variable is a startup refusal");
+    assert!(error.to_string().contains(variable));
 }
 
 #[tokio::test]
