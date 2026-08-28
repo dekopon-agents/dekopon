@@ -47,21 +47,24 @@ use dekopon_broker_protocol::{
     ReportedAgent, ReportedAgentCapability,
 };
 use dekopon_config::LocalCatalog;
+use dekopon_model::image::ImageGenerator;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
-    ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConversationConfig,
-    ConversationPolicy, ConversationWindow, DekopondConfig, HARD_MAX_CONFIG_BYTES,
-    ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
-    SlackActivityConfig, SlackActivityFallback, SlackExperience, TelemetryConfig, TransportConfig,
+    ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem,
+    ConversationConfig, ConversationPolicy, ConversationWindow, DekopondConfig,
+    HARD_MAX_CONFIG_BYTES, ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig,
+    ResolvedRoute, ResolvedTelemetry, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+    TelemetryConfig, TransportConfig,
 };
-pub use routes::RouteError;
+pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
 pub use transport::TransportError;
 
 use crate::{
     asset::AssetStore,
+    config::render_problems,
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
@@ -143,18 +146,10 @@ where
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
-    // Resolve model credentials and construct the fixed-endpoint clients before a chat transport
-    // accepts work. A route naming image generation must not start as a tool that can only fail.
-    let image_generator_referenced = config.routes.iter().any(|route| route.image_generator);
-    let image_generator =
-        configured_image_generator(config.image_generator.as_ref(), image_generator_referenced)
-            .map_err(DekopondError::ImageGenerator)?;
-    // The model credential resolves here too. This process cannot see a variable exported after it
-    // started, so an unset or blank `apiKeyEnv` that only surfaced as a 401 on the first user's
-    // message is a startup refusal naming the variable instead.
-    for model in routes.bound_models() {
-        model_bearer_token(model).map_err(DekopondError::ModelCredential)?;
-    }
+    let Prepared {
+        image_generator,
+        transports: built_transports,
+    } = prepare(&config, &routes)?;
     let inventory = agent_inventory(&catalog);
     let heartbeat_inventory = inventory.clone();
 
@@ -194,8 +189,7 @@ where
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
-    for spec in &config.transports {
-        let mut transport = build_transport(spec)?;
+    for (spec, mut transport) in config.transports.iter().zip(built_transports) {
         let identity =
             transport
                 .connect()
@@ -829,86 +823,139 @@ async fn report_transport_health(health: Arc<TransportHealth>) {
     }
 }
 
-fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, DekopondError> {
-    let name = spec.name().to_owned();
-    let build = || -> Result<Box<dyn ChatTransport>, TransportError> {
-        Ok(match spec {
-            TransportConfig::SlackSocketMode {
-                name,
-                app_token_env,
-                bot_token_env,
-                experience,
-                activity,
-                endpoint,
-            } => Box::new(SlackTransport::new(
-                name.clone(),
-                endpoint
-                    .clone()
-                    .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
-                transport::read_credential(app_token_env)?,
-                transport::read_credential(bot_token_env)?,
-                *experience,
-                *activity,
-            )?),
-            TransportConfig::DiscordGateway {
-                name,
-                bot_token_env,
-                activity,
-                endpoint,
-            } => Box::new(DiscordTransport::new(
-                name.clone(),
-                endpoint
-                    .clone()
-                    .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
-                transport::read_credential(bot_token_env)?,
-                activity.mode,
-            )?),
-            TransportConfig::WhatsappCloudApi {
-                name,
-                app_secret_env,
-                verify_token_env,
-                access_token_env,
-                bind,
-                callback_path,
-                waba_id,
-                phone_number_id,
-                graph_api_version,
-                graph_endpoint,
-            } => Box::new(WhatsappTransport::new(
-                name.clone(),
-                *bind,
-                callback_path.clone(),
-                waba_id.clone(),
-                phone_number_id.clone(),
-                graph_api_version.clone(),
-                graph_endpoint
-                    .clone()
-                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
-                transport::read_credential(app_secret_env)?,
-                transport::read_credential(verify_token_env)?,
-                transport::read_credential(access_token_env)?,
-            )?),
-            TransportConfig::TelegramLongPoll {
-                name,
-                bot_token_env,
-                activity,
-                endpoint,
-            } => Box::new(TelegramTransport::new(
-                name.clone(),
-                endpoint
-                    .clone()
-                    .unwrap_or_else(|| config::TELEGRAM_ENDPOINT.to_owned()),
-                transport::read_credential(bot_token_env)?,
-                activity.mode,
-            )?),
-            TransportConfig::Local { name, socket_path } => {
-                Box::new(LocalTransport::new(name.clone(), socket_path.clone()))
+/// Resolves every credential this daemon holds and builds every transport, before any of them
+/// authenticates.
+///
+/// Nothing here opens a socket or speaks to a chat service: it reads the owner-named environment
+/// variables and constructs the fixed-endpoint clients. That split is the whole point. Reading a
+/// token inside the connect loop meant a rollout missing two of them cost two crash loops, and the
+/// first of those had already authenticated to the service whose token was present. This process
+/// also cannot see a variable exported after it started, so an unset or blank one that used to
+/// surface as a 401 on the first user's message is a startup refusal naming the variable instead.
+///
+/// Every problem is collected, so an operator who forgot two secrets in a deployment manifest is
+/// told about both at once.
+fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, DekopondError> {
+    let mut problems = Vec::new();
+    // A route naming image generation must not start as a tool that can only fail.
+    let referenced = config.routes.iter().any(|route| route.image_generator);
+    let image_generator =
+        match configured_image_generator(config.image_generator.as_ref(), referenced) {
+            Ok(generator) => generator,
+            Err(source) => {
+                problems.push(StartupProblem::ImageGenerator(source));
+                None
             }
+        };
+    for model in routes.bound_models() {
+        if let Err(source) = model_bearer_token(model) {
+            problems.push(StartupProblem::ModelCredential(source));
+        }
+    }
+    let mut transports = Vec::with_capacity(config.transports.len());
+    for spec in &config.transports {
+        match build_transport(spec) {
+            Ok(transport) => transports.push(transport),
+            Err(source) => problems.push(StartupProblem::Transport {
+                transport: spec.name().to_owned(),
+                source,
+            }),
+        }
+    }
+    if problems.is_empty() {
+        Ok(Prepared {
+            image_generator,
+            transports,
         })
-    };
-    build().map_err(|source| DekopondError::TransportConnect {
-        transport: name,
-        source,
+    } else {
+        Err(DekopondError::Startup { problems })
+    }
+}
+
+/// Everything [`prepare`] resolved, none of it having spoken to a chat service yet.
+struct Prepared {
+    /// The gateway's image generator, absent unless a bound route opted into one.
+    image_generator: Option<Arc<dyn ImageGenerator>>,
+    /// One built transport per configured transport, in configuration order.
+    transports: Vec<Box<dyn ChatTransport>>,
+}
+
+/// Reads one transport's owner-named credentials and builds its fixed-endpoint client.
+///
+/// Nothing here connects; [`prepare`] calls it for every transport before any of them does.
+fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, TransportError> {
+    Ok(match spec {
+        TransportConfig::SlackSocketMode {
+            name,
+            app_token_env,
+            bot_token_env,
+            experience,
+            activity,
+            endpoint,
+        } => Box::new(SlackTransport::new(
+            name.clone(),
+            endpoint
+                .clone()
+                .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
+            transport::read_credential(app_token_env)?,
+            transport::read_credential(bot_token_env)?,
+            *experience,
+            *activity,
+        )?),
+        TransportConfig::DiscordGateway {
+            name,
+            bot_token_env,
+            activity,
+            endpoint,
+        } => Box::new(DiscordTransport::new(
+            name.clone(),
+            endpoint
+                .clone()
+                .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
+            transport::read_credential(bot_token_env)?,
+            activity.mode,
+        )?),
+        TransportConfig::WhatsappCloudApi {
+            name,
+            app_secret_env,
+            verify_token_env,
+            access_token_env,
+            bind,
+            callback_path,
+            waba_id,
+            phone_number_id,
+            graph_api_version,
+            graph_endpoint,
+        } => Box::new(WhatsappTransport::new(
+            name.clone(),
+            *bind,
+            callback_path.clone(),
+            waba_id.clone(),
+            phone_number_id.clone(),
+            graph_api_version.clone(),
+            graph_endpoint
+                .clone()
+                .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+            transport::read_credential(app_secret_env)?,
+            transport::read_credential(verify_token_env)?,
+            transport::read_credential(access_token_env)?,
+        )?),
+        TransportConfig::TelegramLongPoll {
+            name,
+            bot_token_env,
+            activity,
+            endpoint,
+        } => Box::new(TelegramTransport::new(
+            name.clone(),
+            endpoint
+                .clone()
+                .unwrap_or_else(|| config::TELEGRAM_ENDPOINT.to_owned()),
+            transport::read_credential(bot_token_env)?,
+            activity.mode,
+        )?),
+        TransportConfig::Local { name, socket_path } => {
+            Box::new(LocalTransport::new(name.clone(), socket_path.clone()))
+        }
     })
 }
 
@@ -924,12 +971,12 @@ pub enum DekopondError {
     /// A route could not be bound to a catalog agent and a configured model.
     #[error("gateway route cannot be satisfied")]
     Route(#[from] RouteError),
-    /// A named image generator could not resolve its model credential or client.
-    #[error("configured image generator is unavailable")]
-    ImageGenerator(#[source] ImageGeneratorStartupError),
-    /// A bound route's model names a credential variable nothing usable can be read from.
-    #[error("configured model credential is unavailable")]
-    ModelCredential(#[source] ModelCredentialError),
+    /// Something the daemon must hold before it serves is unusable; every one of them is named.
+    #[error("{}", render_problems(.problems))]
+    Startup {
+        /// Every credential or client that could not be resolved, in the order they were tried.
+        problems: Vec<StartupProblem>,
+    },
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
@@ -947,6 +994,28 @@ pub enum DekopondError {
     /// difference between a supervisor restarting the gateway and a pod that stays green.
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
+}
+
+/// One thing the daemon must hold before any transport authenticates.
+///
+/// Resolved together by [`prepare`] and reported through [`DekopondError::Startup`], so a
+/// deployment missing several secrets is one refusal naming all of them.
+#[derive(Debug, Error)]
+pub enum StartupProblem {
+    /// A named image generator could not resolve its model credential or client.
+    #[error("configured image generator is unavailable")]
+    ImageGenerator(#[source] ImageGeneratorStartupError),
+    /// A bound route's model names a credential variable nothing usable can be read from.
+    #[error("configured model credential is unavailable")]
+    ModelCredential(#[source] ModelCredentialError),
+    /// A chat transport's credential is unusable, or its fixed-endpoint client could not be built.
+    #[error("chat transport {transport} could not be prepared")]
+    Transport {
+        /// Configured transport name.
+        transport: String,
+        #[source]
+        source: TransportError,
+    },
 }
 
 #[cfg(test)]

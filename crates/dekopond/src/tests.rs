@@ -39,12 +39,12 @@ use crate::{
     asset::{self, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ActivityMode, ConfigError, ConversationPolicy, ConversationWindow,
+        self, ActivityMode, ConfigError, ConfigProblem, ConversationPolicy, ConversationWindow,
         ImageGeneratorConfig, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
         SlackActivityConfig, SlackActivityFallback, SlackExperience,
     },
     conversation::{ConversationKey, ConversationStore, EvictionReason},
-    routes::{RouteError, RoutingTable},
+    routes::{RouteError, RouteProblem, RoutingTable},
     session::{
         BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
         ModelFactory, SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
@@ -105,10 +105,8 @@ fn document(directory: &Path) -> Value {
     })
 }
 
-async fn load(
-    directory: &Path,
-    document: &Value,
-) -> Result<crate::ResolvedConfig, config::ConfigError> {
+/// Writes one configuration document where the daemon's own hygiene checks will accept it.
+fn write_config(directory: &Path, document: &Value) -> PathBuf {
     let path = directory.join("dekopond.json");
     fs::write(
         &path,
@@ -116,7 +114,14 @@ async fn load(
     )
     .expect("write config fixture");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure config fixture");
-    config::load(&path, crate::current_uid()).await
+    path
+}
+
+async fn load(
+    directory: &Path,
+    document: &Value,
+) -> Result<crate::ResolvedConfig, config::ConfigError> {
+    config::load(write_config(directory, document), crate::current_uid()).await
 }
 
 /// One refused configuration: what it is called, the document, and which refusal it must be.
@@ -125,6 +130,26 @@ async fn load(
 /// strict decoding before it ever reaches the check the case is named after, and it keeps passing
 /// if the check stops being called at all.
 type RefusalCase = (&'static str, Value, fn(&ConfigError) -> bool);
+
+/// Whether one aggregated refusal names this problem among the ones it reports.
+///
+/// The whole file is scanned before it is refused, so a case asserts that its problem is *in* the
+/// report rather than that it is the only thing in it — a fixture with a second mistake would
+/// otherwise fail the case it is named after.
+fn reports(error: &ConfigError, matcher: fn(&ConfigProblem) -> bool) -> bool {
+    matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(matcher))
+}
+
+/// The one problem a refused route binding reported.
+fn only_route_problem(error: &RouteError) -> &RouteProblem {
+    assert_eq!(
+        error.problems.len(),
+        1,
+        "one unsatisfiable route, one problem: {:?}",
+        error.problems
+    );
+    &error.problems[0]
+}
 
 fn temporary() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -430,37 +455,59 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 
     let invalid: [RefusalCase; 11] = [
         ("appSecretEnv", json!("pasted secret"), |error| {
-            matches!(error, ConfigError::InvalidEnvironmentName { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+            })
         }),
         ("bind", json!("127.0.0.1:0"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappBind { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappBind { .. })
+            })
         }),
         ("callbackPath", json!("relative"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
+            })
         }),
         ("callbackPath", json!("/webhooks/{wildcard}"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
+            })
         }),
         ("callbackPath", json!("/webhooks//whatsapp"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
+            })
         }),
         ("callbackPath", json!("/webhooks/whatsapp/"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappCallback { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
+            })
         }),
         ("wabaId", json!("0123"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappScope { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappScope { .. })
+            })
         }),
         ("graphApiVersion", json!("latest"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
+            })
         }),
         ("graphApiVersion", json!("v01.0"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
+            })
         }),
         ("graphApiVersion", json!("v23.1"), |error| {
-            matches!(error, ConfigError::InvalidWhatsappGraphVersion { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
+            })
         }),
         ("graphEndpoint", json!("https://evil.example"), |error| {
-            matches!(error, ConfigError::UnsupportedEndpoint { .. })
+            reports(error, |problem| {
+                matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
+            })
         }),
     ];
     for (field, value, expected) in invalid {
@@ -489,7 +536,10 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
         .await
         .expect_err("a text-only transport cannot carry a generated image");
     assert!(
-        matches!(error, ConfigError::UnsupportedRouteImageGenerator { .. }),
+        reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::UnsupportedRouteImageGenerator { .. }
+        )),
         "the refusal must name the transport pairing: {error:?}"
     );
     assert!(
@@ -604,7 +654,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 120_000
                 });
             }),
-            |error| matches!(error, ConfigError::UnnamedImageModel),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnnamedImageModel)
+                })
+            },
         ),
         (
             "invalid image credential environment name",
@@ -615,7 +669,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 120_000
                 });
             }),
-            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+                })
+            },
         ),
         (
             "zero image generator timeout",
@@ -626,14 +684,25 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "timeoutMs": 0
                 });
             }),
-            |error| matches!(error, ConfigError::InvalidImageGeneratorTimeout),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidImageGeneratorTimeout)
+                })
+            },
         ),
         (
             "route enables image generation with none configured",
             mutate(|document| {
                 document["routes"][0]["imageGenerator"] = json!(true);
             }),
-            |error| matches!(error, ConfigError::UnconfiguredRouteImageGenerator { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(
+                        problem,
+                        ConfigProblem::UnconfiguredRouteImageGenerator { .. }
+                    )
+                })
+            },
         ),
         (
             "unknown route match kind",
@@ -663,7 +732,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     .expect("transports array")
                     .push(duplicate);
             }),
-            |error| matches!(error, ConfigError::DuplicateTransport { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::DuplicateTransport { .. })
+                })
+            },
         ),
         (
             "duplicate model name",
@@ -674,35 +747,55 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     .expect("models array")
                     .push(duplicate);
             }),
-            |error| matches!(error, ConfigError::DuplicateModel { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::DuplicateModel { .. })
+                })
+            },
         ),
         (
             "route names an unknown transport",
             mutate(|document| {
                 document["routes"][0]["transport"] = json!("nowhere");
             }),
-            |error| matches!(error, ConfigError::UnknownRouteTransport { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnknownRouteTransport { .. })
+                })
+            },
         ),
         (
             "route names an unknown model",
             mutate(|document| {
                 document["routes"][0]["model"] = json!("gpt-nonexistent");
             }),
-            |error| matches!(error, ConfigError::UnknownRouteModel { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnknownRouteModel { .. })
+                })
+            },
         ),
         (
             "zero step budget",
             mutate(|document| {
                 document["routes"][0]["limits"] = json!({"maxSteps": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidRouteLimits { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidRouteLimits { .. })
+                })
+            },
         ),
         (
             "zero concurrency",
             mutate(|document| {
                 document["sessions"] = json!({"maxConcurrent": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidSessionLimits),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidSessionLimits)
+                })
+            },
         ),
         (
             "unknown conversation mode",
@@ -717,7 +810,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "idleTimeoutMs": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                })
+            },
         ),
         (
             "zero turn window on a persistent route",
@@ -725,7 +822,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "maxTurns": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                })
+            },
         ),
         (
             "zero byte window on a persistent route",
@@ -733,7 +834,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                 document["routes"][0]["conversation"] =
                     json!({"mode": "persistent", "maxBytes": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidConversationBounds { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                })
+            },
         ),
         (
             // A window bound that can never take effect is far more likely a mode typo than an
@@ -758,14 +863,22 @@ async fn invalid_configurations_fail_closed_at_startup() {
             mutate(|document| {
                 document["sessions"] = json!({"maxConversations": 0});
             }),
-            |error| matches!(error, ConfigError::InvalidMaxConversations),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidMaxConversations)
+                })
+            },
         ),
         (
             "no transports at all",
             mutate(|document| {
                 document["transports"] = json!([]);
             }),
-            |error| matches!(error, ConfigError::NoTransports),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::NoTransports)
+                })
+            },
         ),
         (
             // A secret in the field that names a variable is the mistake this rejects loudest: it
@@ -779,14 +892,22 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "botTokenEnv": "12345:AAH-actual-secret-value"
                 });
             }),
-            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+                })
+            },
         ),
         (
             "model API key variable that is not a variable name",
             mutate(|document| {
                 document["models"][0]["apiKeyEnv"] = json!("sk-live-not-a-variable");
             }),
-            |error| matches!(error, ConfigError::InvalidEnvironmentName { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+                })
+            },
         ),
         (
             "a Slack reaction fallback while activity is off",
@@ -799,7 +920,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "activity": {"mode": "off", "classicFallback": "reaction"}
                 });
             }),
-            |error| matches!(error, ConfigError::InvalidSlackActivity { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidSlackActivity { .. })
+                })
+            },
         ),
         (
             "classic native Slack activity with no visible fallback",
@@ -813,7 +938,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "activity": {"mode": "native", "classicFallback": "none"}
                 });
             }),
-            |error| matches!(error, ConfigError::InvalidSlackActivity { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidSlackActivity { .. })
+                })
+            },
         ),
         (
             "a Slack endpoint that is neither production nor loopback",
@@ -826,7 +955,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "https://slack.evil.test"
                 });
             }),
-            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
+                })
+            },
         ),
         (
             "a Discord endpoint that is neither production nor loopback",
@@ -838,7 +971,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "https://discord.evil.test"
                 });
             }),
-            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
+                })
+            },
         ),
         (
             // Userinfo makes the authority read as loopback while the socket connects elsewhere.
@@ -852,7 +989,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "endpoint": "http://127.0.0.1@slack.evil.test"
                 });
             }),
-            |error| matches!(error, ConfigError::UnsupportedEndpoint { .. }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
+                })
+            },
         ),
     ];
 
@@ -863,6 +1004,209 @@ async fn invalid_configurations_fail_closed_at_startup() {
         assert!(
             expected(&error),
             "{name} failed closed for the wrong reason: {error:?}"
+        );
+    }
+}
+
+/// Every mistake in one file, in one refusal.
+///
+/// The property `docs/design.md` mandates and `dekopon-config` already keeps: an operator who wrote
+/// three zeros fixes three and restarts once, instead of rediscovering the next one after every
+/// restart. Three simultaneous problems, three lines, one startup failure.
+#[tokio::test]
+async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["models"][0]["timeoutMs"] = json!(0);
+    document["routes"][0]["limits"] = json!({"maxSteps": 0});
+    document["sessions"] = json!({"maxConcurrent": 0});
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("three mistakes are three problems");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal, not a first-error return: {error:?}");
+    };
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::InvalidModelTimeout { .. }
+    )));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::InvalidRouteLimits { .. }
+    )));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::InvalidSessionLimits
+    )));
+
+    // And the operator reads all three off one line rather than off three restarts.
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("3 validation problems found"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("must have a timeout greater than zero"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("at least one step"), "{rendered}");
+    assert!(rendered.contains("session bounds"), "{rendered}");
+}
+
+/// A list that failed is not blamed on the routes that name it.
+///
+/// `dekopon-config` skips its reference pass when a resource never reached its set, because a
+/// missing transport reported once by its real name beats the same failure reported again for
+/// every route pointing at it. The gateway owes an operator the same signal-to-noise.
+#[tokio::test]
+async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
+    let directory = temporary();
+
+    let mut empty = document(directory.path());
+    empty["transports"] = json!([]);
+    let error = load(directory.path(), &empty)
+        .await
+        .expect_err("a gateway with no transport cannot start");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::NoTransports
+    )));
+    assert!(
+        !reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::UnknownRouteTransport { .. }
+        )),
+        "the route did not make the list empty: {error}"
+    );
+
+    let mut unnamed = document(directory.path());
+    unnamed["transports"][0]["name"] = json!("   ");
+    let error = load(directory.path(), &unnamed)
+        .await
+        .expect_err("a transport with no name cannot be routed to");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::UnnamedTransport
+    )));
+    assert!(
+        !reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::UnknownRouteTransport { .. }
+        )),
+        "the route named the transport the operator meant to name: {error}"
+    );
+
+    // A duplicate is the other case, and it is deliberately not the same one: the first
+    // declaration is still in the name set, so the route it resolves against is real and the
+    // reference check keeps running.
+    let mut duplicate = document(directory.path());
+    duplicate["transports"] = json!([
+        { "name": "dev", "kind": "local", "socketPath": directory.path().join("dev.sock") },
+        { "name": "dev", "kind": "local", "socketPath": directory.path().join("other.sock") }
+    ]);
+    duplicate["routes"]
+        .as_array_mut()
+        .expect("routes array")
+        .push(json!({
+            "transport": "typo",
+            "match": {"kind": "channel"},
+            "agent": "reviewer"
+        }));
+    let error = load(directory.path(), &duplicate)
+        .await
+        .expect_err("a duplicate transport name and an unknown one are two problems");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::DuplicateTransport { .. }
+    )));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::UnknownRouteTransport { .. }
+    )));
+}
+
+/// Two missing chat credentials cost one restart, and neither service is spoken to.
+///
+/// Reading a token inside the connect loop meant the daemon authenticated to the first transport,
+/// then died on the second — so an operator who forgot two secrets paid two crash loops, each one
+/// having already opened a socket with the token it did have. Both are resolved before anything
+/// connects, and the mock endpoints prove nothing dialled them.
+#[tokio::test]
+async fn every_missing_transport_credential_is_named_before_anything_connects() {
+    const SLACK_APP_TOKEN: &str = "DEKOPOND_TEST_MISSING_SLACK_APP_4F1B02";
+    const SLACK_BOT_TOKEN: &str = "DEKOPOND_TEST_MISSING_SLACK_BOT_4F1B02";
+    const TELEGRAM_TOKEN: &str = "DEKOPOND_TEST_MISSING_TELEGRAM_BOT_4F1B02";
+    for variable in [SLACK_APP_TOKEN, SLACK_BOT_TOKEN, TELEGRAM_TOKEN] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "fixture must stay unset"
+        );
+    }
+
+    let directory = temporary();
+    // Loopback stand-ins for Slack and Telegram. Neither is ever served: an accepted connection
+    // here is the regression this test exists for.
+    let slack = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback Slack stand-in");
+    let telegram = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback Telegram stand-in");
+    for listener in [&slack, &telegram] {
+        listener
+            .set_nonblocking(true)
+            .expect("the listener is polled, never waited on");
+    }
+
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .expect("catalog fixture writes");
+
+    let mut document = document(directory.path());
+    document["transports"] = json!([
+        {
+            "name": "support-slack",
+            "kind": "slackSocketMode",
+            "appTokenEnv": SLACK_APP_TOKEN,
+            "botTokenEnv": SLACK_BOT_TOKEN,
+            "endpoint": format!("http://{}", slack.local_addr().expect("bound address"))
+        },
+        {
+            "name": "community-telegram",
+            "kind": "telegramLongPoll",
+            "botTokenEnv": TELEGRAM_TOKEN,
+            "endpoint": format!("http://{}", telegram.local_addr().expect("bound address"))
+        }
+    ]);
+    document["routes"][0]["transport"] = json!("support-slack");
+    let path = write_config(directory.path(), &document);
+
+    let error = crate::run(&path, std::future::pending())
+        .await
+        .expect_err("two unset chat credentials are a startup refusal");
+    let crate::DekopondError::Startup { problems } = &error else {
+        panic!("one refusal naming both transports, not the first one: {error:?}");
+    };
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    let rendered = error.to_string();
+    for variable in [SLACK_APP_TOKEN, TELEGRAM_TOKEN] {
+        assert!(
+            rendered.contains(variable),
+            "the refusal names the variable and never its value: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("support-slack") && rendered.contains("community-telegram"),
+        "the refusal names both transports: {rendered}"
+    );
+
+    for listener in [&slack, &telegram] {
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "a transport whose credential is unusable must never authenticate"
         );
     }
 }
@@ -1154,29 +1498,73 @@ async fn a_route_no_catalog_can_satisfy_fails_at_startup() {
     .expect("catalog fixture parses");
     assert!(matches!(
         RoutingTable::bind(&config, &empty).expect_err("an unknown agent is a startup failure"),
-        RouteError::UnknownAgent { .. }
+        ref error if matches!(only_route_problem(error), RouteProblem::UnknownAgent { .. })
     ));
 
     // Disabled agent: present in the catalog and deliberately not schedulable.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(false, Some("reasoning")))
             .expect_err("a disabled agent is a startup failure"),
-        RouteError::DisabledAgent { .. }
+        ref error if matches!(only_route_problem(error), RouteProblem::DisabledAgent { .. })
     ));
 
     // A class no configured model offers.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(true, Some("vision")))
             .expect_err("an unmatched model class is a startup failure"),
-        RouteError::NoModelForClass { .. }
+        ref error if matches!(only_route_problem(error), RouteProblem::NoModelForClass { .. })
     ));
 
     // No class and no override: nothing selects a model.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(true, None))
             .expect_err("an agent with no class and no override is a startup failure"),
-        RouteError::NoModelClass { .. }
+        ref error if matches!(only_route_problem(error), RouteProblem::NoModelClass { .. })
     ));
+}
+
+/// Every unsatisfiable route, in one refusal.
+///
+/// Binding scans the whole table for the reason `resolve` scans the whole file: a deployment whose
+/// catalog disabled one agent and never declared the other is one restart, not two.
+#[tokio::test]
+async fn every_unsatisfiable_route_is_reported_in_one_refusal() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"]
+        .as_array_mut()
+        .expect("routes array")
+        .push(json!({
+            "transport": "dev",
+            "match": {"kind": "channel", "channel": "ops"},
+            "agent": "nobody"
+        }));
+    let config = resolved(directory.path(), &document).await;
+
+    let error = RoutingTable::bind(&config, &catalog(false, Some("reasoning")))
+        .expect_err("a disabled agent and an absent one are both startup failures");
+    assert_eq!(error.problems.len(), 2, "{:?}", error.problems);
+    assert!(matches!(
+        error.problems[0],
+        RouteProblem::DisabledAgent { .. }
+    ));
+    assert!(matches!(
+        error.problems[1],
+        RouteProblem::UnknownAgent { .. }
+    ));
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("2 validation problems found"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("which the catalog disables"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("which is not in the catalog"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]

@@ -9,12 +9,11 @@ use std::{collections::BTreeSet, sync::Arc};
 use dekopon_agent::prompt::PromptLimits;
 use dekopon_config::LocalCatalog;
 use dekopon_core::AgentId;
-use dekopon_protocol::Agent;
 use thiserror::Error;
 
 use crate::{
     cache_key,
-    config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch},
+    config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch, render_problems},
     transport::ConversationKind,
 };
 
@@ -61,6 +60,14 @@ pub(crate) struct RoutingTable {
 
 impl RoutingTable {
     /// Resolves every configured route against the catalog and the configured models.
+    ///
+    /// Every route is examined before any of them is refused, for the reason `resolve` scans a
+    /// whole configuration file: a deployment whose catalog disabled two of its agents is one
+    /// refusal naming both, not two restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns one [`RouteError`] carrying every route that no configuration could satisfy.
     pub fn bind(config: &ResolvedConfig, catalog: &LocalCatalog) -> Result<Self, RouteError> {
         let models = config
             .models
@@ -69,41 +76,51 @@ impl RoutingTable {
             .map(Arc::new)
             .collect::<Vec<_>>();
         let mut routes = Vec::with_capacity(config.routes.len());
+        let mut problems = Vec::new();
         for route in &config.routes {
-            let agent: &Agent =
-                catalog
-                    .agent(&route.agent)
-                    .ok_or_else(|| RouteError::UnknownAgent {
-                        agent: route.agent.to_string(),
-                    })?;
-            if !agent.spec.enabled {
-                return Err(RouteError::DisabledAgent {
+            // An agent that is absent or disabled settles nothing about which model would serve
+            // it, so the class lookup below would report a second problem about the same route.
+            // The same skip `dekopon-config` makes when a referenced resource never parsed.
+            let Some(agent) = catalog.agent(&route.agent) else {
+                problems.push(RouteProblem::UnknownAgent {
                     agent: route.agent.to_string(),
                 });
+                continue;
+            };
+            if !agent.spec.enabled {
+                problems.push(RouteProblem::DisabledAgent {
+                    agent: route.agent.to_string(),
+                });
+                continue;
             }
             // An explicit override wins; otherwise the agent's declared class picks the first
             // endpoint that offers it. Declaration order is the tie-break, so an operator controls
             // preference by ordering `models` rather than by a hidden score.
-            let model = match &route.model {
+            let selected = match &route.model {
                 Some(name) => models
                     .iter()
                     .find(|model| model.name() == name)
-                    .ok_or_else(|| RouteError::UnknownModel {
+                    .ok_or_else(|| RouteProblem::UnknownModel {
                         model: name.clone(),
-                    })?,
-                None => {
-                    let class = agent.spec.model_class.as_deref().ok_or_else(|| {
-                        RouteError::NoModelClass {
-                            agent: route.agent.to_string(),
-                        }
-                    })?;
-                    models
+                    }),
+                None => match agent.spec.model_class.as_deref() {
+                    None => Err(RouteProblem::NoModelClass {
+                        agent: route.agent.to_string(),
+                    }),
+                    Some(class) => models
                         .iter()
                         .find(|model| model.classes().iter().any(|offered| offered == class))
-                        .ok_or_else(|| RouteError::NoModelForClass {
+                        .ok_or_else(|| RouteProblem::NoModelForClass {
                             agent: route.agent.to_string(),
                             class: class.to_owned(),
-                        })?
+                        }),
+                },
+            };
+            let model = match selected {
+                Ok(model) => model,
+                Err(problem) => {
+                    problems.push(problem);
+                    continue;
                 }
             };
             routes.push(BoundRoute {
@@ -123,7 +140,11 @@ impl RoutingTable {
                 cache_key: cache_key::for_route(),
             });
         }
-        Ok(Self { routes })
+        if problems.is_empty() {
+            Ok(Self { routes })
+        } else {
+            Err(RouteError { problems })
+        }
     }
 
     /// The distinct models bound routes can actually reach, in declaration order.
@@ -169,9 +190,17 @@ impl RoutingTable {
     }
 }
 
-/// A route that no configuration could ever satisfy.
+/// Every route that no configuration could satisfy, reported as one refusal.
 #[derive(Debug, Error)]
-pub enum RouteError {
+#[error("{}", render_problems(.problems))]
+pub struct RouteError {
+    /// Every unsatisfiable route, in declaration order.
+    pub problems: Vec<RouteProblem>,
+}
+
+/// One route that no configuration could ever satisfy.
+#[derive(Debug, Error)]
+pub enum RouteProblem {
     #[error("route names agent {agent:?}, which is not in the catalog")]
     UnknownAgent { agent: String },
     #[error("route names agent {agent:?}, which the catalog disables")]

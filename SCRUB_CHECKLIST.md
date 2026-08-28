@@ -120,7 +120,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #11 — INCONSISTENT_IDIOM — crates/dekopond/src/config.rs:745 (+ routes.rs:64, lib.rs:195-224)
+## [x] #11 — INCONSISTENT_IDIOM — crates/dekopond/src/config.rs:745 (+ routes.rs:64, lib.rs:195-224)
 
 **Finding:** `dekopond::config::resolve` has 32 first-error returns and `RoutingTable::bind` five more, while `dekopon-config` next door aggregates every problem and `docs/design.md:203` mandates it. Worse, `lib.rs:195-224` reads each transport's credential and opens its socket inside one loop, so a rollout missing two tokens costs two crash-loops, each having already authenticated to Slack. `brokerd/src/secrets.rs:1043` aggregates; `brokerd/src/config.rs` does not. (raw: A1)
 **Blast radius:** HIGH  **Confidence:** HIGH
