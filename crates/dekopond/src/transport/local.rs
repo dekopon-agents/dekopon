@@ -8,7 +8,7 @@
 //! be any subject.
 //!
 //! What it does *not* do is grant anything. The declared subject is still only a claim carried into
-//! the broker's `invokeFor`, and the broker still needs an attestor grant covering that namespace
+//! the broker's attested `invoke`, and the broker still needs an attestor grant covering that namespace
 //! plus an owner-controlled mapping before it resolves to a principal. A caller here can therefore
 //! reach exactly the authority the owner already configured for the subject it names, and nothing
 //! else. The socket's own `0600` mode is what keeps that reachable only by the owner's UID, which

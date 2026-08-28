@@ -607,11 +607,11 @@ fn validate_capability_responses<A: AuditLog>(
         }
     }
     // The peers above are the *direct* callers, and in a gateway deployment they are the ones
-    // granted almost nothing. Every chat session is answered through `capabilitiesFor` or
-    // `capabilitiesForChat` under an attested context built from an identity mapping, whose Cedar
-    // grants are the real, larger capability sets — so checking peers alone checks the one path
-    // that never carries the big response, and the oversized one still fails `write_frame` on
-    // every session open. That is exactly the failure this check exists to move to startup.
+    // granted almost nothing. Every chat session is answered through an attested `capabilities`
+    // under a context built from an identity mapping, whose Cedar grants are the real, larger
+    // capability sets — so checking peers alone checks the one path that never carries the big
+    // response, and the oversized one still fails `write_frame` on every session open. That is
+    // exactly the failure this check exists to move to startup.
     //
     // Those contexts cannot be enumerated here: the agent catalog belongs to the gateway and
     // production policy conditions on `context.agent`, so a representative agent would measure a

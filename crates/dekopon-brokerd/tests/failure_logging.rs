@@ -226,7 +226,7 @@ async fn framing_and_audit_failures_name_their_cause() {
         input: json!({"message": "hello through broker"}),
     };
     client
-        .invoke(request)
+        .invoke(None, request)
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
     // The connection's own verdict is observed the moment its task finishes, with the server still

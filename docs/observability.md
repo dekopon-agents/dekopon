@@ -261,7 +261,7 @@ attested context was derived.
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceparent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content. `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
-Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's `capabilitiesForChat` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
+Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
 
 Every transport reconnects on one jittered exponential backoff, and the jitter comes from the
 operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
@@ -439,8 +439,8 @@ only place the cause exists. These events carry it:
 | `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
-`broker_capabilities_refused` exists because `capabilitiesFor`, `capabilitiesForChat`, and
-`resolveCommandForChat` answer a refused caller with the same opaque nothing whatever went wrong — a
+`broker_capabilities_refused` exists because an attested `capabilities` and an attested
+`resolveCommand` answer a refused caller with the same opaque nothing whatever went wrong — a
 distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and an unknown
 command word would disclose the surface the refusal withheld. The class, its determining policies,
 and the canonical subject therefore land on the broker's own side of the socket, which is what makes

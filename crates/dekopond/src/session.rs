@@ -23,10 +23,10 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    BrokerClient, ChatScopeClaim, ChatSessionClaim, ClientError, DeliveredTurnRequest,
-    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
-    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
-    InvocationResult, ModelUsageReport,
+    Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
+    ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
+    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
+    ModelUsageReport,
 };
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
@@ -1082,15 +1082,12 @@ async fn connect(
         runner.broker.server_uid,
         runner.broker.frame,
     )?;
-    BrokerLeg::connect_chat(client, TRACE_PREFIX, chat_claim(route, message)?)
+    BrokerLeg::connect(client, TRACE_PREFIX, Some(chat_claim(route, message)?))
         .await
         .map_err(SessionError::from)
 }
 
-fn chat_claim(
-    route: &BoundRoute,
-    message: &InboundMessage,
-) -> Result<ChatSessionClaim, SessionError> {
+fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestation, SessionError> {
     let transport = message
         .transport
         .parse()
@@ -1102,22 +1099,22 @@ fn chat_claim(
         ),
         _ => (message.channel.clone(), message.conversation_id.clone()),
     };
-    Ok(ChatSessionClaim {
-        subject: message.subject.clone(),
-        agent: route.agent.clone(),
-        scope: ChatScopeClaim {
+    Ok(Attestation::for_chat(
+        message.subject.clone(),
+        route.agent.clone(),
+        ChatScopeClaim {
             transport,
             kind: message.transport_kind,
             channel,
             conversation,
         },
-    })
+    ))
 }
 
 async fn record_delivered_turn(
     runner: &SessionRunner,
     message: &InboundMessage,
-    claim: ChatSessionClaim,
+    claim: Attestation,
     assistant: String,
 ) {
     let Some(delivery) = delivery_identity(message, &claim) else {
@@ -1141,7 +1138,8 @@ async fn record_delivered_turn(
         )
         .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
         let result = client
-            .record_delivered_turn_for_chat(
+            .record_delivered_turn(
+                claim,
                 DeliveredTurnRequest {
                     id,
                     trace: identifiers.trace().clone(),
@@ -1150,7 +1148,6 @@ async fn record_delivered_turn(
                     user: message.text.clone(),
                     assistant,
                 },
-                claim,
             )
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
@@ -1169,31 +1166,31 @@ async fn record_delivered_turn(
 
 pub(crate) fn delivery_identity(
     message: &InboundMessage,
-    claim: &ChatSessionClaim,
+    claim: &Attestation,
 ) -> Option<DeliveryIdentity> {
+    let scope = claim.scope.as_ref()?;
     match message.transport_kind {
         dekopon_broker_protocol::ChatTransportKind::Slack => Some(DeliveryIdentity::Slack {
-            channel: claim.scope.channel.clone(),
+            channel: scope.channel.clone(),
             timestamp: message.message_id.clone(),
         }),
         dekopon_broker_protocol::ChatTransportKind::Discord => Some(DeliveryIdentity::Discord {
-            channel: claim.scope.channel.clone(),
+            channel: scope.channel.clone(),
             message: message.message_id.clone(),
         }),
         dekopon_broker_protocol::ChatTransportKind::Telegram => {
-            let topic = claim
-                .scope
+            let topic = scope
                 .conversation
-                .strip_prefix(&format!("{}:topic:", claim.scope.channel))
+                .strip_prefix(&format!("{}:topic:", scope.channel))
                 .map(str::to_owned);
             Some(DeliveryIdentity::Telegram {
-                chat: claim.scope.channel.clone(),
+                chat: scope.channel.clone(),
                 topic,
                 message: message.message_id.clone(),
             })
         }
         dekopon_broker_protocol::ChatTransportKind::Whatsapp => {
-            let mut parts = claim.scope.channel.split(':');
+            let mut parts = scope.channel.split(':');
             let waba = parts.next()?.to_owned();
             let phone_number = parts.next()?.to_owned();
             let _sender = parts.next()?;
@@ -1212,8 +1209,8 @@ pub(crate) fn delivery_identity(
             let connection = fields.next()?.parse().ok()?;
             let boot_nonce = fields.next()?.to_owned();
             Some(DeliveryIdentity::Local {
-                transport: claim.scope.transport.clone(),
-                conversation: claim.scope.conversation.clone(),
+                transport: scope.transport.clone(),
+                conversation: scope.conversation.clone(),
                 boot_nonce,
                 connection,
                 sequence,

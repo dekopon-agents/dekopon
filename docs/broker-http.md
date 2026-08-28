@@ -65,19 +65,32 @@ The current protocol and service use a local Unix-domain socket. `dekopon-broker
 
 Each invocation request carries a unique invocation identifier, trace identifier, capability identifier, bounded JSON input, and protocol version. The broker rejects duplicate invocation identifiers across verified durable history and current state. Requests and responses use four-byte length-delimited, size-bounded strict JSON with one complete-frame deadline, so a peer cannot force unbounded buffering or hold a partial frame indefinitely.
 
-The protocol exposes only the operations needed by a broker client:
+The protocol exposes only the operations needed by a broker client — **one operation per verb**:
 
-- inspect the broker's available provider capabilities;
-- submit one invocation proposal;
-- inspect the capabilities visible to an attested on-behalf-of context (`capabilitiesFor`);
-- submit one proposal attested on behalf of an external subject (`invokeFor`);
-- rewrite one provider-declared shell command word into a capability proposal (`resolveCommand`);
-- use invocation-bound chat operations (`capabilitiesForChat`, `resolveCommandForChat`, and
-  `invokeForChat`) only under a matching owner-authored `chatScopes` grant;
-- submit hidden post-acceptance recording only through `recordDeliveredTurnForChat` — never generic
-  invocation;
-- let a mapped attestor publish a bounded informational catalog inventory and model-token delta for the process-local web UI; and
-- receive a denied, succeeded, or failed result with bounded public evidence metadata.
+- `capabilities` inspects what this context may use;
+- `resolveCommand` rewrites one provider-declared shell command word into a capability proposal;
+- `invoke` submits one invocation proposal;
+- `recordDeliveredTurn` submits hidden post-acceptance recording, and is the only way to reach it;
+- `publishAgentInventory` and `publishModelUsage` let a mapped attestor report a bounded
+  informational catalog inventory and model-token delta for the process-local web UI; and
+- every operation receives a denied, succeeded, or failed result with bounded public evidence
+  metadata, or a stable failure code.
+
+Whether a caller speaks as its own authenticated peer, on behalf of an external subject, or inside a
+bounded chat scope is **`attestation`, an optional field on the operation** — not an operation of its
+own. One shape:
+
+```json
+{"subject": "slack.t0123abc.u9xyz", "agent": "reviewer",
+ "scope": {"transport": "workspace-slack", "kind": "slack", "channel": "…", "conversation": "…"},
+ "invocation": "invoke-…"}
+```
+
+`scope` is absent for a subject-only claim and present for a chat claim, which is the only claim that
+can reach the durable-memory surface and the only one an owner-authored `chatScopes` grant applies
+to. `invocation` is present exactly for the operations that carry a proposal — `invoke` and
+`recordDeliveredTurn` — where it must equal that proposal's identifier. `recordDeliveredTurn`
+requires a chat claim; every other operation accepts any shape or none.
 
 The informational operations are deliberately outside the authority flow. Their payloads contain no prompt, subject, principal, instruction, credential, policy, constraint, or authorization; they grant nothing, produce no provider effect, and are absent from durable authorization audit. A gateway can misreport dashboard state and cannot use that state to influence a decision.
 
@@ -91,28 +104,32 @@ The reasoning is that the export is a **pure rewrite** and what it returns is a 
 
 Everything that is not a rewrite collapses into one opaque answer. A word no loaded provider declares, a guest that traps or reaches for a host import, and a resolution the broker cannot decode all return the stable `provider-error` code with a fixed message; the guest's own failure text is provider-controlled and never reaches a caller through this path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases apart from the audit stream that a caller deliberately cannot. A provider that simply *declines* the arguments is not a failure at all: that is a usage error, and the provider's own message travels back for the model to read.
 
-Reserved words are unreachable through this path, and what reserves them is the deployment's own `constraintSets`: every word belonging to the provider a chat-memory `route:` names is refused here, and so is any resolution that lands on a chat-memory-routed capability. Reservation therefore follows what an operator declared rather than how a provider or capability happens to be spelled, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. `resolveCommandForChat` is the chat-scoped twin, which *is* bound to an attested claim.
+Reserved words are unreachable through this path, and what reserves them is the deployment's own `constraintSets`: every word belonging to the provider a chat-memory `route:` names is refused here, and so is any resolution that lands on a chat-memory-routed capability. Reservation therefore follows what an operator declared rather than how a provider or capability happens to be spelled, so hidden chat recording cannot be reached by rewrite any more than by generic invocation. A chat claim lifts the reservation on exactly the memory *retrieval* words, and only for a session whose three memory grants are effective; recording stays unreachable from every word.
+
+An `attestation` does not gate the rewrite either, but it is still a claim, and a claim the broker refuses buys nothing: the word answers as an undeclared word does, because naming it would disclose the surface the refusal withheld.
 
 ### Attested on-behalf-of operations
 
-`capabilitiesFor` and `invokeFor` carry a canonical external subject and an agent identity. They carry no principal, because the subject-to-principal mapping is owner-controlled broker state; a peer states *which authenticated external identity it is relaying*, and the broker decides who that is. Both are honored only for peers whose configuration grants attestor authority over the subject's namespace.
+An `attestation` carries a canonical external subject and an agent identity. It carries no principal, because the subject-to-principal mapping is owner-controlled broker state; a peer states *which authenticated external identity it is relaying*, and the broker decides who that is. It is honored only for peers whose configuration grants attestor authority over the subject's namespace, and a chat claim additionally needs a matching owner-authored `chatScopes` grant. An attestor whose grant names no `chatScopes` at all keeps working: a chat claim from it derives the legacy attested context with no trusted chat scope, which makes the durable-memory surface structurally unavailable rather than broken.
 
-`invokeFor` sends its claim as a separate `SubjectAttestation` rather than as fields on the invocation, so the invocation payload stays identity-free exactly as it is for `invoke`. The attestation's `invocation` must equal the accompanying proposal's identifier. They already travel in one frame, so this is defense in depth against a future refactor that separates them; a mismatch is a protocol error (`invalid-request`) rather than a policy decision, and nothing is authorized or accounted.
+It travels as its own structure rather than as fields on the invocation, so the invocation payload stays identity-free whether or not one accompanies it. On `invoke` and `recordDeliveredTurn` its `invocation` must equal the accompanying proposal's identifier, and on every other operation it must be absent. They already travel in one frame, so this is defense in depth against a future refactor that separates them; a disagreement is a protocol error (`invalid-request`) rather than a policy decision, and nothing is authorized or accounted.
 
-The two refusals differ in kind. A refused attestation on `invokeFor` is a normal invocation response carrying a `Denied` outcome and a stable reason — `attestation-denied` for a missing or out-of-scope grant, `unmapped-subject` for a subject no mapping names — because it is a decision the broker made and durably recorded. A refused `capabilitiesFor` is an `unauthenticated` failure response instead: there is no invocation to decide about, and answering with an empty list would tell an ungranted peer whether the subject is mapped.
+The two refusals differ in kind. A refused attestation on `invoke` is a normal invocation response carrying a `Denied` outcome and a stable reason — `attestation-denied` for a missing or out-of-scope grant, `unmapped-subject` for a subject no mapping names, `agent-denied` (or `policy-error`) for a principal policy does not let drive this agent — because it is a decision the broker made and durably recorded. A refused `capabilities` is an `unauthenticated` failure response instead: there is no invocation to decide about, and answering with an empty list would tell an ungranted peer whether the subject is mapped. An unattested `capabilities` is never refused; it is the peer's own listing. The refusal class reaches the operator through `broker_capabilities_refused` on the broker's own side of the socket, never through the wire answer.
 
-The `operation` tag is the compatibility seam for this addition. Requests are strict-decoded, so a broker built before these operations existed rejects an unknown tag as a clean `invalid-request` rather than misreading it as an operation it does know. A client can therefore probe for attestation support without risking a misinterpreted proposal.
+The `operation` tag is still strict-decoded, so an operation a broker does not know is a clean `invalid-request` rather than a misread proposal. It is no longer the *shape* seam it used to be, because shape is now a field; the envelope's `apiVersion` is.
 
 ### Version and compatibility
 
-**Status: current.** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha1`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
+**Status: current.** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha2`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
 
-**`dekopond`, `dekopon-run`, and `dekopon-brokerd` must be upgraded together.** They are separately installable — Homebrew, crates.io, release archives, the container image, and the chart with its own `image.tag` — so a mixed set is a normal deployment mistake rather than a hypothetical one, and the alpha protocol has no compatibility promise across releases. 0.5.0 changed it for policy-filtered command words and command resolution and required exactly this lockstep. The chart and the container image ship all four executables from one release for the same reason.
+**`dekopond`, `dekopon-run`, and `dekopon-brokerd` must be upgraded together.** They are separately installable — Homebrew, crates.io, release archives, the container image, and the chart with its own `image.tag` — so a mixed set is a normal deployment mistake rather than a hypothetical one, and the alpha protocol has no compatibility promise across releases. 0.5.0 changed it for policy-filtered command words and command resolution and required exactly this lockstep. `v1alpha2` changed it again, collapsing the per-attestation-shape operations into one operation per verb. The chart and the container image ship all four executables from one release for the same reason.
 
-A mismatch fails in two different directions, and only one of them is loud:
+A mismatch is now loud in **both** directions, which is the whole reason the version moved rather than the operation tags being aliased:
 
-- **A newer client against an older broker** is refused per operation. Operations added later are unknown `operation` tags, which strict decoding rejects as `invalid-request` rather than misreading as an operation the broker does know. That is the seam working as designed, and it is why a client can probe for a feature safely.
-- **An older client against a newer broker** fails on the response instead. Response variants are `deny_unknown_fields`, so a field added to a response an old client already understands — `commandWords` on `Capabilities`, for instance — makes that response undecodable. Additive-looking changes are therefore breaking in this direction, which is the half a rolling upgrade is most likely to produce.
+- **A newer client against an older broker** sends `apiVersion: dekopon.dev/broker/v1alpha2`, which an older broker strict-decodes into `invalid-request`. Nothing is authorized, accounted, or audited.
+- **An older client against a newer broker** sends `v1alpha1` and gets the same `invalid-request` on its first frame. Under `v1alpha1` this direction failed on the *response* instead — response variants are `deny_unknown_fields`, so a field added to a response an old client already understood made that response undecodable, and for a submitted proposal that is an unknown outcome rather than a refusal. Failing at the envelope moves that failure to before anything runs.
+
+Retiring the old `operation` tags outright, rather than keeping them as deprecated aliases for a cycle, is the same decision: an alias would have carried the old *field shapes* too, which is exactly the multiplication the collapse removed, and a mixed pair would then have half-worked instead of refusing.
 
 Restart order follows from the gateway's startup probe rather than from the protocol: `dekopond` asks the broker for capabilities once before connecting any transport and exits non-zero if the broker does not answer. Start the broker first and stop it last. [`upgrading.md`](upgrading.md) records the per-release steps.
 
@@ -244,8 +261,9 @@ public DRN and its fixed context names capability, provider and sink; it still g
 the owner-authored execution binding.
 
 `agent.prompt` is the session gate. Permitting a principal to drive an agent is now its own
-explicit statement, checked before `capabilitiesFor` answers and before `invokeFor` authorizes
-anything; a denial is the audited reason `agent-denied` under the attested context.
+explicit statement, checked before an attested `capabilities` answers and before an attested
+`invoke` authorizes anything; a denial is the audited reason `agent-denied` under the attested
+context.
 
 ### Startup validation
 

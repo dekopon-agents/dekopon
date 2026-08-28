@@ -2,11 +2,11 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_broker::{
-    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits,
-    CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog,
+    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
+    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog,
     IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
     SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
-    StartupWarning, SubjectAttestation, verify_audit_chain,
+    StartupWarning, verify_audit_chain,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
@@ -313,18 +313,12 @@ fn attestor_grant<'a>(namespaces: impl IntoIterator<Item = &'a str>) -> Attestor
     }
 }
 
-fn attestation(
-    subject: &ExternalSubject,
-    agent_name: &str,
-    invocation: &str,
-) -> SubjectAttestation {
-    SubjectAttestation {
-        subject: subject.clone(),
-        agent: agent(agent_name),
-        invocation: invocation
+fn attestation(subject: &ExternalSubject, agent_name: &str, invocation: &str) -> Attestation {
+    Attestation::for_subject(subject.clone(), agent(agent_name)).bound_to(
+        invocation
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
-    }
+    )
 }
 
 fn directory<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> IdentityDirectory {
@@ -397,6 +391,8 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-once",
                 "echo.echo",
@@ -420,6 +416,8 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
     let replay = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-once",
                 "echo.echo",
@@ -473,6 +471,8 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
     let first = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request("invoke-durable", "echo.echo", json!({"message": "hello"})),
         )
         .await
@@ -508,6 +508,8 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
     let replay = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request("invoke-durable", "echo.echo", json!({"message": "again"})),
         )
         .await
@@ -550,6 +552,8 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     let result = broker
         .invoke(
             &context("other-caller"),
+            None,
+            None,
             request("invoke-denied", "echo.echo", json!({"message": "secret"})),
         )
         .await
@@ -712,6 +716,8 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-http",
                 "http-probe.fetch",
@@ -839,6 +845,8 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     let read = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-json-read-with-write-rule",
                 "jsonplaceholder.posts.get",
@@ -856,6 +864,8 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-json-write",
                 "jsonplaceholder.posts.create",
@@ -963,6 +973,8 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-json-write-failure",
                 "jsonplaceholder.posts.create",
@@ -1078,6 +1090,8 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-credentialed",
                 "http-probe.fetch",
@@ -1187,7 +1201,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), proposal)
+        .invoke(&context("caller"), None, None, proposal)
         .await
         .expect("dual-authorized invocation completes");
     assert_eq!(
@@ -1268,7 +1282,7 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), proposal)
+        .invoke(&context("caller"), None, None, proposal)
         .await
         .expect("denial audited");
     assert_eq!(
@@ -1344,7 +1358,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), proposal)
+        .invoke(&context("caller"), None, None, proposal)
         .await
         .expect("source failure is a normal audited result");
     assert_eq!(
@@ -1447,6 +1461,8 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
             let result = broker
                 .invoke(
                     &context,
+                    None,
+                    None,
                     request(
                         id,
                         "http-probe.fetch",
@@ -1579,6 +1595,8 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
         broker
             .invoke(
                 &agent_context("caller", agent_name),
+                None,
+                None,
                 request(
                     id,
                     "http-probe.fetch",
@@ -1805,10 +1823,10 @@ async fn via_isolation_holds_in_both_directions() {
     let subject = subject(SLACK_SUBJECT);
 
     let attested = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&grant),
-            &attestation(&subject, "some-agent", "invoke-attested"),
+            Some(&attestation(&subject, "some-agent", "invoke-attested")),
             request(
                 "invoke-attested",
                 "echo.echo",
@@ -1828,6 +1846,8 @@ async fn via_isolation_holds_in_both_directions() {
     let direct = broker
         .invoke(
             &agent_context("cpetersen", "some-agent"),
+            None,
+            None,
             request(
                 "invoke-direct-as-mapped",
                 "echo.echo",
@@ -1850,10 +1870,10 @@ async fn via_isolation_holds_in_both_directions() {
 
     // And the attested context cannot borrow authority granted to a direct peer.
     let crossed = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&grant),
-            &attestation(&subject, "some-agent", "invoke-crossed"),
+            Some(&attestation(&subject, "some-agent", "invoke-crossed")),
             request(
                 "invoke-crossed",
                 "echo.reverse",
@@ -1870,7 +1890,14 @@ async fn via_isolation_holds_in_both_directions() {
 
     // Capability listings agree with the invocation decisions on both sides of the boundary.
     let visible = broker
-        .capabilities_for(&gateway, Some(&grant), &subject, &agent("some-agent"))
+        .capability_surface(
+            &gateway,
+            Some(&grant),
+            Some(&Attestation::for_subject(
+                subject.clone(),
+                agent("some-agent"),
+            )),
+        )
         .expect("the attestation is honored")
         .0;
     assert_eq!(visible.len(), 1);
@@ -1907,10 +1934,10 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
 
     // No attestor authority at all.
     let ungranted = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             None,
-            &attestation(&subject, "some-agent", "invoke-no-grant"),
+            Some(&attestation(&subject, "some-agent", "invoke-no-grant")),
             request("invoke-no-grant", "echo.echo", json!({"message": "claim"})),
         )
         .await
@@ -1923,10 +1950,10 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
 
     // Authority over a different workspace is not authority over this one.
     let out_of_scope = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&attestor_grant(["slack.t0999zzz"])),
-            &attestation(&subject, "some-agent", "invoke-out-of-scope"),
+            Some(&attestation(&subject, "some-agent", "invoke-out-of-scope")),
             request(
                 "invoke-out-of-scope",
                 "echo.echo",
@@ -1981,10 +2008,10 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = attested_broker(IdentityDirectory::empty(), Arc::clone(&audit)).await;
     let unmapped = broker
-        .invoke_for(
+        .invoke(
             &gateway,
             Some(&attestor_grant(["slack.t0123abc"])),
-            &attestation(&subject, "some-agent", "invoke-unmapped"),
+            Some(&attestation(&subject, "some-agent", "invoke-unmapped")),
             request("invoke-unmapped", "echo.echo", json!({"message": "claim"})),
         )
         .await
@@ -2025,10 +2052,14 @@ async fn attested_denials_still_consume_the_invocation_identifier() {
     )
     .await;
     let refused = broker
-        .invoke_for(
+        .invoke(
             &service_context("gateway"),
             None,
-            &attestation(&subject(SLACK_SUBJECT), "some-agent", "invoke-shared-id"),
+            Some(&attestation(
+                &subject(SLACK_SUBJECT),
+                "some-agent",
+                "invoke-shared-id",
+            )),
             request("invoke-shared-id", "echo.echo", json!({"message": "claim"})),
         )
         .await
@@ -2038,6 +2069,8 @@ async fn attested_denials_still_consume_the_invocation_identifier() {
     let reused = broker
         .invoke(
             &agent_context("cpetersen", "some-agent"),
+            None,
+            None,
             request("invoke-shared-id", "echo.echo", json!({"message": "retry"})),
         )
         .await
@@ -2062,14 +2095,14 @@ async fn attested_success_audits_via_and_subject() {
     )
     .await;
     let result = broker
-        .invoke_for(
+        .invoke(
             &service_context("gateway"),
             Some(&attestor_grant(["slack.t0123abc"])),
-            &attestation(
+            Some(&attestation(
                 &subject(SLACK_SUBJECT),
                 "some-agent",
                 "invoke-attested-audit",
-            ),
+            )),
             request(
                 "invoke-attested-audit",
                 "echo.echo",
@@ -2126,13 +2159,27 @@ async fn capabilities_for_distinguishes_refusal_from_empty() {
 
     assert!(
         broker
-            .capabilities_for(&gateway, None, &mapped, &agent("some-agent"))
+            .capability_surface(
+                &gateway,
+                None,
+                Some(&Attestation::for_subject(
+                    mapped.clone(),
+                    agent("some-agent"),
+                )),
+            )
             .is_none(),
         "a peer with no attestor authority learns nothing at all"
     );
 
     let granted = broker
-        .capabilities_for(&gateway, Some(&grant), &mapped, &agent("some-agent"))
+        .capability_surface(
+            &gateway,
+            Some(&grant),
+            Some(&Attestation::for_subject(
+                mapped.clone(),
+                agent("some-agent"),
+            )),
+        )
         .expect("the attestation is honored")
         .0;
     assert_eq!(granted.len(), 1);
@@ -2141,11 +2188,13 @@ async fn capabilities_for_distinguishes_refusal_from_empty() {
     // Attested successfully, mapped successfully, and granted nothing: an empty list is the
     // honest answer and is not a refusal.
     let bare = broker
-        .capabilities_for(
+        .capability_surface(
             &gateway,
             Some(&grant),
-            &subject("tel.16034700182"),
-            &agent("some-agent"),
+            Some(&Attestation::for_subject(
+                subject("tel.16034700182"),
+                agent("some-agent"),
+            )),
         )
         .expect("the attestation is honored for every namespace in the grant")
         .0;
@@ -2320,6 +2369,8 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request(
                 "invoke-unconstrained",
                 "echo.reverse",
@@ -2371,6 +2422,8 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request("invoke-explained", "echo.echo", json!({"message": "hi"})),
         )
         .await
@@ -2378,6 +2431,8 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     broker
         .invoke(
             &context("other-caller"),
+            None,
+            None,
             request("invoke-unexplained", "echo.echo", json!({"message": "hi"})),
         )
         .await
@@ -2439,6 +2494,8 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request("invoke-tolerated", "echo.reverse", json!({"message": "x"})),
         )
         .await
@@ -2520,6 +2577,8 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     let result = broker
         .invoke(
             &context("caller"),
+            None,
+            None,
             request("invoke-routed", "echo.echo", json!({"message": "x"})),
         )
         .await
@@ -2600,7 +2659,13 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
     .expect("broker starts");
 
     let error = broker
-        .resolve_command("gh", &["gh".to_owned(), "pr".to_owned()])
+        .resolve_command(
+            &context("caller"),
+            None,
+            None,
+            "gh",
+            &["gh".to_owned(), "pr".to_owned()],
+        )
         .await
         .expect_err("no loaded provider declares this word");
     assert!(

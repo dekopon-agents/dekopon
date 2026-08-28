@@ -14,10 +14,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ChatAttestation, ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog,
-    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld, SubjectAttestation,
+    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits,
+    CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -147,11 +147,11 @@ fn proposal(id: &str) -> InvocationRequest {
     }
 }
 
-fn chat_claim(canonical: &str, agent_id: &str) -> ChatSessionClaim {
-    ChatSessionClaim {
-        subject: subject(canonical),
-        agent: agent(agent_id),
-        scope: ChatScopeClaim {
+fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
+    Attestation::for_chat(
+        subject(canonical),
+        agent(agent_id),
+        ChatScopeClaim {
             transport: "scientist-slack"
                 .parse::<TransportId>()
                 .expect("valid transport fixture"),
@@ -159,7 +159,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> ChatSessionClaim {
             channel: "c0123abc".to_owned(),
             conversation: "c0123abc:1712345678.000100".to_owned(),
         },
-    }
+    )
 }
 
 /// Four refusals that answer identically on the wire must not be one refusal in the logs.
@@ -172,11 +172,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // No attestor authority at all.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 None,
-                &subject(MAPPED_SUBJECT),
-                &agent("some-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("some-agent")
+                )),
             )
             .is_none()
     );
@@ -196,11 +198,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     };
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&narrow),
-                &subject(MAPPED_SUBJECT),
-                &agent("some-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("some-agent")
+                )),
             )
             .is_none()
     );
@@ -210,11 +214,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // event is the whole point — it is the value an operator has to copy into configuration.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &subject(UNMAPPED_SUBJECT),
-                &agent("some-agent")
+                Some(&Attestation::for_subject(
+                    subject(UNMAPPED_SUBJECT),
+                    agent("some-agent")
+                )),
             )
             .is_none()
     );
@@ -225,11 +231,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // Mapped, attested, and still refused: policy does not let this principal drive that agent.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &subject(MAPPED_SUBJECT),
-                &agent("other-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("other-agent")
+                )),
             )
             .is_none()
     );
@@ -242,11 +250,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // class is the only thing that separates a broken rule from a deliberate one.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &subject(MAPPED_SUBJECT),
-                &agent("broken-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("broken-agent")
+                )),
             )
             .is_none()
     );
@@ -258,11 +268,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // they are the only route from the class back to the rule that reached it.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &subject(MAPPED_SUBJECT),
-                &agent("forbidden-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("forbidden-agent")
+                )),
             )
             .is_none()
     );
@@ -274,14 +286,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // broken policy used to be filed as an ordinary refusal.
     let denied = proposal("invoke-policy-error");
     let refused = broker
-        .invoke_for(
+        .invoke(
             &gateway(),
             Some(&grant()),
-            &SubjectAttestation {
-                subject: subject(MAPPED_SUBJECT),
-                agent: agent("broken-agent"),
-                invocation: denied.id.clone(),
-            },
+            Some(
+                &Attestation::for_subject(subject(MAPPED_SUBJECT), agent("broken-agent"))
+                    .bound_to(denied.id.clone()),
+            ),
             denied,
         )
         .await
@@ -293,10 +304,10 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // The chat surface the gateway actually opens takes the same path and reports the same way.
     assert!(
         broker
-            .capabilities_for_chat(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &chat_claim(UNMAPPED_SUBJECT, "some-agent")
+                Some(&chat_claim(UNMAPPED_SUBJECT, "some-agent"))
             )
             .is_none()
     );
@@ -310,10 +321,10 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // the only place the class exists at all.
     assert!(
         broker
-            .resolve_command_for_chat(
+            .resolve_command(
                 &gateway(),
                 Some(&grant()),
-                &chat_claim(UNMAPPED_SUBJECT, "some-agent"),
+                Some(&chat_claim(UNMAPPED_SUBJECT, "some-agent")),
                 "echo",
                 &[],
             )
@@ -370,15 +381,10 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         let request = proposal(&format!("invoke-chat-{index}"));
         let identifier = request.id.clone();
         let refused = broker
-            .invoke_for_chat(
+            .invoke(
                 &gateway(),
                 attestor.as_ref(),
-                &ChatAttestation {
-                    subject: subject(canonical),
-                    agent: agent(agent_id),
-                    scope: chat_claim(canonical, agent_id).scope,
-                    invocation: identifier.clone(),
-                },
+                Some(&chat_claim(canonical, agent_id).bound_to(identifier.clone())),
                 request,
             )
             .await
@@ -407,11 +413,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // An honored session stays silent: this event marks refusals, not traffic.
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway(),
                 Some(&grant()),
-                &subject(MAPPED_SUBJECT),
-                &agent("some-agent")
+                Some(&Attestation::for_subject(
+                    subject(MAPPED_SUBJECT),
+                    agent("some-agent")
+                )),
             )
             .is_some()
     );

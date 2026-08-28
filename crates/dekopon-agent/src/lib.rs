@@ -37,13 +37,11 @@ use std::{
 use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
-    BrokerClient, ChatMemorySurface, ChatScopeClaim, ChatSessionClaim, ClientError,
-    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
+    Attestation, BrokerClient, ChatMemorySurface, ClientError, ERROR_UNAUTHENTICATED,
+    InvocationOutcome, InvocationRequest,
 };
 #[cfg(unix)]
-use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, IdentifierError, InvocationId, TraceId,
-};
+use dekopon_core::{CapabilityId, IdentifierError, InvocationId, TraceId};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
@@ -229,18 +227,6 @@ pub enum BrokerLegError {
     },
 }
 
-/// The on-behalf-of claim an attested leg attaches to every call it makes.
-///
-/// Held whole rather than as two loose fields because the pair is meaningless apart: a subject
-/// without the agent orchestrating for it names no context the broker can resolve, and the broker
-/// matches `via`-scoped rules on both.
-#[cfg(unix)]
-struct Attestation {
-    subject: ExternalSubject,
-    agent: AgentId,
-    scope: Option<ChatScopeClaim>,
-}
-
 /// The broker half of a session's capability dispatch.
 ///
 /// This is a client of `dekopon-brokerd`'s authorization path, never a participant in it: it
@@ -288,69 +274,30 @@ impl BrokerLeg {
     /// `trace_prefix` names the embedding surface (for example `dekopon-run-prompt`) and becomes
     /// the leading component of the session's trace and invocation identifiers, so every call a
     /// session made is recoverable from the broker's audit log by prefix.
-    pub async fn connect(client: BrokerClient, trace_prefix: &str) -> Result<Self, BrokerLegError> {
-        let (capabilities, command_words) = client.session_surface().await?;
-        Self::build(
-            client,
-            trace_prefix,
-            capabilities,
-            command_words,
-            None,
-            None,
-        )
-    }
-
-    /// Connects a leg that proposes on behalf of one transport-authenticated external subject.
     ///
-    /// A chat gateway holds no broker authority of its own: it knows which subject sent a message
-    /// and which agent is answering, and the broker decides everything else. So the snapshot comes
-    /// from `capabilitiesFor` rather than `capabilities` — what this leg reports as granted is what
-    /// policy makes visible to the *attested* context, not to the daemon's own peer identity.
+    /// `attestation` is `None` for a leg that speaks as its own connected peer, which is the
+    /// original behavior. A chat gateway holds no broker authority of its own: it knows which
+    /// subject sent a message and which agent is answering, and the broker decides everything
+    /// else. So an attested leg's snapshot is what policy makes visible to the *attested* context
+    /// rather than to the daemon's own peer identity, and a claim carrying a chat scope is the
+    /// only leg that can see durable memory.
     ///
     /// An empty snapshot is a valid result rather than an error. It means "policy grants this
     /// subject nothing through this agent", which a gateway answers very differently from "the
     /// broker is unreachable"; deciding which of those to say is the caller's job.
-    pub async fn connect_attested(
+    pub async fn connect(
         client: BrokerClient,
         trace_prefix: &str,
-        subject: ExternalSubject,
-        agent: AgentId,
-    ) -> Result<Self, BrokerLegError> {
-        let (capabilities, command_words) = client
-            .session_surface_for(subject.clone(), agent.clone())
-            .await?;
-        Self::build(
-            client,
-            trace_prefix,
-            capabilities,
-            command_words,
-            Some(Attestation {
-                subject,
-                agent,
-                scope: None,
-            }),
-            None,
-        )
-    }
-
-    /// Connects a bounded chat-scoped leg. This is the only leg that can see durable memory.
-    pub async fn connect_chat(
-        client: BrokerClient,
-        trace_prefix: &str,
-        claim: ChatSessionClaim,
+        attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, command_words, chat_memory) =
-            client.session_surface_for_chat(claim.clone()).await?;
+            client.session_surface(attestation.clone()).await?;
         Self::build(
             client,
             trace_prefix,
             capabilities,
             command_words,
-            Some(Attestation {
-                subject: claim.subject,
-                agent: claim.agent,
-                scope: Some(claim.scope),
-            }),
+            attestation,
             chat_memory,
         )
     }
@@ -504,30 +451,9 @@ impl CapabilityInvoker for BrokerLeg {
         }
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
         let resolved = self.runtime.block_on(async {
-            match &self.attestation {
-                Some(Attestation {
-                    subject,
-                    agent,
-                    scope: Some(scope),
-                }) => {
-                    self.client
-                        .resolve_command_for_chat(
-                            ChatSessionClaim {
-                                subject: subject.clone(),
-                                agent: agent.clone(),
-                                scope: scope.clone(),
-                            },
-                            word.to_owned(),
-                            argv.to_vec(),
-                        )
-                        .await
-                }
-                _ => {
-                    self.client
-                        .resolve_command(word.to_owned(), argv.to_vec())
-                        .await
-                }
-            }
+            self.client
+                .resolve_command(self.attestation.clone(), word.to_owned(), argv.to_vec())
+                .await
         });
         match resolved {
             Ok(Ok((capability, input))) => Some(Ok((capability.to_string(), input))),
@@ -574,36 +500,9 @@ impl CapabilityInvoker for BrokerLeg {
         // Safe specifically because this runs on a `spawn_blocking` thread rather than a runtime
         // worker: `Handle::block_on` from a worker would deadlock the executor, and from the
         // blocking pool it is the ordinary bridge back into async code.
-        let submitted = self.runtime.block_on(async {
-            match &self.attestation {
-                Some(Attestation {
-                    subject,
-                    agent,
-                    scope: Some(scope),
-                }) => {
-                    self.client
-                        .invoke_for_chat(
-                            request,
-                            ChatSessionClaim {
-                                subject: subject.clone(),
-                                agent: agent.clone(),
-                                scope: scope.clone(),
-                            },
-                        )
-                        .await
-                }
-                Some(attestation) => {
-                    self.client
-                        .invoke_for(
-                            request,
-                            attestation.subject.clone(),
-                            attestation.agent.clone(),
-                        )
-                        .await
-                }
-                None => self.client.invoke(request).await,
-            }
-        });
+        let submitted = self
+            .runtime
+            .block_on(async { self.client.invoke(self.attestation.clone(), request).await });
         match submitted {
             Ok(result) => match result.outcome {
                 InvocationOutcome::Succeeded => {
@@ -1006,6 +905,7 @@ mod tests {
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
                 scope: None,
+                invocation: None,
             }
         }
 
@@ -1157,18 +1057,18 @@ mod tests {
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
-            let BrokerRequest::InvokeFor {
+            let BrokerRequest::Invoke {
+                attestation: Some(attestation),
                 invocation,
-                attestation,
             } = request.request
             else {
-                panic!("an attested leg must send an invokeFor frame: {request:?}");
+                panic!("an attested leg must send an attested invoke frame: {request:?}");
             };
             assert_eq!(attestation.subject.canonical(), SUBJECT);
             assert_eq!(attestation.agent.as_str(), "chat-agent");
             // The claim binds to the proposal it travels with; the broker rejects a mismatch as a
             // protocol error rather than deciding it as policy.
-            assert_eq!(attestation.invocation, invocation.id);
+            assert_eq!(attestation.invocation, Some(invocation.id));
             assert_eq!(invocation.capability.as_str(), CAPABILITY);
         }
 

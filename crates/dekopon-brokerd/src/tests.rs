@@ -1234,7 +1234,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     };
     use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-    use dekopon_broker_protocol::ResponseEnvelope;
+    use dekopon_broker_protocol::{Attestation, ResponseEnvelope};
     use dekopon_core::{Actor, AgentId, CapabilityId, PrincipalId};
 
     use super::{BrokerdError, MappedPeer, validate_capability_responses};
@@ -1309,14 +1309,16 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     );
     assert!(
         broker
-            .capabilities_for(
+            .capability_surface(
                 &gateway,
                 Some(&dekopon_broker::AttestorGrant {
                     namespaces: vec!["slack.t0123abc".to_owned()],
                     chat_scopes: Vec::new(),
                 }),
-                &"slack.t0123abc.u9xyz".parse().expect("canonical subject"),
-                &"chat-agent".parse::<AgentId>().expect("valid agent"),
+                Some(&Attestation::for_subject(
+                    "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                    "chat-agent".parse::<AgentId>().expect("valid agent"),
+                )),
             )
             .expect("the mapped subject is attestable")
             .0
