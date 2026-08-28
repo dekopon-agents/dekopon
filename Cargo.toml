@@ -67,6 +67,9 @@ opentelemetry-http = { version = "0.32.0", default-features = false }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+# The engine `jaq-std`'s `regex` feature already links into `dekopon-shell`. `grep -E`/`sed -E` use
+# that one directly rather than adding a second regex engine to the graph.
+regex-bites = "0.1.6"
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 schemars = { version = "1.2.2", features = ["derive"] }

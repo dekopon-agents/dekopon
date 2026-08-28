@@ -19,6 +19,7 @@ dekopon-core.workspace = true
 jaq-core.workspace = true
 jaq-json.workspace = true
 jaq-std.workspace = true
+regex-bites.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

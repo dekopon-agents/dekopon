@@ -1235,6 +1235,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "jaq-std",
+ "regex-bites",
  "serde_json",
  "thiserror 2.0.20",
  "tracing",

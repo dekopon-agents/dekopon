@@ -1477,13 +1477,17 @@ exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or \
 concatenation are rejected. The provider never receives the DRN, and the broker independently \
 authorizes every use.
 
-Patterns are literal text everywhere, never regular expressions or globs: a `grep`/`sed` pattern, \
-a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand of `==` inside `[[ ]]`, and a \
-`case` pattern too, where `*)` remains the \
-default branch but `*.json)` is an error rather than a silent mismatch. `${#NAME}` counts \
+Patterns are literal text, never globs, and regular expressions only where you ask for one with \
+`-E`: a `grep`/`sed` pattern, a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand \
+of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the \
+default branch but `*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and \
+`sed -E 's/^ *//'` are how you get a real regular expression, and the only way: unflagged, both \
+are a usage error naming the metacharacter rather than a search that quietly finds nothing. Under \
+`-E`, anchors and `.` mean what they mean in any regex, but the replacement half of `sed` is still \
+literal text, so groups select and do not substitute. `${#NAME}` counts \
 characters of a string but elements of an array and keys of an object, because values here are \
-real JSON. Use `jq` for real matching. A here-document's body arrives as one JSON \
-string, so pipe it through `jq` when you want structure out of it.
+real JSON. Use `jq` when the thing you want is structure rather than lines. A here-document's body \
+arrives as one JSON string, so pipe it through `jq` when you want structure out of it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
 capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \

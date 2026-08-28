@@ -1,4 +1,4 @@
-//! `grep [-v] [-i] [-c] [-n] PATTERN`.
+//! `grep [-v] [-i] [-c] [-n] [-E] PATTERN`.
 
 use serde_json::Value;
 
@@ -10,7 +10,8 @@ use crate::{
 
 use super::Pattern;
 
-/// Selects lines matching a literal, optionally anchored pattern.
+/// Selects lines matching a literal, optionally anchored pattern — or, under `-E`, a regular
+/// expression compiled by the engine `jq` already links.
 pub(crate) struct Grep;
 
 impl Builtin for Grep {
@@ -28,6 +29,7 @@ impl Builtin for Grep {
         let mut ignore_case = false;
         let mut count_only = false;
         let mut number = false;
+        let mut extended = false;
         let mut pattern = None;
 
         for argument in arguments {
@@ -36,6 +38,7 @@ impl Builtin for Grep {
                 "-i" | "--ignore-case" => ignore_case = true,
                 "-c" | "--count" => count_only = true,
                 "-n" | "--line-number" => number = true,
+                "-E" | "--extended-regexp" => extended = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
                     return Err(unsupported_flag("grep", flag));
                 }
@@ -55,7 +58,7 @@ impl Builtin for Grep {
                 "grep: a pattern argument is required",
             ));
         };
-        let pattern = Pattern::compile("grep", &pattern, ignore_case)?;
+        let pattern = Pattern::compile("grep", &pattern, ignore_case, extended)?;
 
         let mut matched = Vec::new();
         for (index, line) in to_lines(&input.unwrap_or(Value::Null))
@@ -141,8 +144,53 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_rejected_by_name() {
-        let failure = run_builtin(&Grep, &["-E", "a|b"], Some(json!("a")))
-            .expect_err("regex mode is not implemented");
-        assert!(format!("{failure:?}").contains("-E"), "{failure:?}");
+        let failure = run_builtin(&Grep, &["-o", "a"], Some(json!("a")))
+            .expect_err("only-matching is not implemented");
+        assert!(format!("{failure:?}").contains("-o"), "{failure:?}");
+    }
+
+    #[test]
+    fn the_e_flag_matches_with_the_regex_engine() {
+        // `grep "[0-9]"` is the single most common thing a model writes, and without `-E` it is a
+        // usage error naming the character class. With it, the engine answers.
+        assert_eq!(
+            grep(&["-E", "[0-9]"], json!("port 8080\nno digits")).value,
+            json!("port 8080")
+        );
+        assert_eq!(
+            grep(&["-E", "^ba(r|z)$"], json!(["bar", "baz", "barn"])).value,
+            json!(["bar", "baz"])
+        );
+        // The other flags keep working against a regex.
+        assert_eq!(
+            grep(&["-c", "-E", r"\d"], json!("a1\nb2\ncc")).value,
+            json!(2)
+        );
+        assert_eq!(
+            grep(&["-v", "-E", "[0-9]"], json!("a1\ncc")).value,
+            json!("cc")
+        );
+        assert_eq!(
+            grep(&["-i", "-E", "^A+$"], json!("aaa")).value,
+            json!("aaa")
+        );
+    }
+
+    #[test]
+    fn without_the_e_flag_a_regex_is_still_refused_by_name() {
+        let failure =
+            run_builtin(&Grep, &["[0-9]"], Some(json!("a1"))).expect_err("literal by default");
+        let message = format!("{failure:?}");
+        assert!(message.contains("literal text"), "{message}");
+    }
+
+    #[test]
+    fn an_uncompilable_e_pattern_fails_rather_than_matching_nothing() {
+        let failure = run_builtin(&Grep, &["-E", "a("], Some(json!("a(")))
+            .expect_err("an unclosed group is not a literal");
+        assert!(
+            format!("{failure:?}").contains("closing ')'"),
+            "{failure:?}"
+        );
     }
 }
