@@ -4498,21 +4498,39 @@ where
             .invoke_with_storage(authorized, credential, storage_grant)
             .await;
         let duration_ms = duration_millis(started.elapsed());
+        // An unaudited storage outcome is the most consequential failure this path can have, and
+        // it used to be anonymous: the guest saw the opaque mapped error, and the broker recorded
+        // a variant with no source and no log, so a full filesystem and an exhausted quota read
+        // the same to whoever had to clear the poisoned namespace.
+        let execution = match execution {
+            Err(dekopon_broker_host::BrokerInvocationFailure {
+                error,
+                http_calls,
+                storage,
+            }) => match *error {
+                BrokerHostError::Storage {
+                    source: source @ dekopon_storage_host::StorageHostError::OutcomeUnaudited { .. },
+                } => {
+                    tracing::error!(
+                        event = "broker_storage_outcome_unaudited",
+                        invocation = %invocation_id,
+                        cause = %source.class(),
+                        error = %error_chain(&source),
+                    );
+                    return Err(BrokerError::StorageOutcome {
+                        invocation: invocation_id,
+                        source,
+                    });
+                }
+                error => Err(dekopon_broker_host::BrokerInvocationFailure {
+                    error: Box::new(error),
+                    http_calls,
+                    storage,
+                }),
+            },
+            Ok(output) => Ok(output),
+        };
         let (result, audit_event) = match execution {
-            Err(failure)
-                if matches!(
-                    failure.error.as_ref(),
-                    BrokerHostError::Storage { source }
-                        if matches!(
-                            source,
-                            dekopon_storage_host::StorageHostError::OutcomeUnaudited
-                        )
-                ) =>
-            {
-                return Err(BrokerError::StorageOutcome {
-                    invocation: invocation_id,
-                });
-            }
             Ok(output) => {
                 let output_digest = output.storage.as_ref().map_or_else(
                     || outcome_evidence_digest(&invocation_id, "provider-response", &output.output),
@@ -5380,7 +5398,13 @@ pub enum BrokerError {
     },
     /// Storage crossed its durable marker but live finalization failed.
     #[error("storage outcome for {invocation} is unaudited")]
-    StorageOutcome { invocation: InvocationId },
+    StorageOutcome {
+        /// Invocation whose durable write may already have landed.
+        invocation: InvocationId,
+        /// The storage failure that ended finalization, naming its coarse cause.
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
     /// Terminal execution could not be audited after provider work ended.
     #[error("broker could not audit terminal execution for {invocation}")]
     OutcomeAudit {
@@ -5469,7 +5493,7 @@ impl BrokerError {
         match self {
             Self::OutcomeEvidence { invocation, .. }
             | Self::OutcomeAudit { invocation, .. }
-            | Self::StorageOutcome { invocation } => Some(invocation),
+            | Self::StorageOutcome { invocation, .. } => Some(invocation),
             Self::ReplayLedgerFull { .. }
             | Self::MemoryUnavailable
             | Self::InvalidMemoryInput

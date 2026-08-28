@@ -921,6 +921,46 @@ fn isolated_namespace_corruption(error: &StorageHostError) -> bool {
     )
 }
 
+/// The coarse class a storage failure is reported under.
+///
+/// One definition serves two readers that must agree: the content-free public reason a rejected
+/// transaction records for a guest, and the cause an [`StorageHostError::OutcomeUnaudited`] carries
+/// so an operator facing a poisoned namespace can tell "free disk" from "raise the quota".
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StorageFailureClass {
+    /// A quota or an accounting overflow refused the write.
+    Quota,
+    /// The operation ran out of its budget.
+    Timeout,
+    /// Retained data, layout, or the namespace key disagreed with itself.
+    Corrupt,
+    /// The grant or the filesystem refused the access.
+    Denied,
+    /// Everything else, filesystem input/output included.
+    Io,
+}
+
+impl StorageFailureClass {
+    /// The stable label. It is the vocabulary a guest-visible violation reason is drawn from, so
+    /// these strings are a contract rather than log text.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::Timeout => "timeout",
+            Self::Corrupt => "corrupt",
+            Self::Denied => "denied",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageFailureClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 /// Stable native storage failure classes. No variant contains guest names, paths, or content.
 #[derive(Debug, Error)]
 pub enum StorageHostError {
@@ -989,6 +1029,30 @@ pub enum StorageHostError {
     StartupTransactionLimit,
     #[error("storage grant belongs to another host instance")]
     GrantHostMismatch,
-    #[error("storage committed durably but finalization or audit evidence failed")]
-    OutcomeUnaudited,
+    #[error("storage committed durably but finalization or audit evidence failed (cause: {cause})")]
+    OutcomeUnaudited {
+        /// Coarse class of the failure that ended finalization.
+        ///
+        /// The outcome itself stays unknown; this says which kind of thing broke on the way to
+        /// it, which is the difference between freeing disk and raising a quota.
+        cause: StorageFailureClass,
+    },
+}
+
+impl StorageHostError {
+    /// The coarse, content-free class this failure is reported under.
+    #[must_use]
+    pub const fn class(&self) -> StorageFailureClass {
+        match self {
+            Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,
+            Self::Timeout => StorageFailureClass::Timeout,
+            Self::Corrupt { .. } | Self::CorruptLayout | Self::KeyMismatch => {
+                StorageFailureClass::Corrupt
+            }
+            Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,
+            // An unaudited outcome is unknown rather than any one class, so it reports the
+            // catch-all here and names what actually broke in its own `cause` instead.
+            _ => StorageFailureClass::Io,
+        }
+    }
 }

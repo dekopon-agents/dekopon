@@ -80,7 +80,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #6 — SILENT_FAILURE_MODE — crates/dekopon-storage-host/src/transaction.rs:852
+## [x] #6 — SILENT_FAILURE_MODE — crates/dekopon-storage-host/src/transaction.rs:852
 
 **Finding:** `Err(_) => self.post_marker_failure()` collapses four causes (`Arithmetic`, `Timeout`, `QuotaExceeded`, filesystem I/O incl. `ENOSPC`) into the fieldless `StorageHostError::OutcomeUnaudited`, in a crate with zero `tracing::` calls; it becomes `BrokerError::StorageOutcome`, the only variant in that enum with no `#[source]`, constructed at `broker/src/lib.rs:4483` with no log. An operator facing a poisoned namespace cannot tell "free disk" from "raise the quota". (raw: D2)
 **Blast radius:** HIGH  **Confidence:** HIGH

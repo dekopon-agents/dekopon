@@ -11,7 +11,9 @@ marker is the durable point: strictly recognized pre-marker transactions roll ba
 post-marker transactions roll forward with bounded old/new identity checks. Every live failure
 from marker creation onward—including marker synchronization, apply, accounting, evidence, and
 atomic retirement—retains either roll-forward state or fully applied recognized trash, poisons the
-whole base scope, conservatively retains quota headroom, and is `outcome-unaudited`. A retired
+whole base scope, conservatively retains quota headroom, and is `outcome-unaudited` carrying the
+coarse class of the failure that ended finalization (`quota`, `timeout`, `corrupt`, `denied`, or
+`io`) — the outcome stays unknown, but which kind of thing made it unknown does not have to be. A retired
 committed transaction becomes ordinary GC-eligible trash only after scan, evidence, accounting, and
 a synchronized `finalized` publication; committed retired state without `finalized` is unknown by
 default even when every additional marker write failed. Bounded GC retains rotating directory
