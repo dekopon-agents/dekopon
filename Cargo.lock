@@ -1189,6 +1189,7 @@ dependencies = [
  "dekopon-broker-protocol",
  "dekopon-core",
  "dekopon-test-support",
+ "libc",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
