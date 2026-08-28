@@ -256,7 +256,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: keep it. Collapse `ImageGeneratorConfig` to a plain struct and the name-keyed registry to `Option<Arc<OpenAiImageGenerator>>`, drop the four match-accessors, and add an example route that configures it. Inbound asset path untouched.**
 
-## [ ] #28 — SIDE_QUEST / COMMENT_ROT — crates/dekopon-agent/src/prompt.rs:1457 vs :1461
+## [x] #28 — SIDE_QUEST / COMMENT_ROT — crates/dekopon-agent/src/prompt.rs:1457 vs :1461
 
 **Finding:** Inside one `SCRIPT_TOOL_DESCRIPTION` string, line 1457 promises `set -e`/`[[ ]]` work and line 1461 tells the model they "are errors, never silent no-ops". Both are supported since #165 (`parser.rs:702`, `interp.rs:891`). No human writes these scripts — the prompt *is* the interpreter's API doc — so the two constructs #165 was built to provide are unreachable in practice. (raw: B1)
 **Blast radius:** MEDIUM  **Confidence:** HIGH

@@ -1458,8 +1458,8 @@ with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`
 `exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
 redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
 named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
-loudly and by name: `eval`, backticks, subshells, `[[ ]]`, `set -e`, `<<<`, and `&` backgrounding \
-are errors, never silent no-ops. If a script ran, it did what it said.
+loudly and by name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never \
+silent no-ops. If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
@@ -1687,7 +1687,7 @@ mod tests {
             ModelMessage, ModelTool, ModelToolCall, ModelUsage,
         },
     };
-    use dekopon_shell::{ExitCode, ScriptOutcome};
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, ExitCode, ScriptOutcome};
     use serde_json::{Value, json};
 
     use crate::meta::{
@@ -1699,10 +1699,10 @@ mod tests {
         CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES,
         DEFAULT_MAX_TURNS, FetchedAsset, GeneratedImageOutput, History, HistoryLimits,
         IMAGE_GENERATION_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
-        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_NAME,
-        ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_tool,
+        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION,
+        SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -2731,6 +2731,99 @@ mod tests {
             !description.contains("  "),
             "the tool description contains a run of spaces: {description}"
         );
+    }
+
+    /// A session holding nothing, for scripts that must be refused before a command ever runs.
+    struct NoCapabilities;
+
+    impl CapabilityInvoker for NoCapabilities {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn invoke(&self, capability: &str, _input: Value) -> CapabilityCallResult {
+            panic!("a refused construct must never reach {capability}");
+        }
+    }
+
+    /// Returns the constructs the description still calls errors, as it writes their names.
+    fn refusal_list() -> Vec<&'static str> {
+        let listed = SCRIPT_TOOL_DESCRIPTION
+            .split_once("fails loudly and by name: ")
+            .expect("the description still names the constructs it refuses")
+            .1
+            .split_once(" are errors")
+            .expect("the refusal list still ends at `are errors`")
+            .0;
+        listed
+            .split(", ")
+            .map(|name| name.strip_prefix("and ").unwrap_or(name))
+            .collect()
+    }
+
+    /// The refusal list is the interpreter's API documentation, not a comment about it.
+    ///
+    /// No human writes these scripts, so a construct the description calls an error is one the
+    /// model will never type — which is how `[[ ]]` and `set -e` stayed unreachable after #165
+    /// implemented them. Pinning the list to the shell the way `dekopon-shell`'s builtin registry
+    /// is pinned to its documented builtin list is what makes that drift a test failure: the names
+    /// still listed must be exactly these, and each must be refused by the interpreter itself.
+    #[test]
+    fn every_construct_the_description_calls_an_error_is_refused_by_the_shell() {
+        // Name as the description writes it, a script that reaches the construct, and the word its
+        // refusal has to carry — a refusal naming the wrong feature sends a model to the wrong fix.
+        let refused = [
+            ("`eval`", "eval 'echo hi'", "eval"),
+            ("backticks", "echo `echo hi`", "backtick"),
+            ("subshells", "(echo hi)", "subshells"),
+            ("`<<<`", "cat <<<\"hi\"", "here-string"),
+            (
+                "`&` backgrounding",
+                "sleep 1 &\necho after",
+                "backgrounding",
+            ),
+        ];
+
+        assert_eq!(
+            refusal_list(),
+            refused.iter().map(|(name, ..)| *name).collect::<Vec<_>>()
+        );
+
+        for (name, script, expected) in refused {
+            let outcome = dekopon_shell::run(script, &NoCapabilities);
+            assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{name}: {outcome:?}");
+            assert!(
+                outcome.output.contains(expected),
+                "{name}: {}",
+                outcome.output
+            );
+        }
+    }
+
+    /// The other half of the same pin: what #165 built has to stay off the refusal list.
+    ///
+    /// Without this, dropping `[[ ]]` and `set -e` from the list could be undone — or the shell
+    /// could stop supporting them — and the test above would still pass on the shortened list.
+    #[test]
+    fn conditionals_and_errexit_are_supported_rather_than_refused() {
+        let listed = refusal_list();
+        assert!(!listed.iter().any(|name| name.contains("[[")), "{listed:?}");
+        assert!(
+            !listed.iter().any(|name| name.contains("set -e")),
+            "{listed:?}"
+        );
+
+        let conditional = dekopon_shell::run(
+            "if [[ \"a\" == \"a\" ]]; then echo yes; fi",
+            &NoCapabilities,
+        );
+        assert_eq!(conditional.exit_code, ExitCode::SUCCESS, "{conditional:?}");
+        assert_eq!(conditional.output, "yes");
+
+        let errexit = dekopon_shell::run("set -e\nnosuchcmd.here\necho after", &NoCapabilities);
+        assert_eq!(errexit.exit_code, ExitCode::NOT_FOUND, "{errexit:?}");
+        assert!(errexit.output.contains("`set -e` is on"), "{errexit:?}");
+        assert!(!errexit.output.contains("after"), "{errexit:?}");
     }
 
     #[test]
