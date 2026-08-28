@@ -203,15 +203,6 @@ impl PolicyWorld {
         self.secrets.iter()
     }
 
-    /// Returns the provider a declared capability routes to.
-    ///
-    /// A phantom name routes nowhere and returns `None`, which is the whole point of keeping
-    /// phantoms out of the route map.
-    #[must_use]
-    pub fn provider_for(&self, capability: &CapabilityId) -> Option<&ProviderId> {
-        self.capabilities.get(capability)
-    }
-
     /// Extends this world with names a policy referenced that no loaded provider declares.
     ///
     /// A deployment may ship policy that anticipates a provider it has not dropped in yet. Cedar's

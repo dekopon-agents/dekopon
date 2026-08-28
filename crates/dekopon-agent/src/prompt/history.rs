@@ -195,7 +195,8 @@ impl History {
     /// Bounds are applied on the way in rather than trusted from the caller, so a window restored
     /// from somewhere durable is the same size as one that grew here.
     #[must_use]
-    pub fn from_turns(
+    #[cfg(test)]
+    pub(crate) fn from_turns(
         limits: HistoryLimits,
         turns: impl IntoIterator<Item = ConversationTurn>,
     ) -> Self {

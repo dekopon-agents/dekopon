@@ -149,15 +149,6 @@ impl FakeBrokerError {
             _ => None,
         }
     }
-
-    /// Returns the storage evidence recorded before the failure, when a transaction had begun.
-    #[must_use]
-    pub fn storage_evidence(&self) -> Option<&StorageEvidence> {
-        match self {
-            Self::Invocation(failure) => failure.storage.as_ref(),
-            _ => None,
-        }
-    }
 }
 
 /// Chat-shaped scope material every storage grant is derived from.
@@ -357,7 +348,7 @@ impl FakeBrokerBuilder {
         .await?;
 
         Ok(FakeBroker {
-            temporary,
+            _temporary: temporary,
             root,
             registry,
             storage,
@@ -392,7 +383,9 @@ impl FakeBrokerBuilder {
 #[derive(Debug)]
 pub struct FakeBroker {
     /// Owned so the storage root outlives every invocation; dropping this deletes the tree.
-    temporary: TempDir,
+    ///
+    /// Never read — the value exists for its `Drop`, which is what the leading underscore says.
+    _temporary: TempDir,
     root: PathBuf,
     registry: BrokerProviderRegistry,
     storage: Option<StorageHost>,
@@ -503,12 +496,6 @@ impl FakeBroker {
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root
-    }
-
-    /// Returns the temporary directory containing the storage root and its namespace key.
-    #[must_use]
-    pub fn temporary_dir(&self) -> &Path {
-        self.temporary.path()
     }
 
     /// Returns the loaded registry, for assertions the harness does not wrap.

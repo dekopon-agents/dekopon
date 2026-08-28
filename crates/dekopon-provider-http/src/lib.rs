@@ -127,16 +127,6 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
-impl Response {
-    /// Returns all values for a case-insensitive header name in wire order.
-    pub fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
-        self.headers
-            .iter()
-            .filter(move |header| header.name.eq_ignore_ascii_case(name))
-            .map(|header| header.value.as_slice())
-    }
-}
-
 /// Stable failure classes returned by the broker HTTP host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpErrorCode {
