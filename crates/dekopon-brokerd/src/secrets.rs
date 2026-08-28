@@ -19,7 +19,10 @@ use dekopon_broker::{
     SecretResolver, SecretUseBinding,
 };
 use dekopon_capability::HttpPathRule;
-use dekopon_core::{CapabilityId, Redacted, SecretDrn, SecretSinkKind};
+use dekopon_core::{
+    CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind,
+    read_trusted_file,
+};
 use futures_util::StreamExt as _;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use reqwest::{Method, Url, header};
@@ -1293,35 +1296,23 @@ async fn read_token(path: &Path, uid: u32) -> Result<Redacted<String>, SourceErr
     Ok(Redacted::new(text.to_owned()))
 }
 
+/// Reads one private secret-map input: the map itself, or a file-source secret.
+///
+/// The refusal stays one opaque `Insecure` on purpose — a source must not tell a caller which check
+/// refused it — so the structured cause is logged by `classified` rather than returned.
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(path)
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
         .await
-        .map_err(|source| classified(SourceError::Io, &source))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|source| classified(SourceError::Io, &source))?;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if !metadata.file_type().is_file()
-        || metadata.uid() != uid
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > maximum as u64
-    {
-        return Err(SourceError::Insecure);
-    }
-    let mut bytes = Vec::new();
-    file.take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| classified(SourceError::Io, &source))?;
-    if bytes.len() > maximum {
-        return Err(SourceError::TooLarge);
-    }
-    Ok(bytes)
+        .map_err(|join| classified(SourceError::Internal, &join))?
+        .map_err(|error| {
+            let mapped = match error {
+                FileHygieneError::Io { .. } => SourceError::Io,
+                FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
+                _ => SourceError::Insecure,
+            };
+            classified(mapped, &error)
+        })
 }
 
 async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, SourceError> {
@@ -1805,6 +1796,14 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             error.timeout = source.is_timeout(),
             error.connect = source.is_connect(),
             http.response.status_code = source.status().map(|status| status.as_u16()),
+        );
+    } else if let Some(source) = any.downcast_ref::<FileHygieneError>() {
+        tracing::debug!(
+            event = "secret_source_cause_classified",
+            category = error.category(),
+            cause_type = "file-hygiene",
+            // The rendered message carries a path; the check name is the low-cardinality half.
+            error.check = source.category(),
         );
     } else if let Some(source) = any.downcast_ref::<serde_json::Error>() {
         tracing::debug!(

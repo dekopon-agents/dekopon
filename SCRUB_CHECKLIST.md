@@ -136,7 +136,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #13 — DUPLICATED_LOGIC — crates/dekopon-brokerd/src/config.rs:407 (+10 sites, 5 crates)
+## [x] #13 — DUPLICATED_LOGIC — crates/dekopon-brokerd/src/config.rs:407 (+10 sites, 5 crates)
 
 **Finding:** The "trusted file" predicate (`O_NOFOLLOW` + regular + `uid ==` + mode mask + `nlink == 1` + size cap + bounded read) is hand-written ≥11 times across 5 crates, and the mode mask silently differs — `0o077` (credentials, secret map, checkpoint, socket, storage keys) vs `0o022` (broker.yaml, dekopond.yaml, policies) — with nothing naming the two tiers; both refuse as `InsecureFile`. Only `provider_manager.rs:1706` and `layout.rs:305` parameterize the tier. (raw: D2)
 **Blast radius:** HIGH  **Confidence:** HIGH

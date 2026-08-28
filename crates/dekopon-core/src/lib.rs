@@ -4,8 +4,9 @@
 //! malformed resource references from leaking into the rest of the workspace while
 //! keeping transport, command-line, async-runtime, and policy concerns out of this crate.
 //!
-//! It also holds the pure helpers that separate processes must not disagree about — the `accept()`
-//! retry classification and `error_chain` — because a fact split across two loops drifts.
+//! It also holds the helpers that separate processes must not disagree about — the `accept()` retry
+//! classification, `error_chain`, and the trusted-file predicate behind [`read_trusted_file`] —
+//! because a fact split across five crates drifts, and the file-permission mask already had.
 
 #![forbid(unsafe_code)]
 
@@ -14,6 +15,8 @@ mod diagnostics;
 mod redaction;
 mod subject;
 mod telemetry_payloads;
+#[cfg(unix)]
+mod trusted_file;
 
 use std::{fmt, str::FromStr};
 
@@ -25,6 +28,8 @@ pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
+#[cfg(unix)]
+pub use trusted_file::{FileHygieneError, FileTier, check_trusted_metadata, read_trusted_file};
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
 /// Maximum canonical bytes in one public Dekopon resource name for secret material.

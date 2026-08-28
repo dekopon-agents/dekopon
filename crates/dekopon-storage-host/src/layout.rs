@@ -576,11 +576,20 @@ impl Directory {
         file: &File,
     ) -> Result<(), StorageHostError> {
         let metadata = file.metadata().map_err(|source| self.io_error(source))?;
-        if !metadata.is_file()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.nlink() != 1
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        // Private: a namespace key and the layout documents beside it are secret material, so
+        // group- or world-readability is already the loss. `Corrupt` stays opaque to the guest,
+        // so which check refused it is logged here rather than returned.
+        if let Err(error) = dekopon_core::check_trusted_metadata(
+            &self.diagnostic_child(name),
+            &metadata,
+            rustix::process::geteuid().as_raw(),
+            dekopon_core::FileTier::Private,
+        ) {
+            tracing::warn!(
+                storage.file = %self.diagnostic_child(name).display(),
+                storage.check = error.category(),
+                "refusing a private storage file that failed its hygiene check"
+            );
             return Err(StorageHostError::Corrupt {
                 scope: "private-file",
             });

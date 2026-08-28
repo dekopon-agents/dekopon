@@ -21,11 +21,10 @@ use dekopon_broker_protocol::{
     BrokerSocketDiscovery, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
     ResolvedBrokerSocket,
 };
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, FileHygieneError, FileTier, read_trusted_file};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt as _;
 
 /// Exact configuration schema this daemon accepts.
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/dekopond/v1alpha1";
@@ -680,49 +679,33 @@ pub async fn load(
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let path = absolute(path.as_ref())?;
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(&path)
-        .await
-        .map_err(|source| ConfigError::Read {
-            path: path.clone(),
-            source,
-        })?;
-    let metadata = file.metadata().await.map_err(|source| ConfigError::Read {
+    // Authored configuration, not a secret: the gateway's own credentials live in the environment
+    // and in transport credential files, so the bar here is that nobody else can rewrite it.
+    let owned = path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        read_trusted_file(
+            &owned,
+            expected_uid,
+            FileTier::NotWorldWritable,
+            HARD_MAX_CONFIG_BYTES,
+        )
+    })
+    .await
+    .map_err(|join| ConfigError::Read {
         path: path.clone(),
-        source,
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(ConfigError::NotRegular { path });
-    }
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(ConfigError::InsecureFile { path });
-    }
-    if metadata.len() > HARD_MAX_CONFIG_BYTES as u64 {
-        return Err(ConfigError::TooLarge {
-            length: metadata.len(),
-            maximum: HARD_MAX_CONFIG_BYTES,
-        });
-    }
-    let mut bytes = Vec::new();
-    file.take((HARD_MAX_CONFIG_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| ConfigError::Read {
+        source: io::Error::other(join),
+    })?
+    .map_err(|error| match error {
+        FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },
+        FileHygieneError::TooLarge {
+            length, maximum, ..
+        } => ConfigError::TooLarge { length, maximum },
+        FileHygieneError::Io { path, source } => ConfigError::Read { path, source },
+        insecure => ConfigError::InsecureFile {
             path: path.clone(),
-            source,
-        })?;
-    if bytes.len() > HARD_MAX_CONFIG_BYTES {
-        return Err(ConfigError::TooLarge {
-            length: bytes.len() as u64,
-            maximum: HARD_MAX_CONFIG_BYTES,
-        });
-    }
+            source: insecure,
+        },
+    })?;
     let config = serde_yaml::from_slice::<DekopondConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
     resolve(
@@ -1193,7 +1176,13 @@ pub enum ConfigError {
     #[error(
         "gateway configuration must be single-link, owned by the daemon UID, and not group/world writable: {path}"
     )]
-    InsecureFile { path: PathBuf },
+    InsecureFile {
+        /// The refused path.
+        path: PathBuf,
+        /// Which hygiene check refused it.
+        #[source]
+        source: FileHygieneError,
+    },
     #[error("gateway configuration is {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
     #[error("gateway configuration is not strict valid YAML/JSON")]

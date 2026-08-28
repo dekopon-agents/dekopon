@@ -57,7 +57,7 @@ The immediate host links no WASI or custom imports, rejects non-read-only manife
 
 Crate boundaries are:
 
-- `dekopon-core`: validated identifiers and dependency-light domain enums, including canonical public `SecretDrn` and typed inert `SecretUseProposal` values.
+- `dekopon-core`: validated identifiers and dependency-light domain enums, including canonical public `SecretDrn` and typed inert `SecretUseProposal` values. It also owns the two facts separate processes must not disagree about at the filesystem: what makes a local file trusted input, and which of the two permission tiers — private, or merely not world-writable — a given file is held to.
 - `dekopon-capability`: capability metadata and proposal/authorization invocation states.
 - `dekopon-protocol`: strict `dekopon.dev/v1alpha1` resources and list responses.
 - `dekopon-config`: discovery, parsing, duplicate detection, and reference validation.
