@@ -308,7 +308,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: with #22 moving the console out, leave the nine "operator CLI is not integrated with the broker" sites as they are (true again) and make #22's move strip every console description from README/security-model/design/cli docs. Fix the three other facts: `docs/dekopond.md:462` → 270 s, name `drainBudget`, link the chart README; `docs/catalog.md:10` → "four"; `.gitignore:21-23` comment goes with #1.**
 
-## [ ] #34 — DEAD_CODE — 5 zero-reference `pub` items + 13 test-only `pub` items + the one `#[allow(dead_code)]`
+## [x] #34 — DEAD_CODE — 5 zero-reference `pub` items + 13 test-only `pub` items + the one `#[allow(dead_code)]`
 
 **Finding:** Zero references anywhere: `dekopon-agent/src/prompt.rs:912 script_outcome_label` (orphaned by #52; its docstring names an attribute nothing exports), `dekopon-policy/src/lib.rs:211 provider_for`, `dekopon-provider-http/src/lib.rs:132 header_values`, `testkit/src/lib.rs:155 storage_evidence`, `:510 temporary_dir` — two landed after the #147 dead-surface sweep. Test-only consumers: `verify_audit_chain` (18 test uses, no operator path — the audit-chain integrity check is unreachable to an operator), `InMemoryAuditLog`, `PROVIDER_WIT`/`STORAGE_WIT`/`HTTP_WIT` declared in 2–3 crates each, `open_handle_count`, `is_bare_command_substitution`, `truthy`, `is_answered`, `from_turns`, `storage_root`. And `chatgpt.rs:2785 #[allow(dead_code)] fn _assert_private_path` — a no-op stub with a security-shaped name, added with the file. All are published API on crates.io crates. (raw: D1)
 **Blast radius:** MEDIUM  **Confidence:** HIGH

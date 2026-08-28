@@ -546,6 +546,23 @@ At startup, the checkpoint must identify an exact prefix of the fully verified a
 
 The backing filesystem must honor Unix no-follow opens, advisory exclusive locks, same-directory atomic rename, and file/directory synchronization. Retain or export checkpoint generations in an independently protected system if rollback by the host owner or storage administrator is in scope. Deleting or rolling back both local files together cannot be detected by local state alone.
 
+### Verifying a chain offline
+
+`audit verify` runs the same sequence, previous-hash, and record-hash check the daemon runs at
+startup, without binding a socket, reading daemon configuration, or taking the daemon's exclusive
+lock — so it also answers for a retained copy the broker is no longer serving:
+
+```console
+dekopon-brokerd audit verify \
+  --audit-path /home/dekopon/.local/state/dekopon/audit.jsonl
+```
+
+It prints the record count and the chain head, takes the same `--output json` as the provider
+commands, and exits non-zero with the reason on any failure. A broken chain is reported separately
+from a file that could not be read: an interrupted append leaves an unterminated final record,
+which is not the same finding as a record that was edited. The whole chain is held in memory while
+it is checked, so a log past the default `auditMaxRecords` is refused rather than read.
+
 ## Boundaries
 
 - The service accepts one strict bounded request per fresh Unix connection.

@@ -903,20 +903,6 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
     text
 }
 
-/// Stable outcome label for one script run.
-///
-/// A script that exits non-zero is a *reported* failure, not a broken session, so this is the
-/// script's own exit status rather than a host error. Truncation is a separate dimension and is
-/// exported as its own attribute.
-#[must_use]
-pub fn script_outcome_label(outcome: &ScriptOutcome) -> &'static str {
-    if outcome.exit_code.get() == 0 {
-        "succeeded"
-    } else {
-        "failed"
-    }
-}
-
 /// Records one model-authored tool call the loop refused to run.
 ///
 /// Every caller passes a fixed category rather than the model's own text: a rejection event is

@@ -31,7 +31,8 @@ pub fn display(value: &Value) -> String {
 /// This is a value-model predicate, not bash's exit-status rule: exit status drives control flow
 /// in the evaluator, while this helper is only used by builtins that inspect a value directly.
 #[must_use]
-pub fn truthy(value: &Value) -> bool {
+#[cfg(test)]
+pub(crate) fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(flag) => *flag,

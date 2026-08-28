@@ -270,7 +270,8 @@ impl Word {
     /// a deliberate, documented deviation from bash, where `$()` is always textual; it is what lets
     /// `ip=$(curl ...)` be followed by `echo ${ip[origin]}`.
     #[must_use]
-    pub fn is_bare_command_substitution(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_bare_command_substitution(&self) -> bool {
         matches!(self.parts.as_slice(), [WordPart::CommandSubstitution(_)])
     }
 }

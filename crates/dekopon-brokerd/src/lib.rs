@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod audit;
 mod checkpoint;
 mod config;
 mod credentials;
@@ -32,6 +33,7 @@ use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use thiserror::Error;
 
+pub use audit::{AuditVerification, AuditVerificationError, verify_audit_file};
 pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,

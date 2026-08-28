@@ -2904,7 +2904,4 @@ mod tests {
 
         assert!(error.to_string().contains("could not parse"), "{error}");
     }
-
-    #[allow(dead_code)]
-    fn _assert_private_path(_path: &Path) {}
 }

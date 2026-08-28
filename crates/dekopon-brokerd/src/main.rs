@@ -40,6 +40,8 @@ struct Cli {
 enum Command {
     /// Resolve, materialize, and verify a startup-fixed provider set.
     Provider(ProviderArgs),
+    /// Inspect a durable audit log without starting the broker.
+    Audit(AuditArgs),
 }
 
 #[cfg(unix)]
@@ -63,14 +65,15 @@ struct ProviderArgs {
     plaintext_loopback_registries: Vec<String>,
     /// Render command results as a table or JSON.
     #[arg(long, value_enum, default_value_t, global = true)]
-    output: ProviderOutput,
+    output: OutputFormat,
     #[command(subcommand)]
     command: ProviderCommand,
 }
 
+/// How an offline operator command renders its result.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum ProviderOutput {
+enum OutputFormat {
     #[default]
     Table,
     Json,
@@ -88,6 +91,26 @@ enum ProviderCommand {
     /// Show locked references and local verification state without network access.
     List,
     /// Verify locked bytes and the complete provider set without network access.
+    Verify,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Args)]
+struct AuditArgs {
+    /// Durable JSONL audit log to read.
+    #[arg(long, value_name = "PATH", global = true)]
+    audit_path: Option<PathBuf>,
+    /// Render command results as a table or JSON.
+    #[arg(long, value_enum, default_value_t, global = true)]
+    output: OutputFormat,
+    #[command(subcommand)]
+    command: AuditCommand,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Verify every retained record's sequence, previous-hash link, and record hash.
     Verify,
 }
 
@@ -197,11 +220,11 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
         )),
         (Some(_), Some(_), _) => Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
-            "--config cannot be used with provider operator mode",
+            "--config cannot be used with an offline operator command",
         )),
         (Some(_), _, Some(_)) => Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
-            "--http-bind cannot be used with provider operator mode",
+            "--http-bind cannot be used with an offline operator command",
         )),
         (Some(Command::Provider(provider)), _, _)
             if provider.lock_file.is_none()
@@ -214,6 +237,11 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
                 "provider mode requires --lock-file and --store; sync also requires --provider-set",
             ))
         }
+        (Some(Command::Audit(audit)), _, _) if audit.audit_path.is_none() => Err(Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "audit mode requires --audit-path",
+            )),
         _ => Ok(()),
     }
 }
@@ -222,6 +250,7 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
 async fn execute(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Some(Command::Provider(provider)) => execute_provider(provider).await,
+        Some(Command::Audit(audit)) => execute_audit(audit),
         None => {
             execute_server(
                 cli.config
@@ -318,14 +347,30 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
+fn execute_audit(audit: AuditArgs) -> Result<(), AppError> {
+    let AuditCommand::Verify = audit.command;
+    let path = audit
+        .audit_path
+        .expect("validate_cli requires --audit-path");
+    let verification = dekopon_brokerd::verify_audit_file(path).map_err(AppError::Audit)?;
+    render(audit.output, &verification, || {
+        format!(
+            "RECORDS\tHEAD\n{}\t{}",
+            verification.records,
+            verification.head.as_deref().unwrap_or("-")
+        )
+    })
+}
+
+#[cfg(unix)]
 fn render<T: Serialize>(
-    output: ProviderOutput,
+    output: OutputFormat,
     value: &T,
     table: impl FnOnce() -> String,
 ) -> Result<(), AppError> {
     match output {
-        ProviderOutput::Table => println!("{}", table()),
-        ProviderOutput::Json => println!(
+        OutputFormat::Table => println!("{}", table()),
+        OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(value).map_err(AppError::Output)?
         ),
@@ -354,6 +399,8 @@ enum AppError {
     Broker(#[source] dekopon_brokerd::BrokerdError),
     #[error("provider manager failed")]
     Provider(#[source] dekopon_brokerd::ProviderManagerError),
+    #[error("audit verification failed")]
+    Audit(#[source] dekopon_brokerd::AuditVerificationError),
     #[error("could not render provider-manager output")]
     Output(#[source] serde_json::Error),
 }
@@ -362,6 +409,7 @@ enum AppError {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        path::Path,
         sync::{Arc, Mutex},
     };
 
@@ -370,7 +418,9 @@ mod tests {
         EnvFilter, Layer as _, layer::Context, layer::SubscriberExt as _, registry,
     };
 
-    use super::{Cli, Command, OTEL_TRACE_FILTER, ProviderCommand, ProviderOutput, validate_cli};
+    use super::{
+        AuditCommand, Cli, Command, OTEL_TRACE_FILTER, OutputFormat, ProviderCommand, validate_cli,
+    };
 
     /// Records the target of every event a layer is actually asked to handle.
     #[derive(Clone, Default)]
@@ -462,7 +512,7 @@ mod tests {
         let Some(Command::Provider(provider)) = cli.command else {
             panic!("provider command");
         };
-        assert_eq!(provider.output, ProviderOutput::Json);
+        assert_eq!(provider.output, OutputFormat::Json);
         assert!(matches!(
             provider.command,
             ProviderCommand::Sync { locked: true }
@@ -479,6 +529,43 @@ mod tests {
         ])
         .expect("offline list parses without desired state");
         assert!(validate_cli(&list).is_ok());
+    }
+
+    /// `audit verify` is the only operator path to the audit-chain integrity check, so it must
+    /// refuse to run against nothing rather than silently verify an empty default.
+    #[test]
+    fn audit_mode_requires_a_log_and_rejects_daemon_arguments() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "audit",
+            "verify",
+            "--audit-path",
+            "audit.jsonl",
+            "--output",
+            "json",
+        ])
+        .expect("audit command parses");
+        assert!(validate_cli(&cli).is_ok());
+        let Some(Command::Audit(audit)) = cli.command else {
+            panic!("audit command");
+        };
+        assert_eq!(audit.output, OutputFormat::Json);
+        assert_eq!(audit.audit_path.as_deref(), Some(Path::new("audit.jsonl")));
+        assert!(matches!(audit.command, AuditCommand::Verify));
+
+        let without_path = Cli::try_parse_from(["dekopon-brokerd", "audit", "verify"])
+            .expect("shape parses before validation");
+        assert!(validate_cli(&without_path).is_err());
+
+        let with_config = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "--config=broker.yaml",
+            "audit",
+            "verify",
+            "--audit-path=audit.jsonl",
+        ])
+        .expect("shape parses before validation");
+        assert!(validate_cli(&with_config).is_err());
     }
 }
 
