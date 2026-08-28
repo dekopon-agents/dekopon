@@ -155,7 +155,11 @@ crate's source changed.
 - `dekopon console` and the `dekopon-tui` crate ship from
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` builtin
   moved to `dekopon-provider-gh` and `turso-sql` to its own repository. It consumes `dekopon-agent`
-  and `dekopon-broker-protocol` from crates.io like any other unprivileged broker client.
+  and `dekopon-broker-protocol` from crates.io like any other unprivileged broker client. The move
+  is `dekopon-agents/dekopon-console@adfe0560f90b45d0f5d4d93435915eec27258cd2`, which is also where
+  scrub finding #32 landed: the help overlay's `o` and `r` keys got their `on_key` arms
+  (`crates/dekopon-tui/src/run.rs:218-219`) and mouse capture was dropped, so nothing in this tree
+  fixes them.
 - Nothing loses authority: the console held a model credential and no policy, provider credential,
   or authorization. `dekopon` is a local catalog and model-account CLI again, and the operator CLI
   contacts no other process.
