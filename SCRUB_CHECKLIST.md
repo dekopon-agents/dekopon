@@ -168,7 +168,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: DEFER**
 
-## [ ] #17 — TEST_THEATER — crates/dekopond/src/tests.rs:375-668, :286-302, :248
+## [x] #17 — TEST_THEATER — crates/dekopond/src/tests.rs:375-668, :286-302, :248
 
 **Finding:** 44 negative gateway-config cases — every endpoint-pinning case (`https://slack.evil.test`, `http://127.0.0.1@slack.evil.test`), credential-name, and file-permission case — assert only `is_err()` against a 30+-variant `ConfigError` with a dedicated `UnsupportedEndpoint`. A fixture typo that trips strict-decode passes forever without reaching the check it is named after; if `validate_endpoint` stops being called for a kind, the table stays green. The predicates are well tested in isolation; the *wiring* is not. (raw: C1)
 **Blast radius:** HIGH  **Confidence:** HIGH
