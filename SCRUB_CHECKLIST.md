@@ -216,7 +216,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #23 — WRONG_ABSTRACTION — crates/dekopon-shell/src/builtins/text/mod.rs:7-9
+## [x] #23 — WRONG_ABSTRACTION — crates/dekopon-shell/src/builtins/text/mod.rs:7-9
 
 **Finding:** Seven text builtins (1,383 LOC, 42 tests) implement a literal-only pattern language justified by "a regex engine is a large dependency and a large attack surface" — but `Cargo.toml:57` enables `jaq-std`'s `regex` feature, `regex-bites` is linked into `dekopon-shell`, and `jq.rs:472`'s two-name denylist leaves `test`/`match`/`capture`/`sub`/`gsub`/`scan`/`splits` script-reachable today. The most common shell idiom a model writes (`grep "[0-9]"`, `sed "s/^ *//"`) gets a usage error telling it to use jq — the regex engine that is already there. (raw: A3)
 **Blast radius:** HIGH  **Confidence:** MEDIUM

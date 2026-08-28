@@ -30,9 +30,9 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 **Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, `getopts`, and `local` under bash's dynamic scoping; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
-**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in a `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
+**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
-That last one is where "rejected loudly" reaches inside a construct that was kept. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns already follow, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
+That last one is where "rejected loudly" reaches inside a construct that was kept. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
@@ -87,11 +87,12 @@ and the promise that an unquoted expansion is one operand, so `[[ -n $v ]]` hold
 spaces where `[ -n $v ]` falls apart.
 
 One thing is refused rather than translated. In bash the right operand of `==` is a **glob**, so
-`[[ $f == *.json ]]` is a pattern match; every pattern here is literal text, and comparing that
+`[[ $f == *.json ]]` is a pattern match; the operand here is literal text, and comparing that
 operand literally would answer exactly that script wrongly and silently. The metacharacter is named
 instead, with quoting as the way out while the parser can still see it (`[[ $f == '*' ]]` compares
 an asterisk) and a run-time-assembled operand checked when it expands. `=~` is refused outright for
-the same reason: there are no regular expressions here to run.
+a related reason: `[[ ]]` carries no `-E`, so nothing inside it can say a regular expression was
+what the script meant. `grep -E` is where that opt-in lives.
 
 `<` and `>` inside the brackets are string comparisons, not redirections — the lexer cannot know
 that, so the parser translates them back.
@@ -131,10 +132,10 @@ JSON array, so `"${arr[@]}"` yields one word per element the way `"$@"` does, `$
 them, and `${#arr[@]}` counts them. An unquoted `$NAME` holding an array already spread element by
 element; `[@]` is how that survives quoting.
 
-`${NAME#p}`, `${NAME%p}`, and `${NAME/p/r}` take **literal** patterns, the rule `grep`, `sed`, and
-`case` patterns already follow. A literal pattern matches in exactly one way, so bash's
-longest/shortest pairs (`##`, `%%`) are accepted as a second spelling of the same request rather
-than as a second behavior. A metacharacter is rejected by name: `${p##*/}` is a parse error, and
+`${NAME#p}`, `${NAME%p}`, and `${NAME/p/r}` take **literal** patterns, the rule an unflagged
+`grep`, an unflagged `sed`, and a `case` pattern already follow. A literal pattern matches in
+exactly one way, so bash's longest/shortest pairs (`##`, `%%`) are accepted as a second spelling of
+the same request rather than as a second behavior. A metacharacter is rejected by name: `${p##*/}` is a parse error, and
 quoting is the way through (`${p#'*'}` strips a literal asterisk) exactly while the parser can still
 see the quotes. A pattern assembled at run time is checked when it expands instead, and quoting
 cannot exempt that one because its quotes are already gone. `basename` and `dirname` are the answer
@@ -178,6 +179,8 @@ inside a script; what a caller receives is still the transcript a terminal would
 ## Builtins
 
 `jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint.
+
+`grep` and `sed` are the only two that take `-E`, and it is the only way regex syntax ever becomes regex syntax here. Unflagged, both read a literal pattern and reject an unescaped metacharacter by name — one matching semantics shared with `case`, `${p#…}`, and the right operand of `[[ == ]]`, so a script never has to know which construct it is in to know what `[0-9]` means. With `-E` the pattern goes to `regex-bites`, the engine `jq`'s own `regex` builtins already link, rather than to a second one added for this. Anchors are real (`grep -E '^ba(r|z)$'`, `sed -E 's/^ *//'`), `.` is the wildcard, and the engine's compile error is reported by name when a pattern does not compile. An `-E` pattern is model-authored text, so it is bounded before it sees input: 1 KiB of pattern source, a 64 KiB compiled program, and sixteen levels of nesting. A replacement stays literal text in both modes — the engine's `$1` interpolation is off, and a real-sed `\1` group reference is refused rather than emitted verbatim. `-iE` folds ASCII case only, because this engine matches codepoint by codepoint; that is narrower than the literal path's `-i`, never wider.
 
 Two of them exist only when the embedder configured them, and are "command not found" otherwise: `curl`, whose target capability is fixed for the whole execution, and `date`, which is gated by the off-by-default `Limits::allow_clock`. A broker-backed `curl` may additionally propose an inert public DRN through exact `--oauth2-bearer '${drn:…}'` or `-u 'USER:${drn:…}'` syntax. The DRN stays in a typed invocation field and is removed before provider JSON is built. Literal passwords and arbitrary interpolation are refused; direct invokers deny the proposal. The broker separately authorizes and resolves it as documented in [`docs/secrets.md`](../../docs/secrets.md).
 
