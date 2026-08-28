@@ -1,11 +1,11 @@
 //! What the broker says about a session it refuses before anything is ever invoked.
 //!
-//! `capabilitiesFor` answers a refused caller with the same opaque nothing whatever went wrong —
-//! that is deliberate, because a distinguishable answer would tell an unauthorized gateway whether
-//! a subject is mapped. The cost was that the broker's own side of the socket recorded nothing
-//! either, so bootstrapping an `identityMapping` for a new Slack sender meant reading the sender's
-//! subject out of a payload-carrying gateway span. These tests hold the opaque wire answer and the
-//! named broker-side event together.
+//! An attested `capabilities` answers a refused caller with the same opaque nothing whatever went
+//! wrong — that is deliberate, because a distinguishable answer would tell an unauthorized gateway
+//! whether a subject is mapped. The cost was that the broker's own side of the socket recorded
+//! nothing either, so bootstrapping an `identityMapping` for a new Slack sender meant reading the
+//! sender's subject out of a payload-carrying gateway span. These tests hold the opaque wire answer
+//! and the named broker-side event together.
 //!
 //! This lives in its own test binary because `tracing` resolves per-callsite interest against the
 //! global dispatcher, so a sibling test hitting these callsites with no subscriber installed can

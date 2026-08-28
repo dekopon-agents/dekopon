@@ -5357,7 +5357,7 @@ fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Val
     event
 }
 
-/// One Slack transport pointed at loopback mocks.
+/// One Telegram transport pointed at loopback mocks, with activity presentation off.
 fn telegram(endpoint: &str) -> crate::transport::telegram::TelegramTransport {
     telegram_with(endpoint, ActivityMode::Off)
 }

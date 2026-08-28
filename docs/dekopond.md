@@ -573,10 +573,11 @@ memory search --query TEXT
 
 It cannot resolve or invoke record. After model success, the gateway bounds the final answer once
 (empty output uses the fixed normal answer), asks the transport to accept those exact bytes, and
-only then opens one fresh broker client for one `RecordDeliveredTurnForChat`. The recorded user text
-is the original bounded sender text, excluding generated attachment reference notes; assistant text
-is exactly what the transport accepted. No response, denial, timeout, EOF, partial Discord delivery,
-or outcome-unaudited is retried, and none changes the already delivered `answered` outcome.
+only then opens one fresh broker client for one `recordDeliveredTurn` carrying the session's chat
+attestation. The recorded user text is the original bounded sender text, excluding generated
+attachment reference notes; assistant text is exactly what the transport accepted. No response,
+denial, timeout, EOF, partial Discord delivery, or outcome-unaudited is retried, and none changes
+the already delivered `answered` outcome.
 
 Receipts mean complete **transport acceptance**, never human receipt: Slack and Telegram require an
 HTTP success status before accepting `ok: true`; Slack also validates channel and strict canonical

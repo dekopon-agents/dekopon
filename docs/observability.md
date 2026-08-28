@@ -265,8 +265,8 @@ Neither gateway span carries chat text or a subject identifier. `outcome` is the
 
 Every transport reconnects on one jittered exponential backoff, and the jitter comes from the
 operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
-refused entropy, carrying the `getrandom` failure and nothing else; the delay then falls back to
-its unjittered ceiling, which costs a fleet its de-synchronization rather than its reconnect.
+refused entropy, carrying the `getrandom` failure and nothing else; that attempt's delay then falls
+back to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect.
 
 In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
 only `operation` plus the stable transport-error category. A permanent Slack installation fallback

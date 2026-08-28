@@ -122,9 +122,10 @@ decoded provider result and then cross a synchronized transaction marker before 
 The independently released optional `memory-chat` provider uses JSONL only. Which capabilities make up
 the surface is the owner's declaration — one `route:` per record/recent/search role in
 `constraintSets` — not a reserved name, so renaming the provider drops no reservation and naming an
-ordinary capability `memory.chat.export` gains none. Hidden recording is reachable solely
-through `RecordDeliveredTurnForChat` after complete gateway-attested transport acceptance. Recent
-and literal case-insensitive search are on demand and never automatically seed a prompt. Both
+ordinary capability `memory.chat.export` gains none. Hidden recording is reachable solely through
+`recordDeliveredTurn` carrying a chat attestation, after complete gateway-attested transport
+acceptance. Recent and literal case-insensitive search are on demand and never automatically seed a
+prompt. Both
 continuity policies always include provider, agent, canonical sender, transport, channel, and
 conversation: `stable` deliberately survives semantic authority changes; the default
 `authority-bound` persists an opaque pointer and random epoch so A→B→A creates three generations.

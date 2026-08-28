@@ -129,9 +129,10 @@ const EXTENDED_PATTERN_NEST_LIMIT: u32 = 16;
 /// Compiles an `-E` pattern with this shell's bounds, reporting the engine's own error by name.
 ///
 /// Case folding is the engine's, not [`str::to_lowercase`]'s: `regex-bites` matches codepoint by
-/// codepoint and does not implement Unicode case insensitivity, so `-iE` folds ASCII only. That is
-/// narrower than the literal path's `-i`, never wider, so it cannot match something the script did
-/// not ask for.
+/// codepoint and does not implement Unicode case insensitivity, so `-i -E` folds ASCII only. That
+/// is narrower than the literal path's `-i`, never wider, so it cannot match something the script
+/// did not ask for. The flags are written separately because the parsers match whole flag strings;
+/// a bundled `-iE` is refused as an unsupported option.
 pub(crate) fn extended_pattern(
     command: &str,
     pattern: &str,
