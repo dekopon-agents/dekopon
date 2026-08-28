@@ -13,8 +13,9 @@
 
 // The session gate: may this person drive this agent at all, and through which gateway?
 //
-// This is checked before `capabilitiesFor` answers and before any capability is authorized, so a
-// sender the owner never permitted to use this agent is refused before a model call is paid for.
+// This is checked before an attested `capabilities` answers and before any capability is
+// authorized, so a sender the owner never permitted to use this agent is refused before a model
+// call is paid for.
 @id("boss-may-prompt-conditional-writer")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",

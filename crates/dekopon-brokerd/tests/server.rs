@@ -1119,7 +1119,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
 /// capabilities, and a peer without a grant is refused without learning whether the subject is
 /// mapped at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn capabilities_for_over_the_socket() {
+async fn attested_capabilities_over_the_socket() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create server fixture");
     let limits = server_limits();

@@ -1222,8 +1222,8 @@ async fn a_drain_past_the_shared_deadline_times_out() {
 /// The startup frame check exists so an oversized capability response fails here rather than on
 /// the first session. It used to measure only the direct peers, and in the deployment it is written
 /// for the direct peer is the gateway — granted almost nothing. The capability sets that actually
-/// reach the wire belong to the attested principals the identity mappings name, on the
-/// `capabilitiesFor` path the check skipped, so the oversized response passed startup and then
+/// reach the wire belong to the attested principals the identity mappings name, on the attested
+/// `capabilities` path the check skipped, so the oversized response passed startup and then
 /// failed `write_frame` on every session open.
 #[tokio::test]
 async fn the_startup_frame_check_covers_more_than_the_direct_peers() {

@@ -2146,7 +2146,7 @@ async fn attested_success_audits_via_and_subject() {
 /// `None` and `Some(vec![])` answer different questions, and collapsing them would let a gateway
 /// probe the directory: "you may not ask" must not be reported as "this subject has nothing".
 #[tokio::test(flavor = "multi_thread")]
-async fn capabilities_for_distinguishes_refusal_from_empty() {
+async fn attested_capabilities_distinguishes_refusal_from_empty() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = attested_broker(
         directory([(SLACK_SUBJECT, "cpetersen"), ("tel.16034700182", "oncall")]),
