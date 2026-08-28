@@ -18,7 +18,6 @@ dekopon-webui
 dekopon-agent
 dekopon-config
 dekopon-provider-host
-dekopon-tui
 dekopon
 dekopon-policy
 dekopon-broker

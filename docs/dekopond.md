@@ -418,12 +418,6 @@ gateway-owned `filename`, `mediaType`, and base64 `data`; the field is absent ot
 line can therefore approach the base64 expansion of the 8 MiB decoded bound and remains a
 development protocol rather than a compact production transport.
 
-A local caller may also declare a `dev.<surface>.<name>` subject rather than borrowing a real
-service's. That is the honest spelling for an identity nothing authenticated, and the broker admits
-it only under `allowDevelopmentSubjects` plus the usual attestor grant and mapping — see
-[`../crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#development-identities).
-A chat-scoped grant for this transport names it as `localSubjectService: dev`.
-
 **This transport trusts its local caller to declare a subject.** That is the whole point of it — it exists so a developer can drive a routed session without a Slack workspace — and it is why it is a development tool rather than a production transport. It grants nothing by doing so: the declared subject is still only a claim carried into the broker's `invokeForChat`, and the broker still needs an attestor grant covering that namespace plus an owner-controlled mapping before it resolves to a principal. Its `0600` mode keeps it reachable only by the owner's UID, which is the trust domain the broker socket already lives in.
 
 A declared subject also selects a *history*. A local caller can therefore name a subject some Slack sender created and have that person's compacted exchange replayed into its own prompt. No authority moves — the broker still decides every invocation for itself — but text does, which is a second reason this socket is `0600` and a development tool.

@@ -174,16 +174,16 @@ fn usage_errors_exit_with_two() {
 }
 
 #[test]
-fn a_bare_invocation_off_a_terminal_stays_a_usage_error() {
-    // The console needs a terminal to draw on and a terminal to read keys from. A test harness has
-    // neither, and neither does a script — which is the case that must never become a process
-    // hanging on raw-mode input that will never arrive.
+fn a_bare_invocation_is_a_usage_error() {
+    // The subcommand is optional in the grammar only so this crate can name what was missing in
+    // its own words. It is still required, and a script that pipes a bare `dekopon` gets the
+    // documented usage exit rather than something it has to interpret.
     let output = binary().output().expect("CLI process starts");
 
     assert_eq!(
         output.status.code(),
         Some(2),
-        "exit 2 is the documented usage code and predates the console"
+        "exit 2 is the documented usage code"
     );
     assert!(
         stderr(&output).contains("subcommand is required"),
@@ -193,62 +193,13 @@ fn a_bare_invocation_off_a_terminal_stays_a_usage_error() {
 }
 
 #[test]
-fn the_console_refuses_without_a_subject_rather_than_guessing_one() {
-    let output = binary()
-        .args(["console"])
-        .env_remove("DEKOPON_CONSOLE_SUBJECT")
-        .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = stderr(&output);
-    assert!(stderr.contains("--subject"), "got: {stderr}");
-    assert!(stderr.contains("DEKOPON_CONSOLE_SUBJECT"), "got: {stderr}");
-    assert!(
-        stderr.contains("allowDevelopmentSubjects"),
-        "the refusal must name the broker-side opt-in too, or the next failure is a mystery: {stderr}"
-    );
-}
-
-#[test]
-fn the_console_rejects_a_subject_no_service_could_issue() {
-    let output = binary()
-        .args(["console", "--subject", "sms.15550100000"])
-        .output()
-        .expect("CLI process starts");
-
-    // An unknown service fails at the command line rather than as a broker refusal several steps
-    // later, where the operator would have learned nothing about which part was wrong.
-    assert_eq!(output.status.code(), Some(2));
-}
-
-#[test]
-fn the_console_accepts_a_development_subject() {
-    // `dev.console.<name>` is what the missing-subject refusal suggests, so it has to parse. It
-    // still reaches nothing until the broker opts in and maps it — this only pins the grammar.
-    let output = binary()
-        .args(["console", "--subject", "dev.console.xavier"])
-        .env("DEKOPON_BROKER_SOCKET", "/nonexistent/broker.sock")
-        .output()
-        .expect("CLI process starts");
-
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "a development subject must not be a usage error: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn top_level_and_nested_help_are_generated() {
     let top = binary().arg("--help").output().expect("CLI process starts");
     assert_eq!(top.status.code(), Some(0));
-    // `[COMMAND]` rather than `<COMMAND>`: a bare `dekopon` on a terminal opens the console, so the
-    // subcommand is genuinely optional and the generated usage line says so.
+    // `[COMMAND]` rather than `<COMMAND>`: the subcommand is optional in the grammar so that a bare
+    // `dekopon` reaches this crate's own refusal instead of Clap's, and the usage line says so.
     assert!(stdout(&top).contains("Usage: dekopon [OPTIONS] [COMMAND]"));
     assert!(stdout(&top).contains("--no-color"));
-    assert!(stdout(&top).contains("console"));
 
     let nested = binary()
         .args(["get", "--help"])
@@ -524,9 +475,8 @@ fn version_does_not_require_configuration() {
 
 #[test]
 fn verbose_diagnostics_still_reach_a_redirected_stderr() {
-    // The console discards diagnostics only when they would land inside its own frame. A test
-    // harness never has a terminal, so this also pins that the discard is conditional rather than
-    // a blanket suppression that would silence `-v` everywhere.
+    // `-vv` has to reach a redirected stderr, which is where a script collects it. Nothing in this
+    // binary writes to a terminal on its own, so there is no suppression path to get this wrong.
     let output = run_example(&["-vv", "get", "agents"]);
 
     assert_eq!(output.status.code(), Some(0));

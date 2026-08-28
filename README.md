@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.1** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, an interactive terminal console, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.1** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -13,7 +13,6 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
 - A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
-- `dekopon console`, an interactive terminal view over a running broker, opened with a bare `dekopon` on a terminal. It shows what policy actually grants an agent beside what its catalog declares, runs turns, and draws each turn's scripts and capability calls with their exact JSON input and result — which exists nowhere else, because history keeps prompts and answers, spans keep argument counts, and audit records keep digests. An opt-in `dev.<surface>.<name>` subject service backs it without borrowing a real phone number.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic broker-configured example — Cedar policy, credential template, and audit chain on its own volume — exercising two authorized calls in one invocation (`examples/conditional-write/`).
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call, and an in-process fake-broker testkit (`dekopon-provider-sdk-testkit`) that runs a provider component against real storage for end-to-end tests.
@@ -53,13 +52,12 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
   `wasm32-unknown-unknown`, importing only `dekopon:storage/durable-files@0.1.0`, published
   separately from [dekopon-provider-turso-sql](https://github.com/dekopon-agents/dekopon-provider-turso-sql).
 
-New in 0.11.0 — an interactive console, and `dekopon-shell`'s real bash-script surface:
+New in 0.11.0 — `dekopon-shell`'s real bash-script surface:
 
-- `dekopon console`, an interactive terminal view over a running broker: it opens an attested
-  session for one external subject through one catalog agent, shows what policy actually grants
-  beside what the catalog declares, and draws every turn's scripts and capability calls with their
-  exact JSON input and result. A `dev.<surface>.<name>` subject service backs it without borrowing a
-  real identity.
+- The interactive console moved out of this tree to
+  [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` provider
+  did. It was an unprivileged broker client holding a model credential, so nothing here loses
+  authority; the operator CLI is a local catalog and model-account tool again.
 - `dekopon-shell` gained compound commands as pipeline stages, `[[ ... ]]`, enforced
   `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two
   script-addressable streams — the bash surface a script author expects, minus glob matching and
@@ -236,25 +234,6 @@ dekopon --config examples/local/dekopon.yaml config view -o json
 The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
 
 See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
-
-## Drive an agent from a terminal
-
-```console
-dekopon auth chatgpt login --auth-file ~/.config/dekopon/chatgpt-auth.console.json
-dekopon --config examples/local/dekopon.yaml console --subject dev.console.xavier
-```
-
-`dekopon console` is an unprivileged client of a running `dekopon-brokerd` that happens to run the
-agent loop itself, which is the only way to see a tool call's arguments and result at all. A bare
-`dekopon` on a terminal opens the same view; anywhere else it stays the usage error it has always
-been, so nothing scripted changes.
-
-It holds a model credential and nothing else — no policy, no provider credential, no authorization
-— and proposes on behalf of a `dev.<surface>.<name>` subject, the one subject service no external
-service authenticated. A broker admits that only under `allowDevelopmentSubjects: true`, plus the
-same attestor grant and identity mapping every other subject needs. See
-[`docs/cli.md`](docs/cli.md#the-interactive-console) and
-[`crates/dekopon-tui/README.md`](crates/dekopon-tui/README.md).
 
 ## Run a Rust provider immediately
 
