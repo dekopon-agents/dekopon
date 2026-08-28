@@ -1778,6 +1778,21 @@ pub enum SourceError {
     Internal,
 }
 
+/// The first `io::Error` in an error's source chain, or `None` when nothing in it is one.
+///
+/// Only the errno leaves this function. Every wrapper along the chain renders a path, which is
+/// what a secret-source event must never carry, so the chain is walked rather than rendered.
+fn io_cause<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(cause) = current.downcast_ref::<std::io::Error>() {
+            return Some(cause);
+        }
+        source = current.source();
+    }
+    None
+}
+
 fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> SourceError {
     let any = source as &dyn std::any::Any;
     if let Some(source) = any.downcast_ref::<std::io::Error>() {
@@ -1798,12 +1813,18 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             http.response.status_code = source.status().map(|status| status.as_u16()),
         );
     } else if let Some(source) = any.downcast_ref::<FileHygieneError>() {
+        // An `EACCES` opening a private secret file is a `FileHygieneError::Io`, not an
+        // `io::Error`, so the branch above never sees it and the errno an operator acts on —
+        // denied, missing, or a broken mount — sits one hop down the source chain.
+        let cause = io_cause(source);
         tracing::debug!(
             event = "secret_source_cause_classified",
             category = error.category(),
             cause_type = "file-hygiene",
             // The rendered message carries a path; the check name is the low-cardinality half.
             error.check = source.category(),
+            error.kind = ?cause.map(std::io::Error::kind),
+            error.errno = cause.and_then(std::io::Error::raw_os_error),
         );
     } else if let Some(source) = any.downcast_ref::<serde_json::Error>() {
         tracing::debug!(
@@ -1887,6 +1908,57 @@ mod tests {
 
     fn uid() -> u32 {
         rustix::process::geteuid().as_raw()
+    }
+
+    /// A private secret file the broker cannot open has to keep naming its errno.
+    ///
+    /// It used to: the failure was an `io::Error` and `classified` logged
+    /// `error.errno`. #13 replaced it with a `FileHygieneError`, the downcast stopped matching,
+    /// and the event became `cause_type="file-hygiene" error.check="io"` with nothing saying
+    /// which I/O failure it was — and `EACCES` on a mounted secret, `ENOENT` on one that never
+    /// arrived, and `EIO` on a broken mount are three different things to do next. The refusal
+    /// itself stays one opaque `Io`, because a source must not tell a caller which check refused
+    /// it; only this debug event carries the cause.
+    #[test]
+    fn a_secret_file_that_cannot_be_opened_still_names_its_errno() {
+        use std::fs;
+
+        use tracing_subscriber::{layer::SubscriberExt as _, registry};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("token");
+        fs::write(&path, b"secret-bytes-that-must-not-be-logged").expect("write fixture");
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod fixture");
+
+        // Whatever this platform's errno for an unreadable file is, that is the one to expect.
+        let expected = fs::File::open(&path)
+            .expect_err("the fixture cannot be opened by its owner")
+            .raw_os_error()
+            .expect("an unreadable file fails with an errno");
+
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let refused = tracing::subscriber::with_default(registry().with(capture.clone()), || {
+            runtime
+                .block_on(super::read_private_file(&path, uid(), 4096))
+                .expect_err("an unreadable secret file is refused")
+        });
+
+        assert!(matches!(refused, super::SourceError::Io), "{refused:?}");
+        let events = capture.events_text();
+        assert!(events.contains("cause_type=\"file-hygiene\""), "{events}");
+        assert!(events.contains("error.check=\"io\""), "{events}");
+        assert!(
+            events.contains(&format!("error.errno={expected}")),
+            "the errno left the log again: {events}"
+        );
+        // The rendered `FileHygieneError` carries the path and the file carries the secret.
+        // Neither may reach this event, which is why the chain is walked rather than rendered.
+        assert!(!events.contains("secret-bytes"), "{events}");
+        assert!(!events.contains(&path.display().to_string()), "{events}");
     }
 
     async fn write(path: &std::path::Path, bytes: &[u8]) {
