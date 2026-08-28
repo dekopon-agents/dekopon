@@ -263,6 +263,11 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's `capabilitiesForChat` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
 
+Every transport reconnects on one jittered exponential backoff, and the jitter comes from the
+operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
+refused entropy, carrying the `getrandom` failure and nothing else; the delay then falls back to
+its unjittered ceiling, which costs a fleet its de-synchronization rather than its reconnect.
+
 In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
 only `operation` plus the stable transport-error category. A permanent Slack installation fallback
 emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or

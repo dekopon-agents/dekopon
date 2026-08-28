@@ -7563,7 +7563,7 @@ fn a_chunk_never_splits_a_character_and_prefers_a_line_break() {
     // The ceiling is in UTF-16 code units, and a chunk boundary is still a character boundary: an
     // astral character straddling one would be two halves of a replacement glyph in both clients.
     let text = format!("{}\n{}", "a".repeat(100), "🦀".repeat(2_048));
-    let chunks = crate::transport::split_message(&text, 4_096);
+    let chunks = crate::transport::split_message(&text, 4_096, crate::transport::TextUnit::Utf16);
 
     assert_eq!(chunks.len(), 2);
     assert_eq!(
@@ -7584,7 +7584,7 @@ fn an_empty_answer_still_becomes_one_post() {
     // Every chat service refuses an empty message. Saying so is better than a silent failure the
     // sender reads as the bot ignoring them.
     assert_eq!(
-        crate::transport::split_message("", 4_096),
+        crate::transport::split_message("", 4_096, crate::transport::TextUnit::Utf16),
         vec!["[empty response]".to_owned()]
     );
 }

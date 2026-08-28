@@ -6,12 +6,7 @@
 //! structured `mentions` array decides whether a guild message is addressed; model-visible text is
 //! never trusted to make that decision.
 
-use std::{
-    collections::{HashSet, VecDeque, hash_map::RandomState},
-    hash::{BuildHasher as _, Hasher as _},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
@@ -26,8 +21,9 @@ use crate::{
     config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, TextUnit,
+        TransportError, TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
+        jitter_below, reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -45,8 +41,6 @@ const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const MAX_MESSAGE_CHARS: usize = 2_000;
 /// The single-shard identify bucket permits one Identify every five seconds.
 const IDENTIFY_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
@@ -78,7 +72,7 @@ pub(crate) struct DiscordTransport {
     next_heartbeat: Option<Instant>,
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
-    seen: Dedup,
+    seen: SeenIds,
     pending: VecDeque<InboundMessage>,
     failures: u32,
     activity: ActivityMode,
@@ -132,7 +126,7 @@ impl DiscordTransport {
             next_heartbeat: None,
             heartbeat_acked: true,
             last_identify: None,
-            seen: Dedup::new(DEDUP_CAPACITY),
+            seen: SeenIds::new(DEDUP_CAPACITY),
             pending: VecDeque::new(),
             failures: 0,
             activity,
@@ -295,9 +289,8 @@ impl DiscordTransport {
             return Err(TransportError::Response);
         }
         let interval = Duration::from_millis(milliseconds);
-        // Discord requires a random first-heartbeat jitter in [0, interval). RandomState is
-        // OS-seeded and already underlies the workspace's opaque identifier minting, so this adds
-        // no RNG dependency and does not synchronize a fleet restarted at once.
+        // Discord requires a random first-heartbeat jitter in [0, interval), so a fleet that
+        // connected together does not heartbeat in lockstep.
         let jitter = Duration::from_millis(jitter_below(milliseconds));
         self.heartbeat_interval = Some(interval);
         self.next_heartbeat = Some(Instant::now() + jitter);
@@ -547,12 +540,6 @@ impl DiscordTransport {
         self.session_id = None;
         self.resume_gateway_url = None;
     }
-
-    fn backoff(&self) -> Duration {
-        let step = BASE_BACKOFF.saturating_mul(1_u32 << self.failures.min(7));
-        let capped = step.min(MAX_BACKOFF);
-        capped.saturating_add(Duration::from_millis(jitter_below(250)))
-    }
 }
 
 impl ChatTransport for DiscordTransport {
@@ -578,7 +565,7 @@ impl ChatTransport for DiscordTransport {
                     return Ok(TransportEvent::Message(Box::new(message)));
                 }
                 if self.socket.is_none() {
-                    tokio::time::sleep(self.backoff()).await;
+                    tokio::time::sleep(reconnect_delay(self.failures)).await;
                     if let Err(error) = self.open().await {
                         self.socket = None;
                         if is_fatal(&error) {
@@ -677,7 +664,7 @@ impl ChatReplier for DiscordReplier {
             // posting into the same conversation at the same time — admission control serializes a
             // conversation against itself. What the reply-wide lock did add was making every other
             // session, and every attachment refresh, wait out this reply's rate limit.
-            for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS)
+            for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
                 .into_iter()
                 .enumerate()
             {
@@ -757,16 +744,12 @@ impl ChatActivity for DiscordReplier {
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
                     .map_err(TransportError::MalformedResponse)?;
-                let seconds = body["retry_after"]
-                    .as_f64()
-                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                let retry = retry_after_from_body(&body, MAX_ACTIVITY_COOLDOWN)
                     .ok_or(TransportError::Response)?;
-                let wait =
-                    Duration::from_secs_f64(seconds.min(MAX_ACTIVITY_COOLDOWN.as_secs_f64()));
                 *self
                     .activity_cooldown_until
                     .lock()
-                    .expect("Discord activity cooldown") = Some(Instant::now() + wait);
+                    .expect("Discord activity cooldown") = Some(Instant::now() + retry.wait);
                 return Err(TransportError::Service {
                     code: "http-429".to_owned(),
                 });
@@ -826,20 +809,15 @@ impl DiscordReplier {
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&bytes)
                     .map_err(TransportError::MalformedResponse)?;
-                let seconds = body["retry_after"]
-                    .as_f64()
+                let retry = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT)
                     .ok_or(TransportError::Response)?;
-                if retried
-                    || !seconds.is_finite()
-                    || seconds < 0.0
-                    || seconds > MAX_RATE_LIMIT_WAIT.as_secs_f64()
-                {
+                if retried || retry.capped {
                     return Err(TransportError::Service {
                         code: "http-429".to_owned(),
                     });
                 }
                 // The wait itself happens in `post_message`, outside the REST lock.
-                self.publish_rest_cooldown(seconds);
+                self.publish_rest_cooldown(retry.wait);
                 retried = true;
                 continue;
             }
@@ -912,20 +890,15 @@ impl DiscordReplier {
                     .map_err(|source| TransportError::Request(Box::new(source)))?;
                 let body = serde_json::from_slice::<Value>(&response_bytes)
                     .map_err(TransportError::MalformedResponse)?;
-                let seconds = body["retry_after"]
-                    .as_f64()
+                let retry = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT)
                     .ok_or(TransportError::Response)?;
-                if retried
-                    || !seconds.is_finite()
-                    || seconds < 0.0
-                    || seconds > MAX_RATE_LIMIT_WAIT.as_secs_f64()
-                {
+                if retried || retry.capped {
                     return Err(TransportError::Service {
                         code: "http-429".to_owned(),
                     });
                 }
                 // The wait itself happens in `send_rest`, outside the REST lock.
-                self.publish_rest_cooldown(seconds);
+                self.publish_rest_cooldown(retry.wait);
                 retried = true;
                 continue;
             }
@@ -991,12 +964,11 @@ impl DiscordReplier {
     }
 
     /// Publishes Discord's own retry deadline so every later request waits it out before the lock.
-    fn publish_rest_cooldown(&self, seconds: f64) {
+    fn publish_rest_cooldown(&self, wait: Duration) {
         *self
             .rest_cooldown_until
             .lock()
-            .expect("Discord REST cooldown") =
-            Some(Instant::now() + Duration::from_secs_f64(seconds));
+            .expect("Discord REST cooldown") = Some(Instant::now() + wait);
     }
 
     /// How long Discord's last 429 still asks Create Message to wait, if at all.
@@ -1172,16 +1144,6 @@ fn is_snowflake(value: &str) -> bool {
         .is_ok_and(|parsed| parsed != 0 && parsed.to_string() == value)
 }
 
-fn jitter_below(upper: u64) -> u64 {
-    if upper == 0 {
-        return 0;
-    }
-    let state = RandomState::new();
-    let mut hasher = state.build_hasher();
-    hasher.write_u32(std::process::id());
-    hasher.finish() % upper
-}
-
 fn is_fatal(error: &TransportError) -> bool {
     matches!(
         error,
@@ -1254,35 +1216,6 @@ fn is_loopback_host(host: Option<&str>) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-struct Dedup {
-    order: VecDeque<String>,
-    seen: HashSet<String>,
-    capacity: usize,
-}
-
-impl Dedup {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn insert(&mut self, key: String) -> bool {
-        if !self.seen.insert(key.clone()) {
-            return false;
-        }
-        self.order.push_back(key);
-        if self.order.len() > self.capacity
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.seen.remove(&evicted);
-        }
-        true
-    }
-}
-
 fn client() -> Result<reqwest::Client, TransportError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1320,8 +1253,8 @@ mod unit_tests {
     use std::time::Duration;
 
     use super::{
-        DiscordTransport, MAX_MESSAGE_CHARS, SessionStarts, allowed_asset_url, gateway_url,
-        is_fatal, split_message,
+        DiscordTransport, MAX_MESSAGE_CHARS, SessionStarts, TextUnit, allowed_asset_url,
+        gateway_url, is_fatal, split_message,
     };
     use crate::{config::ActivityMode, transport::TransportError};
     use tokio::time::Instant;
@@ -1389,7 +1322,7 @@ mod unit_tests {
     #[test]
     fn long_answers_split_without_losing_text() {
         let answer = format!("{}\n{}", "a".repeat(1_999), "🦀".repeat(2_001));
-        let chunks = split_message(&answer, MAX_MESSAGE_CHARS);
+        let chunks = split_message(&answer, MAX_MESSAGE_CHARS, TextUnit::Utf16);
         assert!(
             chunks
                 .iter()

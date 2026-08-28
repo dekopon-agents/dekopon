@@ -280,7 +280,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #31 — DUPLICATED_LOGIC — crates/dekopond/src/transport/{slack,discord,telegram,whatsapp}.rs
+## [x] #31 — DUPLICATED_LOGIC — crates/dekopond/src/transport/{slack,discord,telegram,whatsapp}.rs
 
 **Finding:** `transport.rs` holds real shared helpers, but per transport: backoff ×3 (identical formula/constants, jitter divergent — Slack/Telegram `pid % 250` once per process, Discord hashing the pid through `RandomState`, whose behaviour std does not guarantee; `getrandom` is already a dep), `Dedup` ×2 byte-identical + a third shape with a 4× different bound (1024 vs 4096), `retry_after` body parsing ×3 in Discord and absent from Slack/WhatsApp/Telegram's send path, the reconnect skeleton ×2, WhatsApp's `Service` code spelled `"429"` where the others use `"http-429"`, and a `split_message` fork in `whatsapp.rs:948` shadowing the shared one (deliberately scalar-counted, but its empty-input behaviour silently differs). (raw: D2, E, A1)
 **Blast radius:** MEDIUM  **Confidence:** HIGH
