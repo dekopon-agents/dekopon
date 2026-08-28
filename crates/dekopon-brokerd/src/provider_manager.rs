@@ -21,7 +21,6 @@ use dekopon_broker_host::{
     LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::ProviderId;
-use fs2::FileExt as _;
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
 use reqwest::{
@@ -1660,12 +1659,11 @@ fn open_operation_lock(
         expected_uid,
         true,
     )?;
-    file.try_lock_exclusive().map_err(|source| {
-        if source.kind() == io::ErrorKind::WouldBlock {
-            ProviderManagerError::OperationInProgress {
-                path: path.to_path_buf(),
-            }
-        } else {
+    file.try_lock().map_err(|source| match source {
+        fs::TryLockError::WouldBlock => ProviderManagerError::OperationInProgress {
+            path: path.to_path_buf(),
+        },
+        fs::TryLockError::Error(source) => {
             ProviderManagerError::io_at(LOCK_STORE_OPERATION, path, source)
         }
     })?;

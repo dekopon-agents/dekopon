@@ -6,8 +6,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use fs2::FileExt as _;
-
 use crate::{
     StorageHostError, StorageLimits,
     key::StorageKey,
@@ -130,7 +128,7 @@ pub(crate) fn run(
         }
         let base = layout.namespaces().open_directory(&base_token)?;
         let base_lease = base.open_private("base.lock", false)?;
-        if base_lease.try_lock_exclusive().is_err() {
+        if base_lease.try_lock().is_err() {
             continue;
         }
         if base.exists("poisoned")? {
@@ -197,7 +195,7 @@ pub(crate) fn run(
                 continue;
             }
             let lease = generation.open_private("lease.lock", false)?;
-            if lease.try_lock_exclusive().is_err() {
+            if lease.try_lock().is_err() {
                 continue;
             }
             let remaining = limits
@@ -260,7 +258,7 @@ pub(crate) fn run(
                         false
                     } else {
                         let lease = generation.open_private("lease.lock", false)?;
-                        lease.try_lock_exclusive().is_ok()
+                        lease.try_lock().is_ok()
                     }
                 }
             }

@@ -16,7 +16,6 @@ include = ["src/**", "README.md", "Cargo.toml"]
 [dependencies]
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
-fs2.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 serde.workspace = true

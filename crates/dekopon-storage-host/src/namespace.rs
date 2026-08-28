@@ -1,11 +1,10 @@
 //! Non-reusing namespace derivation, exact housekeeping planning, and continuity pointers.
 
 use std::{
-    fs::File,
+    fs::{File, TryLockError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -893,15 +892,15 @@ pub(crate) fn lock_exclusive(file: &File, timeout_ms: u64) -> Result<(), Storage
         .checked_add(Duration::from_millis(timeout_ms))
         .ok_or(StorageHostError::Arithmetic)?;
     loop {
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(StorageHostError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => return Err(StorageHostError::Io),
+            Err(TryLockError::Error(_)) => return Err(StorageHostError::Io),
         }
     }
 }

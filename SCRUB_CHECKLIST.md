@@ -272,7 +272,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #30 — VERSION_DRIFT_RISK — Cargo.toml:41 (fs2)
+## [x] #30 — VERSION_DRIFT_RISK — Cargo.toml:41 (fs2)
 
 **Finding:** `fs2 0.4.3` — an abandoned pre-1.0 `unsafe`-libc wrapper — is linked in six files on the durability path of both privileged processes (audit writer lock, checkpoint lock, storage leases, provider-store lock) solely for advisory flock; `std::fs::File::{lock, try_lock, unlock}` stabilized in Rust 1.89.0, exactly this workspace's `rust-version`. The workspace already carries `rustix` and `libc` for the same syscall layer. (raw: E)
 **Blast radius:** MEDIUM  **Confidence:** HIGH
