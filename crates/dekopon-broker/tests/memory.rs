@@ -823,7 +823,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
-        [fixture("storage-probe-provider.wasm")],
+        [provider_fixture("storage-probe-provider.wasm")],
         BrokerHostLimits::default(),
         Some(storage),
     )
@@ -2548,7 +2548,7 @@ fn walk(path: &Path) -> Vec<PathBuf> {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_declared_route_conflict_is_reported_at_startup() {
     let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+        BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], BrokerHostLimits::default())
             .await
             .expect("echo fixture loads");
     let world = PolicyWorld::new(
