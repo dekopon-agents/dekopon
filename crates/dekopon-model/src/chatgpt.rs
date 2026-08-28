@@ -87,14 +87,9 @@ impl ChatGptCodexModel {
         }
         let auth_path = resolve_auth_path(auth_path)?;
         let credentials = load_credentials(&auth_path)?;
-        let config = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build();
 
         Ok(Self {
-            agent: config.into(),
+            agent: crate::agent(timeout),
             model,
             auth_path,
             credentials: Mutex::new(credentials),
@@ -298,12 +293,7 @@ fn login_with_endpoints(
     output: &mut dyn Write,
 ) -> Result<PathBuf, ChatGptError> {
     let path = resolve_auth_path(auth_path)?;
-    let config = Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(30)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build();
-    let agent: Agent = config.into();
+    let agent = crate::agent(Duration::from_secs(30));
     let device = start_device_login(&agent, &endpoints)?;
     writeln!(output, "Open {}", endpoints.verification_url)
         .and_then(|()| writeln!(output, "Enter code: {}", device.user_code))

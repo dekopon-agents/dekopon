@@ -392,15 +392,7 @@ impl OpenAiChatModel {
             ));
         }
 
-        let config = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .max_redirects(0)
-            // A non-2xx must stay a response rather than becoming `Error::StatusCode`, whose
-            // Display is only `http status: 429`. The endpoint's own JSON — model not found,
-            // context length, which rate limit — is the entire diagnostic and is otherwise dropped.
-            .http_status_as_error(false)
-            .build();
-        let agent = config.into();
+        let agent = crate::agent(timeout);
         let bearer_token = bearer_token.and_then(|token| {
             let token = token.trim().to_owned();
             (!token.is_empty()).then_some(Redacted::new(token))
