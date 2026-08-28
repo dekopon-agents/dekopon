@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use ureq::Agent;
+use ureq::{Agent, config::ConfigBuilder, typestate::AgentScope};
 
 /// Native ChatGPT/Codex subscription authentication and Responses transport.
 pub mod chatgpt;
@@ -34,7 +34,19 @@ pub mod model;
 ///   only `http status: 429`. The endpoint's own JSON — model not found, context length, which
 ///   rate limit — is the entire diagnostic and is otherwise dropped.
 pub(crate) fn agent(timeout: Duration) -> Agent {
-    Agent::config_builder()
+    agent_from(Agent::config_builder(), timeout)
+}
+
+/// Applies that stance to whatever configuration the caller started from.
+///
+/// Production always starts from `Agent::config_builder()`, which is `Config::default()` and its
+/// ambient `Proxy::try_from_env()`. The seam exists for the proxy assertion: `try_from_env` answers
+/// `None` unless a proxy variable is exported, so on a proxy-free runner a builder that had dropped
+/// `.proxy(None)` would still produce an agent with no proxy and the test would prove nothing. The
+/// test starts from a configuration that definitely carries one and watches this clear it, with no
+/// process environment to mutate and nothing for a concurrent test to race.
+fn agent_from(config: ConfigBuilder<AgentScope>, timeout: Duration) -> Agent {
+    config
         .timeout_global(Some(timeout))
         .max_redirects(0)
         .http_status_as_error(false)
@@ -45,14 +57,33 @@ pub(crate) fn agent(timeout: Duration) -> Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, agent};
+    use ureq::Proxy;
+
+    use super::{Agent, AgentScope, ConfigBuilder, Duration, agent, agent_from};
+
+    /// The discard port: a proxy that is well formed, never dialled, and obvious in a diff.
+    const AMBIENT_PROXY: &str = "http://127.0.0.1:9";
+
+    /// The shape `HTTPS_PROXY=http://127.0.0.1:9` would have left in `Config::default()`.
+    fn proxied_configuration() -> ConfigBuilder<AgentScope> {
+        Agent::config_builder().proxy(Some(
+            Proxy::new(AMBIENT_PROXY).expect("a well-formed proxy uri"),
+        ))
+    }
 
     #[test]
     fn the_shared_agent_ignores_ambient_proxy_configuration() {
-        // `Config::default()` reads `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` at build time, so this
-        // is the assertion that a builder which forgot `.proxy(None)` would fail — no environment
-        // mutation, and no race with any other test.
-        let agent = agent(Duration::from_secs(30));
+        // Not read from the environment: `Proxy::try_from_env()` answers `None` unless a proxy
+        // variable is exported, so building from the default on a proxy-free runner asserts
+        // nothing at all. Starting from a configuration that carries one is what makes the
+        // assertion fail when `.proxy(None)` is missing — and it mutates no process state, so it
+        // cannot race a concurrent test.
+        assert!(
+            proxied_configuration().build().proxy().is_some(),
+            "the fixture must carry the proxy this test is about"
+        );
+
+        let agent = agent_from(proxied_configuration(), Duration::from_secs(30));
 
         assert!(
             agent.config().proxy().is_none(),
