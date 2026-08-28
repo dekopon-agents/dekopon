@@ -2547,10 +2547,12 @@ fn walk(path: &Path) -> Vec<PathBuf> {
 /// Route mistakes are reported together, because a route file is edited as a whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_declared_route_conflict_is_reported_at_startup() {
-    let registry =
-        BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo fixture loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo fixture loads");
     let world = PolicyWorld::new(
         ["caller".parse::<PrincipalId>().expect("caller")],
         registry
