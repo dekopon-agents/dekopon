@@ -27,7 +27,8 @@ use thiserror::Error;
 /// another user editing what this process will obey.
 ///
 /// - [`Private`](Self::Private) — `mode & 0o077` must be zero: the broker credentials file, the
-///   secret map, the audit checkpoint, the control socket, and storage namespace keys.
+///   secret map and the file sources it names, the audit checkpoint, the provider store's
+///   operation lock, and every private file inside a storage root.
 /// - [`NotWorldWritable`](Self::NotWorldWritable) — `mode & 0o022` must be zero: `broker.yaml`,
 ///   `dekopond.yaml`, the Cedar policy file, and managed provider state. These are readable
 ///   configuration by design, and several deployments hand them to an operator group.
