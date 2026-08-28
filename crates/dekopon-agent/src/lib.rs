@@ -802,6 +802,84 @@ mod tests {
         );
     }
 
+    /// A leg whose command words and membership answers no trait default could produce.
+    struct CommandLeg {
+        word: &'static str,
+        capability: &'static str,
+    }
+
+    impl CapabilityInvoker for CommandLeg {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn is_granted(&self, capability: &str) -> bool {
+            capability == self.capability
+        }
+
+        fn grants_namespace(&self, namespace: &str) -> bool {
+            self.capability
+                .split('.')
+                .next()
+                .is_some_and(|candidate| candidate == namespace)
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec![self.word.to_owned()]
+        }
+
+        fn has_command_word(&self, word: &str) -> bool {
+            word == self.word
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+
+    /// Command words and grants have to survive the composite, from either leg.
+    ///
+    /// `command_words` defaults to an empty list and `is_granted` to a scan of `granted`, so a
+    /// composite that forgets either answers "command not found" for a word a provider
+    /// contributed and refuses a capability a leg holds. Both legs here report a `granted` list
+    /// that is empty or silent about what they answer for, so every assertion below fails against
+    /// the defaults rather than coinciding with them.
+    #[test]
+    fn command_words_and_grants_survive_both_legs_rather_than_falling_back_to_the_defaults() {
+        let invoker = SessionInvoker {
+            direct: CommandLeg {
+                word: "echo",
+                capability: "echo.echo",
+            },
+            broker: Some(Box::new(CommandLeg {
+                word: "gh",
+                capability: "gh.pr-view",
+            })),
+        };
+
+        assert_eq!(
+            invoker.command_words(),
+            vec!["echo".to_owned(), "gh".to_owned()],
+            "a word a provider contributed became `command not found`"
+        );
+        assert!(invoker.has_command_word("echo"));
+        assert!(invoker.has_command_word("gh"));
+        assert!(!invoker.has_command_word("git"));
+
+        assert!(invoker.granted().is_empty());
+        assert!(invoker.is_granted("echo.echo"), "the direct leg holds it");
+        assert!(invoker.is_granted("gh.pr-view"), "the broker leg holds it");
+        assert!(!invoker.is_granted("gh.pr-merge"));
+        assert!(invoker.grants_namespace("echo"));
+        assert!(invoker.grants_namespace("gh"));
+        assert!(!invoker.grants_namespace("git"));
+    }
+
     #[cfg(unix)]
     mod broker_leg {
         use std::{
