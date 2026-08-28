@@ -306,9 +306,10 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
 /// `AuthorityBound` mints a fresh non-reusing generation whenever the *effective authority
 /// commitment* changes. This harness holds that commitment fixed across invocations, so it never
 /// changes and the policy addresses one generation exactly like `Stable`: successive calls still
-/// read each other's writes. That is the claim `FakeBrokerBuilder::default` makes in a comment,
-/// and this is the test that keeps it honest if the harness ever grows a varying authority
-/// surface — at which point this assertion fails and both it and the comment need revisiting.
+/// read each other's writes. That is the claim `FakeBrokerBuilder::default` makes in a comment and
+/// the README's continuity bullet makes in prose, and this is the test that keeps both honest: the
+/// authority surface is a literal in `FakeBroker::invoke` with no builder knob on it, so if the
+/// harness ever grows a varying one this assertion fails and all three need revisiting together.
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here() {
     let broker = FakeBroker::builder()
