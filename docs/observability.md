@@ -403,7 +403,7 @@ only place the cause exists. These events carry it:
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `broker_capabilities_refused` | warn | `dekopon-broker` | `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `policy-error`), canonical `subject`, `agent`, `via` |
+| `broker_capabilities_refused` | warn | `dekopon-broker` | `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `policy-error`), `policy_ids` (the policies that determined it, empty for a refusal reached before any evaluation), canonical `subject`, `agent`, `via` |
 | `broker_policy_evaluation_error` | warn | `dekopon-broker` | `invocation`, `policy.target` (`capability` or `secret`) |
 | `broker_secret_resolution_failed` / `broker_secret_credential_failed` | warn | `dekopon-broker` | `invocation` and low-cardinality source/material `category`; structural credential errors are fixed value-free text. No DRN, locator, revision, value, or value-derived length. |
 | `secret_source_resolution_failed` / `secret_projection_failed` | warn | `dekopon-brokerd` | adapter `source_kind` and low-cardinality `category`; no DRN, locator, response body, bootstrap credential, selector, or value |
@@ -417,12 +417,13 @@ only place the cause exists. These events carry it:
 | `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
-`broker_capabilities_refused` exists because `capabilitiesFor` answers a refused caller with the same
-opaque nothing whatever went wrong — a distinguishable answer would tell an unauthorized gateway
-whether a subject is mapped. The class and the canonical subject therefore land on the broker's own
-side of the socket, which is what makes bootstrapping an `identityMapping` for a new sender possible
-without reading the subject out of a payload-carrying gateway span. It marks refusals, not traffic:
-an honored session emits nothing.
+`broker_capabilities_refused` exists because `capabilitiesFor`, `capabilitiesForChat`, and
+`resolveCommandForChat` answer a refused caller with the same opaque nothing whatever went wrong — a
+distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and an unknown
+command word would disclose the surface the refusal withheld. The class, its determining policies,
+and the canonical subject therefore land on the broker's own side of the socket, which is what makes
+bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
+payload-carrying gateway span. It marks refusals, not traffic: an honored session emits nothing.
 
 The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed" and
 `AuditError::Io` as "durable audit append failed"; the errno that says *why* — `ENOSPC` on an audit

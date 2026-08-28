@@ -3201,10 +3201,7 @@ where
             }
             None => {
                 let decision = self.authorize_agent_prompt(&context, &attestation.agent);
-                (!decision.allowed).then(|| Refusal {
-                    reason: denial_reason(&decision, "agent-denied"),
-                    policy_ids: decision.determining_policy_ids,
-                })
+                (!decision.allowed).then(|| decided_refusal(decision, "agent-denied"))
             }
         };
         self.invoke_inner(&context, request, refusal).await
@@ -3230,11 +3227,21 @@ where
         agent: &AgentId,
     ) -> Option<(Vec<AvailableCapability>, Vec<String>)> {
         if !grant.is_some_and(|grant| grant.permits(subject)) {
-            report_inspection_refusal("attestation-denied", peer, subject, agent);
+            report_inspection_refusal(
+                &unevaluated_refusal("attestation-denied"),
+                peer,
+                subject,
+                agent,
+            );
             return None;
         }
         let Some(principal) = self.identities.resolve(subject) else {
-            report_inspection_refusal("unmapped-subject", peer, subject, agent);
+            report_inspection_refusal(
+                &unevaluated_refusal("unmapped-subject"),
+                peer,
+                subject,
+                agent,
+            );
             return None;
         };
         let context = match AuthenticatedContext::attested(
@@ -3247,14 +3254,19 @@ where
         ) {
             Ok(context) => context,
             Err(_) => {
-                report_inspection_refusal("attestation-denied", peer, subject, agent);
+                report_inspection_refusal(
+                    &unevaluated_refusal("attestation-denied"),
+                    peer,
+                    subject,
+                    agent,
+                );
                 return None;
             }
         };
         let decision = self.authorize_agent_prompt(&context, agent);
         if !decision.allowed {
             report_inspection_refusal(
-                denial_reason(&decision, "agent-denied"),
+                &decided_refusal(decision, "agent-denied"),
                 peer,
                 subject,
                 agent,
@@ -3278,8 +3290,8 @@ where
     )> {
         let context = match self.resolve_chat_claim(peer, grant, claim) {
             Ok(context) => context,
-            Err(reason) => {
-                report_inspection_refusal(reason, peer, &claim.subject, &claim.agent);
+            Err(refusal) => {
+                report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
                 return None;
             }
         };
@@ -3307,10 +3319,17 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        let Ok(context) = self.resolve_chat_claim(peer, grant, claim) else {
-            return Err(BrokerHostError::UnknownCommandWord {
-                word: word.to_owned(),
-            });
+        // The word stays unknown on the wire — telling a refused caller that it exists would
+        // leak the surface the refusal withheld — so the class lands on the broker's own side
+        // instead of nowhere at all.
+        let context = match self.resolve_chat_claim(peer, grant, claim) {
+            Ok(context) => context,
+            Err(refusal) => {
+                report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+                return Err(BrokerHostError::UnknownCommandWord {
+                    word: word.to_owned(),
+                });
+            }
         };
         let memory_provider_word =
             self.registry
@@ -3367,15 +3386,20 @@ where
             agent: attestation.agent.clone(),
             scope: attestation.scope.clone(),
         };
-        let context = self
-            .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
-        let mut refusal = (attestation.invocation != request.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_err())
-        .then_some(Refusal {
-            reason: "chat-attestation-denied",
-            policy_ids: Vec::new(),
-        });
+        // Resolved once. The claim decides the context and the refusal together, so a second
+        // call would re-evaluate the `agent.prompt` policy for the same message and throw the
+        // class away in favour of a single flattened reason.
+        let (context, mut refusal) = match self.resolve_chat_claim(peer, grant, &claim) {
+            Ok(context) => (
+                context,
+                (attestation.invocation != request.id)
+                    .then(|| unevaluated_refusal("chat-attestation-denied")),
+            ),
+            Err(refusal) => (
+                peer.with_refused_subject(attestation.subject.clone()),
+                Some(refusal),
+            ),
+        };
         if request.capability.as_str() == MEMORY_RECORD {
             refusal = Some(Refusal {
                 reason: "record-operation-required",
@@ -3418,29 +3442,26 @@ where
             agent: attestation.agent.clone(),
             scope: attestation.scope.clone(),
         };
-        let context = self
-            .resolve_chat_claim(peer, grant, &claim)
-            .unwrap_or_else(|_| peer.with_refused_subject(attestation.subject.clone()));
-        let refusal = if attestation.invocation != turn.id
-            || self.resolve_chat_claim(peer, grant, &claim).is_err()
-        {
-            Some(Refusal {
-                reason: "chat-attestation-denied",
-                policy_ids: Vec::new(),
-            })
-        } else if self.memory_surface(&context, &attestation.agent).is_none() {
-            Some(Refusal {
-                reason: "memory-unavailable",
-                policy_ids: Vec::new(),
-            })
-        } else if !turn.is_bounded() || !turn.delivery.is_canonical_for(&attestation.scope) {
-            Some(Refusal {
-                reason: "invalid-turn",
-                policy_ids: Vec::new(),
-            })
-        } else {
-            None
+        // Resolved once, exactly as the generic chat path is: the refusal the claim produced is
+        // the most specific one there is, so the later checks only run when the claim held.
+        let (context, claim_refusal) = match self.resolve_chat_claim(peer, grant, &claim) {
+            Ok(context) => (context, None),
+            Err(refusal) => (
+                peer.with_refused_subject(attestation.subject.clone()),
+                Some(refusal),
+            ),
         };
+        let refusal = claim_refusal.or_else(|| {
+            if attestation.invocation != turn.id {
+                Some(unevaluated_refusal("chat-attestation-denied"))
+            } else if self.memory_surface(&context, &attestation.agent).is_none() {
+                Some(unevaluated_refusal("memory-unavailable"))
+            } else if !turn.is_bounded() || !turn.delivery.is_canonical_for(&attestation.scope) {
+                Some(unevaluated_refusal("invalid-turn"))
+            } else {
+                None
+            }
+        });
         let request = InvocationRequest {
             id: turn.id,
             capability: MEMORY_RECORD
@@ -3458,21 +3479,23 @@ where
         self.invoke_inner(&context, request, refusal).await
     }
 
-    /// Derives the chat context, or the stable refusal class that stopped it.
+    /// Derives the chat context, or the refusal that stopped it.
     ///
-    /// The class exists so an inspection refusal can be reported once by its caller; the wire
-    /// answer stays the same opaque nothing it was.
+    /// The refusal exists so a caller can report or audit it once; the wire answer stays the same
+    /// opaque nothing it was. It carries the determining `policy_ids` alongside the class, because
+    /// an `agent-denied` or `policy-error` a caller flattens into a bare class is a denial with no
+    /// route back to the rule that made it.
     fn resolve_chat_claim(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         claim: &ChatSessionClaim,
-    ) -> Result<AuthenticatedContext, &'static str> {
-        let grant = grant.ok_or("attestation-denied")?;
+    ) -> Result<AuthenticatedContext, Refusal> {
+        let grant = grant.ok_or_else(|| unevaluated_refusal("attestation-denied"))?;
         let principal = self
             .identities
             .resolve(&claim.subject)
-            .ok_or("unmapped-subject")?;
+            .ok_or_else(|| unevaluated_refusal("unmapped-subject"))?;
         // `chatScopes` was added for storage namespace authority. An existing subject-only
         // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
         // using the chat operations. It receives the legacy context with no trusted chat scope,
@@ -3487,7 +3510,7 @@ where
         )]
         let context = if grant.chat_scopes.is_empty() {
             if !grant.permits(&claim.subject) {
-                return Err("attestation-denied");
+                return Err(unevaluated_refusal("attestation-denied"));
             }
             AuthenticatedContext::attested(
                 principal.clone(),
@@ -3497,10 +3520,10 @@ where
                 peer.principal().clone(),
                 claim.subject.clone(),
             )
-            .map_err(|_| "attestation-denied")?
+            .map_err(|_| unevaluated_refusal("attestation-denied"))?
         } else {
             if !grant.permits_chat(&claim.subject, &claim.scope) {
-                return Err("attestation-denied");
+                return Err(unevaluated_refusal("attestation-denied"));
             }
             AuthenticatedContext::attested_chat(
                 principal.clone(),
@@ -3511,13 +3534,13 @@ where
                 claim.subject.clone(),
                 claim.scope.clone(),
             )
-            .map_err(|_| "attestation-denied")?
+            .map_err(|_| unevaluated_refusal("attestation-denied"))?
         };
         let decision = self.authorize_agent_prompt(&context, &claim.agent);
         if decision.allowed {
             Ok(context)
         } else {
-            Err(denial_reason(&decision, "agent-denied"))
+            Err(decided_refusal(decision, "agent-denied"))
         }
     }
 
@@ -4946,10 +4969,31 @@ fn encode_storage_limits(
     }
 }
 
-/// A refusal decided before policy evaluation, carried into the audited denial.
+/// A refusal decided before the capability decision, carried into the audited denial.
 struct Refusal {
+    /// The stable class an operator reads in the audit record and in the refusal event.
     reason: &'static str,
+    /// The policies that determined it, empty for a refusal reached before any evaluation.
     policy_ids: Vec<String>,
+}
+
+/// A refusal reached before any policy ran, so no policy identifier can explain it.
+const fn unevaluated_refusal(reason: &'static str) -> Refusal {
+    Refusal {
+        reason,
+        policy_ids: Vec::new(),
+    }
+}
+
+/// The refusal an `agent.prompt` decision produced, keeping the policies that determined it.
+///
+/// Dropping the identifiers here would make a denied session the one decision in the broker that
+/// records its class without recording which rule reached it.
+fn decided_refusal(decision: PolicyDecision, denied: &'static str) -> Refusal {
+    Refusal {
+        reason: denial_reason(&decision, denied),
+        policy_ids: decision.determining_policy_ids,
+    }
 }
 
 /// Separates a policy that could not be evaluated from one that simply did not match.
@@ -4971,14 +5015,15 @@ const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'sta
 /// so this event is the only place the refusal class and the canonical subject meet. It is what
 /// makes an unmapped sender diagnosable without a payload-carrying gateway span.
 fn report_inspection_refusal(
-    reason: &'static str,
+    refusal: &Refusal,
     peer: &AuthenticatedContext,
     subject: &ExternalSubject,
     agent: &AgentId,
 ) {
     tracing::warn!(
         event = "broker_capabilities_refused",
-        reason,
+        reason = refusal.reason,
+        policy_ids = ?refusal.policy_ids,
         subject = %subject,
         agent = %agent,
         via = %peer.principal(),
