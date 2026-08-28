@@ -158,6 +158,10 @@ The `conversation:` block adds three more:
 - an idle timeout or a window bound on a `oneShot` route. The setting can never take effect there, and a setting that can never take effect is far more likely a mode typo than an intention;
 - a zero `sessions.maxConversations`, which would make every history immediately evictable and turn a persistent route into an expensive one-shot one.
 
+**Every problem at once.** A file that decoded is scanned to the end before it is refused, and the refusal lists everything wrong with it — `3 validation problems found:` and then one line per problem, the shape `dekopon-config` already refuses a catalog with. Only a file that cannot be understood at all — wrong ownership or permissions, oversize, or invalid YAML — stops at the first error. Route binding scans the whole table the same way, so a catalog that disabled two of the agents routes name is one refusal naming both. And a list that failed itself is not blamed on the routes that name it: no transports at all, or a transport with no name, is reported once rather than again for every route pointing at it.
+
+**Every credential before any connection.** The chat credentials, the bound-route model credentials, and the named image generator's credential all resolve, and every transport client is built, before the first transport authenticates to anything. A transport that cannot be prepared is reported as `chat transport <name> could not be prepared` with the variable named in its cause; only a failure on the wire is `chat transport <name> could not connect`. That ordering is the difference between one refusal naming both missing tokens and two crash loops, the first of which had already opened a Slack socket with the token that was present.
+
 ## Agent configuration self-inspection
 
 Every authorized session is offered `inspect_agent_config`. When someone asks “what is this

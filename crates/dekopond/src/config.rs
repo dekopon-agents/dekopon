@@ -704,25 +704,45 @@ pub(crate) fn resolve(
         }
     };
 
+    // Every semantic problem in this file is collected before any of them is reported, the way
+    // `dekopon-config` scans a whole catalog: an operator with three mistakes in one file fixes
+    // three and restarts once, instead of rediscovering the next one after every restart. Only a
+    // failure that makes the rest unreadable — the file's hygiene, or its decode — stops earlier.
+    let mut problems = Vec::new();
+
     if config.transports.is_empty() {
-        return Err(ConfigError::NoTransports);
+        problems.push(ConfigProblem::NoTransports);
     }
     if config.models.is_empty() {
-        return Err(ConfigError::NoModels);
+        problems.push(ConfigProblem::NoModels);
     }
     if config.routes.is_empty() {
-        return Err(ConfigError::NoRoutes);
+        problems.push(ConfigProblem::NoRoutes);
     }
 
+    // A transport that never reached the name set cannot be named by a route, so the reference
+    // checks below would blame the routes pointing at it on top of reporting the real failure.
+    // A *duplicate* name is not that case: the first declaration is still in the set and still
+    // resolves, which is exactly why `dekopon-config` leaves duplicates out of `drops_resource`.
+    let mut transports_incomplete = config.transports.is_empty();
     let mut transport_names = BTreeSet::new();
+    // Transports that cannot carry a generated image, recorded before validation so the route
+    // pairing check below does not pass merely because this transport had a problem of its own.
+    let mut text_only_transports = BTreeSet::new();
     let mut transports = Vec::with_capacity(config.transports.len());
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
-            return Err(ConfigError::UnnamedTransport);
+            problems.push(ConfigProblem::UnnamedTransport);
+            transports_incomplete = true;
+            continue;
         }
         if !transport_names.insert(name.clone()) {
-            return Err(ConfigError::DuplicateTransport { name });
+            problems.push(ConfigProblem::DuplicateTransport { name });
+            continue;
+        }
+        if matches!(transport, TransportConfig::WhatsappCloudApi { .. }) {
+            text_only_transports.insert(name);
         }
         transports.push(match transport {
             TransportConfig::SlackSocketMode {
@@ -733,8 +753,8 @@ pub(crate) fn resolve(
                 activity,
                 endpoint,
             } => {
-                validate_env_name(&app_token_env)?;
-                validate_env_name(&bot_token_env)?;
+                check_env_name(&app_token_env, &mut problems);
+                check_env_name(&bot_token_env, &mut problems);
                 let activity_is_meaningful = match (experience, activity.mode) {
                     (_, ActivityMode::Off) => {
                         activity.classic_fallback == SlackActivityFallback::None
@@ -745,9 +765,9 @@ pub(crate) fn resolve(
                     (SlackExperience::Agent, ActivityMode::Native) => true,
                 };
                 if !activity_is_meaningful {
-                    return Err(ConfigError::InvalidSlackActivity { name });
+                    problems.push(ConfigProblem::InvalidSlackActivity { name: name.clone() });
                 }
-                let endpoint = validate_endpoint(endpoint, SLACK_ENDPOINT)?;
+                let endpoint = checked_endpoint(endpoint, SLACK_ENDPOINT, &mut problems);
                 TransportConfig::SlackSocketMode {
                     name,
                     app_token_env,
@@ -763,8 +783,8 @@ pub(crate) fn resolve(
                 activity,
                 endpoint,
             } => {
-                validate_env_name(&bot_token_env)?;
-                let endpoint = validate_endpoint(endpoint, DISCORD_ENDPOINT)?;
+                check_env_name(&bot_token_env, &mut problems);
+                let endpoint = checked_endpoint(endpoint, DISCORD_ENDPOINT, &mut problems);
                 TransportConfig::DiscordGateway {
                     name,
                     bot_token_env,
@@ -784,24 +804,26 @@ pub(crate) fn resolve(
                 graph_api_version,
                 graph_endpoint,
             } => {
-                validate_env_name(&app_secret_env)?;
-                validate_env_name(&verify_token_env)?;
-                validate_env_name(&access_token_env)?;
+                check_env_name(&app_secret_env, &mut problems);
+                check_env_name(&verify_token_env, &mut problems);
+                check_env_name(&access_token_env, &mut problems);
                 if !canonical_positive_decimal(&waba_id)
                     || !canonical_positive_decimal(&phone_number_id)
                 {
-                    return Err(ConfigError::InvalidWhatsappScope { name });
+                    problems.push(ConfigProblem::InvalidWhatsappScope { name: name.clone() });
                 }
                 if bind.port() == 0 {
-                    return Err(ConfigError::InvalidWhatsappBind { name });
+                    problems.push(ConfigProblem::InvalidWhatsappBind { name: name.clone() });
                 }
                 if !valid_whatsapp_callback_path(&callback_path) {
-                    return Err(ConfigError::InvalidWhatsappCallback { name });
+                    problems.push(ConfigProblem::InvalidWhatsappCallback { name: name.clone() });
                 }
                 if !valid_graph_version(&graph_api_version) {
-                    return Err(ConfigError::InvalidWhatsappGraphVersion { name });
+                    problems
+                        .push(ConfigProblem::InvalidWhatsappGraphVersion { name: name.clone() });
                 }
-                let graph_endpoint = validate_endpoint(graph_endpoint, WHATSAPP_GRAPH_ENDPOINT)?;
+                let graph_endpoint =
+                    checked_endpoint(graph_endpoint, WHATSAPP_GRAPH_ENDPOINT, &mut problems);
                 TransportConfig::WhatsappCloudApi {
                     name,
                     app_secret_env,
@@ -821,8 +843,8 @@ pub(crate) fn resolve(
                 activity,
                 endpoint,
             } => {
-                validate_env_name(&bot_token_env)?;
-                let endpoint = validate_endpoint(endpoint, TELEGRAM_ENDPOINT)?;
+                check_env_name(&bot_token_env, &mut problems);
+                let endpoint = checked_endpoint(endpoint, TELEGRAM_ENDPOINT, &mut problems);
                 TransportConfig::TelegramLongPoll {
                     name,
                     bot_token_env,
@@ -837,70 +859,70 @@ pub(crate) fn resolve(
         });
     }
 
+    let mut models_incomplete = config.models.is_empty();
     let mut model_names = BTreeSet::new();
     for model in &config.models {
         let name = model.name().to_owned();
         if name.trim().is_empty() {
-            return Err(ConfigError::UnnamedModel);
+            problems.push(ConfigProblem::UnnamedModel);
+            models_incomplete = true;
+            continue;
         }
         if !model_names.insert(name.clone()) {
-            return Err(ConfigError::DuplicateModel { name });
+            problems.push(ConfigProblem::DuplicateModel { name });
+            continue;
         }
         if model.timeout_ms() == 0 {
-            return Err(ConfigError::InvalidModelTimeout { name });
+            problems.push(ConfigProblem::InvalidModelTimeout { name });
         }
         if let ModelConfig::OpenaiCompatible {
             api_key_env: Some(variable),
             ..
         } = model
         {
-            validate_env_name(variable)?;
+            check_env_name(variable, &mut problems);
         }
     }
 
     if let Some(generator) = &config.image_generator {
         if generator.model.trim().is_empty() {
-            return Err(ConfigError::UnnamedImageModel);
+            problems.push(ConfigProblem::UnnamedImageModel);
         }
         if generator.timeout_ms == 0 {
-            return Err(ConfigError::InvalidImageGeneratorTimeout);
+            problems.push(ConfigProblem::InvalidImageGeneratorTimeout);
         }
-        validate_env_name(&generator.api_key_env)?;
+        check_env_name(&generator.api_key_env, &mut problems);
     }
 
     let mut routes = Vec::with_capacity(config.routes.len());
     for route in config.routes {
-        if !transport_names.contains(&route.transport) {
-            return Err(ConfigError::UnknownRouteTransport {
-                transport: route.transport,
+        if !transports_incomplete && !transport_names.contains(&route.transport) {
+            problems.push(ConfigProblem::UnknownRouteTransport {
+                transport: route.transport.clone(),
             });
         }
         if let Some(model) = &route.model
+            && !models_incomplete
             && !model_names.contains(model)
         {
-            return Err(ConfigError::UnknownRouteModel {
+            problems.push(ConfigProblem::UnknownRouteModel {
                 model: model.clone(),
             });
         }
         if route.image_generator && config.image_generator.is_none() {
-            return Err(ConfigError::UnconfiguredRouteImageGenerator {
+            problems.push(ConfigProblem::UnconfiguredRouteImageGenerator {
                 agent: route.agent.to_string(),
             });
         }
         // A generated image on a text-only transport would be paid for, then dropped on the way
         // out. Refusing the pair at startup is the only place that failure is legible.
-        if route.image_generator
-            && transports.iter().any(|transport| {
-                transport.name() == route.transport
-                    && matches!(transport, TransportConfig::WhatsappCloudApi { .. })
-            })
-        {
-            return Err(ConfigError::UnsupportedRouteImageGenerator {
+        if route.image_generator && text_only_transports.contains(&route.transport) {
+            problems.push(ConfigProblem::UnsupportedRouteImageGenerator {
                 transport: route.transport.clone(),
             });
         }
         if route.limits.max_steps == 0 || route.limits.max_capability_calls == 0 {
-            return Err(ConfigError::InvalidRouteLimits {
+            problems.push(ConfigProblem::InvalidRouteLimits {
                 agent: route.agent.to_string(),
             });
         }
@@ -915,7 +937,7 @@ pub(crate) fn resolve(
                 max_bytes,
             } => {
                 if idle_timeout_ms == 0 || max_turns == 0 || max_bytes == 0 {
-                    return Err(ConfigError::InvalidConversationBounds {
+                    problems.push(ConfigProblem::InvalidConversationBounds {
                         agent: route.agent.to_string(),
                     });
                 }
@@ -940,18 +962,21 @@ pub(crate) fn resolve(
     }
 
     if config.sessions.max_concurrent == 0 {
-        return Err(ConfigError::InvalidSessionLimits);
+        problems.push(ConfigProblem::InvalidSessionLimits);
     }
     if config.sessions.max_conversations == 0 {
-        return Err(ConfigError::InvalidMaxConversations);
+        problems.push(ConfigProblem::InvalidMaxConversations);
     }
     let shutdown_grace = match config.shutdown_grace_ms {
-        Some(0) => return Err(ConfigError::InvalidSessionLimits),
+        Some(0) => {
+            problems.push(ConfigProblem::InvalidSessionLimits);
+            DEFAULT_SHUTDOWN_GRACE
+        }
         Some(milliseconds) => Duration::from_millis(milliseconds),
         None => DEFAULT_SHUTDOWN_GRACE,
     };
 
-    let frame = FrameLimits {
+    let frame = match (FrameLimits {
         max_frame_bytes: config
             .broker
             .max_frame_bytes
@@ -960,53 +985,99 @@ pub(crate) fn resolve(
             .broker
             .io_timeout_ms
             .map_or(DEFAULT_IO_TIMEOUT, Duration::from_millis),
-    }
-    .validate()
-    .map_err(|source| ConfigError::BrokerLimits { source })?;
-    let socket_path = match config.broker.socket_path {
-        Some(path) => resolve_path(path),
-        None => discovery
-            .resolve()
-            .map(ResolvedBrokerSocket::into_path)
-            .ok_or(ConfigError::BrokerSocketUnresolved)?,
-    };
-    let broker = ResolvedBroker {
-        socket_path,
-        server_uid: config.broker.server_uid.unwrap_or(current_uid),
-        frame,
-    };
-
-    let telemetry = config
-        .telemetry
-        .as_ref()
-        .map(|telemetry| {
-            Ok::<_, ConfigError>(ResolvedTelemetry {
-                settings: ExporterSettings::new(
-                    &telemetry.endpoint,
-                    telemetry.transport,
-                    &telemetry.service_name,
-                    "dekopond",
-                    env!("CARGO_PKG_VERSION"),
-                    Duration::from_millis(telemetry.export_timeout_ms),
-                )
-                .map_err(|source| ConfigError::Telemetry { source })?,
-                telemetry_payloads: telemetry.telemetry_payloads,
-            })
-        })
-        .transpose()?;
-
-    Ok(ResolvedConfig {
-        source,
-        catalog_path: resolve_path(config.catalog_path),
-        broker,
-        transports,
-        models: config.models,
-        image_generator: config.image_generator,
-        routes,
-        sessions: config.sessions,
-        shutdown_grace,
-        telemetry,
     })
+    .validate()
+    {
+        Ok(frame) => Some(frame),
+        Err(source) => {
+            problems.push(ConfigProblem::BrokerLimits { source });
+            None
+        }
+    };
+    let socket_path = match config.broker.socket_path {
+        Some(path) => Some(resolve_path(path)),
+        None => match discovery.resolve().map(ResolvedBrokerSocket::into_path) {
+            Some(path) => Some(path),
+            None => {
+                problems.push(ConfigProblem::BrokerSocketUnresolved);
+                None
+            }
+        },
+    };
+
+    let telemetry = match config.telemetry.as_ref().map(|telemetry| {
+        ExporterSettings::new(
+            &telemetry.endpoint,
+            telemetry.transport,
+            &telemetry.service_name,
+            "dekopond",
+            env!("CARGO_PKG_VERSION"),
+            Duration::from_millis(telemetry.export_timeout_ms),
+        )
+        .map(|settings| ResolvedTelemetry {
+            settings,
+            telemetry_payloads: telemetry.telemetry_payloads,
+        })
+    }) {
+        None => Some(None),
+        Some(Ok(telemetry)) => Some(Some(telemetry)),
+        Some(Err(source)) => {
+            problems.push(ConfigProblem::Telemetry { source });
+            None
+        }
+    };
+
+    match (frame, socket_path, telemetry) {
+        (Some(frame), Some(socket_path), Some(telemetry)) if problems.is_empty() => {
+            Ok(ResolvedConfig {
+                source,
+                catalog_path: resolve_path(config.catalog_path),
+                broker: ResolvedBroker {
+                    socket_path,
+                    server_uid: config.broker.server_uid.unwrap_or(current_uid),
+                    frame,
+                },
+                transports,
+                models: config.models,
+                image_generator: config.image_generator,
+                routes,
+                sessions: config.sessions,
+                shutdown_grace,
+                telemetry,
+            })
+        }
+        // Each of the three above pushed its own problem in place of a value, so every path that
+        // lands here carries at least one.
+        _ => Err(ConfigError::Invalid {
+            path: source,
+            problems,
+        }),
+    }
+}
+
+/// Records an invalid environment variable name rather than abandoning the rest of the scan.
+fn check_env_name(name: &str, problems: &mut Vec<ConfigProblem>) {
+    if let Err(problem) = validate_env_name(name) {
+        problems.push(problem);
+    }
+}
+
+/// Records an unsupported endpoint and keeps scanning under the pinned production origin.
+///
+/// The substituted value never reaches a socket: a recorded problem is a refusal, and the resolved
+/// configuration this would belong to is not returned at all.
+fn checked_endpoint(
+    endpoint: Option<String>,
+    production: &str,
+    problems: &mut Vec<ConfigProblem>,
+) -> String {
+    match validate_endpoint(endpoint, production) {
+        Ok(endpoint) => endpoint,
+        Err(problem) => {
+            problems.push(problem);
+            production.to_owned()
+        }
+    }
 }
 
 /// Accepts an environment variable *name*, which is never a secret and is safe to echo.
@@ -1014,7 +1085,7 @@ pub(crate) fn resolve(
 /// The grammar is deliberately narrower than the operating system's: a name with `=` or a NUL is
 /// unreachable through `env::var_os` anyway, and one with a space is almost always a typo that
 /// would otherwise surface as "this token is missing" at connect time.
-fn validate_env_name(name: &str) -> Result<(), ConfigError> {
+fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     let mut bytes = name.bytes();
     let valid = match bytes.next() {
         Some(first) if first.is_ascii_alphabetic() || first == b'_' => {
@@ -1025,7 +1096,7 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
     if valid {
         Ok(())
     } else {
-        Err(ConfigError::InvalidEnvironmentName {
+        Err(ConfigProblem::InvalidEnvironmentName {
             name: name.to_owned(),
         })
     }
@@ -1036,7 +1107,7 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
 /// Overridability exists so tests can point a transport at a mock, and the loopback restriction is
 /// what keeps that from doubling as a way to send a bot token to an arbitrary host. The host is
 /// compared after stripping userinfo, so `http://127.0.0.1@evil.test` does not read as loopback.
-fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<String, ConfigError> {
+fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<String, ConfigProblem> {
     let Some(endpoint) = endpoint else {
         return Ok(production.to_owned());
     };
@@ -1049,7 +1120,7 @@ fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<Strin
     {
         return Ok(trimmed.to_owned());
     }
-    Err(ConfigError::UnsupportedEndpoint {
+    Err(ConfigProblem::UnsupportedEndpoint {
         endpoint,
         production: production.to_owned(),
     })
@@ -1109,6 +1180,10 @@ fn is_loopback_authority(authority: &str) -> bool {
 }
 
 /// Strict configuration failure.
+///
+/// Only the four ways a file can be unusable before it is understood stop at the first error. Every
+/// semantic problem in a file that decoded is reported together through [`ConfigError::Invalid`],
+/// which is the shape `dekopon-config` already refuses a catalog with.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine the current directory")]
@@ -1143,6 +1218,23 @@ pub enum ConfigError {
     },
     #[error("configured path has no parent")]
     MissingParent,
+    /// The file decoded, and every semantic problem found in it is listed here.
+    #[error("{path}: {}", render_problems(.problems))]
+    Invalid {
+        /// The configuration file every problem below was found in.
+        path: PathBuf,
+        /// Every problem found, in file order.
+        problems: Vec<ConfigProblem>,
+    },
+}
+
+/// One semantic problem in an otherwise decodable gateway configuration.
+///
+/// The file is scanned to the end before it is refused, so an operator fixing three mistakes
+/// restarts the daemon once rather than three times. Problems are reported through
+/// [`ConfigError::Invalid`], which owns the source path they all share.
+#[derive(Debug, Error)]
+pub enum ConfigProblem {
     #[error("gateway configuration must declare at least one transport")]
     NoTransports,
     #[error("gateway configuration must declare at least one model")]
@@ -1220,4 +1312,29 @@ pub enum ConfigError {
         #[source]
         source: TelemetryError,
     },
+}
+
+/// Renders every problem in one refusal, each followed by its own cause chain.
+///
+/// The chain is walked here rather than inlined into each problem's message because a problem's
+/// real reason can sit two links down — a credential variable that is unset, under the image
+/// generator that named it — and an aggregate printing only top lines would be a list of headlines
+/// with the reasons removed. Shared by the gateway's three aggregate refusals so they read alike.
+pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
+    let mut rendered = format!(
+        "{} validation problem{} found:",
+        problems.len(),
+        if problems.len() == 1 { "" } else { "s" }
+    );
+    for problem in problems {
+        rendered.push_str("\n  - ");
+        rendered.push_str(&problem.to_string());
+        let mut source = std::error::Error::source(problem);
+        while let Some(cause) = source {
+            rendered.push_str(": ");
+            rendered.push_str(&cause.to_string());
+            source = cause.source();
+        }
+    }
+    rendered
 }
