@@ -7,7 +7,6 @@ use std::{
 };
 
 use dekopon_broker::{AuditError, AuditEvent, AuditLog, AuditRecord, FileAuditLog};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -125,8 +124,9 @@ impl CheckpointStore {
             expected_uid,
         )?;
         let lock = lock.into_std().await;
-        lock.try_lock_exclusive()
-            .map_err(|source| CheckpointError::Lock { source })?;
+        lock.try_lock().map_err(|source| CheckpointError::Lock {
+            source: source.into(),
+        })?;
         remove_stale_temporary(&temporary_path, expected_uid).await?;
 
         let current = read_checkpoint(&path, expected_uid).await?;

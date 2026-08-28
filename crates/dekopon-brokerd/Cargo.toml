@@ -28,7 +28,6 @@ dekopon-telemetry.workspace = true
 dekopon-webui.workspace = true
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
-fs2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 http-auth.workspace = true

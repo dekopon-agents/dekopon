@@ -1,14 +1,13 @@
 //! Opaque physical layout, retained directory descriptors, root locking, and accounting.
 
 use std::{
-    fs::{self, File},
+    fs::{self, File, TryLockError},
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use fs2::FileExt as _;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
@@ -180,7 +179,7 @@ impl Layout {
             return Err(StorageHostError::CorruptLayout);
         }
         writer
-            .try_lock_exclusive()
+            .try_lock()
             .map_err(|source| writer_lock_failure(&root, source))?;
 
         let key_commitment = key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]);
@@ -756,11 +755,10 @@ impl Directory {
 /// Only a would-block refusal proves another conforming writer holds the root. Every other error
 /// is the filesystem itself failing or refusing advisory locks, which must surface as root I/O
 /// carrying its cause rather than as a second writer an operator would then go looking for.
-fn writer_lock_failure(root: &Directory, source: std::io::Error) -> StorageHostError {
-    if source.kind() == std::io::ErrorKind::WouldBlock {
-        StorageHostError::SecondWriter
-    } else {
-        root.io_error(source)
+fn writer_lock_failure(root: &Directory, source: TryLockError) -> StorageHostError {
+    match source {
+        TryLockError::WouldBlock => StorageHostError::SecondWriter,
+        TryLockError::Error(source) => root.io_error(source),
     }
 }
 
@@ -1146,7 +1144,7 @@ pub(crate) fn scan_root_usage(
 mod tests {
     use std::io::{Error, ErrorKind};
 
-    use super::{Directory, writer_lock_failure};
+    use super::{Directory, TryLockError, writer_lock_failure};
     use crate::StorageHostError;
 
     #[test]
@@ -1154,12 +1152,12 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary root");
         let root = Directory::open_path(temporary.path(), false).expect("root directory");
         assert!(matches!(
-            writer_lock_failure(&root, Error::from(ErrorKind::WouldBlock)),
+            writer_lock_failure(&root, TryLockError::WouldBlock),
             StorageHostError::SecondWriter
         ));
         // A filesystem that fails or refuses advisory locks is not another conforming writer.
         assert!(matches!(
-            writer_lock_failure(&root, Error::from(ErrorKind::Unsupported)),
+            writer_lock_failure(&root, TryLockError::Error(Error::from(ErrorKind::Unsupported))),
             StorageHostError::RootIo { source, .. } if source.kind() == ErrorKind::Unsupported
         ));
     }

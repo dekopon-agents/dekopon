@@ -67,7 +67,6 @@ use dekopon_storage_host::{
     ContinuityPolicy, StorageEvidence, StorageGrantPreparation, StorageGrantRequest,
     StorageScopeCommitment,
 };
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
@@ -2021,8 +2020,10 @@ impl FileAuditLog {
         }
         let standard_file = file.into_std().await;
         standard_file
-            .try_lock_exclusive()
-            .map_err(|source| FileAuditError::Lock { source })?;
+            .try_lock()
+            .map_err(|source| FileAuditError::Lock {
+                source: source.into(),
+            })?;
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);

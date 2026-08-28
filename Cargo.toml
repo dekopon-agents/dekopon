@@ -45,7 +45,6 @@ base64 = "0.23.1"
 cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
-fs2 = "0.4.3"
 getrandom = "0.4.3"
 futures-util = "0.3.31"
 hmac = "0.13.0"
