@@ -40,7 +40,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 ---
 
-## [ ] #1 — SIDE_QUEST — .gitignore:23
+## [x] #1 — SIDE_QUEST — .gitignore:23
 
 **Finding:** `.gitignore` still ignores `/examples/pr-summarizer-linter/broker-credentials.yaml`, a directory deleted in #155; the surviving walkthrough `examples/conditional-write/README.md:49-57` tells the reader to paste a live token into `broker-credentials.yaml` and asserts "it is in `.gitignore`". `git check-ignore examples/conditional-write/broker-credentials.yaml` exits 1. (raw: B1)
 **Blast radius:** HIGH  **Confidence:** HIGH

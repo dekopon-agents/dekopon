@@ -18,9 +18,10 @@
 coverage/
 __pycache__/
 
-# The end-to-end walkthrough tells a reader to copy the .example beside this path and paste a
-# GitHub token into it. Ignoring it here means following the walkthrough cannot commit a secret.
-/examples/pr-summarizer-linter/broker-credentials.yaml
+# The conditional-write walkthrough tells a reader to copy the .example beside this path and paste
+# a live API bearer token into it. Ignoring it here means following the walkthrough cannot commit a
+# secret, which examples/conditional-write/README.md promises it cannot.
+/examples/conditional-write/broker-credentials.yaml
 
 # Code-review artifacts; system of record is the vagus vault, not git history.
 /docs/review-2026-07/
