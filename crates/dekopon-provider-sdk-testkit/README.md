@@ -42,9 +42,13 @@ let rows = broker
 
 ## Things it does for you that are easy to get wrong
 
-- **Continuity defaults to `Stable`.** `ContinuityPolicy`'s own default is `AuthorityBound`, which
-  mints a fresh generation whenever the authority commitment changes — so every invocation would
-  open an empty namespace and every persistence test would pass without testing anything.
+- **Continuity is selectable and defaults to `Stable`.** `ContinuityPolicy`'s own default is
+  `AuthorityBound`, which mints a fresh non-reusing generation whenever the *effective authority
+  commitment* changes. This harness holds that commitment constant, so `AuthorityBound` addresses
+  one generation here exactly as `Stable` does; `.continuity(…)` selects either. `Stable` is the
+  default because it is the policy that survives an authority change, so a harness that later
+  grows a varying authority surface keeps addressing one namespace instead of silently starting
+  over.
 - **A grant is minted per invocation and consumed by it.** Successive calls get fresh invocation
   ids and identical scope material, which is what keeps them addressing one namespace.
 - **`StorageNamespace::Chat` is the only namespace the storage host will grant.** A provider with
