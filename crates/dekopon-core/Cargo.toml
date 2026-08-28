@@ -14,9 +14,9 @@ categories = ["data-structures"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [features]
-default = ["schemars"]
-# `JsonSchema` derives for every public type. Default-on for crates.io consumers; the workspace
-# dependency entry turns it off so a wasm guest build drops schemars, schemars_derive, and syn.
+default = []
+# `JsonSchema` derives for every public type. Opt-in: leaving it off keeps schemars,
+# schemars_derive, and syn out of every consumer that never calls a `JsonSchema` impl.
 schemars = ["dep:schemars"]
 
 [dependencies]

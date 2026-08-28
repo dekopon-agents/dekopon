@@ -224,7 +224,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: option (a). Accept `-E` on `grep`/`sed` backed by the already-linked regex engine; keep the literal default and the by-name rejection for the unflagged case; rewrite `text/mod.rs:7-9` so the comment matches. Preserve the never-silently-mismatch invariant.**
 
-## [ ] #24 — FEATURE_FLAG_SPRAWL — crates/dekopon-{core,capability,protocol}/Cargo.toml:17 (schemars)
+## [x] #24 — FEATURE_FLAG_SPRAWL — crates/dekopon-{core,capability,protocol}/Cargo.toml:17 (schemars)
 
 **Finding:** The `schemars` feature is default-on in three foundational crates, produces 40 `JsonSchema` derives, and the whole workspace has one call site — a test asserting `schema["title"] == "Agent"`. Every CI gate builds `--all-features`, so no gate ever compiles the three crates with it off; `dekopon-protocol` lacks `default-features = false`, so its feature re-enables the other two for anything with protocol in its graph, defeating the isolation `dekopon-core/Cargo.toml:18-19` describes. crates.io consumers pay `schemars` + `schemars_derive` + `syn` by default. (raw: B2)
 **Blast radius:** HIGH  **Confidence:** MEDIUM
