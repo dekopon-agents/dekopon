@@ -1186,6 +1186,11 @@ pub const DEFAULT_AUTH_FILE_NAME: &str = "chatgpt-auth.json";
 /// land on another surface's file compares this answer against that surface's own and refuses.
 ///
 /// Nothing is read or probed here, so a path comes back whether or not a credential exists at it.
+///
+/// # Errors
+///
+/// Returns [`ChatGptError::Configuration`] when no tier applies, and when the tier that applied
+/// produced a relative path.
 pub fn resolve_auth_path_named(
     explicit: Option<&Path>,
     file_name: &str,
@@ -1193,24 +1198,72 @@ pub fn resolve_auth_path_named(
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = env::var_os("DEKOPON_CHATGPT_AUTH_FILE") {
-        return Ok(PathBuf::from(path));
+    AuthPathEnvironment::from_process().resolve(file_name)
+}
+
+/// The environment tiers [`resolve_auth_path_named`] falls through, captured once.
+///
+/// Capture is separated from resolution the way `dekopon-config` and `dekopon-broker-protocol`
+/// separate theirs, so the tier order and the absolute-path refusal below are exercised by tests
+/// that never mutate the process environment. The three ladders stay distinct: they differ on
+/// which variables they read, whether they probe, and what a miss means.
+struct AuthPathEnvironment {
+    environment: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+}
+
+impl AuthPathEnvironment {
+    fn from_process() -> Self {
+        Self {
+            environment: exported_path(env::var_os("DEKOPON_CHATGPT_AUTH_FILE")),
+            xdg_config_home: exported_path(env::var_os("XDG_CONFIG_HOME")),
+            home: exported_path(env::var_os("HOME")),
+            app_data: exported_path(env::var_os("APPDATA")),
+        }
     }
-    if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(config).join("dekopon").join(file_name));
+
+    /// Applies the highest-precedence tier that is set, then requires an absolute answer.
+    ///
+    /// The absolute check is what keeps a misconfigured tier loud. `save_credentials` writes
+    /// `0600` and succeeds against a relative path just as happily as an absolute one, so a
+    /// relative answer would put the rotating refresh token in whatever directory the process
+    /// started in — a checkout, typically — and the next run from elsewhere would silently
+    /// re-prompt a device login instead of reporting anything.
+    fn resolve(&self, file_name: &str) -> Result<PathBuf, ChatGptError> {
+        let resolved = if let Some(path) = &self.environment {
+            path.clone()
+        } else if let Some(config) = &self.xdg_config_home {
+            config.join("dekopon").join(file_name)
+        } else if let Some(home) = &self.home {
+            home.join(".config").join("dekopon").join(file_name)
+        } else if let Some(app_data) = &self.app_data {
+            app_data.join("dekopon").join(file_name)
+        } else {
+            return Err(ChatGptError::Configuration(
+                "could not determine credential path; set DEKOPON_CHATGPT_AUTH_FILE".to_owned(),
+            ));
+        };
+        if resolved.is_relative() {
+            return Err(ChatGptError::Configuration(format!(
+                "credential path {} is relative; set DEKOPON_CHATGPT_AUTH_FILE to an absolute path",
+                resolved.display()
+            )));
+        }
+        Ok(resolved)
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home)
-            .join(".config")
-            .join("dekopon")
-            .join(file_name));
-    }
-    if let Some(app_data) = env::var_os("APPDATA") {
-        return Ok(PathBuf::from(app_data).join("dekopon").join(file_name));
-    }
-    Err(ChatGptError::Configuration(
-        "could not determine credential path; set DEKOPON_CHATGPT_AUTH_FILE".to_owned(),
-    ))
+}
+
+/// Interprets one exported variable as a path tier, treating an empty export as unset.
+///
+/// This is the filter the other two discovery ladders in this workspace already carry
+/// (`dekopon-config`, `dekopon-broker-protocol`): a variable exported with an empty value is an
+/// unset variable that happens to exist, and resolving it would otherwise turn
+/// `XDG_CONFIG_HOME=""` into the relative path `dekopon/<file>` rather than falling through to
+/// `HOME`.
+fn exported_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
@@ -1617,14 +1670,94 @@ mod tests {
     use dekopon_core::Redacted;
 
     use super::{
-        AUTH_VERSION, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints, build_request_body,
-        credential_lock_path, export_credentials, extract_account_id, load_credentials,
-        login_with_endpoints, logout, parse_sse, save_credentials, status,
+        AUTH_VERSION, AuthPathEnvironment, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints,
+        ChatGptError, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, build_request_body,
+        credential_lock_path, export_credentials, exported_path, extract_account_id,
+        load_credentials, login_with_endpoints, logout, parse_sse, save_credentials, status,
     };
     use crate::{
         mock::{MockResponse, MockServer},
         model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool},
     };
+
+    /// Builds the tier set the process would have captured from these exports.
+    fn exports(
+        environment: Option<&str>,
+        xdg_config_home: Option<&str>,
+        home: Option<&str>,
+    ) -> AuthPathEnvironment {
+        let export = |value: Option<&str>| exported_path(value.map(OsString::from));
+        AuthPathEnvironment {
+            environment: export(environment),
+            xdg_config_home: export(xdg_config_home),
+            home: export(home),
+            app_data: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_xdg_config_home_falls_through_to_home() {
+        // An empty export is an unset variable that happens to exist. Honouring it would resolve
+        // to the relative `dekopon/chatgpt-auth.json`, and `save_credentials` would then write the
+        // rotating refresh token into whatever directory the process started in.
+        let resolved = exports(None, Some(""), Some("/home/operator"))
+            .resolve(DEFAULT_AUTH_FILE_NAME)
+            .expect("an empty tier falls through to the next one");
+
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/operator/.config/dekopon/chatgpt-auth.json")
+        );
+    }
+
+    #[test]
+    fn every_tier_being_empty_is_the_same_as_every_tier_being_unset() {
+        let refused = exports(Some(""), Some(""), Some(""))
+            .resolve(DEFAULT_AUTH_FILE_NAME)
+            .expect_err("no tier applies");
+
+        let ChatGptError::Configuration(message) = refused else {
+            panic!("an exhausted ladder is a configuration error: {refused:?}");
+        };
+        assert!(
+            message.contains("DEKOPON_CHATGPT_AUTH_FILE"),
+            "the refusal must name the way out it accepts: {message}"
+        );
+    }
+
+    #[test]
+    fn a_relative_credential_path_is_refused_by_name() {
+        let refused = exports(Some("dekopon-auth.json"), None, None)
+            .resolve(DEFAULT_AUTH_FILE_NAME)
+            .expect_err("a relative credential path is refused");
+
+        let ChatGptError::Configuration(message) = refused else {
+            panic!("a relative credential path is a configuration error: {refused:?}");
+        };
+        assert!(
+            message.contains("dekopon-auth.json"),
+            "the refusal must name the path an operator will go and look at: {message}"
+        );
+        assert!(
+            message.contains("DEKOPON_CHATGPT_AUTH_FILE"),
+            "the refusal must name the variable that produced it: {message}"
+        );
+    }
+
+    #[test]
+    fn a_relative_xdg_config_home_is_refused_rather_than_written_into_the_cwd() {
+        let refused = exports(None, Some("relative-config"), Some("/home/operator"))
+            .resolve(DEFAULT_AUTH_FILE_NAME)
+            .expect_err("a relative tier is refused rather than silently used");
+
+        let ChatGptError::Configuration(message) = refused else {
+            panic!("a relative credential path is a configuration error: {refused:?}");
+        };
+        assert!(
+            message.contains("relative-config"),
+            "the refusal must name the path an operator will go and look at: {message}"
+        );
+    }
 
     fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(

@@ -56,7 +56,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #3 — SILENT_FAILURE_MODE — crates/dekopon-model/src/chatgpt.rs:1209
+## [x] #3 — SILENT_FAILURE_MODE — crates/dekopon-model/src/chatgpt.rs:1209
 
 **Finding:** The ChatGPT credential-path resolver is the only one of the three XDG/HOME ladders without the empty-value filter the other two carry (`dekopon-config/src/lib.rs:411`, `broker-protocol/src/lib.rs:2309`), so `XDG_CONFIG_HOME=""` resolves to the *relative* path `dekopon/auth.json` and `save_credentials` writes the OAuth refresh token (0600) into the process cwd — a git checkout, typically — with no error; the next run from another cwd re-prompts login. (raw: E, D2)
 **Blast radius:** HIGH  **Confidence:** HIGH
