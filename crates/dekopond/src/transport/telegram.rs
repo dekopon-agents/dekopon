@@ -18,8 +18,9 @@ use crate::{
     config::ActivityMode,
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, split_message,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, reconnect_delay,
+        retry_after_from_body, split_message,
     },
 };
 
@@ -40,8 +41,8 @@ const POLL_SECONDS: u64 = 50;
 const POLL_TIMEOUT: Duration = Duration::from_secs(POLL_SECONDS + 20);
 const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
+/// Ceiling on a server-directed activity cooldown.
+const MAX_ACTIVITY_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub(crate) struct TelegramTransport {
     name: String,
@@ -241,12 +242,6 @@ impl TelegramTransport {
         }
         Vec::new()
     }
-
-    fn backoff(&self) -> Duration {
-        let step = BASE_BACKOFF.saturating_mul(1_u32 << self.failures.min(7));
-        step.min(MAX_BACKOFF)
-            .saturating_add(Duration::from_millis(u64::from(std::process::id() % 250)))
-    }
 }
 
 impl ChatTransport for TelegramTransport {
@@ -288,7 +283,7 @@ impl ChatTransport for TelegramTransport {
                         transport = %self.name,
                         category = error.category()
                     );
-                    tokio::time::sleep(self.backoff()).await;
+                    tokio::time::sleep(reconnect_delay(self.failures)).await;
                 }
             }
         })
@@ -438,12 +433,12 @@ impl ChatActivity for TelegramReplier {
                     .expect("Telegram activity cooldown") = None;
                 return Ok(());
             }
-            if let Some(seconds) = body["parameters"]["retry_after"].as_u64() {
+            if let Some(retry) = retry_after_from_body(&body["parameters"], MAX_ACTIVITY_COOLDOWN) {
                 *self
                     .activity_cooldown_until
                     .lock()
                     .expect("Telegram activity cooldown") =
-                    Some(tokio::time::Instant::now() + Duration::from_secs(seconds.min(300)));
+                    Some(tokio::time::Instant::now() + retry.wait);
                 return Err(TransportError::Service {
                     code: "retry-after".to_owned(),
                 });
@@ -521,7 +516,7 @@ impl TelegramReplier {
     ) -> Result<DeliveryReceipt, TransportError> {
         let mut accepted = prior_accepted;
         let mut last_receipt = None;
-        for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS)
+        for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
             .into_iter()
             .enumerate()
         {

@@ -5,11 +5,16 @@
 //! the broker alone maps to a principal. Message text is untrusted end to end and is bounded before
 //! it reaches a model.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::ExternalSubject;
 use dekopon_model::image::GeneratedImage;
+use serde_json::Value;
 
 use crate::asset::{AssetSourceRef, PendingAsset};
 use futures_util::future::BoxFuture;
@@ -27,11 +32,19 @@ pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
 /// Outbound answers are bounded because a model writes them and chat services reject or silently
 /// mangle oversized posts.
 pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
+/// Ceiling on reconnect backoff.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// First reconnect delay; doubles up to [`MAX_RECONNECT_DELAY`].
+const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+/// Upper bound on the jitter added to a reconnect delay.
+const RECONNECT_JITTER_MS: u64 = 250;
+/// How many doublings a delay may accumulate, which is what reaches the ceiling from the base.
+const MAX_RECONNECT_DOUBLINGS: u32 = 7;
 
 /// One authenticated inbound chat message.
 ///
 /// Redelivery is already rejected before one of these is built, inside the transport that knows what
-/// a redelivery looks like: Slack's `Dedup` ring keyed on `channel:ts`, Discord's on the message
+/// a redelivery looks like: Slack's [`SeenIds`] ring keyed on `channel:ts`, Discord's on the message
 /// snowflake, WhatsApp's bounded claim set on the `wamid`, and Telegram's advancing `offset`, which
 /// is the acknowledgment. [`Self::message_id`] therefore exists for the delivered-turn attestation
 /// rather than for that question.
@@ -514,16 +527,40 @@ pub(crate) fn bound_outbound(text: &str) -> String {
     format!("{}{MARKER}{}", &text[..head], &text[tail..])
 }
 
+/// How a chat service counts one message against its own length ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextUnit {
+    /// UTF-16 code units. Discord's 2,000 and Telegram's 4,096 are both UTF-16 ceilings, and
+    /// counting scalar values against them would let a chunk of astral emoji through at twice the
+    /// declared size — the whole answer rejected, with no partial delivery and nothing to read.
+    Utf16,
+    /// Unicode scalar values, which is what Meta counts against WhatsApp's 4,096 ceiling.
+    Scalar,
+}
+
+impl TextUnit {
+    /// How much one character costs against a ceiling counted in this unit.
+    const fn weight(self, character: char) -> usize {
+        match self {
+            Self::Utf16 => character.len_utf16(),
+            Self::Scalar => 1,
+        }
+    }
+}
+
 /// Splits one answer into chunks a chat service will accept, preferring line boundaries.
 ///
-/// `max_units` is counted in UTF-16 code units because that is what the services enforce — Discord's
-/// 2,000 and Telegram's 4,096 are both UTF-16 ceilings. Counting scalar values instead would let a
-/// chunk of astral emoji through at twice the declared size and get the whole answer rejected, with
-/// no partial delivery and nothing for the sender to read.
+/// `max_units` is counted in `unit`, because the services do not agree on what they count and a
+/// chunk measured in the wrong unit is rejected whole rather than trimmed.
 ///
-/// An empty answer becomes one placeholder chunk: every chat service refuses an empty post, and
-/// "the model said nothing" is a better thing for a person to see than silence.
-pub(crate) fn split_message(text: &str, max_units: usize) -> Vec<String> {
+/// Not truncation: the gateway's own outbound bound is 8 KiB, above what one Discord, Telegram, or
+/// WhatsApp message may carry, so an answer longer than a service ceiling is the ordinary case and
+/// dropping its second half would lose the conclusion.
+///
+/// An empty answer becomes one placeholder chunk, for every service alike: they all refuse an
+/// empty post, so the alternative to a placeholder is not an empty message but a delivery failure,
+/// and "the model said nothing" is a better thing for a person to see than silence.
+pub(crate) fn split_message(text: &str, max_units: usize, unit: TextUnit) -> Vec<String> {
     if text.is_empty() {
         return vec!["[empty response]".to_owned()];
     }
@@ -534,7 +571,7 @@ pub(crate) fn split_message(text: &str, max_units: usize) -> Vec<String> {
         let mut units = 0;
         let mut end = text.len();
         for (index, character) in rest.char_indices() {
-            let next = units + character.len_utf16();
+            let next = units + unit.weight(character);
             if next > max_units {
                 end = start + index;
                 break;
@@ -553,6 +590,105 @@ pub(crate) fn split_message(text: &str, max_units: usize) -> Vec<String> {
     chunks
 }
 
+/// Exponential reconnect backoff with a fixed ceiling and random jitter.
+///
+/// The jitter is what keeps a fleet of daemons restarted together — a rolling deploy, a service
+/// outage that dropped every socket at once — from lining up on the same retry instant and
+/// arriving as one thundering herd. It is drawn from the OS rather than derived from the process
+/// identifier, which a container runtime is free to hand out identically in every pod.
+pub(crate) fn reconnect_delay(failures: u32) -> Duration {
+    let step = BASE_RECONNECT_DELAY.saturating_mul(1_u32 << failures.min(MAX_RECONNECT_DOUBLINGS));
+    step.min(MAX_RECONNECT_DELAY)
+        .saturating_add(Duration::from_millis(jitter_below(RECONNECT_JITTER_MS)))
+}
+
+/// A random value in `[0, upper)`.
+///
+/// The modulo bias is immaterial: every caller is spreading retries or heartbeats over a window,
+/// not minting an identifier. `0` for an empty range, and for an OS that would not supply entropy —
+/// which costs de-synchronization rather than correctness, and says so once per occurrence.
+pub(crate) fn jitter_below(upper: u64) -> u64 {
+    if upper == 0 {
+        return 0;
+    }
+    let mut bytes = [0_u8; 8];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(event = "gateway_transport_jitter_unavailable", error = %error);
+        return 0;
+    }
+    u64::from_le_bytes(bytes) % upper
+}
+
+/// A server-directed wait read from a rate-limit response body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetryAfter {
+    /// How long to wait, never longer than the ceiling the caller passed.
+    pub wait: Duration,
+    /// Whether the service asked for longer than that ceiling.
+    ///
+    /// The difference a caller acts on: a wait it is willing to sit out and retry, against one it
+    /// will not, which is a rate limit to report rather than absorb.
+    pub capped: bool,
+}
+
+/// Reads the `retry_after` seconds a rate-limit body names, in seconds, capped at `max`.
+///
+/// `None` means the body named no wait that can be acted on — the field is absent, is not a
+/// number, is not finite, or is negative. That is a malformed rate-limit response rather than a
+/// wait, and it is deliberately not the same answer as a wait that is merely too long: one says
+/// the service is throttling, the other says the service did not say why it refused.
+pub(crate) fn retry_after_from_body(body: &Value, max: Duration) -> Option<RetryAfter> {
+    let seconds = body["retry_after"]
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)?;
+    let ceiling = max.as_secs_f64();
+    Some(RetryAfter {
+        wait: Duration::from_secs_f64(seconds.min(ceiling)),
+        capped: seconds > ceiling,
+    })
+}
+
+/// Bounded ring of identifiers a transport has already accepted.
+///
+/// Bounded because it must survive reconnects without becoming a slow leak on a busy workspace,
+/// and a ring because the only redeliveries that matter are recent ones.
+pub(crate) struct SeenIds {
+    order: VecDeque<String>,
+    seen: HashSet<String>,
+    capacity: usize,
+}
+
+impl SeenIds {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            seen: HashSet::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Records an identifier, reporting `false` when it was already seen.
+    pub(crate) fn insert(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.capacity
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        true
+    }
+
+    /// Forgets an identifier, so the next delivery carrying it is accepted again.
+    pub(crate) fn remove(&mut self, key: &str) {
+        if self.seen.remove(key) {
+            self.order.retain(|candidate| candidate != key);
+        }
+    }
+}
+
 /// Largest character boundary at or below `index`.
 pub(crate) fn floor_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
@@ -569,4 +705,133 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, time::Duration};
+
+    use serde_json::json;
+
+    use super::{
+        BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
+        SeenIds, TextUnit, jitter_below, reconnect_delay, retry_after_from_body, split_message,
+    };
+
+    /// The delay every transport now shares: doubling from the base, clamped at seven doublings,
+    /// ceilinged, and never longer than the ceiling plus one jitter window. The clamp is what
+    /// stops the shift from overflowing rather than a cosmetic bound, so a transport that has
+    /// failed twenty times must still land in the same window as one that has failed seven.
+    #[test]
+    fn a_reconnect_delay_doubles_within_its_ceiling_and_jitter() {
+        let ceiling = MAX_RECONNECT_DELAY + Duration::from_millis(RECONNECT_JITTER_MS);
+        for failures in [0_u32, 1, 2, 7, 8, 20, u32::MAX] {
+            let floor = BASE_RECONNECT_DELAY
+                .saturating_mul(1 << failures.min(MAX_RECONNECT_DOUBLINGS))
+                .min(MAX_RECONNECT_DELAY);
+            let delay = reconnect_delay(failures);
+            assert!(
+                delay >= floor && delay <= ceiling,
+                "{failures} failures produced {delay:?}, outside {floor:?}..={ceiling:?}"
+            );
+        }
+        assert_eq!(
+            reconnect_delay(7).min(MAX_RECONNECT_DELAY),
+            reconnect_delay(u32::MAX).min(MAX_RECONNECT_DELAY)
+        );
+    }
+
+    /// Jitter has to be inside its window and has to actually vary. The previous per-transport
+    /// spellings derived it from the process identifier, which is fixed for the life of a process
+    /// and identical across pods a runtime numbers the same way — a jitter that de-synchronizes
+    /// nothing.
+    #[test]
+    fn jitter_stays_below_its_bound_and_is_not_a_constant() {
+        assert_eq!(jitter_below(0), 0);
+        assert_eq!(jitter_below(1), 0);
+        for _ in 0..256 {
+            assert!(jitter_below(RECONNECT_JITTER_MS) < RECONNECT_JITTER_MS);
+        }
+        let drawn: HashSet<u64> = (0..64).map(|_| jitter_below(u64::MAX)).collect();
+        assert!(drawn.len() > 1, "the jitter is the same value every time");
+    }
+
+    /// A ring, not a set: the oldest identifier is the one evicted, so a redelivery of a recent
+    /// message is still refused after the ring has turned over.
+    #[test]
+    fn seen_identifiers_evict_oldest_first_and_can_be_released() {
+        let mut seen = SeenIds::new(2);
+        assert!(seen.insert("a".to_owned()));
+        assert!(seen.insert("b".to_owned()));
+        assert!(!seen.insert("a".to_owned()), "a repeat is refused");
+
+        assert!(seen.insert("c".to_owned()), "the ring accepts a third");
+        assert!(seen.insert("a".to_owned()), "the oldest was evicted");
+        assert!(!seen.insert("c".to_owned()), "the newest was retained");
+
+        seen.remove("c");
+        assert!(
+            seen.insert("c".to_owned()),
+            "a released claim is accepted again"
+        );
+    }
+
+    /// The wait a service directs, separated from the two ways a body fails to name one: nothing
+    /// usable at all, and a wait longer than the caller will sit out.
+    #[test]
+    fn a_retry_after_body_is_read_capped_and_classified() {
+        let max = Duration::from_secs(30);
+        for body in [
+            json!({}),
+            json!({ "retry_after": "5" }),
+            json!({ "retry_after": null }),
+            json!({ "retry_after": -1.0 }),
+            json!({ "retry_after": f64::INFINITY }),
+        ] {
+            assert!(
+                retry_after_from_body(&body, max).is_none(),
+                "{body} named a usable wait"
+            );
+        }
+
+        let short = retry_after_from_body(&json!({ "retry_after": 1.5 }), max)
+            .expect("a wait inside the ceiling");
+        assert_eq!(short.wait, Duration::from_millis(1_500));
+        assert!(!short.capped);
+
+        let integer =
+            retry_after_from_body(&json!({ "retry_after": 2 }), max).expect("an integer wait");
+        assert_eq!(integer.wait, Duration::from_secs(2));
+
+        let long = retry_after_from_body(&json!({ "retry_after": 900.0 }), max)
+            .expect("a wait past the ceiling is still a wait");
+        assert_eq!(long.wait, max, "the wait is capped rather than honored");
+        assert!(long.capped, "the caller cannot tell it was capped");
+
+        let exact = retry_after_from_body(&json!({ "retry_after": 30.0 }), max)
+            .expect("the ceiling itself");
+        assert!(!exact.capped, "the ceiling itself is not over it");
+    }
+
+    /// Same text, two ceilings: an astral scalar costs two UTF-16 code units and one scalar value,
+    /// which is the whole reason the unit is a parameter rather than an assumption.
+    #[test]
+    fn splitting_counts_in_the_unit_the_service_enforces() {
+        let text = "🦀".repeat(100);
+        assert_eq!(split_message(&text, 100, TextUnit::Scalar).len(), 1);
+        assert_eq!(split_message(&text, 100, TextUnit::Utf16).len(), 2);
+        assert_eq!(
+            split_message(&text, 100, TextUnit::Utf16).concat(),
+            text,
+            "no scalar is lost at a chunk boundary"
+        );
+
+        for unit in [TextUnit::Utf16, TextUnit::Scalar] {
+            assert_eq!(
+                split_message("", 4_096, unit),
+                vec!["[empty response]".to_owned()],
+                "every service refuses an empty post, so every unit answers the same way"
+            );
+        }
+    }
 }

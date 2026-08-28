@@ -30,9 +30,9 @@ use crate::{
     },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SessionStop, ThreadClaim,
-        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
-        bound_inbound, floor_boundary,
+        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, SessionStop,
+        ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError, TransportEvent,
+        TransportIdentity, bound_inbound, floor_boundary, reconnect_delay,
     },
 };
 
@@ -57,10 +57,6 @@ const REQUEST_SUBTYPES: [&str; 3] = ["file_share", "me_message", "thread_broadca
 const MAX_ATTACHMENTS: usize = 10;
 /// Ceiling on one file name inside an attachment note.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
-/// Ceiling on reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// First reconnect delay; doubles up to [`MAX_BACKOFF`].
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// Activity must never inherit the final reply/file client's general 30-second wait.
 const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a socket may say nothing before it is treated as dead.
@@ -87,7 +83,7 @@ pub(crate) struct SlackTransport {
     socket: Option<Socket>,
     identity: TransportIdentity,
     team_id: Option<String>,
-    seen: Dedup,
+    seen: SeenIds,
     pending: VecDeque<TransportEvent>,
     failures: u32,
     experience: SlackExperience,
@@ -127,7 +123,7 @@ impl SlackTransport {
             socket: None,
             identity: TransportIdentity::default(),
             team_id: None,
-            seen: Dedup::new(DEDUP_CAPACITY),
+            seen: SeenIds::new(DEDUP_CAPACITY),
             pending: VecDeque::new(),
             failures: 0,
             experience,
@@ -407,18 +403,6 @@ impl SlackTransport {
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
         }))
     }
-
-    /// Exponential backoff with a fixed ceiling, jittered by the process identifier.
-    ///
-    /// Nothing in this workspace generates randomness and one reconnect loop is not worth a
-    /// dependency for it, so the jitter is derived rather than random. It is enough to keep a fleet
-    /// of daemons restarted together from lining up on the same retry instant.
-    fn backoff(&self) -> Duration {
-        let step = BASE_BACKOFF.saturating_mul(1_u32 << self.failures.min(7));
-        let capped = step.min(MAX_BACKOFF);
-        let jitter = u64::from(std::process::id() % 250);
-        capped.saturating_add(Duration::from_millis(jitter))
-    }
 }
 
 /// Negotiates one Socket Mode connection and waits for Slack's `hello`.
@@ -476,7 +460,7 @@ impl ChatTransport for SlackTransport {
                     return Ok(event);
                 }
                 if self.socket.is_none() {
-                    tokio::time::sleep(self.backoff()).await;
+                    tokio::time::sleep(reconnect_delay(self.failures)).await;
                     if let Err(error) = self.open().await {
                         self.failures = self.failures.saturating_add(1);
                         tracing::warn!(
@@ -1016,40 +1000,6 @@ impl OwnedThreads {
         if self.owned.remove(key) {
             self.order.retain(|candidate| candidate != key);
         }
-    }
-}
-
-/// Bounded ring of seen message identifiers.
-///
-/// Bounded because it must survive reconnects without becoming a slow leak on a busy workspace,
-/// and a ring because the only redeliveries that matter are recent ones.
-struct Dedup {
-    order: VecDeque<String>,
-    seen: HashSet<String>,
-    capacity: usize,
-}
-
-impl Dedup {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Records an identifier, reporting `false` when it was already seen.
-    fn insert(&mut self, key: String) -> bool {
-        if !self.seen.insert(key.clone()) {
-            return false;
-        }
-        self.order.push_back(key);
-        if self.order.len() > self.capacity
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.seen.remove(&evicted);
-        }
-        true
     }
 }
 

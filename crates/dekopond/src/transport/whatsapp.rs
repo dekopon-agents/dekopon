@@ -5,7 +5,7 @@
 //! atomically, and acknowledges before any session or model work begins.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -30,7 +30,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
-    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
+    ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
+    bound_inbound, split_message,
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -41,6 +42,11 @@ const MAX_CONNECTION_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_QUERY_BYTES: usize = 2 * 1024;
 const MAX_QUERY_VALUE_BYTES: usize = 512;
 const MAX_MESSAGES_PER_DELIVERY: usize = 128;
+/// Message identifiers one webhook remembers, four times the socket transports' ring.
+///
+/// Deliberately larger: Slack's and Discord's rings only have to bridge one reconnect, while this
+/// is the whole replay defense for a webhook Meta retries for far longer than a delivery burst,
+/// and each burst may itself carry [`MAX_MESSAGES_PER_DELIVERY`] identifiers.
 const MAX_DEDUP_IDS: usize = 4096;
 const MAX_QUEUED_MESSAGES: usize = 512;
 const WEBHOOK_QUEUE: usize = 64;
@@ -76,7 +82,7 @@ struct WebhookState {
     waba_id: String,
     phone_number_id: String,
     sender: mpsc::Sender<QueuedDelivery>,
-    dedup: Arc<Mutex<Dedup>>,
+    dedup: Arc<Mutex<ClaimedIds>>,
     refusals: Arc<Mutex<RefusalLog>>,
     queue_capacity: Arc<Semaphore>,
     concurrency: Arc<Semaphore>,
@@ -191,29 +197,21 @@ struct QueuedDelivery {
     _capacity: OwnedSemaphorePermit,
 }
 
-struct Dedup {
-    ids: HashSet<String>,
-    order: VecDeque<String>,
-}
+/// The webhook's redelivery ring, with the claim/release the acknowledgment needs.
+///
+/// A webhook answers Meta before the work is queued, so an identifier is *claimed* on arrival and
+/// released again if the queue refuses it. The ring underneath is the one Slack and Discord use.
+struct ClaimedIds(SeenIds);
 
-impl Dedup {
+impl ClaimedIds {
     fn new() -> Self {
-        Self {
-            ids: HashSet::with_capacity(MAX_DEDUP_IDS),
-            order: VecDeque::with_capacity(MAX_DEDUP_IDS),
-        }
+        Self(SeenIds::new(MAX_DEDUP_IDS))
     }
 
     fn claim(&mut self, messages: Vec<InboundMessage>) -> Vec<InboundMessage> {
         let mut accepted = Vec::with_capacity(messages.len());
         for message in messages {
-            if self.ids.insert(message.message_id.clone()) {
-                self.order.push_back(message.message_id.clone());
-                while self.order.len() > MAX_DEDUP_IDS {
-                    if let Some(oldest) = self.order.pop_front() {
-                        self.ids.remove(&oldest);
-                    }
-                }
+            if self.0.insert(message.message_id.clone()) {
                 accepted.push(message);
             }
         }
@@ -224,9 +222,8 @@ impl Dedup {
     /// silently acknowledged as a duplicate of work nothing is doing.
     fn release(&mut self, claimed: &[String]) {
         for id in claimed {
-            self.ids.remove(id);
+            self.0.remove(id);
         }
-        self.order.retain(|id| self.ids.contains(id));
     }
 }
 
@@ -272,7 +269,7 @@ impl WhatsappTransport {
                 waba_id,
                 phone_number_id,
                 sender,
-                dedup: Arc::new(Mutex::new(Dedup::new())),
+                dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
@@ -857,7 +854,7 @@ impl WhatsappReplier {
         let bytes = bounded_response(response).await?;
         if !status.is_success() {
             return Err(TransportError::Service {
-                code: status.as_u16().to_string(),
+                code: format!("http-{}", status.as_u16()),
             });
         }
         let value: Value =
@@ -897,7 +894,7 @@ impl ChatReplier for WhatsappReplier {
             }
             let mut accepted = 0_usize;
             let mut last_id = None;
-            for chunk in split_message(&text) {
+            for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
                 match self.send_text(&recipient, &chunk).await {
                     Ok(id) => {
                         accepted += 1;
@@ -942,36 +939,6 @@ async fn bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Transp
     Ok(bytes)
 }
 
-/// Splits an answer into service-sized messages, preferring a line boundary.
-///
-/// Not truncation: the session's own outbound bound is 8 KiB, which is twice what one WhatsApp text
-/// message may carry, so an answer longer than the service ceiling is the ordinary case rather than
-/// an abusive one, and dropping its second half would lose the conclusion. Unicode scalar values
-/// are what Meta counts.
-fn split_message(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        // The byte offset of the scalar just past this chunk's ceiling, or the end of the text.
-        let mut end = text[start..]
-            .char_indices()
-            .nth(MAX_WHATSAPP_TEXT_CHARS)
-            .map_or(text.len(), |(index, _)| start + index);
-        if end < text.len()
-            && let Some(newline) = text[start..end].rfind('\n')
-            && newline > 0
-        {
-            end = start + newline + 1;
-        }
-        chunks.push(text[start..end].to_owned());
-        start = end;
-    }
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -992,7 +959,7 @@ mod tests {
                 waba_id: "123".to_owned(),
                 phone_number_id: "456".to_owned(),
                 sender,
-                dedup: Arc::new(Mutex::new(Dedup::new())),
+                dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(1)),
@@ -1248,7 +1215,7 @@ mod tests {
             }),
         )
         .expect("delivery");
-        let mut dedup = Dedup::new();
+        let mut dedup = ClaimedIds::new();
         assert_eq!(dedup.claim(messages.clone()).len(), 1);
         assert!(dedup.claim(messages).is_empty());
     }
@@ -1527,12 +1494,18 @@ mod tests {
         // post-transmission outcome cannot create a second visible message.
     }
 
+    /// The one WhatsApp counting unit, exercised through the shared splitter: Meta counts scalars,
+    /// so 4,096 crabs are one message here where the same text is two on a UTF-16 ceiling.
+    fn split(text: &str) -> Vec<String> {
+        split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
+    }
+
     #[test]
     fn long_answers_split_by_unicode_scalars_without_losing_text() {
-        assert_eq!(split_message(&"🦀".repeat(4096)).len(), 1);
+        assert_eq!(split(&"🦀".repeat(4096)).len(), 1);
 
         let answer = format!("BEGIN{}END", "🦀".repeat(4097));
-        let chunks = split_message(&answer);
+        let chunks = split(&answer);
         assert!(
             chunks.len() > 1,
             "an answer past the ceiling is not one post"
@@ -1549,12 +1522,14 @@ mod tests {
         );
 
         let lines = format!("{}\ntail", "x".repeat(MAX_WHATSAPP_TEXT_CHARS - 1));
-        let split = split_message(&lines);
-        assert_eq!(split.len(), 2);
-        assert!(split[0].ends_with('\n'), "a line boundary is preferred");
-        assert_eq!(split.concat(), lines);
+        let broken = split(&lines);
+        assert_eq!(broken.len(), 2);
+        assert!(broken[0].ends_with('\n'), "a line boundary is preferred");
+        assert_eq!(broken.concat(), lines);
 
-        assert_eq!(split_message(""), vec![String::new()]);
+        // One rule for every transport: Meta refuses an empty message body exactly as Slack and
+        // Discord do, so an empty answer is a visible placeholder rather than a delivery failure.
+        assert_eq!(split(""), vec!["[empty response]".to_owned()]);
     }
 
     #[tokio::test]
