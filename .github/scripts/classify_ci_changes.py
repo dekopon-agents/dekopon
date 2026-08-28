@@ -21,6 +21,7 @@ CATEGORIES = (
     "run_dependencies",
     "run_release_metadata",
     "run_chart",
+    "run_docs",
 )
 
 FULL_CI_INPUTS = {
@@ -29,6 +30,8 @@ FULL_CI_INPUTS = {
     ".github/scripts/classify_ci_changes.py",
     ".github/scripts/test_classify_ci_changes.py",
     ".github/scripts/ci_metrics.sh",
+    ".github/scripts/check_docs_duplicates.py",
+    ".github/scripts/render-homebrew-formula.py",
 }
 
 RUST_ROOT_INPUTS = {
@@ -149,12 +152,18 @@ def classify_path(path: str) -> dict[str, bool]:
     ):
         flags["run_chart"] = True
 
+    if path.startswith("docs/") or path.casefold().endswith(".md"):
+        flags["run_docs"] = True
+
     # Preserve the existing OTLP and release-profile install coverage for every
     # Rust-affecting change. Both exercise normal dependencies outside the four
     # binary crates, so path-only direct-crate gating would silently lose coverage.
     if flags["run_rust"]:
         flags["run_otel"] = True
         flags["run_cli_install"] = True
+        # The documentation lane also reads crates/**/*.rs: it fails a PR that emits
+        # an audit event name docs/observability.md does not carry.
+        flags["run_docs"] = True
 
     return flags
 

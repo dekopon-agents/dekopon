@@ -11,8 +11,18 @@ class ClassifyCiChangesTests(unittest.TestCase):
         expected = {category: category in selected for category in CATEGORIES}
         self.assertEqual(result, expected)
 
-    def test_prose_only_selects_no_expensive_lane(self) -> None:
-        self.assert_selected(["docs/design.md", "README.md"])
+    def test_prose_selects_only_the_documentation_lane(self) -> None:
+        self.assert_selected(["docs/design.md", "README.md"], "run_docs")
+
+    def test_agent_guide_selects_only_the_documentation_lane(self) -> None:
+        self.assert_selected(["AGENTS.md"], "run_docs")
+
+    def test_crate_readme_selects_documentation_and_package_lanes(self) -> None:
+        self.assert_selected(
+            ["crates/dekopon-brokerd/README.md"],
+            "run_docs",
+            "run_package",
+        )
 
     def test_workspace_source_preserves_transitive_cli_install_coverage(self) -> None:
         self.assert_selected(
@@ -20,6 +30,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_cli_install",
+            "run_docs",
         )
 
     def test_direct_binary_source_keeps_path_installation_coverage(self) -> None:
@@ -28,6 +39,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_cli_install",
+            "run_docs",
         )
 
     def test_lockfile_change_runs_every_rust_metadata_lane(self) -> None:
@@ -38,6 +50,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_package",
             "run_cli_install",
             "run_dependencies",
+            "run_docs",
         )
 
     def test_crate_manifest_runs_package_and_dependency_checks(self) -> None:
@@ -48,13 +61,15 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_package",
             "run_cli_install",
             "run_dependencies",
+            "run_docs",
         )
 
-    def test_changelog_runs_only_release_and_chart_checks(self) -> None:
+    def test_changelog_runs_release_chart_and_documentation_checks(self) -> None:
         self.assert_selected(
             ["CHANGELOG.md"],
             "run_release_metadata",
             "run_chart",
+            "run_docs",
         )
 
     def test_chart_only_change_does_not_compile_rust(self) -> None:
@@ -81,6 +96,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
                     "run_rust",
                     "run_otel",
                     "run_cli_install",
+                    "run_docs",
                 )
 
     def test_otel_fixture_preserves_rust_and_smoke_coverage(self) -> None:
@@ -89,11 +105,21 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_cli_install",
+            "run_docs",
         )
 
     def test_ci_control_changes_fail_open_to_every_lane(self) -> None:
         self.assert_selected([".github/workflows/ci.yml"], *CATEGORIES)
         self.assert_selected([".github/scripts/ci_metrics.sh"], *CATEGORIES)
+
+    def test_gate_scripts_fail_open_to_every_lane(self) -> None:
+        # Neither script has a lane of its own, so an edit to one used to run nothing at all.
+        for path in (
+            ".github/scripts/check_docs_duplicates.py",
+            ".github/scripts/render-homebrew-formula.py",
+        ):
+            with self.subTest(path=path):
+                self.assert_selected([path], *CATEGORIES)
 
     def test_categories_union_across_paths(self) -> None:
         self.assert_selected(
@@ -101,6 +127,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_cli_install",
+            "run_docs",
             "run_chart",
         )
 
