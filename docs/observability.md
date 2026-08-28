@@ -483,34 +483,6 @@ finalization step from starting after its deadline, while the base/generation le
 reservation remain held until an already-started blocking job drains. Duration is therefore
 observation rather than a hard native-operation deadline.
 
-## The console owns its terminal
-
-`dekopon console` draws a full-screen view, so its own diagnostics must never reach the terminal it
-owns — and that means standard error as much as standard output, because the alternate screen *is*
-the terminal and a `tracing` line written there lands inside a frame and stays until something
-overdraws it. The operator's next action would then be against a display that is no longer true.
-
-So when the console is about to open and standard error is that same terminal, the subscriber writes
-to a sink. Redirecting standard error keeps every diagnostic and costs nothing:
-`dekopon console -vv 2> console.log`.
-
-It emits no span or audit event of its own. What a console session produces is exactly what a
-gateway session produces — `prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`,
-`shell.command`, and the `dekopon_agent::audit` accounting records — because it runs the same loop
-through the same crate. Its invocations carry the trace prefix `dekopon-console`, which is the join
-key between what an operator watched on screen and what the broker's audit chain recorded for the
-same session.
-
-One `debug` record exists for a failure that would otherwise be silent: a session event with no
-console left to receive it carries `reason = "console-receiver-closed"`. It fires once per lost
-event while a session finishes against a torn-down console, and never in ordinary operation.
-
-The console's own view is not telemetry and does not obey the payload gate. It renders capability
-input and output because it *is* the process that made those calls — the same reason a script's
-author can read its own variables — and it holds them in memory for the session's lifetime and
-sends them nowhere. Provider credentials are not among them: the broker injects those inside its
-native HTTP engine after guest-header validation, so nothing on this side ever holds one.
-
 ## Span payloads
 
 Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope

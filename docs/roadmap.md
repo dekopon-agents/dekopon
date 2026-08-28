@@ -140,16 +140,29 @@ only transport credentials. The same release lands a 145-finding deep-review har
 diagnosable failure causes end to end, single-pass authorization and audit serialization on the hot
 path, and three recurring failure classes promoted to deny-by-default clippy lints.
 
-Version 0.11.0 adds `dekopon console`, one command that opens an attested broker session and runs
-the agent loop locally with a model credential and no broker authority of its own, backed by an
-opt-in `dev.<surface>.<name>` subject service. `dekopon-shell` gains the bash-script surface a
-script author expects — compound commands as pipeline stages, `[[ ... ]]`, enforced
-`set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable
-streams. The `gh` shell builtin moves out of tree to `dekopon-provider-gh`, joining `turso-sql` as a
-provider published and versioned separately from this repository. Version 0.11.1 moves the
-container image's runtime base from Debian 12 to Debian 13 so it publishes at all: the console
-binary references two symbols glibc's dynamic linker requires the runtime library to name even
-though both are weak-probed and safely absent on an older one. No crate's source changed.
+Version 0.11.0 gives `dekopon-shell` the bash-script surface a script author expects — compound
+commands as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`,
+real parameter expansion, and two script-addressable streams — and adds `dekopon console`, an
+interactive terminal view over a running broker. The `gh` shell builtin moves out of tree to
+`dekopon-provider-gh`, joining `turso-sql` as a provider published and versioned separately from
+this repository. Version 0.11.1 moves the container image's runtime base from Debian 12 to Debian 13
+so it publishes at all: the CLI binary referenced two symbols glibc's dynamic linker requires the
+runtime library to name even though both are weak-probed and safely absent on an older one. No
+crate's source changed.
+
+## Unreleased — the console moved out of tree
+
+- `dekopon console` and the `dekopon-tui` crate ship from
+  [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` builtin
+  moved to `dekopon-provider-gh` and `turso-sql` to its own repository. It consumes `dekopon-agent`
+  and `dekopon-broker-protocol` from crates.io like any other unprivileged broker client.
+- Nothing loses authority: the console held a model credential and no policy, provider credential,
+  or authorization. `dekopon` is a local catalog and model-account CLI again, and the operator CLI
+  contacts no other process.
+- `ratatui`, `crossterm`, and the five duplicate-version `deny.toml` exemptions they caused leave
+  the control plane with it. So does the `dev.<surface>.<name>` subject service and the broker's
+  `allowDevelopmentSubjects` opt-in: the console was the only surface that minted one, and no
+  deployment set the field. See [`upgrading.md`](upgrading.md).
 
 ## Unreleased — Tokio process lifecycle foundation (implemented)
 
@@ -228,4 +241,4 @@ A crate should be added only with meaningful, tested behavior needed by an imple
 
 ## Explicit non-goals for 0.1
 
-Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list and has since arrived as `dekopon console`; it is an unprivileged broker client holding a model credential, so it acquires none of the operator-accessible provider or policy paths this sentence still rules out. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopon auth`; model inference and component loading remain confined to the explicitly experimental `dekopon-run` executable.
+Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopon auth`; model inference and component loading remain confined to the explicitly experimental `dekopon-run` executable.

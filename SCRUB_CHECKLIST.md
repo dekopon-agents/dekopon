@@ -208,7 +208,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: leave the hand-rolled OCI client and its controls alone. Only collapse `ProviderManagerError` to ~10 variants (`Configuration`, `FileSecurity`, `Registry`, `DigestMismatch`, `LockMismatch`, `StoreFull`, `Host`, `Io`), each with `reason: &'static str` + optional `#[source]`, preserving the exact refusal strings tests assert on and the no-secret-bytes-in-messages property.**
 
-## [ ] #22 — SIDE_QUEST — crates/dekopon-tui/ (whole crate) + crates/dekopon/src/console.rs
+## [x] #22 — SIDE_QUEST — crates/dekopon-tui/ (whole crate) + crates/dekopon/src/console.rs
 
 **Finding:** `dekopon console` (#164) added 6,170 lines and a TUI framework to the `kubectl`-shaped operator CLI, is unrunnable against the shipped chart (`allowDevelopmentSubjects` is set nowhere; default off), cost five permanent `deny.toml` duplicate-version exemptions (all from `ratatui`), added a `SubjectService::Dev` namespace to the trusted core crate, and is described in 13 documents — while `design.md:292`'s named operator commands (`apply`, `delete`, `logs`, `auth can-i`, `policy explain`) remain unbuilt. An interactive TUI was an explicit 0.1 non-goal in `roadmap.md`. (raw: B1, B2)
 **Blast radius:** HIGH  **Confidence:** MEDIUM
@@ -292,7 +292,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 *Entries #32–#35 are auditor D1's (DEAD_CODE / COMMENT_ROT), appended after the sort above; #32 and #33 are HIGH blast and belong in Wave 0/1.*
 
-## [ ] #32 — DEAD_CODE — crates/dekopon-tui/src/app.rs:308,320 + src/run.rs:51,130
+## [x] #32 — DEAD_CODE — crates/dekopon-tui/src/app.rs:308,320 + src/run.rs:51,130
 
 **Finding:** Two of the ten keys the console's help overlay advertises — `o` (expand a capability call) and `r` (reveal a redacted field) — have no arm in `run.rs::on_key`, so `App::toggle_call`, `App::reveal`, `expanded_call`, `revealed`, the `▸` disclosure branch and the `[N redacted · r to reveal]` hint are all unreachable in the running console; only unit tests call them (which is what hid it). Same commit (#164) also enables mouse capture and discards every mouse event, taking native text selection/scroll away from the operator for nothing. `crates/dekopon-tui/README.md:91` and `docs/cli.md:171` both promise "revealing is one keystroke against one field". (raw: D1)
 **Blast radius:** HIGH  **Confidence:** HIGH

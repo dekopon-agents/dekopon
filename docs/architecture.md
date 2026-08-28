@@ -4,14 +4,13 @@ Read [`design.md`](design.md) first for the product model and accepted invariant
 
 ## Published 0.11.1 foundation
 
-The published `0.11.1` patch fixes the container image, which failed to publish for `0.11.0`:
-`dekopon`'s console linked two weak-probed `GLIBC_2.39` symbols the distroless Debian 12 runtime
-base (glibc 2.36) does not provide, and glibc's dynamic linker refuses to load a binary naming a
-version node the runtime library lacks at all, weak reference or not. The base moved to Debian 13
-(glibc 2.41). No crate's source changed. It otherwise retains everything `0.11.0` added:
-`dekopon console`, which opens an attested session against the broker's Unix socket and runs the
-agent loop locally through one command, `dekopon-tui`, holding a model credential and no broker
-authority; a `dev.<surface>.<name>` subject service backs it without borrowing a real identity.
+The published `0.11.1` patch fixes the container image, which failed to publish for `0.11.0`: the
+CLI linked two weak-probed `GLIBC_2.39` symbols the distroless Debian 12 runtime base (glibc 2.36)
+does not provide, and glibc's dynamic linker refuses to load a binary naming a version node the
+runtime library lacks at all, weak reference or not. The base moved to Debian 13 (glibc 2.41). No
+crate's source changed. The interactive console `0.11.0` added has since moved out of this tree to
+[`dekopon-console`](https://github.com/dekopon-agents/dekopon-console); it was an unprivileged
+broker client holding a model credential, so no responsibility moved with it.
 `dekopon-shell` gained a real bash-script surface — compound commands as pipeline stages,
 `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and
 two script-addressable streams. `dekopon-provider-sdk-testkit` runs a provider component against
@@ -76,7 +75,6 @@ Crate boundaries are:
 - `dekopon-broker-protocol`: lightweight strict versioned messages and an unprivileged Unix client carrying proposals/results but no identity or authorization fields; it has no broker-host or native-HTTP dependency.
 - `dekopon-brokerd`: Unix-only privileged process with strict owner-controlled configuration, a separate owner-only Cedar policy file and per-capability constraint sets, private socket lifecycle, peer-UID context mapping, legacy destination-bound credentials, an owner-only public-DRN/private-source map with bounded per-invocation adapters, bounded concurrency/shutdown, durable replay restoration, provider execution, an optional explicitly bound unauthenticated read-only HTTP listener, and a separate offline provider-manager command tree. The manager keeps operator-authored exact OCI references, generated immutable resolutions, and installed content-addressed bytes distinct; daemon startup constructs no registry client and passes expected lock identities into the component host's exact-read compile boundary.
 - `dekopon-model`: bounded chat-model contract, OpenAI-compatible transport, isolated ChatGPT/Codex authentication and Responses client, and a fixed-production-endpoint OpenAI Images client returning one validated bounded PNG.
-- `dekopon-tui`: the operator console. It composes `dekopon-agent`'s session loop with the client half of the broker protocol and observes both through decorators on the `ScriptRuntime` and `CapabilityInvoker` seams, which is the only place a tool call's arguments and results exist. It links no policy, credential store, or provider host; its local dispatch leg is deliberately empty, so every capability goes to the broker and no Wasmtime enters the operator CLI. All rendered text is stripped of terminal control sequences, and model- or provider-authored secrets are redacted per field at render time.
 - `dekopon-telemetry`: OTLP exporter settings and subscriber wiring shared by the executables. Ingest credentials are read from the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable, so no configuration file, command line, or span attribute holds one.
 - `dekopon-webui`: GET-only HTML rendering and process-local status counters embedded in `dekopon-brokerd`. It documents loaded component manifests/interfaces, host-observed Wasmtime activity, credential-free OTLP settings, and bounded agent/token reports from `dekopond`; it owns no policy or execution path.
 - `dekopon-shell`: sandboxed bash-flavored script parser and tree-walking interpreter whose command words dispatch to capabilities through one abstract seam; it links no Wasmtime, broker, HTTP, or filesystem code and owns its own step, recursion, output, deadline, and capability-call bounds. It emits a `tracing` span per command word, but links no exporter and knows no telemetry protocol: the embedding binary's subscriber decides where those go, the same way `curl` there assembles a request for a capability rather than opening a socket.
@@ -89,13 +87,9 @@ Crate boundaries are:
 
 ## Deployment boundary
 
-The deployment is three operator-visible roles, two of which are now separate running processes:
+The deployment is three operator-visible roles, two of which are separate running processes:
 
 ```text
-dekopon console
-    one operator's terminal acting as a gateway: model interaction,
-    bounded sessions, and full-fidelity local observation of both
-
 dekopond
     chat transports, routing, model interaction, bounded sessions,
     bounded per-conversation history; optional post-acceptance durable recording
@@ -113,7 +107,7 @@ dekopon
 
 The gateway may now also accept a public HTTPS path after an external Cloudflare Tunnel/Traefik boundary forwards plain HTTP to its exact WhatsApp callback. That is a wakeup path only: HMAC-authenticated sender and WABA/phone routing facts become an attested proposal scope, while all policy, provider credentials, authorization, and effects remain in the broker.
 
-The two processes currently share one UID, so scoping policy on `via` is attribution rather than isolation until a dedicated gateway UID exists; see [`security-model.md`](security-model.md). The operator CLI's console shares that UID too, and therefore that peer identity: what separates a console session from a gateway session is the attested subject it names, never the connected peer.
+The two processes currently share one UID, so scoping policy on `via` is attribution rather than isolation until a dedicated gateway UID exists; see [`security-model.md`](security-model.md).
 
 A model-facing tool call is only a proposal. The daemon-to-broker request carries that proposal, not trusted identity context or an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`; it creates and consumes that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopond` never receives or presents serialized authorization state as a bearer grant, and agent code never receives raw provider credentials. Its complete contract is in [`dekopond.md`](dekopond.md).
 
