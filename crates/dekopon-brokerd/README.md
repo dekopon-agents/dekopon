@@ -593,9 +593,58 @@ chatMemory:
   compactionThresholdBytes: 12582912
 ```
 
+The three capabilities that make up the surface are named by their `route:`, not by their spelling.
+Exactly one constraint set declares each of `chatMemoryRecord`, `chatMemoryRecent`, and
+`chatMemorySearch`; they must all name one provider, and each must declare `jsonl` chat storage at
+the access its role implies — read-write for record, read-only for the two reads. Every conflict is
+reported together at startup rather than one per run.
+
+```yaml
+constraintSets:
+  memory.chat.record:
+    route: chatMemoryRecord
+    provider: memory-chat
+    effect: local-write
+    risk: Medium
+    idempotency: conditional
+    constraints:
+      timeoutMs: 30000
+      maxOutputBytes: 131072
+      storage: { interface: jsonl, access: read-write, namespace: chat }
+  memory.chat.recent:
+    route: chatMemoryRecent
+    provider: memory-chat
+    effect: read-only
+    risk: High
+    idempotency: idempotent
+    constraints:
+      timeoutMs: 30000
+      maxOutputBytes: 131072
+      storage: { interface: jsonl, access: read-only, namespace: chat }
+  memory.chat.search:
+    route: chatMemorySearch
+    provider: memory-chat
+    effect: read-only
+    risk: High
+    idempotency: idempotent
+    constraints:
+      timeoutMs: 30000
+      maxOutputBytes: 131072
+      storage: { interface: jsonl, access: read-only, namespace: chat }
+```
+
+`route:` is the only thing that reserves a capability. Omitted, it is `generic`, and the capability
+is an ordinary one on every path however it is spelled: a capability called `memory.chat.export` or
+a provider called `memory-chat` is reserved by nothing. Declared, it takes the capability off the
+generic listing, resolve, and invoke paths, takes every command word of its provider out of the
+non-chat vocabulary, and makes the record route reachable only through the delivered-turn
+operation. Renaming the shipped provider therefore drops no reservation, and the reserved names are
+the ones this deployment chose.
+
 Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
-headroom. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
+headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
+capabilities and no fourth. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
 invocation and host-call budgets, requires both logical files, and reserves the post-append old file,
 staged replacement, permanent dedup copies, and transaction metadata. Startup accounts the
 worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files

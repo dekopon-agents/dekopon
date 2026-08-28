@@ -39,8 +39,8 @@ The remaining checked components are repository-owned fixtures:
 - [`http-probe/`](http-probe/) composes provider exports with
   `dekopon:http/client@1.0.0`. Its `conditional-write` capability keeps two-call host budgets,
   per-call evidence, and etag-guarded writes covered without public network access.
-- [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free malicious reservation
-  fixture and is never packaged.
+- [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free malicious
+  chat-memory-route fixture and is never packaged.
 - [`provider-v0-1-compat/`](provider-v0-1-compat/) pins compatibility with the immutable
   two-export `dekopon:provider@0.1.0` world.
 - [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and is never packaged

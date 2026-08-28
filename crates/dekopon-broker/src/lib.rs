@@ -89,11 +89,13 @@ const PROVIDER_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.provider-res
 const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+json";
 const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evidence+json";
 
-pub const MEMORY_PROVIDER: &str = "memory-chat";
-pub const MEMORY_WORD: &str = "memory";
-pub const MEMORY_RECORD: &str = "memory.chat.record";
-pub const MEMORY_RECENT: &str = "memory.chat.recent";
-pub const MEMORY_SEARCH: &str = "memory.chat.search";
+/// Capability named by the audited denial when no chat-memory record route is declared.
+///
+/// Deliberately not a decision input: nothing compares a capability identifier to it. A
+/// deployment that declares a [`CapabilityRoute::ChatMemoryRecord`] set names its own capability,
+/// and that name is what a delivered-turn record carries. This is only the label the refusal
+/// record uses when there is no such set to name.
+const UNROUTED_RECORD_CAPABILITY: &str = "memory.chat.record";
 /// Conservative complete line bound for broker-curated HMAC dedup records.
 ///
 /// The current canonical JSON is 227 bytes including LF. Keeping explicit headroom decouples
@@ -455,6 +457,87 @@ pub enum ContextError {
     PrincipalMismatch,
 }
 
+/// Which trusted route the broker executes a capability through.
+///
+/// This is the operator's declaration, not a spelling convention. The reserved durable chat-memory
+/// surface is identified here and nowhere else: a capability is part of it because a constraint set
+/// says so, so naming a capability `memory.chat.export` or a provider `memory-chat` changes nothing
+/// the broker hides or denies, and renaming the shipped provider drops no reservation.
+///
+/// [`Generic`](Self::Generic) is the default and is omitted from serialized configuration, so every
+/// constraint set written before the field existed keeps meaning exactly what it meant.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityRoute {
+    /// An ordinary capability, reachable by any path policy permits.
+    #[default]
+    Generic,
+    /// The hidden write half of chat memory, reachable only through the delivered-turn operation.
+    ChatMemoryRecord,
+    /// The bounded recent-turns read of chat memory.
+    ChatMemoryRecent,
+    /// The bounded literal-search read of chat memory.
+    ChatMemorySearch,
+}
+
+impl CapabilityRoute {
+    /// The three roles one deployment must declare together to have a chat-memory surface.
+    pub(crate) const CHAT_MEMORY: [Self; 3] = [
+        Self::ChatMemoryRecord,
+        Self::ChatMemoryRecent,
+        Self::ChatMemorySearch,
+    ];
+
+    /// Whether this is an ordinary capability the generic paths may list, resolve, and invoke.
+    #[must_use]
+    pub const fn is_generic(&self) -> bool {
+        matches!(self, Self::Generic)
+    }
+
+    /// Whether this capability belongs to the reserved chat-memory surface.
+    #[must_use]
+    pub const fn is_chat_memory(self) -> bool {
+        !self.is_generic()
+    }
+
+    /// Whether a chat session may propose this capability directly.
+    ///
+    /// Recording is never proposable: it is reachable only from the typed delivered-turn
+    /// operation, after gateway-attested transport acceptance.
+    #[must_use]
+    pub const fn is_chat_memory_retrieval(self) -> bool {
+        matches!(self, Self::ChatMemoryRecent | Self::ChatMemorySearch)
+    }
+
+    /// The storage authority a chat-memory role requires of its constraint set.
+    const fn chat_memory_access(self) -> Option<StorageAccess> {
+        match self {
+            Self::Generic => None,
+            Self::ChatMemoryRecord => Some(StorageAccess::ReadWrite),
+            Self::ChatMemoryRecent | Self::ChatMemorySearch => Some(StorageAccess::ReadOnly),
+        }
+    }
+
+    /// The stable operator-facing name of this route, as authored and as reported.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::ChatMemoryRecord => "chatMemoryRecord",
+            Self::ChatMemoryRecent => "chatMemoryRecent",
+            Self::ChatMemorySearch => "chatMemorySearch",
+        }
+    }
+}
+
+impl fmt::Display for CapabilityRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Owner-authored execution constraints for one capability.
 ///
 /// A constraint set is not a grant. It answers "if some policy permits this capability, how
@@ -468,6 +551,13 @@ pub enum ContextError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintSet {
+    /// Which trusted route the broker executes this capability through.
+    ///
+    /// Absent means [`CapabilityRoute::Generic`]. Declaring a chat-memory role is the only thing
+    /// that puts a capability on the reserved surface, and the only thing that takes it off the
+    /// generic listing, resolve, and invoke paths.
+    #[serde(default, skip_serializing_if = "CapabilityRoute::is_generic")]
+    pub route: CapabilityRoute,
     /// Expected provider selected by the trusted route.
     pub provider: ProviderId,
     /// Trusted effect classification, which must match the loaded manifest byte for byte.
@@ -678,6 +768,25 @@ impl ConstraintCatalog {
         self.sets.iter()
     }
 
+    /// Returns the capability declared for one chat-memory role, when the deployment declares it.
+    ///
+    /// Unambiguous by construction: [`Self::validate`] refuses a catalog that gives one role two
+    /// constraint sets, so the reserved surface can never be two capabilities deep.
+    fn routed(&self, route: CapabilityRoute) -> Option<(&CapabilityId, &ConstraintSet)> {
+        self.sets.iter().find(|(_, set)| set.route == route)
+    }
+
+    /// Returns the provider every chat-memory route names, when any route is declared.
+    ///
+    /// Also unambiguous by construction: [`Self::validate`] refuses chat-memory routes split
+    /// across two providers, so one provider owns the whole reserved surface or none of it does.
+    fn chat_memory_provider(&self) -> Option<&ProviderId> {
+        self.sets
+            .values()
+            .find(|set| set.route.is_chat_memory())
+            .map(|set| &set.provider)
+    }
+
     /// Number of declared constraint sets.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -703,6 +812,7 @@ impl ConstraintCatalog {
                 maximum,
             });
         }
+        self.validate_routes()?;
         for (capability_id, set) in &self.sets {
             validate_set_constraints(set)?;
             validate_set_credential(capability_id, set, credentials)?;
@@ -718,6 +828,61 @@ impl ConstraintCatalog {
             validate_trusted_metadata(capability_id, set, provider, capability)?;
         }
         Ok(())
+    }
+
+    /// Proves the declared chat-memory routes are unambiguous and carry the authority they imply.
+    ///
+    /// Every conflict is reported together. A route mistake is an editing mistake in one file, and
+    /// an operator fixing three of them should need one run rather than three.
+    fn validate_routes(&self) -> Result<(), BrokerBuildError> {
+        let mut conflicts = Vec::new();
+        for route in CapabilityRoute::CHAT_MEMORY {
+            let claimants = self
+                .sets
+                .iter()
+                .filter(|(_, set)| set.route == route)
+                .map(|(capability, _)| capability.clone())
+                .collect::<Vec<_>>();
+            if claimants.len() > 1 {
+                conflicts.push(RouteConflict::DuplicateRole {
+                    route,
+                    capabilities: claimants,
+                });
+            }
+        }
+        let providers = self
+            .sets
+            .values()
+            .filter(|set| set.route.is_chat_memory())
+            .map(|set| set.provider.clone())
+            .collect::<BTreeSet<_>>();
+        if providers.len() > 1 {
+            conflicts.push(RouteConflict::SplitProvider {
+                providers: providers.into_iter().collect(),
+            });
+        }
+        for (capability, set) in &self.sets {
+            let Some(access) = set.route.chat_memory_access() else {
+                continue;
+            };
+            let declared = set.constraints.storage.as_ref().filter(|storage| {
+                storage.interface == StorageInterface::Jsonl
+                    && storage.namespace == StorageNamespace::Chat
+                    && storage.access == access
+            });
+            if declared.is_none() {
+                conflicts.push(RouteConflict::MissingChatStorage {
+                    capability: capability.clone(),
+                    route: set.route,
+                    access,
+                });
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(BrokerBuildError::ConflictingRoutes { conflicts })
+        }
     }
 }
 
@@ -1427,13 +1592,6 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
     Ok(())
 }
 
-fn is_memory_capability(capability: &CapabilityId) -> bool {
-    matches!(
-        capability.as_str(),
-        MEMORY_RECORD | MEMORY_RECENT | MEMORY_SEARCH
-    )
-}
-
 /// The model-facing note announcing durable chat memory.
 ///
 /// Shared by the live surface and the startup frame ceiling so the check measures the exact bytes
@@ -1444,11 +1602,6 @@ fn memory_prompt_note(max_lookback_turns: u32) -> String {
          search --query TEXT`. Searches inspect at most {max_lookback_turns} prior turns. Do not \
          claim recall without retrieving it."
     )
-}
-
-fn is_reserved_memory_route(capability: &CapabilityId, set: Option<&ConstraintSet>) -> bool {
-    capability.as_str().starts_with("memory.chat.")
-        || set.is_some_and(|set| set.provider.as_str() == MEMORY_PROVIDER)
 }
 
 fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
@@ -1558,6 +1711,74 @@ fn canonical_signed_decimal(value: &str) -> bool {
     value
         .parse::<i64>()
         .is_ok_and(|number| number != 0 && number.to_string() == value)
+}
+
+/// One thing wrong with the deployment's declared capability routes.
+///
+/// A route is the operator's only handle on the reserved chat-memory surface, so an ambiguous or
+/// under-declared one has no reading the broker may pick for them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteConflict {
+    /// Two or more constraint sets claimed one chat-memory role.
+    DuplicateRole {
+        /// The role claimed more than once.
+        route: CapabilityRoute,
+        /// Every capability claiming it, in catalog order.
+        capabilities: Vec<CapabilityId>,
+    },
+    /// Chat-memory routes named more than one provider.
+    ///
+    /// The surface is one component's, all of it or none: a split would let one provider hold the
+    /// write half of a conversation another provider reads back.
+    SplitProvider {
+        /// Every provider named by a chat-memory route.
+        providers: Vec<ProviderId>,
+    },
+    /// A chat-memory route did not declare the chat-namespace JSONL authority its role requires.
+    MissingChatStorage {
+        /// The capability carrying the route.
+        capability: CapabilityId,
+        /// The declared route.
+        route: CapabilityRoute,
+        /// The storage access that role must declare.
+        access: StorageAccess,
+    },
+}
+
+impl fmt::Display for RouteConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateRole {
+                route,
+                capabilities,
+            } => {
+                write!(formatter, "route {route} is claimed by")?;
+                for capability in capabilities {
+                    write!(formatter, " {capability}")?;
+                }
+                write!(
+                    formatter,
+                    "; exactly one constraint set may declare each chat-memory role"
+                )
+            }
+            Self::SplitProvider { providers } => {
+                write!(formatter, "chat-memory routes name providers")?;
+                for provider in providers {
+                    write!(formatter, " {provider}")?;
+                }
+                write!(formatter, "; one provider must own the whole surface")
+            }
+            Self::MissingChatStorage {
+                capability,
+                route,
+                access,
+            } => write!(
+                formatter,
+                "capability {capability} declares route {route} without jsonl chat storage at \
+                 {access:?} access"
+            ),
+        }
+    }
 }
 
 /// Failure to construct a coherent broker boundary.
@@ -1735,6 +1956,15 @@ pub enum BrokerBuildError {
     /// Chat-memory bounds or their composition with storage ceilings are invalid.
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
+    /// Declared capability routes were ambiguous or under-declared.
+    ///
+    /// Carries every conflict rather than the first, because a route file is edited as a whole.
+    #[error("constraint sets declare {} conflicting capability route(s): {}", conflicts.len(),
+        conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    ConflictingRoutes {
+        /// Every route conflict found, in check order.
+        conflicts: Vec<RouteConflict>,
+    },
     /// Two identity mappings named one canonical subject.
     #[error("identity mapping duplicates subject {subject:?}")]
     DuplicateSubjectMapping {
@@ -2775,60 +3005,44 @@ where
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         config.validate(storage_host.limits())?;
         config.validate_host_limits(self.registry.host_limits())?;
+        // Storage interface, namespace, and per-role access are proved by
+        // `ConstraintCatalog::validate_routes` before any broker exists, so what is left here is
+        // the part that only the loaded manifest and these bounds can answer.
         let expected = [
             (
-                MEMORY_RECORD,
+                CapabilityRoute::ChatMemoryRecord,
                 EffectKind::LocalWrite,
                 RiskLevel::Medium,
                 Idempotency::Conditional,
-                StorageAccess::ReadWrite,
             ),
             (
-                MEMORY_RECENT,
+                CapabilityRoute::ChatMemoryRecent,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
                 Idempotency::Idempotent,
-                StorageAccess::ReadOnly,
             ),
             (
-                MEMORY_SEARCH,
+                CapabilityRoute::ChatMemorySearch,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
                 Idempotency::Idempotent,
-                StorageAccess::ReadOnly,
             ),
         ];
-        for (identifier, effect, risk, idempotency, access) in expected {
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "`identifier` is one of the MEMORY_RECORD/RECENT/SEARCH constants this \
-                          crate defines, so the parse cannot fail and an IdentifierError could \
-                          only restate a literal we control"
-            )]
-            let capability = identifier
-                .parse::<CapabilityId>()
-                .map_err(|_| BrokerBuildError::InvalidChatMemory)?;
-            let set = self
+        let mut routed = BTreeSet::new();
+        for (route, effect, risk, idempotency) in expected {
+            let (capability, set) = self
                 .constraints
-                .get(&capability)
+                .routed(route)
                 .ok_or(BrokerBuildError::InvalidChatMemory)?;
-            let storage = set
-                .constraints
-                .storage
-                .as_ref()
-                .ok_or(BrokerBuildError::InvalidChatMemory)?;
-            if set.provider.as_str() != MEMORY_PROVIDER
-                || set.effect != effect
+            routed.insert(capability.as_str());
+            if set.effect != effect
                 || set.risk != risk
                 || set.idempotency != idempotency
                 || set.credential.is_some()
                 || !set.credential_by_agent.is_empty()
-                || storage.interface != StorageInterface::Jsonl
-                || storage.access != access
-                || storage.namespace != StorageNamespace::Chat
                 || set.constraints.http.is_some()
                 || set.constraints.max_output_bytes
-                    < if identifier == MEMORY_RECORD {
+                    < if route == CapabilityRoute::ChatMemoryRecord {
                         MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES
                     } else {
                         config
@@ -2840,26 +3054,25 @@ where
                 return Err(BrokerBuildError::InvalidChatMemory);
             }
         }
+        // The routed provider owns exactly the three routed capabilities and nothing else. A
+        // component that declares a fourth route would be reachable under the same storage
+        // authority the memory surface grants, so the surface stays all-or-nothing per component
+        // rather than per capability.
+        let provider = self
+            .constraints
+            .chat_memory_provider()
+            .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let memory_provider = self
             .registry
             .manifests()
-            .find(|manifest| manifest.id.as_str() == MEMORY_PROVIDER)
+            .find(|manifest| &manifest.id == provider)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let declared = memory_provider
             .capabilities
             .iter()
             .map(|capability| capability.id.as_str())
             .collect::<BTreeSet<_>>();
-        if declared
-            != [MEMORY_RECORD, MEMORY_RECENT, MEMORY_SEARCH]
-                .into_iter()
-                .collect()
-            || self.registry.capabilities().any(|(provider, capability)| {
-                capability.id.as_str().starts_with("memory.chat.")
-                    && (provider.as_str() != MEMORY_PROVIDER
-                        || !is_memory_capability(&capability.id))
-            })
-        {
+        if declared != routed {
             return Err(BrokerBuildError::InvalidChatMemory);
         }
         self.chat_memory = Some(config);
@@ -2869,14 +3082,13 @@ where
     /// Whether trusted routing constraints classify this capability as storage-backed.
     ///
     /// Used before outer span construction so generic storage providers receive the same
-    /// identity-free telemetry treatment as the built-in memory route.
+    /// identity-free telemetry treatment as the reserved chat-memory route. Every chat-memory
+    /// route declares chat storage, so one test answers for both.
     #[must_use]
     pub fn capability_uses_storage(&self, capability: &CapabilityId) -> bool {
-        is_reserved_memory_route(capability, self.constraints.get(capability))
-            || self
-                .constraints
-                .get(capability)
-                .is_some_and(|set| set.constraints.storage.is_some())
+        self.constraints
+            .get(capability)
+            .is_some_and(|set| set.constraints.storage.is_some() || set.route.is_chat_memory())
     }
 
     /// Asks policy whether this context may act on one capability at all.
@@ -2948,7 +3160,7 @@ where
         self.constraints
             .iter()
             .filter(|(capability, set)| {
-                !is_reserved_memory_route(capability, Some(set))
+                set.route.is_generic()
                     && (set.constraints.storage.is_none() || context.chat_scope().is_some())
                     && self.authorize_capability(context, capability, set).allowed
             })
@@ -2981,30 +3193,17 @@ where
             .filter(|set| set.constraints.storage.is_some())
             .map(|set| set.provider.clone())
             .collect::<BTreeSet<_>>();
-        let reserved_providers = self
-            .registry
-            .capabilities()
-            .filter(|(provider, capability)| {
-                provider.as_str() == MEMORY_PROVIDER
-                    || capability.id.as_str().starts_with("memory.chat.")
-            })
-            .map(|(provider, _)| provider.clone())
-            .collect::<BTreeSet<_>>();
+        let reserved = self.constraints.chat_memory_provider();
         let mut words = self
             .registry
             .command_words_by_provider()
             .into_iter()
             .filter(|(provider, _)| {
-                !reserved_providers.contains(*provider)
+                Some(*provider) != reserved
                     && reachable.contains(provider)
                     && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
             })
-            .flat_map(|(_, words)| {
-                words
-                    .iter()
-                    .filter(|word| word.as_str() != MEMORY_WORD)
-                    .cloned()
-            })
+            .flat_map(|(_, words)| words.iter().cloned())
             .collect::<Vec<_>>();
         words.sort();
         words.dedup();
@@ -3028,19 +3227,7 @@ where
         word: &str,
         argv: &[String],
     ) -> Result<CommandResolution, BrokerHostError> {
-        let reserved_provider_word =
-            self.registry
-                .command_words_by_provider()
-                .into_iter()
-                .any(|(provider, words)| {
-                    words.iter().any(|value| value == word)
-                        && self.registry.capabilities().any(|(candidate, capability)| {
-                            candidate == provider
-                                && (candidate.as_str() == MEMORY_PROVIDER
-                                    || capability.id.as_str().starts_with("memory.chat."))
-                        })
-                });
-        if word == MEMORY_WORD || reserved_provider_word {
+        if self.is_chat_memory_word(word) {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
@@ -3048,8 +3235,7 @@ where
         let resolution = self.registry.resolve_command(word, argv).await?;
         if matches!(
             &resolution,
-            CommandResolution::Resolved { capability, .. }
-                if is_reserved_memory_route(capability, self.constraints.get(capability))
+            CommandResolution::Resolved { capability, .. } if self.route(capability).is_chat_memory()
         ) {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
@@ -3155,14 +3341,13 @@ where
         context: &AuthenticatedContext,
         request: InvocationRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        let refusal = is_reserved_memory_route(
-            &request.capability,
-            self.constraints.get(&request.capability),
-        )
-        .then_some(Refusal {
-            reason: "chat-scope-required",
-            policy_ids: Vec::new(),
-        });
+        let refusal = self
+            .route(&request.capability)
+            .is_chat_memory()
+            .then_some(Refusal {
+                reason: "chat-scope-required",
+                policy_ids: Vec::new(),
+            });
         self.invoke_inner(context, request, refusal).await
     }
 
@@ -3189,16 +3374,10 @@ where
                 reason,
                 policy_ids: Vec::new(),
             }),
-            None if is_reserved_memory_route(
-                &request.capability,
-                self.constraints.get(&request.capability),
-            ) =>
-            {
-                Some(Refusal {
-                    reason: "chat-scope-required",
-                    policy_ids: Vec::new(),
-                })
-            }
+            None if self.route(&request.capability).is_chat_memory() => Some(Refusal {
+                reason: "chat-scope-required",
+                policy_ids: Vec::new(),
+            }),
             None => {
                 let decision = self.authorize_agent_prompt(&context, &attestation.agent);
                 (!decision.allowed).then(|| decided_refusal(decision, "agent-denied"))
@@ -3298,12 +3477,15 @@ where
         let (mut capabilities, mut words) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
-            for identifier in [MEMORY_RECENT, MEMORY_SEARCH] {
-                let capability = identifier.parse::<CapabilityId>().ok()?;
-                capabilities.push(self.available_capability(&capability)?);
+            for route in [
+                CapabilityRoute::ChatMemoryRecent,
+                CapabilityRoute::ChatMemorySearch,
+            ] {
+                let (capability, _) = self.constraints.routed(route)?;
+                capabilities.push(self.available_capability(capability)?);
             }
             capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
-            words.push(MEMORY_WORD.to_owned());
+            words.extend(self.chat_memory_words());
             words.sort();
             words.dedup();
         }
@@ -3331,28 +3513,11 @@ where
                 });
             }
         };
-        let memory_provider_word =
-            self.registry
-                .command_words_by_provider()
-                .into_iter()
-                .any(|(provider, words)| {
-                    provider.as_str() == MEMORY_PROVIDER && words.iter().any(|value| value == word)
-                });
-        let reserved_nonmemory_provider_word = self
-            .registry
-            .command_words_by_provider()
-            .into_iter()
-            .any(|(provider, words)| {
-                provider.as_str() != MEMORY_PROVIDER
-                    && words.iter().any(|value| value == word)
-                    && self.registry.capabilities().any(|(candidate, capability)| {
-                        candidate == provider && capability.id.as_str().starts_with("memory.chat.")
-                    })
-            });
-        if (word == MEMORY_WORD && self.memory_surface(&context, &claim.agent).is_none())
-            || (memory_provider_word && word != MEMORY_WORD)
-            || reserved_nonmemory_provider_word
-        {
+        // A chat-memory word is offered only to a session the surface is authorized for; every
+        // other word must not resolve onto the surface, and the surface's own words must resolve
+        // only onto its two retrieval routes. Recording stays unreachable from any word.
+        let memory_word = self.is_chat_memory_word(word);
+        if memory_word && self.memory_surface(&context, &claim.agent).is_none() {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             });
@@ -3360,11 +3525,10 @@ where
         let resolution = self.registry.resolve_command(word, argv).await?;
         if matches!(
             &resolution,
-            CommandResolution::Resolved { capability, .. }
-                if (word != MEMORY_WORD
-                    && is_reserved_memory_route(capability, self.constraints.get(capability)))
-                    || (word == MEMORY_WORD
-                        && !matches!(capability.as_str(), MEMORY_RECENT | MEMORY_SEARCH))
+            CommandResolution::Resolved { capability, .. } if {
+                let route = self.route(capability);
+                if memory_word { !route.is_chat_memory_retrieval() } else { route.is_chat_memory() }
+            }
         ) {
             return Err(BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
@@ -3400,31 +3564,28 @@ where
                 Some(refusal),
             ),
         };
-        if request.capability.as_str() == MEMORY_RECORD {
-            refusal = Some(Refusal {
-                reason: "record-operation-required",
-                policy_ids: Vec::new(),
-            });
-        } else if matches!(request.capability.as_str(), MEMORY_RECENT | MEMORY_SEARCH) {
-            if self.memory_surface(&context, &attestation.agent).is_none() {
+        let route = self.route(&request.capability);
+        match route {
+            CapabilityRoute::Generic => {}
+            CapabilityRoute::ChatMemoryRecord => {
                 refusal = Some(Refusal {
-                    reason: "memory-unavailable",
-                    policy_ids: Vec::new(),
-                });
-            } else if let Err(reason) = self.curate_memory_input(&mut request) {
-                refusal = Some(Refusal {
-                    reason,
+                    reason: "record-operation-required",
                     policy_ids: Vec::new(),
                 });
             }
-        } else if is_reserved_memory_route(
-            &request.capability,
-            self.constraints.get(&request.capability),
-        ) {
-            refusal = Some(Refusal {
-                reason: "memory-unavailable",
-                policy_ids: Vec::new(),
-            });
+            CapabilityRoute::ChatMemoryRecent | CapabilityRoute::ChatMemorySearch => {
+                if self.memory_surface(&context, &attestation.agent).is_none() {
+                    refusal = Some(Refusal {
+                        reason: "memory-unavailable",
+                        policy_ids: Vec::new(),
+                    });
+                } else if let Err(reason) = self.curate_memory_input(route, &mut request) {
+                    refusal = Some(Refusal {
+                        reason,
+                        policy_ids: Vec::new(),
+                    });
+                }
+            }
         }
         self.invoke_inner(&context, request, refusal).await
     }
@@ -3462,11 +3623,22 @@ where
                 None
             }
         });
+        // The operator names this capability by declaring the record route; the fallback only
+        // labels the audited refusal a deployment with no such route already earned above.
+        let capability = self
+            .constraints
+            .routed(CapabilityRoute::ChatMemoryRecord)
+            .map_or_else(
+                || {
+                    UNROUTED_RECORD_CAPABILITY
+                        .parse()
+                        .expect("reserved record label is a valid capability identifier")
+                },
+                |(capability, _)| capability.clone(),
+            );
         let request = InvocationRequest {
             id: turn.id,
-            capability: MEMORY_RECORD
-                .parse()
-                .expect("reserved memory capability is valid"),
+            capability,
             trace: turn.trace,
             trace_parent: turn.trace_parent,
             secret_use: None,
@@ -3544,6 +3716,36 @@ where
         }
     }
 
+    /// The trusted route declared for one capability; anything undeclared is generic.
+    ///
+    /// An undeclared capability is denied `unconstrained-capability` before policy is consulted,
+    /// so treating it as generic hides nothing a route could have hidden.
+    fn route(&self, capability: &CapabilityId) -> CapabilityRoute {
+        self.constraints
+            .get(capability)
+            .map_or(CapabilityRoute::Generic, |set| set.route)
+    }
+
+    /// The command words the chat-memory provider declares, and only that provider.
+    ///
+    /// These are the words the chat surface offers when memory is authorized, and the words every
+    /// non-chat path refuses. Nothing here reads a word's spelling.
+    fn chat_memory_words(&self) -> Vec<String> {
+        let Some(provider) = self.constraints.chat_memory_provider() else {
+            return Vec::new();
+        };
+        self.registry
+            .command_words_by_provider()
+            .into_iter()
+            .filter(|(candidate, _)| *candidate == provider)
+            .flat_map(|(_, words)| words.iter().cloned())
+            .collect()
+    }
+
+    fn is_chat_memory_word(&self, word: &str) -> bool {
+        self.chat_memory_words().iter().any(|value| value == word)
+    }
+
     fn memory_surface(
         &self,
         context: &AuthenticatedContext,
@@ -3553,10 +3755,9 @@ where
         if !config.enabled_for(agent) || context.chat_scope().is_none() {
             return None;
         }
-        for identifier in [MEMORY_RECORD, MEMORY_RECENT, MEMORY_SEARCH] {
-            let capability = identifier.parse::<CapabilityId>().ok()?;
-            let set = self.constraints.get(&capability)?;
-            if !self.authorize_capability(context, &capability, set).allowed {
+        for route in CapabilityRoute::CHAT_MEMORY {
+            let (capability, set) = self.constraints.routed(route)?;
+            if !self.authorize_capability(context, capability, set).allowed {
                 return None;
             }
         }
@@ -3621,8 +3822,7 @@ where
             .constraints
             .iter()
             .filter(|(capability, set)| {
-                let reserved = is_reserved_memory_route(capability, Some(set));
-                (!reserved || (effective_memory_surface && is_memory_capability(capability)))
+                (set.route.is_generic() || effective_memory_surface)
                     && self.authorize_capability(context, capability, set).allowed
             })
             .collect::<Vec<_>>();
@@ -3743,8 +3943,7 @@ where
                 return Err(BrokerError::MemoryUnavailable);
             }
         };
-        let memory_route =
-            set.provider.as_str() == MEMORY_PROVIDER && is_memory_capability(&request.capability);
+        let memory_route = set.route.is_chat_memory();
         let authority =
             self.canonical_authority_surface(context, storage.interface, memory_route)?;
         let host = self
@@ -3780,10 +3979,14 @@ where
             .map_err(|source| BrokerError::Storage { source })
     }
 
-    fn curate_memory_input(&self, request: &mut InvocationRequest) -> Result<(), &'static str> {
+    fn curate_memory_input(
+        &self,
+        route: CapabilityRoute,
+        request: &mut InvocationRequest,
+    ) -> Result<(), &'static str> {
         let config = self.chat_memory.as_ref().ok_or("memory-unavailable")?;
-        request.input = match request.capability.as_str() {
-            MEMORY_RECENT => {
+        request.input = match route {
+            CapabilityRoute::ChatMemoryRecent => {
                 let last = request
                     .input
                     .as_object()
@@ -3799,7 +4002,7 @@ where
                     "maxResultBytes": config.max_result_bytes,
                 })
             }
-            MEMORY_SEARCH => {
+            CapabilityRoute::ChatMemorySearch => {
                 let query = request
                     .input
                     .as_object()
@@ -3817,7 +4020,11 @@ where
                     "maxResultBytes": config.max_result_bytes,
                 })
             }
-            _ => return Err("invalid-memory-input"),
+            // Recording is built by the broker from typed post-acceptance fields, never curated
+            // from a proposal, and a generic route has no memory input to curate.
+            CapabilityRoute::Generic | CapabilityRoute::ChatMemoryRecord => {
+                return Err("invalid-memory-input");
+            }
         };
         Ok(())
     }
@@ -4231,7 +4438,7 @@ where
         let storage_scope_commitment = storage_preparation
             .as_ref()
             .map(StorageGrantPreparation::scope_commitment);
-        if request.capability.as_str() == MEMORY_RECORD {
+        if set.route == CapabilityRoute::ChatMemoryRecord {
             let config = self
                 .chat_memory
                 .as_ref()
@@ -4244,7 +4451,7 @@ where
             #[allow(
                 clippy::map_err_ignore,
                 reason = "not wire input: every externally reachable entry point refuses \
-                          MEMORY_RECORD, so the only proposal reaching here is the one \
+                          the record route, so the only proposal reaching here is the one \
                           `record_delivered_turn_for_chat` builds from a typed DeliveryIdentity \
                           — this is that value's own round trip, and serde has no malformed \
                           input to name"
@@ -4601,7 +4808,7 @@ where
                 )
             }
             Err(failure) => {
-                let error = public_host_error(&failure.error).to_owned();
+                let error = public_host_error(&failure.error, set.route).to_owned();
                 // A failure can follow calls that already left the host; their sanitized
                 // metadata belongs in the terminal record exactly as it would on success.
                 let mut evidence = vec![policy_evidence];
@@ -5210,7 +5417,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn public_host_error(error: &BrokerHostError) -> &'static str {
+fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'static str {
     match error {
         BrokerHostError::AuthorizationExceedsHostLimit { .. }
         | BrokerHostError::InvalidHttpAuthorization
@@ -5274,17 +5481,12 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
             _ => "storage-io",
         },
         BrokerHostError::Invoke { .. } => "provider-trap",
-        BrokerHostError::ProviderFailure {
-            provider,
-            capability,
-            code,
-            ..
-        } if provider.as_str() == MEMORY_PROVIDER
-            && is_memory_capability(capability)
-            && matches!(
-                code.as_str(),
-                "memory-corrupt" | "result-too-large" | "dedup-conflict" | "dedup-capacity"
-            ) =>
+        BrokerHostError::ProviderFailure { code, .. }
+            if route.is_chat_memory()
+                && matches!(
+                    code.as_str(),
+                    "memory-corrupt" | "result-too-large" | "dedup-conflict" | "dedup-capacity"
+                ) =>
         {
             match code.as_str() {
                 "memory-corrupt" => "memory-corrupt",

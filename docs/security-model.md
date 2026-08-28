@@ -207,9 +207,12 @@ resolution receive a disabled sticky context.
 Chat storage needs more than the existing subject attestation. New operations carry an
 invocation-bound transport/channel/conversation claim; the owner must grant both the subject
 namespace and an explicit transport-wide, exact-channel, or exact-conversation `chatScopes` entry.
-The canonical scope also enters Cedar context. Legacy capability, resolve, and invoke operations
-reserve and omit `memory`, `memory.chat.record`, `memory.chat.recent`, and `memory.chat.search`.
-Generic chat invocation may reach recent/search but never record.
+The canonical scope also enters Cedar context. What is reserved is what the owner declared: a
+constraint set carries a `route:` of `chatMemoryRecord`, `chatMemoryRecent`, or `chatMemorySearch`,
+and legacy capability, resolve, and invoke operations omit and refuse exactly those capabilities and
+every command word of the provider they name. Naming a capability `memory.chat.export` or a
+provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
+chat invocation may reach the two retrieval routes but never the record route.
 
 Recording is **model-hidden, gateway-attested transport acceptance**, not broker-proven delivery or
 human receipt. Slack/Telegram/Discord receipts prove complete service acceptance; local `flush`

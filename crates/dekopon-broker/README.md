@@ -24,8 +24,11 @@ The in-memory audit implementation is deterministic and bounded for tests. `File
 
 New chat operations add canonical transport/channel/conversation authority to the existing subject
 mapping and `agent.prompt` gate. Owner configuration must grant both the subject namespace and an
-explicit `chatScopes` breadth; Cedar receives those scope fields. Legacy list/resolve/invoke paths
-reserve and omit the memory provider, word, and capabilities. Recent/search are visible only as an
+explicit `chatScopes` breadth; Cedar receives those scope fields. What is reserved is what the owner
+declared: each of the three capabilities carries a `route` of `chatMemoryRecord`, `chatMemoryRecent`,
+or `chatMemorySearch`, and legacy list/resolve/invoke paths omit and refuse exactly those and every
+command word of the provider they name — no capability or provider spelling reserves anything.
+Recent/search are visible only as an
 all-three surface; record is reachable only through the dedicated typed post-acceptance operation.
 Storage audit records replace raw identities/provider/policy metadata with a domain-separated keyed
 scope commitment and content-free evidence. `authority-bound` continuity uses only the sorted

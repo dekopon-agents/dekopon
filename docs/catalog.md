@@ -157,7 +157,8 @@ status: Unknown
 
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
 decision actually sees come from the capability's `constraintSets` entry in `broker.yaml`, validated
-against the loaded provider manifest. The catalog's copy is operator documentation: it is what a
+against the loaded provider manifest — as does its `route`, the field that decides whether a
+capability is ordinary or part of the reserved chat-memory surface. The catalog's copy is operator documentation: it is what a
 reviewer reads to understand what the deployment intends, and it can disagree with the broker
 without either process noticing. When they disagree, the broker's copy is the one that decides.
 

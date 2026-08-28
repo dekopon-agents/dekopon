@@ -15,8 +15,8 @@ use std::{
 
 #[cfg(unix)]
 use dekopon_broker::{
-    Broker, BrokerLimits, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
-    InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
+    IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
 };
 #[cfg(unix)]
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
@@ -63,6 +63,7 @@ fn broker_constraints<'a>(
         (
             capability.parse().expect("valid capability fixture"),
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 provider: provider.parse().expect("valid provider fixture"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,

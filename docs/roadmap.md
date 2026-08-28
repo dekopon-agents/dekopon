@@ -120,7 +120,7 @@ out of scope.
 - Optional independently released JSONL `memory-chat` provider: hidden post-acceptance record, visible on-demand
   recent/literal search, finite permanent dedup, and compaction hysteresis.
 - Invocation-bound chat attestation plus owner-authored `chatScopes` and Cedar scope context; legacy
-  operations reserve and omit all memory entry points.
+  operations omit and refuse every capability and command word the owner routed to chat memory.
 - Complete transport-acceptance receipts and exactly one no-retry record request after acceptance.
 - Separate retained broker-only provider-storage PVC and operator-managed key; optional memory
   component path outside the default scan.

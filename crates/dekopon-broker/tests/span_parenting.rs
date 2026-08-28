@@ -14,8 +14,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
     AuditError, AuditEvent, AuditLog, AuditRecord, AuthenticatedContext, Broker, BrokerLimits,
-    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    InvocationRequest, PolicyEngine, PolicyWorld,
+    CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
+    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -62,6 +62,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
         "echo.reverse".parse().expect("valid capability fixture"),
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: "echo"
                 .parse::<ProviderId>()
                 .expect("valid provider fixture"),

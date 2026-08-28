@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path};
 
-use dekopon_broker::ConstraintSet;
+use dekopon_broker::{CapabilityRoute, ConstraintSet};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
@@ -27,6 +27,7 @@ when { context has via && context.via == "gateway"
 
 fn constraint_set() -> serde_json::Value {
     serde_json::to_value(ConstraintSet {
+        route: CapabilityRoute::Generic,
         provider: "echo"
             .parse::<ProviderId>()
             .expect("valid provider fixture"),

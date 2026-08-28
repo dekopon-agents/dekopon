@@ -8,12 +8,19 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerError, BrokerLimits,
-    ChatAttestation, ChatMemoryConfig, ChatScopeGrant, ChatSessionClaim, ChatTransportKind,
-    ConstraintCatalog, ConstraintSet, CredentialStore, DeliveredTurnRequest, DeliveryIdentity,
-    IdentityDirectory, InMemoryAuditLog, MEMORY_RECENT, MEMORY_RECORD, PolicyEngine, PolicyWorld,
-    SubjectAttestation,
+    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError, BrokerError,
+    BrokerLimits, CapabilityRoute, ChatAttestation, ChatMemoryConfig, ChatScopeGrant,
+    ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
+    DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
+    PolicyWorld, RouteConflict, SubjectAttestation,
 };
+
+/// Capability identifiers the shipped `memory-chat` provider declares.
+///
+/// Fixtures only. The broker reserves the surface by the declared `route`, so these are the
+/// component's names rather than anything the broker compares against.
+const MEMORY_RECORD: &str = "memory.chat.record";
+const MEMORY_RECENT: &str = "memory.chat.recent";
 use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
@@ -48,6 +55,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     let mut entries = [
         (
             "memory.chat.record",
+            CapabilityRoute::ChatMemoryRecord,
             EffectKind::LocalWrite,
             RiskLevel::Medium,
             Idempotency::Conditional,
@@ -55,6 +63,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
         ),
         (
             "memory.chat.recent",
+            CapabilityRoute::ChatMemoryRecent,
             EffectKind::ReadOnly,
             RiskLevel::High,
             Idempotency::Idempotent,
@@ -62,6 +71,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
         ),
         (
             "memory.chat.search",
+            CapabilityRoute::ChatMemorySearch,
             EffectKind::ReadOnly,
             RiskLevel::High,
             Idempotency::Idempotent,
@@ -69,11 +79,12 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
         ),
     ]
     .into_iter()
-    .map(|(id, effect, risk, idempotency, access)| {
+    .map(|(id, route, effect, risk, idempotency, access)| {
         let capability = id.parse().expect("capability");
         (
             capability,
             ConstraintSet {
+                route,
                 provider: "memory-chat".parse().expect("provider"),
                 effect,
                 risk,
@@ -98,6 +109,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     entries.push((
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
@@ -121,6 +133,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
         entries.push((
             "http-probe.fetch".parse().expect("capability"),
             ConstraintSet {
+                route: CapabilityRoute::Generic,
                 provider: "http-probe".parse().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
@@ -510,9 +523,15 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     );
     assert!(scoped_words.iter().any(|word| word == storage_word));
 }
-
+/// The reserved chat-memory surface is the operator's declaration, not a spelling.
+///
+/// The fixture is deliberately hostile in every way a name can be: its provider identity is
+/// `memory-chat` and one of its capabilities is `memory.chat.export`. With no `route` declared,
+/// both are ordinary capabilities on every path — which is the whole point of typing the route,
+/// because the reservation now follows what an operator wrote rather than what they happened to
+/// call something.
 #[tokio::test(flavor = "multi_thread")]
-async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
+async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabilities() {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -555,15 +574,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         ConstraintCatalog::new(["ordinary.escape", "memory.chat.export"].map(|identifier| {
             (
                 identifier.parse().expect("capability"),
-                ConstraintSet {
-                    provider: "memory-chat".parse().expect("provider"),
-                    effect: EffectKind::ReadOnly,
-                    risk: RiskLevel::Low,
-                    idempotency: Idempotency::Idempotent,
-                    credential: None,
-                    credential_by_agent: Default::default(),
-                    constraints: dekopon_capability::ExecutionConstraints::default(),
-                },
+                reserved_read_constraint(),
             )
         }))
         .expect("constraints");
@@ -590,9 +601,20 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         },
     )
     .expect("caller context");
-    assert!(broker.capabilities(&caller).is_empty());
-    assert!(broker.command_words(&caller).is_empty());
-    assert!(broker.resolve_command("recall", &[]).await.is_err());
+    assert_eq!(
+        broker
+            .capabilities(&caller)
+            .iter()
+            .map(|entry| entry.capability.id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        ["memory.chat.export", "ordinary.escape"],
+        "an undeclared route hides nothing, however the capability is spelled"
+    );
+    assert_eq!(broker.command_words(&caller), ["recall"]);
+    broker
+        .resolve_command("recall", &[])
+        .await
+        .expect("the word of a provider that owns no route resolves normally");
 
     for (index, capability) in ["ordinary.escape", "memory.chat.export"]
         .into_iter()
@@ -602,11 +624,11 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
             .invoke(
                 &caller,
                 InvocationRequest {
-                    id: format!("malicious-direct-{index}")
+                    id: format!("unrouted-direct-{index}")
                         .parse()
                         .expect("invocation"),
                     capability: capability.parse().expect("capability"),
-                    trace: format!("trace-malicious-direct-{index}")
+                    trace: format!("trace-unrouted-direct-{index}")
                         .parse()
                         .expect("trace"),
                     trace_parent: None,
@@ -615,12 +637,12 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
                 },
             )
             .await
-            .expect("reserved denial is audited");
+            .expect("ordinary invocation is audited");
         assert_eq!(
             result.outcome,
-            dekopon_capability::InvocationOutcome::Denied
+            dekopon_capability::InvocationOutcome::Succeeded,
+            "{result:?}"
         );
-        assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
     }
 
     let gateway = gateway();
@@ -629,23 +651,21 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         chat_scopes: Vec::new(),
     };
     let claim = claim();
-    let (listed, words) = broker
+    let (listed, _) = broker
         .capabilities_for(&gateway, Some(&grant), &claim.subject, &claim.agent)
         .expect("legacy attestation is honored");
-    assert!(listed.is_empty() && words.is_empty());
+    assert_eq!(listed.len(), 2, "the attested listing reserves nothing");
     let (listed, words, memory) = broker
         .capabilities_for_chat(&gateway, Some(&grant), &claim)
         .expect("ordinary chat remains available");
-    assert!(listed.is_empty() && words.is_empty() && memory.is_none());
-    assert!(
-        broker
-            .resolve_command_for_chat(&gateway, Some(&grant), &claim, "recall", &[])
-            .await
-            .is_err()
-    );
-    let chat_id = "malicious-chat"
-        .parse::<InvocationId>()
-        .expect("invocation");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(words, ["recall"]);
+    assert!(memory.is_none(), "no route means no memory surface");
+    broker
+        .resolve_command_for_chat(&gateway, Some(&grant), &claim, "recall", &[])
+        .await
+        .expect("chat resolution reserves nothing either");
+    let chat_id = "unrouted-chat".parse::<InvocationId>().expect("invocation");
     let chat_result = broker
         .invoke_for_chat(
             &gateway,
@@ -659,21 +679,21 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
             InvocationRequest {
                 id: chat_id,
                 capability: "ordinary.escape".parse().expect("capability"),
-                trace: "trace-malicious-chat".parse().expect("trace"),
+                trace: "trace-unrouted-chat".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({}),
                 secret_use: None,
             },
         )
         .await
-        .expect("chat reserved denial is audited");
+        .expect("chat invocation is audited");
     assert_eq!(
         chat_result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
+        dekopon_capability::InvocationOutcome::Succeeded,
+        "{chat_result:?}"
     );
-    assert_eq!(chat_result.error.as_deref(), Some("memory-unavailable"));
 
-    let id = "malicious-attested"
+    let id = "unrouted-attested"
         .parse::<InvocationId>()
         .expect("invocation");
     let result = broker
@@ -688,23 +708,24 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
             InvocationRequest {
                 id,
                 capability: "ordinary.escape".parse().expect("capability"),
-                trace: "trace-malicious-attested".parse().expect("trace"),
+                trace: "trace-unrouted-attested".parse().expect("trace"),
                 trace_parent: None,
                 input: json!({}),
                 secret_use: None,
             },
         )
         .await
-        .expect("attested reserved denial is audited");
+        .expect("attested invocation is audited");
     assert_eq!(
         result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
+        dekopon_capability::InvocationOutcome::Succeeded,
+        "{result:?}"
     );
-    assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
     drop(broker);
 
-    // Even when an operator supplies otherwise-correct constraints for the exact three memory
-    // IDs, the malicious provider's extra routes make the composition invalid.
+    // Declaring the three routes correctly is still not enough: the routed provider must own
+    // exactly those three capabilities, so a component with a fourth route can never be the one
+    // holding a conversation's storage authority.
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
@@ -731,6 +752,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         (
             "memory.chat.record".parse().expect("capability"),
             memory_constraint(
+                CapabilityRoute::ChatMemoryRecord,
                 EffectKind::LocalWrite,
                 RiskLevel::Medium,
                 Idempotency::Conditional,
@@ -740,6 +762,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         (
             "memory.chat.recent".parse().expect("capability"),
             memory_constraint(
+                CapabilityRoute::ChatMemoryRecent,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
                 Idempotency::Idempotent,
@@ -749,6 +772,7 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
         (
             "memory.chat.search".parse().expect("capability"),
             memory_constraint(
+                CapabilityRoute::ChatMemorySearch,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
                 Idempotency::Idempotent,
@@ -779,17 +803,229 @@ async fn malicious_memory_provider_and_prefix_routes_are_reserved_end_to_end() {
     .expect("broker without chat memory");
     assert!(
         broker.with_chat_memory(memory_config()).is_err(),
-        "only the exact three-capability provider composition may enable memory"
+        "only the exact three-capability routed provider may enable memory"
     );
 }
 
+/// Renaming the shipped provider changes nothing the broker hides or denies.
+///
+/// `storage-probe` is named nothing like chat memory and declares `storage-probe.run`, but the
+/// deployment routes it as the record half of the surface — and that alone takes it off the
+/// generic listing, out of the vocabulary, and off every non-record invoke path, exactly as the
+/// shipped `memory-chat` provider is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let key = directory.join("storage-key.yaml");
+    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [fixture("storage-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("storage probe fixture loads");
+    let world = PolicyWorld::new(
+        [
+            "caller".parse::<PrincipalId>().expect("caller"),
+            "gateway".parse().expect("gateway"),
+            "maintainer".parse().expect("maintainer"),
+        ],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("policy world");
+    // Policy permits it on every path, so what hides it can only be the route.
+    let policy = PolicyEngine::new(
+        r#"
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"storage-probe.run",
+               resource == Dekopon::Provider::"storage-probe")
+        unless { context has via };
+        permit(principal == Dekopon::Principal::"maintainer",
+               action == Dekopon::Action::"agent.prompt",
+               resource == Dekopon::Agent::"reviewer")
+        when { context has via && context.via == "gateway" };
+        permit(principal == Dekopon::Principal::"maintainer",
+               action == Dekopon::Action::"storage-probe.run",
+               resource == Dekopon::Provider::"storage-probe")
+        when { context has via && context.via == "gateway"
+            && context has agent && context.agent == "reviewer" };
+        "#,
+        &world,
+    )
+    .expect("policy");
+    let constraints = ConstraintCatalog::new([(
+        "storage-probe.run".parse().expect("capability"),
+        ConstraintSet {
+            route: CapabilityRoute::ChatMemoryRecord,
+            provider: "storage-probe".parse().expect("provider"),
+            effect: EffectKind::LocalWrite,
+            risk: RiskLevel::Medium,
+            idempotency: Idempotency::Conditional,
+            credential: None,
+            credential_by_agent: Default::default(),
+            constraints: dekopon_capability::ExecutionConstraints {
+                timeout_ms: 10_000,
+                max_output_bytes: 131_072,
+                http: None,
+                storage: Some(StorageConstraints {
+                    interface: StorageInterface::Jsonl,
+                    access: StorageAccess::ReadWrite,
+                    namespace: StorageNamespace::Chat,
+                }),
+                secret_use: None,
+            },
+        },
+    )])
+    .expect("constraints");
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "renamed-route-policy".to_owned(),
+        policy,
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        )])
+        .expect("identities"),
+        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("broker");
+    let caller = AuthenticatedContext::new(
+        "caller".parse().expect("caller"),
+        Actor::Service {
+            principal: "caller".parse().expect("caller"),
+        },
+    )
+    .expect("caller context");
+    assert!(broker.capabilities(&caller).is_empty());
+    assert!(broker.command_words(&caller).is_empty());
+    assert!(
+        broker.resolve_command("storageprobe", &[]).await.is_err(),
+        "the routed provider's word is reserved even though nothing about it says memory"
+    );
+
+    let direct = "renamed-direct"
+        .parse::<InvocationId>()
+        .expect("invocation");
+    let result = broker
+        .invoke(
+            &caller,
+            InvocationRequest {
+                id: direct,
+                capability: "storage-probe.run".parse().expect("capability"),
+                trace: "trace-renamed-direct".parse().expect("trace"),
+                trace_parent: None,
+                input: json!({}),
+                secret_use: None,
+            },
+        )
+        .await
+        .expect("reserved denial is audited");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
+
+    let gateway = gateway();
+    let grant = grant();
+    let claim = claim();
+    let (listed, words) = broker
+        .capabilities_for(&gateway, Some(&grant), &claim.subject, &claim.agent)
+        .expect("legacy attestation is honored");
+    assert!(listed.is_empty() && words.is_empty());
+    let (listed, words, memory) = broker
+        .capabilities_for_chat(&gateway, Some(&grant), &claim)
+        .expect("ordinary chat remains available");
+    assert!(listed.is_empty() && words.is_empty() && memory.is_none());
+    assert!(
+        broker
+            .resolve_command_for_chat(&gateway, Some(&grant), &claim, "storageprobe", &[])
+            .await
+            .is_err()
+    );
+
+    let chat_id = "renamed-chat".parse::<InvocationId>().expect("invocation");
+    let chat_result = broker
+        .invoke_for_chat(
+            &gateway,
+            Some(&grant),
+            &ChatAttestation {
+                subject: claim.subject.clone(),
+                agent: claim.agent.clone(),
+                scope: claim.scope.clone(),
+                invocation: chat_id.clone(),
+            },
+            InvocationRequest {
+                id: chat_id,
+                capability: "storage-probe.run".parse().expect("capability"),
+                trace: "trace-renamed-chat".parse().expect("trace"),
+                trace_parent: None,
+                input: json!({}),
+                secret_use: None,
+            },
+        )
+        .await
+        .expect("chat reserved denial is audited");
+    assert_eq!(
+        chat_result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(
+        chat_result.error.as_deref(),
+        Some("record-operation-required"),
+        "the record route is unreachable from the generic chat invoke path"
+    );
+
+    let id = "renamed-attested"
+        .parse::<InvocationId>()
+        .expect("invocation");
+    let result = broker
+        .invoke_for(
+            &gateway,
+            Some(&grant),
+            &SubjectAttestation {
+                subject: claim.subject,
+                agent: claim.agent,
+                invocation: id.clone(),
+            },
+            InvocationRequest {
+                id,
+                capability: "storage-probe.run".parse().expect("capability"),
+                trace: "trace-renamed-attested".parse().expect("trace"),
+                trace_parent: None,
+                input: json!({}),
+                secret_use: None,
+            },
+        )
+        .await
+        .expect("attested reserved denial is audited");
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
+}
+
 fn memory_constraint(
+    route: CapabilityRoute,
     effect: EffectKind,
     risk: RiskLevel,
     idempotency: Idempotency,
     access: StorageAccess,
 ) -> ConstraintSet {
     ConstraintSet {
+        route,
         provider: "memory-chat".parse().expect("provider"),
         effect,
         risk,
@@ -812,6 +1048,7 @@ fn memory_constraint(
 
 fn reserved_read_constraint() -> ConstraintSet {
     ConstraintSet {
+        route: CapabilityRoute::Generic,
         provider: "memory-chat".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
@@ -852,7 +1089,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             entry.provider.as_str() != "memory-chat"
                 && !entry.capability.id.as_str().starts_with("memory.chat.")
         }),
-        "legacy listing reserves the complete provider and capability prefix"
+        "the legacy listing reserves every capability the deployment routed to chat memory"
     );
     assert!(
         broker
@@ -864,14 +1101,16 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         broker.resolve_command("memory", &[]).await.is_err(),
         "legacy command resolution never enters the memory provider"
     );
+    // A routed capability on the two legacy paths: reserved, denied, and audited without the
+    // identity every non-storage record carries.
     for (index, attested) in [false, true].into_iter().enumerate() {
-        let id = format!("reserved-prefix-{index}")
+        let id = format!("reserved-route-{index}")
             .parse::<InvocationId>()
             .expect("invocation");
         let request = InvocationRequest {
             id: id.clone(),
-            capability: "memory.chat.export".parse().expect("capability"),
-            trace: format!("trace-reserved-prefix-{index}")
+            capability: MEMORY_RECENT.parse().expect("capability"),
+            trace: format!("trace-reserved-route-{index}")
                 .parse()
                 .expect("trace"),
             trace_parent: None,
@@ -894,7 +1133,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         } else {
             broker.invoke(&gateway(), request).await
         }
-        .expect("reserved prefix denial is audited");
+        .expect("reserved route denial is audited");
         assert_eq!(
             result.outcome,
             dekopon_capability::InvocationOutcome::Denied
@@ -2303,4 +2542,102 @@ fn walk(path: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Route mistakes are reported together, because a route file is edited as a whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_declared_route_conflict_is_reported_at_startup() {
+    let registry =
+        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
+            .await
+            .expect("echo fixture loads");
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().expect("caller")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("policy world");
+    let routed = |route, provider: &str, storage| ConstraintSet {
+        route,
+        provider: provider.parse().expect("provider"),
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        idempotency: Idempotency::Idempotent,
+        credential: None,
+        credential_by_agent: Default::default(),
+        constraints: dekopon_capability::ExecutionConstraints {
+            timeout_ms: 10_000,
+            max_output_bytes: 131_072,
+            http: None,
+            storage,
+            secret_use: None,
+        },
+    };
+    let read_only = Some(StorageConstraints {
+        interface: StorageInterface::Jsonl,
+        access: StorageAccess::ReadOnly,
+        namespace: StorageNamespace::Chat,
+    });
+    let constraints = ConstraintCatalog::new([
+        (
+            "echo.echo".parse().expect("capability"),
+            routed(CapabilityRoute::ChatMemoryRecent, "echo", read_only.clone()),
+        ),
+        (
+            "echo.second".parse().expect("capability"),
+            routed(CapabilityRoute::ChatMemoryRecent, "echo", read_only),
+        ),
+        (
+            "echo.third".parse().expect("capability"),
+            routed(CapabilityRoute::ChatMemorySearch, "elsewhere", None),
+        ),
+    ])
+    .expect("catalog");
+    let error = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "route-conflict-policy".to_owned(),
+        PolicyEngine::new("", &world).expect("empty policy"),
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect_err("conflicting routes refuse startup");
+    let rendered = error.to_string();
+    let BrokerBuildError::ConflictingRoutes { conflicts } = error else {
+        panic!("route conflicts must be their own build error: {rendered}");
+    };
+    assert_eq!(
+        conflicts,
+        vec![
+            RouteConflict::DuplicateRole {
+                route: CapabilityRoute::ChatMemoryRecent,
+                capabilities: vec![
+                    "echo.echo".parse().expect("capability"),
+                    "echo.second".parse().expect("capability"),
+                ],
+            },
+            RouteConflict::SplitProvider {
+                providers: vec![
+                    "echo".parse().expect("provider"),
+                    "elsewhere".parse().expect("provider"),
+                ],
+            },
+            RouteConflict::MissingChatStorage {
+                capability: "echo.third".parse().expect("capability"),
+                route: CapabilityRoute::ChatMemorySearch,
+                access: StorageAccess::ReadOnly,
+            },
+        ],
+        "one run must report every route mistake: {rendered}"
+    );
+    for fragment in ["echo.second", "elsewhere", "echo.third"] {
+        assert!(
+            rendered.contains(fragment),
+            "the message names {fragment}: {rendered}"
+        );
+    }
 }

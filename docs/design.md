@@ -119,7 +119,10 @@ is bound to one authorization; HTTP and storage cannot coexist in one v1 capabil
 logical names never select paths. Mutations remain provisional until a successful, bounded,
 decoded provider result and then cross a synchronized transaction marker before becoming success.
 
-The independently released optional `memory-chat` provider uses JSONL only. Hidden recording is reachable solely
+The independently released optional `memory-chat` provider uses JSONL only. Which capabilities make up
+the surface is the owner's declaration — one `route:` per record/recent/search role in
+`constraintSets` — not a reserved name, so renaming the provider drops no reservation and naming an
+ordinary capability `memory.chat.export` gains none. Hidden recording is reachable solely
 through `RecordDeliveredTurnForChat` after complete gateway-attested transport acceptance. Recent
 and literal case-insensitive search are on demand and never automatically seed a prompt. Both
 continuity policies always include provider, agent, canonical sender, transport, channel, and

@@ -128,7 +128,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #12 — WRONG_ABSTRACTION — crates/dekopon-broker/src/lib.rs:93-97, :1446 (+ ~30 decision sites)
+## [x] #12 — WRONG_ABSTRACTION — crates/dekopon-broker/src/lib.rs:93-97, :1446 (+ ~30 decision sites)
 
 **Finding:** The optional `memory-chat` provider is identified inside the authorization core by string-matching operator-chosen names (`capability.starts_with("memory.chat.")`, `provider == "memory-chat"`; 72 `MEMORY_*` refs; the same predicate spelled three ways at `:2978`, `:3025`, `:3311`). Naming any capability `memory.chat.export` or any provider `memory-chat` in `broker.yaml` silently changes what the broker hides and denies; renaming the shipped provider silently drops the reserved gate that keeps `record` off the generic invoke path. (raw: A2)
 **Blast radius:** HIGH  **Confidence:** HIGH

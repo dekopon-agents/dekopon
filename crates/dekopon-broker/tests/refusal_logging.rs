@@ -14,10 +14,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
-    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation,
-    ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld, SubjectAttestation,
+    AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ChatAttestation, ChatScopeClaim, ChatSessionClaim, ChatTransportKind, ConstraintCatalog,
+    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld, SubjectAttestation,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -73,6 +73,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
         "echo.reverse".parse().expect("valid capability fixture"),
         ConstraintSet {
+            route: CapabilityRoute::Generic,
             provider: "echo"
                 .parse::<ProviderId>()
                 .expect("valid provider fixture"),
