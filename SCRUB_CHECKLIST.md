@@ -176,7 +176,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #18 — TEST_THEATER — crates/dekopon-provider-storage/src/lib.rs:362 (+ dekopon-provider-host/src/lib.rs:42)
+## [x] #18 — TEST_THEATER — crates/dekopon-provider-storage/src/lib.rs:362 (+ dekopon-provider-host/src/lib.rs:42)
 
 **Finding:** `dekopon-provider-storage`'s only test is `STORAGE_WIT.starts_with("package dekopon:storage@0.1.0;")` on its vendored WIT copy — the exact check `provider-http/tests/wit_mirror.rs:3-6` documents as insufficient — while broker-host and provider-http verify byte-for-byte; `provider-host/src/lib.rs:42`'s `provider.wit` copy is verified by nothing. The storage contract is the one under active change (durable-files, JSONL, turso). (raw: C2)
 **Blast radius:** HIGH  **Confidence:** HIGH

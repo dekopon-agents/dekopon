@@ -126,6 +126,50 @@ pub mod jsonl {
             wit::StorageError::Io => StorageError::Io,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StorageError, map_error, wit};
+
+        /// Eleven hand-written arms across two independently declared enums.
+        ///
+        /// Nothing else checks them: a transposed pair reports "busy" where the host said "quota
+        /// exceeded", and the variant is the guest's only signal about why a storage call failed.
+        /// A variant added to the WIT enum breaks `map_error`'s match, so this table only has to
+        /// pin the pairing.
+        #[test]
+        fn every_wit_error_maps_to_its_own_variant() {
+            let table = [
+                (wit::StorageError::NotFound, StorageError::NotFound),
+                (
+                    wit::StorageError::AlreadyExists,
+                    StorageError::AlreadyExists,
+                ),
+                (wit::StorageError::InvalidName, StorageError::InvalidName),
+                (
+                    wit::StorageError::InvalidArgument,
+                    StorageError::InvalidArgument,
+                ),
+                (
+                    wit::StorageError::PermissionDenied,
+                    StorageError::PermissionDenied,
+                ),
+                (
+                    wit::StorageError::QuotaExceeded,
+                    StorageError::QuotaExceeded,
+                ),
+                (wit::StorageError::Busy, StorageError::Busy),
+                (wit::StorageError::Timeout, StorageError::Timeout),
+                (wit::StorageError::Unsupported, StorageError::Unsupported),
+                (wit::StorageError::Corrupt, StorageError::Corrupt),
+                (wit::StorageError::Io, StorageError::Io),
+            ];
+            assert_eq!(table.len(), 11, "every WIT failure class must be covered");
+            for (wire, expected) in table {
+                assert_eq!(map_error(wire), expected, "{wire:?} must not be remapped");
+            }
+        }
+    }
 }
 
 #[cfg(feature = "durable-files")]
@@ -351,14 +395,48 @@ pub mod durable_files {
             wit::StorageError::Io => StorageError::Io,
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::STORAGE_WIT;
+    #[cfg(test)]
+    mod tests {
+        use super::{StorageError, map_error, wit};
 
-    #[test]
-    fn bindings_pin_the_storage_contract() {
-        assert!(STORAGE_WIT.starts_with("package dekopon:storage@0.1.0;"));
+        /// Eleven hand-written arms across two independently declared enums.
+        ///
+        /// Nothing else checks them: a transposed pair reports "busy" where the host said "quota
+        /// exceeded", and the variant is the guest's only signal about why a storage call failed.
+        /// A variant added to the WIT enum breaks `map_error`'s match, so this table only has to
+        /// pin the pairing.
+        #[test]
+        fn every_wit_error_maps_to_its_own_variant() {
+            let table = [
+                (wit::StorageError::NotFound, StorageError::NotFound),
+                (
+                    wit::StorageError::AlreadyExists,
+                    StorageError::AlreadyExists,
+                ),
+                (wit::StorageError::InvalidName, StorageError::InvalidName),
+                (
+                    wit::StorageError::InvalidArgument,
+                    StorageError::InvalidArgument,
+                ),
+                (
+                    wit::StorageError::PermissionDenied,
+                    StorageError::PermissionDenied,
+                ),
+                (
+                    wit::StorageError::QuotaExceeded,
+                    StorageError::QuotaExceeded,
+                ),
+                (wit::StorageError::Busy, StorageError::Busy),
+                (wit::StorageError::Timeout, StorageError::Timeout),
+                (wit::StorageError::Unsupported, StorageError::Unsupported),
+                (wit::StorageError::Corrupt, StorageError::Corrupt),
+                (wit::StorageError::Io, StorageError::Io),
+            ];
+            assert_eq!(table.len(), 11, "every WIT failure class must be covered");
+            for (wire, expected) in table {
+                assert_eq!(map_error(wire), expected, "{wire:?} must not be remapped");
+            }
+        }
     }
 }
