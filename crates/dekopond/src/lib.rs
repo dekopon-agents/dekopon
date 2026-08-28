@@ -872,7 +872,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, D
     }
 }
 
-/// Everything [`prepare`] resolved, none of it having spoken to a chat service yet.
+/// Everything `prepare` resolved, none of it having spoken to a chat service yet.
 struct Prepared {
     /// The gateway's image generator, absent unless a bound route opted into one.
     image_generator: Option<Arc<dyn ImageGenerator>>,
@@ -882,7 +882,7 @@ struct Prepared {
 
 /// Reads one transport's owner-named credentials and builds its fixed-endpoint client.
 ///
-/// Nothing here connects; [`prepare`] calls it for every transport before any of them does.
+/// Nothing here connects; `prepare` calls it for every transport before any of them does.
 fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, TransportError> {
     Ok(match spec {
         TransportConfig::SlackSocketMode {
@@ -998,7 +998,7 @@ pub enum DekopondError {
 
 /// One thing the daemon must hold before any transport authenticates.
 ///
-/// Resolved together by [`prepare`] and reported through [`DekopondError::Startup`], so a
+/// Resolved together by `prepare` and reported through [`DekopondError::Startup`], so a
 /// deployment missing several secrets is one refusal naming all of them.
 #[derive(Debug, Error)]
 pub enum StartupProblem {
