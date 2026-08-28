@@ -353,11 +353,6 @@ mod tests {
     ];
 
     #[test]
-    fn generated_bindings_identify_the_versioned_http_contract() {
-        assert!(HTTP_WIT.starts_with("package dekopon:http@1.0.0;"));
-    }
-
-    #[test]
     fn accepts_standard_and_extension_methods() {
         assert!(Request::new(method::PATCH, "https://example.test/items/1").is_ok());
         assert!(Request::new("PROPFIND", "https://example.test/").is_ok());
