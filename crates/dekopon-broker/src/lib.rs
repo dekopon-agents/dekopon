@@ -1265,8 +1265,13 @@ impl IdentityDirectory {
 }
 
 /// Independent broker limits for constraint and replay state.
+///
+/// Every field defaults independently to the value [`BrokerLimits::default`] gives it, which is
+/// the same value an entirely absent `brokerLimits` block produces. An operator raising one bound
+/// therefore writes one line instead of restating the others, and a restated default cannot drift
+/// away from the one the code uses.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrokerLimits {
     /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,

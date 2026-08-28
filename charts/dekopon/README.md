@@ -347,6 +347,9 @@ refusal and `ENOSPC` in the middle of an append is not. If you raise `auditMaxLi
 `state.size` in the same change — and remember you cannot raise it after the volume exists.
 
 `serverLimits` is all-or-nothing: when the section is present every field is required.
+`brokerLimits` and `hostLimits` are not — each of their fields defaults on its own to the value an
+absent section would have produced, which is why the chart's default configuration can set
+`maxReplayIds` and `maxTotalMemoryBytes` without restating the sixteen bounds around them.
 
 ### Size `maxReplayIds` with it
 
@@ -360,10 +363,11 @@ denial-heavy history exhausts the ledger at half the audit budget, before the de
 `AuditError::Full` refusal ever fires.
 
 Either bound reached answers every client `capacity-exhausted` and logs
-`broker_capacity_exhausted`. Neither is recoverable by retry or by restart. Set `maxReplayIds` to at
-least `auditMaxRecords`. The ledger holds one bounded identifier string per entry, so matching
+`broker_capacity_exhausted`. Neither is recoverable by retry or by restart. `maxReplayIds` must be
+at least `auditMaxRecords`, so the chart's default `broker.yaml` sets it to **200 000**, matching
+its `auditMaxRecords`. The ledger holds one bounded identifier string per entry, so matching
 200 000 costs tens of MiB of resident memory — cheaper than a broker that refuses every invocation
-until someone edits a values file and rolls the pod.
+until someone edits a values file and rolls the pod. Raise the two together.
 
 ## Storage, uninstall, and recovery
 

@@ -146,6 +146,20 @@ broker:
         auditMaxRecords: 200000
         auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
+      brokerLimits:
+        # Unlike serverLimits, brokerLimits and hostLimits default field by field: everything
+        # omitted here keeps the daemon's own value. The replay ledger never evicts and is
+        # restored from durable history at startup, so the stock 100 000 would answer every
+        # invocation `capacity-exhausted` at half the auditMaxRecords budget above — see
+        # "Size maxReplayIds with it" in README.md.
+        maxReplayIds: 200000
+      hostLimits:
+        # maxMemoryBytes bounds one invocation (64 MiB by default); nothing bounds all of them at
+        # once, so the worst case is maxConnections x maxMemoryBytes = 64 x 64 MiB = 4 GiB, four
+        # times the memory limit below. 256 MiB lets four invocations hold their full ceiling and
+        # refuses the fifth, which is a failed invocation instead of an OOM-killed pod, and it
+        # leaves the rest of the limit to the broker process and Cranelift.
+        maxTotalMemoryBytes: 268435456
     existingSecret: ""
     existingSecretKey: broker.yaml
 

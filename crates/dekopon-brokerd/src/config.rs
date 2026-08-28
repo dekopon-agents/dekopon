@@ -235,8 +235,14 @@ pub struct IdentityMapping {
     pub principal: PrincipalId,
 }
 
+/// Per-invocation Wasmtime ceilings and the optional aggregate memory budget.
+///
+/// Every field defaults independently to the value [`HostLimitsConfig::default`] gives it — the
+/// same value an entirely absent `hostLimits` block produces. Setting `maxTotalMemoryBytes` alone
+/// is therefore one line rather than fifteen, which is what makes the aggregate budget something a
+/// deployment actually sets. The cross-field checks in [`resolve`] still run on the merged result.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HostLimitsConfig {
     pub max_memory_bytes: usize,
     pub max_table_elements: usize,
