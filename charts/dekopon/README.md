@@ -595,6 +595,21 @@ callback path and terminate public TLS outside the pod. A Kubernetes Service can
 so the corresponding transport must bind `0.0.0.0:<gateway.service.port>`. The TCP readiness probe
 keeps the Service endpoint unavailable when the configuration and chart port disagree.
 
+`broker.httpBind` is empty by default, and empty means the chart passes no `--http-bind` argument at
+all, so the broker opens no TCP listener. An address appends `--http-bind <address>` to the broker
+container's arguments and enables `dekopon-webui`: an unauthenticated, `GET`/`HEAD`-only dashboard
+with no login and no mutating route, running inside the privileged broker's address space and
+container memory limit. Read-only is not the same as public-safe — it discloses agent names and
+declared permissions, provider descriptions and input schemas, component paths and digests,
+Wasmtime limits and activity, and the credential-free OTLP endpoint. The network that can reach the
+bound address is the whole access control, so bind loopback (`127.0.0.1:8080`, which `kubectl
+port-forward` still reaches) or a cluster-internal address; `0.0.0.0` publishes that deployment
+metadata on every interface. The chart creates neither a Service nor an Ingress for this listener:
+there is nothing to authenticate against, so exposing it is a decision the operator has to make
+explicitly, outside the chart. See
+[`../../docs/security-model.md`](../../docs/security-model.md#informational-status-reporting-and-the-web-ui) and
+[`../../crates/dekopon-webui/README.md`](../../crates/dekopon-webui/README.md).
+
 ## Install
 
 From the registry:

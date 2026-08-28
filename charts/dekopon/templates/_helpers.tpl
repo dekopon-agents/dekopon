@@ -455,7 +455,10 @@ Arguments: dict "ctx" $ "sidecar" bool
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
-  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"]
+  # broker.httpBind is empty by default, so the unauthenticated read-only web UI stays absent:
+  # without the flag dekopon-brokerd opens no TCP listener. The chart adds no Service or Ingress
+  # for it either; see values.yaml and docs/security-model.md.
+  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"{{ with $.Values.broker.httpBind }}, "--http-bind", "{{ . }}"{{ end }}]
   securityContext:
     {{- toYaml $.Values.securityContext | nindent 4 }}
   env:

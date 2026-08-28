@@ -213,6 +213,19 @@ broker:
   #   existingSecretKey: token
   secretBootstrapFiles: []
 
+  # Optional read-only web UI. Empty is the default and means no `--http-bind` argument reaches
+  # argv, so dekopon-brokerd opens no TCP listener at all. An address appends
+  # `--http-bind <address>` to the broker container's arguments.
+  #
+  # Read docs/security-model.md before setting it. The listener is unauthenticated and shares the
+  # privileged broker's address space and container memory limit. It discloses agent names and
+  # declared permissions, provider descriptions and input schemas, component paths and digests,
+  # Wasmtime limits and activity, and the credential-free OTLP endpoint. The network that can
+  # reach the bound address is the whole access control, so bind loopback (127.0.0.1:8080, which
+  # `kubectl port-forward` still reaches) or a cluster-internal address; 0.0.0.0 publishes that
+  # deployment metadata on every interface. The chart creates no Service and no Ingress for it.
+  httpBind: ""
+
   resources:
     requests:
       cpu: 100m

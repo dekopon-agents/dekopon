@@ -724,6 +724,18 @@ jobs:
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
+          # broker.httpBind is the only optional value that reaches the broker container's argv,
+          # so rendering is the only thing that can prove the flag is still passed. Default values
+          # otherwise: no Service and no Ingress exist for this listener.
+          helm template dekopon charts/dekopon \
+            --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml"
+          grep -q -- '"--http-bind", "127.0.0.1:8080"' "$RUNNER_TEMP/http-bind.yaml"
+          # ... and that the default render, which is the one everybody installs, still passes no
+          # such flag, so the listener stays absent unless an operator asks for it.
+          if grep -q -- '--http-bind' "$RUNNER_TEMP/default.yaml"; then
+            echo "default values must not enable the web UI listener" >&2
+            exit 1
+          fi
       # The drains run in sequence, so the pod's grace has to cover their sum. A guard that never
       # fires is not a guard: render the two shapes that must be refused and prove the message
       # names the number, not just that something went wrong.
@@ -777,6 +789,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/gateway-service.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/http-bind.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a

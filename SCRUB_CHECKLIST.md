@@ -232,7 +232,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: MODIFY: flip to opt-in. `default = []` in dekopon-core, dekopon-capability, dekopon-protocol; `default-features = false` on protocol's edges to core/capability so the feature stays isolated; keep the feature and the 40 derives for consumers who ask. Add one CI build of the three crates without the feature so the off state stays compilable.**
 
-## [ ] #25 — SIDE_QUEST — crates/dekopon-webui/ (whole crate) + charts/dekopon/templates/_helpers.tpl:457-458
+## [x] #25 — SIDE_QUEST — crates/dekopon-webui/ (whole crate) + charts/dekopon/templates/_helpers.tpl:457-458
 
 **Finding:** A 1,973-line crate reachable only through `--http-bind`, which the chart cannot pass — `args: ["--config", …]` is a literal with no values key reaching argv. Seven documents (including a full threat paragraph in `security-model.md:143`) describe an unauthenticated GET listener sharing the privileged broker's address space that no supported deployment can enable; `dekopond` carries the gateway-side inventory/model-usage reports that exist only to feed it. (raw: B1, B2)
 **Blast radius:** MEDIUM  **Confidence:** HIGH
