@@ -7,6 +7,16 @@ construction lives here rather than being duplicated in each binary. The crate d
 must stay linkable from the runner without pulling broker code into the runner's dependency tree,
 which CI rejects.
 
+## Subscriber installation
+
+`Install` builds one process's whole subscriber: a `Console` layer — JSON or text, on stdout or
+stderr, filtered by `RUST_LOG` or by a fixed directive — then any process-specific layer, then the
+OTLP span layer, then the OTLP log bridge, in that order so an entered span has already activated
+a context the log SDK can correlate against. It returns a `TelemetryGuard` whose `shutdown` flushes
+and stops both providers, reporting every failure rather than the first. What a caller does with
+that failure stays the caller's policy: the short-lived runner fails the command, and the daemons
+log and carry on.
+
 ## Transports
 
 `Transport::Grpc` and `Transport::Http` are both first-class. gRPC method paths are fixed by the
@@ -19,9 +29,10 @@ destination, and one client serves both signals rather than one per signal.
 ## Export failures
 
 The OpenTelemetry SDK reports its own export failures through its `internal-logs` feature, which
-this crate enables. Those records use the `opentelemetry*` `tracing` targets; every Dekopon binary
-filters that target off its OTLP layers, so an export failure reaches stdout or stderr and can
-never be re-exported through the exporter that produced it.
+this crate enables. Those records use the `opentelemetry*` `tracing` targets, and `Install`
+silences that prefix on every OTLP layer it builds whatever directive the calling binary supplies,
+so an export failure reaches stdout or stderr and can never be re-exported through the exporter
+that produced it.
 
 ## Authority
 

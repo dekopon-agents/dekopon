@@ -913,7 +913,6 @@ dependencies = [
  "hmac",
  "http-auth",
  "libc",
- "opentelemetry",
  "reqwest",
  "rustix",
  "semver",
@@ -1110,9 +1109,6 @@ dependencies = [
  "dekopon-shell",
  "dekopon-telemetry",
  "dekopon-test-support",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry_sdk",
  "rustix",
  "serde",
  "serde_json",
@@ -1121,7 +1117,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-chrome",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -1165,6 +1160,7 @@ version = "0.11.1"
 dependencies = [
  "async-trait",
  "opentelemetry",
+ "opentelemetry-appender-tracing",
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1173,6 +1169,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1223,7 +1220,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "opentelemetry",
  "reqwest",
  "rustix",
  "serde",
@@ -1235,8 +1231,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]

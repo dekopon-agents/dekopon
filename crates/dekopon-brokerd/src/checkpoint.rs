@@ -251,7 +251,7 @@ impl AuditLog for CheckpointedAuditLog {
             tracing::error!(
                 event = "broker_checkpoint_poisoned",
                 audit_records = records,
-                error = %crate::error_chain(&error)
+                error = %dekopon_core::error_chain(&error)
             );
             state.poisoned = true;
             return Err(AuditError::Io {

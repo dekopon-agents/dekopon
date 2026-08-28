@@ -5,29 +5,26 @@ use std::{
     time::Duration,
 };
 
-use dekopon_telemetry::{ExporterSettings, TelemetryError};
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider};
+use dekopon_telemetry::{
+    Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, ExporterSettings, Install,
+    TelemetryError, TelemetryGuard,
+};
 use thiserror::Error;
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
-use tracing_subscriber::{
-    EnvFilter, Layer, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
-};
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::cli::TelemetryArgs;
 
 /// Crates whose execution spans and lifecycle events belong in runner telemetry.
 const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_agent=trace,dekopon_model=trace,dekopon_process=trace,dekopon_provider_host=trace,dekopon_shell=trace";
-/// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
-/// feed its own export failures back into itself.
-const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_agent=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,opentelemetry=off,reqwest=off";
+/// Transport crates are silenced explicitly: an HTTP stack logs every connection. The OTLP
+/// exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that directive to
+/// every OTLP layer it installs.
+const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_agent=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,reqwest=off";
 
 pub(crate) struct TraceGuard {
     chrome: Option<FlushGuard>,
-    logger_provider: Option<SdkLoggerProvider>,
-    tracer_provider: Option<SdkTracerProvider>,
-    shutdown_timeout: Duration,
+    telemetry: TelemetryGuard,
 }
 
 impl TraceGuard {
@@ -40,30 +37,9 @@ impl TraceGuard {
         // Dropping the Chrome guard flushes its buffered writer. Do this while the tracing
         // subscriber and the OpenTelemetry providers are still alive.
         drop(self.chrome.take());
-
-        let mut failures = Vec::new();
-        if let Some(provider) = self.logger_provider.take() {
-            if let Err(error) = provider.force_flush() {
-                failures.push(format!("logs flush: {error}"));
-            }
-            if let Err(error) = provider.shutdown_with_timeout(self.shutdown_timeout) {
-                failures.push(format!("logs shutdown: {error}"));
-            }
-        }
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(error) = provider.force_flush() {
-                failures.push(format!("traces flush: {error}"));
-            }
-            if let Err(error) = provider.shutdown_with_timeout(self.shutdown_timeout) {
-                failures.push(format!("traces shutdown: {error}"));
-            }
-        }
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(TraceError::Shutdown(failures.join("; ")))
-        }
+        self.telemetry
+            .shutdown()
+            .map_err(|error| TraceError::Shutdown(error.to_string()))
     }
 }
 
@@ -82,13 +58,17 @@ pub(crate) fn initialize(
     // the OTLP and Chrome sinks (whose crate directives match the prefix) without ever printing on
     // the operator's stderr, which must stay byte-for-byte what it was before those events
     // existed.
-    let stderr_layer = fmt::layer()
-        .with_ansi(!no_color)
-        .with_target(verbosity > 1)
-        .with_writer(io::stderr)
-        .with_filter(EnvFilter::new(format!(
+    let console = Console {
+        format: ConsoleFormat::Text {
+            ansi: Some(!no_color),
+            target: verbosity > 1,
+            timestamps: true,
+        },
+        writer: ConsoleWriter::Stderr,
+        filter: ConsoleFilter::Directive(format!(
             "{level},dekopon_run::audit=off,dekopon_agent::audit=off"
-        )));
+        )),
+    };
 
     let (chrome_layer, chrome_guard) = if let Some(path) = chrome_trace {
         let file = File::create(path).map_err(|source| TraceError::Create {
@@ -109,6 +89,10 @@ pub(crate) fn initialize(
     };
 
     let shutdown_timeout = Duration::from_millis(telemetry.otel_export_timeout_ms);
+    let mut install = Install::new(console);
+    if let Some(layer) = chrome_layer {
+        install = install.with_layer(layer);
+    }
 
     // Process state rather than a parameter: it describes the sink's retention scope, not the call.
     // Applied before the endpoint check because `--trace` is a sink too — a local Chrome file is
@@ -116,20 +100,16 @@ pub(crate) fn initialize(
     // without an endpoint would be the same "configures nothing" failure the broker guard refuses.
     dekopon_core::set_telemetry_payloads(telemetry.otel_telemetry_payloads);
 
-    // No endpoint means no exporter, no provider, and no extra layer: the subscriber built here is
+    // No endpoint means no exporter, no provider, and no OTLP layer: the subscriber built here is
     // exactly the one a build without this feature would install. Telemetry settings are not even
     // validated on this path — with export disabled they configure nothing.
     let Some(endpoint) = telemetry.otlp_endpoint.as_deref() else {
-        tracing_subscriber::registry()
-            .with(stderr_layer)
-            .with(chrome_layer)
-            .try_init()
+        let telemetry = install
+            .install()
             .map_err(|error| TraceError::Subscriber(error.to_string()))?;
         return Ok(TraceGuard {
             chrome: chrome_guard,
-            logger_provider: None,
-            tracer_provider: None,
-            shutdown_timeout,
+            telemetry,
         });
     };
 
@@ -148,48 +128,19 @@ pub(crate) fn initialize(
         other => TraceError::Telemetry(other),
     })?;
 
-    let tracer_provider = settings.tracer_provider()?;
-    let tracer = tracer_provider.tracer("dekopon-run");
-    let otel_trace_layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_filter(EnvFilter::new(TRACE_FILTER));
-
-    let logger_provider = settings.logger_provider()?;
-    let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
-        .with_filter(EnvFilter::new(OTEL_LOG_FILTER));
-
-    if let Err(error) = tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(chrome_layer)
-        // Install the span layer before the log bridge so entered tracing spans activate an
-        // OpenTelemetry context that the log SDK can use for trace/span correlation.
-        .with(otel_trace_layer)
-        .with(otel_log_layer)
-        .try_init()
-    {
-        // Best-effort teardown of two providers that never received a span: `try_init` just
-        // failed, so nothing was exported and there is no installed subscriber for a shutdown
-        // diagnostic to reach anyway.
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "rollback of providers that exported nothing; the returned Subscriber error \
-                      is the failure, and no subscriber is installed to carry a second one"
-        )]
-        let _ = logger_provider.shutdown_with_timeout(shutdown_timeout);
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "rollback of providers that exported nothing; the returned Subscriber error \
-                      is the failure, and no subscriber is installed to carry a second one"
-        )]
-        let _ = tracer_provider.shutdown_with_timeout(shutdown_timeout);
-        return Err(TraceError::Subscriber(error.to_string()));
-    }
+    // The span layer is installed before the log bridge so entered tracing spans activate an
+    // OpenTelemetry context the log SDK can use for trace/span correlation; `Install` fixes that
+    // order. A failed installation rolls both providers back there too.
+    let telemetry = install
+        .with_traces(settings.tracer_provider()?, "dekopon-run", TRACE_FILTER)
+        .with_logs(settings.logger_provider()?, OTEL_LOG_FILTER)
+        .with_shutdown_timeout(shutdown_timeout)
+        .install()
+        .map_err(|error| TraceError::Subscriber(error.to_string()))?;
 
     Ok(TraceGuard {
         chrome: chrome_guard,
-        logger_provider: Some(logger_provider),
-        tracer_provider: Some(tracer_provider),
-        shutdown_timeout,
+        telemetry,
     })
 }
 
@@ -215,9 +166,9 @@ pub(crate) enum TraceError {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tracing_subscriber::{layer::Context, registry};
+    use tracing_subscriber::{EnvFilter, Layer as _, layer::Context, registry};
 
-    use super::{EnvFilter, Layer as _, OTEL_LOG_FILTER, TRACE_FILTER, TraceError, initialize};
+    use super::{OTEL_LOG_FILTER, TRACE_FILTER, TraceError, initialize};
     use crate::cli::{TelemetryArgs, Transport};
     use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -234,12 +185,12 @@ mod tests {
         }
     }
 
-    /// Neither OTLP layer may see the exporter's own diagnostics. `internal-logs` is enabled
-    /// workspace-wide, so a layer that accepted them would export the failures of its own export.
-    /// The SDK crates log under their package names, hyphens and all, which is why the log filter
-    /// silences the `opentelemetry` prefix rather than an exact target.
+    /// The runner's two directives are allowlists of its own crates, so nothing else — the OTLP
+    /// exporter's own diagnostics included — can match. `dekopon_telemetry` silences the exporter
+    /// target on every OTLP layer besides; this asserts the runner's own lists, which also select
+    /// the Chrome sink, admit exactly the crates they name.
     #[test]
-    fn the_otlp_layers_never_see_the_exporters_own_records() {
+    fn the_runner_filters_admit_only_its_own_crates() {
         for filter in [TRACE_FILTER, OTEL_LOG_FILTER] {
             let recorded = RecordTargets::default();
             let subscriber = registry().with(recorded.clone().with_filter(EnvFilter::new(filter)));

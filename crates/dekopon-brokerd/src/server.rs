@@ -125,7 +125,7 @@ where
                                 event = "broker_accept_retried",
                                 error.kind = kind,
                                 backoff_ms = accept_backoff_ms,
-                                error = %crate::error_chain(&source),
+                                error = %dekopon_core::error_chain(&source),
                             );
                             tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
                             accept_backoff_ms =
@@ -184,7 +184,7 @@ fn observe_task(
             // The category answers "which failure class"; the chain answers "why", which is the
             // half that used to be dropped. `ENOSPC` during an audit append reaches an operator
             // only through this line.
-            let cause = crate::error_chain(&error);
+            let cause = dekopon_core::error_chain(&error);
             // An unaudited outcome is the only connection failure an operator must act on: it
             // names the one invocation whose effect may have happened with nothing recording it.
             match error.unaudited_outcome() {
@@ -248,7 +248,7 @@ fn report_command_resolve_failure(word: &str, error: &dekopon_broker_host::Broke
             audit.event = "command.resolve.failed",
             command.word = %word,
             error.kind = "provider",
-            error = %crate::error_chain(error),
+            error = %dekopon_core::error_chain(error),
         },
         "command-word rewrite failed"
     );
