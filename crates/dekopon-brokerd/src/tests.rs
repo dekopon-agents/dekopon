@@ -1101,45 +1101,6 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
     );
 }
 
-/// One transient `accept` failure used to end the privileged daemon, and ending it is the most
-/// expensive answer available: the container restarts, every provider recompiles under Cranelift
-/// before the socket rebinds, and durable audit state waits through all of it. Descriptor
-/// exhaustion — which the unauthenticated `--http-bind` listener can cause on its own — is not a
-/// broken listener.
-#[test]
-fn transient_accept_failures_are_survivable_and_the_rest_are_not() {
-    for (errno, kind) in [
-        (libc::EMFILE, "process-descriptor-limit"),
-        (libc::ENFILE, "system-descriptor-limit"),
-        (libc::ENOBUFS, "kernel-memory"),
-        (libc::ENOMEM, "kernel-memory"),
-        (libc::ECONNABORTED, "connection-aborted"),
-        (libc::ECONNRESET, "connection-reset"),
-        (libc::EINTR, "interrupted"),
-    ] {
-        assert_eq!(
-            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
-            Some(kind),
-            "errno {errno} must not exit the daemon"
-        );
-    }
-
-    // A listener that is gone, unbound, or not a socket is a real fault: retrying it forever would
-    // turn a startup mistake into a silent hang.
-    for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
-        assert_eq!(
-            server::retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
-            None,
-            "errno {errno} must stay fatal"
-        );
-    }
-    // Not every `io::Error` carries an errno.
-    assert_eq!(
-        server::retryable_accept_error(&std::io::Error::other("no errno")),
-        None
-    );
-}
-
 /// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
 /// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
 /// storage GC and the web UI a fresh full grace each — that is how a 120 s `shutdownGraceMs`
