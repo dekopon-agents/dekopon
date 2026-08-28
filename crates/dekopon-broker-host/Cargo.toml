@@ -17,7 +17,7 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 dekopon-http-host.workspace = true
-dekopon-provider-sdk.workspace = true
+dekopon-provider-sdk = { workspace = true, features = ["host"] }
 dekopon-storage-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
