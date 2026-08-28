@@ -171,9 +171,25 @@ The OpenTelemetry SDK has no error handler to install; its `internal-logs` featu
 runtime channel it reports export failures through, and the workspace enables that feature for the
 API, the SDK, and the OTLP exporter. Rejected tokens, a missing `organization` header, and a
 receiver that is down therefore say so: the runner prints them on stderr at warn/error, and both
-daemons emit them as structured JSON on stdout. Every binary filters the `opentelemetry` target off
-its own OTLP layers, so those records reach the local stream only and an export failure can never
-be re-exported through the exporter that failed.
+daemons emit them as structured JSON on stdout. `dekopon-telemetry` filters the `opentelemetry`
+target off every OTLP layer it installs, whatever crate directive the binary supplied, so those
+records reach the local stream only and an export failure can never be re-exported through the
+exporter that failed.
+
+### Daemon exit and shutdown records
+
+Both daemons report the same two facts on the way out, in the same shape:
+
+| Event | Level | Emitted by | Carries |
+|---|---|---|---|
+| `gateway_exit` / `broker_exit` | error | `dekopond` / `dekopon-brokerd` | `error`: the failure and its whole source chain, rendered as one `a: b: c` line |
+| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopond` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters, each naming its signal and stage |
+
+`gateway_exit` used to carry both an `error` holding only the top-level `Display` and a `cause`
+that omitted it, so the two daemons' exit records could not be read the same way; they now render
+one `error` through the same chain renderer. The shutdown record likewise replaces a separate
+flush-failed and shutdown-failed pair with one record whose text names which signal and which
+stage failed.
 
 ## Broker export
 

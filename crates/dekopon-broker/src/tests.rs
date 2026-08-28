@@ -682,7 +682,7 @@ fn an_unaudited_storage_outcome_carries_the_cause_that_ended_finalization() {
             std::error::Error::source(&error).is_some(),
             "the storage failure is not reachable as a source"
         );
-        let chain = super::error_chain(&error);
+        let chain = dekopon_core::error_chain(&error);
         assert!(
             chain.contains(cause.label()),
             "{chain} does not name its cause"

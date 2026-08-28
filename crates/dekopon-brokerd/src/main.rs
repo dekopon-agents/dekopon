@@ -4,17 +4,15 @@ use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
 #[cfg(unix)]
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum, error::ErrorKind};
 #[cfg(unix)]
-use opentelemetry::trace::TracerProvider as _;
+use dekopon_core::error_chain;
+#[cfg(unix)]
+use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
 #[cfg(unix)]
 use serde::Serialize;
 #[cfg(unix)]
 use thiserror::Error;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
-#[cfg(unix)]
-use tracing_subscriber::{
-    EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
-};
 
 #[cfg(unix)]
 #[derive(Debug, Parser)]
@@ -114,10 +112,11 @@ enum AuditCommand {
     Verify,
 }
 
-/// Transport crates are silenced explicitly: an OTLP exporter that logs through `tracing` would
-/// feed its own export failures back into itself.
+/// Transport crates are silenced explicitly: an HTTP or gRPC stack logs every connection. The
+/// OTLP exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that
+/// directive to every OTLP layer it installs.
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,hyper=off,h2=off,opentelemetry=off,tonic=off,reqwest=off";
+const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,hyper=off,h2=off,tonic=off,reqwest=off";
 
 #[cfg(unix)]
 #[tokio::main]
@@ -143,52 +142,44 @@ async fn main() -> ExitCode {
         _ => None,
     };
 
-    let tracer_provider = match settings
-        .as_ref()
-        .map(|telemetry| telemetry.settings.tracer_provider())
-    {
-        Some(Ok(provider)) => Some(provider),
-        // Telemetry must never keep the broker from starting. Authorization and audit are the
-        // service's contract; observability is not, and failing closed here would trade a working
-        // authority boundary for a missing dashboard.
-        Some(Err(error)) => {
-            eprintln!("dekopon-brokerd: telemetry disabled: {error}");
-            None
-        }
-        None => None,
-    };
+    // Telemetry must never keep the broker from starting. Authorization and audit are the
+    // service's contract; observability is not, and failing closed here would trade a working
+    // authority boundary for a missing dashboard.
+    let tracer_provider = dekopon_telemetry::optional_tracer_provider(
+        settings.as_ref().map(|telemetry| &telemetry.settings),
+        "dekopon-brokerd",
+    );
 
-    let subscriber_result = if provider_mode {
-        tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(io::stderr).with_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-            ))
-            .try_init()
+    let console = if provider_mode {
+        Console {
+            format: ConsoleFormat::Text {
+                ansi: None,
+                target: true,
+                timestamps: true,
+            },
+            writer: ConsoleWriter::Stderr,
+            filter: ConsoleFilter::Environment("warn".to_owned()),
+        }
     } else {
         // Structured JSON on stdout is the daemon log contract; a collector or shipper can pick it
         // up without the broker holding a second credential.
-        let stdout_layer = fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(true)
-            .with_writer(io::stdout)
-            .with_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            );
-        let otel_layer = tracer_provider.as_ref().map(|provider| {
-            tracing_opentelemetry::layer()
-                .with_tracer(provider.tracer("dekopon-brokerd"))
-                .with_filter(EnvFilter::new(OTEL_TRACE_FILTER))
-        });
-        tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(otel_layer)
-            .try_init()
+        Console {
+            format: ConsoleFormat::Json,
+            writer: ConsoleWriter::Stdout,
+            filter: ConsoleFilter::Environment("info".to_owned()),
+        }
     };
-    if subscriber_result.is_err() {
-        eprintln!("dekopon-brokerd: could not install tracing subscriber");
-        return ExitCode::FAILURE;
+    let mut install = Install::new(console);
+    if let Some(provider) = tracer_provider {
+        install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
     }
+    let telemetry = match install.install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let code = match execute(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -198,15 +189,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Some(provider) = tracer_provider {
-        // Flush failures are reported but do not change the exit code: the broker's durable audit,
-        // not its telemetry, is the record of what happened.
-        if let Err(error) = provider.force_flush() {
-            tracing::error!(event = "broker_telemetry_flush_failed", error = %error);
-        }
-        if let Err(error) = provider.shutdown() {
-            tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
-        }
+    // Flush failures are reported but do not change the exit code: the broker's durable audit,
+    // not its telemetry, is the record of what happened.
+    if let Err(error) = telemetry.shutdown() {
+        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
     }
     code
 }
@@ -379,18 +365,6 @@ fn render<T: Serialize>(
 }
 
 #[cfg(unix)]
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut rendered = error.to_string();
-    let mut source = error.source();
-    while let Some(current) = source {
-        rendered.push_str(": ");
-        rendered.push_str(&current.to_string());
-        source = current.source();
-    }
-    rendered
-}
-
-#[cfg(unix)]
 #[derive(Debug, Error)]
 enum AppError {
     #[error("could not install termination signal handler")]
@@ -410,56 +384,11 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::Path,
-        sync::{Arc, Mutex},
     };
 
     use clap::{CommandFactory as _, Parser as _};
-    use tracing_subscriber::{
-        EnvFilter, Layer as _, layer::Context, layer::SubscriberExt as _, registry,
-    };
 
-    use super::{
-        AuditCommand, Cli, Command, OTEL_TRACE_FILTER, OutputFormat, ProviderCommand, validate_cli,
-    };
-
-    /// Records the target of every event a layer is actually asked to handle.
-    #[derive(Clone, Default)]
-    struct RecordTargets(Arc<Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordTargets {
-        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
-            self.0
-                .lock()
-                .expect("target log")
-                .push(event.metadata().target().to_owned());
-        }
-    }
-
-    /// The OTLP layer must never see the exporter's own diagnostics. `internal-logs` is enabled
-    /// workspace-wide, so a layer that accepted them would export the failures of its own export.
-    /// The SDK crates log under their package names, hyphens and all, which is why the directive
-    /// has to be the `opentelemetry` prefix rather than an exact target.
-    #[test]
-    fn the_otlp_layer_never_sees_the_exporters_own_records() {
-        let recorded = RecordTargets::default();
-        let subscriber = registry().with(
-            recorded
-                .clone()
-                .with_filter(EnvFilter::new(OTEL_TRACE_FILTER)),
-        );
-
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::error!(target: "opentelemetry", "api diagnostic");
-            tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
-            tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
-            tracing::info!(target: "dekopon_brokerd", "broker event");
-        });
-
-        assert_eq!(
-            *recorded.0.lock().expect("target log"),
-            vec!["dekopon_brokerd".to_owned()]
-        );
-    }
+    use super::{AuditCommand, Cli, Command, OutputFormat, ProviderCommand, validate_cli};
 
     #[test]
     fn cli_definition_is_internally_consistent() {

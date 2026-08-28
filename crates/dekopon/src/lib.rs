@@ -121,7 +121,16 @@ fn initialize_tracing(verbosity: u8, no_color: bool) {
         .with_ansi(!no_color)
         .with_target(verbosity > 1)
         .without_time();
-    let _subscriber_result = builder.with_writer(io::stderr).try_init();
+    if let Err(error) = builder.with_writer(io::stderr).try_init() {
+        // A second installation in one process is a real event rather than nothing: the
+        // subscriber that won owns the verbosity and the writer, so `--verbose` and `--no-color`
+        // on this call did not take effect. The winner receives this record.
+        tracing::debug!(
+            event = "cli_tracing_already_installed",
+            error = %error,
+            "another tracing subscriber is already installed"
+        );
+    }
 }
 
 #[derive(Debug, Error)]

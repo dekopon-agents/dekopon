@@ -264,7 +264,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #29 — WRONG_ABSTRACTION / DUPLICATED_LOGIC — crates/dekopon-telemetry/src/lib.rs (owns exporters, not wiring)
+## [x] #29 — WRONG_ABSTRACTION / DUPLICATED_LOGIC — crates/dekopon-telemetry/src/lib.rs (owns exporters, not wiring)
 
 **Finding:** `docs/design.md:103` says `dekopon-telemetry` owns "subscriber wiring"; it owns none. Four binaries hand-roll the same registry/`EnvFilter`/JSON-stdout/OTLP-layer/flush-shutdown sequence (`dekopond/src/main.rs:68-140` and `brokerd/src/main.rs:101-186` are the same function with different strings), each with its own `OTEL_TRACE_FILTER` const; `error_chain` exists at four sites with one divergent copy (`dekopond` skips the top-level `Display`, so the two daemons' exit records have different field shapes); the `RecordTargets` self-log regression test is copied verbatim three times; `dekopon/src/lib.rs:176` discards `try_init()`'s result into a `_named` binding with no log. (raw: A3, D2)
 **Blast radius:** MEDIUM  **Confidence:** HIGH

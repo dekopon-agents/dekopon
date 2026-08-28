@@ -12,6 +12,8 @@
 //! so a token is never accepted as a command-line argument, never written to a configuration file
 //! this crate parses, and never attached to a span attribute or log field.
 
+mod install;
+
 use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
 
 use async_trait::async_trait;
@@ -27,6 +29,11 @@ use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvi
 use serde::Deserialize;
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+pub use install::{
+    Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install, InstallError, ShutdownError,
+    TelemetryGuard, optional_tracer_provider,
+};
 
 /// Wire transport used to reach an OTLP receiver.
 ///

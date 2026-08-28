@@ -59,7 +59,7 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretBytes, SecretDrn, SecretSinkKind, SecretUseProposal, SubjectError,
-    SubjectService, TraceId,
+    SubjectService, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
@@ -5061,22 +5061,6 @@ fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: 
         invocation = %invocation,
         error = %error_chain(source),
     );
-}
-
-/// Renders an error and its sources as one `a: b: c` line.
-///
-/// The chain is the point: `AuditError::Io`'s own message says only that a durable append failed,
-/// and the errno that says *why* — `ENOSPC`, the deployment's named top risk — lives one level
-/// down.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut rendered = error.to_string();
-    let mut source = error.source();
-    while let Some(current) = source {
-        rendered.push_str(": ");
-        rendered.push_str(&current.to_string());
-        source = current.source();
-    }
-    rendered
 }
 
 #[allow(
