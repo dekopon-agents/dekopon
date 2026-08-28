@@ -75,7 +75,10 @@ The complete `${...}` value must be one canonical DRN. Literal passwords, prefix
 interpolation are rejected. Bare DRN characters elsewhere are ordinary public text and have no
 resolution semantics. The marker is removed
 before provider input is built. Immediate/direct invokers refuse secret use; only a broker-backed
-leg forwards the typed top-level proposal.
+leg forwards the typed top-level proposal. Every broker-backed session reaches it — `dekopon-run
+prompt --broker`, a `dekopond` chat session, and `dekopon console` — because invocation is one
+method, so a wrapper that records a call or stops one at a cancellation boundary cannot drop the
+proposal on the way through.
 
 ## Two independent policies
 

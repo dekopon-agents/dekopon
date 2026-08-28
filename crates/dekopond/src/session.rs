@@ -313,10 +313,10 @@ impl Drop for SessionAdmission {
 }
 
 #[derive(Clone)]
-struct SessionCancellation(Arc<AtomicU8>);
+pub(crate) struct SessionCancellation(Arc<AtomicU8>);
 
 impl SessionCancellation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(AtomicU8::new(SESSION_RUNNING)))
     }
 
@@ -331,7 +331,7 @@ impl SessionCancellation {
             .is_ok()
     }
 
-    fn cancel(&self) -> bool {
+    pub(crate) fn cancel(&self) -> bool {
         self.0
             .compare_exchange(
                 SESSION_RUNNING,
@@ -362,9 +362,9 @@ impl Drop for CancellationOnDrop {
 ///
 /// A call already inside the delegate is not rollbackable; this check is the cooperative boundary
 /// immediately before the broker proposal.
-struct CancelAwareInvoker<I> {
-    inner: I,
-    cancellation: SessionCancellation,
+pub(crate) struct CancelAwareInvoker<I> {
+    pub(crate) inner: I,
+    pub(crate) cancellation: SessionCancellation,
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
@@ -402,13 +402,18 @@ impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
         self.inner.describe(capability)
     }
 
-    fn invoke(&self, capability: &str, input: serde_json::Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        capability: &str,
+        input: serde_json::Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
         if self.cancellation.is_cancelled() {
             CapabilityCallResult::Denied {
                 reason: "session-cancelled".to_owned(),
             }
         } else {
-            self.inner.invoke(capability, input)
+            self.inner.invoke(capability, input, secret_use)
         }
     }
 }

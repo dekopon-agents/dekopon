@@ -119,6 +119,7 @@ impl dekopon_shell::CapabilityInvoker for NoCapabilities {
         &self,
         _capability: &str,
         _input: serde_json::Value,
+        _secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> dekopon_shell::CapabilityCallResult {
         dekopon_shell::CapabilityCallResult::NotFound
     }

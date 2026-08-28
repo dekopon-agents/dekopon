@@ -93,7 +93,12 @@ impl CapabilityInvoker for BridgedInvoker {
         vec!["echo.echo".to_owned()]
     }
 
-    fn invoke(&self, _capability: &str, input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _capability: &str,
+        input: Value,
+        _secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
         // A real await point, reached from the same blocking-pool thread the session runs on.
         self.handle.block_on(async move {
             tokio::task::yield_now().await;

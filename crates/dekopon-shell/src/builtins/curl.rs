@@ -274,23 +274,19 @@ mod tests {
             vec!["http-probe.fetch".to_owned()]
         }
 
-        fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
-            self.calls
-                .borrow_mut()
-                .push((capability.to_owned(), input.clone()));
-            CapabilityCallResult::Succeeded(json!({"status": 200}))
-        }
-
-        fn invoke_with_secret_use(
+        fn invoke(
             &self,
             capability: &str,
             input: Value,
             secret_use: Option<SecretUseProposal>,
         ) -> CapabilityCallResult {
+            self.calls
+                .borrow_mut()
+                .push((capability.to_owned(), input.clone()));
             if let Some(secret_use) = secret_use {
                 self.secret_uses.borrow_mut().push(secret_use);
             }
-            self.invoke(capability, input)
+            CapabilityCallResult::Succeeded(json!({"status": 200}))
         }
     }
 

@@ -2727,7 +2727,12 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(&self, capability: &str, _input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            capability: &str,
+            _input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
             panic!("a refused construct must never reach {capability}");
         }
     }

@@ -96,7 +96,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #8 — OVER_ABSTRACTION — crates/dekopon-shell/src/lib.rs:147-237 (CapabilityInvoker)
+## [x] #8 — OVER_ABSTRACTION — crates/dekopon-shell/src/lib.rs:147-237 (CapabilityInvoker)
 
 **Finding:** `CapabilityInvoker` has 7 defaulted methods and 4 hand-written forwarders; three of them (`dekopon-tui` `RecordingInvoker`, `LegHandle`, `dekopond` `CancelAwareInvoker`) do not forward `invoke_with_secret_use`, so the default fires and #173's secret-DRN path is unreachable from both `dekopond` and `dekopon console` — a broker-backed session denies with "secret references require a broker-backed capability". `curl.rs:45` produces the proposal; it never leaves the process. (raw: A3)
 **Blast radius:** HIGH  **Confidence:** HIGH

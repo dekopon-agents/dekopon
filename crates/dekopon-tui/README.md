@@ -20,16 +20,20 @@ payloads. There is no wire anywhere that carries what this console shows.
 ## How it observes without changing anything
 
 Every capability an agent reaches passes through one seam,
-`CapabilityInvoker::invoke(&self, capability, input) -> CapabilityCallResult`, and every script
-passes through one more, `ScriptRuntime::run_script`. `RecordingInvoker` and `RecordingRuntime`
-wrap those two, forward every method unchanged, and report what went through:
+`CapabilityInvoker::invoke(&self, capability, input, secret_use) -> CapabilityCallResult`, and every
+script passes through one more, `ScriptRuntime::run_script`. `RecordingInvoker` and
+`RecordingRuntime` wrap those two, forward every method unchanged, and report what went through:
 
 ```text
 RecordingRuntime
   └ ShellRuntime
       └ RecordingInvoker
-          └ SessionInvoker { direct: NoDirect, broker: BrokerLeg }
+          └ SessionInvoker { direct: NoDirect, broker: Arc<BrokerLeg> }
 ```
+
+Invocation is one method rather than two, which is what makes "forward every method unchanged"
+checkable: a wrapper that observes a call cannot drop the secret-use proposal it carries, because
+there is no second method to forget.
 
 Neither decorator can influence a session. An observer that could deny a call would be a second
 authorization path, and there is exactly one of those. A torn-down console does not stop a running

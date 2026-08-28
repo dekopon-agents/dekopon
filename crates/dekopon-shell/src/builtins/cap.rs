@@ -95,7 +95,15 @@ mod tests {
             })
         }
 
-        fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            capability: &str,
+            input: Value,
+            secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if secret_use.is_some() {
+                return crate::secret_use_unsupported();
+            }
             match capability {
                 "alpha.write" => CapabilityCallResult::Succeeded(input),
                 "zulu.read" => CapabilityCallResult::Denied {

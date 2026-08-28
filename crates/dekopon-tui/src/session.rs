@@ -290,7 +290,14 @@ impl CapabilityInvoker for NoDirect {
         None
     }
 
-    fn invoke(&self, _capability: &str, _input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _capability: &str,
+        _input: Value,
+        _secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        // Deny-by-default on the direct leg. The console's local leg reaches nothing, so it owns
+        // no capability and no secret; `NotFound` sends both kinds of call to the broker.
         CapabilityCallResult::NotFound
     }
 }
@@ -443,7 +450,7 @@ pub async fn run_turn(
                 invoker: RecordingInvoker::new(
                     SessionInvoker {
                         direct: NoDirect,
-                        broker: Some(Box::new(LegHandle(Arc::clone(&leg)))),
+                        broker: Some(Box::new(Arc::clone(&leg))),
                     },
                     events.clone(),
                     sequence.clone(),
@@ -478,50 +485,6 @@ pub async fn run_turn(
     })
     .await
     .map_err(SessionError::Task)
-}
-
-/// Shares one leg across a session's dispatch without cloning its capability snapshot.
-///
-/// `SessionInvoker` wants an owned `Box<dyn CapabilityInvoker + Send>` while the console keeps the
-/// leg for its shell pane, so this forwards through the `Arc` both hold.
-struct LegHandle(Arc<BrokerLeg>);
-
-impl CapabilityInvoker for LegHandle {
-    fn granted(&self) -> Vec<String> {
-        self.0.granted()
-    }
-
-    fn is_granted(&self, capability: &str) -> bool {
-        self.0.is_granted(capability)
-    }
-
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.0.grants_namespace(namespace)
-    }
-
-    fn command_words(&self) -> Vec<String> {
-        self.0.command_words()
-    }
-
-    fn has_command_word(&self, word: &str) -> bool {
-        self.0.has_command_word(word)
-    }
-
-    fn resolve_command(
-        &self,
-        word: &str,
-        argv: &[String],
-    ) -> Option<Result<(String, Value), String>> {
-        self.0.resolve_command(word, argv)
-    }
-
-    fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
-        self.0.describe(capability)
-    }
-
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
-        self.0.invoke(capability, input)
-    }
 }
 
 /// Opens a channel for one session's events.

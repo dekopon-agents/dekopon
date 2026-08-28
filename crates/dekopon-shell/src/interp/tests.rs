@@ -33,7 +33,15 @@ impl CapabilityInvoker for Fixture {
         })
     }
 
-    fn invoke(&self, capability: &str, input: Value) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        if secret_use.is_some() {
+            return crate::secret_use_unsupported();
+        }
         self.calls
             .borrow_mut()
             .push((capability.to_owned(), input.clone()));
@@ -1702,7 +1710,12 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             vec!["slow.call".to_owned()]
         }
 
-        fn invoke(&self, _capability: &str, input: Value) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _capability: &str,
+            input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
             std::thread::sleep(Duration::from_millis(20));
             CapabilityCallResult::Succeeded(input)
         }
