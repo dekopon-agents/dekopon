@@ -29,6 +29,7 @@ jobs:
       run_dependencies: ${{ steps.classify.outputs.run_dependencies }}
       run_release_metadata: ${{ steps.classify.outputs.run_release_metadata }}
       run_chart: ${{ steps.classify.outputs.run_chart }}
+      run_docs: ${{ steps.classify.outputs.run_docs }}
     steps:
       - name: Check out source and pull request history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -126,37 +127,6 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
-      - name: Verify documentation has no stale duplicate entries
-        run: python3 .github/scripts/check_docs_duplicates.py docs
-      - name: Verify emitted audit events are documented
-        shell: bash
-        run: |
-          set -euo pipefail
-          doc=docs/observability.md
-          emitted=()
-          while IFS= read -r event; do
-            emitted+=("$event")
-          done < <(
-            grep -rhoE 'audit\.event[[:space:]]*=[[:space:]]*"[a-z0-9_.]+"' --include='*.rs' crates \
-              | grep -oE '"[a-z0-9_.]+"' \
-              | tr -d '"' \
-              | sort -u
-          )
-          # An empty set means the emission shape changed and this gate stopped reading anything,
-          # which is the silent failure worth failing on.
-          if [ ${#emitted[@]} -eq 0 ]; then
-            echo 'no audit.event names found in crates/; the extraction pattern is stale' >&2
-            exit 1
-          fi
-          status=0
-          for event in "${emitted[@]}"; do
-            if ! grep -Fq -- "\`$event\`" "$doc"; then
-              echo "undocumented audit event: $event (add \`$event\` to $doc)" >&2
-              status=1
-            fi
-          done
-          printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
-          exit "$status"
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
@@ -271,20 +241,77 @@ jobs:
             .github/scripts/ci_metrics.sh finish
           fi
 
-  # Preserve the required branch-protection context while its two expensive halves run in parallel.
+  # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
+  # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
+  # undocumented audit event. The audit gate reads crates/**/*.rs, which is why every
+  # Rust-affecting change also selects run_docs.
+  docs:
+    name: documentation checks
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_docs != 'false' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify documentation has no stale duplicate entries
+        run: |
+          python3 .github/scripts/check_docs_duplicates.py \
+            docs README.md AGENTS.md crates/*/README.md
+      - name: Verify emitted audit events are documented
+        shell: bash
+        run: |
+          set -euo pipefail
+          doc=docs/observability.md
+          emitted=()
+          while IFS= read -r event; do
+            emitted+=("$event")
+          done < <(
+            grep -rhoE 'audit\.event[[:space:]]*=[[:space:]]*"[a-z0-9_.]+"' --include='*.rs' crates \
+              | grep -oE '"[a-z0-9_.]+"' \
+              | tr -d '"' \
+              | sort -u
+          )
+          # An empty set means the emission shape changed and this gate stopped reading anything,
+          # which is the silent failure worth failing on.
+          if [ ${#emitted[@]} -eq 0 ]; then
+            echo 'no audit.event names found in crates/; the extraction pattern is stale' >&2
+            exit 1
+          fi
+          status=0
+          for event in "${emitted[@]}"; do
+            if ! grep -Fq -- "\`$event\`" "$doc"; then
+              echo "undocumented audit event: $event (add \`$event\` to $doc)" >&2
+              status=1
+            fi
+          done
+          printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
+          exit "$status"
+
+  # Preserve the required branch-protection context while its expensive halves run in parallel. A
+  # lane this pull request did not select is skipped, so require each one only under its own gate.
   quality:
     name: quality (stable)
-    needs: [changes, quality_checks, stable_tests]
-    if: ${{ always() && !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    needs: [changes, quality_checks, stable_tests, docs]
+    if: ${{ always() && !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_docs != 'false') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require stable quality lanes
+        shell: bash
         env:
+          RUN_RUST: ${{ needs.changes.outputs.run_rust }}
+          RUN_DOCS: ${{ needs.changes.outputs.run_docs }}
           CHECKS_RESULT: ${{ needs.quality_checks.result }}
           TESTS_RESULT: ${{ needs.stable_tests.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
         run: |
-          test "$CHECKS_RESULT" = success
-          test "$TESTS_RESULT" = success
+          set -euo pipefail
+          if [ "$RUN_RUST" != false ]; then
+            test "$CHECKS_RESULT" = success
+            test "$TESTS_RESULT" = success
+          fi
+          if [ "$RUN_DOCS" != false ]; then
+            test "$DOCS_RESULT" = success
+          fi
 
   otel-e2e:
     name: OTLP OpenObserve smoke test

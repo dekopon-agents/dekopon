@@ -104,7 +104,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #9 — SILENT_FAILURE_MODE — .github/workflows/ci.yml:54, :129 (+ .github/scripts/classify_ci_changes.py:26-32)
+## [x] #9 — SILENT_FAILURE_MODE — .github/workflows/ci.yml:54, :129 (+ .github/scripts/classify_ci_changes.py:26-32)
 
 **Finding:** Both documentation gates (`check_docs_duplicates.py`, added by `a1f3cc8` itself, and the audit-event-documented check) live inside `quality_checks`, which is gated on `run_rust != 'false'`, so a docs-only PR skips exactly the checks that police docs and shows green. `check_docs_duplicates.py` and `render-homebrew-formula.py` are also absent from `FULL_CI_INPUTS`, so editing the gate script runs zero jobs. The gate runs on `docs` only, not `README.md`/`AGENTS.md`/`crates/*/README.md`. (raw: F)
 **Blast radius:** HIGH  **Confidence:** HIGH

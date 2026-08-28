@@ -122,7 +122,7 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust 1.89.0)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization.
 
-Expensive validation runs on pull requests only. The classifier selects Rust, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output still runs every lane. Stable workspace tests run in their own Cargo lane concurrently with formatting, linting, documentation, provider-workspace, shell, release-profile, and privilege-boundary checks; the required `quality (stable)` context aggregates both lanes. The required `test (Rust 1.89.0)` context compiles and links every binary test target on the MSRV with `--no-run` without executing that suite; its small doctest set still executes because Cargo cannot compile doctests under `--no-run`. Full `cargo package --workspace` verification runs when manifests, build scripts, explicit package inputs, WIT, or publication machinery change, while release metadata validation still runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests only. The classifier selects Rust, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output still runs every lane. Stable workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them; the required `quality (stable)` context aggregates all three lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The required `test (Rust 1.89.0)` context compiles and links every binary test target on the MSRV with `--no-run` without executing that suite; its small doctest set still executes because Cargo cannot compile doctests under `--no-run`. Full `cargo package --workspace` verification runs when manifests, build scripts, explicit package inputs, WIT, or publication machinery change, while release metadata validation still runs for ordinary Rust and changelog changes.
 
 Pull-request compiler and Cargo-registry caches are restore-only. `.github/workflows/cache-warm.yml` writes a default-branch registry cache capped at 512 MiB plus granular sccache compiler objects after relevant changes reach `main`; its independent warmer jobs compile lint/test targets but execute no tests and are not a second validation gate. CI job summaries record cache selection, network byte deltas, and target/registry growth so cache usefulness is measured rather than inferred from lookup hits. The tag-triggered release performs only the release-specific tag/version, changelog, and publication-plan checks before building and attesting three platform archives, creating the GitHub release, and publishing every public crate in dependency order. The authorized tag push is the single publication gate: the `crates-io` environment remains part of the short-lived trusted-publisher OIDC identity but has no required-reviewer rule. A manual dispatch against an existing tag is only recovery; it packages and publishes crates while skipping platform builds, the existing GitHub release, and immutable crate versions already present. Every public crate needs a crates.io GitHub trusted-publisher entry for `dekopon-agents/dekopon`, `release.yml`, and that environment; bootstrap a brand-new crate name only under explicit authorization, then register it and revoke the bootstrap credential. Published versions and tags remain immutable. The complete operator checklist lives in the root [`README.md`](../README.md#maintainer-release-process).
 
@@ -197,6 +197,21 @@ cargo package --workspace --locked
 ```
 
 The storage host, immediate host, broker host, broker-core, and broker-service packages intentionally exclude repository-only integration fixtures, so Cargo may warn that `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, or `tests/server.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
+
+### Documentation gates
+
+Both gates run without a Rust toolchain in the `documentation checks` job that the required
+`quality (stable)` context aggregates, so a Markdown-only pull request is gated even though it
+selects no Rust lane. The duplicate-entry check covers `docs/`, the root `README.md`, `AGENTS.md`,
+and every `crates/*/README.md`:
+
+```console
+python3 .github/scripts/check_docs_duplicates.py docs README.md AGENTS.md crates/*/README.md
+```
+
+The other gate is inline in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml): every
+`audit.event` name emitted under `crates/` must appear in [`observability.md`](observability.md),
+and an extraction that reads nothing fails rather than passing silently.
 
 ### OpenObserve OTLP end-to-end test
 
