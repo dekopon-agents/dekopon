@@ -10,11 +10,7 @@
 //! disable them for the whole process.
 
 use std::{
-    collections::BTreeMap,
-    fs,
-    os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path, sync::Arc,
     time::Duration,
 };
 
@@ -31,6 +27,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
 };
+use dekopon_test_support::{CaptureLayer, provider_fixture};
 use serde_json::json;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -48,78 +45,18 @@ when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
 
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<String>>);
-
-impl Captured {
-    fn take(&self) -> String {
-        let mut sink = self.0.lock().expect("capture sink");
-        std::mem::take(&mut sink)
-    }
-
-    /// Drains the capture once `marker` has arrived.
-    ///
-    /// The events under test are emitted by a connection task the client never waits for, so a
-    /// fixed sleep would only decide how flaky this is on a loaded machine.
-    async fn take_after(&self, marker: &str) -> String {
-        for _ in 0..200 {
-            if self.0.lock().expect("capture sink").contains(marker) {
-                return self.take();
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+/// Drains the capture once `marker` has arrived.
+///
+/// The events under test are emitted by a connection task the client never waits for, so a fixed
+/// sleep would only decide how flaky this is on a loaded machine.
+async fn take_after(captured: &CaptureLayer, marker: &str) -> String {
+    for _ in 0..200 {
+        if captured.saw(marker) {
+            return captured.take_events();
         }
-        panic!("no {marker} event arrived: {}", self.take());
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
-    /// These tests compile a real component, and Wasmtime's own trace instrumentation would
-    /// otherwise be captured event by event. Only this project's events are the subject here.
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if metadata.target().starts_with("dekopon") {
-            tracing::subscriber::Interest::always()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
-    }
-
-    /// `Layer::enabled` is what actually turns a callsite off when the inner subscriber is a
-    /// registry, so the filter has to live here rather than only in `register_callsite`.
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target().starts_with("dekopon")
-    }
-
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.0.lock().expect("capture sink");
-        sink.push_str(event.metadata().level().as_str());
-        event.record(&mut Visitor(&mut sink));
-        sink.push('\n');
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-}
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
+    panic!("no {marker} event arrived: {}", captured.take_events());
 }
 
 fn context() -> AuthenticatedContext {
@@ -152,10 +89,12 @@ fn limits() -> ServerLimits {
 /// One audit slot: an allowed invocation spends it on its decision, so its terminal append is
 /// already doomed when the provider runs.
 async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo provider fixture loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider fixture loads");
     let world = PolicyWorld::new(
         ["caller".parse::<PrincipalId>().expect("valid principal")],
         [(
@@ -228,7 +167,7 @@ async fn write_raw(socket: &Path, prefix: u32, body: &[u8], limits: FrameLimits)
 /// what separates "a client is misbehaving" from "the frame ceiling is too small for this input".
 #[tokio::test(flavor = "multi_thread")]
 async fn framing_and_audit_failures_name_their_cause() {
-    let captured = Captured::default();
+    let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
     let uid = current_uid();
@@ -256,7 +195,7 @@ async fn framing_and_audit_failures_name_their_cause() {
     )
     .await;
     assert_eq!(code, ERROR_INVALID_REQUEST);
-    let unreadable = captured.take_after("broker_request_frame_invalid").await;
+    let unreadable = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(unreadable.contains("deserialize"), "{unreadable}");
     // The frame's own bytes are not diagnostics: an untrusted payload must not become a log field.
     assert!(
@@ -266,7 +205,7 @@ async fn framing_and_audit_failures_name_their_cause() {
 
     let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame).await;
     assert_eq!(oversized_code, ERROR_INVALID_REQUEST);
-    let oversized = captured.take_after("broker_request_frame_invalid").await;
+    let oversized = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(oversized.contains("frame-too-large"), "{oversized}");
     // The bound and the attempted size are the whole answer to "why did that call fail".
     assert!(oversized.contains("65536"), "{oversized}");
@@ -292,7 +231,7 @@ async fn framing_and_audit_failures_name_their_cause() {
     // accepting and no second client on the way. It used to wait inside the `JoinSet` for the next
     // accept or for shutdown, so on a quiet broker the one failure an operator must act on was
     // reported whenever the next connection happened to arrive.
-    let unaudited = captured.take_after("broker_outcome_unaudited").await;
+    let unaudited = take_after(&captured, "broker_outcome_unaudited").await;
     assert!(
         unaudited.contains("broker_audit_append_failed"),
         "{unaudited}"

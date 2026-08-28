@@ -1,9 +1,5 @@
 use std::{
-    collections::BTreeMap,
-    fs,
-    os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
-    sync::Arc,
+    collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path, sync::Arc,
     time::Duration,
 };
 
@@ -30,6 +26,7 @@ use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretUseProposal, TraceId,
 };
+use dekopon_test_support::{provider_fixture, shutdown_on};
 use dekopon_webui::ServiceStatus;
 use serde_json::{Value, json};
 use tokio::{
@@ -37,12 +34,6 @@ use tokio::{
     net::{TcpStream, UnixListener, UnixStream},
     sync::oneshot,
 };
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
 
 fn context(principal: &str) -> AuthenticatedContext {
     AuthenticatedContext::new(
@@ -163,10 +154,12 @@ async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
 /// A broker whose replay ledger holds `maximum` identifiers and whose audit is roomy, so the
 /// ledger is the only bound that can be reached.
 async fn broker_with_replay_bound(maximum: usize) -> Arc<Broker<InMemoryAuditLog>> {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("load echo fixture");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load echo fixture");
     Arc::new(
         Broker::new(
             registry,
@@ -191,10 +184,12 @@ async fn broker_with_replay_bound(maximum: usize) -> Arc<Broker<InMemoryAuditLog
 async fn broker_with_audit_bound(
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("load echo fixture");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load echo fixture");
     let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
     let broker = Arc::new(
         Broker::new(
@@ -238,10 +233,12 @@ fn attestor_grant() -> AttestorGrant {
 /// A broker carrying both the direct grant and its attested twin, plus the one owner-controlled
 /// mapping that turns the subject into a principal.
 async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("load echo fixture");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load echo fixture");
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let identities = IdentityDirectory::new([(
         subject(),
@@ -301,13 +298,7 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let capabilities = client.capabilities().await.expect("inspect capabilities");
@@ -350,13 +341,7 @@ async fn mapped_attestor_can_publish_informational_ui_state_without_touching_aud
     let server = BrokerServer::new_with_status(broker, identities, limits, status.clone())
         .expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     client
         .publish_agent_inventory(AgentInventory {
@@ -413,13 +398,7 @@ async fn unmapped_peer_receives_no_capability_information() {
     let limits = server_limits();
     let server = BrokerServer::new(broker, BTreeMap::new(), limits).expect("server starts");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     assert!(client.capabilities().await.is_err());
     shutdown_send.send(()).expect("signal clean shutdown");
@@ -449,7 +428,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
-        "providers": [fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
@@ -468,16 +447,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
 
     let (stop, stopped) = oneshot::channel::<()>();
     let first_config = config_path.clone();
-    let mut first = tokio::spawn(async move {
-        run(first_config, async move {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-            )]
-            let _ = stopped.await;
-        })
-        .await
-    });
+    let mut first = tokio::spawn(async move { run(first_config, shutdown_on(stopped)).await });
     wait_for_socket(&socket_path, &mut first).await;
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create service client");
@@ -495,16 +465,7 @@ async fn full_service_restores_replay_state_from_verified_audit() {
 
     let (stop, stopped) = oneshot::channel::<()>();
     let second_config = config_path.clone();
-    let mut second = tokio::spawn(async move {
-        run(second_config, async move {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-            )]
-            let _ = stopped.await;
-        })
-        .await
-    });
+    let mut second = tokio::spawn(async move { run(second_config, shutdown_on(stopped)).await });
     wait_for_socket(&socket_path, &mut second).await;
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create restarted service client");
@@ -640,7 +601,7 @@ when { context.capability == "http-probe.fetch"
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "secretMapPath": &secret_map_path,
-        "providers": [fixture("http-probe-provider.wasm")],
+        "providers": [provider_fixture("http-probe-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
@@ -736,7 +697,7 @@ async fn full_service_serves_the_explicit_read_only_http_listener() {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
-        "providers": [fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
@@ -760,14 +721,7 @@ async fn full_service_serves_the_explicit_read_only_http_listener() {
     let (stop, stopped) = oneshot::channel::<()>();
     let started_config = config_path.clone();
     let mut service = tokio::spawn(async move {
-        run_with_http(started_config, Some(http_address), async move {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-            )]
-            let _ = stopped.await;
-        })
-        .await
+        run_with_http(started_config, Some(http_address), shutdown_on(stopped)).await
     });
     wait_for_socket(&socket_path, &mut service).await;
     wait_for_http(http_address, &mut service).await;
@@ -887,13 +841,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let ran = client
@@ -1026,13 +974,7 @@ async fn invoke_for_over_the_socket_succeeds_for_an_attestor_peer() {
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
@@ -1083,13 +1025,7 @@ async fn invoke_for_from_a_peer_without_a_grant_is_denied_not_erred() {
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
@@ -1140,13 +1076,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
     let limits = server_limits();
     let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let mut stream = UnixStream::connect(&socket_path)
         .await
@@ -1204,13 +1134,7 @@ async fn capabilities_for_over_the_socket() {
     );
     let granted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (granted_stop, granted_stopped) = oneshot::channel::<()>();
-    let granted_task = tokio::spawn(granted.serve(granted_listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = granted_stopped.await;
-    }));
+    let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
     let (capabilities, _) = client
@@ -1246,13 +1170,8 @@ async fn capabilities_for_over_the_socket() {
     );
     let ungranted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
     let (ungranted_stop, ungranted_stopped) = oneshot::channel::<()>();
-    let ungranted_task = tokio::spawn(ungranted.serve(ungranted_listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender is how this test's shutdown fires when the body panics or returns early, so RecvError is a normal outcome"
-        )]
-        let _ = ungranted_stopped.await;
-    }));
+    let ungranted_task =
+        tokio::spawn(ungranted.serve(ungranted_listener, shutdown_on(ungranted_stopped)));
 
     let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
     let refused = client
@@ -1292,7 +1211,7 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "strict": true,
-        "providers": [fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
@@ -1368,7 +1287,7 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
-        "providers": [fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("echo-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",

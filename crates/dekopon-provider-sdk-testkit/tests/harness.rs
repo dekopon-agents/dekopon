@@ -3,20 +3,12 @@
 //! Every test here is `multi_thread`: the storage path dispatches to `spawn_blocking`, and a
 //! current-thread runtime deadlocks waiting for a namespace lease.
 
-use std::path::PathBuf;
-
 use dekopon_provider_sdk_testkit::{
     BrokerHostError, BrokerHostLimits, ContinuityPolicy, FakeBroker, FakeBrokerError,
     StorageAccess, StorageInterface, StorageLimits,
 };
+use dekopon_test_support::{provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("examples/providers")
-        .join(name)
-}
 
 fn record(id: &str, user: &str, assistant: &str) -> Value {
     json!({
@@ -36,7 +28,7 @@ fn record(id: &str, user: &str, assistant: &str) -> Value {
 
 async fn memory_chat() -> FakeBroker {
     FakeBroker::builder()
-        .component(fixture("memory-chat-provider.wasm"))
+        .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
         .build()
@@ -47,7 +39,7 @@ async fn memory_chat() -> FakeBroker {
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     let broker = FakeBroker::builder()
-        .component(fixture("storage-probe-provider.wasm"))
+        .component(provider_fixture("storage-probe-provider.wasm"))
         .provider("storage-probe")
         .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
         .build()
@@ -128,7 +120,7 @@ async fn two_subjects_do_not_share_a_namespace() {
         .expect("records");
 
     let second = FakeBroker::builder()
-        .component(fixture("memory-chat-provider.wasm"))
+        .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
         .subject("slack.t0123abc.udifferent")
@@ -157,7 +149,7 @@ async fn two_subjects_do_not_share_a_namespace() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_free_component_needs_no_storage() {
     let broker = FakeBroker::builder()
-        .component(fixture("echo-provider.wasm"))
+        .component(provider_fixture("echo-provider.wasm"))
         .provider("echo")
         .build()
         .await
@@ -227,7 +219,7 @@ async fn a_builder_missing_its_component_or_provider_says_which() {
     assert!(matches!(error, FakeBrokerError::NoComponent), "{error}");
 
     let error = FakeBroker::builder()
-        .component(fixture("echo-provider.wasm"))
+        .component(provider_fixture("echo-provider.wasm"))
         .build()
         .await
         .expect_err("no provider");
@@ -244,7 +236,7 @@ async fn a_compile_cache_directory_is_written_and_reused() {
 
     for attempt in ["first", "second"] {
         let broker = FakeBroker::builder()
-            .component(fixture("echo-provider.wasm"))
+            .component(provider_fixture("echo-provider.wasm"))
             .provider("echo")
             .compile_cache(cache.path())
             .build()
@@ -270,7 +262,7 @@ async fn a_compile_cache_directory_is_written_and_reused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
     let narrowed = FakeBroker::builder()
-        .component(fixture("memory-chat-provider.wasm"))
+        .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
         .storage_limits(StorageLimits {
@@ -320,7 +312,7 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here() {
     let broker = FakeBroker::builder()
-        .component(fixture("memory-chat-provider.wasm"))
+        .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
         .continuity(ContinuityPolicy::AuthorityBound)
@@ -363,7 +355,7 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     // The control: the same component, the same builder, the default ceilings.
     FakeBroker::builder()
-        .component(fixture("echo-provider.wasm"))
+        .component(provider_fixture("echo-provider.wasm"))
         .provider("echo")
         .host_limits(BrokerHostLimits::default())
         .build()
@@ -371,7 +363,7 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
         .expect("echo loads under the default host limits");
 
     let error = FakeBroker::builder()
-        .component(fixture("echo-provider.wasm"))
+        .component(provider_fixture("echo-provider.wasm"))
         .provider("echo")
         .host_limits(BrokerHostLimits {
             fuel: 1,
@@ -392,18 +384,10 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
 
 /// Counts every regular file under a directory, recursively.
 fn files(root: &std::path::Path) -> usize {
-    std::fs::read_dir(root)
+    snapshot_tree(root)
         .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| {
-            if entry.path().is_dir() {
-                files(&entry.path())
-            } else {
-                1
-            }
-        })
-        .sum()
+        .filter(|entry| !entry.is_dir)
+        .count()
 }
 
 /// Counts namespace generations on disk: `<root>/namespaces/<namespace>/<generation>/`.

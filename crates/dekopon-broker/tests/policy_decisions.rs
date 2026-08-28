@@ -9,7 +9,7 @@
 //! The `agent.prompt` rows have no exact-engine counterpart — the session gate is authority the
 //! Cedar migration adds — so they are asserted against their documented intent alone.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, ChatAttestation, ChatScopeClaim,
@@ -23,6 +23,7 @@ use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, TraceId, TransportId,
 };
+use dekopon_test_support::provider_fixture;
 use serde_json::json;
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -49,12 +50,6 @@ permit(principal == Dekopon::Principal::"cpetersen",
        resource == Dekopon::Agent::"some-agent")
 when { context has via && context.via == "gateway" };
 "#;
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!("examples/providers/{name}"))
-}
 
 fn principal(name: &str) -> PrincipalId {
     name.parse().expect("valid principal fixture")
@@ -186,10 +181,12 @@ fn policy_engine() -> PolicyEngine {
 }
 
 async fn broker(mapped_principal: &str) -> Broker<InMemoryAuditLog> {
-    let registry =
-        BrokerProviderRegistry::load([fixture("echo-provider.wasm")], BrokerHostLimits::default())
-            .await
-            .expect("echo provider fixture loads");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("echo-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("echo provider fixture loads");
     Broker::new(
         registry,
         principal("broker-test"),

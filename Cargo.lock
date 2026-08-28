@@ -843,6 +843,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-policy",
  "dekopon-storage-host",
+ "dekopon-test-support",
  "libc",
  "serde",
  "serde_json",
@@ -864,6 +865,7 @@ dependencies = [
  "dekopon-provider-sdk",
  "dekopon-provider-sdk-testkit",
  "dekopon-storage-host",
+ "dekopon-test-support",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -905,6 +907,7 @@ dependencies = [
  "dekopon-policy",
  "dekopon-storage-host",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "dekopon-webui",
  "futures-util",
  "hmac",
@@ -972,6 +975,7 @@ dependencies = [
  "base64 0.23.1",
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-test-support",
  "futures-util",
  "reqwest",
  "serde",
@@ -1073,6 +1077,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-storage-host",
+ "dekopon-test-support",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
@@ -1104,6 +1109,7 @@ dependencies = [
  "dekopon-provider-sdk",
  "dekopon-shell",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry_sdk",
@@ -1141,6 +1147,7 @@ version = "0.11.1"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-test-support",
  "getrandom 0.4.3",
  "rustix",
  "serde",
@@ -1169,6 +1176,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-test-support"
+version = "0.11.1"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dekopon-webui"
 version = "0.11.1"
 dependencies = [
@@ -1176,6 +1191,7 @@ dependencies = [
  "dekopon-broker-host",
  "dekopon-broker-protocol",
  "dekopon-core",
+ "dekopon-test-support",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

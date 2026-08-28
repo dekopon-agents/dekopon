@@ -13,6 +13,7 @@ use dekopon_storage_host::{
     ContinuityPolicy, Durability, LockLevel, OpenOptions, StorageGrantRequest, StorageHost,
     StorageHostError, StorageLimits,
 };
+use dekopon_test_support::snapshot_tree;
 use tempfile::TempDir;
 
 fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -137,7 +138,11 @@ fn jsonl_commits_and_reopens_without_raw_scope_paths() {
     );
     transaction.finish_read().expect("finish");
 
-    let tree = walk(&root);
+    let tree = snapshot_tree(&root)
+        .into_iter()
+        .map(|entry| entry.relative.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
     for sentinel in [
         "memory-chat",
         "reviewer",
@@ -270,20 +275,6 @@ fn wrong_key_and_second_writer_fail_closed() {
         StorageHost::open(&root, &key, StorageLimits::default()),
         Err(StorageHostError::KeyMismatch)
     ));
-}
-
-fn walk(root: &Path) -> String {
-    fn visit(path: &Path, output: &mut String) {
-        output.push_str(&path.to_string_lossy());
-        if path.is_dir() {
-            for entry in fs::read_dir(path).expect("read tree") {
-                visit(&entry.expect("entry").path(), output);
-            }
-        }
-    }
-    let mut output = String::new();
-    visit(root, &mut output);
-    output
 }
 
 #[test]
@@ -1941,49 +1932,25 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     ));
 }
 
-fn logical_tree_usage(root: &Path) -> (u64, u64) {
-    fn visit(path: &Path, bytes: &mut u64, entries: &mut u64) {
-        for entry in fs::read_dir(path).expect("read logical usage") {
-            let entry = entry.expect("usage entry");
-            let metadata = fs::symlink_metadata(entry.path()).expect("usage metadata");
-            *entries += 1;
-            *bytes += 4_096;
-            if metadata.is_dir() {
-                visit(&entry.path(), bytes, entries);
-            } else {
-                *bytes += metadata.len();
-            }
-        }
-    }
-    let mut bytes = 0;
-    let mut entries = 0;
-    visit(root, &mut bytes, &mut entries);
-    (bytes, entries)
+/// Every path under `root` paired with its file contents, directories carrying empty contents.
+fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    snapshot_tree(root)
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.relative.to_string_lossy().into_owned(),
+                entry.contents,
+            )
+        })
+        .collect()
 }
 
-fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    fn visit(root: &Path, path: &Path, output: &mut Vec<(String, Vec<u8>)>) {
-        let mut entries = fs::read_dir(path)
-            .expect("read tree")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("entries");
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(root)
-                .expect("relative")
-                .to_string_lossy()
-                .into_owned();
-            if path.is_dir() {
-                output.push((relative, Vec::new()));
-                visit(root, &path, output);
-            } else {
-                output.push((relative, fs::read(path).unwrap_or_default()));
-            }
-        }
-    }
-    let mut output = Vec::new();
-    visit(root, root, &mut output);
-    output
+/// The logical bytes and entries a namespace tree occupies, as the quota ledger counts them.
+fn logical_tree_usage(root: &Path) -> (u64, u64) {
+    let entries = snapshot_tree(root);
+    let bytes = entries
+        .iter()
+        .map(|entry| 4_096 + if entry.is_dir { 0 } else { entry.len })
+        .sum();
+    (bytes, entries.len() as u64)
 }

@@ -6,97 +6,12 @@
 //! A dedicated binary with one global subscriber is the only arrangement where this assertion is
 //! not order-dependent.
 
-use std::{
-    io::{Read as _, Write as _},
-    net::TcpListener,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::time::Duration;
 
 use dekopon_capability::HttpConstraints;
 use dekopon_http_host::{BufferedHttpClient, ErrorCode, Header, HttpHostCeilings, Request};
+use dekopon_test_support::{CaptureLayer, LoopbackServer};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<String>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
-    /// Only this workspace's callsites. An unfiltered layer over a registry also captures every
-    /// transport callsite, which both drowns the assertions and makes them depend on a dependency's
-    /// logging.
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        metadata.target().starts_with("dekopon")
-    }
-
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::Id,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.0.lock().expect("capture sink");
-        sink.push_str(attrs.metadata().name());
-        attrs.record(&mut Visitor(&mut sink));
-    }
-
-    fn on_record(
-        &self,
-        _id: &tracing::Id,
-        values: &tracing::span::Record<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.0.lock().expect("capture sink");
-        values.record(&mut Visitor(&mut sink));
-    }
-
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.0.lock().expect("capture sink");
-        sink.push_str(event.metadata().target());
-        event.record(&mut Visitor(&mut sink));
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-}
-
-/// Minimal loopback server that reads one request and replies once.
-fn mock_http() -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
-    let address = listener.local_addr().expect("fixture address");
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fixture request");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set fixture timeout");
-        let mut buffer = [0_u8; 4096];
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "the fixture discards the request bytes by design and replies unconditionally; \
-                      a read that actually failed breaks the exchange the span assertions below \
-                      depend on"
-        )]
-        let _ = stream.read(&mut buffer);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-            .expect("write fixture response");
-        stream.flush().expect("flush fixture response");
-    });
-    (format!("127.0.0.1:{}", address.port()), handle)
-}
 
 /// Telemetry is a second egress path for the same call the audit chain records, and it has none of
 /// the audit chain's guarantees. A URL path, a query, a header, or a body reaching a span field
@@ -104,10 +19,11 @@ fn mock_http() -> (String, thread::JoinHandle<()>) {
 /// whose every such component is a distinct sentinel and reads back what the span layer captured.
 #[tokio::test]
 async fn http_span_carries_evidence_fields_and_no_payload() {
-    let captured = Captured::default();
+    let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
-    let (authority, handle) = mock_http();
+    let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+    let authority = server.authority().to_owned();
     let mut client = BufferedHttpClient::authorized(
         HttpConstraints {
             allowed_hosts: vec![authority.clone()],
@@ -135,9 +51,9 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
         .await
         .expect("authorized loopback request succeeds");
     assert_eq!(response.status, 200);
-    handle.join().expect("fixture server exits");
+    server.join();
 
-    let recorded = captured.0.lock().expect("capture sink").clone();
+    let recorded = captured.text();
 
     // The sanitized set is present, so a failure below is redaction and not a dead span.
     assert!(recorded.contains("http.request"), "{recorded}");
@@ -160,7 +76,8 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
     // Same client, payloads enabled. The URL now appears, because the operator asked for it — and
     // headers and body still do not, because verbosity widens what spans carry, not everything.
     dekopon_core::set_telemetry_payloads(true);
-    let (verbose_authority, verbose_handle) = mock_http();
+    let verbose_server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+    let verbose_authority = verbose_server.authority().to_owned();
     let mut verbose = BufferedHttpClient::authorized(
         HttpConstraints {
             allowed_hosts: vec![verbose_authority.clone()],
@@ -175,7 +92,7 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
     )
     .expect("verbose fixture client");
 
-    captured.0.lock().expect("capture sink").clear();
+    captured.clear();
     verbose
         .send(Request {
             method: "POST".to_owned(),
@@ -188,10 +105,10 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
         })
         .await
         .expect("verbose loopback request succeeds");
-    verbose_handle.join().expect("verbose fixture exits");
+    verbose_server.join();
     dekopon_core::set_telemetry_payloads(false);
 
-    let verbose_recorded = captured.0.lock().expect("capture sink").clone();
+    let verbose_recorded = captured.text();
     assert!(
         verbose_recorded.contains("VERBOSE_PATH"),
         "{verbose_recorded}"
@@ -218,8 +135,8 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
 ///
 /// This runs inside the one test that owns the global subscriber, for the reason the module
 /// comment gives.
-async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &Captured) {
-    captured.0.lock().expect("capture sink").clear();
+async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &CaptureLayer) {
+    captured.clear();
 
     let mut client = BufferedHttpClient::authorized(
         HttpConstraints {
@@ -246,7 +163,7 @@ async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &C
         .expect_err("an unauthorized destination is refused");
     assert_eq!(error.code, ErrorCode::Denied);
 
-    let recorded = captured.0.lock().expect("capture sink").clone();
+    let recorded = captured.text();
     assert!(recorded.contains("Denied"), "{recorded}");
     assert!(
         recorded.contains("HTTP destination is not authorized for this invocation"),

@@ -7,49 +7,19 @@
 //! for every later thread-local subscriber. Sharing a binary with other tests that call
 //! `run_prompt` would make these assertions depend on execution order.
 
-use std::sync::{Arc, Mutex};
-
 use dekopon_model::model::{
     AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
     ModelToolCall, ModelUsage,
 };
 use dekopon_run::prompt::{PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, run_prompt};
 use dekopon_shell::{Interpreter, Limits, ScriptOutcome};
+use dekopon_test_support::CaptureLayer;
 use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const PROMPT_SENTINEL: &str = "SENTINEL_PROMPT_TEXT";
 const SCRIPT_SENTINEL: &str = "SENTINEL_SCRIPT_TOKEN";
 const ANSWER_SENTINEL: &str = "SENTINEL_ANSWER_TEXT";
-
-/// Captures every log event's rendered fields.
-struct EventLayer {
-    events: Arc<Mutex<String>>,
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut sink = self.events.lock().expect("event sink");
-        event.record(&mut Visitor(&mut sink));
-        sink.push('\n');
-    }
-}
-
-struct Visitor<'a>(&'a mut String);
-
-impl tracing::field::Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0.push_str(&format!(" {}={value}", field.name()));
-    }
-}
 
 /// A model that requests one script and then answers with recognizable text.
 struct ScriptedModel;
@@ -127,9 +97,8 @@ impl dekopon_shell::CapabilityInvoker for NoCapabilities {
 
 /// Runs one session with payloads set as given and returns everything the log stream saw.
 fn session_events(payloads: bool) -> String {
-    let events = Arc::new(Mutex::new(String::new()));
-    let recorded = Arc::clone(&events);
-    let subscriber = tracing_subscriber::registry().with(EventLayer { events: recorded });
+    let captured = CaptureLayer::new();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
         dekopon_core::set_telemetry_payloads(payloads);
@@ -146,7 +115,7 @@ fn session_events(payloads: bool) -> String {
         .expect("prompt session succeeds");
         dekopon_core::set_telemetry_payloads(false);
     });
-    events.lock().expect("event sink").clone()
+    captured.events_text()
 }
 
 /// Quiet then verbose, in one test on purpose.
@@ -237,14 +206,14 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
 
     assert_eq!(prompts.len(), 2, "one prompt event per turn: {verbose}");
     assert!(
-        prompts[0].contains("transcript.scope=full"),
+        prompts[0].contains("transcript.scope=\"full\""),
         "{}",
         prompts[0]
     );
     assert!(prompts[0].contains(PROMPT_SENTINEL), "{}", prompts[0]);
 
     assert!(
-        prompts[1].contains("transcript.scope=delta"),
+        prompts[1].contains("transcript.scope=\"delta\""),
         "{}",
         prompts[1]
     );

@@ -26,6 +26,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dekopon-test-support = { path = "../dekopon-test-support" }
 tempfile.workspace = true
 
 [lints]
