@@ -447,6 +447,13 @@ and the canonical subject therefore land on the broker's own side of the socket,
 bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
 payload-carrying gateway span. It marks refusals, not traffic: an honored session emits nothing.
 
+A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
+they are accounted decisions rather than unanswered inspections, so what the peer receives is a
+`Denied` result whose reason is the one fixed literal `chat-attestation-denied` whatever the claim
+failed on. `broker.authorize`'s `outcome` and the durable decision record keep the real class and
+its `policy_ids`. A subject-only attested proposal still answers with its own class; no chat
+transport takes that path.
+
 The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed" and
 `AuditError::Io` as "durable audit append failed"; the errno that says *why* — `ENOSPC` on an audit
 filesystem shared with anything else — lives one or two levels down, and these events render the
