@@ -222,7 +222,7 @@ pub struct IdentityMapping {
 /// Every field defaults independently to the value [`HostLimitsConfig::default`] gives it — the
 /// same value an entirely absent `hostLimits` block produces. Setting `maxTotalMemoryBytes` alone
 /// is therefore one line rather than fifteen, which is what makes the aggregate budget something a
-/// deployment actually sets. The cross-field checks in [`resolve`] still run on the merged result.
+/// deployment actually sets. The cross-field checks in `resolve` still run on the merged result.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HostLimitsConfig {
