@@ -3468,7 +3468,7 @@ where
     /// refusal is about who may drive this agent.
     ///
     /// Those classes are the audit record's. A chat-scoped claim's refusal answers the peer with
-    /// the single literal [`CHAT_REFUSAL`] instead, because a session peer able to tell the
+    /// the single literal `CHAT_REFUSAL` instead, because a session peer able to tell the
     /// classes apart would read the subject directory and the agent grants out of its own
     /// denials; an attested non-chat proposal still carries its class on the wire, as it did
     /// before the class was typed.
@@ -3603,7 +3603,7 @@ where
     ///
     /// The refusal exists so a caller can report or audit it once; the wire answer stays the same
     /// opaque nothing it was. The inspection callers answer `None` and an unknown command word,
-    /// and both chat invocation paths collapse the class into [`CHAT_REFUSAL`] before it can reach
+    /// and both chat invocation paths collapse the class into `CHAT_REFUSAL` before it can reach
     /// a peer — only an attested non-chat proposal carries the class outward, as it did before
     /// this refusal was typed. The refusal carries the determining `policy_ids` alongside the
     /// class, because an `agent-denied` or `policy-error` a caller flattens into a bare class is a
@@ -5161,7 +5161,7 @@ struct Refusal {
 }
 
 impl Refusal {
-    /// Collapses the peer-visible answer to [`CHAT_REFUSAL`], leaving the audited class intact.
+    /// Collapses the peer-visible answer to `CHAT_REFUSAL`, leaving the audited class intact.
     fn opaque(mut self) -> Self {
         self.wire = CHAT_REFUSAL;
         self
