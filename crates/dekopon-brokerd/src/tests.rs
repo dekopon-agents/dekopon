@@ -747,6 +747,63 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
     );
 }
 
+/// An all-or-nothing limits block is a bound nobody sets: `hostLimits` alone is fifteen fields to
+/// restate before the aggregate memory budget can be raised. Each field now defaults on its own to
+/// exactly the value the absent block produces — and a partial block still meets every cross-field
+/// check, because merging defaults happens before validation rather than instead of it.
+#[tokio::test]
+async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_validated() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let policies = directory.path().join("policies.cedar");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(&policies, POLICIES.as_bytes());
+
+    let defaults = dekopon_broker_host::BrokerHostLimits::default();
+    let mut document = attested_document(uid);
+    document["hostLimits"] = json!({"maxTotalMemoryBytes": 256 * 1024 * 1024});
+    document["brokerLimits"] = json!({"maxReplayIds": 200_000});
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("a partial limits block loads on the absent-block defaults");
+    assert_eq!(resolved.host_limits, defaults);
+    assert_eq!(
+        resolved.host_options.max_total_memory_bytes,
+        Some(256 * 1024 * 1024)
+    );
+    assert_eq!(resolved.broker_limits.max_replay_ids, 200_000);
+    assert_eq!(
+        resolved.broker_limits.max_constraint_sets,
+        dekopon_broker::DEFAULT_MAX_CONSTRAINT_SETS
+    );
+
+    // Defaulting the omitted fields must not defeat the checks that read them together: an
+    // aggregate ceiling below the defaulted per-store ceiling still refuses.
+    document["hostLimits"] = json!({"maxTotalMemoryBytes": defaults.max_memory_bytes - 1});
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("an aggregate ceiling below the defaulted per-store ceiling refuses");
+    assert!(
+        matches!(error, config::ConfigError::InvalidHostLimits),
+        "{error:?}"
+    );
+
+    // An unknown field inside a partial block is still rejected.
+    document["hostLimits"] = json!({"maxTotalMemoryBytes": 256 * 1024 * 1024, "typo": 1});
+    write_config(&path, &document);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("an unknown host-limit field is still refused");
+    assert!(
+        matches!(error, config::ConfigError::Decode { .. }),
+        "{error:?}"
+    );
+}
+
 /// An empty directory is almost certainly a mount that did not happen or a build that did not run,
 /// so it gets its own error rather than the generic "no providers".
 #[tokio::test]

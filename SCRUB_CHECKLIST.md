@@ -112,7 +112,7 @@ Decided 2026-08-27: 25 APPROVE, 7 MODIFY, 3 DEFER (#15, #16, #26), 0 SKIP. Conse
 
 **Decision: APPROVE**
 
-## [ ] #10 — PHANTOM_CONFIGURABILITY — crates/dekopon-brokerd/src/config.rs:129-131 (brokerLimits / hostLimits)
+## [x] #10 — PHANTOM_CONFIGURABILITY — crates/dekopon-brokerd/src/config.rs:129-131 (brokerLimits / hostLimits)
 
 **Finding:** `brokerLimits.maxReplayIds` (default 100 000) is authored nowhere — not the chart default, not `rpi-homelab` — while `docs/broker-http.md:139`, `charts/dekopon/README.md:351`, and `brokerd/README.md:486` all instruct setting it equal to `auditMaxRecords: 200000`, which the live Pi broker does set. The live replay ledger will hard-fail at 100 000 decisions with `capacity-exhausted`. `hostLimits` is 14 required fields (all-or-nothing), so nobody sets `maxTotalMemoryBytes` either, and the config comment at `config.rs:238-246` says the unset worst case exceeds a small container's limit. (raw: B2)
 **Blast radius:** HIGH  **Confidence:** HIGH
