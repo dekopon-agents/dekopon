@@ -35,6 +35,19 @@ All notable changes to Dekopon are documented here. The format is based on
   and compares lock digest, length, and provider identity against the exact buffer handed to
   Wasmtime. Registry provenance verification, private registry credentials, SemVer requirements,
   update/remove/prune commands, and container-image staging migration remain follow-ups.
+- `dekopon-brokerd audit verify --audit-path <PATH>` verifies a durable audit chain offline, beside
+  `provider list|verify`. (#34)
+- The Helm chart can enable the read-only web UI through `broker.httpBind`; it is empty by default,
+  passes no `--http-bind` argument at all, and creates no Service or Ingress. (#25)
+- `grep -E` and `sed -E` accept real regular expressions, compiled by the engine `jq` already links,
+  with bounded pattern size and nesting; without `-E` patterns stay literal and an unescaped
+  metacharacter is still rejected by name. (#23)
+- Durable chat memory is identified by a typed `route:` on each constraint set instead of by
+  capability and provider names, so renaming the shipped provider no longer drops the reservation
+  and naming a capability `memory.chat.export` no longer gains one. (#12)
+- `dekopon-provider-sdk` gained an optional `host` feature carrying the manifest validation,
+  conflict reporting, store bounds, and engine construction both Wasmtime hosts share; the seven
+  `DEFAULT_MAX_*` constants are deprecated at their old paths. (#14)
 
 ### Changed
 
@@ -44,6 +57,39 @@ All notable changes to Dekopon are documented here. The format is based on
   coverage, and package/install/dependency/chart work is selected from tested path classes. Default-branch registry and sccache warmers feed restore-only PR jobs
   instead of uploading multi-gigabyte PR-scoped target archives, while job summaries report cache,
   network, and target-growth measurements for follow-up tuning.
+- The local broker protocol is now `dekopon.dev/broker/v1alpha2`: attestation is one optional
+  field on one operation per verb (`capabilities`, `resolveCommand`, `invoke`,
+  `recordDeliveredTurn`) instead of eleven shape-specific operations, and a mixed broker/client
+  pair refuses on the first frame in either direction instead of failing on a response. Broker and
+  gateway upgrade in lockstep; see `docs/upgrading.md`. (#20)
+- The interactive console moved out of this repository to `dekopon-agents/dekopon-console`, taking
+  `ratatui`, `crossterm`, five duplicate-version `deny.toml` exemptions, the `dev.<surface>.<name>`
+  subject service, and the broker's `allowDevelopmentSubjects` field with it. (#22, #32)
+- Route-scoped image generation collapsed to one `imageGenerator:` block with a boolean route
+  opt-in; see `docs/upgrading.md`. (#27)
+- `brokerLimits` and `hostLimits` default field by field, and the chart sets
+  `maxReplayIds: 200000` and `maxTotalMemoryBytes: 268435456` by default. (#10)
+- The `schemars` feature of `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` is opt-in,
+  so a default dependency no longer pulls `schemars`, `schemars_derive`, and `syn`. (#24)
+- The provider manager's 73 error variants collapsed into ten a caller can branch on, each naming
+  the exact check that refused. (#21)
+- The abandoned `fs2` dependency is replaced by `std::fs::File` advisory locking on the audit,
+  checkpoint, storage-lease, and provider-store paths. (#30)
+- The trusted-file predicate — no symlink, regular, owner-owned, single-link, byte-capped — has one
+  definition in `dekopon-core`, with its two permission tiers named. (#13)
+- Every exporting process installs its subscriber and flushes its exporters through one
+  `dekopon-telemetry` builder, and both daemons' exit records carry the same single `error` field. (#29)
+- The Slack, Discord, Telegram, and WhatsApp transports share one reconnect delay, one dedup ring,
+  one `retry_after` parser, and one message splitter, and WhatsApp reports its service codes as
+  `http-<status>` like the others. (#31)
+- The broker's web UI classifies accept failures with the same table the control socket uses and
+  logs the errno chain instead of a bare event. (#7)
+- Model clients no longer follow an ambient `HTTPS_PROXY`/`ALL_PROXY`; every `dekopon-model`
+  transport is built from one agent that disables proxies and redirects. (#2)
+- The scripting tool's description no longer tells the model that `[[ ]]` and `set -e` are errors,
+  and a test pins the refusal list to what the interpreter rejects. (#28)
+- Documentation gates run in their own toolchain-free CI lane covering `README.md`, `AGENTS.md`, and
+  `crates/*/README.md`, so a documentation-only pull request can no longer skip them. (#9)
 
 ### Removed
 
@@ -60,6 +106,29 @@ All notable changes to Dekopon are documented here. The format is based on
   [dekopon-agents/dekopon-provider-skylight-private](https://github.com/dekopon-agents/dekopon-provider-skylight-private);
   no provider release is claimed, and it remains absent from default catalogs, images, policies,
   and deployments.
+- A batch of unreferenced public items (`script_outcome_label`, `provider_for`, `header_values`,
+  testkit `storage_evidence`/`temporary_dir`, the `_assert_private_path` stub). (#34)
+
+### Fixed
+
+- A chat refusal is audited with its real class (`attestation-denied`, `unmapped-subject`,
+  `agent-denied`, `policy-error`) and the policies that determined it, instead of one flattened
+  `chat-attestation-denied`, and each chat message evaluates the `agent.prompt` policy once instead
+  of twice. (#5)
+- An unaudited storage outcome names the class of the failure that caused it (`quota`, `timeout`,
+  `corrupt`, `denied`, `io`) in the error chain and in a new `broker_storage_outcome_unaudited`
+  log. (#6)
+- A model's `apiKeyEnv` naming an unset, blank, or non-UTF-8 variable is a startup refusal naming
+  the variable, instead of a tokenless client that answered every message with a 401. (#4)
+- A `${drn:…}` secret reference in a script reaches the broker from a `dekopond` chat session
+  instead of being refused inside the process that built the proposal. (#8)
+- ChatGPT credential discovery ignores an empty `DEKOPON_CHATGPT_AUTH_FILE`/`XDG_CONFIG_HOME`/
+  `HOME`/`APPDATA` export and refuses a relative discovered path instead of writing the rotating
+  refresh token into the current directory. (#3)
+- `.gitignore` ignores `examples/conditional-write/broker-credentials.yaml`, the path the surviving
+  walkthrough tells you to paste a live token into. (#1)
+- `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
+  own four-row reserved-fields table. (#33)
 
 ## [0.11.1] - 2026-08-23
 
