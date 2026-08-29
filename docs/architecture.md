@@ -2,15 +2,26 @@
 
 Read [`design.md`](design.md) first for the product model and accepted invariants. This document maps that design to current crate boundaries and the planned deployment topology; it does not make planned components current.
 
-## Published 0.11.1 foundation
+## Published 0.12.0 foundation
 
-The published `0.11.1` patch fixes the container image, which failed to publish for `0.11.0`: the
-CLI linked two weak-probed `GLIBC_2.39` symbols the distroless Debian 12 runtime base (glibc 2.36)
-does not provide, and glibc's dynamic linker refuses to load a binary naming a version node the
-runtime library lacks at all, weak reference or not. The base moved to Debian 13 (glibc 2.41). No
-crate's source changed. The interactive console `0.11.0` added has since moved out of this tree to
+The published `0.12.0` release is a structural scrub rather than a feature release: thirty-two
+decided findings, one commit each, across every crate. The boundaries it moved are the ones worth
+reading here. The local broker protocol is `dekopon.dev/broker/v1alpha2`, in which attestation is
+one optional field on the request instead of a type-level axis multiplied across eleven request
+variants, thirteen client methods, and nine broker entry points; the six `*_for` / `*_for_chat`
+pairs are gone and a client upgrades in lockstep with its broker. Durable chat memory is keyed by a
+typed `route:` on a constraint set, not by capability and provider names. `ProviderManagerError`
+collapsed from seventy-three variants to ten. Both Wasmtime hosts now share one host layer in
+`dekopon_provider_sdk::host`, twelve hand-rolled trusted-file checks became one `dekopon-core`
+predicate, and every process installs its telemetry subscriber from one builder. The interactive
+console `0.11.0` added moved out of this tree to
 [`dekopon-console`](https://github.com/dekopon-agents/dekopon-console); it was an unprivileged
 broker client holding a model credential, so no responsibility moved with it.
+
+`0.11.1` before it was a container-image patch: the CLI linked two weak-probed `GLIBC_2.39` symbols
+the distroless Debian 12 runtime base (glibc 2.36) does not provide, and glibc's dynamic linker
+refuses to load a binary naming a version node the runtime library lacks at all, weak reference or
+not. The base moved to Debian 13 (glibc 2.41). No crate's source changed.
 `dekopon-shell` gained a real bash-script surface — compound commands as pipeline stages,
 `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and
 two script-addressable streams. `dekopon-provider-sdk-testkit` runs a provider component against

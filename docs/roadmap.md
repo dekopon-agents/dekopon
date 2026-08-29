@@ -150,7 +150,17 @@ so it publishes at all: the CLI binary referenced two symbols glibc's dynamic li
 runtime library to name even though both are weak-probed and safely absent on an older one. No
 crate's source changed.
 
-## Unreleased — the console moved out of tree
+Version 0.12.0 is a structural scrub rather than a feature release: thirty-two decided findings from
+a whole-tree audit, one commit each. It bumps the local broker protocol to
+`dekopon.dev/broker/v1alpha2`, where attestation is one optional request field instead of a
+type-level axis multiplied across eleven request variants, thirteen client methods, and nine broker
+entry points; keys durable chat memory by a typed `route:` on a constraint set rather than by
+capability and provider names; collapses `ProviderManagerError` from seventy-three variants to ten;
+gives both Wasmtime hosts one shared host layer; replaces twelve hand-rolled trusted-file checks
+with one `dekopon-core` predicate; and moves the interactive console out of tree. A client and a
+broker upgrade together.
+
+## 0.12 — the console moved out of tree (released)
 
 - `dekopon console` and the `dekopon-tui` crate ship from
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` builtin
@@ -168,7 +178,7 @@ crate's source changed.
   `allowDevelopmentSubjects` opt-in: the console was the only surface that minted one, and no
   deployment set the field. See [`upgrading.md`](upgrading.md).
 
-## Unreleased — Tokio process lifecycle foundation (implemented)
+## 0.12 — Tokio process lifecycle foundation (released)
 
 - `dekopon-process` provides one async operation trait and a one-run/one-node execution boundary.
   It records private payload-free trace IDs, preserves the typed operation result or Tokio task
@@ -182,7 +192,7 @@ crate's source changed.
   real production consumer. The current lifecycle crate contains no broker, policy, credential,
   provider host, network, filesystem, retry, or audit machinery.
 
-## Unreleased — locked provider-set foundation (implemented)
+## 0.12 — locked provider-set foundation (released)
 
 - `dekopon-brokerd provider sync`, `sync --locked`, `list`, and `verify` keep exact operator-authored
   OCI references, immutable manifest/component resolutions, and content-addressed installed bytes
@@ -195,7 +205,7 @@ crate's source changed.
   and container-staging adoption remain the ordered follow-ups rather than fields parsed but read by
   nothing.
 
-## Unreleased — public DRNs and private secret sources (implemented)
+## 0.12 — public DRNs and private secret sources (released)
 
 - Canonical logical DRNs are inert typed proposal values, never provider JSON/WIT or bearer grants.
   Each use requires the normal capability decision, a separate exact Cedar `secret.use` decision,

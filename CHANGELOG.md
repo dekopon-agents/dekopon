@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-29
+
 ### Added
 
 - Added `dekopon-process`, a small unprivileged Tokio lifecycle seam that runs one typed async
@@ -37,8 +39,6 @@ All notable changes to Dekopon are documented here. The format is based on
   update/remove/prune commands, and container-image staging migration remain follow-ups.
 - `dekopon-brokerd audit verify --audit-path <PATH>` verifies a durable audit chain offline, beside
   `provider list|verify`. (#34)
-- The Helm chart can enable the read-only web UI through `broker.httpBind`; it is empty by default,
-  passes no `--http-bind` argument at all, and creates no Service or Ingress. (#25)
 - `grep -E` and `sed -E` accept real regular expressions, compiled by the engine `jq` already links,
   with bounded pattern size and nesting; without `-E` patterns stay literal and an unescaped
   metacharacter is still rejected by name. (#23)
@@ -70,8 +70,8 @@ All notable changes to Dekopon are documented here. The format is based on
   subject service, and the broker's `allowDevelopmentSubjects` field with it. (#22, #32)
 - Route-scoped image generation collapsed to one `imageGenerator:` block with a boolean route
   opt-in; see `docs/upgrading.md`. (#27)
-- `brokerLimits` and `hostLimits` default field by field, and the chart sets
-  `maxReplayIds: 200000` and `maxTotalMemoryBytes: 268435456` by default. (#10)
+- `brokerLimits` and `hostLimits` default field by field, so naming one field no longer drops the
+  defaults of every other field in the block. (#10)
 - The `schemars` feature of `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` is opt-in,
   so a default dependency no longer pulls `schemars`, `schemars_derive`, and `syn`. (#24)
 - The provider manager's 73 error variants collapsed into ten a caller can branch on, each naming
@@ -163,6 +163,20 @@ All notable changes to Dekopon are documented here. The format is based on
   walkthrough tells you to paste a live token into. (#1)
 - `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
   own four-row reserved-fields table. (#33)
+
+## [dekopon-chart-0.3.0] - 2026-08-29
+
+### Added
+
+- The chart can enable the read-only web UI through `broker.httpBind`. It is empty by default, so
+  the rendered deployment passes no `--http-bind` argument at all and neither a Service nor an
+  Ingress is created for it. (#25)
+
+### Changed
+
+- `appVersion` names `0.12.0`, and the chart authors `brokerLimits.maxReplayIds: 200000` and
+  `hostLimits.maxTotalMemoryBytes: 268435456` explicitly. `0.12.0` defaults both blocks field by
+  field, so a chart that names one field no longer silently drops the rest. (#10)
 
 ## [0.11.1] - 2026-08-23
 

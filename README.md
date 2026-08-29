@@ -1,6 +1,6 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.11.1** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.12.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
 > **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
 
@@ -8,7 +8,7 @@ Dekopon is a capability-oriented control plane for self-hosted AI agents. **Vers
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
-## What works today in 0.11.1
+## What works today in 0.12.0
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
@@ -52,12 +52,31 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
   `wasm32-unknown-unknown`, importing only `dekopon:storage/durable-files@0.1.0`, published
   separately from [dekopon-provider-turso-sql](https://github.com/dekopon-agents/dekopon-provider-turso-sql).
 
-New in 0.11.0 — `dekopon-shell`'s real bash-script surface:
+New in 0.12.0 — a structural scrub of the whole tree:
 
 - The interactive console moved out of this tree to
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` provider
   did. It was an unprivileged broker client holding a model credential, so nothing here loses
   authority; the operator CLI is a local catalog and model-account tool again.
+- The local broker protocol is `dekopon.dev/broker/v1alpha2`. Attestation is one optional field on
+  the request rather than a shape multiplied across eleven request variants, thirteen client
+  methods, and nine broker entry points, so the six `*_for` / `*_for_chat` constructors and their
+  matching client and broker methods are gone. A client and a broker upgrade together.
+- Durable chat memory is identified by a typed `route:` on a constraint set instead of by
+  capability and provider names, so renaming the shipped provider no longer silently drops the
+  reservation. A deployment with `memory.chat.*` capabilities and no `chatMemory:` block loses the
+  old name-based reservation; see [`docs/upgrading.md`](docs/upgrading.md).
+- `dekopon-brokerd`'s `ProviderManagerError` collapsed from seventy-three variants to ten, each
+  naming the check that refused rather than the message it printed.
+- `grep -E` and `sed -E` accept real regular expressions in the sandboxed shell, bounded in pattern
+  size and nesting; without `-E` patterns stay literal.
+- `dekopon-brokerd audit verify --audit-path <PATH>` verifies a durable audit chain offline.
+- `brokerLimits` and `hostLimits` default field by field, so naming one field no longer drops the
+  defaults of every other field in its block.
+- The `schemars` feature of `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` is opt-in.
+
+New in 0.11.0 — `dekopon-shell`'s real bash-script surface:
+
 - `dekopon-shell` gained compound commands as pipeline stages, `[[ ... ]]`, enforced
   `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two
   script-addressable streams — the bash surface a script author expects, minus glob matching and
@@ -153,26 +172,26 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 
 ### Prebuilt archives
 
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.11.1 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.11.1). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
+Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to the [v0.12.0 GitHub release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.12.0). Each carries all four executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.11.1 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.11.1-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.11.1-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.12.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.12.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.12.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.11.1-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.11.1-aarch64-apple-darwin.tar.gz
+  dekopon-0.12.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.12.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
 
-The workspace contains twenty-five public crates, and the `0.11.1` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
+The workspace contains twenty-five public crates, and the `0.12.0` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
-cargo install --locked --version 0.11.1 dekopon
-cargo install --locked --version 0.11.1 dekopon-run
-cargo install --locked --version 0.11.1 dekopon-brokerd
-cargo install --locked --version 0.11.1 dekopond
+cargo install --locked --version 0.12.0 dekopon
+cargo install --locked --version 0.12.0 dekopon-run
+cargo install --locked --version 0.12.0 dekopon-brokerd
+cargo install --locked --version 0.12.0 dekopond
 ```
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
@@ -210,7 +229,7 @@ dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
 
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.2.1` declares `appVersion: 0.11.0`, so it deploys `v0.11.0` by default; to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
+For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.3.0` declares `appVersion: 0.12.0`, so it deploys `v0.12.0` by default; to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
 
 ## Run the flagship example
 
