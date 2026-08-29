@@ -1211,7 +1211,6 @@ dependencies = [
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
- "dekopon-protocol",
  "dekopon-shell",
  "dekopon-storage-host",
  "dekopon-telemetry",
