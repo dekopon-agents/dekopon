@@ -22,7 +22,6 @@ dekopon-broker-protocol.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
-dekopon-protocol.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 futures-util.workspace = true
