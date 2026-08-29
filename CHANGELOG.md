@@ -7,7 +7,7 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-08-28
+## [0.12.0] - 2026-08-29
 
 ### Added
 
@@ -164,7 +164,7 @@ All notable changes to Dekopon are documented here. The format is based on
 - `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
   own four-row reserved-fields table. (#33)
 
-## [dekopon-chart-0.3.0] - 2026-08-28
+## [dekopon-chart-0.3.0] - 2026-08-29
 
 ### Added
 
