@@ -417,7 +417,7 @@ They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1`
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
 force an application release, and an application release should not republish an unchanged chart.
 
-`appVersion` is `0.11.0`, the current application release. It is not decorative: `dekopon.labels`
+`appVersion` is `0.12.0`, the current application release. It is not decorative: `dekopon.labels`
 renders it as `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a
 cluster answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running,
 and every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -429,7 +429,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.11.0
+ghcr.io/dekopon-agents/dekopon:v0.12.0
 ```
 
 There is no `latest`. Prefer `image.digest` once a release exists; it pins across the
@@ -461,8 +461,8 @@ The published coordinates are:
 oci://ghcr.io/dekopon-agents/charts/dekopon
 ```
 
-Chart `0.2.1` is published there. The packaging half is checked on every CI run, which packages the
-chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.2.1`
+Chart `0.3.0` is published there. The packaging half is checked on every CI run, which packages the
+chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.3.0`
 tag ran the push. What remains unproven is the *pull*: no cluster has installed the published chart,
 so a first install should be treated as the first exercise of this path.
 

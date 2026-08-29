@@ -50,7 +50,7 @@ explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
-### After 0.11.1 — optional public DRNs require a private map and second policy
+### 0.11.1 → 0.12.0 — optional public DRNs require a private map and second policy
 
 Existing `credentialsPath`, `credential`, and `credentialByAgent` deployments need no migration and
 retain byte-compatible legacy audit serialization. To opt into model-selected DRNs:
@@ -67,6 +67,100 @@ retain byte-compatible legacy audit serialization. To opt into model-selected DR
 Startup validates descriptors without network. Remote source availability is first exercised after
 an authorized invocation. See [`secrets.md`](secrets.md) for exact source fields and current
 bootstrap limitations.
+
+### 0.11.1 → 0.12.0 — the structural scrub
+
+- **Delete `allowDevelopmentSubjects` from `broker.yaml` before upgrading the broker.** The field is
+  gone, and `broker.yaml` rejects unknown fields, so leaving it is a startup failure rather than a
+  value quietly ignored. Delete every `dev.*` `identityMappings` subject and attestor namespace with
+  it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
+  by default and no chart release could set it, so a deployment that never opted in has nothing to
+  edit — and no persisted audit chain can carry a `dev.*` subject.
+- **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
+  memory used to be recognized by name: any capability spelled `memory.chat.*` and any provider
+  called `memory-chat` was reserved, and renaming the shipped provider silently dropped that
+  reservation. It is now the owner's declaration. Add `route: chatMemoryRecord`,
+  `route: chatMemoryRecent`, and `route: chatMemorySearch` to the three `constraintSets` entries
+  that make up the surface — exactly one set per role, all naming one provider, each already
+  declaring `jsonl` chat storage at its role's access. Without them the sets are ordinary
+  capabilities, `chatMemory` refuses to compose, and the broker fails to start rather than serving a
+  memory surface nothing reserves. That refusal names the work: it lists every role no constraint
+  set declares `route:` for, names all three, and says exactly one set must declare each. Startup
+  reports every route conflict at once for the same reason. Deployments with no chat memory have
+  nothing to edit: `route:` is optional, defaults to `generic`, and a set that
+  omits it means exactly what it meant before. The wire protocol and audit record shapes are
+  unchanged.
+- **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables
+  in one step.** The eleven request operations collapsed into six — `capabilities`,
+  `resolveCommand`, `invoke`, `recordDeliveredTurn`, `publishAgentInventory`, `publishModelUsage` —
+  because whether a caller speaks as its own peer, on behalf of a subject, or inside a chat scope is
+  now an optional `attestation` field rather than a separate operation per shape. The retired tags
+  (`capabilitiesFor`, `capabilitiesForChat`, `invokeFor`, `invokeForChat`, `resolveCommandForChat`,
+  `recordDeliveredTurnForChat`) are gone rather than aliased: an alias would have had to carry the
+  old field shapes too, and a mixed pair would then half-work. There is nothing to edit — no
+  configuration file, policy, catalog, or audit record shape changes, and no persisted state is
+  touched — but a mixed set of binaries now fails at the **envelope, in both directions**: the
+  broker answers an `apiVersion` it does not know with `invalid-request` on the first request frame,
+  before anything is authorized, accounted, or audited. A client never emits that code. An older
+  client against a newer broker therefore fails on the *response* frame, cannot decode the refusal,
+  and reports the outcome as unknown — but under `v1alpha1` that same failure came after the
+  request had been decoded and run, so the proposal really had an unknown outcome; now nothing ran.
+  That half is what this closes. The restart order in
+  [Restart the broker first and stop it last](#restart-the-broker-first-and-stop-it-last) is
+  unchanged and is what keeps the window shut: stop `dekopond`, drain and stop `dekopon-brokerd`,
+  replace **all four** binaries, start the broker, then start the gateway. Do not roll one process
+  at a time.
+
+  A fifth broker client lives outside this repository:
+  [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
+  `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
+  `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
+  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
+  0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
+  that lands, and do not run the console against an upgraded broker.
+- **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
+  now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
+  `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`
+  is the usage error it was before 0.11.0 rather than a full-screen view. Nothing loses authority:
+  the console never held any.
+
+#### `imageGenerators:` becomes one `imageGenerator:` block
+
+A gateway configures at most one image generator, so the named list is now a single optional object
+and a route opts in with a flag instead of a name. `deny_unknown_fields` means the old shape does not
+decode: `dekopond` refuses to start rather than ignoring the block. In `dekopond.yaml`:
+
+```yaml
+# before
+imageGenerators:
+  - name: openai-images
+    kind: openaiImages
+    model: gpt-image-1
+    apiKeyEnv: OPENAI_IMAGE_API_KEY
+    timeoutMs: 120000
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    imageGenerator: openai-images
+
+# after
+imageGenerator:
+  model: gpt-image-1
+  apiKeyEnv: OPENAI_IMAGE_API_KEY
+  timeoutMs: 120000
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    imageGenerator: true
+```
+
+Drop `name:` and `kind:` — the endpoint was already fixed to OpenAI's public Images API and the name
+had one referent. Deployments that configured more than one generator keep the one their routes
+actually named. Nothing else changes: the credential is still an environment variable name read only
+when a route opts in, and pairing an opted-in route with a `whatsappCloudApi` transport is still a
+startup refusal.
 
 ### 0.2 → 0.3 — the broker configuration is a breaking migration
 
@@ -220,103 +314,6 @@ application under an existing chart, set `image.tag` (or better, `image.digest`)
 for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
 has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
 audit chain in place.
-
-## Pending the next release
-
-These are implemented in this tree and sit under `[Unreleased]` in the changelog. They move into a
-release section here when that release is tagged.
-
-- **Delete `allowDevelopmentSubjects` from `broker.yaml` before upgrading the broker.** The field is
-  gone, and `broker.yaml` rejects unknown fields, so leaving it is a startup failure rather than a
-  value quietly ignored. Delete every `dev.*` `identityMappings` subject and attestor namespace with
-  it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
-  by default and no chart release could set it, so a deployment that never opted in has nothing to
-  edit — and no persisted audit chain can carry a `dev.*` subject.
-- **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
-  memory used to be recognized by name: any capability spelled `memory.chat.*` and any provider
-  called `memory-chat` was reserved, and renaming the shipped provider silently dropped that
-  reservation. It is now the owner's declaration. Add `route: chatMemoryRecord`,
-  `route: chatMemoryRecent`, and `route: chatMemorySearch` to the three `constraintSets` entries
-  that make up the surface — exactly one set per role, all naming one provider, each already
-  declaring `jsonl` chat storage at its role's access. Without them the sets are ordinary
-  capabilities, `chatMemory` refuses to compose, and the broker fails to start rather than serving a
-  memory surface nothing reserves. That refusal names the work: it lists every role no constraint
-  set declares `route:` for, names all three, and says exactly one set must declare each. Startup
-  reports every route conflict at once for the same reason. Deployments with no chat memory have
-  nothing to edit: `route:` is optional, defaults to `generic`, and a set that
-  omits it means exactly what it meant before. The wire protocol and audit record shapes are
-  unchanged.
-- **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables
-  in one step.** The eleven request operations collapsed into six — `capabilities`,
-  `resolveCommand`, `invoke`, `recordDeliveredTurn`, `publishAgentInventory`, `publishModelUsage` —
-  because whether a caller speaks as its own peer, on behalf of a subject, or inside a chat scope is
-  now an optional `attestation` field rather than a separate operation per shape. The retired tags
-  (`capabilitiesFor`, `capabilitiesForChat`, `invokeFor`, `invokeForChat`, `resolveCommandForChat`,
-  `recordDeliveredTurnForChat`) are gone rather than aliased: an alias would have had to carry the
-  old field shapes too, and a mixed pair would then half-work. There is nothing to edit — no
-  configuration file, policy, catalog, or audit record shape changes, and no persisted state is
-  touched — but a mixed set of binaries now fails at the **envelope, in both directions**: the
-  broker answers an `apiVersion` it does not know with `invalid-request` on the first request frame,
-  before anything is authorized, accounted, or audited. A client never emits that code. An older
-  client against a newer broker therefore fails on the *response* frame, cannot decode the refusal,
-  and reports the outcome as unknown — but under `v1alpha1` that same failure came after the
-  request had been decoded and run, so the proposal really had an unknown outcome; now nothing ran.
-  That half is what this closes. The restart order in
-  [Restart the broker first and stop it last](#restart-the-broker-first-and-stop-it-last) is
-  unchanged and is what keeps the window shut: stop `dekopond`, drain and stop `dekopon-brokerd`,
-  replace **all four** binaries, start the broker, then start the gateway. Do not roll one process
-  at a time.
-
-  A fifth broker client lives outside this repository:
-  [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
-  `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
-  `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
-  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
-  0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
-  that lands, and do not run the console against an upgraded broker.
-- **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
-  now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
-  `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`
-  is the usage error it was before 0.11.0 rather than a full-screen view. Nothing loses authority:
-  the console never held any.
-
-### `imageGenerators:` becomes one `imageGenerator:` block
-
-A gateway configures at most one image generator, so the named list is now a single optional object
-and a route opts in with a flag instead of a name. `deny_unknown_fields` means the old shape does not
-decode: `dekopond` refuses to start rather than ignoring the block. In `dekopond.yaml`:
-
-```yaml
-# before
-imageGenerators:
-  - name: openai-images
-    kind: openaiImages
-    model: gpt-image-1
-    apiKeyEnv: OPENAI_IMAGE_API_KEY
-    timeoutMs: 120000
-routes:
-  - transport: workspace-slack
-    match: { kind: directMessage }
-    agent: reviewer
-    imageGenerator: openai-images
-
-# after
-imageGenerator:
-  model: gpt-image-1
-  apiKeyEnv: OPENAI_IMAGE_API_KEY
-  timeoutMs: 120000
-routes:
-  - transport: workspace-slack
-    match: { kind: directMessage }
-    agent: reviewer
-    imageGenerator: true
-```
-
-Drop `name:` and `kind:` — the endpoint was already fixed to OpenAI's public Images API and the name
-had one referent. Deployments that configured more than one generator keep the one their routes
-actually named. Nothing else changes: the credential is still an environment variable name read only
-when a route opts in, and pairing an opted-in route with a `whatsappCloudApi` transport is still a
-startup refusal.
 
 ## Related documents
 
