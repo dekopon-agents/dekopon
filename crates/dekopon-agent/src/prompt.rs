@@ -1512,70 +1512,96 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 /// `help` builtin — the runtime discovery surface is `cap --list` and `cap --describe`, and
 /// pointing a model at anything else would spend a tool call on "command not found".
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
-Run one script in Dekopon's sandboxed shell. Returns the script's combined output followed by an \
-`[exit code: N]` trailer, exactly as a terminal would.
+Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
+whenever the task needs data or an action the session's capabilities provide, and write the whole \
+job as one script rather than one tool call per step. Send scripts one after another only when \
+the next step genuinely depends on a result you cannot know yet. If you do not yet know what this \
+session can call, the first script is `cap --list`. Returns the script's combined output followed \
+by an `[exit code: N]` trailer, exactly as a terminal would.
 
-The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` groups \
-— the compound ones all usable as \
-pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
-because nothing here forks — `break`/`continue`, functions \
-with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, \
-`${#NAME}`, \
-`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, \
-`${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, \
-`exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
-redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
-named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
-loudly and by name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never \
-silent no-ops. If a script ran, it did what it said.
+The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
+leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
+groups — the compound ones all usable as pipeline stages, so `cmd | while ...; do ...; done` \
+works and a piped loop keeps what it assigns because nothing here forks — `break`/`continue`, \
+functions with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
+`${NAME[@]}`, `${#NAME}`, `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( \
+)`, `$(( ))`, `$?`, `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, `exit`, \
+both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and redirection of \
+either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into named in-memory \
+buffers all behave the way you expect. Everything outside that curated set fails loudly and by \
+name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never silent no-ops. \
+If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
 1. Commands are Dekopon capabilities, not programs. A command word containing `.`, `-`, or `_` is \
 a capability invocation; every other word is a builtin. There are no processes, no filesystem, no \
-environment variables, and no network reachable except through a capability.
-2. Capability arguments are `--kebab-case` flags that become one JSON object: \
-`posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \"includeBody\": true}`. A repeated \
-flag becomes an array, and a single bare `{...}` argument is used as the input verbatim.
+environment variables, and no network reachable except through a capability. The capabilities you \
+may invoke are exactly those this session was granted: no flag, retry, or rewording escalates \
+past that set, and a refusal is a fact to report, not an obstacle to work around.
+2. Capability arguments are `--kebab-case` flags that become one JSON object. With a capability \
+such as `posts.get`, `posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \
+\"includeBody\": true}`: a value that reads as a JSON number, `true`, `false`, or `null` is sent \
+typed, anything else is sent as a string, and a flag with no value is `true`. A repeated flag \
+becomes an array, and a single bare `{...}` argument is used as the input verbatim. `cap \
+<capability> ...` invokes one under the same argument rules.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
 in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
-`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you capture \
-the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a quiet \
-command leaves its value, and its type, untouched.
-4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
-tripping one ends the script with a message naming it.
+`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \
+capture the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a \
+quiet command leaves its value, and its type, untouched.
+4. The session is bounded. Steps, output, wall-clock time, and capability calls all have \
+ceilings; tripping one ends the script with a message naming it. Filter with `jq`, loop in the \
+shell, and print only what you need next.
 
-Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
-`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them \
-depend on session configuration and report their exact missing prerequisite otherwise: `curl`, \
-which opens no socket of its own but assembles a request for whichever HTTP capability the session \
-was given; and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A \
-provider may contribute further command words, which behave the same way and are authorized \
-identically; any this session has are listed at the end of this description.
+Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
+`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them depend on \
+session configuration and report their exact missing prerequisite otherwise: `curl`, which opens \
+no socket of its own but assembles a request for whichever HTTP capability the session was given; \
+and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may \
+contribute further command words, which behave the same way and are authorized identically; any \
+this session has are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Use it only in \
-exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or \
-`curl -u 'USER:${drn:...}' URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN \
-concatenation are rejected. The provider never receives the DRN, and the broker independently \
-authorizes every use.
+exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or `curl -u 'USER:${drn:...}' \
+URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN concatenation are rejected. The \
+provider never receives the DRN, and the broker independently authorizes every use.
 
 Patterns are literal text, never globs, and regular expressions only where you ask for one with \
 `-E`: a `grep`/`sed` pattern, a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand \
-of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the \
-default branch but `*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and \
-`sed -E 's/^ *//'` are how you get a real regular expression, and the only way: unflagged, both \
-are a usage error naming the metacharacter rather than a search that quietly finds nothing. Under \
-`-E`, anchors and `.` mean what they mean in any regex, but the replacement half of `sed` is still \
-literal text, so groups select and do not substitute. `${#NAME}` counts \
-characters of a string but elements of an array and keys of an object, because values here are \
-real JSON. Use `jq` when the thing you want is structure rather than lines. A here-document's body \
-arrives as one JSON string, so pipe it through `jq` when you want structure out of it.
+of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the default branch but \
+`*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and `sed -E 's/^ *//'` are \
+how you get a real regular expression, and the only way: unflagged, both are a usage error naming \
+the metacharacter rather than a search that quietly finds nothing. Under `-E`, anchors and `.` \
+mean what they mean in any regex, but the replacement half of `sed` is still literal text, so \
+groups select and do not substitute. `${#NAME}` counts characters of a string but elements of an \
+array and keys of an object, because values here are real JSON. Use `jq` when the thing you want \
+is structure rather than lines. A here-document's body arrives as one JSON string, so pipe it \
+through `jq fromjson` when you want structure out of it.
+
+Reading the result. The tool result is your only evidence: what a script printed is what you \
+know, and what it did not print you do not know, so never guess what a capability returned, what \
+it accepts, or whether it exists. Exit 0 is success. Exit 1 is a command that ran and failed; a \
+capability's error arrives on stderr as `<capability>: failed: ...`, so read it before retrying. \
+Exit 127 (`command not found` or `capability not found`) means the word is misspelled or names a \
+capability this session does not hold; the two are deliberately indistinguishable, and `cap \
+--list` is the fix, not guessing at more names. Exit 126 means this session holds the capability \
+but authorization refused this use; different arguments will not change that, so report it. Exit \
+2 is a parse error, a refused construct, a usage error, or an exhausted budget, and the message \
+names which. Exit 124 is the wall-clock deadline. Output past the ceiling is truncated in the \
+middle, keeping the head and the tail with a marker giving the total line count, so filter inside \
+the script rather than printing everything and reading it here. Each script starts empty: nothing \
+an earlier script assigned survives, but everything it printed is already in this conversation.
+
+Not for: skills, chat attachments, and this agent's own configuration are not files here, and \
+when the session offers a tool for one of them it is listed beside this one. There are no files \
+at all: `ls` and `cd` do not exist, and `cat` only passes along what is piped or here-documented \
+into it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
 capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \
-input schema. Then prefer a single script that does the whole job over many small ones — that is \
-the entire point of this tool.";
+input schema alongside its description, as one object. Discover once, then prefer a single script \
+that does the whole job over many small ones — that is the entire point of this tool.";
 
 /// Failure to complete a prompt/tool session.
 ///
@@ -2926,6 +2952,139 @@ mod tests {
         assert_eq!(errexit.exit_code, ExitCode::NOT_FOUND, "{errexit:?}");
         assert!(errexit.output.contains("`set -e` is on"), "{errexit:?}");
         assert!(!errexit.output.contains("after"), "{errexit:?}");
+    }
+
+    /// A session whose capabilities cover every outcome the description explains.
+    struct OutcomeCapabilities;
+
+    impl CapabilityInvoker for OutcomeCapabilities {
+        fn granted(&self) -> Vec<String> {
+            ["posts.get", "locked.door", "broken.thing"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn describe(&self, _capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
+            None
+        }
+
+        fn invoke(
+            &self,
+            capability: &str,
+            input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            match capability {
+                "posts.get" => CapabilityCallResult::Succeeded(input),
+                "locked.door" => CapabilityCallResult::Denied {
+                    reason: "policy says no".to_owned(),
+                },
+                "broken.thing" => CapabilityCallResult::Failed {
+                    error: "upstream boom".to_owned(),
+                },
+                _ => CapabilityCallResult::NotFound,
+            }
+        }
+    }
+
+    /// The exit codes, messages, and argument rules the description promises are the shell's.
+    ///
+    /// The "Reading the result" paragraph and the flag-typing sentence describe interpreter
+    /// behaviour that no prose can keep true on its own; this pins each promise to the shell the
+    /// way `refusal_list` pins the refused constructs, so a remapped code, a reworded message, or
+    /// a changed typing rule fails here rather than misleading a model.
+    #[test]
+    fn every_outcome_the_description_explains_is_what_the_shell_produces() {
+        for (code, phrase) in [
+            (ExitCode::SUCCESS, "Exit 0 is success"),
+            (ExitCode::FAILURE, "Exit 1 is a command that ran and failed"),
+            (
+                ExitCode::SYNTAX,
+                "Exit 2 is a parse error, a refused construct, a usage error, or an exhausted budget",
+            ),
+            (ExitCode::TIMEOUT, "Exit 124 is the wall-clock deadline"),
+            (
+                ExitCode::DENIED,
+                "Exit 126 means this session holds the capability but authorization refused this use",
+            ),
+            (
+                ExitCode::NOT_FOUND,
+                "Exit 127 (`command not found` or `capability not found`)",
+            ),
+        ] {
+            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
+            assert!(
+                phrase.contains(&format!("Exit {} ", code.get())),
+                "{phrase} must name exit code {}",
+                code.get()
+            );
+        }
+
+        let not_found = dekopon_shell::run("nosuch.capability --x 1", &OutcomeCapabilities);
+        assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
+        assert!(
+            not_found.output.contains("command not found"),
+            "{not_found:?}"
+        );
+
+        let denied = dekopon_shell::run("locked.door --knock", &OutcomeCapabilities);
+        assert_eq!(denied.exit_code, ExitCode::DENIED, "{denied:?}");
+
+        let failed = dekopon_shell::run("broken.thing", &OutcomeCapabilities);
+        assert_eq!(failed.exit_code, ExitCode::FAILURE, "{failed:?}");
+        assert!(
+            failed
+                .output
+                .contains("broken.thing: failed: upstream boom"),
+            "{failed:?}"
+        );
+
+        let usage = dekopon_shell::run("echo abc | grep '[0-9]'", &OutcomeCapabilities);
+        assert_eq!(usage.exit_code, ExitCode::SYNTAX, "{usage:?}");
+
+        // Item 2: numbers, booleans, and null typed; anything else a string; bare flag true;
+        // repeats an array. The echo-like capability returns exactly what it was sent.
+        let typed = dekopon_shell::run(
+            "posts.get --post-id 7 --include-body --tag a --tag b --name 7x --gone null",
+            &OutcomeCapabilities,
+        );
+        assert_eq!(typed.exit_code, ExitCode::SUCCESS, "{typed:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&typed.output).expect("the input is echoed as JSON"),
+            json!({"postId": 7, "includeBody": true, "tag": ["a", "b"], "name": "7x", "gone": null})
+        );
+        let via_cap = dekopon_shell::run("cap posts.get --post-id 7", &OutcomeCapabilities);
+        assert_eq!(via_cap.exit_code, ExitCode::SUCCESS, "{via_cap:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&via_cap.output).expect("cap echoes the same input"),
+            json!({"postId": 7})
+        );
+
+        let structured = dekopon_shell::run(
+            "jq 'fromjson | .n' <<'EOF'\n{\"n\": 3}\nEOF",
+            &OutcomeCapabilities,
+        );
+        assert_eq!(structured.exit_code, ExitCode::SUCCESS, "{structured:?}");
+        assert_eq!(structured.output.trim(), "3");
+
+        let truncated = dekopon_shell::Interpreter::new(dekopon_shell::Limits {
+            max_output_lines: 4,
+            ..dekopon_shell::Limits::default()
+        })
+        .run(
+            "for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; done",
+            &OutcomeCapabilities,
+        );
+        assert!(truncated.truncated, "{truncated:?}");
+        assert!(
+            truncated
+                .output
+                .contains("... Output truncated (10 total lines) ..."),
+            "{truncated:?}"
+        );
+        assert!(truncated.output.starts_with("1\n"), "{truncated:?}");
+        assert!(truncated.output.ends_with("10"), "{truncated:?}");
     }
 
     #[test]

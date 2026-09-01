@@ -141,17 +141,23 @@ struct RawSuggestion {
 pub(crate) fn improvement_tool() -> ModelTool {
     ModelTool {
         name: IMPROVEMENT_TOOL_NAME.to_owned(),
-        description: "Tap the glass: record one structured note telling the operator how this \
-                      agent could be improved. Use it when you noticed something the operator \
-                      could fix — standing instructions that were wrong, missing, or contradictory; \
-                      a skill that would have helped or that misled you; a capability you needed \
-                      but were not granted; a limit you ran into; a tool that behaved differently \
-                      from how it was described. Call it after the task is done or when it is \
-                      genuinely blocked, at most three times per session, and never instead of \
-                      answering. The note goes to the operator's telemetry, not to the person you \
-                      are talking with, so be specific: name the thing, quote the evidence briefly, \
-                      and propose one concrete change."
-            .to_owned(),
+        description: format!(
+            "Tap the glass: record one structured note telling the operator how this agent could \
+             be improved. Use it when you noticed something the operator could fix: standing \
+             instructions that were wrong, missing, or contradictory; a skill that would have \
+             helped or that misled you; a capability you needed but were not granted; a limit \
+             you ran into; a tool that behaved differently from how it was described. Ground \
+             every field in something you observed in this session's tool results, such as an \
+             exit code, a refusal message, or a missing fact, rather than in speculation. Call it \
+             after the task is done or when it is genuinely blocked, at most {MAX_SUGGESTIONS_PER_SESSION} \
+             times per session, never instead of answering, and without asking the person for \
+             permission. Recording a note changes nothing in this session; it goes to the \
+             operator's telemetry, not to the person you are talking with, so be specific: name \
+             the thing in `target`, quote the evidence briefly, and propose one concrete change. \
+             Returns a confirmation with the note's number out of {MAX_SUGGESTIONS_PER_SESSION}; \
+             a note that breaks a bound is refused with the reason, so fix it and resend, or \
+             continue without it."
+        ),
         parameters: json!({
             "type": "object",
             "properties": {
