@@ -2127,8 +2127,7 @@ fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
             .as_array()
             .expect("messages are an array")
             .iter()
-            .filter(|message| message["role"] == "user")
-            .next_back()
+            .rfind(|message| message["role"] == "user")
             .expect("the recorded prompt is replayed");
         assert_eq!(last_user["content"], "Upcase hello");
         respond(first_stream, &bash_tool_call("replay-1", &recorded_script));

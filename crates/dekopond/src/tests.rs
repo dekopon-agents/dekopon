@@ -3562,7 +3562,7 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
         "{}  skills:\n    - skills/counting\n",
         catalog_text(true, Some("reasoning"))
     );
-    let catalog = LocalCatalog::from_str(&directory.path().join("dekopon.yaml"), &text)
+    let catalog = LocalCatalog::from_str(directory.path().join("dekopon.yaml"), &text)
         .expect("catalog with a skill parses");
     let resolved = load(directory.path(), &document(directory.path()))
         .await
