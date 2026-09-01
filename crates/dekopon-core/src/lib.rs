@@ -13,6 +13,7 @@
 mod accept;
 mod diagnostics;
 mod redaction;
+mod skill;
 mod subject;
 mod telemetry_payloads;
 #[cfg(unix)]
@@ -26,6 +27,7 @@ use thiserror::Error;
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
+pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
 #[cfg(unix)]

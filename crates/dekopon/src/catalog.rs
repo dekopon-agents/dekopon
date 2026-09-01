@@ -1,6 +1,6 @@
 //! Read abstraction used by command execution.
 
-use dekopon_config::{CatalogSnapshot, LocalCatalog};
+use dekopon_config::{CatalogSnapshot, LocalCatalog, Skill};
 use dekopon_core::{AgentId, CapabilityId, ProviderId};
 use dekopon_protocol::{Agent, Capability, Provider};
 use thiserror::Error;
@@ -62,6 +62,12 @@ impl LocalConfigReader {
                 kind: "agent",
                 name: name.to_string(),
             })
+    }
+
+    /// The skills one agent mounts, in the order its `spec.skills` names them.
+    #[must_use]
+    pub fn agent_skills(&self, name: &AgentId) -> Vec<Skill> {
+        self.catalog.agent_skills(name).to_vec()
     }
 
     /// Lists all capabilities in deterministic order.

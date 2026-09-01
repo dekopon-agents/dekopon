@@ -1,6 +1,6 @@
 //! Typed command execution, independent of rendering.
 
-use dekopon_config::CatalogSnapshot;
+use dekopon_config::{CatalogSnapshot, Skill};
 use dekopon_core::Redacted;
 use dekopon_model::chatgpt::ChatGptAuthStatus;
 use dekopon_protocol::{Agent, Capability, Provider};
@@ -107,6 +107,9 @@ pub struct AgentDescription {
     pub capabilities: Vec<Capability>,
     /// Resolved providers in deterministic name order.
     pub providers: Vec<Provider>,
+    /// Mounted skills, in the order `spec.skills` names them, read whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Skill>,
 }
 
 /// Counts emitted after successful validation.
@@ -195,11 +198,13 @@ fn execute_describe(
                 .collect::<Result<Vec<_>, _>>()?;
             capabilities.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
             providers.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+            let skills = reader.agent_skills(name);
 
             Ok(CommandResult::AgentDescription(AgentDescription {
                 agent,
                 capabilities,
                 providers,
+                skills,
             }))
         }
     }

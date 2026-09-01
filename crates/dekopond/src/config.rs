@@ -493,6 +493,13 @@ pub struct RouteConfig {
     /// Explicitly enables the gateway's image generator for this route.
     #[serde(default)]
     pub image_generator: bool,
+    /// Offers the `suggest_improvement` tool on this route's sessions.
+    ///
+    /// Opt-in because the suggestion record carries model-authored text to the telemetry sink
+    /// whether or not payload telemetry is on; enabling it is that consent. It grants nothing: a
+    /// suggestion is a tagged log record an operator reads, never a change the daemon applies.
+    #[serde(default)]
+    pub improvement_suggestions: bool,
     #[serde(default)]
     pub limits: RouteLimits,
     /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
@@ -543,6 +550,8 @@ pub struct ResolvedRoute {
     pub model: Option<String>,
     /// Whether this route may generate images, already proved against the configured generator.
     pub image_generator: bool,
+    /// Whether this route's sessions may record improvement suggestions.
+    pub improvement_suggestions: bool,
     pub limits: RouteLimits,
     pub conversation: ConversationPolicy,
 }
@@ -956,6 +965,7 @@ pub(crate) fn resolve(
             agent: route.agent,
             model: route.model,
             image_generator: route.image_generator,
+            improvement_suggestions: route.improvement_suggestions,
             limits: route.limits,
             conversation,
         });

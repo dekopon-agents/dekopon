@@ -152,41 +152,45 @@ pub enum Command {
         #[arg(long, value_name = "CAPABILITY")]
         curl_capability: Option<CapabilityId>,
 
-        /// Model identifier sent to the selected model backend.
-        #[arg(long, value_name = "MODEL")]
-        model: String,
-
-        /// Use the ChatGPT/Codex login managed by `dekopon auth chatgpt`.
-        #[arg(long)]
-        chatgpt_subscription: bool,
-
-        /// Override Dekopon's ChatGPT credential file.
-        #[arg(long, requires = "chatgpt_subscription", value_name = "PATH")]
-        chatgpt_auth_file: Option<PathBuf>,
-
-        /// OpenAI-compatible API base URL; ignored with `--chatgpt-subscription`.
-        #[arg(long, default_value = "http://127.0.0.1:11434/v1", value_name = "URL")]
-        endpoint: String,
-
-        /// Environment variable containing an optional bearer token.
-        #[arg(long, default_value = "OPENAI_API_KEY", value_name = "NAME")]
-        api_key_env: String,
+        /// Which model answers, and how to reach it.
+        #[command(flatten)]
+        model: ModelArgs,
 
         /// Optional system instruction prepended to the conversation.
         #[arg(long, value_name = "TEXT")]
         system: Option<String>,
 
+        /// Skill directory to mount, holding a `SKILL.md`; repeat for several.
+        ///
+        /// The model sees each skill's name and description in its instructions and reads the
+        /// rest on demand with `read_skill`. A directory that does not load is a usage failure
+        /// before any model call.
+        #[arg(long, action = ArgAction::Append, value_name = "DIRECTORY")]
+        skill: Vec<PathBuf>,
+
+        /// Offer the `suggest_improvement` tool and print what the model recorded on stderr.
+        ///
+        /// Off by default because the suggestion record carries model-authored text in telemetry.
+        #[arg(long)]
+        suggestions: bool,
+
         /// Maximum model turns, including the final answer.
         #[arg(long, default_value = "8", value_name = "COUNT")]
         max_steps: NonZeroU32,
 
-        /// Timeout for each model HTTP request.
-        #[arg(long, default_value = "120000", value_name = "MILLISECONDS")]
-        model_timeout_ms: u64,
-
         /// User prompt.
         #[arg(value_name = "PROMPT")]
         prompt: String,
+    },
+    /// Read sessions back from OpenObserve, show one transcript, or replay one against a model.
+    ///
+    /// These commands query the receiver the runner and gateway export to; they load no
+    /// component, contact no broker, and run a model only for `replay`, whose scripts are
+    /// answered from the recording rather than executed.
+    Session {
+        /// Session operation.
+        #[command(subcommand)]
+        command: SessionCommand,
     },
     /// Hold a conversation with a running `dekopond` over its local development transport.
     ///
@@ -216,6 +220,187 @@ pub enum Command {
         )]
         conversation: Option<String>,
     },
+}
+
+/// Which model answers a prompt or a replay, and how to reach it.
+#[derive(Clone, Debug, Args)]
+pub struct ModelArgs {
+    /// Model identifier sent to the selected model backend.
+    #[arg(long, value_name = "MODEL")]
+    pub model: String,
+
+    /// Use the ChatGPT/Codex login managed by `dekopon auth chatgpt`.
+    #[arg(long)]
+    pub chatgpt_subscription: bool,
+
+    /// Override Dekopon's ChatGPT credential file.
+    #[arg(long, requires = "chatgpt_subscription", value_name = "PATH")]
+    pub chatgpt_auth_file: Option<PathBuf>,
+
+    /// OpenAI-compatible API base URL; ignored with `--chatgpt-subscription`.
+    #[arg(long, default_value = "http://127.0.0.1:11434/v1", value_name = "URL")]
+    pub endpoint: String,
+
+    /// Environment variable containing an optional bearer token.
+    #[arg(long, default_value = "OPENAI_API_KEY", value_name = "NAME")]
+    pub api_key_env: String,
+
+    /// Timeout for each model HTTP request.
+    #[arg(long, default_value = "120000", value_name = "MILLISECONDS")]
+    pub model_timeout_ms: u64,
+}
+
+/// Reading sessions back from the receiver the exporters wrote to.
+#[derive(Clone, Debug, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a parsed command is built once and matched once; boxing the replay arguments would \
+              only move bytes that are never copied"
+)]
+pub enum SessionCommand {
+    /// List recent sessions by trace, from their model-turn accounting records.
+    List {
+        /// Where to search.
+        #[command(flatten)]
+        observe: ObserveArgs,
+
+        /// How far back to look: a count followed by `s`, `m`, `h`, or `d`.
+        #[arg(long, default_value = "7d", value_name = "DURATION")]
+        since: String,
+
+        /// Most recent sessions to print.
+        #[arg(long, default_value = "50", value_name = "COUNT")]
+        limit: usize,
+
+        /// Print one JSON document instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconstruct one session's transcript from its exported log records.
+    Show {
+        /// Which session, and where it is recorded.
+        #[command(flatten)]
+        source: SessionSourceArgs,
+
+        /// Print the transcript as JSON, the shape `replay --from-file` reads back.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay one recorded session against a model, answering its scripts from the recording.
+    ///
+    /// No capability runs unless `--provider` components are supplied and the replayed model
+    /// writes a script the recording never ran; without them the replay stops at that point and
+    /// reports it as the divergence.
+    Replay {
+        /// Which session, and where it is recorded.
+        #[command(flatten)]
+        source: SessionSourceArgs,
+
+        /// Which model answers the replay, and how to reach it.
+        #[command(flatten)]
+        model: ModelArgs,
+
+        /// Replacement standing instructions; absent, the recorded ones are replayed.
+        #[arg(long, conflicts_with = "system_file", value_name = "TEXT")]
+        system: Option<String>,
+
+        /// Replacement standing instructions, read from a file.
+        #[arg(long, conflicts_with = "system", value_name = "PATH")]
+        system_file: Option<PathBuf>,
+
+        /// Skill directory to mount, replacing any listing the recording carried; repeatable.
+        #[arg(long, action = ArgAction::Append, value_name = "DIRECTORY")]
+        skill: Vec<PathBuf>,
+
+        /// Offer the `suggest_improvement` tool to the replayed model.
+        #[arg(long)]
+        suggestions: bool,
+
+        /// Read-only provider components that run a script the recording never ran; repeatable.
+        ///
+        /// Absent, the replay stops at the first such script instead. Direct mode's linker is
+        /// import-free, so a component supplied here can compute but never reach the network.
+        #[arg(long, action = ArgAction::Append, value_name = "COMPONENT")]
+        provider: Vec<PathBuf>,
+
+        /// Directory holding Wasmtime's compiled-code cache, reused across runs.
+        #[arg(long, env = "DEKOPON_RUN_COMPILE_CACHE", value_name = "DIRECTORY")]
+        compile_cache: Option<PathBuf>,
+
+        /// Bounded immediate-mode Wasm settings for `--provider` components.
+        #[command(flatten)]
+        limits: LimitArgs,
+
+        /// Bounded interpreter settings for scripts that run live.
+        #[command(flatten)]
+        shell: ShellLimitArgs,
+
+        /// Maximum model turns, including the final answer.
+        #[arg(long, default_value = "8", value_name = "COUNT")]
+        max_steps: NonZeroU32,
+
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Where the exported records live and how to read them.
+///
+/// The URL is the same organization base the OTLP exporter posts to. The credential is the
+/// complete `Authorization` header value, read from a named environment variable so that a value
+/// never appears in a process argument.
+#[derive(Clone, Debug, Args)]
+pub struct ObserveArgs {
+    /// OpenObserve organization base URL, such as `http://127.0.0.1:5080/api/default`.
+    #[arg(long, env = "DEKOPON_OPENOBSERVE_URL", value_name = "URL")]
+    pub openobserve_url: Option<String>,
+
+    /// The log stream the exporters wrote to.
+    #[arg(
+        long,
+        env = "DEKOPON_OPENOBSERVE_STREAM",
+        default_value = "dekopon",
+        value_name = "STREAM"
+    )]
+    pub openobserve_stream: String,
+
+    /// Environment variable holding the `Authorization` header value, such as `Basic <token>`.
+    #[arg(
+        long,
+        default_value = "DEKOPON_OPENOBSERVE_AUTHORIZATION",
+        value_name = "NAME"
+    )]
+    pub openobserve_auth_env: String,
+
+    /// Whole-request deadline for each search page.
+    #[arg(long, default_value = "10000", value_name = "MILLISECONDS")]
+    pub openobserve_timeout_ms: u64,
+}
+
+/// One recorded session: by trace from the receiver, or from a transcript file.
+#[derive(Clone, Debug, Args)]
+pub struct SessionSourceArgs {
+    /// The OpenTelemetry trace identifier of the session, as `session list` prints it.
+    #[arg(
+        long,
+        value_name = "TRACE_ID",
+        required_unless_present = "from_file",
+        conflicts_with = "from_file"
+    )]
+    pub trace_id: Option<String>,
+
+    /// A transcript `session show --json` printed, read instead of querying the receiver.
+    #[arg(long, value_name = "PATH")]
+    pub from_file: Option<PathBuf>,
+
+    /// Where to search when `--trace-id` is given.
+    #[command(flatten)]
+    pub observe: ObserveArgs,
+
+    /// How far back to search for the trace: a count followed by `s`, `m`, `h`, or `d`.
+    #[arg(long, default_value = "7d", value_name = "DURATION")]
+    pub since: String,
 }
 
 /// Unprivileged broker operations.
@@ -568,7 +753,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{BrokerCommand, Cli, Command, ProviderArgs};
+    use super::{BrokerCommand, Cli, Command, ModelArgs, ProviderArgs, SessionCommand};
 
     /// A `--provider` directory expands to the components inside it, in filename order, and a
     /// plain file argument still means itself.
@@ -720,10 +905,122 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Prompt {
-                chatgpt_subscription: true,
+                model: ModelArgs {
+                    chatgpt_subscription: true,
+                    ..
+                },
                 ..
             }
         ));
+    }
+
+    /// `prompt --skill` repeats, and `--suggestions` is a plain opt-in flag.
+    #[test]
+    fn parses_mounted_skills_and_the_suggestion_opt_in() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "prompt",
+            "--provider",
+            "echo.wasm",
+            "--model",
+            "test-model",
+            "--skill",
+            "skills/pull-request-review",
+            "--skill",
+            "skills/release-notes",
+            "--suggestions",
+            "review it",
+        ])
+        .expect("valid prompt with skills");
+        let Command::Prompt {
+            skill, suggestions, ..
+        } = cli.command
+        else {
+            panic!("expected prompt command");
+        };
+        assert_eq!(skill.len(), 2);
+        assert!(suggestions);
+    }
+
+    /// A replay names its session exactly one way, and the receiver URL may come from the
+    /// environment rather than the command line.
+    #[test]
+    fn parses_session_commands() {
+        let cli = Cli::try_parse_from([
+            "dekopon-run",
+            "session",
+            "replay",
+            "--from-file",
+            "session.json",
+            "--model",
+            "test-model",
+            "--system",
+            "Be terse.",
+            "--skill",
+            "skills/pull-request-review",
+        ])
+        .expect("valid replay from a file");
+        let Command::Session {
+            command:
+                SessionCommand::Replay {
+                    source,
+                    system,
+                    skill,
+                    provider,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected session replay");
+        };
+        assert!(source.trace_id.is_none());
+        assert_eq!(source.from_file.as_deref(), Some(Path::new("session.json")));
+        assert_eq!(system.as_deref(), Some("Be terse."));
+        assert_eq!(skill.len(), 1);
+        assert!(provider.is_empty());
+
+        let error = Cli::try_parse_from(["dekopon-run", "session", "show"])
+            .expect_err("a session must be named by trace or by file");
+        assert_eq!(error.exit_code(), 2);
+
+        let both = Cli::try_parse_from([
+            "dekopon-run",
+            "session",
+            "show",
+            "--trace-id",
+            "abc",
+            "--from-file",
+            "s.json",
+        ])
+        .expect_err("two sources conflict");
+        assert_eq!(both.exit_code(), 2);
+
+        let list = Cli::try_parse_from([
+            "dekopon-run",
+            "session",
+            "list",
+            "--openobserve-url",
+            "http://127.0.0.1:5080/api/default",
+            "--since",
+            "24h",
+        ])
+        .expect("valid list");
+        let Command::Session {
+            command: SessionCommand::List { observe, since, .. },
+        } = list.command
+        else {
+            panic!("expected session list");
+        };
+        assert_eq!(
+            observe.openobserve_url.as_deref(),
+            Some("http://127.0.0.1:5080/api/default")
+        );
+        assert_eq!(observe.openobserve_stream, "dekopon");
+        assert_eq!(
+            observe.openobserve_auth_env,
+            "DEKOPON_OPENOBSERVE_AUTHORIZATION"
+        );
+        assert_eq!(since, "24h");
     }
 
     #[test]

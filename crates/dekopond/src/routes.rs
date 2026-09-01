@@ -7,7 +7,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use dekopon_agent::prompt::PromptLimits;
-use dekopon_config::LocalCatalog;
+use dekopon_config::{LocalCatalog, Skill};
 use dekopon_core::AgentId;
 use thiserror::Error;
 
@@ -29,9 +29,16 @@ pub(crate) struct BoundRoute {
     pub model_class: Option<String>,
     /// The agent's standing orders, which are untrusted model text and grant nothing.
     pub instructions: Option<String>,
+    /// The agent's mounted skills, read whole at catalog load and shared by every session.
+    ///
+    /// Shared rather than cloned because a bound route is cloned per message, and a skill set
+    /// can be a megabyte of text that never changes while the daemon runs.
+    pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
     /// Whether this route may generate images, already validated against the configured generator.
     pub image_generator: bool,
+    /// Whether this route's sessions may record improvement suggestions.
+    pub improvement_suggestions: bool,
     pub limits: PromptLimits,
     /// What this route remembers between messages.
     pub conversation: ConversationPolicy,
@@ -130,8 +137,10 @@ impl RoutingTable {
                 description: agent.spec.description.clone(),
                 model_class: agent.spec.model_class.clone(),
                 instructions: agent.spec.instructions.clone(),
+                skills: Arc::from(catalog.agent_skills(&route.agent).to_vec()),
                 model: Arc::clone(model),
                 image_generator: route.image_generator,
+                improvement_suggestions: route.improvement_suggestions,
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,

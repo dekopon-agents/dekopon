@@ -14,7 +14,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::prompt::{
     AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
-    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, PromptLimits,
+    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, IMPROVEMENT_TOOL_NAME, PromptLimits,
+    SKILL_TOOL_NAME,
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
@@ -2069,6 +2070,75 @@ fn decline_reply() -> AssistantTurn {
     }
 }
 
+/// One model turn asking for a mounted skill's body.
+fn read_skill(name: &str) -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: format!("skill-{name}"),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: SKILL_TOOL_NAME.to_owned(),
+                arguments: json!({"name": name}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+/// One model turn tapping the glass.
+fn suggest_improvement() -> AssistantTurn {
+    AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "suggestion-1".to_owned(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: IMPROVEMENT_TOOL_NAME.to_owned(),
+                arguments: json!({
+                    "category": "instructions",
+                    "target": "reviewer",
+                    "summary": "Say which files to read first",
+                    "evidence": "The first two turns were spent finding the entry point",
+                    "proposal": "Name the entry point in the standing instructions",
+                    "confidence": "high"
+                })
+                .to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: Vec::new(),
+    }
+}
+
+/// Writes one small skill under `root` and loads it the way the catalog would.
+fn mounted_skill(root: &Path, name: &str) -> dekopon_config::Skill {
+    let directory = root.join(name);
+    fs::create_dir_all(directory.join("references")).expect("skill directory");
+    fs::write(
+        directory.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Counts things carefully.\n---\n\
+             # Counting\n\nAlways count twice.\n"
+        ),
+    )
+    .expect("skill file writes");
+    fs::write(directory.join("references/table.md"), "one two three\n")
+        .expect("skill resource writes");
+    dekopon_config::load_skill(&directory).expect("skill loads")
+}
+
+/// The latest tool result one request carried back to the model.
+fn tool_message(models: &ModelScript, index: usize) -> String {
+    models
+        .prompt(index)
+        .into_iter()
+        .filter_map(|(role, content)| (role == "tool").then_some(content))
+        .next_back()
+        .unwrap_or_else(|| panic!("request {index} carries a tool result"))
+}
+
 fn inspect_agent_config() -> AssistantTurn {
     AssistantTurn {
         content: None,
@@ -2373,8 +2443,10 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         description: "Reviews things".to_owned(),
         model_class: Some("reasoning".to_owned()),
         instructions: Some("Answer briefly.".to_owned()),
+        skills: Arc::from(Vec::new()),
         model: Arc::new(model),
         image_generator: false,
+        improvement_suggestions: false,
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -3479,6 +3551,166 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         "the cancellation guard prevents the model's late tool call reaching the broker"
     );
     assert!(replier.replies().is_empty());
+}
+
+/// The catalog's skills ride the bound route, so a session never touches the filesystem.
+#[tokio::test]
+async fn a_bound_route_carries_the_skills_its_agent_mounts() {
+    let directory = temporary();
+    let _skill = mounted_skill(&directory.path().join("skills"), "counting");
+    let text = format!(
+        "{}  skills:\n    - skills/counting\n",
+        catalog_text(true, Some("reasoning"))
+    );
+    let catalog = LocalCatalog::from_str(&directory.path().join("dekopon.yaml"), &text)
+        .expect("catalog with a skill parses");
+    let resolved = load(directory.path(), &document(directory.path()))
+        .await
+        .expect("configuration resolves");
+
+    let routes = RoutingTable::bind(&resolved, &catalog).expect("route binds");
+    let route = routes
+        .route("dev", &ConversationKind::DirectMessage)
+        .expect("route matches");
+
+    assert_eq!(route.skills.len(), 1);
+    assert_eq!(route.skills[0].name().as_str(), "counting");
+    assert!(!route.improvement_suggestions);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
+    let directory = temporary();
+    let skill = mounted_skill(directory.path(), "counting");
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([
+        read_skill("counting"),
+        inspect_agent_config(),
+        answer("Counted twice."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let route = crate::routes::BoundRoute {
+        skills: Arc::from(vec![skill]),
+        ..route(model_config())
+    };
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route,
+        message("count the posts"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), vec!["Counted twice.".to_owned()]);
+    assert_eq!(models.requests(), 3);
+    let tools = models.tool_names(0);
+    assert!(tools.contains(&SKILL_TOOL_NAME.to_owned()), "{tools:?}");
+    assert!(
+        !tools.contains(&IMPROVEMENT_TOOL_NAME.to_owned()),
+        "suggestions are a route opt-in: {tools:?}"
+    );
+    let listing = models
+        .prompt(0)
+        .into_iter()
+        .filter(|(role, _)| role == "system")
+        .map(|(_, content)| content)
+        .find(|content| content.contains("Skills mounted for this agent"))
+        .expect("the skills listing is a system message");
+    assert!(listing.contains("counting"), "{listing}");
+    assert!(listing.contains("Counts things carefully."), "{listing}");
+    assert!(
+        !listing.contains("Always count twice."),
+        "the body is read on demand, not listed: {listing}"
+    );
+    let body = tool_message(&models, 1);
+    assert!(body.contains("Always count twice."), "{body}");
+
+    // The configuration view names the skill and its files, never their text.
+    let view: Value =
+        serde_json::from_str(&tool_message(&models, 2)).expect("the meta result is JSON");
+    assert_eq!(view["skills"][0]["name"], "counting");
+    assert_eq!(view["skills"][0]["description"], "Counts things carefully.");
+    assert_eq!(
+        view["skills"][0]["resources"],
+        json!(["references/table.md"])
+    );
+    assert!(!view.to_string().contains("Always count twice."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([suggest_improvement(), answer("Noted.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let route = crate::routes::BoundRoute {
+        improvement_suggestions: true,
+        ..route(model_config())
+    };
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route,
+        message("how could this go better?"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), vec!["Noted.".to_owned()]);
+    assert_eq!(models.requests(), 2);
+    let tools = models.tool_names(0);
+    assert!(
+        tools.contains(&IMPROVEMENT_TOOL_NAME.to_owned()),
+        "{tools:?}"
+    );
+    assert!(
+        !tools.contains(&SKILL_TOOL_NAME.to_owned()),
+        "no skill is mounted, so nothing offers to read one: {tools:?}"
+    );
+    let recorded = tool_message(&models, 1);
+    assert!(
+        recorded.contains("Recorded suggestion 1 of 3"),
+        "{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn improvement_suggestions_are_a_per_route_opt_in() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("the default configuration resolves");
+    assert!(!resolved.routes[0].improvement_suggestions);
+
+    document["routes"][0]["improvementSuggestions"] = json!(true);
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("the opt-in resolves");
+    assert!(resolved.routes[0].improvement_suggestions);
+    let routes =
+        RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).expect("the route binds");
+    assert!(
+        routes
+            .route("dev", &ConversationKind::DirectMessage)
+            .expect("route matches")
+            .improvement_suggestions
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
