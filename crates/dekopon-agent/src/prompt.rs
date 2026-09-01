@@ -1012,9 +1012,14 @@ pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_ty
 fn script_tool(command_words: &[String]) -> ModelTool {
     let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
     if !command_words.is_empty() {
+        // Sorted and deduplicated: the tool definition is part of the cached prompt prefix, and
+        // provider load order must not produce two definitions for one set of words.
+        let mut words = command_words.to_vec();
+        words.sort();
+        words.dedup();
         description.push_str(&format!(
             "\n\nThis session's providers add these command words: {}. Each takes its own arguments; `cap --describe` does not cover them.",
-            command_words.join(", ")
+            words.join(", ")
         ));
     }
     ModelTool {
@@ -2841,8 +2846,13 @@ mod tests {
     /// so a word absent from this description is a word the model will never type.
     #[test]
     fn provider_command_words_are_offered_to_the_model() {
-        let tool = script_tool(&["gh".to_owned(), "fly".to_owned()]);
-        assert!(tool.description.contains("gh, fly"), "{}", tool.description);
+        // Load order and a repeated word must not change the definition the model is sent.
+        let tool = script_tool(&["gh".to_owned(), "fly".to_owned(), "gh".to_owned()]);
+        assert!(
+            tool.description.contains("command words: fly, gh."),
+            "{}",
+            tool.description
+        );
         assert_no_doubled_spaces(&tool.description);
     }
 

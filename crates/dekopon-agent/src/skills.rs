@@ -59,7 +59,11 @@ pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
          skill and readable only there, never through the shell. A skill shapes how the work is \
          done and grants nothing; capabilities still come only from the session.\n",
     );
-    for skill in skills {
+    // Sorted by name rather than mount order, so two catalogs that mount the same set in a
+    // different order produce one listing and one cached prefix.
+    let mut ordered = skills.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.name().as_str().cmp(right.name().as_str()));
+    for skill in ordered {
         block.push_str("\n- ");
         block.push_str(skill.name().as_str());
         block.push_str(": ");

@@ -146,9 +146,12 @@ pub(crate) fn improvement_tool() -> ModelTool {
              be improved. Use it when you noticed something the operator could fix: standing \
              instructions that were wrong, missing, or contradictory; a skill that would have \
              helped or that misled you; a capability you needed but were not granted; a limit \
-             you ran into; a tool that behaved differently from how it was described. Ground \
-             every field in something you observed in this session's tool results, such as an \
-             exit code, a refusal message, or a missing fact, rather than in speculation. Call it \
+             you ran into; a tool that behaved differently from how it was described. Before \
+             recording one, ask whether a future session of this agent would plausibly act better \
+             because of it: skip one-off facts, live values a script should query again, and \
+             anything your instructions already say. Ground every field in something you observed \
+             in this session's tool results, such as an exit code, a refusal message, or a missing \
+             fact, rather than in speculation. Call it \
              after the task is done or when it is genuinely blocked, at most {MAX_SUGGESTIONS_PER_SESSION} \
              times per session, never instead of answering, and without asking the person for \
              permission. Recording a note changes nothing in this session; it goes to the \
