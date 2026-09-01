@@ -87,6 +87,41 @@ examples/otel-traces/smoke-test.sh
 
 The script creates an isolated Compose project, builds `dekopon-run`, sends one invocation, polls OpenObserve's trace search API, and asserts that the expected runner and provider spans arrived. It also checks that a sentinel provider input did not appear in the exported trace. The container and volume are removed when the test exits; set `DEKOPON_OTEL_KEEP=1` to retain them for inspection.
 
+## Read sessions back
+
+`dekopon-run session` reads the log stream this receiver holds back out again: `list` finds the sessions a deployment ran, `show` reconstructs one transcript, and `replay` puts it to a model again with its scripts answered from the recording. It searches the same organization base the exporter posts to, over `/_search?type=logs`, with the credential read from an environment variable named on the command line, so a value never appears in an argument.
+
+With the exports from step 2 in place, derive both settings from them. The header value is sent verbatim, so the space after `Basic` is a space here rather than the `%20` the exporter's header list needs:
+
+```console
+export DEKOPON_OPENOBSERVE_URL="$OTEL_EXPORTER_OTLP_ENDPOINT"
+export DEKOPON_OPENOBSERVE_AUTHORIZATION="Basic ${auth_token}"
+```
+
+The default stream, `dekopon`, is the `stream-name` step 2 sets; `--openobserve-stream` (or `DEKOPON_OPENOBSERVE_STREAM`) names another, and `--openobserve-auth-env` reads a differently named variable.
+
+Sessions are listed from `accounting.model.turn` records, which only a model loop writes: the `invoke` in step 3 leaves spans and lifecycle logs but no session. `show` and `replay` also need the transcript, which reaches the receiver only when the session ran with payload telemetry on — `--otel-telemetry-payloads true`, or `DEKOPON_OTEL_TELEMETRY_PAYLOADS` — so record one that way:
+
+```console
+cargo run --locked -p dekopon-run -- \
+  --otel-telemetry-payloads true \
+  prompt \
+  --provider examples/providers/echo-provider.wasm \
+  --model "$MODEL" \
+  'Echo the word observed.'
+```
+
+Payload telemetry sends the prompt, every script with its output, and the answer to this receiver, which is why the flag is off by default and why the HTTPS advice in step 2 applies. Then:
+
+```console
+cargo run --locked -p dekopon-run -- session list --since 1h
+cargo run --locked -p dekopon-run -- session show --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+cargo run --locked -p dekopon-run -- session show --trace-id 4bf92f3577b34da6a3ce929d0e0e4736 --json > session.json
+cargo run --locked -p dekopon-run -- session replay --from-file session.json --model "$MODEL"
+```
+
+`list` prints one row per trace in the window, newest first — `--trace-id` takes the value under `TRACE` — and includes sessions recorded metadata-only; `show` or `replay` of one of those fails with `trace <ID> has <N> accounted model turn(s) but no transcript`. `replay --from-file` needs no receiver, which is how a recording outlives `docker compose … down --volumes`. The flags are documented in [`../../docs/run.md`](../../docs/run.md) and the loop they close in [`../../docs/improvement.md`](../../docs/improvement.md).
+
 ## Stop the development instance
 
 ```console

@@ -18,12 +18,12 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 
 | Area | Primary implementation | Behavior tests and fixtures |
 |---|---|---|
-| Domain identifiers and enums | `crates/dekopon-core/src/lib.rs` | Inline unit and compile-fail tests |
+| Domain identifiers and enums | `crates/dekopon-core/src/lib.rs`; the skill-name grammar (`SkillId`) in `crates/dekopon-core/src/skill.rs` | Inline unit and compile-fail tests |
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
-| Config discovery and validation | `crates/dekopon-config/src/` | `crates/dekopon-config/src/tests.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml` and `examples/conditional-write/dekopon.yaml` |
+| Config discovery and validation | `crates/dekopon-config/src/`; skill-directory loading (`SKILL.md` front matter, resources, and size/depth/count bounds) in `crates/dekopon-config/src/skill.rs` | `crates/dekopon-config/src/tests.rs`, including catalog-relative skill loading and one-refusal reporting of every unmountable skill; inline front-matter, bound, and symlink-refusal tests in `skill.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml`, which mounts `examples/local/skills/pull-request-review/`, and `examples/conditional-write/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
-| Operator CLI and model auth commands | `crates/dekopon/src/` | `crates/dekopon/tests/cli.rs` |
+| Operator CLI and model auth commands | `crates/dekopon/src/`; the `describe agent` `Skills:` section and the wide `get agent` `SKILLS` column in `render.rs` | `crates/dekopon/tests/cli.rs`, including the example `reviewer` agent's skill described by name and resource count without its body |
 | Model clients, bounded OpenAI image generation, and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
@@ -39,12 +39,13 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
 | Tokio process lifecycle | `crates/dekopon-process/src/` | Inline typed-result, Tokio task-panic, and payload-free tracing tests plus a public doctest; `dekopon-run shell` is the normal consumer |
-| Shared prompt loop, safe agent-configuration/image-generation meta views, and session capability dispatch | `crates/dekopon-agent/src/` | Inline prompt/meta-tool, one-attempt byte-free image output, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests |
-| Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange and shell limit/rejection coverage; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
-| Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
+| Shared prompt loop, safe agent-configuration/image-generation meta views, session capability dispatch, mounted skills, opt-in improvement suggestions, and session replay | `crates/dekopon-agent/src/`; the skills listing and `read_skill` tool in `skills.rs`, the `suggest_improvement` tool and its bounds in `improvement.rs`, recorded-session reconstruction and `replay` in `replay.rs` | Inline prompt/meta-tool, one-attempt byte-free image output, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests, plus inline listing/argument, suggestion-validation, and reconstruction/divergence tests in those three modules |
+| Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs, and `session` list/show/replay | `crates/dekopon-run/src/`; the OpenObserve search client in `observe.rs` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange, shell limit/rejection coverage, `prompt --skill`/`--suggestions` against a mock model endpoint, an unmountable skill refused before any model call, `session show`/`replay --from-file` round trips, and `session list`/`show` against a loopback receiver mock with the credential read from a named environment variable; inline URL, trace-id, and settings validation tests in `observe.rs`; `examples/otel-traces/smoke-test.sh` for OpenObserve delivery/redaction |
+| Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, route-mounted skills read on demand, the per-route `improvementSuggestions` opt-in, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving exact fetched `echo`/`memory-chat` releases plus the checked `storage-probe` fixture |
 | Rust provider fixtures | `examples/providers/http-probe/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, loopback mocks, and broker/VFS tests; exact standalone echo/JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
+| Agent skill example | `examples/local/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/local/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs`; described by `crates/dekopon/tests/cli.rs` |
 | Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
@@ -59,15 +60,21 @@ Scaffolding that more than one suite needs lives in `dekopon-test-support` inste
 
 Update protocol types first, then config validation, CLI rendering, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
 
+Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names directories, resolved relative to the catalog file unless absolute; `SkillId` in `crates/dekopon-core/src/skill.rs` owns the name grammar; `crates/dekopon-config/src/skill.rs` reads each directory into memory at load time under its size, depth, and count bounds, so no session touches the filesystem; and the catalog loader reports every unmountable or same-named skill in one refusal (`CatalogProblem::Skill`, `CatalogProblem::DuplicateSkill`) and serves the loaded set through `LocalCatalog::agent_skills`. `dekopon describe agent` renders each skill's name, resource count, and description without its body, and the wide `get agent` table carries a `SKILLS` column.
+
 ### CLI behavior
 
 Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exits documented. Add parser tests and black-box tests. Machine-readable JSON/YAML shapes and exit codes need compatibility consideration even when table output can evolve.
 
 `dekopon auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands. Its explicit broker subcommands must remain identity-free clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
 
+`dekopon-run session` follows the same split: `SessionCommand`, `ObserveArgs`, and `SessionSourceArgs` in `cli.rs`, `evaluate_session` in `lib.rs`, and `render_session_table`, `render_transcript`, and `render_replay` for text output. `observe.rs` is the only OpenObserve client; its inline tests validate settings, the search URL, and trace identifiers without sending anything, the black-box tests talk to a loopback mock rather than a real receiver, and the `Authorization` header value is read from the environment variable `--openobserve-auth-env` names rather than accepted as an argument. `session show --json` prints exactly what `session replay --from-file` reads back, so that shape is a compatibility surface like every other JSON output.
+
 ### Model clients or prompt tools
 
 Generic model types and transports belong in `dekopon-model`; the immediate bounded tool loop belongs in `dekopon-run`. Gateway image generation is also a model client: its fixed public endpoint and credential remain in `dekopon-model`, while the shared prompt loop carries generated bytes through a request-local output slot rather than a model message. Keep credentials and generated bytes inside their typed boundaries and out of providers, broker protocol, history, and traces. Mock network protocols in tests; never read or import another application's credential store.
+
+Skills, the `suggest_improvement` tool, and replay live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`, `replay.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered only where the embedder opted in (`--suggestions`, `improvementSuggestions`) because its record carries model-authored text whether or not payload telemetry is on; replay answers scripts from the recording and never invents tool output. The contract is in [`improvement.md`](improvement.md).
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must still validate its capability-specific fields and constraints.
 
@@ -215,7 +222,10 @@ python3 .github/scripts/check_docs_duplicates.py docs README.md AGENTS.md crates
 
 The other gate is inline in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml): every
 `audit.event` name emitted under `crates/` must appear in [`observability.md`](observability.md),
-and an extraction that reads nothing fails rather than passing silently.
+and an extraction that reads nothing fails rather than passing silently. Emitting a new name
+therefore means adding it, backticked, to that document in the same change; the skill and
+suggestion tools added `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`,
+and `agent.improvement.refused` this way.
 
 ### OpenObserve OTLP end-to-end test
 

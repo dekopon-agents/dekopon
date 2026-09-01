@@ -7,6 +7,100 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Added skills, operator-authored reference material an agent reads on demand. `spec.skills` lists
+  directories in the Agent Skills `SKILL.md` layout: YAML front matter carrying `name` (equal to
+  the directory name; `[a-z0-9-]`, at most 64 bytes) and `description` (at most 1024 bytes), the
+  optional `license`, `compatibility`, `metadata`, and `allowed-tools`, and no other key; then a
+  Markdown body; every other regular UTF-8 file in the tree is a resource addressed by its
+  `/`-separated relative path. `dekopon-config` reads each skill whole at catalog load — paths
+  resolved against the catalog file's directory, hidden entries skipped, and a symbolic link, a
+  non-regular file, nesting past 4 levels, more than 64 resources, a `SKILL.md` over 64 KiB, a
+  resource over 256 KiB, or more than 1 MiB of resources refused — and reports every unloadable
+  directory and every repeated name in the one catalog refusal, so a session never touches the
+  filesystem. `dekopond` mounts the agent's skills on every session of a bound route, and
+  `dekopon-run prompt --skill <DIRECTORY>` (repeatable) mounts them for one session, exiting 1
+  before a session starts when a directory does not load or two carry one name. A mounted set adds
+  one system message after the instructions listing each skill's name and description only; the
+  model reads a body or one resource with `read_skill`, a repeat is answered with a one-line pointer
+  at the earlier result, and an unknown name or path is a tool result naming what does exist rather
+  than the end of the session. Each read is one `agent.skill.read` record (`skill.name`,
+  `skill.resource`, `skill.bytes`, `skill.repeated`) and each refusal one `agent.skill.refused`
+  record (`reason` `unknown-skill` or `unknown-resource`), in either payload mode.
+  `inspect_agent_config` gains `skills` — names, descriptions, and resource paths, never the text.
+  A skill is untrusted model text exactly as `instructions` is: the model reads it in full, so
+  nothing secret goes in it, and it grants nothing. `examples/local` mounts a
+  `pull-request-review` skill on its `reviewer` agent.
+- Added `suggest_improvement`, the tool an agent taps the glass with: at most three structured
+  notes per session on how its operator could improve it, each a `category` (`instructions`,
+  `skill`, `capability`, `tool`, `limits`, `other`), a `target` (at most 128 bytes), a `summary`
+  (512), an `evidence` and a `proposal` (2048 each), and a `confidence` (`low`, `medium`, `high`).
+  It is off everywhere by default: `dekopon-run prompt --suggestions` and `session replay
+  --suggestions` offer it and print each note to standard error, keeping standard output for the
+  answer, and `routes[].improvementSuggestions: true` offers it on a gateway route, where a note
+  reaches telemetry and never the chat. An accepted note is one `agent.improvement.suggested`
+  record carrying every field; a note outside an enum, blank, past a bound, or past the session
+  limit is answered with the reason and one `agent.improvement.refused` record
+  (`invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, `session-limit`), and
+  the session continues either way. Both records fire whether or not payload telemetry is on,
+  because offering the tool is the consent to put model-authored text in the log. A suggestion
+  changes nothing: no instruction, skill, limit, or grant moves because a model asked. Embedders
+  read them back from `PromptOutcome.suggestions`.
+- Added `dekopon-run session list|show|replay`, which read sessions back from the OpenObserve log
+  stream the runner and gateway export to. The receiver is `--openobserve-url`
+  (`DEKOPON_OPENOBSERVE_URL`), the organization base the OTLP exporter posts to, with
+  `--openobserve-stream` (`DEKOPON_OPENOBSERVE_STREAM`, default `dekopon`) and
+  `--openobserve-auth-env` (default `DEKOPON_OPENOBSERVE_AUTHORIZATION`), the name of the variable
+  holding the complete `Authorization` header value, so no credential value appears in an
+  argument; the client follows no redirect, uses no ambient proxy, reads at most 20 pages of 500
+  records and warns when it stops there, bounds a response at 32 MiB, and validates a trace
+  identifier before interpolating it into SQL. `list` groups `accounting.model.turn` records by
+  trace within `--since` (default `7d`; a count followed by `s`, `m`, `h`, or `d`), newest first,
+  so it also lists sessions recorded metadata-only; `show` reconstructs one session — system
+  messages, earlier exchanges, prompt, every turn's scripts and their outputs, the answer — from
+  `agent.model.prompt`, `agent.model.answer`, and the accounting records, and `--json` prints the
+  exact shape `replay --from-file` reads back, so a recording can be kept, edited, and replayed
+  with no backend in the loop. A session recorded with payload telemetry off is reported as
+  accounted turns with no transcript rather than guessed at. Under the runner's root span the
+  command is `session.list`, `session.show`, or `session.replay`.
+- `session replay` puts a recorded conversation to a model again — the recorded instructions
+  unless `--system` or `--system-file` replaces them, the recorded skills listing unless `--skill`
+  replaces it, and whichever `--model` the operator names — and answers every script the model
+  writes from the recording, so by default no capability runs and no effect happens. The first
+  script the recording never ran is the divergence: the replay stops there and exits 0 unless
+  `--provider` components were supplied, in which case that script runs live in direct mode and
+  the report says so. The report compares recorded and replayed scripts index by index (`same`,
+  `differs`, `recorded only`, `replayed only`) beside both answers and token totals, `--json`
+  prints it whole, and the exit code is 1 only when the replayed session failed for a reason other
+  than a divergence stop. Turns before the divergence are a faithful comparison and turns after a
+  live one are a new session; replay never invents tool output. There is deliberately no durable
+  store, no automatic rewriting, and no grader: the loop is `list`, `show`, edit, `replay`, commit.
+
+### Changed
+
+- The scripting tool's description now tells the model when to reach for the tool and to write a
+  job as one script; the exact JSON a `--kebab-case` flag becomes (a value reading as a number,
+  `true`, `false`, or `null` is sent typed, anything else as a string, a bare flag as `true`);
+  what each exit code means and what to do next (127 is `cap --list`, 126 a refusal to report, 2
+  names its cause, 124 the deadline); that truncated output keeps its head and tail with a marker
+  giving the total line count; that scripts share nothing but the conversation; and that skills,
+  attachments, and configuration are not files. The refusal list and the four differences from
+  bash are unchanged, and a test pins every promised exit code and message to the interpreter.
+- `dekopon describe agent` always prints a `Skills:` section, `(none)` when nothing is mounted, its
+  `--output json` carries each loaded skill whole, and the wide `get agent` table gains a `SKILLS`
+  column between `PROVIDERS` and `MODEL`.
+- `dekopon-agent`'s `PromptOutcome` gains `suggestions`, and `PromptError` gains
+  `MissingSkillName`, `UnexpectedSkillArguments`, and `InvalidSuggestion` (telemetry kinds
+  `missing-skill-name`, `unexpected-skill-arguments`, `invalid-suggestion`), which end a session
+  as every other malformed tool call does; an exhaustive match downstream must name them.
+- `dekopon-agent` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
+  and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`), `ureq` (the OpenObserve
+  client, on the HTTP stack the model clients already use), and `time` (RFC 3339 timestamps in
+  `session list`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
+  `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and
+  `dekopon-protocol`'s `AgentSpec` gains `skills`, absent from serialized output when empty.
+
 ## [0.12.0] - 2026-08-29
 
 ### Added

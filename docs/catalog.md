@@ -6,18 +6,18 @@ the `Agent`, `Capability`, and `Provider` documents in the file `dekopon --confi
 this document covers the schema and, for every field, what actually consumes it today.
 
 That last part is the reason this document exists. The catalog looks like a permission system and is
-not one. Two of its fields decide how an agent behaves, several are validated cross-references, and
-four are reserved names that no shipped component reads. Authoring one correctly means knowing which
-is which.
+not one. Three of its fields decide how an agent behaves, several are validated cross-references,
+and four are reserved names that no shipped component reads. Authoring one correctly means knowing
+which is which.
 
 ## Who reads it
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopon` | Yes | Renders and validates it. Every catalog command is this file and nothing else. |
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, and publishes a bounded content-free inventory to the broker's web UI. |
+| `dekopon` | Yes | Renders and validates it, and with it every skill directory an agent's `spec.skills` names, because loading the catalog reads them. Every catalog command is this file and those directories, nothing else. |
+| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and publishes a bounded content-free inventory to the broker's web UI. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
-| `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept at all. |
+| `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept at all. Its `--skill <DIRECTORY>` flag mounts a skill directory in the format below without a catalog. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
 broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. An agent's
@@ -79,6 +79,8 @@ spec:
   modelClass: reasoning
   instructions: |
     You review pull requests. Comment once, do not approve.
+  skills:
+    - skills/pull-request-review   # a directory beside this file, holding SKILL.md
   capabilities:
     - gh.pull-request.read
     - gh.pull-request.comment
@@ -92,6 +94,7 @@ status: Ready
 | `description` | string | yes | Rendered by `dekopon get`/`describe`, and reported in the broker web UI inventory (bounded to 4 KiB). |
 | `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. It also overrides `status` in CLI rendering: a disabled agent always displays `Disabled`. |
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
+| `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent; `dekopon describe agent` lists them by name, description, and resource count. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
 | `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. Rendered by the CLI, expanded into the web UI inventory. **Grants nothing.** |
 | `providers` | list of provider IDs | no | Cross-checked at load the same way. Rendered and reported. **Grants nothing.** |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
@@ -107,6 +110,63 @@ this field. Treat the text the way you would treat any other model input.
 They are also not private. An authorized chat sender can retrieve them verbatim through the
 gateway's `inspect_agent_config` tool, which was added for exactly that purpose. **Do not put a
 secret, a token, or an internal hostname in `instructions`.**
+
+### `skills` are directories the model reads on demand
+
+Each `spec.skills` entry names a directory in the Agent Skills layout: a directory named after the
+skill, holding a `SKILL.md` and, optionally, supporting files beside it. A `SKILL.md` that uses the specification's front-matter keys loads here unchanged; a key the specification does not define is refused rather than ignored.
+
+`SKILL.md` opens with YAML front matter between `---` lines — the opening fence is the first line
+and the closing fence a line of its own; CRLF endings are tolerated — followed by the skill's
+Markdown instructions, its *body*. The front matter is strict, like every other authored document
+here: an unknown key is a load failure naming it.
+
+| Key | Required | Notes |
+|---|---|---|
+| `name` | yes | Lowercase ASCII letters, digits, and single hyphens; at most 64 bytes; starts and ends with a letter or digit. **Must equal the directory's name.** The grammar is narrower than the catalog's [identifier grammar](#identifier-grammar) on purpose — it is the one the format fixes — so `pull-request-review` loads and `Pdf`, `pdf_tools`, and `pdf--tools` do not. |
+| `description` | yes | Trimmed, non-blank, at most 1024 bytes. The one line a model reads to decide whether the skill applies; it sits in every prompt on a route that mounts the skill. |
+| `license` | no | Recorded and rendered. Blank is treated as absent. |
+| `compatibility` | no | Declared environment requirements. Recorded and rendered; blank is treated as absent. |
+| `metadata` | no | A map of scalar values — strings, booleans, numbers, or null — kept as text. A list or map value is refused. |
+| `allowed-tools` | no | A string, carried through and rendered. **Not enforced:** a session has one scripting tool whatever a skill says, and authority comes from broker policy, never from a file a model reads. |
+
+Every other regular file in the directory tree is a *resource* of the skill, addressed by its
+`/`-separated path relative to the skill directory, such as `references/risk-checklist.md`, and
+sorted by that path. Hidden entries (a leading `.`) are skipped as editor and version-control
+residue. A symbolic link anywhere in the tree, the skill directory itself included, is refused
+rather than followed, because a link is how content escapes the directory that was reviewed; so is
+anything that is neither a regular file nor a directory, and any file name or file content that is
+not UTF-8.
+
+Every bound is fixed before a byte is read: `SKILL.md` is at most 64 KiB including its front
+matter; each resource is at most 256 KiB; a skill carries at most 64 resources, at most 1 MiB in
+total, nested at most four directory levels below the skill directory. Everything within those
+bounds is read into memory when the catalog loads, so a session never touches the filesystem to
+show a model a skill, and a skill that cannot be read refuses the catalog rather than a session.
+
+What consumes a loaded skill:
+
+- `dekopond` binds an agent's skills to every route naming it and mounts them on every session on
+  that route: a second system message after `instructions` lists each skill by name and
+  description, and the `read_skill` tool returns a skill's body, or one resource's text, when the
+  model asks. Bodies and resources are never in a prompt until read; each read is recorded as
+  `agent.skill.read`. See [`dekopond.md`](dekopond.md#sessions) and
+  [`observability.md`](observability.md).
+- `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
+  text. Skills are not part of the web UI inventory.
+- `dekopon describe agent` renders a `Skills:` section, one `- <name> [<N> resource file(s)]:
+  <description>` line per skill or `(none)`; `dekopon get agents -o wide` adds a `SKILLS` column
+  counting the agent's `spec.skills` entries. `-o yaml`, `-o json`, and `config view` show the
+  authored paths, never the skill text.
+- `dekopon-run --skill <DIRECTORY>` mounts the same format with no catalog; see
+  [`run.md`](run.md#mounting-skills).
+
+A skill is operator-authored text handed to the model, exactly as `instructions` is. It shapes how
+the agent answers and nothing else: it cannot widen a capability, name a principal, or influence an
+authorization decision, and broker policy never reads it. It is also not private — the model reads
+any mounted skill in full through `read_skill`, and an authorized sender can list skill names,
+descriptions, and resource paths through `inspect_agent_config`. **A skill must hold no secret: no
+token, credential, or internal hostname belongs in a `SKILL.md` or in any resource file.**
 
 ### `modelClass` decides which model runs the agent
 
@@ -206,7 +266,7 @@ value is inert. `policyProfile`, `status`, and `labels` are optional and may sim
 ## What the loader checks
 
 Loading is a single pass that either produces a fully validated catalog or fails with one error
-naming the file and the offending document:
+naming the file and each offending document or skill directory:
 
 - the file is non-empty and parses as JSON or YAML;
 - every document carries a `kind`;
@@ -215,7 +275,13 @@ naming the file and the offending document:
 - no two documents of one kind share a name;
 - every `agent.spec.capabilities` entry names a `Capability` in this catalog;
 - every `agent.spec.providers` entry and every `capability.spec.provider` names a `Provider` in this
-  catalog.
+  catalog;
+- every `agent.spec.skills` entry, resolved against the catalog file's directory when relative,
+  loads as a skill directory as described above. Every skill that does not is reported — naming
+  the agent, the authored path, and the file at fault — in the same refusal, so an operator with
+  three broken skills fixes three and validates once;
+- no two skills one agent mounts share a `name`; the second is refused rather than shadowing the
+  first, because a model could not tell two `read_skill` targets apart.
 
 `dekopon validate` runs exactly this and reports the result; `dekopon get`, `describe`, and `config
 view` run it before rendering anything. A catalog is therefore either wholly loadable or wholly
@@ -225,9 +291,13 @@ refused — there is no partial mode where some resources are usable.
 
 - [`cli.md`](cli.md) — configuration discovery order, output formats, and exit codes.
 - [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
-  that makes `instructions`, `enabled`, and `modelClass` load-bearing.
+  that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
+- [`run.md`](run.md#mounting-skills) — the runner's `--skill` flag, which mounts the same skill
+  format with no catalog in the loop.
 - [`broker-http.md`](broker-http.md) — `constraintSets`, Cedar policy, and why the broker's own
   configuration is what decides authority.
 - [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the broker
   configuration this catalog is deliberately separate from.
 - [`examples/local/dekopon.yaml`](../examples/local/dekopon.yaml) — a complete authored catalog.
+- [`examples/local/skills/pull-request-review/SKILL.md`](../examples/local/skills/pull-request-review/SKILL.md)
+  — the skill that catalog's `reviewer` agent mounts, with one resource file.
