@@ -10,6 +10,14 @@ This crate is a pure interpreter library. It links no Wasmtime, no broker, no HT
 pub trait CapabilityInvoker {
     fn granted(&self) -> Vec<String>;
     fn is_granted(&self, capability: &str) -> bool { /* ... */ }
+    fn grants_namespace(&self, namespace: &str) -> bool { /* ... */ }
+    fn command_words(&self) -> Vec<String> { /* ... */ }
+    fn has_command_word(&self, word: &str) -> bool { /* ... */ }
+    fn resolve_command(
+        &self,
+        word: &str,
+        argv: &[String],
+    ) -> Option<Result<(String, serde_json::Value), String>> { /* ... */ }
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> { /* ... */ }
     fn invoke(
         &self,
@@ -28,7 +36,7 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 ## Grammar
 
-**Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, `getopts`, and `local` under bash's dynamic scoping; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
+**Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, `getopts`, and `local` under bash's dynamic scoping; `unset`; the no-op `:`; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
 **Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
@@ -138,8 +146,8 @@ exactly one way, so bash's longest/shortest pairs (`##`, `%%`) are accepted as a
 the same request rather than as a second behavior. A metacharacter is rejected by name: `${p##*/}` is a parse error, and
 quoting is the way through (`${p#'*'}` strips a literal asterisk) exactly while the parser can still
 see the quotes. A pattern assembled at run time is checked when it expands instead, and quoting
-cannot exempt that one because its quotes are already gone. `basename` and `dirname` are the answer
-for the path-slicing idiom `${p##*/}` would have covered.
+cannot exempt that one because its quotes are already gone. There is no `basename` or `dirname`;
+`jq -r 'split("/") | last'` covers what `${p##*/}` would have.
 
 A whole right-hand side keeps its value rather than collapsing to text — `copy=$obj` followed by
 `${copy[key]}` works, the same deviation that already made `ip=$(curl ...)` followed by
@@ -178,7 +186,9 @@ inside a script; what a caller receives is still the transcript a terminal would
 
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint. A loaded provider may also contribute separator-free *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::resolve_command` into an ordinary capability proposal with the same budget, denial, and telemetry path; a provider word that collides with a builtin is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+
+Provider command words are the embedder's to supply, through three defaulted methods on the same seam: `command_words` lists the words the session's loaded providers contribute, for dispatch and the prompt; `has_command_word` is the membership test dispatch asks after the builtin table and before capability fallback; and `resolve_command` rewrites one word's argv into `Some(Ok((capability, input)))`, a usage error `Some(Err(message))` the provider chose to report, or `None` when no loaded provider owns the word. The defaults contribute no words, so an invoker implementing only `granted` and `invoke` never resolves one. The rewrite proposes and grants nothing: a capability it names that this session was not granted is refused with a message naming it and exit 127, and one that was granted is invoked on exactly the path a direct capability word takes.
 
 `grep` and `sed` are the only two that take `-E`, and it is the only way regex syntax ever becomes regex syntax here. Unflagged, both read a literal pattern and reject an unescaped metacharacter by name — one matching semantics shared with `case`, `${p#…}`, and the right operand of `[[ == ]]`, so a script never has to know which construct it is in to know what `[0-9]` means. With `-E` the pattern goes to `regex-bites`, the engine `jq`'s own `regex` builtins already link, rather than to a second one added for this. Anchors are real (`grep -E '^ba(r|z)$'`, `sed -E 's/^ *//'`), `.` is the wildcard, and the engine's compile error is reported by name when a pattern does not compile. An `-E` pattern is model-authored text, so it is bounded before it sees input: 1 KiB of pattern source, a 64 KiB compiled program, and sixteen levels of nesting. A replacement stays literal text in both modes — the engine's `$1` interpolation is off, and a real-sed `\1` group reference is refused rather than emitted verbatim. Flags are matched whole, so the two are written separately: `-i -E` folds ASCII case only, because this engine matches codepoint by codepoint; that is narrower than the literal path's `-i`, never wider. The bundled `-iE` is "option not yet supported".
 

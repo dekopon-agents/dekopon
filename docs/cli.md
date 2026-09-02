@@ -21,7 +21,7 @@ dekopon validate
 dekopon config view
 ```
 
-`dekopon` with no subcommand prints help to standard error and exits `2`. The subcommand is optional
+`dekopon` with no subcommand prints `error: a subcommand is required` to standard error and exits `2`. The subcommand is optional
 in the grammar only so that refusal comes from this CLI, naming what was missing, rather than from
 Clap's generic required-argument error.
 
@@ -32,7 +32,7 @@ Run `dekopon --help` or `dekopon <COMMAND> --help` for generated syntax.
 - `--config <PATH>`: authoritative YAML or JSON source for catalog commands; ignored by `version` and `auth`.
 - `-o, --output <FORMAT>`: `table` (default), `wide`, `json`, `yaml`, or `name`.
 - `--no-color`: disable ANSI color in diagnostics.
-- `--quiet`: suppress successful output; errors still print.
+- `--quiet`: suppress successful output; errors still print. Conflicts with `-v`.
 - `-v`: emit informational diagnostics and error causes.
 - `-vv`: emit debug diagnostics and debug error context.
 
@@ -40,7 +40,7 @@ Global flags may appear before or after subcommands. Authentication commands do 
 
 ## ChatGPT subscription authentication
 
-`dekopon auth chatgpt login` uses OpenAI's Codex device authorization flow and writes only to Dekopon's credential file. `status` reports state without revealing tokens, and `logout` removes only Dekopon's file. The default is `~/.config/dekopon/chatgpt-auth.json`; override it with `DEKOPON_CHATGPT_AUTH_FILE` or `--auth-file <PATH>`. Discovery treats a variable exported with an empty value as unset and falls through to the next tier, and refuses a discovered path that is not absolute — a relative `DEKOPON_CHATGPT_AUTH_FILE` or `XDG_CONFIG_HOME` would otherwise leave the rotating refresh token in whatever directory the process started in. Only `--auth-file` is taken verbatim. See [`run.md`](run.md) for inference behavior and the complete security boundary.
+`dekopon auth chatgpt login` uses OpenAI's Codex device authorization flow and writes only to Dekopon's credential file. `status` reports state without revealing tokens, and `logout` removes only Dekopon's file. The credential file is resolved in this exact order: `--auth-file <PATH>`, `DEKOPON_CHATGPT_AUTH_FILE`, `$XDG_CONFIG_HOME/dekopon/chatgpt-auth.json`, `$HOME/.config/dekopon/chatgpt-auth.json`, then `%APPDATA%/dekopon/chatgpt-auth.json`; when no tier applies the command fails asking for `DEKOPON_CHATGPT_AUTH_FILE`. Discovery treats a variable exported with an empty value as unset and falls through to the next tier, and refuses a discovered path that is not absolute — a relative `DEKOPON_CHATGPT_AUTH_FILE` or `XDG_CONFIG_HOME` would otherwise leave the rotating refresh token in whatever directory the process started in. Only `--auth-file` is taken verbatim. See [`run.md`](run.md) for inference behavior and the complete security boundary.
 
 ### Exporting a credential for a secret store
 
@@ -57,7 +57,7 @@ Global flags may appear before or after subcommands. Authentication commands do 
 | `--format secret` | Default. A `v1` `Secret` manifest for `kubectl apply -f -`. |
 | `--format raw` | The credential document itself, byte-identical to what a login writes, for a password-manager field. |
 | `--secret-name <NAME>` | Secret name, default `dekopon-chatgpt-auth`; validated as an RFC 1123 subdomain before the credential is read. |
-| `--namespace <NAMESPACE>` | Secret namespace; omitted from the manifest when unset. |
+| `--namespace <NAMESPACE>` | Secret namespace; validated as an RFC 1123 label (no dots, at most 63 characters) before the credential is read; omitted from the manifest when unset. |
 | `--expose-credential` | Required acknowledgement that this prints a live access token and refresh token. |
 | `--allow-terminal` | Print to a terminal anyway. |
 
@@ -79,13 +79,13 @@ Paths are considered in this exact order:
 
 An explicit or environment path is authoritative: if it cannot be read, the command fails rather than falling back. For default locations, the first existing regular file wins; a candidate that exists but cannot be examined is an error naming that path, not a silent fall-through to the next location. An empty environment variable is ignored. If no default exists, the error lists all searched paths.
 
-The loader accepts JSON, a single YAML resource, a YAML sequence, or multiple YAML documents. It parses the file once and rejects unknown fields, malformed IDs, unsupported API versions, duplicate names, missing capability references, missing provider references, and an `agent.spec.providers` list that disagrees with the providers the agent's own capabilities route to.
+The loader accepts JSON, a single YAML resource, a YAML sequence, or multiple YAML documents. It parses the file once and rejects unknown fields, malformed IDs, unsupported API versions, duplicate names, missing capability references, missing provider references, an `agent.spec.providers` list that disagrees with the providers the agent's own capabilities route to, and any `agent.spec.skills` directory that does not load; [`catalog.md`](catalog.md#what-the-loader-checks) is the complete list.
 
-Semantic problems are accumulated: the whole catalog is scanned and every problem is reported in one list, so a file with several mistakes takes one `dekopon validate` run to diagnose. Only a failure that makes continuing impossible — an unreadable file or invalid YAML — stops at the first error.
+Semantic problems are accumulated: the whole catalog is scanned and every problem is reported in one list, so a file with several mistakes takes one `dekopon validate` run to diagnose. Only a failure that makes continuing impossible — an unreadable file or invalid YAML — stops at the first error. A document that never loads — a missing or unsupported `kind`, an unsupported `apiVersion`, a decode failure, or a malformed name — also suppresses the cross-reference checks for that run, because a resource that never loaded cannot be referenced by name; skill directories are still checked.
 
 ## Output behavior
 
-List output is sorted by validated identifier. `name` output uses qualified names such as `agent/reviewer`. A singular JSON or YAML command emits one resource; a list emits a versioned `AgentList`, `CapabilityList`, or `ProviderList`. `config view` emits a canonical grouped catalog rather than preserving comments or original document order.
+List output is sorted by validated identifier. `name` output uses qualified names such as `agent/reviewer`. A singular JSON or YAML command emits one resource; a list emits a versioned `AgentList`, `CapabilityList`, or `ProviderList`. `config view` emits a canonical grouped catalog rather than preserving comments or original document order. `validate` prints `configuration valid: N agent(s), N capability(ies), N provider(s)` (`wide` adds a `source:` line, `name` prints `config/valid`) or a `{source, valid, agents, capabilities, providers}` document in `json`/`yaml`; an invalid catalog is an error with exit `1`, never a `valid: false` document. `version` prints `dekopon <version>` or `{product, version, apiVersion}`.
 
 `describe agent` expands one agent with the capabilities and providers it names and the skills it mounts. The text form — `table` and `wide` render it identically — ends with a `Skills:` heading after `Providers:`, listing each skill as `  - <name> [<N> resource file(s)]: <description>` in the order `spec.skills` names them, or `  (none)`. Name and description are what a model matches a request against and the count says how much sits behind `read_skill`; the skill's body and its resource text are never printed there. The JSON and YAML forms carry each loaded skill whole under `skills` — `name`, `description`, `body`, `resources` as `path` and `text` pairs, the front matter's optional `license`, `compatibility`, `metadata`, and `allowedTools`, and the resolved `source` directory — and omit the key when the agent mounts none, so the exact text a session will read can be diffed. The wide agent table (`get agents -o wide`, `get agent <NAME> -o wide`, the `AGENTS` group of `config view -o wide`) inserts `PROVIDERS`, `SKILLS`, `MODEL`, and `POLICY` between `CAPABILITIES` and `DESCRIPTION`; `SKILLS` counts the directories `spec.skills` names, which `get agent -o yaml` prints as written in the catalog and omits when empty.
 

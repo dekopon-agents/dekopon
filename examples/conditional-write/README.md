@@ -27,7 +27,9 @@ noticing.
 
 ## 1. Create the Slack app
 
-Follow [`../slack/README.md`](../slack/README.md): create the app from the manifest, generate the
+Follow [`../slack/README.md`](../slack/README.md): create the app from
+[`manifest-agent.yaml`](../slack/manifest-agent.yaml) (this example's `dekopond.yaml` sets
+`experience: agent`; the classic `manifest.yaml` pairs with `experience: classic`), generate the
 app-level token (`xapp-…`, scope `connections:write`), install it for the bot token (`xoxb-…`), and
 find the two identifiers you will need below — the workspace `T…` team ID and the sender's `U…`
 member ID. Socket Mode means no public HTTP endpoint and no inbound firewall hole.
@@ -267,8 +269,8 @@ What each part is doing:
 - No record body, no request payload, no written text, no Slack message, no URL path or query. The
   chain records that something happened and to what; provider output is a digest.
 
-Records 1 through 5 are the rest of the same session: a `decision` and an `execution` for the
-read, then the `decision` that allowed this write. Every identifier in the session shares
+Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
+for the read, then the `decision` that allowed this write. Every identifier in the session shares
 the `trace`, and each invocation extends it with a counter, so `grep dekopond-session-9f1c4a7b0e35d268`
 recovers the whole conversation's effects. Each record carries `previousHash` and `recordHash`, and
 the broker verifies the entire chain on every start.

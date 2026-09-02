@@ -85,7 +85,7 @@ The same single-container path used by CI is available locally:
 examples/otel-traces/smoke-test.sh
 ```
 
-The script creates an isolated Compose project, builds `dekopon-run`, sends one invocation, polls OpenObserve's trace search API, and asserts that the expected runner and provider spans arrived. It also checks that a sentinel provider input did not appear in the exported trace. The container and volume are removed when the test exits; set `DEKOPON_OTEL_KEEP=1` to retain them for inspection.
+The script creates an isolated Compose project, builds `dekopon-run`, sends one invocation, polls OpenObserve's trace search API, and asserts that the expected runner and provider spans arrived. It also checks that a sentinel provider input did not appear in the exported trace. The container and volume are removed when the test exits; set `DEKOPON_OTEL_KEEP=1` to retain them for inspection. `OPENOBSERVE_PORT` (default `5080`; CI uses `15080`) and `OPENOBSERVE_STREAM` (default `dekopon_smoke`) pick the host port and the stream, and `DEKOPON_OTEL_SKIP_BUILD=1` reuses an already-built `target/debug/dekopon-run` instead of running `cargo build`.
 
 ## Read sessions back
 

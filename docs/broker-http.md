@@ -153,12 +153,15 @@ The server logs `broker_outcome_unaudited` with the invocation identifier for ex
 
 `capacity-exhausted` separates a permanent exhaustion from a momentary one. `broker-unavailable` invites a retry under a fresh invocation identifier; the replay ledger and the audit log are conditions under which that retry can never succeed. Neither structure evicts or rotates, and restart does not clear the ledger — `scan_audit_file` restores an entry for every Decision event in durable history — so a client told `broker-unavailable` would loop against a permanently capped broker. The server logs `broker_capacity_exhausted` alongside the refusal; the fix is an operator raising `brokerLimits.maxReplayIds` or `serverLimits.auditMaxRecords`, or moving the audit file aside, not anything the caller can do.
 
-Size `maxReplayIds` against `auditMaxRecords` rather than below it. The ledger bound is cumulative across restarts for the same reason: one restored identifier per durable Decision event. A denial costs one audit record and one ledger slot, while an executed invocation costs two audit records and one slot, so a denial-heavy history exhausts a ledger sized at half the audit budget *first* — before the designed `AuditError::Full` refusal the audit bound exists to produce. The stock `maxReplayIds` of 100 000 is therefore undersized for the chart's `auditMaxRecords: 200000`, which is why the chart's default `broker.yaml` sets `brokerLimits.maxReplayIds: 200000` outright. `brokerLimits` defaults field by field, so raising one bound does not mean restating the other; raise the two together.
-A DRN refusal is a normal denied invocation with reason `secret-denied`; unknown, unbound,
-wrong-sink/username and Cedar-denied names deliberately share it. A source that is missing,
-malformed, oversized, unavailable or times out after authorization produces a normal failed
-invocation such as `secret-resolution`, plus a terminal execution audit record with zero HTTP
-calls. No provider work began, so retry is safe but useful only after the source condition changes.
+Size `brokerLimits.maxReplayIds` at or above `serverLimits.auditMaxRecords`, and raise the two together; the reasoning and the chart defaults are in [`charts/dekopon/README.md`](../charts/dekopon/README.md#size-maxreplayids-with-it).
+
+A refused or unresolvable DRN is never a failure response: refusal is a normal `Denied` invocation
+(`secret-denied`) and a post-authorization source failure is a normal `Failed` invocation
+(`secret-resolution`) with a terminal audit record and zero HTTP calls, so retry is safe but useful
+only after the source condition changes. [`secrets.md`](secrets.md#two-independent-policies)
+defines which conditions share `secret-denied`, and its
+[Resolution and rotation](secrets.md#resolution-and-rotation) section defines the source-failure
+conditions.
 
 A failure response is not the only way to reach that state. Nothing ties a client's `io_timeout` to broker-side execution deadlines, so a client whose response read fails is in the same position: the complete request frame was delivered and the outcome is unknown to it. `ClientError` therefore records which half of the exchange failed — a request-phase framing failure delivered nothing, a response-phase one delivered everything — and `ClientError::may_have_executed` covers both that case and the `outcome-unaudited` code. A caller submitting a write must map it to a non-retryable result: `dekopon-agent` reports it to a script as `denied` (exit `126`) rather than as a generic failure, because a retry carries a fresh invocation identifier and replay rejection cannot recognize it as a duplicate.
 
@@ -334,8 +337,9 @@ breadth and Cedar sees those four trusted optional context fields. Each swapped/
 field denies before namespace creation.
 
 The gateway receipt proves complete transport acceptance (service acceptance for Slack, Telegram,
-and Discord; kernel acceptance for local), not human receipt. One dedicated record request follows,
-with no automatic retry after response loss or outcome-unknown.
+Discord, and WhatsApp Graph sends — a failure after an accepted chunk of a split answer is partial
+delivery, not a receipt; kernel acceptance for local), not human receipt. One dedicated record
+request follows, with no automatic retry after response loss or outcome-unknown.
 
 ## Version and implementation policy
 
@@ -351,7 +355,7 @@ The broker fails closed when no approved implementation exists for an import. Ru
 
 ## Delivery sequence
 
-The behavior lands in reviewable slices without temporarily granting authority to the immediate host:
+The behavior landed in reviewable slices, none of which granted authority to the immediate host. Every slice below except the last is current:
 
 1. **Implemented:** publish and validate the HTTP WIT contract and guest bindings.
 2. **Implemented:** generalize provider guest world generation and add an HTTP-importing fixture that the immediate host still rejects.
@@ -368,4 +372,4 @@ The behavior lands in reviewable slices without temporarily granting authority t
 13. **Implemented per-agent credentials:** let one constraint set name a default credential plus per-agent overrides, validate every selectable credential's existence and destination coverage at startup, and record the selected symbolic name in the terminal audit event.
 14. Add independently retained, signed, or remote checkpoints before production claims.
 
-Until a remaining slice is implemented, its behavior remains committed direction rather than current functionality.
+Slice 14 is the only slice in this list still outstanding; until it lands, checkpoint anchoring is local integrity evidence only (see [Evidence and audit](#evidence-and-audit)). The other committed directions — a dedicated gateway UID and operator-CLI integration — are listed under [Current foundation](#current-foundation).

@@ -17,7 +17,7 @@ which is which.
 | `dekopon` | Yes | Renders and validates it, and with it every skill directory an agent's `spec.skills` names, because loading the catalog reads them. Every catalog command is this file and those directories, nothing else. |
 | `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and publishes a bounded content-free inventory to the broker's web UI. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
-| `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept at all. Its `--skill <DIRECTORY>` flag mounts a skill directory in the format below without a catalog. |
+| `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept; it links `dekopon-config` only for `load_skill`, which its `--skill <DIRECTORY>` flag uses to mount a skill directory in the format below without a catalog. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
 broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. An agent's
@@ -96,7 +96,7 @@ status: Ready
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
 | `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent; `dekopon describe agent` lists them by name, description, and resource count. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
 | `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. Rendered by the CLI, expanded into the web UI inventory. **Grants nothing.** |
-| `providers` | list of provider IDs | no | Cross-checked at load the same way. Rendered and reported. **Grants nothing.** |
+| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. Rendered and reported. **Grants nothing.** |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
 | `policyProfile` | string | no | **Reserved.** Nothing reads it. See [Reserved and inert fields](#reserved-and-inert-fields). |
 | `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | Authored, never observed. Rendered by the CLI; absent renders as `Pending`. |
@@ -256,7 +256,7 @@ than left to be discovered, because each one reads like it selects a behavior.
 | Field | Looks like | Actually |
 |---|---|---|
 | `spec.policyProfile` (Agent) | Selects a named policy for the agent | Read by `dekopon get`/`describe` and nothing else. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Read by `dekopon get -o wide` and nothing else. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
+| `spec.credentialRef` (Provider) | Names the credential the provider will present | Rendered in the wide provider table (`dekopon get -o wide`, `config view -o wide`), carried through every `-o json`/`-o yaml` form, and read by nothing else. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
 | `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so `dekopon get capabilities` reports the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Round-tripped through `-o yaml`/`-o json`. Nothing filters, selects, or reports on them. |
 
@@ -276,6 +276,9 @@ naming the file and each offending document or skill directory:
 - every `agent.spec.capabilities` entry names a `Capability` in this catalog;
 - every `agent.spec.providers` entry and every `capability.spec.provider` names a `Provider` in this
   catalog;
+- `agent.spec.providers` agrees with the agent's own capabilities: a provider that one of the
+  agent's capabilities routes to must be listed, and a listed provider that none of its capabilities
+  route to is refused (the second check runs only once every capability resolved);
 - every `agent.spec.skills` entry, resolved against the catalog file's directory when relative,
   loads as a skill directory as described above. Every skill that does not is reported — naming
   the agent, the authored path, and the file at fault — in the same refusal, so an operator with

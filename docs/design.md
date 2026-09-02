@@ -27,7 +27,7 @@ Success does not mean making a model trustworthy. Success means containing an un
 5. **Authorization is bound to execution.** A grant carries the proposal, policy decision, execution constraints, and receipt needed to prevent a provider host from executing a different or broader operation.
 6. **Effects produce evidence and audit linkage.** Proposal, identity, decision, policy revision, execution outcome, and evidence must remain correlatable by invocation and trace identifiers.
 7. **External-write authority requires process isolation.** Once writes exist, orchestration and broker authority run in separate processes and deployment units.
-8. **Documentation must distinguish reality from direction.** Never describe a daemon, broker, policy engine, privileged provider interface, or external effect as available before it is implemented and tested. The immediate read-only component host must not be presented as the future broker host.
+8. **Documentation must distinguish reality from direction.** Never describe a daemon, broker, policy engine, privileged provider interface, or external effect as available before it is implemented and tested. The immediate read-only component host must not be presented as the privileged broker host.
 
 These invariants are more important than API convenience, model autonomy, or architectural symmetry.
 
@@ -104,10 +104,12 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-webui` | GET-only, unauthenticated operational HTML for broker-loaded providers, Wasmtime counters, credential-free OTLP settings, and bounded gateway-reported agent/token status | **Current** library embedded only in `dekopon-brokerd`; listener enablement is explicit |
 | `dekopon-run` | One-shot direct invocation, a single model scripting tool with optional mounted skills, local/OTLP trace export, audit-safe lifecycle logs, an OpenObserve read-back client (`ureq`) that lists, shows, and replays exported sessions, and identity-free Unix broker proposal client without effect authority | **Current**, with deliberately separate direct and broker subcommands; its dependency set still excludes every privileged broker crate under the CI check |
 | `dekopond` | Chat-transport wakeups, including a signed text-only WhatsApp Cloud API webhook, attested routing, opt-in route-scoped image generation, text/image replies, authorization-fed Slack Agent thread ownership, optional no-reply decisions, best-effort native in-flight activity, cooperatively cancellable bounded agent sessions with no broker authority, credential-free self-inspection, and bounded per-sender conversation history | **Current** unprivileged daemon; a route is one independent session per message unless it opts into `mode: persistent`, generation/activity are explicit opt-ins after authorization, Slack continuation is installed only after authorization, WhatsApp TLS terminates outside the daemon and replay handling is process-local, and a dedicated gateway UID remains **committed direction** |
-| `dekopon-brokerd` | Owner-only Unix peer authentication, Cedar authorization, legacy destination-bound credentials, public-DRN/private-map secret resolution after a separate `secret.use` decision, replay restoration, provider execution, evidence, durable audit, atomic local checkpoint verification, an explicitly enabled unauthenticated read-only web view, and a separate offline exact-reference OCI provider-manager mode | **Current** privileged process; secret descriptors are parsed without network at startup and one source snapshot resolves per authorized invocation; managed-provider startup remains network-free; workload-identity secret bootstraps, leased secrets, provenance verification, SemVer updates, pruning, and independent remote/signed audit anchoring remain future |
+| `dekopon-brokerd` | Owner-only Unix peer authentication, Cedar authorization, legacy destination-bound credentials, public-DRN/private-map secret resolution after a separate `secret.use` decision, replay restoration, provider execution, evidence, durable audit, atomic local checkpoint verification, an explicitly enabled unauthenticated read-only web view, and two operator command trees that run without serving the broker: the exact-reference OCI provider manager (`provider sync|list|verify`, of which only `sync` reaches the network) and `audit verify` | **Current** privileged process; secret descriptors are parsed without network at startup and one source snapshot resolves per authorized invocation; managed-provider startup remains network-free; workload-identity secret bootstraps, leased secrets, provenance verification, SemVer updates, pruning, and independent remote/signed audit anchoring remain future |
 | Cedar policy adapter | Declarative authorization with strict startup validation and per-decision explanations | **Current**; it replaced the exact-match evaluator outright |
 | Exact policy evaluator | Principal/actor/capability/provider rules with deny-by-default matching | **Removed.** Its authorization half is now Cedar; its execution half survives unchanged as owner-authored constraint sets, still validated against loaded manifests, host ceilings, and the credential store |
 | Deployable privileged provider path | Authenticated broker ownership of policy, credentials, component-host execution, durable evidence, and authorized effects | **Current** local Unix foundation; stronger deployment transport remains direction |
+
+Of the rows above, the `SkillId` grammar, `Skill` loading, `read_skill`, `suggest_improvement`, mounted skills, and the `dekopon-run` session list/show/replay client are unreleased post-`0.12.0` work recorded under [`CHANGELOG.md`](../CHANGELOG.md#unreleased) `[Unreleased]`.
 
 The agent daemon must not gain effect authority merely because it coordinates a task. The broker must not perform model orchestration merely because it can execute a provider. Image generation is model inference rather than a provider effect: its explicitly named model credential stays inside the unprivileged gateway/model client, while the model can choose only a bounded prompt and never the endpoint, credential, filename, or authenticated chat destination.
 
@@ -141,7 +143,7 @@ if no model turn remains, the gateway posts a fixed warning to inspect audit bef
 
 ## Current control paths
 
-The published `0.12.0` release retains the local catalog read path introduced in 0.1:
+The current tree — the published `0.12.0` release plus the work recorded under `CHANGELOG.md` `[Unreleased]` — retains the local catalog read path introduced in 0.1:
 
 ```text
 parse dekopon CLI
@@ -329,7 +331,7 @@ See [`cli.md`](cli.md) for the current command contract.
 | Desired provider set, generated lock, immutable store | Provider selection, exact OCI resolution, and installed bytes are different states. The lock is the atomic activation point; daemon startup is offline and the host checks the lock against the exact compiled buffer. Exact tags are never implicit SemVer ranges. |
 | Gateway-held conversation history | Immediate replay remains a per-sender, compacted, window-bounded in-memory gateway feature. Optional durable memory is a separate broker-owned provider store: content is namespace-bound and model-hidden on write, omitted from audit/telemetry, and retrieved only on demand. Authorization stays uncached in both mechanisms. |
 | No empty future crates | A package boundary must be justified by meaningful, tested behavior. |
-| Improvement is operator-driven | Skills are catalog resources, `suggest_improvement` notes are telemetry records, and `dekopon-run session` replays a session from exported records, answering recorded scripts from the recording so nothing runs live unless the operator names `--provider` components. There is deliberately no durable improvement store, no automatic prompt rewriting, and no grader: an operator reads a suggestion, edits instructions or a skill, replays, and commits the change to the catalog. |
+| Improvement is operator-driven | Skills are catalog resources, `suggest_improvement` notes are telemetry records, and `dekopon-run session` replays a session from exported records, answering recorded scripts from the recording so nothing runs live unless the operator names `--provider` components. There is deliberately no durable improvement store, no automatic prompt rewriting, and no grader: an operator reads a suggestion, edits instructions or a skill, replays, and commits the change to the catalog. All three mechanisms are unreleased post-`0.12.0` work recorded under `CHANGELOG.md` `[Unreleased]`. |
 | Explicit unauthenticated web listener | The web UI has no mutating route and receives no credential values, but provider schemas, artifact paths, agent names, receiver endpoints, and runtime capacity are deployment information. `dekopon-brokerd` opens no TCP listener unless the operator supplies `--http-bind`; the surrounding network is the access boundary. |
 
 ## How to evaluate a proposed change
@@ -351,12 +353,14 @@ If authority ownership is unclear, stop and update the design before adding code
 ## Related documents
 
 - [`security-model.md`](security-model.md) — trust assumptions, threat boundaries, and limitations.
-- [`architecture.md`](architecture.md) — current crate structure and planned deployment topology.
+- [`architecture.md`](architecture.md) — current crate structure and deployment topology.
 - [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
 - [`cli.md`](cli.md) — current catalog and model-auth operator contract, discovery, output, and exit codes.
 - [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
 - [`inference.md`](inference.md) — model request types and wire shape, cache optimization and retention caveats, current conversation memory, and exploratory long-term memory.
 - [`dekopond.md`](dekopond.md) — the unprivileged chat gateway's configuration, transports, session bounds, authorization flow, and committed conversation contract.
 - [`broker-http.md`](broker-http.md) — committed broker-mediated HTTP contract and authority boundary.
+- [`secrets.md`](secrets.md) — public DRN proposal, dual `secret.use` authorization, private source adapters, and native Basic/Bearer sinks.
+- [`observability.md`](observability.md) — telemetry and audit event names, redaction, and OpenObserve read-back.
 - [`roadmap.md`](roadmap.md) — implementation sequence and deliberately deferred scope.
 - [`README.md`](README.md) — documentation map and task-based reading guide.

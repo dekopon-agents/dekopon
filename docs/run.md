@@ -18,10 +18,11 @@ dekopon-run chat --gateway <SOCKET> --subject <SUBJECT> [--conversation <ID>]
 dekopon auth chatgpt <login | status | logout | export>
 ```
 
+Every `--provider <COMPONENT>` is a component file or a directory, which expands to the `*.wasm` files directly inside it in filename order, so two runs over one directory agree about which provider claimed a duplicate capability. `--input-file -` reads the capability input from standard input on both `invoke` and `broker invoke`.
+
 **`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
 
-Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls. Repeating `--provider` creates one deterministic capability registry, and duplicate provider or capability IDs fail before invocation. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
-Each direct `inspect`, `invoke`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. There is no persistent compilation cache between processes. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
+Each direct `inspect`, `invoke`, `shell`, or `prompt` command (and a `session replay` given `--provider`) builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
 The standalone Rust echo provider is immediately runnable after fetching its exact v0.1.0 release
 fixture:
@@ -199,7 +200,10 @@ By default a prompt session is direct-only and contacts no broker, so a local de
 This is what makes an HTTP-capable capability reachable at all. Direct mode's linker is import-free by construction, so a component there cannot perform I/O; `curl` and any fetching capability therefore resolve over the broker leg or not at all. Dispatch checks the direct registry first — a capability that can run locally always does, without an authorization decision or an audit record — and falls through to the broker only for what direct mode cannot serve. The broker remains the sole authority: `dekopon-run` submits an identity-free proposal per call and reports back whatever the broker decided, so a policy refusal surfaces to the script as exit code `126` (denied) rather than a generic failure, and a capability outside the session as `127`. Each call carries a freshly generated invocation ID extending one per-session trace ID, because the broker treats an invocation ID as a durable replay-rejection key.
 
 Passing any broker connection flag — `--socket`, `--server-uid`, `--max-frame-bytes`, or
-`--io-timeout-ms` — without `--broker` is a usage error rather than a silent no-op:
+`--io-timeout-ms` — without `--broker` is refused before any model call rather than silently
+ignored: the command prints
+`error: broker connection flags were supplied without --broker; a prompt session contacts no broker until you ask it to`
+and exits `1`:
 
 ```console
 cargo run -p dekopon-run -- prompt \
@@ -418,11 +422,11 @@ Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT
 
 ## Tracing, logs, and limits
 
-`--trace <PATH>` writes Chrome/Perfetto-compatible JSON containing runner, model, component compilation, description, and invocation spans. An optional `--otlp-endpoint <URL>` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) also exports correlated OTLP/HTTP protobuf traces and structured lifecycle logs. The URL is a generic base to which `/v1/traces` and `/v1/logs` are appended. Standard OTLP header environment variables carry receiver authentication and routing without exposing credentials in process arguments. The short-lived runner flushes configured exporters before returning, and a failed flush fails the command.
+`--trace <PATH>` writes Chrome/Perfetto-compatible JSON containing runner, model, component compilation, description, and invocation spans. An optional `--otlp-endpoint <URL>` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) also exports correlated OTLP protobuf traces and structured lifecycle logs — over HTTP by default, where the URL is a generic base to which `/v1/traces` and `/v1/logs` are appended, or over gRPC with `--otlp-transport grpc` (`OTEL_EXPORTER_OTLP_PROTOCOL_KIND`). `--otel-service-name` and `--otel-export-timeout-ms` complete the exporter settings; [`observability.md`](observability.md#enable-otlp-export) documents all of them. Standard OTLP header environment variables carry receiver authentication and routing without exposing credentials in process arguments. The short-lived runner flushes configured exporters before returning, and a failed flush fails the command.
 
 Prompt text, model responses, model-authored script text and its output, provider input/output, bearer tokens, OTLP authorization headers, and raw errors are intentionally excluded from telemetry. Two opt-ins widen that on purpose: `--otel-telemetry-payloads true` adds the transcript events [`observability.md`](observability.md#model-and-tool-transcript) defines, and `--suggestions` records the model's bounded suggestion fields as `agent.improvement.suggested` in either mode. Lifecycle logs record stable command/session/model/script/guest events and share generated trace and span IDs with performance traces. They are operational audit telemetry, not broker authorization evidence or a replacement for durable broker audit. See [`observability.md`](observability.md) for configuration, event semantics, data minimization, and the single-container OpenObserve example.
 
-Direct-operation bounds are configurable on `inspect`, `invoke`, `prompt`, and `session replay` (for its `--provider` components) with:
+Direct-operation bounds are configurable on `inspect`, `invoke`, `shell`, `prompt`, and `session replay` (for its `--provider` components) with:
 
 - `--max-memory-bytes`
 - `--max-input-bytes`
@@ -440,8 +444,9 @@ that.
 
 The host supplies no WASI, filesystem, network, environment, clock, random, credential, JSONL, or
 durable-file imports. It accepts only capabilities declaring `read-only`. Consequently this path
-exercises pure provider computation; both generated storage components are intentionally rejected
-by `inspect`, just like HTTP-importing components.
+exercises pure provider computation; the storage-importing components — the generated
+`storage-probe-provider.wasm` and the fetched `memory-chat-provider.wasm` — are intentionally
+rejected by `inspect`, just like HTTP-importing components.
 
 ## Authority limitation
 

@@ -2,7 +2,7 @@
 
 Roadmap items describe sequencing, not shipped behavior or permission to bypass the invariants in [`design.md`](design.md) and [`security-model.md`](security-model.md). They are intentions rather than delivery commitments.
 
-## 0.1 — local control and immediate provider tooling (implemented)
+## 0.1 — local control and immediate provider tooling (released)
 
 - Strict `v1alpha1` agent, capability, and provider resources.
 - Local YAML/JSON discovery and cross-reference validation.
@@ -37,7 +37,7 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
 - The `examples/conditional-write` end-to-end walkthrough. The nineteen-capability GitHub provider and its own walkthrough ship from [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh); the image fetches that component at a pinned tag.
 
-Version 0.3.0 is published as provenance-attested CLI archives and a Git tag covering 20 public crates. Those crates were never uploaded: crates.io publication is a separate manual dispatch that has not been run, so crates.io still holds the 17 packages of `0.2.0`. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
+Version 0.3.0 is published as provenance-attested CLI archives and a Git tag covering 20 public crates. Those crates were never uploaded and are being left that way: at the time, crates.io publication was a separate manual dispatch, and it was not run for `0.3.0`, so no crate carries that version. Since 0.9.0 (#121) every release tag *attempts* to publish the public crate set through crates.io trusted publishing in the order `.github/release-crates.txt` states — a run can still stop partway, as `v0.12.0`'s did — and the manual dispatch remains only to recover an interrupted tag publication; the root README's [crates.io section](../README.md#cratesio) is the current statement of what is published. What has *not* changed is the checkpoint story: there is still no independently retained, signed, or remote anchor.
 
 ## 0.4 — distribution: image, chart, and tap (released)
 
@@ -138,20 +138,26 @@ before parsing and behind external TLS — and broker-owned provider storage beh
 grants. Identity mapping and effect authorization remain solely the broker's, and the gateway holds
 only transport credentials. The same release lands a 145-finding deep-review hardening pass:
 diagnosable failure causes end to end, single-pass authorization and audit serialization on the hot
-path, and three recurring failure classes promoted to deny-by-default clippy lints.
+path, and three recurring failure classes promoted to deny-by-default clippy lints. It adds two
+public crates, `dekopon-storage-host` and `dekopon-provider-storage`, for twenty-three.
+
+## 0.11 — bash-shaped shell and an interactive console (released)
 
 Version 0.11.0 gives `dekopon-shell` the bash-script surface a script author expects — compound
 commands as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`,
 real parameter expansion, and two script-addressable streams — and adds `dekopon console`, an
 interactive terminal view over a running broker. The `gh` shell builtin moves out of tree to
 `dekopon-provider-gh`, joining `turso-sql` as a provider published and versioned separately from
-this repository. Version 0.11.1 moves the container image's runtime base from Debian 12 to Debian 13
-so it publishes at all: the CLI binary referenced two symbols glibc's dynamic linker requires the
-runtime library to name even though both are weak-probed and safely absent on an older one. No
-crate's source changed.
+this repository. It adds `dekopon-provider-sdk-testkit`, the in-process fake broker provider tests
+run against, and `dekopon-tui`, for twenty-five. Version 0.11.1 moves the container image's
+runtime base from Debian 12 to Debian 13 so it publishes at all: the CLI binary referenced two
+symbols glibc's dynamic linker requires the runtime library to name even though both are
+weak-probed and safely absent on an older one. No crate's source changed.
 
-Version 0.12.0 is a structural scrub rather than a feature release: thirty-two decided findings from
-a whole-tree audit, one commit each. It bumps the local broker protocol to
+## 0.12 — structural scrub, process seam, provider manager, and secret sources (released)
+
+Version 0.12.0 pairs a structural scrub with three foundations (below): thirty-two decided findings
+from a whole-tree audit, one commit each. It bumps the local broker protocol to
 `dekopon.dev/broker/v1alpha2`, where attestation is one optional request field instead of a
 type-level axis multiplied across eleven request variants, thirteen client methods, and nine broker
 entry points; keys durable chat memory by a typed `route:` on a constraint set rather than by
@@ -160,7 +166,7 @@ gives both Wasmtime hosts one shared host layer; replaces twelve hand-rolled tru
 with one `dekopon-core` predicate; and moves the interactive console out of tree. A client and a
 broker upgrade together.
 
-## 0.12 — the console moved out of tree (released)
+### 0.12 — the console moved out of tree (released)
 
 - `dekopon console` and the `dekopon-tui` crate ship from
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` builtin
@@ -178,7 +184,7 @@ broker upgrade together.
   `allowDevelopmentSubjects` opt-in: the console was the only surface that minted one, and no
   deployment set the field. See [`upgrading.md`](upgrading.md).
 
-## 0.12 — Tokio process lifecycle foundation (released)
+### 0.12 — Tokio process lifecycle foundation (released)
 
 - `dekopon-process` provides one async operation trait and a one-run/one-node execution boundary.
   It records private payload-free trace IDs, preserves the typed operation result or Tokio task
@@ -192,7 +198,7 @@ broker upgrade together.
   real production consumer. The current lifecycle crate contains no broker, policy, credential,
   provider host, network, filesystem, retry, or audit machinery.
 
-## 0.12 — locked provider-set foundation (released)
+### 0.12 — locked provider-set foundation (released)
 
 - `dekopon-brokerd provider sync`, `sync --locked`, `list`, and `verify` keep exact operator-authored
   OCI references, immutable manifest/component resolutions, and content-addressed installed bytes
@@ -205,7 +211,7 @@ broker upgrade together.
   and container-staging adoption remain the ordered follow-ups rather than fields parsed but read by
   nothing.
 
-## 0.12 — public DRNs and private secret sources (released)
+### 0.12 — public DRNs and private secret sources (released)
 
 - Canonical logical DRNs are inert typed proposal values, never provider JSON/WIT or bearer grants.
   Each use requires the normal capability decision, a separate exact Cedar `secret.use` decision,
@@ -216,6 +222,29 @@ broker upgrade together.
 - Workload-identity bootstrap chains, Vault dynamic leases, custom source CAs, caching/stale
   fallback, output materialization, arbitrary secret interpolation, and transformed-reflection
   prevention remain follow-ups rather than parsed-but-unused configuration.
+
+Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-five public crates.
+
+## Unreleased — skills, improvement suggestions, and session replay (implemented, not yet released)
+
+- `spec.skills` mounts Agent Skills `SKILL.md` directories, read whole at catalog load under fixed
+  bounds; a session lists them by name and description and reads a body or one resource on
+  demand through `read_skill`. `dekopon-run prompt --skill` mounts them for one session.
+- `suggest_improvement`, the tool an agent taps the glass with: at most three bounded structured
+  notes per session, off everywhere by default, opt-in per gateway route
+  (`improvementSuggestions: true`) or per runner session (`--suggestions`); a note is telemetry a
+  person reads and changes nothing.
+- `dekopon-run session list|show|replay` reads recorded sessions back from OpenObserve and replays
+  one against a model, answering its scripts from the recording; only `--provider` makes a
+  divergent script run, in the same read-only import-free direct mode as `prompt`. See
+  [`improvement.md`](improvement.md).
+
+This adds no crate, process boundary, inbound listener, provider credential access, or effect
+authority. The one new network path is the runner's outbound OpenObserve query client, whose
+`Authorization` header value is read from an environment variable named on the command line
+rather than passed as an argument; `dekopon-agent` gains a `dekopon-config` dependency, and
+`dekopon-run` still reaches no broker crate under the CI `cargo tree` gate.
+[`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under `[Unreleased]`.
 
 ## Next milestones
 
@@ -240,6 +269,14 @@ Each of these was raised, deliberately scoped out, and accepted as a follow-up r
 - **Actor kind (human versus service) in policy context.** The broker knows it; policy cannot currently read it. Cheap to add and easy to add wrongly, since it invites rules that look like identity checks but are transport facts.
 - **`AuditEvent` field casing.** Variants rename to camelCase while their fields stay snake_case, so a record mixes `attested_subject` with `credentialInjected`. Fixing it breaks the audit chain format, which is worth doing only alongside another change that already does.
 
+## Deferred from the 2026-08-27 scrub
+
+The whole-tree audit behind 0.12.0 decided thirty-five findings: the thirty-two executed ones are recorded in [`CHANGELOG.md`](../CHANGELOG.md#0120---2026-08-29)'s 0.12.0 entries, one bullet per landed finding citing its checklist number (the test-only #17, #18, #19, and #35 have no user-visible change and no entry, and the chart wiring of #25 sits under `dekopon-chart-0.3.0`), and these three were decided `DEFER` — revisit in the next scrub — rather than dropped. Each carries the audit's finding and suggested fix; paths are current, the audit's line numbers are not repeated.
+
+- **Secret-source backends (#15, PREMATURE_GENERALIZATION).** `SecretSource` in `crates/dekopon-brokerd/src/secrets.rs` ships ten kinds — `secureFile`, `kubernetesProjection`, `kubernetesApi`, `onePasswordConnect`, `vaultKv1`, `vaultKv2`, `awsSecretsManager`, `awsSsmParameter`, `gcpSecretManager`, and `azureKeyVault` — eight of them hand-written vendor HTTP clients exercised only against in-process mock responses, and the AWS pair hand-rolls SigV4 with no known-answer signature test. No example or chart value sets `secretMapPath`, no `dekopon-brokerd` test authorizes through `secretUse` with `allowQuery: true` or `maxInjections` above one, and the deployment the audit read for context still used `credentialsPath`, including for 1Password. Suggested fix: keep `secureFile` and `kubernetesProjection`; delete the eight remote adapters, `read_aws_credentials`, the SigV4, `hmac`, and `crc32c` helpers, and the `time` and `hmac` dependencies they pull into `dekopon-brokerd`, keeping the `SecretSource` enum shape so a backend returns as one variant; add one end-to-end `dekopon-brokerd` test authorizing through `secretUse` with `allowQuery: true` and `maxInjections: 2`; and until a deployment sets `secretMapPath`, mark the feature **Exploration** in [`design.md`](design.md), or wire one live token through a `secureFile` entry and keep it Current.
+- **`dekopon-process` into `dekopon-run` (#16, CRATE_FACTORIZATION).** A public crate of 309 source and 348 test lines whose `Process` trait has one implementation, its own `ProcessFn`, and one call site, `evaluate_shell` in `crates/dekopon-run/src/lib.rs`, under the kind string `"legacy-shell"`. Its abandonment-observer machinery — the supervisor's nested spawn, `OutcomeEnvelope`, and three of its six tests — exists for a dropped future the only caller cannot produce: nothing above it selects, times out, or aborts. Sibling handoff sites in `dekopond` still call `spawn_blocking` directly, and [`design.md`](design.md)'s "no empty future crates" rule and the package-namespace rule below both refuse a crate without a consuming milestone. Suggested fix: move `lib.rs` to `crates/dekopon-run/src/process.rs` as a private module; delete the crate from `[workspace.members]`, `[workspace.dependencies]`, `.github/release-crates.txt`, and its design and roadmap paragraphs; drop the `Process` trait, `ProcessFn`, `on_unobserved`, `OutcomeEnvelope`, and the three drop-path tests; rename `"legacy-shell"` to `"shell"`. Preserve the `process.run` and `process.node` spans, which `dekopon-run`'s trace tests assert and [`observability.md`](observability.md) names, and `ProcessOutcome::TaskFailed` carrying the raw `JoinError`. The crate is on the crates.io publication plan, so any version of it already published needs a yank or a deprecation pointing at `dekopon-run` when it goes.
+- **WhatsApp and Telegram in or out of tree (#26, SIDE_QUEST).** The deployment the audit read for context ran Slack and Discord only. WhatsApp (`crates/dekopond/src/transport/whatsapp.rs`) is the gateway's only inbound listener, its only HMAC path, and three gateway-held credentials, described in eleven Markdown documents in this tree and served by a chart `ClusterIP` Service that `gateway.service.enabled` leaves off by default. Telegram (`transport/telegram.rs`) has no example directory at all — `telegramLongPoll` appears only in [`dekopond.md`](dekopond.md), the gateway's configuration type, and unit tests — yet `ChatTransportKind::Telegram`, `DeliveryIdentity::Telegram`, and `SubjectService::Telegram` reach the trusted `dekopon-broker-protocol` and `dekopon-core` crates. Both widen the chat-scope authorization surface every change must carry. Suggested fix: decide both together — either `dekopond` grows a transport seam that lives out of tree, or delete both (`whatsapp.rs`, `telegram.rs`, `examples/whatsapp/`, the chart `gateway.service` block, the `ChatTransportKind` and `DeliveryIdentity` variants, and the broker's transport-to-subject match arms). Preserve: `SubjectService` must keep parsing `whatsapp.<id>`, `tel.<n>`, and `telegram.<id>` subjects so existing audit chains stay readable.
+
 ## Intended package namespace
 
 `dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed by `dekopon-run shell`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
@@ -255,4 +292,4 @@ A crate should be added only with meaningful, tested behavior needed by an imple
 
 ## Explicit non-goals for 0.1
 
-Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopon auth`; model inference and component loading remain confined to the explicitly experimental `dekopon-run` executable.
+Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopon auth`; the operator CLI itself performs no model inference and loads no component. Inference lives in the explicitly experimental `dekopon-run` and in `dekopond`, and component loading in `dekopon-run` (import-free, read-only) and `dekopon-brokerd`.

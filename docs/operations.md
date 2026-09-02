@@ -43,6 +43,7 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`broker-http.md` § Startup validation](broker-http.md#startup-validation) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
+| Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — `compileCachePath` is optional; absent, Cranelift recompiles every component before the socket binds, which is what the chart's startup probe budget ([`charts/dekopon/README.md` § Probes](../charts/dekopon/README.md#probes)) is sized to cover |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
 | This release changed configuration — what do I edit? | [`upgrading.md`](upgrading.md) |
 | Can I run a newer broker against an older gateway? | No. [`broker-http.md` § Version and compatibility](broker-http.md#version-and-compatibility) |
@@ -65,6 +66,7 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Question | Read |
 |---|---|
 | What do the traces, spans, and audit-safe logs contain? | [`observability.md`](observability.md) |
+| What did a session actually say and run, after the fact? | [`observability.md` § Reading sessions back](observability.md#reading-sessions-back) — `dekopon-run session list`, `show`, and `replay` query the OpenObserve receiver the runner and gateway export to; a session recorded with payload telemetry off still lists, but `show` and `replay` find its accounted turns and no transcript |
 | What is the dashboard, and what does exposing it disclose? | [`dekopon-brokerd` § Read-only web UI](../crates/dekopon-brokerd/README.md#read-only-web-ui) |
 | A client got a failure code — is it safe to resubmit? | [`broker-http.md` § Failure codes](broker-http.md#failure-codes) |
 | An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The durable audit is the only record; do not resubmit under any identifier |
