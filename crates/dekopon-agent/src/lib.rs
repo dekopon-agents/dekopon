@@ -599,16 +599,17 @@ impl CapabilityInvoker for BrokerLeg {
         Some(match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
             // A transport failure is not the provider declining: the model reads it as the broker
-            // being unreachable rather than as a bad argv, and the cause travels with it. No
-            // `ClientError` names the socket path.
+            // being unreachable rather than as a bad argv, and the cause travels with it; the
+            // interpreter prefixes the word, so the message must not. No `ClientError` names the
+            // socket path.
             ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
-                message: format!("{word}: {}", dekopon_core::error_chain(&error)),
+                message: dekopon_core::error_chain(&error),
             },
             ProcessOutcome::TaskFailed(error) if error.is_cancelled() => CommandRun::Denied {
                 reason: "session-cancelled".to_owned(),
             },
             ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
-                message: format!("{word}: {error}"),
+                message: error.to_string(),
             },
         })
     }
@@ -1292,7 +1293,7 @@ mod tests {
                 panic!("a missing broker socket is an infrastructure failure, not a decline");
             };
             assert!(
-                message.starts_with("probe: could not inspect broker socket: "),
+                message.starts_with("could not inspect broker socket: "),
                 "{message}"
             );
             assert!(!message.contains("dekopon-secret-broker"), "{message}");

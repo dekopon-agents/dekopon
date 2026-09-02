@@ -1273,12 +1273,13 @@ impl CapabilityInvoker for RegistryInvoker {
         Some(match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
             // A host refusal — an input past `--max-input-bytes`, a trap, a deadline — is not the
-            // provider declining the argv; its message already names the provider and the bound.
+            // provider declining the argv; its message already names the provider and the bound,
+            // and the interpreter prefixes the word.
             ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
                 message: error.to_string(),
             },
             ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
-                message: format!("{word}: {}", AppError::CommandTask(error)),
+                message: AppError::CommandTask(error).to_string(),
             },
         })
     }
