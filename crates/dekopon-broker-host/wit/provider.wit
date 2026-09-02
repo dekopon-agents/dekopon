@@ -1,8 +1,8 @@
-package dekopon:broker-provider@0.2.0;
+package dekopon:broker-provider@0.3.0;
 
 /// Broker provider world with buffered HTTP and exact storage authority supplied per invocation.
 world provider {
-    include dekopon:provider/provider@0.2.0;
+    include dekopon:provider/provider@0.3.0;
     import dekopon:http/client@1.0.0;
     import dekopon:storage/jsonl@0.1.0;
     import dekopon:storage/durable-files@0.1.0;

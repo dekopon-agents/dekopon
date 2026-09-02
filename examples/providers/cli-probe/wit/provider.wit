@@ -1,0 +1,6 @@
+package dekopon:cli-probe@0.1.0;
+
+/// Import-free fixture whose command word behaves like a small command-line program.
+world provider {
+    include dekopon:provider/provider-cli@0.3.0;
+}

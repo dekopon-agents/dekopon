@@ -13,10 +13,14 @@ on:
       - "crates/dekopon-provider-sdk/wit/**"
       - "crates/dekopon-provider-storage/**"
       - "crates/dekopon-broker-host/wit/**"
+      - "examples/providers/cli-probe/**"
+      - "examples/providers/cli-probe-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
       - "examples/providers/provider-v0-1-compat-provider.wasm"
+      - "examples/providers/provider-v0-2-compat/**"
+      - "examples/providers/provider-v0-2-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/http-probe/**"
@@ -36,10 +40,14 @@ on:
       - "crates/dekopon-provider-sdk/wit/**"
       - "crates/dekopon-provider-storage/**"
       - "crates/dekopon-broker-host/wit/**"
+      - "examples/providers/cli-probe/**"
+      - "examples/providers/cli-probe-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
       - "examples/providers/provider-v0-1-compat-provider.wasm"
+      - "examples/providers/provider-v0-2-compat/**"
+      - "examples/providers/provider-v0-2-compat-provider.wasm"
       - "examples/providers/storage-probe/**"
       - "examples/providers/storage-probe-provider.wasm"
       - "examples/providers/http-probe/**"
@@ -63,7 +71,7 @@ env:
   WASM_TOOLS_VERSION: 1.236.1
   WASM_TOOLS_SHA256: 2ea92231826976cb001c6c6d8708ff54e1ef1ea7229968a75a2119ff26c4cd6f
   PROVIDER_RUST_TOOLCHAIN: 1.97.0
-  PROVIDER_WIT_PACKAGE: dekopon:provider@0.2.0
+  PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
 
@@ -186,6 +194,7 @@ jobs:
             crates/dekopon-provider-host/wit/provider.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/provider.wit \
+            examples/providers/cli-probe/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
@@ -241,8 +250,8 @@ jobs:
           jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" '
             (.packages | length == 1) and
             (.packages[0].name == $package) and
-            (.packages[0].worlds == {"provider": 0, "provider-commands": 1}) and
-            (.worlds | length == 2) and
+            (.packages[0].worlds == {"provider": 0, "provider-commands": 1, "provider-cli": 2}) and
+            (.worlds | length == 3) and
             (.worlds[0].name == "provider") and
             ((.worlds[0].imports | keys) == []) and
             ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
@@ -260,7 +269,18 @@ jobs:
               {"name": "argv", "type": 0}
             ]) and
             (.types[0].kind == {"list": "string"}) and
-            (.worlds[1].exports."resolve-command".function.result == "string")
+            (.worlds[1].exports."resolve-command".function.result == "string") and
+            (.worlds[2].name == "provider-cli") and
+            ((.worlds[2].imports | keys) == []) and
+            ((.worlds[2].exports | keys) == ["describe", "invoke", "run-command"]) and
+            (.worlds[2].exports."run-command".function.params == [
+              {"name": "argv", "type": 1},
+              {"name": "stdin", "type": 2}
+            ]) and
+            (.types[1].kind == {"list": "string"}) and
+            (.types[2].kind == {"option": "string"}) and
+            (.types | length == 3) and
+            (.worlds[2].exports."run-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
       - name: Verify buffered HTTP interface
@@ -418,9 +438,9 @@ jobs:
             examples/providers/provider-v0-1-compat/wit/deps/provider.wit
           grep -Fq 'include dekopon:provider/provider@0.1.0;' \
             examples/providers/provider-v0-1-compat/wit/provider.wit
-          if grep -Rq 'dekopon:provider@0.2.0' \
+          if grep -Rqe 'dekopon:provider@0\.[2-9]' \
             examples/providers/provider-v0-1-compat/wit; then
-            echo "historical fixture was regenerated against the current provider package" >&2
+            echo "historical fixture was regenerated against a later provider package" >&2
             exit 1
           fi
           wasm-tools validate "$component"
@@ -430,6 +450,49 @@ jobs:
             (.worlds | length == 1) and
             (.worlds[0].imports == {}) and
             ((.worlds[0].exports | keys) == ["describe", "invoke"])
+          ' "$description"
+
+      - name: Verify the historical provider 0.2 compatibility component
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/provider-v0-2-compat-provider.wasm
+          description=target/wit-package/provider-v0-2-compat.json
+          grep -Fxq 'package dekopon:provider@0.2.0;' \
+            examples/providers/provider-v0-2-compat/wit/deps/provider.wit
+          grep -Fq 'include dekopon:provider/provider-commands@0.2.0;' \
+            examples/providers/provider-v0-2-compat/wit/provider.wit
+          if grep -Rq 'dekopon:provider@0.3.0' \
+            examples/providers/provider-v0-2-compat/wit; then
+            echo "historical fixture was regenerated against the current provider package" >&2
+            exit 1
+          fi
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].imports == {}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "resolve-command"])
+          ' "$description"
+
+      - name: Verify the command-line provider fixture is import-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/cli-probe-provider.wasm
+          description=target/wit-package/cli-probe.json
+          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+            examples/providers/cli-probe/wit/provider.wit
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].imports == {}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+            (.worlds[0].exports."run-command".function.params | map(.name) == ["argv", "stdin"]) and
+            (.worlds[0].exports."run-command".function.result == "string")
           ' "$description"
 
       - name: Verify the malicious memory reservation fixture is import-free

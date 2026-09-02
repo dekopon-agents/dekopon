@@ -43,8 +43,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use async_trait::async_trait;
 use dekopon_broker_host::{
-    BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, HttpCallEvidence,
-    ProviderCapability,
+    BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, CommandRunOutcome,
+    ComponentFailure, HttpCallEvidence, ProviderCapability,
 };
 pub use dekopon_broker_protocol::{
     Attestation, AvailableCapability, ChatMemorySurface, ChatScopeClaim, ChatTransportKind,
@@ -3257,6 +3257,11 @@ where
     /// chat-memory route is refused whatever word produced it. Recording stays unreachable from
     /// any word.
     ///
+    /// The guest runs through the registry's `run_command` with no piped value. A `run-command`
+    /// guest that answers with rendered text (a help page, a usage error) has no shape on this
+    /// wire yet, so it is degraded to a decline whose code is `rendered` and whose message is the
+    /// text it printed; the protocol grows a first-class command run in a later change.
+    ///
     /// # Errors
     ///
     /// Returns a host error when no loaded provider declares the word, when the guest traps, or
@@ -3294,7 +3299,18 @@ where
                 word: word.to_owned(),
             });
         }
-        let resolution = self.registry.resolve_command(word, argv).await?;
+        let resolution = match self.registry.run_command(word, argv, None).await? {
+            CommandRunOutcome::Proposed { capability, input } => {
+                CommandResolution::Resolved { capability, input }
+            }
+            CommandRunOutcome::Failed { error } => CommandResolution::Failed { error },
+            CommandRunOutcome::Rendered { stdout, stderr, .. } => CommandResolution::Failed {
+                error: ComponentFailure {
+                    code: "rendered".to_owned(),
+                    message: format!("{stdout}{stderr}"),
+                },
+            },
+        };
         if matches!(
             &resolution,
             CommandResolution::Resolved { capability, .. } if {
@@ -5413,8 +5429,8 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         // already survived them — but naming them keeps this match exhaustive by proof rather than
         // by a wildcard that would silently absorb a future variant into the wrong public reason.
         BrokerHostError::ConflictingProviders { .. }
-        | BrokerHostError::MissingResolveCommand { .. }
-        | BrokerHostError::ResolveCommandSignature { .. }
+        | BrokerHostError::MissingCommandExport { .. }
+        | BrokerHostError::CommandExportSignature { .. }
         | BrokerHostError::InvalidArtifactSize { .. }
         | BrokerHostError::InvalidArtifactDigest
         | BrokerHostError::ArtifactTooLarge { .. }
@@ -5425,13 +5441,14 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
-        | BrokerHostError::InputTooLarge { .. } => "invalid-input",
+        | BrokerHostError::InputTooLarge { .. }
+        | BrokerHostError::CommandInputTooLarge { .. } => "invalid-input",
         BrokerHostError::OutputTooLarge { .. } | BrokerHostError::InvalidOutput { .. } => {
             "invalid-provider-output"
         }
-        BrokerHostError::ResolveCommand { .. }
-        | BrokerHostError::ResolveCommandUsedHostImport { .. }
-        | BrokerHostError::InvalidCommandResolution { .. } => "command-rewrite-failed",
+        BrokerHostError::RunCommand { .. }
+        | BrokerHostError::RunCommandUsedHostImport { .. }
+        | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
         BrokerHostError::StorageCallRejected {

@@ -36,6 +36,8 @@ Standalone providers consumed at exact v0.1.0:
 
 The remaining checked components are repository-owned fixtures:
 
+- [`cli-probe/`](cli-probe/) is the import-free `run-command` guest: its `probe` word renders
+  help and usage errors, reads a piped value, and proposes its three read-only capabilities.
 - [`http-probe/`](http-probe/) composes provider exports with
   `dekopon:http/client@1.0.0`. Its `conditional-write` capability keeps two-call host budgets,
   per-call evidence, and etag-guarded writes covered without public network access.
@@ -43,6 +45,8 @@ The remaining checked components are repository-owned fixtures:
   chat-memory-route fixture and is never packaged.
 - [`provider-v0-1-compat/`](provider-v0-1-compat/) pins compatibility with the immutable
   two-export `dekopon:provider@0.1.0` world.
+- [`provider-v0-2-compat/`](provider-v0-2-compat/) pins compatibility with the immutable
+  `dekopon:provider@0.2.0` `provider-commands` world and its legacy `resolve-command` export.
 - [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and is never packaged
   in a scanned image directory.
 

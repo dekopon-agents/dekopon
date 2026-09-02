@@ -21,11 +21,16 @@ use std::{
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_provider_sdk::host::CommandExport;
 pub use dekopon_provider_sdk::host::ProviderConflicts;
-use dekopon_provider_sdk::host::{self, ConflictScan, ConflictWording, EngineError, StoreLimits};
+use dekopon_provider_sdk::host::{
+    self, CommandExportProblem, ConflictScan, ConflictWording, EngineError, RESOLVE_COMMAND_EXPORT,
+    RUN_COMMAND_EXPORT, StoreLimits, check_command_export, command_export, command_input_bytes,
+    parse_command_run,
+};
 pub use dekopon_provider_sdk::{
-    CommandResolution, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
-    ProviderManifest,
+    CommandResolution, CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion,
+    ProviderCapability, ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
 use serde::Serialize;
@@ -43,10 +48,7 @@ mod storage;
 pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError};
 use http::{HttpCeilings, HttpState};
 pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
-use metadata::{
-    RESOLVE_COMMAND_EXPORT, ResolveCommandExport, component_interface, identify_bytes,
-    resolve_command_export,
-};
+use metadata::{component_interface, identify_bytes};
 use metrics::{ActiveStore, TrackingStoreLimits};
 pub use metrics::{BrokerHostMetrics, BrokerHostStats};
 
@@ -562,7 +564,7 @@ struct CompiledComponent {
     imports: Vec<ComponentInterfaceItem>,
     exports: Vec<ComponentInterfaceItem>,
     interface_truncated: bool,
-    resolve_command: ResolveCommandExport,
+    command_export: CommandExport,
 }
 
 /// One provider component compiled by the broker host.
@@ -579,6 +581,8 @@ pub struct BrokerWasmProvider {
     exports: Vec<ComponentInterfaceItem>,
     interface_truncated: bool,
     manifest: ProviderManifest,
+    /// Which command export the component offers, read once from its type at compile.
+    command_export: CommandExport,
 }
 
 impl fmt::Debug for BrokerWasmProvider {
@@ -698,7 +702,7 @@ fn compile_component(
     compile.record("elapsed_ms", compile_ms);
     runtime.metrics.record_compilation(elapsed, artifact.bytes);
     let (imports, exports, interface_truncated) = component_interface(&runtime.engine, &component);
-    let resolve_command = resolve_command_export(&runtime.engine, &component);
+    let command_export = command_export(&runtime.engine, &component);
     let pre = runtime
         .linker
         .instantiate_pre(&component)
@@ -717,7 +721,7 @@ fn compile_component(
         imports,
         exports,
         interface_truncated,
-        resolve_command,
+        command_export,
     })
 }
 
@@ -736,7 +740,7 @@ impl BrokerWasmProvider {
             imports,
             exports,
             interface_truncated,
-            resolve_command,
+            command_export,
         } = compiled;
         let manifest_json = describe_component(&runtime, &pre, &source).await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
@@ -763,26 +767,24 @@ impl BrokerWasmProvider {
                 actual: manifest.id,
             });
         }
-        // A manifest that promises command words the component cannot rewrite would fail at the
+        // A manifest that promises command words the component cannot run would fail at the
         // first `gh …` a model typed, in a session, hours later. Prove it at load instead — from
         // the component's own type, which distinguishes "no such export" from "wrong signature".
-        if !manifest.command_words.is_empty() {
-            match resolve_command {
-                ResolveCommandExport::Present => {}
-                ResolveCommandExport::Absent => {
-                    return Err(BrokerHostError::MissingResolveCommand {
+        if let Err(problem) = check_command_export(&manifest, &command_export) {
+            return Err(match problem {
+                CommandExportProblem::Missing => BrokerHostError::MissingCommandExport {
+                    provider: manifest.id.clone(),
+                    path: source.clone(),
+                },
+                CommandExportProblem::Mismatched { name, found } => {
+                    BrokerHostError::CommandExportSignature {
                         provider: manifest.id.clone(),
                         path: source.clone(),
-                    });
-                }
-                ResolveCommandExport::Mismatched { found } => {
-                    return Err(BrokerHostError::ResolveCommandSignature {
-                        provider: manifest.id.clone(),
-                        path: source.clone(),
+                        name,
                         found,
-                    });
+                    }
                 }
-            }
+            });
         }
         runtime.metrics.record_provider_loaded();
         tracing::info!(
@@ -793,6 +795,7 @@ impl BrokerWasmProvider {
             compile_ms,
             capabilities = manifest.capabilities.len(),
             command_words = manifest.command_words.len(),
+            command_export = command_export_name(&command_export),
             "loaded broker provider"
         );
         Ok(Self {
@@ -805,15 +808,55 @@ impl BrokerWasmProvider {
             exports,
             interface_truncated,
             manifest,
+            command_export,
         })
     }
 
-    /// Rewrites one command word's argv into a capability proposal, inside the guest.
+    /// Runs one command word's argv inside the guest and returns the JSON it produced.
     ///
-    /// Bounded exactly as `describe` is: import-free, timed out, and output-capped. The rewrite
-    /// runs *before* authorization, so a component that reaches for a host import here is refused
-    /// rather than trusted.
-    pub async fn resolve_command(&self, argv: &[String]) -> Result<String, BrokerHostError> {
+    /// Bounded exactly as `describe` is: import-free, timed out, input- and output-capped. The run
+    /// happens *before* authorization, so a component that reaches for a host import here is
+    /// refused rather than trusted. Which export is called was decided once at load from the
+    /// component's type: `run-command` receives `argv` and `stdin`; a legacy `resolve-command`
+    /// guest receives only `argv`, because its contract has no piped value — `stdin` is dropped for
+    /// it by contract, not lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerHostError::CommandInputTooLarge`] before instantiation when `argv` plus
+    /// `stdin` exceed the host's input bound, and any instantiation, trap, timeout, host-import, or
+    /// output-size failure from the run itself.
+    pub async fn run_command(
+        &self,
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Result<String, BrokerHostError> {
+        let length = command_input_bytes(argv, stdin);
+        if length > self.runtime.limits.max_input_bytes {
+            return Err(BrokerHostError::CommandInputTooLarge {
+                provider: self.manifest.id.clone(),
+                length,
+                maximum: self.runtime.limits.max_input_bytes,
+            });
+        }
+        let export_name = match &self.command_export {
+            CommandExport::RunCommand => RUN_COMMAND_EXPORT,
+            CommandExport::ResolveCommand => RESOLVE_COMMAND_EXPORT,
+            CommandExport::Absent => {
+                return Err(BrokerHostError::MissingCommandExport {
+                    provider: self.manifest.id.clone(),
+                    path: self.source.clone(),
+                });
+            }
+            CommandExport::Mismatched { name, found } => {
+                return Err(BrokerHostError::CommandExportSignature {
+                    provider: self.manifest.id.clone(),
+                    path: self.source.clone(),
+                    name,
+                    found: found.clone(),
+                });
+            }
+        };
         self.runtime.metrics.record_command_resolution();
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
@@ -822,6 +865,17 @@ impl BrokerWasmProvider {
             .runtime
             .store(http, storage::StorageState::disabled())?;
         let argv = argv.to_vec();
+        let stdin = stdin.map(str::to_owned);
+        let signature = |source: wasmtime::Error| BrokerHostError::CommandExportSignature {
+            provider: self.manifest.id.clone(),
+            path: self.source.clone(),
+            name: export_name,
+            found: source.to_string(),
+        };
+        let failed = |source: wasmtime::Error| BrokerHostError::RunCommand {
+            provider: self.manifest.id.clone(),
+            source,
+        };
         let operation = async {
             let instance = self
                 .pre
@@ -833,27 +887,36 @@ impl BrokerWasmProvider {
                     source,
                 })?;
             self.runtime.metrics.record_instantiation();
-            let function = instance
-                .get_typed_func::<(Vec<String>,), (String,)>(&mut store, RESOLVE_COMMAND_EXPORT)
-                .map_err(|source| BrokerHostError::ResolveCommandSignature {
-                    provider: self.manifest.id.clone(),
-                    path: self.source.clone(),
-                    found: source.to_string(),
-                })?;
-            let (output,) = function
-                .call_async(&mut store, (argv,))
-                .await
-                .map_err(|source| BrokerHostError::ResolveCommand {
-                    provider: self.manifest.id.clone(),
-                    source,
-                })?;
-            function
-                .post_return_async(&mut store)
-                .await
-                .map_err(|source| BrokerHostError::ResolveCommand {
-                    provider: self.manifest.id.clone(),
-                    source,
-                })?;
+            let output = if export_name == RUN_COMMAND_EXPORT {
+                let function = instance
+                    .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
+                        &mut store,
+                        RUN_COMMAND_EXPORT,
+                    )
+                    .map_err(signature)?;
+                let (output,) = function
+                    .call_async(&mut store, (argv, stdin))
+                    .await
+                    .map_err(failed)?;
+                function
+                    .post_return_async(&mut store)
+                    .await
+                    .map_err(failed)?;
+                output
+            } else {
+                let function = instance
+                    .get_typed_func::<(Vec<String>,), (String,)>(&mut store, RESOLVE_COMMAND_EXPORT)
+                    .map_err(signature)?;
+                let (output,) = function
+                    .call_async(&mut store, (argv,))
+                    .await
+                    .map_err(failed)?;
+                function
+                    .post_return_async(&mut store)
+                    .await
+                    .map_err(failed)?;
+                output
+            };
             Ok::<_, BrokerHostError>(output)
         };
         #[allow(
@@ -865,13 +928,13 @@ impl BrokerWasmProvider {
             timeout(operation_timeout, operation)
                 .await
                 .map_err(|_| BrokerHostError::Timeout {
-                    operation: format!("resolve-command {}", self.manifest.id),
+                    operation: format!("{export_name} {}", self.manifest.id),
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
         self.runtime.record_fuel(&mut store);
         let output = output??;
         if store.data().http.attempted() || store.data().storage.attempted() {
-            return Err(BrokerHostError::ResolveCommandUsedHostImport {
+            return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
             });
         }
@@ -1270,17 +1333,24 @@ impl BrokerProviderRegistry {
         words
     }
 
-    /// Rewrites one command word's argv through the provider that declared it.
+    /// Runs one command word's argv through the provider that declared it.
+    ///
+    /// The provider's `run-command` export receives `argv` and `stdin`; a legacy `resolve-command`
+    /// export receives `argv` alone, and its answer is adapted into the same
+    /// [`CommandRunOutcome`], so a caller handles one type whichever export the component has.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerHostError::UnknownCommandWord`] when no loaded provider declared it, and any
-    /// guest failure from the rewrite itself.
-    pub async fn resolve_command(
+    /// Returns [`BrokerHostError::UnknownCommandWord`] when no loaded provider declared it,
+    /// [`BrokerHostError::CommandInputTooLarge`] when `argv` plus `stdin` exceed the input bound,
+    /// [`BrokerHostError::InvalidCommandRun`] when the guest's answer is not its wire type, and any
+    /// guest failure from the run itself.
+    pub async fn run_command(
         &self,
         word: &str,
         argv: &[String],
-    ) -> Result<CommandResolution, BrokerHostError> {
+        stdin: Option<&str>,
+    ) -> Result<CommandRunOutcome, BrokerHostError> {
         let provider = self
             .providers
             .iter()
@@ -1297,18 +1367,19 @@ impl BrokerProviderRegistry {
         // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
         // a daemon that never sees the raw string cannot accidentally forward it to a caller.
         //
-        // `argv` is deliberately not a span field for the same reason the invoke span omits input:
-        // it is model-authored text.
+        // `argv` and `stdin` are deliberately not span fields for the same reason the invoke span
+        // omits input: they are model-authored text.
         let json = provider
-            .resolve_command(argv)
+            .run_command(argv, stdin)
             .instrument(tracing::info_span!(
-                "provider.resolve_command",
+                "provider.run_command",
                 provider = %provider.manifest.id,
                 word,
+                command.export = command_export_name(&provider.command_export),
             ))
             .await?;
-        serde_json::from_str::<CommandResolution>(&json).map_err(|source| {
-            BrokerHostError::InvalidCommandResolution {
+        parse_command_run(&provider.command_export, &json).map_err(|source| {
+            BrokerHostError::InvalidCommandRun {
                 provider: provider.manifest.id.clone(),
                 source,
             }
@@ -1523,6 +1594,18 @@ impl BrokerProviderRegistry {
                 span
             })
             .await
+    }
+}
+
+/// The export name a load line and a run span report for one component.
+///
+/// A mismatched export is reported as `none` here: nothing callable exists under it, and a manifest
+/// declaring words never loads with one, so the line only ever says it for a wordless component.
+const fn command_export_name(export: &CommandExport) -> &'static str {
+    match export {
+        CommandExport::RunCommand => RUN_COMMAND_EXPORT,
+        CommandExport::ResolveCommand => RESOLVE_COMMAND_EXPORT,
+        CommandExport::Absent | CommandExport::Mismatched { .. } => "none",
     }
 }
 
@@ -1879,9 +1962,9 @@ pub enum BrokerHostError {
         /// Every conflict found, boxed to keep this enum small.
         report: Box<ProviderConflicts>,
     },
-    /// A provider returned something that is not a command resolution.
-    #[error("provider {provider} returned an unreadable command resolution")]
-    InvalidCommandResolution {
+    /// A provider returned something that is not a command run outcome.
+    #[error("provider {provider} returned an unreadable command run outcome")]
+    InvalidCommandRun {
         /// Provider identity.
         provider: ProviderId,
         /// Decode failure.
@@ -1894,50 +1977,62 @@ pub enum BrokerHostError {
         /// The unclaimed word.
         word: String,
     },
-    /// Provider declared command words but exports no way to rewrite them.
+    /// Provider declared command words but exports no way to run them.
     #[error(
-        "provider {provider} declares command words but component {} exports no resolve-command; \
-         rebuild it against the dekopon:provider/provider-commands world",
+        "provider {provider} declares command words but component {} exports neither run-command \
+         nor resolve-command; rebuild it against the dekopon:provider/provider-cli world",
         path.display()
     )]
-    MissingResolveCommand {
+    MissingCommandExport {
         /// Provider identity.
         provider: ProviderId,
         /// Component path.
         path: PathBuf,
     },
-    /// Provider exports `resolve-command` as something the host cannot call.
+    /// Provider exports a command export as something the host cannot call.
     #[error(
-        "provider {provider} exports resolve-command from component {} as {found}, not \
-         func(argv: list<string>) -> string",
+        "provider {provider} exports {name} from component {} as {found}, not the function the \
+         dekopon:provider package declares",
         path.display()
     )]
-    ResolveCommandSignature {
+    CommandExportSignature {
         /// Provider identity.
         provider: ProviderId,
         /// Component path.
         path: PathBuf,
+        /// Which export name was found.
+        name: &'static str,
         /// Bounded description of what the component actually exports.
         found: String,
     },
-    /// Rewriting a command word failed inside the guest.
-    #[error("provider {provider} failed while rewriting a command word")]
-    ResolveCommand {
+    /// A command word's argv plus its piped value exceeded the host input bound.
+    #[error("command input for provider {provider} is {length} bytes; broker maximum is {maximum}")]
+    CommandInputTooLarge {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Actual bytes: every argv word plus the piped value.
+        length: usize,
+        /// Maximum bytes.
+        maximum: usize,
+    },
+    /// Running a command word failed inside the guest.
+    #[error("provider {provider} failed while running a command word")]
+    RunCommand {
         /// Provider identity.
         provider: ProviderId,
         /// Underlying trap or error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Provider attempted a host call while rewriting a command word.
+    /// Provider attempted a host call while running a command word.
     ///
-    /// The rewrite runs before authorization, so a component reaching for host authority there is
+    /// The run happens before authorization, so a component reaching for host authority there is
     /// refused rather than trusted.
     #[error(
-        "provider component {} attempted a host import during resolve-command",
+        "provider component {} attempted a host import during a command run",
         path.display()
     )]
-    ResolveCommandUsedHostImport {
+    RunCommandUsedHostImport {
         /// Component path.
         path: PathBuf,
     },

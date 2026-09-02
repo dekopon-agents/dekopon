@@ -362,7 +362,7 @@ that a key and a canonical subject never share a record.
 | Span | Crate | Fields |
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
-| `provider.resolve_command` | `dekopon-broker-host` | provider, `word` |
+| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`) |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
@@ -389,12 +389,16 @@ thread.
 `dekopon-brokerd provider sync` and `verify` commands reuse that same host validation and can emit the
 span to their stderr subscriber, but they install no OTLP exporter; normal command output remains on
 stdout. Its fields attribute time to one component, and each loaded provider also emits one info
-event carrying its identity, artifact digest prefix, artifact bytes, and compile milliseconds.
+event carrying its identity, artifact digest prefix, artifact bytes, compile milliseconds, its
+capability and command-word counts, and `command_export` — `run-command`, `resolve-command`, or
+`none` — naming which export the host will call for its words.
 Since components compile concurrently, their spans overlap; the compile times sum to more than the
 wall-clock validation.
 
-`provider.resolve_command` carries the provider and the command word, never the argv. Model-authored
-argv is untrusted content for the same reason `provider.invoke` omits `input`.
+`provider.run_command` carries the provider, the command word, and the export name that served
+it, never the argv or the value piped into the word. Model-authored argv and piped text are
+untrusted content for the same reason `provider.invoke` omits `input`; the help page or usage error
+a `run-command` guest renders travels back in the result, not in telemetry.
 
 A `policy-denied` outcome the policy engine never actually evaluated additionally emits
 `audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The
@@ -701,7 +705,8 @@ One generated OpenTelemetry trace links the command to spans such as:
   (`adopted`, `rotated`, `rotated-unsaved`, or `failed`), `duration_ms`, and the new
   `credential.expires_at`, and never any token material;
 - `prompt.script`, `shell.script`, and `shell.command`; and
-- `provider.compile`, `provider.describe`, and `provider.invoke`.
+- `provider.compile`, `provider.describe`, and `provider.invoke`; and
+- `provider.run_command` at `DEBUG`.
 
 `process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
 private stable `node.id`, root parent, fixed `process.kind`, the `process.interruptibility`
@@ -722,6 +727,16 @@ only; the payloads themselves are governed by the span-payload opt-in below. A c
 than returning also emits a `WARN` naming which wall it hit — the wall-clock deadline, the output
 ceiling and its configured bound, or a trap inside the component — because the runner's shell seam
 flattens errors to their message and would otherwise leave nothing in telemetry saying why.
+
+The runner's `provider.run_command` — again `dekopon-provider-host` — is one span per provider
+command-word run and carries `provider.id`, `provider.path`, `command.export` (`run-command`, or
+the legacy `resolve-command`), `input.bytes` (argv plus the piped value), `output.bytes`, and
+`fuel.remaining`; never the argv, the piped value, or the text the guest rendered. It is `DEBUG`
+rather than `INFO` because a command run is not budget-bounded the way a capability call is, so
+the span that runs the word carries the outcome once instead. A run that dies emits the same
+`WARN` naming the wall it hit as `provider.invoke` does, and an argv-plus-stdin beyond
+`max_input_bytes` is refused before a store exists. Nothing on the `dekopon-run` command line
+reaches this span yet; its shell invoker gains provider command words in a later change.
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation.
 

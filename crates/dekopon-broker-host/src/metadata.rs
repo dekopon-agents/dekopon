@@ -1,23 +1,20 @@
 use std::{fmt::Write as _, path::PathBuf};
 
+use dekopon_provider_sdk::host::{bounded_signature, function_signature, item_kind};
 use sha2::{Digest as _, Sha256};
 use wasmtime::Engine;
-use wasmtime::component::types::{ComponentFunc, ComponentItem};
-use wasmtime::component::{Component, Type};
+use wasmtime::component::Component;
+use wasmtime::component::types::ComponentItem;
 
 use crate::ProviderManifest;
-
-/// Optional export a provider component uses to rewrite one command word's argv.
-pub(crate) const RESOLVE_COMMAND_EXPORT: &str = "resolve-command";
 
 /// Maximum component type entries retained for one provider's informational view.
 ///
 /// Provider metadata is owner-supplied but still must not make an unauthenticated status page grow
 /// without bound. The manifest and the component itself remain authoritative when this summary is
-/// truncated.
+/// truncated. Each rendered signature is bounded by the SDK's shared signature limit.
 const MAX_INTERFACE_ITEMS: usize = 1_024;
 const MAX_INTERFACE_DEPTH: usize = 8;
-const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 
 /// Metadata retained for one component that was actually compiled into the broker registry.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,55 +68,6 @@ pub(crate) fn identify_bytes(bytes: &[u8]) -> ArtifactIdentity {
         bytes: bytes.len() as u64,
         sha256,
     }
-}
-
-/// What a compiled component offers under the optional `resolve-command` export name.
-///
-/// Absent and wrong-typed are different operator problems with different fixes, and neither is
-/// worth an instantiation to discover: the component's own type answers both.
-pub(crate) enum ResolveCommandExport {
-    /// Exported as `func(argv: list<string>) -> string`, which is what the host calls.
-    Present,
-    /// Not exported: the component was built against the base `dekopon:provider` world.
-    Absent,
-    /// Exported under that name as something the host cannot call.
-    Mismatched {
-        /// Bounded description of what the component actually exports.
-        found: String,
-    },
-}
-
-pub(crate) fn resolve_command_export(
-    engine: &Engine,
-    component: &Component,
-) -> ResolveCommandExport {
-    let component_type = component.component_type();
-    let Some((_, item)) = component_type
-        .exports(engine)
-        .find(|(name, _)| *name == RESOLVE_COMMAND_EXPORT)
-    else {
-        return ResolveCommandExport::Absent;
-    };
-    let ComponentItem::ComponentFunc(function) = item else {
-        return ResolveCommandExport::Mismatched {
-            found: item_kind(&item).to_owned(),
-        };
-    };
-    if resolves_commands(&function) {
-        ResolveCommandExport::Present
-    } else {
-        ResolveCommandExport::Mismatched {
-            found: component_function_signature(&function),
-        }
-    }
-}
-
-fn resolves_commands(function: &ComponentFunc) -> bool {
-    let mut params = function.params();
-    let argv_is_strings = params.len() == 1
-        && matches!(params.next(), Some((_, Type::List(list))) if list.ty() == Type::String);
-    let mut results = function.results();
-    argv_is_strings && results.len() == 1 && results.next() == Some(Type::String)
 }
 
 pub(crate) fn component_interface(
@@ -213,21 +161,9 @@ fn summarize(
     })
 }
 
-const fn item_kind(item: &ComponentItem) -> &'static str {
-    match item {
-        ComponentItem::ComponentFunc(_) => "function",
-        ComponentItem::CoreFunc(_) => "core-function",
-        ComponentItem::Module(_) => "module",
-        ComponentItem::Component(_) => "component",
-        ComponentItem::ComponentInstance(_) => "instance",
-        ComponentItem::Type(_) => "type",
-        ComponentItem::Resource(_) => "resource",
-    }
-}
-
 fn item_signature(item: &ComponentItem) -> Option<String> {
     match item {
-        ComponentItem::ComponentFunc(function) => Some(component_function_signature(function)),
+        ComponentItem::ComponentFunc(function) => Some(function_signature(function)),
         ComponentItem::CoreFunc(function) => Some(bounded_debug(function)),
         ComponentItem::Type(value) => Some(bounded_debug(value)),
         ComponentItem::Resource(value) => Some(bounded_debug(value)),
@@ -237,33 +173,6 @@ fn item_signature(item: &ComponentItem) -> Option<String> {
     }
 }
 
-fn component_function_signature(function: &ComponentFunc) -> String {
-    let params = function
-        .params()
-        .map(|(name, value)| format!("{name}: {value:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let results = function
-        .results()
-        .map(|value| format!("{value:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    bounded(format!("fn({params}) -> ({results})"))
-}
-
 fn bounded_debug(value: &impl std::fmt::Debug) -> String {
-    bounded(format!("{value:?}"))
-}
-
-fn bounded(mut value: String) -> String {
-    if value.len() <= MAX_SIGNATURE_BYTES {
-        return value;
-    }
-    let mut end = MAX_SIGNATURE_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-    value.push('…');
-    value
+    bounded_signature(format!("{value:?}"))
 }

@@ -1,7 +1,10 @@
 //! Rust guest interface for Dekopon provider components.
 //!
 //! Provider authors implement [`Provider`] using ordinary domain types. [`export_provider!`]
-//! supplies the JSON-over-WIT adapter required by `dekopon-provider-host`.
+//! supplies the JSON-over-WIT adapter required by `dekopon-provider-host`. A provider that
+//! contributes command words to the sandboxed shell implements [`Provider::run_command`] and
+//! exports through [`export_provider_with_cli!`], so `gh --help` renders a page and `gh pr view 7`
+//! proposes a capability.
 //!
 //! The optional `host` feature adds [`host`], the Wasmtime plumbing both Dekopon hosts share. It is
 //! off by default and no guest build enables it.
@@ -43,10 +46,12 @@ pub struct ProviderManifest {
     pub capabilities: Vec<ProviderCapability>,
     /// Command words this provider contributes to the sandboxed shell.
     ///
-    /// Each is a bare word a model may type, resolved through [`Provider::resolve_command`]. A
-    /// manifest that declares one without the component exporting `resolve-command` is refused at
-    /// load, and a word colliding with a shell builtin, a refused word, a control word, or another
-    /// provider's is a startup failure naming every conflict at once.
+    /// Each is a bare word a model may type, run through [`Provider::run_command`] (or the
+    /// legacy [`Provider::resolve_command`] on a component exporting only `resolve-command`). A
+    /// manifest that declares one without the component exporting `run-command` or
+    /// `resolve-command` is refused at load, and a word colliding with a shell builtin, a refused
+    /// word, a control word, or another provider's is a startup failure naming every conflict at
+    /// once.
     ///
     /// Defaulted so a component built against `dekopon:provider@0.1.0` still loads, contributing
     /// none.
@@ -105,6 +110,24 @@ pub trait Provider {
             "this provider declares no command words",
         ))
     }
+
+    /// Runs one command word's argv the way the upstream command-line tool would.
+    ///
+    /// Where [`Provider::resolve_command`] can only rewrite or decline, this can also *render*:
+    /// `--help`, `--version`, and usage errors come back as [`CommandRun::Rendered`] text with an
+    /// exit status, printed by the shell and authorizing nothing. A [`CommandRun::Proposal`] is
+    /// the rewrite and travels the same authorization path as before. A decline is
+    /// `Err(ProviderError)`, reported to the model as a usage error.
+    ///
+    /// `stdin` is the value piped into the word, `None` when nothing was piped. The same rules as
+    /// the rewrite apply: pure, before authorization, no host imports.
+    ///
+    /// The default delegates to [`Provider::resolve_command`], which is what a provider written
+    /// against the legacy export gets when it moves to [`export_provider_with_cli!`] without
+    /// changing anything else. That contract has no stdin, so the default never forwards it.
+    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
+        Self::resolve_command(argv).map(CommandRun::Proposal)
+    }
 }
 
 /// One capability proposal produced by [`Provider::resolve_command`].
@@ -114,6 +137,56 @@ pub struct CommandInvocation {
     pub capability: CapabilityId,
     /// The input object assembled from the arguments.
     pub input: Value,
+}
+
+/// What one command-word run produced, from [`Provider::run_command`].
+///
+/// Only the proposal reaches authorization. Rendered text is shown to the model exactly as a
+/// command-line program's output would be — help on stdout at status 0, a usage error on stderr
+/// at status 2 — and grants nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandRun {
+    /// The argv maps to one capability proposal, authorized as any other.
+    Proposal(CommandInvocation),
+    /// The argv was answered by the guest alone, as a command-line program prints and exits.
+    Rendered {
+        /// Text for the shell's standard output; capturable by `$( )`.
+        stdout: String,
+        /// Text for the shell's standard error; visible to the model, never captured.
+        stderr: String,
+        /// Exit status the shell reports for the word.
+        status: u8,
+    },
+}
+
+impl CommandRun {
+    /// A capability proposal for `capability` with `input` assembled from the arguments.
+    #[must_use]
+    pub fn proposal(capability: CapabilityId, input: Value) -> Self {
+        Self::Proposal(CommandInvocation { capability, input })
+    }
+
+    /// Text on standard output with an exit status and nothing on standard error: a help page,
+    /// a version line.
+    #[must_use]
+    pub fn rendered(stdout: impl Into<String>, status: u8) -> Self {
+        Self::Rendered {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            status,
+        }
+    }
+
+    /// Text on standard error with an exit status and nothing on standard output: a usage error,
+    /// an unknown subcommand.
+    #[must_use]
+    pub fn rendered_error(stderr: impl Into<String>, status: u8) -> Self {
+        Self::Rendered {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            status,
+        }
+    }
 }
 
 /// Provider-declared invocation failure.
@@ -198,6 +271,47 @@ pub enum CommandResolution {
     },
 }
 
+/// JSON result of a command-word run, returned across the `run-command` WIT boundary.
+///
+/// The superset of [`CommandResolution`]: a legacy `resolve-command` answer converts into it
+/// losslessly, so a host handles one type whichever export the component has.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CommandRunOutcome {
+    /// The argv maps to one capability proposal.
+    Proposed {
+        /// Capability the command word named.
+        capability: CapabilityId,
+        /// Input object assembled from the arguments.
+        input: Value,
+    },
+    /// The guest answered by itself, as a command-line program prints and exits.
+    Rendered {
+        /// Text for the shell's standard output.
+        stdout: String,
+        /// Text for the shell's standard error.
+        stderr: String,
+        /// Exit status the shell reports for the word.
+        status: u8,
+    },
+    /// The provider declined this argv.
+    Failed {
+        /// Stable failure detail, reported to the model as a usage error.
+        error: ComponentFailure,
+    },
+}
+
+impl From<CommandResolution> for CommandRunOutcome {
+    fn from(resolution: CommandResolution) -> Self {
+        match resolution {
+            CommandResolution::Resolved { capability, input } => {
+                Self::Proposed { capability, input }
+            }
+            CommandResolution::Failed { error } => Self::Failed { error },
+        }
+    }
+}
+
 #[doc(hidden)]
 pub mod __wit {
     wit_bindgen::generate!({
@@ -218,6 +332,12 @@ const INVOKE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"cod
 /// Hand-written for the same reason as [`INVOKE_SERIALIZATION_FALLBACK`], and pinned by the same
 /// test.
 const RESOLVE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command resolution could not be serialized"}}"#;
+
+/// Last-resort [`CommandRunOutcome`] when the real one cannot be serialized.
+///
+/// Hand-written for the same reason as [`INVOKE_SERIALIZATION_FALLBACK`], and pinned by the same
+/// test.
+const RUN_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command run could not be serialized"}}"#;
 
 /// Manifest returned when `P::manifest()` cannot be serialized.
 ///
@@ -289,6 +409,33 @@ pub fn __resolve_command<P: Provider>(argv: Vec<String>) -> String {
 
     serde_json::to_string(&resolution)
         .unwrap_or_else(|_error| RESOLVE_SERIALIZATION_FALLBACK.to_owned())
+}
+
+#[doc(hidden)]
+pub fn __run_command<P: Provider>(argv: Vec<String>, stdin: Option<String>) -> String {
+    let outcome = match P::run_command(&argv, stdin.as_deref()) {
+        Ok(CommandRun::Proposal(invocation)) => CommandRunOutcome::Proposed {
+            capability: invocation.capability,
+            input: invocation.input,
+        },
+        Ok(CommandRun::Rendered {
+            stdout,
+            stderr,
+            status,
+        }) => CommandRunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        },
+        Err(error) => CommandRunOutcome::Failed {
+            error: ComponentFailure {
+                code: error.code,
+                message: error.message,
+            },
+        },
+    };
+
+    serde_json::to_string(&outcome).unwrap_or_else(|_error| RUN_SERIALIZATION_FALLBACK.to_owned())
 }
 
 /// Exports a Rust [`Provider`] implementation as the import-free Dekopon WIT world.
@@ -383,15 +530,55 @@ macro_rules! export_provider_with_commands {
     };
 }
 
+/// Exports a [`Provider`] whose command words behave like a command-line program, through
+/// caller-generated bindings.
+///
+/// The bindings module must describe a world including `dekopon:provider/provider-cli`, so it
+/// exports `run-command` alongside `describe` and `invoke`. Use this when the provider declares
+/// `commandWords` and implements [`Provider::run_command`] — or keeps the default, which routes to
+/// [`Provider::resolve_command`]. [`export_provider_with_commands!`] remains for the legacy
+/// `provider-commands` world.
+#[macro_export]
+macro_rules! export_provider_with_cli {
+    ($provider:ty, $bindings:ident) => {
+        struct __DekoponProviderComponent;
+
+        impl $bindings::Guest for __DekoponProviderComponent {
+            fn describe() -> ::std::string::String {
+                $crate::__describe::<$provider>()
+            }
+
+            fn invoke(
+                capability: ::std::string::String,
+                input_json: ::std::string::String,
+            ) -> ::std::string::String {
+                $crate::__invoke::<$provider>(capability, input_json)
+            }
+
+            fn run_command(
+                argv: ::std::vec::Vec<::std::string::String>,
+                stdin: ::std::option::Option<::std::string::String>,
+            ) -> ::std::string::String {
+                $crate::__run_command::<$provider>(argv, stdin)
+            }
+        }
+
+        $bindings::export!(
+            __DekoponProviderComponent with_types_in $bindings
+        );
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        __describe, __invoke, CapabilityId, CommandResolution, ComponentFailure, ComponentResponse,
-        EffectKind, INVOKE_SERIALIZATION_FALLBACK, Idempotency, Provider, ProviderApiVersion,
+        __describe, __invoke, __run_command, CapabilityId, CommandInvocation, CommandResolution,
+        CommandRun, CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind,
+        INVOKE_SERIALIZATION_FALLBACK, Idempotency, Provider, ProviderApiVersion,
         ProviderCapability, ProviderError, ProviderManifest, RESOLVE_SERIALIZATION_FALLBACK,
-        RiskLevel, describe_fallback,
+        RUN_SERIALIZATION_FALLBACK, RiskLevel, describe_fallback,
     };
 
     struct Echo;
@@ -424,6 +611,59 @@ mod tests {
                 Err(ProviderError::new("unsupported", capability.to_string()))
             }
         }
+
+        fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
+            match argv {
+                [word] if word == "say" => Ok(CommandInvocation {
+                    capability: "echo.echo".parse().expect("valid capability fixture"),
+                    input: json!({}),
+                }),
+                _ => Err(ProviderError::new("usage", "echo say")),
+            }
+        }
+    }
+
+    /// A hand-rolled command-line provider: shifts values out of argv, no argument parser.
+    struct Cli;
+
+    impl Provider for Cli {
+        fn manifest() -> ProviderManifest {
+            Echo::manifest()
+        }
+
+        fn invoke(
+            capability: &CapabilityId,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            Echo::invoke(capability, input)
+        }
+
+        fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
+            match argv {
+                [flag] if flag == "--help" => Ok(CommandRun::rendered("Usage: echo say [-]\n", 0)),
+                [word, dash] if word == "say" && dash == "-" => match stdin {
+                    Some(text) => Ok(CommandRun::proposal(
+                        "echo.echo".parse().expect("valid capability fixture"),
+                        json!({"message": text}),
+                    )),
+                    None => Ok(CommandRun::rendered_error(
+                        "echo: `-` needs piped input\n",
+                        2,
+                    )),
+                },
+                [word] if word == "say" => Ok(CommandRun::proposal(
+                    "echo.echo".parse().expect("valid capability fixture"),
+                    json!({}),
+                )),
+                _ => Err(ProviderError::new("usage", "echo say [-]")),
+            }
+        }
+    }
+
+    fn run<P: Provider>(argv: &[&str], stdin: Option<&str>) -> CommandRunOutcome {
+        let argv = argv.iter().map(|word| (*word).to_owned()).collect();
+        serde_json::from_str(&__run_command::<P>(argv, stdin.map(str::to_owned)))
+            .expect("command run parses")
     }
 
     #[test]
@@ -456,6 +696,105 @@ mod tests {
                 .expect("response parses");
 
         assert!(matches!(response, ComponentResponse::Failed { .. }));
+    }
+
+    /// A provider that only ever implemented the legacy rewrite gets the new export for free.
+    #[test]
+    fn the_default_run_command_delegates_to_the_legacy_rewrite() {
+        assert_eq!(
+            run::<Echo>(&["say"], Some("ignored by contract")),
+            CommandRunOutcome::Proposed {
+                capability: "echo.echo".parse().expect("valid capability fixture"),
+                input: json!({}),
+            }
+        );
+        assert_eq!(
+            run::<Echo>(&["bogus"], None),
+            CommandRunOutcome::Failed {
+                error: ComponentFailure {
+                    code: "usage".to_owned(),
+                    message: "echo say".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn the_run_adapter_encodes_each_outcome_a_hand_rolled_provider_returns() {
+        assert_eq!(
+            run::<Cli>(&["--help"], None),
+            CommandRunOutcome::Rendered {
+                stdout: "Usage: echo say [-]\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }
+        );
+        assert_eq!(
+            run::<Cli>(&["say", "-"], None),
+            CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: "echo: `-` needs piped input\n".to_owned(),
+                status: 2,
+            }
+        );
+        assert_eq!(
+            run::<Cli>(&["say", "-"], Some("hello")),
+            CommandRunOutcome::Proposed {
+                capability: "echo.echo".parse().expect("valid capability fixture"),
+                input: json!({"message": "hello"}),
+            }
+        );
+        assert_eq!(
+            run::<Cli>(&["bogus"], None),
+            CommandRunOutcome::Failed {
+                error: ComponentFailure {
+                    code: "usage".to_owned(),
+                    message: "echo say [-]".to_owned(),
+                },
+            }
+        );
+    }
+
+    /// The wire tags are the host's contract; pin them so a rename shows up here, not in a host.
+    #[test]
+    fn run_outcomes_serialize_under_their_documented_tags() {
+        let encoded = __run_command::<Cli>(vec!["--help".to_owned()], None);
+        assert!(
+            encoded.starts_with(r#"{"outcome":"rendered","#),
+            "{encoded}"
+        );
+        let encoded = __run_command::<Cli>(vec!["say".to_owned()], None);
+        assert!(
+            encoded.starts_with(r#"{"outcome":"proposed","#),
+            "{encoded}"
+        );
+        let encoded = __run_command::<Cli>(vec!["bogus".to_owned()], None);
+        assert!(encoded.starts_with(r#"{"outcome":"failed","#), "{encoded}");
+    }
+
+    #[test]
+    fn a_legacy_resolution_converts_losslessly_into_a_run_outcome() {
+        let capability: CapabilityId = "echo.echo".parse().expect("valid capability fixture");
+        assert_eq!(
+            CommandRunOutcome::from(CommandResolution::Resolved {
+                capability: capability.clone(),
+                input: json!({"last": 5}),
+            }),
+            CommandRunOutcome::Proposed {
+                capability,
+                input: json!({"last": 5}),
+            }
+        );
+        let error = ComponentFailure {
+            code: "usage".to_owned(),
+            message: "memory recent --last N".to_owned(),
+        };
+        assert_eq!(
+            CommandRunOutcome::from(CommandResolution::Failed {
+                error: error.clone()
+            }),
+            CommandRunOutcome::Failed { error }
+        );
     }
 
     /// The manifest fallback must name why it exists.
@@ -510,6 +849,18 @@ mod tests {
                 error: ComponentFailure {
                     code: "serialization-failed".to_owned(),
                     message: "command resolution could not be serialized".to_owned(),
+                },
+            }
+        );
+
+        let run = serde_json::from_str::<CommandRunOutcome>(RUN_SERIALIZATION_FALLBACK)
+            .expect("run fallback decodes as a command run outcome");
+        assert_eq!(
+            run,
+            CommandRunOutcome::Failed {
+                error: ComponentFailure {
+                    code: "serialization-failed".to_owned(),
+                    message: "command run could not be serialized".to_owned(),
                 },
             }
         );

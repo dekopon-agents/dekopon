@@ -37,7 +37,8 @@ pub struct BrokerHostStats {
     pub compilation_micros: u64,
     /// Provider manifest calls completed at startup.
     pub provider_descriptions: u64,
-    /// Command-line rewrite calls dispatched to components.
+    /// Command-word runs dispatched to components, through either `run-command` or the legacy
+    /// `resolve-command` export.
     pub command_resolutions: u64,
     /// Fresh Wasmtime stores created.
     pub stores_created: u64,
