@@ -377,12 +377,13 @@ impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
         self.inner.has_command_word(word)
     }
 
-    fn resolve_command(
+    fn run_command(
         &self,
         word: &str,
         argv: &[String],
-    ) -> Option<Result<(String, serde_json::Value), String>> {
-        self.inner.resolve_command(word, argv)
+        stdin: Option<&str>,
+    ) -> Option<dekopon_shell::CommandRun> {
+        self.inner.run_command(word, argv, stdin)
     }
 
     fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {

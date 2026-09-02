@@ -87,6 +87,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- `dekopon-shell`'s `CapabilityInvoker::run_command` replaces `resolve_command`: it receives the
+  piped value rendered as text (strings verbatim, other values as compact JSON) and answers with a
+  `CommandRun` — a capability proposal authorized and charged like a direct call, text the provider
+  rendered itself (help, a version, a usage error) written to the shell's stdout and diagnostic
+  streams at the provider's own exit status and charging no capability call, or a decline
+  reported as a usage error at exit `2`. The scripting tool's description now tells the model to
+  run `<word> --help` for a provider command word's subcommands and flags. `dekopon-agent`,
+  `dekopond`, and `dekopon-run` forward the new method; the broker round trip still speaks
+  `resolveCommand` and sends no stdin until the `runCommand` operation lands.
 - The scripting tool's description now tells the model when to reach for the tool and to write a
   job as one script; the exact JSON a `--kebab-case` flag becomes (a value reading as a number,
   `true`, `false`, or `null` is sent typed, anything else as a string, a bare flag as `true`);

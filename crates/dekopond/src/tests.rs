@@ -334,7 +334,7 @@ fn a_secret_use_proposal_reaches_the_broker_leg_through_the_cancellation_boundar
 /// argument was, one method over, and nothing else in this crate pins it.
 #[test]
 fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answering_them() {
-    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun};
 
     /// Every answer here is one the trait default cannot give for this `granted` list.
     struct CommandLeg;
@@ -360,6 +360,19 @@ fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answerin
             word == "gh"
         }
 
+        fn run_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            Some(CommandRun::Rendered {
+                stdout: format!("{word} {}\n", argv.join(" ")),
+                stderr: stdin.unwrap_or_default().to_owned(),
+                status: 3,
+            })
+        }
+
         fn invoke(
             &self,
             _capability: &str,
@@ -377,6 +390,15 @@ fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answerin
 
     assert_eq!(invoker.command_words(), vec!["gh".to_owned()]);
     assert!(invoker.has_command_word("gh"));
+    // Defaults to `None`, which dispatch reports as "command not found".
+    assert_eq!(
+        invoker.run_command("gh", &["--help".to_owned()], Some("piped")),
+        Some(CommandRun::Rendered {
+            stdout: "gh --help\n".to_owned(),
+            stderr: "piped".to_owned(),
+            status: 3,
+        })
+    );
     // Absent from `granted`, so the default scan would refuse both.
     assert!(invoker.is_granted("gh.pr-view"));
     assert!(invoker.grants_namespace("gh"));

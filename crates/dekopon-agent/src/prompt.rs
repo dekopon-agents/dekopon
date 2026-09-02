@@ -1018,7 +1018,7 @@ fn script_tool(command_words: &[String]) -> ModelTool {
         words.sort();
         words.dedup();
         description.push_str(&format!(
-            "\n\nThis session's providers add these command words: {}. Each takes its own arguments; `cap --describe` does not cover them.",
+            "\n\nThis session's providers add these command words: {}. Each behaves like its own command-line program: run `<word> --help` to see its subcommands and flags; `cap --describe` does not cover them.",
             words.join(", ")
         ));
     }
@@ -2850,6 +2850,13 @@ mod tests {
         let tool = script_tool(&["gh".to_owned(), "fly".to_owned(), "gh".to_owned()]);
         assert!(
             tool.description.contains("command words: fly, gh."),
+            "{}",
+            tool.description
+        );
+        // A provider word is a program of its own, and its help page is the only place its
+        // subcommands and flags are described; the model has to be told where to look.
+        assert!(
+            tool.description.contains("run `<word> --help`"),
             "{}",
             tool.description
         );

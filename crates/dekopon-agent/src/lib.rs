@@ -45,7 +45,8 @@ use dekopon_core::{CapabilityId, IdentifierError, InvocationId, TraceId};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, Interpreter, Limits as ShellLimits, ScriptOutcome,
+    CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits as ShellLimits,
+    ScriptOutcome,
 };
 use serde_json::Value;
 #[cfg(unix)]
@@ -185,17 +186,13 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         words
     }
 
-    fn resolve_command(
-        &self,
-        word: &str,
-        argv: &[String],
-    ) -> Option<Result<(String, Value), String>> {
-        // Same precedence as `invoke`: whichever leg owns the word rewrites it. A word both legs
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        // Same precedence as `invoke`: whichever leg owns the word runs it. A word both legs
         // claim cannot happen — the broker refuses to start on a duplicate, and direct mode loads
         // its own registry through the same check.
         self.direct
-            .resolve_command(word, argv)
-            .or_else(|| self.broker.as_ref()?.resolve_command(word, argv))
+            .run_command(word, argv, stdin)
+            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
     }
 }
 
@@ -442,27 +439,31 @@ impl CapabilityInvoker for BrokerLeg {
         self.namespaces.contains(namespace)
     }
 
-    fn resolve_command(
-        &self,
-        word: &str,
-        argv: &[String],
-    ) -> Option<Result<(String, Value), String>> {
+    fn run_command(&self, word: &str, argv: &[String], _stdin: Option<&str>) -> Option<CommandRun> {
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
         if !self.command_words.contains(word) {
             return None;
         }
+        // The wire still speaks `resolveCommand`, which carries no stdin and can only rewrite or
+        // decline; the `runCommand` operation of a later commit carries the piped text and lets a
+        // provider render its own help. Until then the piped text stops here, unsent.
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
         let resolved = self.runtime.block_on(async {
             self.client
                 .resolve_command(self.attestation.clone(), word.to_owned(), argv.to_vec())
                 .await
         });
-        match resolved {
-            Ok(Ok((capability, input))) => Some(Ok((capability.to_string(), input))),
-            Ok(Err(message)) => Some(Err(message)),
-            Err(error) => Some(Err(format!("{word}: {error}"))),
-        }
+        Some(match resolved {
+            Ok(Ok((capability, input))) => CommandRun::Proposed {
+                capability: capability.to_string(),
+                input,
+            },
+            Ok(Err(message)) => CommandRun::Failed { message },
+            Err(error) => CommandRun::Failed {
+                message: format!("{word}: {error}"),
+            },
+        })
     }
 
     fn invoke(

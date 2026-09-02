@@ -854,6 +854,12 @@ impl ScriptRuntime for ReplayRuntime<'_> {
             }
         }
     }
+
+    // The tool description is part of the prompt the replayed model is shown, so it has to name
+    // the words the live runtime would run; with no live runtime there are none to offer.
+    fn command_words(&self) -> Vec<String> {
+        self.live.map_or_else(Vec::new, |live| live.command_words())
+    }
 }
 
 impl CancellationProbe for ReplayRuntime<'_> {

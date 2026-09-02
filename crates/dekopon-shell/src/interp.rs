@@ -21,7 +21,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CapabilityInvoker, ExitCode, ScriptOutcome,
+    CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
         Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
@@ -395,6 +395,48 @@ impl Evaluator<'_> {
             }
             CommandFailure::Fatal(fatal) => Err(fatal),
         }
+    }
+
+    /// Routes text a provider command word rendered itself onto the shell's two streams.
+    ///
+    /// No capability call is charged: the provider printed help, a version, or a usage error and
+    /// invoked nothing. The bytes are charged against the value ceiling first, so a provider that
+    /// renders a page the size of the ceiling trips the same limit a script materializing it
+    /// would, and both streams then obey the output ceilings like any other write.
+    ///
+    /// Both texts arrive as the provider wrote them, which for `clap` means newline-terminated.
+    /// Values here are not newline-terminated — emitting one is what adds the line ending — so
+    /// one trailing newline is folded into the value model: `h=$(word --help)` holds the page the
+    /// way `h=$(cat <<EOF ...)` would, and printing it adds the newline back exactly once. Text
+    /// with no trailing newline is emitted as a fragment, the way `printf '%s'` is.
+    fn emit_rendered(
+        &mut self,
+        stdout: String,
+        stderr: String,
+        status: u8,
+    ) -> Result<Executed, FatalError> {
+        self.budget
+            .charge_value_bytes((stdout.len() + stderr.len()) as u64)?;
+        if !stderr.is_empty() {
+            self.write_line(stderr.strip_suffix('\n').unwrap_or(&stderr));
+        }
+        let status = ExitCode::from(status);
+        if stdout.is_empty() {
+            return Ok(Executed::Result(CommandResult::status(status)));
+        }
+        let result = match stdout.strip_suffix('\n') {
+            Some(terminated) => CommandResult {
+                value: Value::String(terminated.to_owned()),
+                status,
+                suppress_newline: false,
+            },
+            None => CommandResult {
+                value: Value::String(stdout),
+                status,
+                suppress_newline: true,
+            },
+        };
+        Ok(Executed::Result(result))
     }
 
     // -----------------------------------------------------------------------
@@ -1535,16 +1577,32 @@ impl Evaluator<'_> {
                 }
             }
             Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
-            // The provider rewrites its own argv, then the result travels the identical path a
-            // direct capability word takes: same budget, same denial, same telemetry. The rewrite
-            // proposes; it does not grant.
+            // The provider runs its own argv like a small command-line program. A proposal it
+            // makes then travels the identical path a direct capability word takes: same budget,
+            // same denial, same telemetry. Running the word proposes; it does not grant.
             Resolution::ProviderCommand => {
-                let (capability, input) = match self.invoker.resolve_command(command, arguments) {
-                    Some(Ok(resolved)) => resolved,
-                    Some(Err(message)) => {
+                // Encoded once, with the rule every emitted value follows — strings verbatim,
+                // everything else as compact JSON — so a provider reads `echo hello | word -` and
+                // `some.capability | word -` exactly as the script would have printed them.
+                let stdin = input.as_deref().map(display);
+                // A guest run costs wall clock the same way a capability call does, and for the
+                // same reason `invoke_capability` re-reads the clock on both sides of one.
+                self.budget.check_deadline()?;
+                let run = self
+                    .invoker
+                    .run_command(command, arguments, stdin.as_deref());
+                self.budget.check_deadline()?;
+                let (capability, input) = match run {
+                    Some(CommandRun::Proposed { capability, input }) => (capability, input),
+                    Some(CommandRun::Failed { message }) => {
                         let status = self.absorb(CommandFailure::usage(message))?;
                         return Ok(Executed::Result(CommandResult::status(status)));
                     }
+                    Some(CommandRun::Rendered {
+                        stdout,
+                        stderr,
+                        status,
+                    }) => return self.emit_rendered(stdout, stderr, status),
                     // Resolution said a provider owned this word, so nothing owning it now means
                     // the registry changed underneath the session. Fail closed and visibly.
                     None => {
@@ -1582,6 +1640,9 @@ impl Evaluator<'_> {
                     }
                 }
             }
+            // A piped value is not offered to a bare capability word: its input is exactly the
+            // `--flag value` argv, so `x | echo.echo` sees nothing of `x`. Only a provider command
+            // word receives stdin, above. The crate README states the rule.
             Resolution::Capability => {
                 let input = match arguments_to_input(command, arguments) {
                     Ok(input) => input,
