@@ -321,12 +321,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     // the only place the class exists at all.
     assert!(
         broker
-            .resolve_command(
+            .run_command(
                 &gateway(),
                 Some(&grant()),
                 Some(&chat_claim(UNMAPPED_SUBJECT, "some-agent")),
                 "echo",
                 &[],
+                None,
             )
             .await
             .is_err()

@@ -215,7 +215,7 @@ invocation-bound transport/channel/conversation claim; the owner must grant both
 namespace and an explicit transport-wide, exact-channel, or exact-conversation `chatScopes` entry.
 The canonical scope also enters Cedar context. What is reserved is what the owner declared: a
 constraint set carries a `route:` of `chatMemoryRecord`, `chatMemoryRecent`, or `chatMemorySearch`,
-and legacy capability, resolve, and invoke operations omit and refuse exactly those capabilities and
+and legacy capability, run, resolve, and invoke operations omit and refuse exactly those capabilities and
 every command word of the provider they name. Naming a capability `memory.chat.export` or a
 provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
 chat invocation may reach the two retrieval routes but never the record route.

@@ -9,7 +9,7 @@ use dekopon_broker::{
     StartupWarning, verify_audit_chain,
 };
 use dekopon_broker_host::BoundCredential;
-use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
 use dekopon_capability::{
     EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule, Idempotency,
 };
@@ -2659,17 +2659,110 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
     .expect("broker starts");
 
     let error = broker
-        .resolve_command(
+        .run_command(
             &context("caller"),
             None,
             None,
             "gh",
             &["gh".to_owned(), "pr".to_owned()],
+            None,
         )
         .await
         .expect_err("no loaded provider declares this word");
     assert!(
         format!("{error}").contains("gh"),
         "the refusal names the word: {error}"
+    );
+}
+
+/// A `run-command` guest answers as the command-line tool it fronts: a help page at status 0, a
+/// proposal built from the piped value, and a usage error at status 2, each travelling intact and
+/// none of them a decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broker() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("cli-probe fixture loads");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, _) = Broker::start(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        engine("", ["caller"], [("cli-probe.upper", "cli-probe")]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Strict,
+        std::iter::empty(),
+    )
+    .expect("broker starts");
+    let caller = context("caller");
+
+    match broker
+        .run_command(&caller, None, None, "probe", &["--help".to_owned()], None)
+        .await
+        .expect("the help page renders")
+    {
+        CommandRunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        } => {
+            assert_eq!(status, 0);
+            assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+        other => panic!("expected a rendered help page, got {other:?}"),
+    }
+
+    let proposed = broker
+        .run_command(
+            &caller,
+            None,
+            None,
+            "probe",
+            &["upper".to_owned(), "-".to_owned()],
+            Some("hello"),
+        )
+        .await
+        .expect("the piped value proposes");
+    assert_eq!(
+        proposed,
+        CommandRunOutcome::Proposed {
+            capability: "cli-probe.upper".parse().expect("valid capability fixture"),
+            input: json!({"text": "hello"}),
+        }
+    );
+
+    match broker
+        .run_command(&caller, None, None, "probe", &["bogus".to_owned()], None)
+        .await
+        .expect("a usage error renders")
+    {
+        CommandRunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        } => {
+            assert_eq!(status, 2);
+            assert!(stdout.is_empty(), "{stdout}");
+            assert!(
+                stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+                "{stderr}"
+            );
+        }
+        other => panic!("expected a rendered usage error, got {other:?}"),
+    }
+    assert!(
+        audit.records().await.is_empty(),
+        "running a word decides nothing"
     );
 }

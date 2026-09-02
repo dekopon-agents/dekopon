@@ -6,11 +6,11 @@ use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
     AgentInventory, Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind,
-    DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InventoryError, InvocationRequest,
-    MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS, MAX_REPORTED_TEXT_BYTES,
-    MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission, ProtocolError,
-    ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope, ResponseEnvelope,
-    TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
+    CommandRunOutcome, ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
+    InventoryError, InvocationRequest, MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS,
+    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission,
+    ProtocolError, ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
+    ResponseEnvelope, TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
 };
 
 fn subject() -> dekopon_core::ExternalSubject {
@@ -1144,14 +1144,37 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         ),
         (
             "resolveCommand",
-            RequestEnvelope::resolve_command(None, "memory".to_owned(), Vec::new()),
+            RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                request: BrokerRequest::ResolveCommand {
+                    attestation: None,
+                    word: "memory".to_owned(),
+                    argv: Vec::new(),
+                },
+            },
         ),
         (
             "resolveCommand",
-            RequestEnvelope::resolve_command(
+            RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                request: BrokerRequest::ResolveCommand {
+                    attestation: Some(chat.clone()),
+                    word: "memory".to_owned(),
+                    argv: vec!["recent".to_owned()],
+                },
+            },
+        ),
+        (
+            "runCommand",
+            RequestEnvelope::run_command(None, "memory".to_owned(), Vec::new(), None),
+        ),
+        (
+            "runCommand",
+            RequestEnvelope::run_command(
                 Some(chat.clone()),
                 "memory".to_owned(),
-                vec!["recent".to_owned()],
+                vec!["search".to_owned(), "-".to_owned()],
+                Some("piped".to_owned()),
             ),
         ),
         ("invoke", RequestEnvelope::invoke(None, invocation())),
@@ -1282,6 +1305,7 @@ fn recording_is_reachable_only_through_its_own_operation() {
             "id": "invoke-chat", "capability": "echo.echo", "trace": "trace-chat", "input": {},
         }, "turn": turn.clone()}),
         json!({"operation": "resolveCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
+        json!({"operation": "runCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
         json!({"operation": "capabilities", "turn": turn}),
     ] {
         assert!(
@@ -1293,6 +1317,189 @@ fn recording_is_reachable_only_through_its_own_operation() {
             "{smuggled} decoded a delivered turn onto an operation that must not carry one"
         );
     }
+}
+
+/// The piped value is one optional field on the run frame, absent when nothing was piped, so a
+/// bare run is the same frame with or without a `stdin` key and a piped one carries the text.
+#[test]
+fn a_run_command_frame_omits_an_absent_piped_value() {
+    let bare =
+        RequestEnvelope::run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None);
+    let encoded = serde_json::to_value(&bare).expect("envelope serializes");
+    assert_eq!(encoded["request"]["operation"], json!("runCommand"));
+    assert!(encoded["request"].get("stdin").is_none(), "{encoded}");
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
+        bare
+    );
+
+    let piped = RequestEnvelope::run_command(
+        None,
+        "probe".to_owned(),
+        vec!["upper".to_owned(), "-".to_owned()],
+        Some("hello".to_owned()),
+    );
+    let encoded = serde_json::to_value(&piped).expect("envelope serializes");
+    assert_eq!(encoded["request"]["stdin"], json!("hello"), "{encoded}");
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
+        piped
+    );
+}
+
+/// Every answer a guest can give travels intact under its own tag, so a script sees exactly what
+/// the upstream tool would have printed and a decline keeps its stable code.
+#[test]
+fn a_command_run_response_round_trips_each_outcome() {
+    for (expected, result) in [
+        (
+            "proposed",
+            CommandRunOutcome::Proposed {
+                capability: "cli-probe.upper"
+                    .parse::<CapabilityId>()
+                    .expect("valid capability fixture"),
+                input: json!({"text": "hello"}),
+            },
+        ),
+        (
+            "rendered",
+            CommandRunOutcome::Rendered {
+                stdout: "Usage: probe <COMMAND>\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            },
+        ),
+        (
+            "failed",
+            CommandRunOutcome::Failed {
+                error: ComponentFailure {
+                    code: "usage".to_owned(),
+                    message: "no input was piped for -".to_owned(),
+                },
+            },
+        ),
+    ] {
+        let envelope = ResponseEnvelope::command_run(result);
+        let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(
+            encoded["response"]["type"],
+            json!("commandRun"),
+            "{encoded}"
+        );
+        assert_eq!(
+            encoded["response"]["result"]["outcome"],
+            json!(expected),
+            "{encoded}"
+        );
+        assert_eq!(
+            serde_json::from_value::<ResponseEnvelope>(encoded.clone()).expect("envelope decodes"),
+            envelope,
+            "{encoded}"
+        );
+    }
+}
+
+/// A rendered answer crosses the socket as the guest produced it: the client hands back the help
+/// page and the status the provider chose, never a decline dressed as one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_command_exchange_decodes_a_rendered_answer() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use tokio::net::UnixListener;
+
+    use super::BrokerClient;
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let rendered = CommandRunOutcome::Rendered {
+        stdout: "Usage: probe <COMMAND>\n".to_owned(),
+        stderr: String::new(),
+        status: 0,
+    };
+    let answer = rendered.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client fixture");
+        let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
+            .await
+            .expect("server decodes request");
+        assert_eq!(
+            request.request,
+            BrokerRequest::RunCommand {
+                attestation: None,
+                word: "probe".to_owned(),
+                argv: vec!["--help".to_owned()],
+                stdin: None,
+            }
+        );
+        write_frame(&mut stream, &ResponseEnvelope::command_run(answer), limits)
+            .await
+            .expect("server writes response");
+    });
+
+    let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
+    let outcome = client
+        .run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None)
+        .await
+        .expect("authenticated exchange succeeds");
+    assert_eq!(outcome, rendered);
+    server.await.expect("server fixture exits");
+}
+
+/// An oversized piped value stops at the frame ceiling on this side: nothing is written, the
+/// failure sits in the request phase, and it names the bound rather than the socket.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use tokio::net::UnixListener;
+
+    use super::{BrokerClient, ClientError, ExchangePhase};
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let socket = directory.path().join("unread.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
+    let tight = FrameLimits {
+        max_frame_bytes: 64,
+        io_timeout: Duration::from_secs(1),
+    };
+    let client = BrokerClient::new(&socket, uid, tight).expect("valid client limits");
+    let refused = client
+        .run_command(
+            None,
+            "probe".to_owned(),
+            vec!["upper".to_owned(), "-".to_owned()],
+            Some("x".repeat(256)),
+        )
+        .await
+        .expect_err("an oversized piped value must fail");
+    drop(listener);
+    assert!(
+        matches!(
+            &refused,
+            ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::FrameTooLarge { .. },
+            }
+        ),
+        "expected a request-phase frame bound, got {refused}"
+    );
+    assert!(!refused.may_have_executed());
+    let rendered = refused.to_string();
+    assert!(rendered.contains("maximum is 64"), "rendered {rendered}");
+    assert!(!rendered.contains("unread.sock"), "rendered {rendered}");
 }
 
 /// A refused attested inspection reaches the client as an opaque failure, never as an empty list.

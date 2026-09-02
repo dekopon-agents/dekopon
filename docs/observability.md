@@ -100,7 +100,7 @@ untrusted text that triggered it:
 | `runner.command.failed` | `dekopon-run` | the command name and a stable `error.type`, including the `output-write` failure that has no other surface |
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
-| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word and a stable `error.kind`, recorded when a provider's own rewrite fails rather than declines |
+| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`, or the legacy `resolveCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
 | `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller still sees plain `policy-denied` |
 | `broker.leg.connected` | `dekopon-run` | the broker socket tier, the session trace identifier, and the granted-capability count — never the socket path |
 | `guest.invocation.summary` | `dekopon-run` | provider and capability ids with iteration count and total/mean durations for a `--repeat` run, replacing one record per iteration |
@@ -442,7 +442,7 @@ only place the cause exists. These events carry it:
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested
-`resolveCommand` answer a refused caller with the same opaque nothing whatever went wrong — a
+`runCommand` (or legacy `resolveCommand`) answer a refused caller with the same opaque nothing whatever went wrong — a
 distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and an unknown
 command word would disclose the surface the refusal withheld. The class, its determining policies,
 and the canonical subject therefore land on the broker's own side of the socket, which is what makes

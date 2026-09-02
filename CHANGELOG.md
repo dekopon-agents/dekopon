@@ -105,8 +105,18 @@ All notable changes to Dekopon are documented here. The format is based on
   streams at the provider's own exit status and charging no capability call, or a decline
   reported as a usage error at exit `2`. The scripting tool's description now tells the model to
   run `<word> --help` for a provider command word's subcommands and flags. `dekopon-agent`,
-  `dekopond`, and `dekopon-run` forward the new method; the broker round trip still speaks
-  `resolveCommand` and sends no stdin until the `runCommand` operation lands.
+  `dekopond`, and `dekopon-run` forward the new method, and the broker leg carries it over the
+  new `runCommand` operation with the piped value.
+- The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
+  answered by `BrokerResponse::CommandRun` carrying the guest's own `CommandRunOutcome` — a
+  proposal, rendered text with its exit status, or a decline with the provider's stable code and
+  message, which now rides the wire beside the message. `BrokerClient::run_command` replaces
+  `resolve_command`, `Broker::run_command` replaces `Broker::resolve_command` and threads the
+  piped value to the guest, and `dekopon-brokerd` answers both operations: `runCommand` with the
+  outcome intact and the legacy `resolveCommand` with rendered text degraded to a decline carrying
+  the text, so an older client keeps working against a newer broker for one release while a newer
+  client's `runCommand` reaching an older broker is refused `invalid-request`. The piped value is
+  bounded by the frame ceiling on the client and by the host's `maxInputBytes` on the broker.
 - The scripting tool's description now tells the model when to reach for the tool and to write a
   job as one script; the exact JSON a `--kebab-case` flag becomes (a value reading as a number,
   `true`, `false`, or `null` is sent typed, anything else as a string, a bare flag as `true`);

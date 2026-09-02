@@ -37,8 +37,8 @@ use std::{
 use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatMemorySurface, ClientError, ERROR_UNAUTHENTICATED,
-    InvocationOutcome, InvocationRequest,
+    Attestation, BrokerClient, ChatMemorySurface, ClientError, CommandRunOutcome,
+    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, IdentifierError, InvocationId, TraceId};
@@ -439,27 +439,40 @@ impl CapabilityInvoker for BrokerLeg {
         self.namespaces.contains(namespace)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], _stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
         if !self.command_words.contains(word) {
             return None;
         }
-        // The wire still speaks `resolveCommand`, which carries no stdin and can only rewrite or
-        // decline; the `runCommand` operation of a later commit carries the piped text and lets a
-        // provider render its own help. Until then the piped text stops here, unsent.
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
-        let resolved = self.runtime.block_on(async {
+        let outcome = self.runtime.block_on(async {
             self.client
-                .resolve_command(self.attestation.clone(), word.to_owned(), argv.to_vec())
+                .run_command(
+                    self.attestation.clone(),
+                    word.to_owned(),
+                    argv.to_vec(),
+                    stdin.map(str::to_owned),
+                )
                 .await
         });
-        Some(match resolved {
-            Ok(Ok((capability, input))) => CommandRun::Proposed {
+        Some(match outcome {
+            Ok(CommandRunOutcome::Proposed { capability, input }) => CommandRun::Proposed {
                 capability: capability.to_string(),
                 input,
             },
-            Ok(Err(message)) => CommandRun::Failed { message },
+            Ok(CommandRunOutcome::Rendered {
+                stdout,
+                stderr,
+                status,
+            }) => CommandRun::Rendered {
+                stdout,
+                stderr,
+                status,
+            },
+            Ok(CommandRunOutcome::Failed { error }) => CommandRun::Failed {
+                message: error.message,
+            },
             Err(error) => CommandRun::Failed {
                 message: format!("{word}: {error}"),
             },

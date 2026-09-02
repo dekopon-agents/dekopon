@@ -21,7 +21,9 @@ use dekopon_broker::{
 /// component's names rather than anything the broker compares against.
 const MEMORY_RECORD: &str = "memory.chat.record";
 const MEMORY_RECENT: &str = "memory.chat.recent";
-use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
+use dekopon_broker_host::{
+    BoundCredential, BrokerHostError, BrokerHostLimits, BrokerProviderRegistry,
+};
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
     EffectKind, HttpConstraints, Idempotency, StorageAccess, StorageConstraints, StorageInterface,
@@ -609,7 +611,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
     assert_eq!(broker.command_words(&caller), ["recall"]);
     broker
-        .resolve_command(&caller, None, None, "recall", &[])
+        .run_command(&caller, None, None, "recall", &[], None)
         .await
         .expect("the word of a provider that owns no route resolves normally");
 
@@ -668,7 +670,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     assert_eq!(words, ["recall"]);
     assert!(memory.is_none(), "no route means no memory surface");
     broker
-        .resolve_command(&gateway, Some(&grant), Some(&claim), "recall", &[])
+        .run_command(&gateway, Some(&grant), Some(&claim), "recall", &[], None)
         .await
         .expect("chat resolution reserves nothing either");
     let chat_id = "unrouted-chat".parse::<InvocationId>().expect("invocation");
@@ -804,6 +806,109 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
 }
 
+/// A reserved provider renders not even its help page for a caller without the surface.
+///
+/// The word gate runs before the guest does, so the `run-command` export of a provider a
+/// chat-memory `route:` names is never entered for a session the surface is not effective for —
+/// nothing it could have rendered exists to leak. The fixture is the hand-rolled `run-command`
+/// guest whose `recall --help` renders a page, routed as the recent half of the surface.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let key = directory.join("storage-key.yaml");
+    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("rendering fixture loads");
+    let metrics = registry.metrics();
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().expect("caller")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("policy world");
+    // Policy permits the capability outright, so what reserves the word can only be the route.
+    let policy = PolicyEngine::new(
+        r#"
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"ordinary.escape",
+               resource == Dekopon::Provider::"memory-chat")
+        unless { context has via };
+        "#,
+        &world,
+    )
+    .expect("policy");
+    let constraints = ConstraintCatalog::new([(
+        "ordinary.escape".parse().expect("capability"),
+        ConstraintSet {
+            route: CapabilityRoute::ChatMemoryRecent,
+            provider: "memory-chat".parse().expect("provider"),
+            effect: EffectKind::ReadOnly,
+            risk: RiskLevel::Low,
+            idempotency: Idempotency::Idempotent,
+            credential: None,
+            credential_by_agent: Default::default(),
+            constraints: dekopon_capability::ExecutionConstraints {
+                timeout_ms: 10_000,
+                max_output_bytes: 131_072,
+                http: None,
+                storage: Some(StorageConstraints {
+                    interface: StorageInterface::Jsonl,
+                    access: StorageAccess::ReadOnly,
+                    namespace: StorageNamespace::Chat,
+                }),
+                secret_use: None,
+            },
+        },
+    )])
+    .expect("constraints");
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "reserved-render-policy".to_owned(),
+        policy,
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("broker");
+    let caller = AuthenticatedContext::new(
+        "caller".parse().expect("caller"),
+        Actor::Service {
+            principal: "caller".parse().expect("caller"),
+        },
+    )
+    .expect("caller context");
+    assert!(
+        broker.command_words(&caller).is_empty(),
+        "a reserved word is not in the vocabulary"
+    );
+    let refused = broker
+        .run_command(&caller, None, None, "recall", &["--help".to_owned()], None)
+        .await
+        .expect_err("a reserved word never reaches its guest");
+    assert!(
+        matches!(&refused, BrokerHostError::UnknownCommandWord { word } if word == "recall"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        metrics.snapshot().command_resolutions,
+        0,
+        "the guest never ran, so it rendered nothing"
+    );
+}
+
 /// Renaming the shipped provider changes nothing the broker hides or denies.
 ///
 /// `storage-probe` is named nothing like chat memory and declares `storage-probe.run`, but the
@@ -908,7 +1013,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     assert!(broker.command_words(&caller).is_empty());
     assert!(
         broker
-            .resolve_command(&caller, None, None, "storageprobe", &[])
+            .run_command(&caller, None, None, "storageprobe", &[], None)
             .await
             .is_err(),
         "the routed provider's word is reserved even though nothing about it says memory"
@@ -959,7 +1064,14 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     assert!(listed.is_empty() && words.is_empty() && memory.is_none());
     assert!(
         broker
-            .resolve_command(&gateway, Some(&grant), Some(&claim), "storageprobe", &[])
+            .run_command(
+                &gateway,
+                Some(&grant),
+                Some(&claim),
+                "storageprobe",
+                &[],
+                None
+            )
             .await
             .is_err()
     );
@@ -1099,7 +1211,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     );
     assert!(
         broker
-            .resolve_command(&gateway(), None, None, "memory", &[])
+            .run_command(&gateway(), None, None, "memory", &[], None)
             .await
             .is_err(),
         "legacy command resolution never enters the memory provider"
