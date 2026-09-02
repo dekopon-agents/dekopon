@@ -26,7 +26,7 @@ New chat operations add canonical transport/channel/conversation authority to th
 mapping and `agent.prompt` gate. Owner configuration must grant both the subject namespace and an
 explicit `chatScopes` breadth; Cedar receives those scope fields. What is reserved is what the owner
 declared: each of the three capabilities carries a `route` of `chatMemoryRecord`, `chatMemoryRecent`,
-or `chatMemorySearch`, and legacy list/resolve/invoke paths omit and refuse exactly those and every
+or `chatMemorySearch`, and the list, run, resolve, and invoke paths omit and refuse exactly those and every
 command word of the provider they name — no capability or provider spelling reserves anything.
 Recent/search are visible only as an
 all-three surface; record is reachable only through the dedicated typed post-acceptance operation.

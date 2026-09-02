@@ -220,6 +220,23 @@ every command word of the provider they name. Naming a capability `memory.chat.e
 provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
 chat invocation may reach the two retrieval routes but never the record route.
 
+A provider command word is deliberately ungated. `runCommand` and the legacy `resolveCommand`
+carry no capability to decide on, so the broker runs the declaring component's argv handling — a
+pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
+authorization, and authorizes only the proposal that comes back, on exactly the path a direct
+`invoke` takes. Text the guest renders itself (a help page, a usage error) is provider-authored,
+pre-authorization, model-visible output: it authorizes nothing, charges no capability call, and is
+bounded by the host output ceiling and the shell's value and output ceilings, but it is the
+provider speaking to the model, with the trust its manifest and schemas already carry. The order
+of checks is what keeps the reservation above meaningful: a refused attestation and a reserved
+word are both answered as an unknown word before the guest is instantiated, so a reserved provider
+renders not even its help page, and a proposal that lands on a chat-memory route is refused after
+the run whatever word produced it. The piped value is bounded by the client's frame ceiling before
+it leaves the process and by the host's `maxInputBytes` before a store exists; the broker reports
+the second only in its own `command.resolve.failed` record, and the caller sees the opaque
+`provider-error` reply. [`broker-http.md`](broker-http.md#runcommand-and-resolvecommand-are-deliberately-ungated)
+carries the wire detail.
+
 Recording is **model-hidden, gateway-attested transport acceptance**, not broker-proven delivery or
 human receipt. Slack/Telegram/Discord receipts prove complete service acceptance; local `flush`
 proves kernel acceptance. Discord partial delivery produces no receipt. The gateway submits one

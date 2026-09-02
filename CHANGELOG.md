@@ -15,8 +15,24 @@ All notable changes to Dekopon are documented here. The format is based on
   `ProcessOutcome::TaskFailed` with `is_cancelled()`; a node that already returned keeps its real
   result, dropping every handle (or `CancelSignal::never`) never cancels, and the `process.node`
   span records `process.interruptibility` as `cancellable` and a requested cancellation as
-  `process.outcome` `cancelled`. Nothing in the repository is cancellable yet; the runner's
-  `legacy-shell` node stays non-interruptible.
+  `process.outcome` `cancelled`. The broker leg in `dekopon-agent` is the one cancellable
+  consumer — a gateway session's Stop abandons an in-flight command run through it — and the
+  runner's `legacy-shell` and `direct-command` nodes stay non-interruptible.
+- Added `dekopon:provider@0.3.0`, whose new `provider-cli` world exports `run-command`: a command
+  word receives its argv and the value piped into it and answers with a capability proposal, text
+  it rendered itself (stdout, stderr, and an exit status), or a decline. On the SDK side that is
+  `Provider::run_command` (defaulting to the legacy rewrite), `CommandRun`, `CommandRunOutcome`,
+  and `export_provider_with_cli!`; `dekopon_provider_sdk::host` carries the plumbing both hosts
+  share to read which command export a component offers, gate a manifest declaring `commandWords`
+  without one, count argv plus the piped value against the input bound, and decode either
+  export's answer into one `CommandRunOutcome`. Both hosts serve the export —
+  `ProviderRegistry::run_command` and `command_words_by_provider` on the import-free immediate
+  host, `BrokerProviderRegistry::run_command` on the broker host — refuse an oversized input
+  before a store exists (`CommandInputTooLarge`), call `run-command` when a component exports
+  both, and keep loading components built against `0.1.0` or `0.2.0`, whose legacy export never
+  receives a piped value. The `provider` and `provider-commands` worlds are unchanged, every WIT
+  mirror moved together, the `cli-probe` and frozen `provider-v0-2-compat` fixtures joined the
+  tree, and every repository-owned component was rebuilt with the pinned toolchain.
 - Added an optional `clap` feature to `dekopon-provider-sdk`: `cli::run_command` parses a
   command word's argv against a declared `clap::Command` tree and answers as the upstream tool's
   `main` would — `--help`, `--version`, and the `help` subcommand rendered on stdout at status 0,
@@ -28,6 +44,28 @@ All notable changes to Dekopon are documented here. The format is based on
   the baseline contract; the `cli-probe` fixture now uses the layer and `memory-reservation-probe`
   is the hand-rolled `run-command` guest. `dekopon-provider-sdk-testkit` gained
   `FakeBroker::run_command`, which drives a component's command word through the broker host.
+- `dekopon-run` serves provider command words in direct mode: `shell`, `prompt`, and `session
+  replay --provider` answer every word the loaded components declare through
+  `ProviderRegistry::run_command`, each run one nested non-interruptible `direct-command` process
+  node inside the `legacy-shell` node, so `probe --help` renders the component's page,
+  `echo hello | probe upper -` hands the piped value to the guest, and a proposal is invoked
+  exactly as a bare capability word would be; `--max-input-bytes` bounds argv plus the piped value
+  there. The broker leg in `dekopon-agent` runs each word as a cancellable `broker-command` node:
+  `BrokerLeg::with_cancel_signal` accepts a `CancelSignal`, `dekopond` supplies one per session,
+  and a native Stop abandons an in-flight command run instead of waiting for the broker's answer.
+  `dekopon-run --broker` supplies none, so its nodes are cancellable in contract only.
+- `dekopon-shell`'s `CommandRun` gains `Errored` and `Denied` for a run that never reached the
+  provider's answer: a broker transport failure, a host refusal or trap, or a task that did not
+  complete is reported like a capability that ran and errored (`<word>: failed: <cause>`, exit
+  `1`), and a run cancelled underneath its session like a refused capability
+  (`<word>: denied: session-cancelled`, exit `126`), so neither reads to the model as a usage
+  error it should fix.
+- Added the `agent.command.unobserved` audit record, emitted by `dekopon-agent`'s
+  `report_unobserved_command_run` when either command leg's process node finishes after its
+  caller was dropped: `command.leg` (`broker` or `direct`), a fixed `outcome`, and a fixed
+  `error.type`, never the word, the argv, or any text; the cause goes out as an ordinary error
+  event beside it. `command_run_from_outcome` maps a wire `CommandRunOutcome` onto the shell's
+  `CommandRun` for both legs.
 - Added skills, operator-authored reference material an agent reads on demand. `spec.skills` lists
   directories in the Agent Skills `SKILL.md` layout: YAML front matter carrying `name` (equal to
   the directory name; `[a-z0-9-]`, at most 64 bytes) and `description` (at most 1024 bytes), the
@@ -110,13 +148,21 @@ All notable changes to Dekopon are documented here. The format is based on
 - The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
   answered by `BrokerResponse::CommandRun` carrying the guest's own `CommandRunOutcome` — a
   proposal, rendered text with its exit status, or a decline with the provider's stable code and
-  message, which now rides the wire beside the message. `BrokerClient::run_command` replaces
-  `resolve_command`, `Broker::run_command` replaces `Broker::resolve_command` and threads the
-  piped value to the guest, and `dekopon-brokerd` answers both operations: `runCommand` with the
+  message, which now rides the wire beside the message. `BrokerClient::run_command` and
+  `RequestEnvelope::run_command` replace their `resolve_command` forms, which are gone,
+  `Broker::run_command` replaces `Broker::resolve_command` and threads the piped value to the
+  guest, and `dekopon-brokerd` answers both operations: `runCommand` with the
   outcome intact and the legacy `resolveCommand` with rendered text degraded to a decline carrying
   the text, so an older client keeps working against a newer broker for one release while a newer
   client's `runCommand` reaching an older broker is refused `invalid-request`. The piped value is
   bounded by the frame ceiling on the client and by the host's `maxInputBytes` on the broker.
+- `dekopon-broker-host` renamed its command-word errors around the new export:
+  `MissingResolveCommand` is `MissingCommandExport`, `ResolveCommandSignature` is
+  `CommandExportSignature`, `ResolveCommand` is `RunCommand`, `InvalidCommandResolution` is
+  `InvalidCommandRun`, and `ResolveCommandUsedHostImport` is `RunCommandUsedHostImport`, beside
+  the new `CommandInputTooLarge`; `dekopon-provider-host` gains the same set plus
+  `UnknownCommandWord`. Their messages say a command word was run, not rewritten; an exhaustive
+  match downstream must name them.
 - The scripting tool's description now tells the model when to reach for the tool and to write a
   job as one script; the exact JSON a `--kebab-case` flag becomes (a value reading as a number,
   `true`, `false`, or `null` is sent typed, anything else as a string, a bare flag as `true`);
@@ -136,6 +182,9 @@ All notable changes to Dekopon are documented here. The format is based on
   and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`), `ureq` (the OpenObserve
   client, on the HTTP stack the model clients already use), and `time` (RFC 3339 timestamps in
   `session list`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
+  `dekopon-agent` and `dekopond` now also depend on `dekopon-process`, for the node each broker
+  command run executes in and the cancel signal a gateway session hands it; it is not a broker
+  crate, and the same gate covers `dekopond`.
   `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and
   `dekopon-protocol`'s `AgentSpec` gains `skills`, absent from serialized output when empty.
 

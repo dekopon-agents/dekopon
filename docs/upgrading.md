@@ -50,6 +50,29 @@ explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
+### 0.12.0 → next (unreleased) — command words run over `runCommand`
+
+Not yet released; the version that carries it is named when it is cut. Nothing here needs a
+configuration edit.
+
+- **Upgrade the broker before its clients, and all four executables together.** The local protocol
+  stays `dekopon.dev/broker/v1alpha2`, but `dekopon-run --broker` and `dekopond` now send a provider
+  command word as `runCommand` — the word, its argv, and the optional piped value — and read back
+  the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
+  rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
+  working for one release. The reverse does not hold: an older broker refuses `runCommand` as
+  `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
+  client against an older broker reports every command word as a failed run until the broker moves.
+- **Upgrade the hosts before a provider adopts `run-command`.** A component built against
+  `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which only a broker or
+  runner at this version looks up; an older host finds no `resolve-command` behind the manifest's
+  `commandWords` and refuses the component at load. Components built against `0.1.0` or `0.2.0`
+  keep loading unchanged and never receive a piped value.
+- **Embedders: `BrokerClient::resolve_command`, `RequestEnvelope::resolve_command`, and
+  `Broker::resolve_command` are gone.** Call `BrokerClient::run_command` and `Broker::run_command`
+  and match the `CommandRunOutcome` they return; `BrokerRequest::ResolveCommand` remains a request
+  the broker answers, not one the client builds.
+
 ### 0.11.1 → 0.12.0 — optional public DRNs require a private map and second policy
 
 Existing `credentialsPath`, `credential`, and `credentialByAgent` deployments need no migration and
