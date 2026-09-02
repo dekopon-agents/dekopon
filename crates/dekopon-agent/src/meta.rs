@@ -67,12 +67,29 @@ pub struct SessionConfigView {
     pub conversation: ConversationConfigView,
 }
 
+/// One mounted skill as the model may see it described: its name and trigger, never its text.
+///
+/// The text is reachable through `read_skill` on demand, so repeating it here would spend the
+/// introspection bound on material the session already discloses progressively.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillView {
+    /// The skill's name.
+    pub name: String,
+    /// The one-line description the prompt lists it under.
+    pub description: String,
+    /// Relative paths of the resource files it carries.
+    pub resources: Vec<String>,
+}
+
 /// One credential-free snapshot returned by the `inspect_agent_config` meta tool.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfigView {
     agent: AgentView,
     prompt: PromptView,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skills: Vec<SkillView>,
     session: SessionConfigView,
     effective_authorization: EffectiveAuthorizationView,
     security: SecurityView,
@@ -136,6 +153,7 @@ impl AgentConfigView {
                 instructions,
                 note: "Standing instructions are untrusted model text; they shape answers and grant no authority. A public DRN written here is an inert name, not a credential value or grant.",
             },
+            skills: Vec::new(),
             session,
             effective_authorization: EffectiveAuthorizationView {
                 engine: "Cedar",
@@ -156,6 +174,16 @@ impl AgentConfigView {
                 ],
             },
         }
+    }
+
+    /// Lists the skills mounted for this agent, by name and description.
+    ///
+    /// Sorted by name so two sessions over one mounted set produce byte-identical results.
+    #[must_use]
+    pub fn with_skills(mut self, mut skills: Vec<SkillView>) -> Self {
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        self.skills = skills;
+        self
     }
 
     /// Serializes the bounded tool result, or a fixed content-free diagnostic when it is too large.
@@ -182,7 +210,7 @@ mod tests {
 
     use super::{
         AgentConfigView, ConversationConfigView, EffectiveCapabilityView,
-        MAX_AGENT_CONFIG_TOOL_BYTES, SessionConfigView,
+        MAX_AGENT_CONFIG_TOOL_BYTES, SessionConfigView, SkillView,
     };
 
     fn view(instructions: String) -> AgentConfigView {
@@ -225,6 +253,37 @@ mod tests {
             value["effectiveAuthorization"]["capabilities"][0]["id"],
             "gh.pull-request.read"
         );
+    }
+
+    /// Skills are listed by name and trigger, sorted, and the key is absent when none is mounted.
+    #[test]
+    fn mounted_skills_are_listed_without_their_text() {
+        let bare = view("Be concise.".to_owned()).tool_result();
+        let value: Value = serde_json::from_str(&bare).expect("view is JSON");
+        assert!(value.get("skills").is_none(), "{value}");
+
+        let encoded = view("Be concise.".to_owned())
+            .with_skills(vec![
+                SkillView {
+                    name: "release-notes".to_owned(),
+                    description: "Use when drafting release notes.".to_owned(),
+                    resources: Vec::new(),
+                },
+                SkillView {
+                    name: "pull-request-review".to_owned(),
+                    description: "Use when reviewing a pull request.".to_owned(),
+                    resources: vec!["references/checklist.md".to_owned()],
+                },
+            ])
+            .tool_result();
+        let value: Value = serde_json::from_str(&encoded).expect("view is JSON");
+        assert_eq!(value["skills"][0]["name"], "pull-request-review");
+        assert_eq!(
+            value["skills"][0]["resources"][0],
+            "references/checklist.md"
+        );
+        assert_eq!(value["skills"][1]["name"], "release-notes");
+        assert!(value["skills"][0].get("body").is_none());
     }
 
     #[test]

@@ -87,6 +87,8 @@ Semantic problems are accumulated: the whole catalog is scanned and every proble
 
 List output is sorted by validated identifier. `name` output uses qualified names such as `agent/reviewer`. A singular JSON or YAML command emits one resource; a list emits a versioned `AgentList`, `CapabilityList`, or `ProviderList`. `config view` emits a canonical grouped catalog rather than preserving comments or original document order.
 
+`describe agent` expands one agent with the capabilities and providers it names and the skills it mounts. The text form — `table` and `wide` render it identically — ends with a `Skills:` heading after `Providers:`, listing each skill as `  - <name> [<N> resource file(s)]: <description>` in the order `spec.skills` names them, or `  (none)`. Name and description are what a model matches a request against and the count says how much sits behind `read_skill`; the skill's body and its resource text are never printed there. The JSON and YAML forms carry each loaded skill whole under `skills` — `name`, `description`, `body`, `resources` as `path` and `text` pairs, the front matter's optional `license`, `compatibility`, `metadata`, and `allowedTools`, and the resolved `source` directory — and omit the key when the agent mounts none, so the exact text a session will read can be diffed. The wide agent table (`get agents -o wide`, `get agent <NAME> -o wide`, the `AGENTS` group of `config view -o wide`) inserts `PROVIDERS`, `SKILLS`, `MODEL`, and `POLICY` between `CAPABILITIES` and `DESCRIPTION`; `SKILLS` counts the directories `spec.skills` names, which `get agent -o yaml` prints as written in the catalog and omits when empty.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -106,6 +108,7 @@ dekopon --config examples/local/dekopon.yaml get agents -o wide
 dekopon --config examples/local/dekopon.yaml get agent reviewer -o yaml
 dekopon --config examples/local/dekopon.yaml get capabilities -o name
 dekopon --config examples/local/dekopon.yaml describe agent reviewer
+dekopon --config examples/local/dekopon.yaml describe agent reviewer -o json
 dekopon --config examples/local/dekopon.yaml validate
 dekopon --config examples/local/dekopon.yaml config view --output json
 dekopon auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -

@@ -7,6 +7,7 @@
 
 use std::{fmt, sync::Mutex, time::Instant};
 
+use dekopon_config::Skill;
 use dekopon_model::{
     image::{GeneratedImage, ImageGenerator, MAX_IMAGE_PROMPT_BYTES},
     model::{
@@ -18,10 +19,16 @@ use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{meta::AgentConfigView, milliseconds};
+use crate::{
+    improvement::{self, ImprovementSuggestion},
+    meta::AgentConfigView,
+    milliseconds,
+    skills::{self, SkillReads},
+};
 
 mod history;
 
+pub use crate::{improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME};
 pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
 
 /// Model-facing name of the single scripting tool.
@@ -221,6 +228,11 @@ pub struct PromptOutcome {
     pub script_calls: u32,
     /// Capability invocations those scripts drove.
     pub capability_invocations: u32,
+    /// Improvement suggestions the model recorded, when the embedder offered the tool.
+    ///
+    /// Already written to telemetry by the time they arrive here; this copy is for an embedder
+    /// that wants to show them to the operator directly, the way the one-shot runner prints them.
+    pub suggestions: Vec<ImprovementSuggestion>,
 }
 
 /// Runs a bounded prompt/tool loop over one scripting tool.
@@ -347,6 +359,8 @@ pub struct SessionInputs<'a> {
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     optional_reply: bool,
+    skills: &'a [Skill],
+    improvement_suggestions: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -370,7 +384,30 @@ impl<'a> SessionInputs<'a> {
             agent_config: None,
             cancellation: None,
             optional_reply: false,
+            skills: &[],
+            improvement_suggestions: false,
         }
+    }
+
+    /// Mounts operator-authored skills, listed in the system prompt and read on demand.
+    ///
+    /// An empty slice mounts nothing and changes no request: no listing is added and no
+    /// `read_skill` tool is offered, so a session without skills is byte-identical to one built
+    /// before skills existed.
+    #[must_use]
+    pub const fn with_skills(mut self, skills: &'a [Skill]) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// Offers the `suggest_improvement` tool, so the model can tell the operator how to improve it.
+    ///
+    /// Opt-in per session because the suggestion record carries model-authored text. Offering the
+    /// tool is what declares the telemetry sink in scope for that text.
+    #[must_use]
+    pub const fn with_improvement_suggestions(mut self) -> Self {
+        self.improvement_suggestions = true;
+        self
     }
 
     /// Standing instructions, supplied fresh per call and never remembered.
@@ -448,6 +485,8 @@ struct SessionExtensions<'a> {
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     optional_reply: bool,
+    skills: &'a [Skill],
+    improvement_suggestions: bool,
 }
 
 /// Runs one bounded prompt/tool session from a [`SessionInputs`].
@@ -475,6 +514,8 @@ where
         agent_config,
         cancellation,
         optional_reply,
+        skills,
+        improvement_suggestions,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -484,11 +525,16 @@ where
         return Err(PromptError::ZeroSteps);
     }
 
-    // Order matters and is fixed here rather than left to callers: instructions first, then what
-    // the conversation remembers, then what the operator just said.
+    // Order matters and is fixed here rather than left to callers: instructions first, then the
+    // standing skills listing, then what the conversation remembers, then what the operator just
+    // said. The listing sits with the instructions because it is agent-standing rather than
+    // request-scoped, which keeps a route's cached prompt prefix stable across sessions.
     let mut messages = Vec::new();
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
+    }
+    if let Some(listing) = skills::prompt_block(skills) {
+        messages.push(ModelMessage::system(listing));
     }
     if optional_reply {
         messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
@@ -509,6 +555,8 @@ where
             agent_config,
             cancellation,
             optional_reply,
+            skills,
+            improvement_suggestions,
         },
     );
     history.record(match &result {
@@ -543,6 +591,8 @@ where
         agent_config,
         cancellation,
         optional_reply,
+        skills,
+        improvement_suggestions,
     } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
@@ -551,11 +601,17 @@ where
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
     }
+    if !skills.is_empty() {
+        model_tools.push(skills::skill_tool());
+    }
     if assets.is_some() {
         model_tools.push(asset_tool());
     }
     if image_generation.is_some() {
         model_tools.push(image_generation_tool());
+    }
+    if improvement_suggestions {
+        model_tools.push(improvement::improvement_tool());
     }
     if optional_reply {
         model_tools.push(decline_reply_tool());
@@ -578,6 +634,10 @@ where
     // One attempt, successful or not. A failed image request may still have incurred provider
     // cost, so letting the model retry would quietly widen the route's explicit one-call bound.
     let mut image_generation_attempted = false;
+    // Which skill text is already in the message vector, so a repeat costs a pointer, not a copy.
+    let mut skill_reads = SkillReads::default();
+    // What the model has told the operator so far; bounded by the tool itself.
+    let mut suggestions = Vec::new();
 
     for model_turns in 1..=limits.max_steps {
         check_cancelled(cancellation)?;
@@ -695,6 +755,7 @@ where
                 model_turns,
                 script_calls,
                 capability_invocations,
+                suggestions,
             });
         }
         if turn.tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
@@ -747,6 +808,7 @@ where
                     model_turns,
                     script_calls,
                     capability_invocations,
+                    suggestions,
                 });
             }
 
@@ -783,6 +845,27 @@ where
                     model_turns,
                     tool_call_index,
                     &mut agent_config_shown,
+                )?;
+                continue;
+            }
+            if call.function.name == SKILL_TOOL_NAME && !skills.is_empty() {
+                skills::read_skill_into(
+                    &mut messages,
+                    skills,
+                    &mut skill_reads,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                )?;
+                continue;
+            }
+            if call.function.name == IMPROVEMENT_TOOL_NAME && improvement_suggestions {
+                improvement::suggest_improvement_into(
+                    &mut messages,
+                    &mut suggestions,
+                    &call,
+                    model_turns,
+                    tool_call_index,
                 )?;
                 continue;
             }
@@ -908,7 +991,7 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
 /// Every caller passes a fixed category rather than the model's own text: a rejection event is
 /// triggered by untrusted model output, and `docs/observability.md` keeps that output out of
 /// exported telemetry.
-fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
+pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
     tracing::error!(
         target: "dekopon_agent::audit",
         {
@@ -929,9 +1012,14 @@ fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'stati
 fn script_tool(command_words: &[String]) -> ModelTool {
     let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
     if !command_words.is_empty() {
+        // Sorted and deduplicated: the tool definition is part of the cached prompt prefix, and
+        // provider load order must not produce two definitions for one set of words.
+        let mut words = command_words.to_vec();
+        words.sort();
+        words.dedup();
         description.push_str(&format!(
             "\n\nThis session's providers add these command words: {}. Each takes its own arguments; `cap --describe` does not cover them.",
-            command_words.join(", ")
+            words.join(", ")
         ));
     }
     ModelTool {
@@ -1429,70 +1517,96 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 /// `help` builtin — the runtime discovery surface is `cap --list` and `cap --describe`, and
 /// pointing a model at anything else would spend a tool call on "command not found".
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
-Run one script in Dekopon's sandboxed shell. Returns the script's combined output followed by an \
-`[exit code: N]` trailer, exactly as a terminal would.
+Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
+whenever the task needs data or an action the session's capabilities provide, and write the whole \
+job as one script rather than one tool call per step. Send scripts one after another only when \
+the next step genuinely depends on a result you cannot know yet. If you do not yet know what this \
+session can call, the first script is `cap --list`. Returns the script's combined output followed \
+by an `[exit code: N]` trailer, exactly as a terminal would.
 
-The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a leading \
-`!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` groups \
-— the compound ones all usable as \
-pipeline stages, so `cmd | while ...; do ...; done` works and a piped loop keeps what it assigns \
-because nothing here forks — `break`/`continue`, functions \
-with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, `${NAME[@]}`, \
-`${#NAME}`, \
-`${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( )`, `$(( ))`, `$?`, \
-`${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, \
-`exit`, both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and \
-redirection of either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into \
-named in-memory buffers all behave the way you expect. Everything outside that curated set fails \
-loudly and by name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never \
-silent no-ops. If a script ran, it did what it said.
+The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
+leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
+groups — the compound ones all usable as pipeline stages, so `cmd | while ...; do ...; done` \
+works and a piped loop keeps what it assigns because nothing here forks — `break`/`continue`, \
+functions with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
+`${NAME[@]}`, `${#NAME}`, `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( \
+)`, `$(( ))`, `$?`, `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, `exit`, \
+both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and redirection of \
+either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into named in-memory \
+buffers all behave the way you expect. Everything outside that curated set fails loudly and by \
+name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never silent no-ops. \
+If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
 1. Commands are Dekopon capabilities, not programs. A command word containing `.`, `-`, or `_` is \
 a capability invocation; every other word is a builtin. There are no processes, no filesystem, no \
-environment variables, and no network reachable except through a capability.
-2. Capability arguments are `--kebab-case` flags that become one JSON object: \
-`posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \"includeBody\": true}`. A repeated \
-flag becomes an array, and a single bare `{...}` argument is used as the input verbatim.
+environment variables, and no network reachable except through a capability. The capabilities you \
+may invoke are exactly those this session was granted: no flag, retry, or rewording escalates \
+past that set, and a refusal is a fact to report, not an obstacle to work around.
+2. Capability arguments are `--kebab-case` flags that become one JSON object. With a capability \
+such as `posts.get`, `posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \
+\"includeBody\": true}`: a value that reads as a JSON number, `true`, `false`, or `null` is sent \
+typed, anything else is sent as a string, and a flag with no value is `true`. A repeated flag \
+becomes an array, and a single bare `{...}` argument is used as the input verbatim. `cap \
+<capability> ...` invokes one under the same argument rules.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
 in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
-`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you capture \
-the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a quiet \
-command leaves its value, and its type, untouched.
-4. The session is bounded. Steps, output, wall-clock time, and capability calls all have ceilings; \
-tripping one ends the script with a message naming it.
+`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \
+capture the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a \
+quiet command leaves its value, and its type, untouched.
+4. The session is bounded. Steps, output, wall-clock time, and capability calls all have \
+ceilings; tripping one ends the script with a message naming it. Filter with `jq`, loop in the \
+shell, and print only what you need next.
 
-Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, \
-`sleep`, `date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them \
-depend on session configuration and report their exact missing prerequisite otherwise: `curl`, \
-which opens no socket of its own but assembles a request for whichever HTTP capability the session \
-was given; and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A \
-provider may contribute further command words, which behave the same way and are authorized \
-identically; any this session has are listed at the end of this description.
+Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
+`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them depend on \
+session configuration and report their exact missing prerequisite otherwise: `curl`, which opens \
+no socket of its own but assembles a request for whichever HTTP capability the session was given; \
+and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may \
+contribute further command words, which behave the same way and are authorized identically; any \
+this session has are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Use it only in \
-exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or \
-`curl -u 'USER:${drn:...}' URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN \
-concatenation are rejected. The provider never receives the DRN, and the broker independently \
-authorizes every use.
+exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or `curl -u 'USER:${drn:...}' \
+URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN concatenation are rejected. The \
+provider never receives the DRN, and the broker independently authorizes every use.
 
 Patterns are literal text, never globs, and regular expressions only where you ask for one with \
 `-E`: a `grep`/`sed` pattern, a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand \
-of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the \
-default branch but `*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and \
-`sed -E 's/^ *//'` are how you get a real regular expression, and the only way: unflagged, both \
-are a usage error naming the metacharacter rather than a search that quietly finds nothing. Under \
-`-E`, anchors and `.` mean what they mean in any regex, but the replacement half of `sed` is still \
-literal text, so groups select and do not substitute. `${#NAME}` counts \
-characters of a string but elements of an array and keys of an object, because values here are \
-real JSON. Use `jq` when the thing you want is structure rather than lines. A here-document's body \
-arrives as one JSON string, so pipe it through `jq` when you want structure out of it.
+of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the default branch but \
+`*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and `sed -E 's/^ *//'` are \
+how you get a real regular expression, and the only way: unflagged, both are a usage error naming \
+the metacharacter rather than a search that quietly finds nothing. Under `-E`, anchors and `.` \
+mean what they mean in any regex, but the replacement half of `sed` is still literal text, so \
+groups select and do not substitute. `${#NAME}` counts characters of a string but elements of an \
+array and keys of an object, because values here are real JSON. Use `jq` when the thing you want \
+is structure rather than lines. A here-document's body arrives as one JSON string, so pipe it \
+through `jq fromjson` when you want structure out of it.
+
+Reading the result. The tool result is your only evidence: what a script printed is what you \
+know, and what it did not print you do not know, so never guess what a capability returned, what \
+it accepts, or whether it exists. Exit 0 is success. Exit 1 is a command that ran and failed; a \
+capability's error arrives on stderr as `<capability>: failed: ...`, so read it before retrying. \
+Exit 127 (`command not found` or `capability not found`) means the word is misspelled or names a \
+capability this session does not hold; the two are deliberately indistinguishable, and `cap \
+--list` is the fix, not guessing at more names. Exit 126 means this session holds the capability \
+but authorization refused this use; different arguments will not change that, so report it. Exit \
+2 is a parse error, a refused construct, a usage error, or an exhausted budget, and the message \
+names which. Exit 124 is the wall-clock deadline. Output past the ceiling is truncated in the \
+middle, keeping the head and the tail with a marker giving the total line count, so filter inside \
+the script rather than printing everything and reading it here. Each script starts empty: nothing \
+an earlier script assigned survives, but everything it printed is already in this conversation.
+
+Not for: skills, chat attachments, and this agent's own configuration are not files here, and \
+when the session offers a tool for one of them it is listed beside this one. There are no files \
+at all: `ls` and `cd` do not exist, and `cat` only passes along what is piped or here-documented \
+into it.
 
 There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
 capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \
-input schema. Then prefer a single script that does the whole job over many small ones — that is \
-the entire point of this tool.";
+input schema alongside its description, as one object. Discover once, then prefer a single script \
+that does the whole job over many small ones — that is the entire point of this tool.";
 
 /// Failure to complete a prompt/tool session.
 ///
@@ -1575,6 +1689,27 @@ pub enum PromptError {
         /// Prompt-visible tool name.
         tool: String,
     },
+    /// Skill-reading arguments carried no skill name.
+    #[error("model arguments for tool {tool:?} must include a non-empty string \"name\" field")]
+    MissingSkillName {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// Skill-reading arguments contained fields outside the strict name-and-resource schema.
+    #[error("model arguments for tool {tool:?} contain unexpected or mistyped fields")]
+    UnexpectedSkillArguments {
+        /// Prompt-visible tool name.
+        tool: String,
+    },
+    /// Suggestion arguments were a JSON object but not the six-field shape the tool declares.
+    #[error("model arguments for tool {tool:?} do not match the suggestion schema")]
+    InvalidSuggestion {
+        /// Prompt-visible tool name.
+        tool: String,
+        /// Decoder diagnostic.
+        #[source]
+        source: serde_json::Error,
+    },
     /// The model-authored image prompt exceeded the fixed byte ceiling.
     #[error("image generation prompt is {actual} bytes; maximum is {maximum}")]
     ImagePromptTooLarge {
@@ -1619,6 +1754,9 @@ impl PromptError {
             Self::MissingAssetId { .. } => "missing-asset-id",
             Self::MissingImagePrompt { .. } => "missing-image-prompt",
             Self::UnexpectedImageArguments { .. } => "unexpected-image-arguments",
+            Self::MissingSkillName { .. } => "missing-skill-name",
+            Self::UnexpectedSkillArguments { .. } => "unexpected-skill-arguments",
+            Self::InvalidSuggestion { .. } => "invalid-suggestion",
             Self::ImagePromptTooLarge { .. } => "image-prompt-too-large",
             Self::UnreportedCapabilityWork => "unreported-capability-work",
             Self::EmptyAnswer => "empty-answer",
@@ -1688,11 +1826,11 @@ mod tests {
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
         CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES,
         DEFAULT_MAX_TURNS, FetchedAsset, GeneratedImageOutput, History, HistoryLimits,
-        IMAGE_GENERATION_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
-        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION,
-        SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome,
-        run_prompt, run_prompt_session, run_prompt_with_history,
-        run_prompt_with_history_and_options, script_tool,
+        IMAGE_GENERATION_TOOL_NAME, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES,
+        MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition,
+        SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs,
+        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     /// A model whose turns are fixed in advance, recording what it was asked.
@@ -2708,8 +2846,13 @@ mod tests {
     /// so a word absent from this description is a word the model will never type.
     #[test]
     fn provider_command_words_are_offered_to_the_model() {
-        let tool = script_tool(&["gh".to_owned(), "fly".to_owned()]);
-        assert!(tool.description.contains("gh, fly"), "{}", tool.description);
+        // Load order and a repeated word must not change the definition the model is sent.
+        let tool = script_tool(&["gh".to_owned(), "fly".to_owned(), "gh".to_owned()]);
+        assert!(
+            tool.description.contains("command words: fly, gh."),
+            "{}",
+            tool.description
+        );
         assert_no_doubled_spaces(&tool.description);
     }
 
@@ -2819,6 +2962,139 @@ mod tests {
         assert_eq!(errexit.exit_code, ExitCode::NOT_FOUND, "{errexit:?}");
         assert!(errexit.output.contains("`set -e` is on"), "{errexit:?}");
         assert!(!errexit.output.contains("after"), "{errexit:?}");
+    }
+
+    /// A session whose capabilities cover every outcome the description explains.
+    struct OutcomeCapabilities;
+
+    impl CapabilityInvoker for OutcomeCapabilities {
+        fn granted(&self) -> Vec<String> {
+            ["posts.get", "locked.door", "broken.thing"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn describe(&self, _capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
+            None
+        }
+
+        fn invoke(
+            &self,
+            capability: &str,
+            input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            match capability {
+                "posts.get" => CapabilityCallResult::Succeeded(input),
+                "locked.door" => CapabilityCallResult::Denied {
+                    reason: "policy says no".to_owned(),
+                },
+                "broken.thing" => CapabilityCallResult::Failed {
+                    error: "upstream boom".to_owned(),
+                },
+                _ => CapabilityCallResult::NotFound,
+            }
+        }
+    }
+
+    /// The exit codes, messages, and argument rules the description promises are the shell's.
+    ///
+    /// The "Reading the result" paragraph and the flag-typing sentence describe interpreter
+    /// behaviour that no prose can keep true on its own; this pins each promise to the shell the
+    /// way `refusal_list` pins the refused constructs, so a remapped code, a reworded message, or
+    /// a changed typing rule fails here rather than misleading a model.
+    #[test]
+    fn every_outcome_the_description_explains_is_what_the_shell_produces() {
+        for (code, phrase) in [
+            (ExitCode::SUCCESS, "Exit 0 is success"),
+            (ExitCode::FAILURE, "Exit 1 is a command that ran and failed"),
+            (
+                ExitCode::SYNTAX,
+                "Exit 2 is a parse error, a refused construct, a usage error, or an exhausted budget",
+            ),
+            (ExitCode::TIMEOUT, "Exit 124 is the wall-clock deadline"),
+            (
+                ExitCode::DENIED,
+                "Exit 126 means this session holds the capability but authorization refused this use",
+            ),
+            (
+                ExitCode::NOT_FOUND,
+                "Exit 127 (`command not found` or `capability not found`)",
+            ),
+        ] {
+            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
+            assert!(
+                phrase.contains(&format!("Exit {} ", code.get())),
+                "{phrase} must name exit code {}",
+                code.get()
+            );
+        }
+
+        let not_found = dekopon_shell::run("nosuch.capability --x 1", &OutcomeCapabilities);
+        assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
+        assert!(
+            not_found.output.contains("command not found"),
+            "{not_found:?}"
+        );
+
+        let denied = dekopon_shell::run("locked.door --knock", &OutcomeCapabilities);
+        assert_eq!(denied.exit_code, ExitCode::DENIED, "{denied:?}");
+
+        let failed = dekopon_shell::run("broken.thing", &OutcomeCapabilities);
+        assert_eq!(failed.exit_code, ExitCode::FAILURE, "{failed:?}");
+        assert!(
+            failed
+                .output
+                .contains("broken.thing: failed: upstream boom"),
+            "{failed:?}"
+        );
+
+        let usage = dekopon_shell::run("echo abc | grep '[0-9]'", &OutcomeCapabilities);
+        assert_eq!(usage.exit_code, ExitCode::SYNTAX, "{usage:?}");
+
+        // Item 2: numbers, booleans, and null typed; anything else a string; bare flag true;
+        // repeats an array. The echo-like capability returns exactly what it was sent.
+        let typed = dekopon_shell::run(
+            "posts.get --post-id 7 --include-body --tag a --tag b --name 7x --gone null",
+            &OutcomeCapabilities,
+        );
+        assert_eq!(typed.exit_code, ExitCode::SUCCESS, "{typed:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&typed.output).expect("the input is echoed as JSON"),
+            json!({"postId": 7, "includeBody": true, "tag": ["a", "b"], "name": "7x", "gone": null})
+        );
+        let via_cap = dekopon_shell::run("cap posts.get --post-id 7", &OutcomeCapabilities);
+        assert_eq!(via_cap.exit_code, ExitCode::SUCCESS, "{via_cap:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&via_cap.output).expect("cap echoes the same input"),
+            json!({"postId": 7})
+        );
+
+        let structured = dekopon_shell::run(
+            "jq 'fromjson | .n' <<'EOF'\n{\"n\": 3}\nEOF",
+            &OutcomeCapabilities,
+        );
+        assert_eq!(structured.exit_code, ExitCode::SUCCESS, "{structured:?}");
+        assert_eq!(structured.output.trim(), "3");
+
+        let truncated = dekopon_shell::Interpreter::new(dekopon_shell::Limits {
+            max_output_lines: 4,
+            ..dekopon_shell::Limits::default()
+        })
+        .run(
+            "for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; done",
+            &OutcomeCapabilities,
+        );
+        assert!(truncated.truncated, "{truncated:?}");
+        assert!(
+            truncated
+                .output
+                .contains("... Output truncated (10 total lines) ..."),
+            "{truncated:?}"
+        );
+        assert!(truncated.output.starts_with("1\n"), "{truncated:?}");
+        assert!(truncated.output.ends_with("10"), "{truncated:?}");
     }
 
     #[test]
@@ -3674,5 +3950,374 @@ mod tests {
             .expect_err("non-object arguments must fail closed");
 
         assert!(matches!(error, PromptError::ArgumentsNotObject { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Skills
+    // -----------------------------------------------------------------------
+
+    /// One loaded skill with one resource file, held with the directory it was read from.
+    fn mounted_skill() -> (tempfile::TempDir, dekopon_config::Skill) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let directory = root.path().join("pull-request-review");
+        std::fs::create_dir_all(directory.join("references")).expect("skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: pull-request-review\ndescription: Use when reviewing a pull request.\n---\nRead the diff before commenting.\n",
+        )
+        .expect("skill file");
+        std::fs::write(
+            directory.join("references/checklist.md"),
+            "- every write has a capability\n",
+        )
+        .expect("resource");
+        let skill = dekopon_config::load_skill(&directory).expect("fixture loads");
+        (root, skill)
+    }
+
+    /// The tool results the model saw on its *last* request, in order.
+    ///
+    /// `tool_messages` flattens every request, so a result the loop appended on turn one is
+    /// observed again on every later request; the last request carries each exactly once.
+    fn last_tool_results(model: &ScriptedModel) -> Vec<String> {
+        model
+            .observed_messages
+            .lock()
+            .expect("message observations lock")
+            .last()
+            .expect("the model was asked at least once")
+            .iter()
+            .filter(|message| message.role() == "tool")
+            .filter_map(|message| message.content().map(str::to_owned))
+            .collect()
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![ModelToolCall {
+                id: id.to_owned(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: name.to_owned(),
+                    arguments: arguments.to_string(),
+                },
+            }],
+            usage: None,
+            replay_items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mounted_skills_are_listed_by_summary_and_read_on_demand() {
+        let (_root, skill) = mounted_skill();
+        let skills = vec![skill];
+        let model = ScriptedModel::new([
+            tool_call(
+                "read-1",
+                SKILL_TOOL_NAME,
+                json!({"name": "pull-request-review"}),
+            ),
+            tool_call(
+                "read-2",
+                SKILL_TOOL_NAME,
+                json!({"name": "pull-request-review", "resource": "references/checklist.md"}),
+            ),
+            // A repeat costs a pointer rather than a second copy.
+            tool_call(
+                "read-3",
+                SKILL_TOOL_NAME,
+                json!({"name": "pull-request-review"}),
+            ),
+            answer("Reviewed."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("review PR 7", limits(5, 2))
+                .with_system(Some("Be concise."))
+                .with_skills(&skills),
+            &mut history,
+        )
+        .expect("skill reads are recoverable model turns");
+
+        assert_eq!(outcome.answer, "Reviewed.");
+        // Instructions first, then the standing listing, then the prompt.
+        let roles = model.first_roles();
+        assert_eq!(roles[0], ("system", "Be concise.".to_owned()));
+        assert_eq!(roles[1].0, "system");
+        assert!(
+            roles[1]
+                .1
+                .contains("- pull-request-review: Use when reviewing a pull request."),
+            "{}",
+            roles[1].1
+        );
+        assert!(
+            !roles[1].1.contains("Read the diff before commenting"),
+            "the body must not ride the listing: {}",
+            roles[1].1
+        );
+        assert_eq!(roles[2], ("user", "review PR 7".to_owned()));
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0].iter().any(|tool| tool.name == SKILL_TOOL_NAME),
+            "the read tool is offered when a skill is mounted"
+        );
+        drop(tools);
+
+        let results = last_tool_results(&model);
+        assert!(
+            results[0].starts_with("# Skill: pull-request-review"),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[0].contains("Read the diff before commenting."),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[0].contains("references/checklist.md"),
+            "{}",
+            results[0]
+        );
+        assert_eq!(
+            results[1],
+            "# pull-request-review/references/checklist.md\n\n- every write has a capability\n"
+        );
+        assert!(
+            results[2].contains("already in this conversation"),
+            "{}",
+            results[2]
+        );
+        assert!(
+            runtime.scripts.lock().expect("script lock").is_empty(),
+            "reading a skill runs no script and spends no capability budget"
+        );
+    }
+
+    #[test]
+    fn an_unknown_skill_or_resource_is_a_refusal_the_model_reads() {
+        let (_root, skill) = mounted_skill();
+        let skills = vec![skill];
+        let model = ScriptedModel::new([
+            tool_call("read-1", SKILL_TOOL_NAME, json!({"name": "release-notes"})),
+            tool_call(
+                "read-2",
+                SKILL_TOOL_NAME,
+                json!({"name": "pull-request-review", "resource": "scripts/none.sh"}),
+            ),
+            answer("Working without it."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("review", limits(4, 2)).with_skills(&skills),
+            &mut history,
+        )
+        .expect("a wrong name is recoverable");
+
+        assert_eq!(outcome.answer, "Working without it.");
+        let results = last_tool_results(&model);
+        assert!(
+            results[0].contains("Mounted skills: pull-request-review."),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[1].contains("has no resource by that path"),
+            "{}",
+            results[1]
+        );
+        assert!(
+            results[1].contains("references/checklist.md"),
+            "{}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn a_session_without_skills_offers_no_listing_and_no_tool() {
+        let model = ScriptedModel::new([tool_call(
+            "read-1",
+            SKILL_TOOL_NAME,
+            json!({"name": "pull-request-review"}),
+        )]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("review", limits(2, 2)).with_system(Some("Be concise.")),
+            &mut history,
+        )
+        .expect_err("a tool that was never offered is unknown");
+
+        assert!(matches!(error, PromptError::UnknownTool(name) if name == SKILL_TOOL_NAME));
+        let roles = model.first_roles();
+        assert_eq!(roles.len(), 2, "no listing was added: {roles:?}");
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME));
+    }
+
+    #[test]
+    fn malformed_skill_arguments_end_the_session_like_every_other_tool() {
+        let (_root, skill) = mounted_skill();
+        let skills = vec![skill];
+        let model = ScriptedModel::new([tool_call(
+            "read-1",
+            SKILL_TOOL_NAME,
+            json!({"name": "pull-request-review", "page": 2}),
+        )]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("review", limits(2, 2)).with_skills(&skills),
+            &mut history,
+        )
+        .expect_err("an unexpected field is malformed model output");
+
+        assert!(matches!(
+            error,
+            PromptError::UnexpectedSkillArguments { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement suggestions
+    // -----------------------------------------------------------------------
+
+    fn suggestion(id: &str, target: &str) -> AssistantTurn {
+        tool_call(
+            id,
+            IMPROVEMENT_TOOL_NAME,
+            json!({
+                "category": "capability",
+                "target": target,
+                "summary": "The capability was never granted.",
+                "evidence": "exit code 127 on every attempt",
+                "proposal": "Grant it to this agent.",
+                "confidence": "high"
+            }),
+        )
+    }
+
+    #[test]
+    fn suggestions_are_recorded_bounded_and_returned_with_the_outcome() {
+        let model = ScriptedModel::new([
+            suggestion("s-1", "gh.pull-request.read"),
+            suggestion("s-2", "gh.pull-request.comment"),
+            suggestion("s-3", "gh.issue.read"),
+            // One past the bound: refused in a sentence, never an error.
+            suggestion("s-4", "gh.issue.comment"),
+            answer("Done."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("do the thing", limits(6, 2)).with_improvement_suggestions(),
+            &mut history,
+        )
+        .expect("suggestions never fail a session");
+
+        assert_eq!(outcome.answer, "Done.");
+        assert_eq!(outcome.suggestions.len(), 3);
+        assert_eq!(outcome.suggestions[0].target, "gh.pull-request.read");
+        assert_eq!(
+            outcome.suggestions[2].category,
+            crate::improvement::ImprovementCategory::Capability
+        );
+        let results = last_tool_results(&model);
+        assert!(
+            results[0].contains("Recorded suggestion 1 of 3"),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[2].contains("Recorded suggestion 3 of 3"),
+            "{}",
+            results[2]
+        );
+        assert!(results[3].contains("already recorded"), "{}", results[3]);
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .any(|tool| tool.name == IMPROVEMENT_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn a_badly_formed_suggestion_is_refused_without_ending_the_session() {
+        let model = ScriptedModel::new([
+            tool_call(
+                "s-1",
+                IMPROVEMENT_TOOL_NAME,
+                json!({
+                    "category": "vibes",
+                    "target": "x",
+                    "summary": "s",
+                    "evidence": "e",
+                    "proposal": "p",
+                    "confidence": "high"
+                }),
+            ),
+            answer("Carrying on."),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("do the thing", limits(3, 2)).with_improvement_suggestions(),
+            &mut history,
+        )
+        .expect("a refused suggestion is a tool result");
+
+        assert_eq!(outcome.answer, "Carrying on.");
+        assert!(outcome.suggestions.is_empty());
+        let results = last_tool_results(&model);
+        assert!(
+            results[0].contains("Suggestion not recorded"),
+            "{}",
+            results[0]
+        );
+        assert!(results[0].contains("`category`"), "{}", results[0]);
+    }
+
+    #[test]
+    fn the_suggestion_tool_is_absent_unless_the_embedder_offers_it() {
+        let model = ScriptedModel::new([suggestion("s-1", "gh.pull-request.read")]);
+        let runtime = RecordingRuntime::new(0);
+
+        let error = run_prompt(&model, &runtime, "do the thing", None, limits(2, 2))
+            .expect_err("a tool that was never offered is unknown");
+
+        assert!(matches!(error, PromptError::UnknownTool(name) if name == IMPROVEMENT_TOOL_NAME));
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        assert!(
+            tools[0]
+                .iter()
+                .all(|tool| tool.name != IMPROVEMENT_TOOL_NAME)
+        );
+        assert!(
+            tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME),
+            "no skill tool either: the default session is exactly the pre-skills session"
+        );
     }
 }

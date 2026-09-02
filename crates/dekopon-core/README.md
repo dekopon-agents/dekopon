@@ -1,6 +1,9 @@
 # dekopon-core
 
-Validated identifiers and dependency-light domain types shared by Dekopon crates.
+Validated identifiers and dependency-light domain types shared by Dekopon crates. Among the
+identifiers, `SkillId` follows the open Agent Skills name grammar rather than Dekopon's resource
+grammar — lowercase ASCII letters, digits, and single hyphens, at most 64 bytes — so a skill
+authored for another client loads here unchanged and one authored here loads there.
 
 It also holds the small helpers that separate processes must not disagree about: the `accept()`
 retry classification with its backoff bounds, `error_chain`, which renders a failure and its sources

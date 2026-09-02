@@ -53,8 +53,11 @@ use thiserror::Error;
 
 use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
+pub mod improvement;
 pub mod meta;
 pub mod prompt;
+pub mod replay;
+pub mod skills;
 
 /// Runs each model-authored script on the interpreter under this session's dispatch.
 pub struct ShellRuntime<I> {

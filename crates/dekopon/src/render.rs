@@ -242,6 +242,7 @@ fn agent_table(agents: &[Agent], wide: bool) -> String {
             if wide {
                 row.extend([
                     agent.spec.providers.len().to_string(),
+                    agent.spec.skills.len().to_string(),
                     option_cell(agent.spec.model_class.as_deref()),
                     option_cell(agent.spec.policy_profile.as_deref()),
                 ]);
@@ -258,6 +259,7 @@ fn agent_table(agents: &[Agent], wide: bool) -> String {
                 "STATUS",
                 "CAPABILITIES",
                 "PROVIDERS",
+                "SKILLS",
                 "MODEL",
                 "POLICY",
                 "DESCRIPTION",
@@ -386,6 +388,22 @@ fn agent_description(description: &AgentDescription) -> String {
                 "  - {} [type={}]",
                 provider.metadata.name,
                 cell_text(&provider.spec.provider_type)
+            )
+        }));
+    }
+
+    // Name, trigger, and resource count rather than the text: the description is what a model
+    // matches a request against, and the body is what `read_skill` shows it on demand.
+    lines.push("Skills:".to_owned());
+    if description.skills.is_empty() {
+        lines.push("  (none)".to_owned());
+    } else {
+        lines.extend(description.skills.iter().map(|skill| {
+            format!(
+                "  - {} [{} resource file(s)]: {}",
+                skill.name(),
+                skill.resources().len(),
+                cell_text(skill.description())
             )
         }));
     }

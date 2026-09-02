@@ -431,3 +431,113 @@ fn write_config(path: &Path) {
     }
     fs::write(path, valid_documents("reviewer")).expect("fixture config");
 }
+
+/// One well-formed skill directory beside a catalog.
+fn write_skill(root: &Path, name: &str) {
+    let directory = root.join("skills").join(name);
+    fs::create_dir_all(directory.join("references")).expect("skill directory");
+    fs::write(
+        directory.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Use when asked about {name}.\n---\n# {name}\n\nDo the thing.\n"
+        ),
+    )
+    .expect("skill file");
+    fs::write(directory.join("references/notes.md"), "notes\n").expect("skill resource");
+}
+
+fn agent_with_skills(skills: &[&str]) -> String {
+    let mounted = skills
+        .iter()
+        .map(|path| format!("    - {path}\n"))
+        .collect::<String>();
+    format!(
+        r#"apiVersion: dekopon.dev/v1alpha1
+kind: Agent
+metadata:
+  name: reviewer
+spec:
+  description: Test agent
+  skills:
+{mounted}status: Ready
+"#
+    )
+}
+
+/// Skills resolve against the catalog file's directory and are read whole at load, so a session
+/// never opens a file to show a model one.
+#[test]
+fn agent_skills_are_loaded_relative_to_the_catalog() {
+    let root = tempdir().expect("temporary directory");
+    write_skill(root.path(), "pull-request-review");
+    write_skill(root.path(), "release-notes");
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        agent_with_skills(&["skills/pull-request-review", "skills/release-notes"]),
+    )
+    .expect("catalog");
+
+    let catalog = LocalCatalog::load(&catalog_path).expect("catalog with skills loads");
+    let reviewer = "reviewer".parse().expect("valid agent id");
+    let skills = catalog.agent_skills(&reviewer);
+
+    assert_eq!(
+        skills
+            .iter()
+            .map(|skill| skill.name().as_str())
+            .collect::<Vec<_>>(),
+        ["pull-request-review", "release-notes"],
+        "mount order is the authored order"
+    );
+    assert_eq!(
+        skills[0].description(),
+        "Use when asked about pull-request-review."
+    );
+    assert_eq!(skills[0].resources()[0].path, "references/notes.md");
+    let absent = "nobody".parse().expect("valid agent id");
+    assert!(catalog.agent_skills(&absent).is_empty());
+}
+
+/// Every broken skill is reported, and one bad directory does not hide a second problem.
+#[test]
+fn every_unmountable_skill_is_reported_in_one_refusal() {
+    let root = tempdir().expect("temporary directory");
+    write_skill(root.path(), "pull-request-review");
+    // A second directory carrying the first skill's name.
+    let copy = root.path().join("elsewhere").join("pull-request-review");
+    fs::create_dir_all(&copy).expect("copy directory");
+    fs::copy(
+        root.path().join("skills/pull-request-review/SKILL.md"),
+        copy.join("SKILL.md"),
+    )
+    .expect("copy skill");
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        agent_with_skills(&[
+            "skills/pull-request-review",
+            "skills/absent",
+            "elsewhere/pull-request-review",
+        ]),
+    )
+    .expect("catalog");
+
+    let error = LocalCatalog::load(&catalog_path).expect_err("broken skills refuse the catalog");
+    let reported = problems(&error);
+
+    assert_eq!(reported.len(), 2, "{error}");
+    assert!(
+        matches!(&reported[0], CatalogProblem::Skill { agent, path, .. }
+            if agent == "reviewer" && path == "skills/absent"),
+        "{error}"
+    );
+    assert!(
+        matches!(&reported[1], CatalogProblem::DuplicateSkill { name, first, duplicate, .. }
+            if name == "pull-request-review"
+                && first == "skills/pull-request-review"
+                && duplicate == "elsewhere/pull-request-review"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("could not be loaded"), "{error}");
+}

@@ -1026,6 +1026,13 @@ fn prompt_refuses_broker_connection_flags_without_the_broker_opt_in() {
 }
 
 fn read_request(listener: &TcpListener) -> (Value, TcpStream) {
+    let (_headers, body, stream) = read_http_request(listener);
+    (body, stream)
+}
+
+/// Reads one HTTP request off the listener: its header block, its JSON body, and the stream to
+/// answer on.
+fn read_http_request(listener: &TcpListener) -> (String, Value, TcpStream) {
     let (mut stream, _) = listener.accept().expect("mock endpoint accepts");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1060,7 +1067,7 @@ fn read_request(listener: &TcpListener) -> (Value, TcpStream) {
     }
     let body = &bytes[header_end..header_end + content_length];
     let value = serde_json::from_slice(body).expect("request body is JSON");
-    (value, stream)
+    (headers, value, stream)
 }
 
 fn respond(mut stream: TcpStream, body: &Value) {
@@ -1810,4 +1817,529 @@ fn chat_refuses_a_message_the_gateway_could_not_read() {
     assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("65536"), "{}", stderr(&output));
     assert!(gateway.join().expect("stub gateway completes").is_empty());
+}
+
+/// Builds one model turn calling a named tool with JSON arguments.
+fn tool_call(id: &str, name: &str, arguments: &Value) -> Value {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() }
+                }]
+            }
+        }]
+    })
+}
+
+/// The names of every tool one request offered, sorted so the assertion is order-free.
+fn tool_names(request: &Value) -> Vec<String> {
+    let mut names = request["tools"]
+        .as_array()
+        .expect("tools are an array")
+        .iter()
+        .map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .expect("tool name is a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// Every system message one request carried, in order.
+fn system_messages(request: &Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .expect("messages are an array")
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .map(|message| {
+            message["content"]
+                .as_str()
+                .expect("system content is a string")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Writes one small skill with a single reference file and returns its directory.
+fn write_skill(root: &std::path::Path, name: &str) -> PathBuf {
+    let directory = root.join(name);
+    std::fs::create_dir_all(directory.join("references")).expect("skill directory");
+    std::fs::write(
+        directory.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Counts things carefully.\n---\n\
+             # Counting\n\nAlways count twice.\n"
+        ),
+    )
+    .expect("skill file writes");
+    std::fs::write(directory.join("references/table.md"), "one two three\n")
+        .expect("skill resource writes");
+    directory
+}
+
+fn run_with_env(arguments: &[&str], variables: &[(&str, &str)]) -> Output {
+    let mut command = binary();
+    command.args(arguments);
+    for (name, value) in variables {
+        command.env(name, value);
+    }
+    command.output().expect("dekopon-run process starts")
+}
+
+#[test]
+fn prompt_mounts_skills_by_summary_and_records_suggestions_on_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let server = thread::spawn(move || {
+        let (first, first_stream) = read_request(&listener);
+        assert_eq!(
+            tool_names(&first),
+            vec![
+                "bash".to_owned(),
+                "read_skill".to_owned(),
+                "suggest_improvement".to_owned()
+            ]
+        );
+        let system = system_messages(&first);
+        assert_eq!(system.len(), 2, "{system:?}");
+        assert_eq!(system[0], "Count.");
+        assert!(
+            system[1].contains("Skills mounted for this agent")
+                && system[1].contains("counting")
+                && system[1].contains("Counts things carefully."),
+            "{}",
+            system[1]
+        );
+        // The listing is a summary: the body is not in the prompt until it is asked for.
+        assert!(!system[1].contains("Always count twice."));
+        respond(
+            first_stream,
+            &tool_call("call-1", "read_skill", &json!({"name": "counting"})),
+        );
+
+        let (second, second_stream) = read_request(&listener);
+        let body = tool_result(&second);
+        assert!(body.contains("Always count twice."), "{body}");
+        assert!(body.contains("references/table.md"), "{body}");
+        respond(
+            second_stream,
+            &tool_call(
+                "call-2",
+                "read_skill",
+                &json!({"name": "counting", "resource": "references/table.md"}),
+            ),
+        );
+
+        let (third, third_stream) = read_request(&listener);
+        let latest = third["messages"]
+            .as_array()
+            .expect("messages are an array")
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("resource result is returned")
+            .to_owned();
+        assert!(latest.contains("one two three"), "{latest}");
+        respond(
+            third_stream,
+            &tool_call(
+                "call-3",
+                "suggest_improvement",
+                &json!({
+                    "category": "skill",
+                    "target": "counting",
+                    "summary": "Add a worked example",
+                    "evidence": "The reference table has no example row",
+                    "proposal": "Add one three-row example under references/",
+                    "confidence": "medium"
+                }),
+            ),
+        );
+
+        let (fourth, fourth_stream) = read_request(&listener);
+        let recorded = fourth["messages"]
+            .as_array()
+            .expect("messages are an array")
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("suggestion result is returned")
+            .to_owned();
+        assert!(
+            recorded.contains("Recorded suggestion 1 of 3"),
+            "{recorded}"
+        );
+        respond(fourth_stream, &final_answer("Counted."));
+    });
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let skill = write_skill(directory.path(), "counting");
+    let provider = provider_path();
+    let endpoint = format!("http://{address}/v1");
+    let output = run(&[
+        "prompt",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "--system",
+        "Count.",
+        "--skill",
+        skill.to_str().expect("UTF-8 skill path"),
+        "--suggestions",
+        "Count things",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout UTF-8"),
+        "Counted.\n"
+    );
+    assert!(
+        errors.contains("suggestion 1/1 [skill, medium confidence] counting: Add a worked example"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("proposal: Add one three-row example"),
+        "{errors}"
+    );
+    server.join().expect("mock endpoint completes");
+}
+
+#[test]
+fn an_unmountable_skill_is_refused_before_any_model_call() {
+    // A port nothing listens on: reaching the model would fail with a different message.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve an unused local port");
+    let address = listener.local_addr().expect("reserved address");
+    drop(listener);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("no-such-skill");
+    let provider = provider_path();
+    let endpoint = format!("http://{address}/v1");
+
+    let output = run(&[
+        "prompt",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--skill",
+        missing.to_str().expect("UTF-8 path"),
+        "Count things",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let errors = stderr(&output);
+    assert!(errors.contains("could not be mounted"), "{errors}");
+}
+
+/// One recorded session as `session show --json` prints it: a system message, one script
+/// answered with recorded output, and a final answer.
+fn recorded_session(script: &str) -> Value {
+    json!({
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "system": ["Be brief."],
+        "history": [],
+        "prompt": "Upcase hello",
+        "turns": [
+            {
+                "turn": 1,
+                "toolCalls": [{
+                    "id": "call-1",
+                    "name": "bash",
+                    "arguments": json!({"script": script}).to_string(),
+                    "result": "HELLO\n[exit code: 0]"
+                }],
+                "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+                "durationMs": 12.0
+            },
+            {
+                "turn": 2,
+                "content": "The script printed HELLO.",
+                "toolCalls": [],
+                "usage": {"inputTokens": 20, "outputTokens": 6, "totalTokens": 26},
+                "durationMs": 3.0
+            }
+        ],
+        "answer": "The script printed HELLO."
+    })
+}
+
+#[test]
+fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
+    let script = "echo.upcase --message hello | jq -r .message";
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let transcript = directory.path().join("session.json");
+    std::fs::write(
+        &transcript,
+        serde_json::to_vec(&recorded_session(script)).expect("transcript serializes"),
+    )
+    .expect("transcript writes");
+    let transcript_path = transcript.to_str().expect("UTF-8 path");
+
+    let shown = run(&["session", "show", "--from-file", transcript_path]);
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    let text = String::from_utf8(shown.stdout).expect("stdout UTF-8");
+    for expected in [
+        "trace: 4bf92f3577b34da6a3ce929d0e0e4736",
+        "system:\n    Be brief.",
+        "user:\n    Upcase hello",
+        "turn 1 [12 ms, 15 tokens]:",
+        "  script:\n    echo.upcase --message hello | jq -r .message",
+        "  output:\n    HELLO\n    [exit code: 0]",
+        "answer:\n    The script printed HELLO.",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+
+    let shown_json = run(&["session", "show", "--from-file", transcript_path, "--json"]);
+    assert_eq!(shown_json.status.code(), Some(0), "{}", stderr(&shown_json));
+    let round_trip: Value = serde_json::from_slice(&shown_json.stdout).expect("JSON transcript");
+    assert_eq!(round_trip, recorded_session(script));
+
+    // On the recorded trajectory the script is answered from the recording: no provider is
+    // loaded, and the tool result is byte-for-byte what was recorded.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let recorded_script = script.to_owned();
+    let server = thread::spawn(move || {
+        let (first, first_stream) = read_request(&listener);
+        assert_eq!(system_messages(&first), vec!["Be terse.".to_owned()]);
+        let last_user = first["messages"]
+            .as_array()
+            .expect("messages are an array")
+            .iter()
+            .rfind(|message| message["role"] == "user")
+            .expect("the recorded prompt is replayed");
+        assert_eq!(last_user["content"], "Upcase hello");
+        respond(first_stream, &bash_tool_call("replay-1", &recorded_script));
+
+        let (second, second_stream) = read_request(&listener);
+        assert_eq!(tool_result(&second), "HELLO\n[exit code: 0]");
+        respond(second_stream, &final_answer("HELLO, tersely."));
+    });
+    let endpoint = format!("http://{address}/v1");
+    let replayed = run(&[
+        "session",
+        "replay",
+        "--from-file",
+        transcript_path,
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "--system",
+        "Be terse.",
+        "--json",
+    ]);
+    server.join().expect("mock endpoint completes");
+    assert_eq!(replayed.status.code(), Some(0), "{}", stderr(&replayed));
+    let report: Value = serde_json::from_slice(&replayed.stdout).expect("report is JSON");
+    assert_eq!(report["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(report["divergence"], Value::Null);
+    assert_eq!(report["recorded"]["scripts"], json!([script]));
+    assert_eq!(report["replayed"]["scripts"], json!([script]));
+    assert_eq!(report["recorded"]["answer"], "The script printed HELLO.");
+    assert_eq!(report["replayed"]["answer"], "HELLO, tersely.");
+    assert_eq!(report["recorded"]["usage"]["totalTokens"], 41);
+
+    // Off the recorded trajectory, with no provider supplied, the replay stops and says where.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let server = thread::spawn(move || {
+        let (_first, first_stream) = read_request(&listener);
+        respond(
+            first_stream,
+            &bash_tool_call("replay-1", "echo.downcase --message HELLO"),
+        );
+    });
+    let endpoint = format!("http://{address}/v1");
+    let diverged = run(&[
+        "session",
+        "replay",
+        "--from-file",
+        transcript_path,
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+    ]);
+    server.join().expect("mock endpoint completes");
+    assert_eq!(diverged.status.code(), Some(0), "{}", stderr(&diverged));
+    let text = String::from_utf8(diverged.stdout).expect("stdout UTF-8");
+    assert!(
+        text.contains("divergence: turn 1 (stopped there), 1 recorded script(s) unused"),
+        "{text}"
+    );
+    assert!(text.contains("echo.downcase --message HELLO"), "{text}");
+    assert!(text.contains("answer (replayed): (none)"), "{text}");
+}
+
+#[test]
+fn session_list_and_show_query_the_receiver_with_a_named_credential() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock receiver binds");
+    let address = listener.local_addr().expect("mock receiver address");
+    let script = "posts.count | jq .n";
+    let server = thread::spawn(move || {
+        let (headers, first, first_stream) = read_http_request(&listener);
+        let header_lines = headers.lines().collect::<Vec<_>>();
+        assert!(
+            header_lines[0].starts_with("POST /api/default/_search?type=logs "),
+            "{headers}"
+        );
+        assert!(
+            header_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Basic dGVzdA==")),
+            "{headers}"
+        );
+        let sql = first["query"]["sql"].as_str().expect("SQL is a string");
+        assert!(sql.contains("FROM \"dekopon\""), "{sql}");
+        assert!(
+            sql.contains("audit_event = 'accounting.model.turn'"),
+            "{sql}"
+        );
+        assert!(first["query"]["start_time"].as_i64().is_some());
+        assert_eq!(first["query"]["from"], 0);
+        respond(
+            first_stream,
+            &json!({"hits": [
+                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1,
+                 "_timestamp": 1_756_000_000_000_000_i64, "usage_total_tokens": 12,
+                 "answer_present": false, "outcome": "succeeded", "service_name": "dekopon-run"},
+                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2,
+                 "_timestamp": 1_756_000_001_000_000_i64, "usage_total_tokens": 8,
+                 "answer_present": true, "outcome": "succeeded", "service_name": "dekopon-run"},
+                {"trace_id": "older", "audit_event": "accounting.model.turn", "model_turn": 1,
+                 "_timestamp": 1_755_000_000_000_000_i64, "outcome": "failed"}
+            ]}),
+        );
+
+        let (_headers, second, second_stream) = read_http_request(&listener);
+        let sql = second["query"]["sql"].as_str().expect("SQL is a string");
+        assert_eq!(sql, "SELECT * FROM \"dekopon\" WHERE trace_id = 'newer'");
+        let call = json!([{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]);
+        let delta = json!([
+            {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]},
+            {"role": "tool", "content": "42\n[exit code: 0]", "tool_call_id": "call-1"}
+        ]);
+        respond(
+            second_stream,
+            &json!({"hits": [
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 1, "transcript_scope": "full",
+                 "messages": json!([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "How many posts?"}]).to_string()},
+                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1, "duration_ms": 12.5, "usage_total_tokens": 12},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 1, "answer": "", "tool_calls": call.to_string()},
+                {"trace_id": "newer", "audit_event": "agent.tool.script", "model_turn": 1, "tool_call_index": 1, "script": script},
+                {"trace_id": "newer", "audit_event": "agent.tool.output", "model_turn": 1, "tool_call_index": 1, "output": "42\n[exit code: 0]"},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 2, "answer": "There are 42 posts.", "tool_calls": "[]"},
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 2, "transcript_scope": "delta", "messages": delta.to_string()},
+                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2, "duration_ms": 7, "usage_total_tokens": 8}
+            ]}),
+        );
+    });
+    let url = format!("http://{address}/api/default");
+    let credential = [("DEKOPON_OPENOBSERVE_AUTHORIZATION", "Basic dGVzdA==")];
+
+    let listed = run_with_env(
+        &[
+            "session",
+            "list",
+            "--openobserve-url",
+            &url,
+            "--since",
+            "24h",
+            "--json",
+        ],
+        &credential,
+    );
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    let sessions: Value = serde_json::from_slice(&listed.stdout).expect("listing is JSON");
+    assert_eq!(
+        sessions,
+        json!([
+            {"traceId": "newer", "service": "dekopon-run", "startedUs": 1_756_000_000_000_000_i64,
+             "endedUs": 1_756_000_001_000_000_i64, "modelTurns": 2, "totalTokens": 20,
+             "failed": false, "answered": true},
+            {"traceId": "older", "service": null, "startedUs": 1_755_000_000_000_000_i64,
+             "endedUs": 1_755_000_000_000_000_i64, "modelTurns": 1, "totalTokens": null,
+             "failed": true, "answered": false}
+        ])
+    );
+
+    let shown = run_with_env(
+        &[
+            "session",
+            "show",
+            "--trace-id",
+            "newer",
+            "--openobserve-url",
+            &url,
+        ],
+        &credential,
+    );
+    server.join().expect("mock receiver completes");
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    let text = String::from_utf8(shown.stdout).expect("stdout UTF-8");
+    assert!(text.contains("trace: newer"), "{text}");
+    assert!(
+        text.contains("  script:\n    posts.count | jq .n"),
+        "{text}"
+    );
+    assert!(text.contains("answer:\n    There are 42 posts."), "{text}");
+
+    // The credential is read by name, never from an argument, and its absence is the failure.
+    let unauthenticated = run(&["session", "list", "--openobserve-url", &url]);
+    assert_eq!(unauthenticated.status.code(), Some(1));
+    assert!(
+        stderr(&unauthenticated).contains("DEKOPON_OPENOBSERVE_AUTHORIZATION is not set"),
+        "{}",
+        stderr(&unauthenticated)
+    );
+    let unaddressed = run_with_env(&["session", "list"], &credential);
+    assert_eq!(unaddressed.status.code(), Some(1));
+    assert!(
+        stderr(&unaddressed).contains("pass --openobserve-url or set DEKOPON_OPENOBSERVE_URL"),
+        "{}",
+        stderr(&unaddressed)
+    );
+    let unparseable = run_with_env(
+        &[
+            "session",
+            "list",
+            "--openobserve-url",
+            &url,
+            "--since",
+            "soon",
+        ],
+        &credential,
+    );
+    assert_eq!(unparseable.status.code(), Some(1));
+    assert!(
+        stderr(&unparseable).contains("count followed by s, m, h, or d"),
+        "{}",
+        stderr(&unparseable)
+    );
 }

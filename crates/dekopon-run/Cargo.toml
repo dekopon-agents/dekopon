@@ -18,6 +18,9 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 clap.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
+# `prompt --skill` and `session replay --skill` read skill directories with the catalog's loader;
+# the runner still has no catalog concept.
+dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-provider-host.workspace = true
@@ -34,6 +37,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-chrome.workspace = true
 tracing-subscriber.workspace = true
+# The OpenObserve search client behind `session`, on the same HTTP stack the model clients use.
+# RFC 3339 rendering of the timestamps `session list` reads back.
+time.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }

@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use thiserror::Error;
 
+pub mod skill;
+
+pub use skill::{Skill, SkillError, SkillResource, load_skill};
+
 /// Environment variable used for an explicit configuration path.
 pub const CONFIG_ENV: &str = "DEKOPON_CONFIG";
 
@@ -29,6 +33,11 @@ pub struct LocalCatalog {
     agents: BTreeMap<AgentId, Agent>,
     capabilities: BTreeMap<CapabilityId, Capability>,
     providers: BTreeMap<ProviderId, Provider>,
+    /// Every agent's mounted skills, in the order its `spec.skills` names them.
+    ///
+    /// Read once here, at load, so a session never touches the filesystem to show a model a
+    /// skill, and so a skill that cannot be read refuses the catalog instead of a session.
+    skills: BTreeMap<AgentId, Vec<Skill>>,
 }
 
 impl LocalCatalog {
@@ -107,6 +116,11 @@ impl LocalCatalog {
         if !incomplete {
             validate_references(&agents, &capabilities, &providers, &mut problems);
         }
+        // Skills reference files rather than other resources, so an agent that decoded can have
+        // its skills checked whatever happened to the rest of the catalog. Relative paths resolve
+        // against the catalog file's own directory, the rule `dekopond` applies to its own paths.
+        let base = source.parent().map(Path::to_path_buf).unwrap_or_default();
+        let skills = load_agent_skills(&agents, &base, &mut problems);
 
         if !problems.is_empty() {
             return Err(ConfigError::Invalid {
@@ -120,6 +134,7 @@ impl LocalCatalog {
             agents: agents.into_map(),
             capabilities: capabilities.into_map(),
             providers: providers.into_map(),
+            skills,
         })
     }
 
@@ -160,6 +175,15 @@ impl LocalCatalog {
     #[must_use]
     pub fn provider(&self, id: &ProviderId) -> Option<&Provider> {
         self.providers.get(id)
+    }
+
+    /// The skills one agent mounts, in the order its `spec.skills` names them.
+    ///
+    /// Empty for an agent that mounts none and for an identifier the catalog does not declare;
+    /// [`Self::agent`] is the question "does this agent exist".
+    #[must_use]
+    pub fn agent_skills(&self, id: &AgentId) -> &[Skill] {
+        self.skills.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Creates an owned, serializable view for `dekopon config view`.
@@ -383,6 +407,60 @@ fn validate_references(
             });
         }
     }
+}
+
+/// Reads every skill every agent names, reporting each one that cannot be mounted.
+///
+/// Every problem is collected rather than the first returned, for the reason the reference checks
+/// above scan the whole catalog: an operator with three broken skills fixes three and validates
+/// once. A skill that fails still leaves the agent's other skills checked, and two agents naming
+/// one directory read it twice rather than sharing a cache, because the catalog is loaded once per
+/// process and a skill directory is small.
+fn load_agent_skills(
+    agents: &ResourceSet<Agent>,
+    base: &Path,
+    problems: &mut Vec<CatalogProblem>,
+) -> BTreeMap<AgentId, Vec<Skill>> {
+    let mut mounted = BTreeMap::new();
+    for (agent_id, agent) in agents.iter() {
+        if agent.spec.skills.is_empty() {
+            continue;
+        }
+        let mut skills = Vec::with_capacity(agent.spec.skills.len());
+        let mut names = BTreeMap::new();
+        for path in &agent.spec.skills {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                base.join(path)
+            };
+            let skill = match skill::load_skill(&resolved) {
+                Ok(skill) => skill,
+                Err(source) => {
+                    problems.push(CatalogProblem::Skill {
+                        agent: agent_id.to_string(),
+                        path: path.display().to_string(),
+                        source: Box::new(source),
+                    });
+                    continue;
+                }
+            };
+            // Two directories carrying one name would give a model two `read_skill` targets it
+            // cannot tell apart, so the second is refused rather than shadowing the first.
+            if let Some(first) = names.insert(skill.name().clone(), path.display().to_string()) {
+                problems.push(CatalogProblem::DuplicateSkill {
+                    agent: agent_id.to_string(),
+                    name: skill.name().to_string(),
+                    first,
+                    duplicate: path.display().to_string(),
+                });
+                continue;
+            }
+            skills.push(skill);
+        }
+        mounted.insert(agent_id.clone(), skills);
+    }
+    mounted
 }
 
 /// Inputs used to resolve the configuration discovery precedence.
@@ -673,6 +751,31 @@ pub enum CatalogProblem {
         agent: String,
         /// Unreachable provider name.
         provider: String,
+    },
+    /// An agent named a skill directory that could not be mounted.
+    #[error("agent {agent:?} mounts skill {path:?}, which could not be loaded: {source}")]
+    Skill {
+        /// Agent name.
+        agent: String,
+        /// The authored skill path.
+        path: String,
+        /// Why the directory was refused, naming the file.
+        #[source]
+        source: Box<SkillError>,
+    },
+    /// An agent mounted two directories carrying one skill name.
+    #[error(
+        "agent {agent:?} mounts skill {name:?} twice, at {first:?} and {duplicate:?}; a model could not tell them apart"
+    )]
+    DuplicateSkill {
+        /// Agent name.
+        agent: String,
+        /// The repeated skill name.
+        name: String,
+        /// The first path carrying it.
+        first: String,
+        /// The second path carrying it.
+        duplicate: String,
     },
 }
 

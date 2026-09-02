@@ -114,6 +114,20 @@ fn example_encodes_the_review_authority_boundary() {
     assert!(!rendered.contains("github.pull-request.approve"));
 }
 
+/// A mounted skill is described by name, file count, and summary; its text stays in the file.
+#[test]
+fn example_describes_the_reviewer_skill_without_its_body() {
+    let description = run_example(&["describe", "agent", "reviewer"]);
+    let rendered = stdout(&description);
+
+    assert!(rendered.contains("Skills:"), "{rendered}");
+    assert!(
+        rendered.contains("pull-request-review [1 resource file(s)]"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("## "), "{rendered}");
+}
+
 #[test]
 fn config_view_is_canonical_and_machine_readable() {
     let output = run_example(&["config", "view", "--output", "json"]);

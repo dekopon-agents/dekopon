@@ -69,6 +69,11 @@ spec:
   instructions: >-
     Read the pull request, summarize the risky changes, and leave one review comment.
     Never claim to have approved anything.
+  # Skill directories, resolved relative to this file. Each holds a SKILL.md whose name and
+  # description the model sees in its instructions; it reads the rest on demand. Skill text is
+  # untrusted model text exactly as `instructions` is, and grants nothing.
+  skills:
+    - skills/pull-request-review
   capabilities:
     - github.pull-request.read
     - github.pull-request.comment

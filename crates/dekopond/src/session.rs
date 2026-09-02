@@ -16,7 +16,7 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
-    meta::{AgentConfigView, ConversationConfigView, SessionConfigView},
+    meta::{AgentConfigView, ConversationConfigView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
         ReplyDisposition, SessionInputs, run_prompt_session,
@@ -726,6 +726,7 @@ async fn session(
         &route.description,
         route.model_class.as_deref(),
         route.instructions.as_deref(),
+        &route.skills,
         route.limits,
         route.conversation,
         &leg,
@@ -858,6 +859,9 @@ async fn session(
         .thread_continuation
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
+    // Shared with the route rather than cloned: the skill text is read once at startup.
+    let skills = Arc::clone(&route.skills);
+    let improvement_suggestions = route.improvement_suggestions;
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Resolved before the accumulator exists, so a model client that cannot be constructed
@@ -881,6 +885,7 @@ async fn session(
         let generated_image = GeneratedImageOutput::default();
         let mut inputs = SessionInputs::new(&text, limits)
             .with_system(instructions.as_deref())
+            .with_skills(&skills)
             .with_options(&options)
             .with_assets(&assets)
             .with_usage_observer(observed_usage.as_ref())
@@ -888,6 +893,9 @@ async fn session(
             .with_cancellation(&prompt_cancellation);
         if let Some(generator) = image_generator.as_deref() {
             inputs = inputs.with_image_generation(generator, &generated_image);
+        }
+        if improvement_suggestions {
+            inputs = inputs.with_improvement_suggestions();
         }
         if reply_optional {
             inputs = inputs.with_optional_reply();
@@ -1036,11 +1044,16 @@ fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
 /// Deliberately takes no [`ModelConfig`], broker configuration, transport message, subject, or
 /// principal. Those are exactly the places credentials, endpoints, paths, and identity live, and a
 /// constructor that cannot receive them is stronger than one expected to remember to redact them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is one catalog or route fact the view names; bundling them would hide which fact a caller forgot"
+)]
 fn agent_config_view(
     agent: &str,
     description: &str,
     model_class: Option<&str>,
     instructions: Option<&str>,
+    skills: &[dekopon_config::Skill],
     limits: dekopon_agent::prompt::PromptLimits,
     conversation: ConversationPolicy,
     leg: &BrokerLeg,
@@ -1064,6 +1077,20 @@ fn agent_config_view(
             conversation,
         },
         leg.effective_capabilities(),
+    )
+    .with_skills(
+        skills
+            .iter()
+            .map(|skill| SkillView {
+                name: skill.name().to_string(),
+                description: skill.description().to_owned(),
+                resources: skill
+                    .resources()
+                    .iter()
+                    .map(|resource| resource.path.clone())
+                    .collect(),
+            })
+            .collect(),
     )
 }
 

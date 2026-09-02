@@ -12,19 +12,25 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use dekopon_agent::{BrokerLeg, BrokerLegError};
 use dekopon_agent::{
     SessionInvoker, ShellRuntime,
-    prompt::{PromptError, PromptLimits, format_script_outcome, run_prompt},
+    improvement::ImprovementSuggestion,
+    prompt::{PromptError, PromptLimits, ScriptRuntime, SessionInputs, format_script_outcome},
+    replay::{
+        RecordedSession, RecordedToolCall, RecordingError, ReplayInputs, ReplayReport,
+        SessionListing, list_sessions, replay,
+    },
 };
 #[cfg(unix)]
 use dekopon_broker_protocol::BrokerSocketDiscovery;
 #[cfg(unix)]
 use dekopon_broker_protocol::{BrokerClient, ClientError, InvocationOutcome, InvocationRequest};
+use dekopon_config::{Skill, SkillError};
 #[cfg(unix)]
 use dekopon_core::IdentifierError;
 use dekopon_core::{CapabilityId, ExternalSubject, ProviderId};
@@ -43,14 +49,28 @@ use dekopon_shell::{
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::Instrument as _;
 
-use crate::cli::{BrokerCommand, BrokerConnectionArgs, Cli, Command, LimitArgs, ShellLimitArgs};
+use crate::{
+    cli::{
+        BrokerCommand, BrokerConnectionArgs, Cli, Command, LimitArgs, ModelArgs, ObserveArgs,
+        ProviderArgs, SessionCommand, SessionSourceArgs, ShellLimitArgs,
+    },
+    observe::{ObserveError, OpenObserveClient, OpenObserveSettings},
+};
 
 #[cfg(unix)]
 mod chat;
 pub mod cli;
+mod observe;
 mod trace;
+
+/// Bytes a transcript file or a `--system-file` may occupy.
+///
+/// A transcript is bounded by the prompt loop's own history and output ceilings, and a standing
+/// instruction by a model's context; a file past this is not one of either.
+const MAX_TEXT_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The prompt loop and session types now live in `dekopon-agent`; this re-export keeps the
 /// `dekopon_run::prompt` path stable for existing consumers and tests.
@@ -145,6 +165,15 @@ fn command_name(command: &Command) -> &'static str {
         Command::Broker {
             command: BrokerCommand::Invoke { .. },
         } => "broker.invoke",
+        Command::Session {
+            command: SessionCommand::List { .. },
+        } => "session.list",
+        Command::Session {
+            command: SessionCommand::Show { .. },
+        } => "session.show",
+        Command::Session {
+            command: SessionCommand::Replay { .. },
+        } => "session.replay",
         Command::Chat { .. } => "chat",
     }
 }
@@ -312,21 +341,16 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
             connection,
             curl_capability,
             model,
-            chatgpt_subscription,
-            chatgpt_auth_file,
-            endpoint,
-            api_key_env,
             system,
+            skill,
+            suggestions,
             max_steps,
-            model_timeout_ms,
             prompt,
         } => {
-            let backend = if *chatgpt_subscription {
-                "chatgpt-subscription"
-            } else {
-                "openai-compatible"
-            };
             let components = providers.components()?;
+            // Read before any model call, so a skill that does not load is a usage failure
+            // naming the directory rather than a session that ran without it.
+            let skills = load_skills(skill)?;
             let settings = PromptSettings {
                 limits: host_limits(limits),
                 options: providers.host_options(),
@@ -334,13 +358,10 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 curl_capability: curl_capability.as_ref().map(CapabilityId::to_string),
                 providers: components.clone(),
                 model: model.clone(),
-                chatgpt_subscription: *chatgpt_subscription,
-                chatgpt_auth_file: chatgpt_auth_file.clone(),
-                endpoint: endpoint.clone(),
-                api_key_env: api_key_env.clone(),
                 system: system.clone(),
+                skills,
+                suggestions: *suggestions,
                 prompt: prompt.clone(),
-                model_timeout: Duration::from_millis(*model_timeout_ms),
                 prompt_limits: PromptLimits {
                     max_steps: max_steps.get(),
                     max_capability_calls: shell.shell_max_capability_calls,
@@ -350,13 +371,16 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                 .instrument(tracing::info_span!(
                     "runner.prompt",
                     provider.count = components.len(),
-                    model = %model,
-                    model.backend = backend,
+                    model = %model.model,
+                    model.backend = model_backend(model),
                     prompt.max_steps = max_steps.get(),
-                    prompt.broker = *broker
+                    prompt.broker = *broker,
+                    prompt.skills = skill.len(),
+                    prompt.suggestions = *suggestions
                 ))
                 .await
         }
+        Command::Session { command } => evaluate_session(command).await,
         Command::Chat {
             gateway,
             subject,
@@ -518,15 +542,85 @@ struct PromptSettings {
     shell: ShellLimits,
     curl_capability: Option<String>,
     providers: Vec<PathBuf>,
-    model: String,
-    chatgpt_subscription: bool,
-    chatgpt_auth_file: Option<PathBuf>,
-    endpoint: String,
-    api_key_env: String,
+    model: ModelArgs,
     system: Option<String>,
+    skills: Vec<Skill>,
+    suggestions: bool,
     prompt: String,
-    model_timeout: Duration,
     prompt_limits: PromptLimits,
+}
+
+/// Stable label for which model backend a set of model arguments selects.
+fn model_backend(model: &ModelArgs) -> &'static str {
+    if model.chatgpt_subscription {
+        "chatgpt-subscription"
+    } else {
+        "openai-compatible"
+    }
+}
+
+/// Builds the model client the arguments select. Reads the bearer token, so it runs once per
+/// command and never on a runtime worker.
+fn build_model(model: &ModelArgs) -> Result<Box<dyn ChatModel>, AppError> {
+    let timeout = Duration::from_millis(model.model_timeout_ms);
+    if model.chatgpt_subscription {
+        return Ok(Box::new(ChatGptCodexModel::new(
+            &model.model,
+            model.chatgpt_auth_file.as_deref(),
+            timeout,
+        )?));
+    }
+    let bearer_token = read_optional_secret(&model.api_key_env)?;
+    Ok(Box::new(OpenAiChatModel::new(
+        &model.endpoint,
+        &model.model,
+        bearer_token,
+        timeout,
+    )?))
+}
+
+/// Reads every `--skill` directory, in order, before a session starts.
+fn load_skills(directories: &[PathBuf]) -> Result<Vec<Skill>, AppError> {
+    let mut skills = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let skill = dekopon_config::load_skill(directory).map_err(AppError::Skill)?;
+        if skills
+            .iter()
+            .any(|loaded: &Skill| loaded.name() == skill.name())
+        {
+            return Err(AppError::DuplicateSkill {
+                name: skill.name().to_string(),
+            });
+        }
+        skills.push(skill);
+    }
+    Ok(skills)
+}
+
+/// Prints the suggestions a session recorded, for the operator who asked for them.
+///
+/// Standard error rather than standard output: the answer is the command's output, and a script
+/// capturing it must not find a suggestion appended to the model's text.
+fn report_suggestions(suggestions: &[ImprovementSuggestion]) {
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        eprintln!(
+            "suggestion {}/{} [{}, {} confidence] {}: {}",
+            index + 1,
+            suggestions.len(),
+            suggestion.category,
+            suggestion.confidence,
+            suggestion.target,
+            suggestion.summary
+        );
+        eprintln!(
+            "  evidence: {}",
+            suggestion.evidence.replace('\n', "\n            ")
+        );
+        eprintln!(
+            "  proposal: {}",
+            suggestion.proposal.replace('\n', "\n            ")
+        );
+    }
 }
 
 /// Runs one prompt session, bridging the synchronous loop onto a blocking task.
@@ -558,6 +652,7 @@ async fn evaluate_prompt(
     .await
     .map_err(AppError::PromptTask)??;
 
+    report_suggestions(&outcome.suggestions);
     Ok(CommandOutput::success(outcome.answer))
 }
 
@@ -571,21 +666,7 @@ fn run_prompt_session(
         settings.limits,
         &settings.options,
     )?;
-    let model: Box<dyn ChatModel> = if settings.chatgpt_subscription {
-        Box::new(ChatGptCodexModel::new(
-            &settings.model,
-            settings.chatgpt_auth_file.as_deref(),
-            settings.model_timeout,
-        )?)
-    } else {
-        let bearer_token = read_optional_secret(&settings.api_key_env)?;
-        Box::new(OpenAiChatModel::new(
-            &settings.endpoint,
-            &settings.model,
-            bearer_token,
-            settings.model_timeout,
-        )?)
-    };
+    let model = build_model(&settings.model)?;
     let runtime = ShellRuntime {
         invoker: SessionInvoker {
             direct: RegistryInvoker {
@@ -597,14 +678,490 @@ fn run_prompt_session(
         curl_capability: settings.curl_capability,
     };
 
-    run_prompt(
-        model.as_ref(),
-        &runtime,
-        &settings.prompt,
-        settings.system.as_deref(),
-        settings.prompt_limits,
-    )
-    .map_err(AppError::from)
+    let mut inputs = SessionInputs::new(&settings.prompt, settings.prompt_limits)
+        .with_system(settings.system.as_deref())
+        .with_skills(&settings.skills);
+    if settings.suggestions {
+        inputs = inputs.with_improvement_suggestions();
+    }
+    // A one-shot session starts from an empty conversation and forgets it on the way out; the
+    // accumulator exists only because the loop records into one.
+    let mut history = prompt::History::default();
+    prompt::run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+        .map_err(AppError::from)
+}
+
+/// Reads sessions back from the receiver, or from a transcript file, and replays one.
+///
+/// Every search is a blocking HTTP round trip and a replay is a whole model session, so both run
+/// on the blocking pool for the reason a prompt session does.
+async fn evaluate_session(command: &SessionCommand) -> Result<CommandOutput, AppError> {
+    match command {
+        SessionCommand::List {
+            observe,
+            since,
+            limit,
+            json,
+        } => {
+            let client = observe_client(observe)?;
+            let (start_us, end_us) = search_window(parse_since(since)?)?;
+            let span = tracing::info_span!("runner.session.list", session.limit = *limit);
+            let result = tokio::task::spawn_blocking(move || {
+                let _entered = span.enter();
+                client.search(&client.accounting_sql(), start_us, end_us)
+            })
+            .await
+            .map_err(AppError::ObserveTask)??;
+            warn_if_truncated(result.truncated);
+            let mut sessions = list_sessions(&result.hits);
+            sessions.truncate(*limit);
+            if *json {
+                serde_json::to_string_pretty(&sessions)
+                    .map(CommandOutput::success)
+                    .map_err(AppError::Serialize)
+            } else {
+                Ok(CommandOutput::success(render_session_table(&sessions)))
+            }
+        }
+        SessionCommand::Show { source, json } => {
+            let recorded = load_recorded(source).await?;
+            if *json {
+                serde_json::to_string_pretty(&recorded)
+                    .map(CommandOutput::success)
+                    .map_err(AppError::Serialize)
+            } else {
+                Ok(CommandOutput::success(render_transcript(&recorded)))
+            }
+        }
+        SessionCommand::Replay {
+            source,
+            model,
+            system,
+            system_file,
+            skill,
+            suggestions,
+            provider,
+            compile_cache,
+            limits,
+            shell,
+            max_steps,
+            json,
+        } => {
+            let recorded = load_recorded(source).await?;
+            let system = match (system, system_file) {
+                (Some(text), _) => Some(text.clone()),
+                (None, Some(path)) => Some(read_text_file(path)?),
+                (None, None) => None,
+            };
+            let skills = load_skills(skill)?;
+            let providers = ProviderArgs {
+                provider: provider.clone(),
+                compile_cache: compile_cache.clone(),
+            };
+            let components = providers.components()?;
+            let settings = ReplaySettings {
+                recorded,
+                model: model.clone(),
+                system,
+                skills,
+                suggestions: *suggestions,
+                components,
+                host_limits: host_limits(limits),
+                host_options: providers.host_options(),
+                shell: shell_limits(shell),
+                prompt_limits: PromptLimits {
+                    max_steps: max_steps.get(),
+                    max_capability_calls: shell.shell_max_capability_calls,
+                },
+            };
+            let span = tracing::info_span!(
+                "runner.session.replay",
+                model = %model.model,
+                model.backend = model_backend(model),
+                provider.count = settings.components.len(),
+                prompt.max_steps = max_steps.get(),
+                prompt.skills = skill.len(),
+                prompt.suggestions = *suggestions,
+                replay.system_replaced = settings.system.is_some()
+            );
+            let report = tokio::task::spawn_blocking(move || {
+                let _entered = span.enter();
+                run_replay(settings)
+            })
+            .await
+            .map_err(AppError::PromptTask)??;
+            report_suggestions(&report.suggestions);
+            // A replay that stopped at a divergence did its job; one whose session failed for
+            // any other reason still prints the comparison, and the exit code says it failed.
+            let exit_code = i32::from(report.error.is_some());
+            let text = if *json {
+                serde_json::to_string_pretty(&report).map_err(AppError::Serialize)?
+            } else {
+                render_replay(&report)
+            };
+            Ok(CommandOutput { text, exit_code })
+        }
+    }
+}
+
+/// Everything one replay needs, gathered before the blocking handoff.
+struct ReplaySettings {
+    recorded: RecordedSession,
+    model: ModelArgs,
+    system: Option<String>,
+    skills: Vec<Skill>,
+    suggestions: bool,
+    components: Vec<PathBuf>,
+    host_limits: HostLimits,
+    host_options: HostOptions,
+    shell: ShellLimits,
+    prompt_limits: PromptLimits,
+}
+
+/// Builds the model, loads any live providers, and replays. Blocking throughout.
+fn run_replay(settings: ReplaySettings) -> Result<ReplayReport, AppError> {
+    let model = build_model(&settings.model)?;
+    // Providers are loaded only when named: the default replay must be provably effect-free, and
+    // a loaded component is a thing that can run.
+    let registry = if settings.components.is_empty() {
+        None
+    } else {
+        Some(ProviderRegistry::load_with_options(
+            settings.components,
+            settings.host_limits,
+            &settings.host_options,
+        )?)
+    };
+    let live = registry.as_ref().map(|registry| ShellRuntime {
+        invoker: RegistryInvoker { registry },
+        limits: settings.shell,
+        // Direct mode cannot speak HTTP, so there is no capability for `curl` to assemble for.
+        curl_capability: None,
+    });
+    let inputs = ReplayInputs {
+        system: settings.system.as_deref(),
+        skills: &settings.skills,
+        improvement_suggestions: settings.suggestions,
+        live: live
+            .as_ref()
+            .map(|runtime| runtime as &(dyn ScriptRuntime + Sync)),
+        limits: settings.prompt_limits,
+    };
+    Ok(replay(model.as_ref(), &settings.recorded, inputs))
+}
+
+/// Loads one recorded session from a transcript file or from the receiver.
+async fn load_recorded(source: &SessionSourceArgs) -> Result<RecordedSession, AppError> {
+    if let Some(path) = &source.from_file {
+        let text = read_text_file(path)?;
+        return serde_json::from_str(&text).map_err(|error| AppError::ParseRecording {
+            path: path.clone(),
+            source: error,
+        });
+    }
+    let trace_id = source
+        .trace_id
+        .clone()
+        .expect("Clap requires --trace-id unless --from-file is present");
+    let client = observe_client(&source.observe)?;
+    let sql = client.trace_sql(&trace_id)?;
+    let (start_us, end_us) = search_window(parse_since(&source.since)?)?;
+    let span = tracing::info_span!("runner.session.fetch");
+    let result = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        client.search(&sql, start_us, end_us)
+    })
+    .await
+    .map_err(AppError::ObserveTask)??;
+    warn_if_truncated(result.truncated);
+    RecordedSession::from_records(&trace_id, &result.hits).map_err(AppError::Recording)
+}
+
+/// Builds the search client from the shared receiver flags, reading the credential by name.
+fn observe_client(args: &ObserveArgs) -> Result<OpenObserveClient, AppError> {
+    let url = args
+        .openobserve_url
+        .clone()
+        .ok_or(AppError::ObserveUrlMissing)?;
+    let authorization = read_optional_secret(&args.openobserve_auth_env)?.ok_or_else(|| {
+        AppError::ObserveCredentialMissing {
+            variable: args.openobserve_auth_env.clone(),
+        }
+    })?;
+    OpenObserveClient::new(OpenObserveSettings {
+        url,
+        stream: args.openobserve_stream.clone(),
+        authorization,
+        timeout: Duration::from_millis(args.openobserve_timeout_ms),
+    })
+    .map_err(AppError::Observe)
+}
+
+fn warn_if_truncated(truncated: bool) {
+    if truncated {
+        eprintln!(
+            "warning: the search stopped after {} pages of {} records; narrow --since to see the rest",
+            observe::MAX_PAGES,
+            observe::PAGE_SIZE
+        );
+    }
+}
+
+/// Parses a `--since` window: a count followed by `s`, `m`, `h`, or `d`.
+fn parse_since(text: &str) -> Result<Duration, AppError> {
+    let trimmed = text.trim();
+    let invalid = || AppError::Since {
+        text: text.to_owned(),
+    };
+    let unit = trimmed.chars().last().ok_or_else(invalid)?;
+    let count = trimmed[..trimmed.len() - unit.len_utf8()]
+        .parse::<u64>()
+        .map_err(|_error| invalid())?;
+    let seconds_per_unit = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => return Err(invalid()),
+    };
+    let seconds = count.checked_mul(seconds_per_unit).ok_or_else(invalid)?;
+    if seconds == 0 {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// The `[start, end)` microsecond window ending now that a `--since` duration selects.
+fn search_window(window: Duration) -> Result<(i64, i64), AppError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(AppError::Clock)?;
+    let end_us = i64::try_from(now.as_micros()).unwrap_or(i64::MAX);
+    let window_us = i64::try_from(window.as_micros()).unwrap_or(i64::MAX);
+    Ok((end_us.saturating_sub(window_us).max(0), end_us))
+}
+
+/// Reads one UTF-8 text file the operator named, bounded.
+fn read_text_file(path: &Path) -> Result<String, AppError> {
+    let file = File::open(path).map_err(|source| AppError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let read_limit = u64::try_from(MAX_TEXT_FILE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| AppError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_TEXT_FILE_BYTES {
+        return Err(AppError::FileTooLarge {
+            path: path.to_path_buf(),
+            maximum: MAX_TEXT_FILE_BYTES,
+        });
+    }
+    String::from_utf8(bytes).map_err(|source| AppError::FileUtf8 {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Renders microseconds since the epoch as an RFC 3339 UTC timestamp, to the second.
+fn format_timestamp(micros: i64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000)
+        .ok()
+        .and_then(|time| time.replace_nanosecond(0).ok())
+        .and_then(|time| time.format(&Rfc3339).ok())
+        .unwrap_or_else(|| micros.to_string())
+}
+
+fn render_session_table(sessions: &[SessionListing]) -> String {
+    let mut text = format!(
+        "{:<32}  {:<20}  {:>5}  {:>8}  {:<9}  SERVICE\n",
+        "TRACE", "STARTED", "TURNS", "TOKENS", "OUTCOME"
+    );
+    if sessions.is_empty() {
+        text.push_str("(no sessions in the window)\n");
+        return text;
+    }
+    for session in sessions {
+        let outcome = match (session.failed, session.answered) {
+            (true, _) => "failed",
+            (false, true) => "answered",
+            (false, false) => "no-answer",
+        };
+        text.push_str(&format!(
+            "{:<32}  {:<20}  {:>5}  {:>8}  {:<9}  {}\n",
+            session.trace_id,
+            format_timestamp(session.started_us),
+            session.model_turns,
+            session
+                .total_tokens
+                .map_or_else(|| "-".to_owned(), |tokens| tokens.to_string()),
+            outcome,
+            session.service.as_deref().unwrap_or("-")
+        ));
+    }
+    text
+}
+
+/// Indents every line of a block so it reads as one field's value.
+fn indented(block: &str) -> String {
+    let trimmed = block.trim_end();
+    if trimmed.is_empty() {
+        return "    (empty)".to_owned();
+    }
+    trimmed
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_transcript(recorded: &RecordedSession) -> String {
+    let mut text = format!("trace: {}\n", recorded.trace_id);
+    for system in &recorded.system {
+        text.push_str(&format!("system:\n{}\n", indented(system)));
+    }
+    for exchange in &recorded.history {
+        text.push_str(&format!("user (earlier):\n{}\n", indented(&exchange.user)));
+        if let Some(answer) = &exchange.answer {
+            text.push_str(&format!("assistant (earlier):\n{}\n", indented(answer)));
+        }
+    }
+    text.push_str(&format!("user:\n{}\n", indented(&recorded.prompt)));
+    for turn in &recorded.turns {
+        let mut header = format!("turn {}", turn.turn);
+        if let Some(duration) = turn.duration_ms {
+            header.push_str(&format!(" [{duration:.0} ms"));
+            if let Some(total) = turn.usage.and_then(|usage| usage.total_tokens) {
+                header.push_str(&format!(", {total} tokens"));
+            }
+            header.push(']');
+        }
+        text.push_str(&format!("{header}:\n"));
+        if let Some(content) = turn
+            .content
+            .as_deref()
+            .filter(|content| !content.trim().is_empty())
+        {
+            text.push_str(&format!("  assistant:\n{}\n", indented(content)));
+        }
+        for call in &turn.tool_calls {
+            render_tool_call(&mut text, call);
+        }
+    }
+    match &recorded.answer {
+        Some(answer) => {
+            text.push_str(&format!("answer:\n{}\n", indented(answer)));
+        }
+        None => text.push_str("answer: (none recorded)\n"),
+    }
+    text
+}
+
+fn render_tool_call(text: &mut String, call: &RecordedToolCall) {
+    match call.script() {
+        Some(script) => {
+            text.push_str(&format!("  script:\n{}\n", indented(&script)));
+        }
+        None => {
+            text.push_str(&format!(
+                "  tool {}:\n{}\n",
+                call.name,
+                indented(&call.arguments)
+            ));
+        }
+    }
+    match &call.result {
+        Some(result) => {
+            text.push_str(&format!("  output:\n{}\n", indented(result)));
+        }
+        None => text.push_str("  output: (not recorded)\n"),
+    }
+}
+
+fn render_replay(report: &ReplayReport) -> String {
+    let mut text = format!("trace: {}\n", report.trace_id);
+    for (label, summary) in [
+        ("recorded", &report.recorded),
+        ("replayed", &report.replayed),
+    ] {
+        text.push_str(&format!(
+            "{label}: {} turn(s), {} script(s), {} token(s), answer: {}\n",
+            summary.model_turns,
+            summary.scripts.len(),
+            summary
+                .usage
+                .total_tokens
+                .map_or_else(|| "-".to_owned(), |tokens| tokens.to_string()),
+            if summary.answer.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+    }
+    match &report.divergence {
+        Some(divergence) => {
+            text.push_str(&format!(
+                "divergence: turn {} ({}), {} recorded script(s) unused\n  script:\n{}\n",
+                divergence.turn,
+                match divergence.handling {
+                    dekopon_agent::replay::DivergenceHandling::Stopped => "stopped there",
+                    dekopon_agent::replay::DivergenceHandling::Live => "ran live",
+                },
+                divergence.unused_recorded_scripts.len(),
+                indented(&divergence.script)
+            ));
+        }
+        None => text.push_str("divergence: none\n"),
+    }
+    let width = report
+        .recorded
+        .scripts
+        .len()
+        .max(report.replayed.scripts.len());
+    for index in 0..width {
+        let recorded = report.recorded.scripts.get(index);
+        let replayed = report.replayed.scripts.get(index);
+        let status = match (recorded, replayed) {
+            (Some(left), Some(right)) if left == right => "same",
+            (Some(_), Some(_)) => "differs",
+            (Some(_), None) => "recorded only",
+            (None, Some(_)) => "replayed only",
+            (None, None) => unreachable!("index is below the longer list"),
+        };
+        text.push_str(&format!("script {} ({status}):\n", index + 1));
+        if let Some(script) = recorded {
+            text.push_str(&format!("  recorded:\n{}\n", indented(script)));
+        }
+        if let Some(script) = replayed
+            && status != "same"
+        {
+            text.push_str(&format!("  replayed:\n{}\n", indented(script)));
+        }
+    }
+    for (label, summary) in [
+        ("recorded", &report.recorded),
+        ("replayed", &report.replayed),
+    ] {
+        match &summary.answer {
+            Some(answer) => {
+                text.push_str(&format!("answer ({label}):\n{}\n", indented(answer)));
+            }
+            None => {
+                text.push_str(&format!("answer ({label}): (none)\n"));
+            }
+        }
+    }
+    if let Some(error) = &report.error {
+        text.push_str(&format!("error: {error}\n"));
+    }
+    text
 }
 
 struct CommandOutput {
@@ -1068,6 +1625,46 @@ enum AppError {
     },
     #[error("the prompt session did not run to completion")]
     PromptTask(#[source] tokio::task::JoinError),
+    #[error("a --skill directory could not be mounted")]
+    Skill(#[source] SkillError),
+    #[error("skill {name:?} was mounted twice; a model could not tell the two apart")]
+    DuplicateSkill { name: String },
+    #[error(transparent)]
+    Observe(#[from] ObserveError),
+    #[error("no OpenObserve URL; pass --openobserve-url or set DEKOPON_OPENOBSERVE_URL")]
+    ObserveUrlMissing,
+    #[error(
+        "environment variable {variable} is not set; it must hold the OpenObserve Authorization header value"
+    )]
+    ObserveCredentialMissing { variable: String },
+    #[error("the OpenObserve search did not run to completion")]
+    ObserveTask(#[source] tokio::task::JoinError),
+    #[error(transparent)]
+    Recording(RecordingError),
+    #[error("could not read {}", path.display())]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{} is larger than the {maximum}-byte maximum", path.display())]
+    FileTooLarge { path: PathBuf, maximum: usize },
+    #[error("{} is not UTF-8", path.display())]
+    FileUtf8 {
+        path: PathBuf,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    #[error("{} is not a transcript `session show --json` printed", path.display())]
+    ParseRecording {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("--since {text:?} must be a count followed by s, m, h, or d, such as 24h")]
+    Since { text: String },
+    #[error("the system clock is before the Unix epoch")]
+    Clock(#[source] SystemTimeError),
     #[error("the shell blocking task did not run to completion")]
     ShellTask(#[source] tokio::task::JoinError),
     #[error("the shell process task did not run to completion")]
@@ -1138,6 +1735,19 @@ impl AppError {
             #[cfg(unix)]
             Self::BrokerDuplicateCapabilities { .. } => "broker-duplicate-capabilities",
             Self::PromptTask(_) => "prompt-task",
+            Self::Skill(_) => "skill",
+            Self::DuplicateSkill { .. } => "duplicate-skill",
+            Self::Observe(_) => "observe",
+            Self::ObserveUrlMissing => "observe-url-missing",
+            Self::ObserveCredentialMissing { .. } => "observe-credential-missing",
+            Self::ObserveTask(_) => "observe-task",
+            Self::Recording(_) => "recording",
+            Self::ReadFile { .. } => "file-read",
+            Self::FileTooLarge { .. } => "file-too-large",
+            Self::FileUtf8 { .. } => "file-utf8",
+            Self::ParseRecording { .. } => "recording-json",
+            Self::Since { .. } => "since",
+            Self::Clock(_) => "clock",
             Self::ShellTask(_) => "shell-task",
             Self::ShellProcessTask(_) => "shell-process-task",
             Self::BrokerInputObject => "broker-input-object",

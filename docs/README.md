@@ -17,11 +17,12 @@ Read in this order:
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential across that boundary, from a local login to a pod.
 6. [`inference.md`](inference.md) — exact model request types and wire shape, prompt-cache optimization and retention caveats, bounded Slack history, optional durable on-demand chat turns, ecosystem memory patterns, and the broader-memory design space.
 7. [`observability.md`](observability.md) — runner, broker, and gateway OTLP traces, audit-safe logs, data minimization, what conversation history and the prompt cache add, and the OpenObserve development example.
-8. [`broker-http.md`](broker-http.md) — implemented host/policy foundation and committed authenticated broker-process design, with status called out per slice.
-9. [`secrets.md`](secrets.md) — public inert DRNs, separate `secret.use` authorization, the owner-only private map, executable source adapters, exact HTTP sinks, and rotation/reflection limits.
-10. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon through 1Password and External Secrets, including the Kubernetes projection boundary the direct secret-map adapter now handles separately.
-11. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` is the index into the per-crate operational contracts, including audit checkpoint recovery; `upgrading.md` records the breaking configuration migrations and the restart order.
-12. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
+8. [`improvement.md`](improvement.md) — the operator-driven improvement loop: skills as progressive disclosure of operator-authored knowledge, opt-in `suggest_improvement` records, replay of recorded sessions under a changed instruction or skill, and what is deliberately absent.
+9. [`broker-http.md`](broker-http.md) — implemented host/policy foundation and committed authenticated broker-process design, with status called out per slice.
+10. [`secrets.md`](secrets.md) — public inert DRNs, separate `secret.use` authorization, the owner-only private map, executable source adapters, exact HTTP sinks, and rotation/reflection limits.
+11. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon through 1Password and External Secrets, including the Kubernetes projection boundary the direct secret-map adapter now handles separately.
+12. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` is the index into the per-crate operational contracts, including audit checkpoint recovery; `upgrading.md` records the breaking configuration migrations and the restart order.
+13. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ## Build a provider
 
@@ -63,6 +64,7 @@ Keep the host, SDK, HTTP facade, provider WIT, HTTP WIT, and manifest API versio
 | Immediate provider loading, direct invocation, or prompt tools | [`run.md`](run.md) | Records the experimental runner contract and its deliberately restricted authority. |
 | Chat transports, gateway configuration, routing, agent sessions, or conversation history | [`dekopond.md`](dekopond.md) | Records the daemon's configuration, transport semantics, session bounds, attested authorization flow, and the conversation contract. |
 | Runner tracing, OTLP logs, OpenObserve, telemetry redaction, model-token totals, or the broker web UI | [`observability.md`](observability.md) | Records signal semantics, live-versus-exported accounting, configuration, data minimization, and end-to-end validation. |
+| Skills, `read_skill`, improvement suggestions, session replay, or evaluating a changed instruction before it ships | [`improvement.md`](improvement.md) | Records the three operator-driven improvement mechanisms, how they compose into one loop, and the store, rewriter, grader, and cross-session memory that are deliberately absent. |
 | Public DRNs, private source maps, secret-use policy, source adapters, path-bound Basic/Bearer sinks, or mounted secret/config files | [`secrets.md`](secrets.md) | Defines the complete current secret-reference and resolution contract. |
 | Deployment secrets, 1Password, External Secrets, or projecting a credential into a pod | [`1password-eso.md`](1password-eso.md) | Records the deployed secret-store configuration, the manual bootstrap a human owns, and how ESO materialization composes with Dekopon's secure-file and projection sources. |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`broker-http.md`](broker-http.md) | Records the accepted HTTP contract, process ownership, authorization, and delivery boundaries. |

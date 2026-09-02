@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use dekopon_capability::{EffectKind, Idempotency, Permission};
 pub use dekopon_core::AgentStatus;
@@ -171,6 +171,15 @@ pub struct AgentSpec {
     /// policy, which never reads this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Skill directories mounted into the agent's sessions, each holding a `SKILL.md`.
+    ///
+    /// A relative path resolves against the catalog file's own directory. The loader reads every
+    /// skill at catalog load and refuses the catalog when one cannot be read, so a routed agent
+    /// never starts with a skill it cannot show. Skill text is untrusted model text exactly as
+    /// `instructions` is: it is reference material the model reads on demand, and it grants
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<PathBuf>,
     /// Capabilities the agent may propose. This list itself grants no provider authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityId>,
@@ -438,6 +447,7 @@ mod tests {
                 description: "Reviews pull requests".to_owned(),
                 enabled: true,
                 instructions: Some("Review the diff and comment; never approve.".to_owned()),
+                skills: vec!["skills/pull-request-review".into()],
                 capabilities: vec![
                     "github.pull-request.read"
                         .parse()
@@ -464,6 +474,21 @@ mod tests {
         assert_eq!(from_yaml, original);
         assert!(yaml.contains("apiVersion: dekopon.dev/v1alpha1"));
         assert!(yaml.contains("instructions:"));
+        assert!(yaml.contains("skills:"), "{yaml}");
+    }
+
+    /// An agent that mounts nothing serializes without the key, exactly as `instructions` does.
+    #[test]
+    fn absent_skills_stay_absent_through_a_round_trip() {
+        let mut original = agent();
+        original.spec.skills = Vec::new();
+
+        let value = serde_json::to_value(&original).expect("agent serializes");
+        assert!(value["spec"].get("skills").is_none(), "{value}");
+        let yaml = serde_yaml::to_string(&original).expect("agent serializes as YAML");
+        assert!(!yaml.contains("skills"), "{yaml}");
+        let decoded = serde_yaml::from_str::<Agent>(&yaml).expect("agent parses as YAML");
+        assert_eq!(decoded, original);
     }
 
     /// Standing orders are optional and absent rather than empty when unauthored.
