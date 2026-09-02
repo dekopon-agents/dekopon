@@ -704,15 +704,17 @@ One generated OpenTelemetry trace links the command to spans such as:
 - `provider.compile`, `provider.describe`, and `provider.invoke`.
 
 `process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
-private stable `node.id`, root parent, fixed `process.kind`, `non-interruptible` contract, and
-terminal `process.outcome`. Tokio task IDs, scripts, argv, values, diagnostics, provider payloads,
+private stable `node.id`, root parent, fixed `process.kind`, the `process.interruptibility`
+contract (`non-interruptible` or `cancellable`), and terminal `process.outcome` (`succeeded`,
+`operation-error`, `panicked`, `cancelled` for a requested cancellation of a cancellable node, or
+`task-cancelled` for a runtime-driven abort). Tokio task IDs, scripts, argv, values, diagnostics, provider payloads,
 and raw operation errors are absent. These spans are `DEBUG` so normal INFO telemetry volume does
 not grow with frontend process nodes; a diagnostic filter may enable them. The current
 `dekopon-run shell` path contributes exactly one `legacy-shell` node and keeps the existing
 `shell.script`/`shell.command` spans beneath it. The runner's trace filter explicitly includes the
 `dekopon_process` target; when a sink disables these DEBUG spans, `Span::or_current` keeps existing
 shell/provider work under the current `runner.shell` parent. No public process IDs, scopes, ports,
-cancellation, or graph telemetry contract exists yet.
+or graph telemetry contract exists yet.
 
 The runner's own `provider.invoke` — `dekopon-provider-host`, not the broker host — carries provider,
 capability, component path, `input.bytes`, `output.bytes`, and `fuel.remaining`. Counts and fuel

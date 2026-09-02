@@ -9,6 +9,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable
+  `CancelHandle` whose idempotent `cancel` makes the supervisor abort a
+  `ProcessMetadata::cancellable` node at its next await and then still join it, surfacing
+  `ProcessOutcome::TaskFailed` with `is_cancelled()`; a node that already returned keeps its real
+  result, dropping every handle (or `CancelSignal::never`) never cancels, and the `process.node`
+  span records `process.interruptibility` as `cancellable` and a requested cancellation as
+  `process.outcome` `cancelled`. Nothing in the repository is cancellable yet; the runner's
+  `legacy-shell` node stays non-interruptible.
 - Added skills, operator-authored reference material an agent reads on demand. `spec.skills` lists
   directories in the Agent Skills `SKILL.md` layout: YAML front matter carrying `name` (equal to
   the directory name; `[a-z0-9-]`, at most 64 bytes) and `description` (at most 1024 bytes), the
