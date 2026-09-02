@@ -80,6 +80,12 @@ impl CapabilityInvoker for Fixture {
             ["decline"] => CommandRun::Failed {
                 message: "probe: declined".to_owned(),
             },
+            ["errored"] => CommandRun::Errored {
+                message: "could not connect to broker socket".to_owned(),
+            },
+            ["cancelled"] => CommandRun::Denied {
+                reason: "session-cancelled".to_owned(),
+            },
             _ => CommandRun::Rendered {
                 stdout: String::new(),
                 stderr: format!(
@@ -1937,6 +1943,22 @@ fn a_provider_command_decline_is_a_usage_error() {
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert_eq!(outcome.output, "probe: declined");
     assert_eq!(outcome.capability_calls, 0);
+}
+
+/// A run that never reached the provider's answer takes the exit codes a capability call takes
+/// for the same two facts, so the model reads "retry later" or "stop" rather than "fix the argv".
+#[test]
+fn a_command_run_that_errored_or_was_refused_is_not_a_usage_error() {
+    let errored = run("probe errored; echo $?");
+    assert_eq!(
+        errored.output,
+        "probe: failed: could not connect to broker socket\n1"
+    );
+    assert_eq!(errored.capability_calls, 0);
+
+    let refused = run("probe cancelled; echo $?");
+    assert_eq!(refused.output, "probe: denied: session-cancelled\n126");
+    assert_eq!(refused.capability_calls, 0);
 }
 
 #[test]

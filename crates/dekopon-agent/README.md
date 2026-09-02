@@ -50,7 +50,16 @@ authoritative copy of each:
   proposes on behalf of a transport-authenticated external subject, which the broker
   honors only under an owner-configured attestor grant. Its fresh capability
   snapshot also supplies trusted effect/risk/idempotency metadata for self-inspection,
-  never policy source, identity, constraints, or credentials.
+  never policy source, identity, constraints, or credentials. Each provider command word
+  it runs is one cancellable `broker-command` process node around the `runCommand` round
+  trip; `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
+  gateway's Stop), and without it they are cancellable in contract only. A transport
+  failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
+  as `CommandRun::Denied { "session-cancelled" }`.
+- `command_run_from_outcome` and `report_unobserved_command_run` — the one mapping from
+  a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
+  `agent.command.unobserved` record for a run whose caller was dropped, shared by the
+  broker leg here and the direct leg in `dekopon-run`.
 - `IdSequence` — collision-free trace and invocation identifiers under a caller-chosen
   session prefix.
 

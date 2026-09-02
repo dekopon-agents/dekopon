@@ -7,24 +7,27 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeSet,
     env,
     error::Error as _,
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use dekopon_agent::{BrokerLeg, BrokerLegError};
 use dekopon_agent::{
-    SessionInvoker, ShellRuntime,
+    SessionInvoker, ShellRuntime, command_run_from_outcome,
     improvement::ImprovementSuggestion,
     prompt::{PromptError, PromptLimits, ScriptRuntime, SessionInputs, format_script_outcome},
     replay::{
         RecordedSession, RecordedToolCall, RecordingError, ReplayInputs, ReplayReport,
         SessionListing, list_sessions, replay,
     },
+    report_unobserved_command_run,
 };
 #[cfg(unix)]
 use dekopon_broker_protocol::BrokerSocketDiscovery;
@@ -43,13 +46,14 @@ use dekopon_provider_host::{
     HostLimits, HostOptions, ProviderHostError, ProviderManifest, ProviderRegistry,
 };
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, Interpreter,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, Interpreter,
     Limits as ShellLimits,
 };
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::runtime::Handle;
 use tracing::Instrument as _;
 
 use crate::{
@@ -366,6 +370,7 @@ async fn evaluate(cli: &Cli) -> Result<CommandOutput, AppError> {
                     max_steps: max_steps.get(),
                     max_capability_calls: shell.shell_max_capability_calls,
                 },
+                runtime: Handle::current(),
             };
             evaluate_prompt(settings, *broker, connection)
                 .instrument(tracing::info_span!(
@@ -410,20 +415,22 @@ async fn evaluate_shell(
     script: String,
     verbosity: u8,
 ) -> Result<CommandOutput, AppError> {
+    // Captured on the async side, as the broker leg captures its own: the command-word nodes the
+    // invoker runs need a handle to the runtime the blocking thread is parked against.
+    let runtime = Handle::current();
     let operation = process_fn(
         ProcessMetadata::non_interruptible("legacy-shell"),
         move || async move {
             let node_span = tracing::Span::current();
             tokio::task::spawn_blocking(move || {
                 node_span.in_scope(|| {
-                    let registry = ProviderRegistry::load_with_options(
+                    // Loaded here, on the blocking thread, so Cranelift never runs on a worker.
+                    let registry = Arc::new(ProviderRegistry::load_with_options(
                         components,
                         host_limits,
                         &host_options,
-                    )?;
-                    let invoker = RegistryInvoker {
-                        registry: &registry,
-                    };
+                    )?);
+                    let invoker = RegistryInvoker::new(registry, runtime);
                     let outcome = Interpreter::new(interpreter_limits)
                         .with_curl_capability(curl_capability)
                         .run(&script, &invoker);
@@ -548,6 +555,8 @@ struct PromptSettings {
     suggestions: bool,
     prompt: String,
     prompt_limits: PromptLimits,
+    /// The runtime the direct leg's command-word nodes run on, captured on the async side.
+    runtime: Handle,
 }
 
 /// Stable label for which model backend a set of model arguments selects.
@@ -661,17 +670,15 @@ fn run_prompt_session(
     settings: PromptSettings,
     broker: Option<Box<dyn CapabilityInvoker + Send>>,
 ) -> Result<prompt::PromptOutcome, AppError> {
-    let registry = ProviderRegistry::load_with_options(
+    let registry = Arc::new(ProviderRegistry::load_with_options(
         settings.providers,
         settings.limits,
         &settings.options,
-    )?;
+    )?);
     let model = build_model(&settings.model)?;
     let runtime = ShellRuntime {
         invoker: SessionInvoker {
-            direct: RegistryInvoker {
-                registry: &registry,
-            },
+            direct: RegistryInvoker::new(registry, settings.runtime),
             broker,
         },
         limits: settings.shell,
@@ -773,6 +780,7 @@ async fn evaluate_session(command: &SessionCommand) -> Result<CommandOutput, App
                     max_steps: max_steps.get(),
                     max_capability_calls: shell.shell_max_capability_calls,
                 },
+                runtime: Handle::current(),
             };
             let span = tracing::info_span!(
                 "runner.session.replay",
@@ -816,6 +824,8 @@ struct ReplaySettings {
     host_options: HostOptions,
     shell: ShellLimits,
     prompt_limits: PromptLimits,
+    /// The runtime a live leg's command-word nodes run on, captured on the async side.
+    runtime: Handle,
 }
 
 /// Builds the model, loads any live providers, and replays. Blocking throughout.
@@ -826,14 +836,16 @@ fn run_replay(settings: ReplaySettings) -> Result<ReplayReport, AppError> {
     let registry = if settings.components.is_empty() {
         None
     } else {
-        Some(ProviderRegistry::load_with_options(
+        Some(Arc::new(ProviderRegistry::load_with_options(
             settings.components,
             settings.host_limits,
             &settings.host_options,
-        )?)
+        )?))
     };
-    let live = registry.as_ref().map(|registry| ShellRuntime {
-        invoker: RegistryInvoker { registry },
+    // The live leg speaks the recording's vocabulary: a recorded `probe --help` replays the same
+    // way it ran, so command words are served here exactly as `prompt` serves them.
+    let live = registry.map(|registry| ShellRuntime {
+        invoker: RegistryInvoker::new(registry, settings.runtime),
         limits: settings.shell,
         // Direct mode cannot speak HTTP, so there is no capability for `curl` to assemble for.
         curl_capability: None,
@@ -1188,12 +1200,89 @@ impl CommandOutput {
 ///
 /// Direct mode performs no broker transition, so no invocation here can be *denied*: there is no
 /// authorization to refuse one. `Denied` stays reachable in the shared vocabulary because a
-/// broker-backed invoker will produce it; this adapter simply never does.
-struct RegistryInvoker<'a> {
-    registry: &'a ProviderRegistry,
+/// broker-backed invoker will produce it; this adapter produces it only for a command-word run
+/// the session cancelled underneath, which direct mode has no way to do today.
+///
+/// The registry is shared rather than borrowed because each command-word run is one process node
+/// whose blocking body outlives this invoker's stack frame on the Tokio blocking pool.
+struct RegistryInvoker {
+    registry: Arc<ProviderRegistry>,
+    runtime: Handle,
+    /// The words every loaded provider declared, snapshotted once: dispatch asks per word, and a
+    /// script running a thousand commands must not rebuild the list a thousand times.
+    command_words: BTreeSet<String>,
 }
 
-impl CapabilityInvoker for RegistryInvoker<'_> {
+impl RegistryInvoker {
+    fn new(registry: Arc<ProviderRegistry>, runtime: Handle) -> Self {
+        let command_words = registry
+            .command_words_by_provider()
+            .into_iter()
+            .flat_map(|(_provider, words)| words.iter().cloned())
+            .collect();
+        Self {
+            registry,
+            runtime,
+            command_words,
+        }
+    }
+}
+
+impl CapabilityInvoker for RegistryInvoker {
+    fn command_words(&self) -> Vec<String> {
+        self.command_words.iter().cloned().collect()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.command_words.contains(word)
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if !self.command_words.contains(word) {
+            return None;
+        }
+        // One non-interruptible node per run. The guest call blocks a thread the way a capability
+        // call does, and the supervisor never joins `spawn_blocking` work, so a cancellable node
+        // here would report `cancelled` while the Wasm call still ran; the run therefore stays
+        // joined to its end, exactly as the `legacy-shell` node around the whole script does.
+        let registry = Arc::clone(&self.registry);
+        let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
+        let operation = process_fn(
+            ProcessMetadata::non_interruptible("direct-command"),
+            move || async move {
+                let node_span = tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    node_span.in_scope(|| {
+                        registry
+                            .run_command(&owned_word, &argv, stdin.as_deref())
+                            .map(command_run_from_outcome)
+                            .map_err(AppError::from)
+                    })
+                })
+                .await
+                .map_err(AppError::CommandTask)?
+            },
+        );
+        // The interpreter runs on the blocking pool, never on a worker, so blocking here is legal
+        // for the same reason the broker leg's `invoke` documents.
+        let outcome = self
+            .runtime
+            .block_on(ProcessRun::execute(operation, |outcome| {
+                report_unobserved_command_run("direct", outcome, AppError::telemetry_kind);
+            }));
+        Some(match outcome {
+            ProcessOutcome::Completed(Ok(run)) => run,
+            // A host refusal — an input past `--max-input-bytes`, a trap, a deadline — is not the
+            // provider declining the argv; its message already names the provider and the bound.
+            ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
+                message: error.to_string(),
+            },
+            ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
+                message: format!("{word}: {}", AppError::CommandTask(error)),
+            },
+        })
+    }
+
     fn granted(&self) -> Vec<String> {
         self.registry
             .capabilities()
@@ -1669,6 +1758,8 @@ enum AppError {
     ShellTask(#[source] tokio::task::JoinError),
     #[error("the shell process task did not run to completion")]
     ShellProcessTask(#[source] tokio::task::JoinError),
+    #[error("the command-word blocking task did not run to completion")]
+    CommandTask(#[source] tokio::task::JoinError),
     #[error("broker capability input must be a JSON object")]
     BrokerInputObject,
     #[error(transparent)]
@@ -1750,6 +1841,7 @@ impl AppError {
             Self::Clock(_) => "clock",
             Self::ShellTask(_) => "shell-task",
             Self::ShellProcessTask(_) => "shell-process-task",
+            Self::CommandTask(_) => "command-task",
             Self::BrokerInputObject => "broker-input-object",
             Self::ChatGpt(_) => "chatgpt",
             Self::Provider(_) => "provider",
@@ -1779,6 +1871,8 @@ mod tests {
         CapabilityCallResult, CapabilityInvoker, HostLimits, InvocationReport, ProviderRegistry,
         RegistryInvoker, TimingSamples, read_input,
     };
+    use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     /// The direct leg has no authorizer and no credential store, so a DRN cannot be proven here.
     ///
@@ -1786,16 +1880,14 @@ mod tests {
     /// asked for a credential this leg cannot show it may use. The refusal is the shared wording
     /// from `dekopon_shell::secret_use_unsupported`, so an operator reading it in immediate mode
     /// and in a session sees one message rather than two spellings of the same limit.
-    #[test]
-    fn the_direct_leg_refuses_a_secret_use_proposal_it_cannot_authorize() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_direct_leg_refuses_a_secret_use_proposal_it_cannot_authorize() {
         let registry = ProviderRegistry::load(
             [dekopon_test_support::provider_fixture("echo-provider.wasm")],
             HostLimits::default(),
         )
         .expect("echo provider loads");
-        let invoker = RegistryInvoker {
-            registry: &registry,
-        };
+        let invoker = RegistryInvoker::new(Arc::new(registry), Handle::current());
         let proposal = dekopon_core::SecretUseProposal::HttpBearer {
             secret: "drn:com.xrl:secret:prod:api/token"
                 .parse::<dekopon_core::SecretDrn>()

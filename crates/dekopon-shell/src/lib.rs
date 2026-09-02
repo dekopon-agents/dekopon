@@ -153,8 +153,9 @@ pub enum CapabilityCallResult {
 /// What a provider did with one of its command words.
 ///
 /// A provider command word behaves like its own command-line program: it can turn an argv into a
-/// capability proposal, print its own help or usage text, or refuse the argv outright. The three
-/// are kept apart because the interpreter charges and reports them differently.
+/// capability proposal, print its own help or usage text, or refuse the argv outright. Those are
+/// kept apart because the interpreter charges and reports them differently, and apart again from
+/// a run that never reached the provider's answer, which is not a usage error however it failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandRun {
     /// The provider proposed a capability, authorized and charged exactly like a direct call.
@@ -179,6 +180,19 @@ pub enum CommandRun {
     Failed {
         /// Why the provider declined.
         message: String,
+    },
+    /// The run itself failed before the provider could answer — the broker was unreachable, the
+    /// host refused or trapped, the task did not complete — and is reported like a capability
+    /// that ran and errored, at exit `1`. Telling the model to fix its argv would be wrong.
+    Errored {
+        /// What failed, naming its cause; never a path.
+        message: String,
+    },
+    /// The run was refused before or during dispatch — the session was cancelled underneath it —
+    /// and is reported like a refused capability, at exit `126`.
+    Denied {
+        /// Why the run was refused.
+        reason: String,
     },
 }
 

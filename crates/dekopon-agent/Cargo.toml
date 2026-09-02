@@ -15,6 +15,8 @@ include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 dekopon-broker-protocol.workspace = true
+# One cancellable process node per broker-leg command word, joined before the leg answers.
+dekopon-process.workspace = true
 # Loaded skills: the session shows a model text `dekopon-config` already read and bounded.
 dekopon-config.workspace = true
 dekopon-core.workspace = true

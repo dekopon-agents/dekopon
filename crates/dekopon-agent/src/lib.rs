@@ -42,6 +42,9 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, IdentifierError, InvocationId, TraceId};
+use dekopon_process::ProcessOutcome;
+#[cfg(unix)]
+use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
@@ -209,6 +212,117 @@ pub fn current_trace_parent() -> Option<TraceParent> {
     TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok()
 }
 
+/// Maps a provider's own command-run outcome onto the shell's seam type.
+///
+/// One definition for both legs: the direct host and the broker answer with the same
+/// [`CommandRunOutcome`], and the shell reads the same [`CommandRun`] from either. The provider's
+/// stable failure `code` stays with the operator; the model reads the message, as it always has.
+#[must_use]
+pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
+    match outcome {
+        CommandRunOutcome::Proposed { capability, input } => CommandRun::Proposed {
+            capability: capability.to_string(),
+            input,
+        },
+        CommandRunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        } => CommandRun::Rendered {
+            stdout,
+            stderr,
+            status,
+        },
+        CommandRunOutcome::Failed { error } => CommandRun::Failed {
+            message: error.message,
+        },
+    }
+}
+
+/// Records a command-word run whose caller was dropped while its process node was still joined.
+///
+/// The audit record carries only fixed categories — the leg, the outcome, an error kind — never
+/// the word, the argv, the piped value, or the text a provider rendered. The complete cause of a
+/// failure goes out as an ordinary error event at the same site, so it is recorded exactly once
+/// and never inside the audit stream, where a provider path or broker text does not belong.
+/// `error_type` names the stable kind of the leg's own error, since each leg fails differently.
+pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
+    leg: &'static str,
+    outcome: ProcessOutcome<CommandRun, E>,
+    error_type: fn(&E) -> &'static str,
+) {
+    match outcome {
+        ProcessOutcome::Completed(Ok(_run)) => {
+            tracing::warn!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "agent.command.unobserved",
+                    command.leg = leg,
+                    outcome = "succeeded",
+                    error.type = "none",
+                },
+                "unobserved command run completed"
+            );
+        }
+        ProcessOutcome::Completed(Err(error)) => {
+            tracing::error!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "agent.command.unobserved",
+                    command.leg = leg,
+                    outcome = "operation-error",
+                    error.type = error_type(&error),
+                },
+                "unobserved command run failed"
+            );
+            tracing::error!(
+                command.leg = leg,
+                error = %dekopon_core::error_chain(&error),
+                "unobserved command run failed"
+            );
+        }
+        ProcessOutcome::TaskFailed(error) => {
+            let (outcome, error_type) = if error.is_cancelled() {
+                ("cancelled", "task-cancelled")
+            } else {
+                ("task-failed", "task-panicked")
+            };
+            tracing::error!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "agent.command.unobserved",
+                    command.leg = leg,
+                    outcome = outcome,
+                    error.type = error_type,
+                },
+                "unobserved command run task failed"
+            );
+            tracing::error!(
+                command.leg = leg,
+                error = %error,
+                "unobserved command run task failed"
+            );
+        }
+    }
+}
+
+/// The stable kind of one broker-client failure, for the unobserved-run record.
+#[cfg(unix)]
+fn client_error_kind(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::SocketMetadata { .. } => "socket-metadata",
+        ClientError::UnsafeSocket => "unsafe-socket",
+        ClientError::ConnectTimeout => "connect-timeout",
+        ClientError::Connect { .. } => "connect",
+        ClientError::PeerCredentials { .. } => "peer-credentials",
+        ClientError::ServerIdentity { .. } => "server-identity",
+        ClientError::Limits(_) => "limits",
+        ClientError::Protocol { .. } => "protocol",
+        ClientError::Remote { .. } => "remote",
+        ClientError::UnexpectedResponse => "unexpected-response",
+    }
+}
+
 /// Failure to open a session's broker leg.
 #[cfg(unix)]
 #[derive(Debug, Error)]
@@ -260,6 +374,9 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
     chat_memory: Option<ChatMemorySurface>,
+    /// What cancels a command-word run in flight: [`CancelSignal::never`] until an embedder ties
+    /// it to its own session with [`BrokerLeg::with_cancel_signal`].
+    cancel: CancelSignal,
 }
 
 #[cfg(unix)]
@@ -323,7 +440,19 @@ impl BrokerLeg {
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
             chat_memory,
+            cancel: CancelSignal::never(),
         })
+    }
+
+    /// Ties every command-word run this leg makes to the embedder's cancellation.
+    ///
+    /// A run in flight when `signal` is requested is aborted at its next await and joined before
+    /// the leg answers the script with `session-cancelled`; the gateway fires it from a native
+    /// Stop. Without it a run is cancellable in contract only, which is what `dekopon-run` gets.
+    #[must_use]
+    pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
+        self.cancel = signal;
+        self
     }
 
     /// Returns this session's trusted, subject-specific effective capability classification.
@@ -445,35 +574,40 @@ impl CapabilityInvoker for BrokerLeg {
         if !self.command_words.contains(word) {
             return None;
         }
+        // The round trip is one cancellable process node: a gateway Stop aborts it at its next
+        // await and the supervisor still joins it before this returns, so the leg never answers
+        // while the request could still be in flight. The node owns its inputs for the whole run,
+        // which is why the client (a path, a UID, and two bounds) is cloned into it.
+        let client = self.client.clone();
+        let attestation = self.attestation.clone();
+        let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
+        let operation = process_fn(
+            ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
+            move || async move {
+                client
+                    .run_command(attestation, owned_word, argv, stdin)
+                    .await
+                    .map(command_run_from_outcome)
+            },
+        );
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
-        let outcome = self.runtime.block_on(async {
-            self.client
-                .run_command(
-                    self.attestation.clone(),
-                    word.to_owned(),
-                    argv.to_vec(),
-                    stdin.map(str::to_owned),
-                )
-                .await
-        });
+        let outcome = self
+            .runtime
+            .block_on(ProcessRun::execute(operation, |outcome| {
+                report_unobserved_command_run("broker", outcome, client_error_kind);
+            }));
         Some(match outcome {
-            Ok(CommandRunOutcome::Proposed { capability, input }) => CommandRun::Proposed {
-                capability: capability.to_string(),
-                input,
+            ProcessOutcome::Completed(Ok(run)) => run,
+            // A transport failure is not the provider declining: the model reads it as the broker
+            // being unreachable rather than as a bad argv, and the cause travels with it. No
+            // `ClientError` names the socket path.
+            ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
+                message: format!("{word}: {}", dekopon_core::error_chain(&error)),
             },
-            Ok(CommandRunOutcome::Rendered {
-                stdout,
-                stderr,
-                status,
-            }) => CommandRun::Rendered {
-                stdout,
-                stderr,
-                status,
+            ProcessOutcome::TaskFailed(error) if error.is_cancelled() => CommandRun::Denied {
+                reason: "session-cancelled".to_owned(),
             },
-            Ok(CommandRunOutcome::Failed { error }) => CommandRun::Failed {
-                message: error.message,
-            },
-            Err(error) => CommandRun::Failed {
+            ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
                 message: format!("{word}: {error}"),
             },
         })
@@ -906,14 +1040,21 @@ mod tests {
         };
 
         use dekopon_broker_protocol::{
-            BrokerClient, BrokerRequest, ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome,
-            InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+            BrokerClient, BrokerRequest, CommandRunOutcome, ERROR_UNAUTHENTICATED, FrameLimits,
+            InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
+            write_frame,
         };
         use dekopon_capability::DecisionReference;
         use dekopon_core::{AgentId, ExternalSubject};
-        use dekopon_shell::{CapabilityCallResult, CapabilityDescription, CapabilityInvoker};
+        use dekopon_process::CancelSignal;
+        use dekopon_shell::{
+            CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
+        };
         use serde_json::json;
-        use tokio::{net::UnixListener, sync::mpsc};
+        use tokio::{
+            net::UnixListener,
+            sync::{mpsc, oneshot},
+        };
 
         use crate::{Attestation, BrokerLeg, IdSequence, meta::EffectiveCapabilityView};
 
@@ -991,6 +1132,180 @@ mod tests {
             leg_with(socket, None)
         }
 
+        /// Accepts one request, reports it, and never answers until released: the shape of a
+        /// broker still working on a run when the session is cancelled underneath it.
+        async fn stub_leg_parked(
+            directory: &Path,
+        ) -> (
+            BrokerLeg,
+            mpsc::UnboundedReceiver<RequestEnvelope>,
+            oneshot::Sender<()>,
+        ) {
+            let socket = directory.join("broker.sock");
+            let listener = UnixListener::bind(&socket).expect("bind stub broker");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("secure stub socket");
+            let (observed, receiver) = mpsc::unbounded_channel();
+            let (release, released) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("stub broker accepts");
+                let request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+                    .await
+                    .expect("stub broker reads one request");
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the test may have finished observing before the stub reports"
+                )]
+                let _ = observed.send(request);
+                // Hold the connection open, unanswered, until the test lets go of the sender: a
+                // dropped sender releases the stub exactly as a sent signal would.
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped sender and a sent signal both mean the test is done"
+                )]
+                let _ = released.await;
+                drop(stream);
+            });
+            (leg_for(&socket), receiver, release)
+        }
+
+        /// Runs one command word the way an embedding binary does: from a blocking thread.
+        async fn run_word(
+            leg: BrokerLeg,
+            argv: &'static [&'static str],
+            stdin: Option<&'static str>,
+        ) -> Option<CommandRun> {
+            tokio::task::spawn_blocking(move || {
+                let argv = argv
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect::<Vec<_>>();
+                leg.run_command("probe", &argv, stdin)
+            })
+            .await
+            .expect("blocking dispatch completes")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_rendered_run_reaches_the_script_with_its_status() {
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let rendered = CommandRunOutcome::Rendered {
+                stdout: "Usage: probe <COMMAND>\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            };
+            let (mut leg, mut observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::command_run(rendered)],
+                None,
+            )
+            .await;
+            leg.command_words.insert("probe".to_owned());
+
+            assert_eq!(
+                run_word(leg, &["--help"], None).await,
+                Some(CommandRun::Rendered {
+                    stdout: "Usage: probe <COMMAND>\n".to_owned(),
+                    stderr: String::new(),
+                    status: 0,
+                })
+            );
+            let request = observed.recv().await.expect("stub broker saw the run");
+            assert_eq!(
+                request.request,
+                BrokerRequest::RunCommand {
+                    attestation: None,
+                    word: "probe".to_owned(),
+                    argv: vec!["--help".to_owned()],
+                    stdin: None,
+                }
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_piped_value_travels_in_the_run_frame() {
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let proposed = CommandRunOutcome::Proposed {
+                capability: "cli-probe.upper".parse().expect("valid capability fixture"),
+                input: json!({"text": "hello"}),
+            };
+            let (mut leg, mut observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::command_run(proposed)],
+                None,
+            )
+            .await;
+            leg.command_words.insert("probe".to_owned());
+
+            assert_eq!(
+                run_word(leg, &["upper", "-"], Some("hello")).await,
+                Some(CommandRun::Proposed {
+                    capability: "cli-probe.upper".to_owned(),
+                    input: json!({"text": "hello"}),
+                })
+            );
+            let request = observed.recv().await.expect("stub broker saw the run");
+            assert!(
+                matches!(
+                    &request.request,
+                    BrokerRequest::RunCommand { stdin: Some(piped), .. } if piped == "hello"
+                ),
+                "{request:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_cancel_signal_abandons_an_in_flight_run() {
+            // The broker has the request and is not answering. A gateway Stop must not leave the
+            // script parked on it: the node is aborted and joined, and the script reads the same
+            // refusal the capability path gives a cancelled session.
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
+            leg.command_words.insert("probe".to_owned());
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg.with_cancel_signal(signal);
+
+            let run = tokio::task::spawn_blocking(move || {
+                leg.run_command("probe", &["--help".to_owned()], None)
+            });
+            observed.recv().await.expect("the run reached the broker");
+            handle.cancel();
+
+            assert_eq!(
+                run.await.expect("blocking dispatch completes"),
+                Some(CommandRun::Denied {
+                    reason: "session-cancelled".to_owned(),
+                })
+            );
+            drop(release);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_transport_failure_names_its_cause_and_never_the_socket() {
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let socket = directory.path().join("dekopon-secret-broker.sock");
+            let mut leg = leg_for(&socket);
+            leg.command_words.insert("probe".to_owned());
+
+            let Some(CommandRun::Errored { message }) = run_word(leg, &["--help"], None).await
+            else {
+                panic!("a missing broker socket is an infrastructure failure, not a decline");
+            };
+            assert!(
+                message.starts_with("probe: could not inspect broker socket: "),
+                "{message}"
+            );
+            assert!(!message.contains("dekopon-secret-broker"), "{message}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_word_no_provider_owns_never_reaches_the_broker() {
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let leg = leg_for(&directory.path().join("absent.sock"));
+
+            assert_eq!(run_word(leg, &["--help"], None).await, None);
+        }
+
         fn attestation() -> Attestation {
             Attestation {
                 subject: SUBJECT
@@ -1036,6 +1351,7 @@ mod tests {
                 identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
                 attestation,
                 chat_memory: None,
+                cancel: CancelSignal::never(),
             }
         }
 

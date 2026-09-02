@@ -1598,6 +1598,22 @@ impl Evaluator<'_> {
                         let status = self.absorb(CommandFailure::usage(message))?;
                         return Ok(Executed::Result(CommandResult::status(status)));
                     }
+                    // Neither a proposal nor the provider's own answer: the same two shapes a
+                    // capability call ends in when it errors or is refused, so the model reads
+                    // them the same way — retry later, or stop — rather than as a bad argv.
+                    Some(CommandRun::Errored { message }) => {
+                        let status = self.absorb(CommandFailure::failed(format!(
+                            "{command}: failed: {message}"
+                        )))?;
+                        return Ok(Executed::Result(CommandResult::status(status)));
+                    }
+                    Some(CommandRun::Denied { reason }) => {
+                        let status = self.absorb(CommandFailure::Status {
+                            message: format!("{command}: denied: {reason}"),
+                            status: ExitCode::DENIED,
+                        })?;
+                        return Ok(Executed::Result(CommandResult::status(status)));
+                    }
                     Some(CommandRun::Rendered {
                         stdout,
                         stderr,
