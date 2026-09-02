@@ -761,8 +761,8 @@ async fn a_command_word_provider_is_instantiated_once_at_load() {
     assert_eq!(stats.stores_created, 1, "{stats:?}");
     assert_eq!(stats.command_resolutions, 0, "{stats:?}");
 
-    // The first run is the second instantiation, in its own fresh store; the piped value is
-    // dropped for this legacy `resolve-command` guest by contract rather than refused.
+    // The first run is the second instantiation, in its own fresh store; this hand-rolled
+    // `run-command` guest ignores the piped value rather than refusing it.
     let outcome = registry
         .run_command("recall", &["recall".to_owned()], Some("piped"))
         .await
@@ -777,9 +777,70 @@ async fn a_command_word_provider_is_instantiated_once_at_load() {
     assert_eq!(stats.command_resolutions, 1, "{stats:?}");
 }
 
-/// The checked-in `cli-probe` component exports `run-command`: the load reads that export from
-/// the component type, the typed `(list<string>, option<string>)` call delivers the piped value,
-/// and a help page, a usage error, a proposal, and a decline each parse as the shared outcome.
+/// The checked-in `memory-reservation-probe` component is the hand-rolled `run-command` guest:
+/// no argument parser, values shifted out of argv by hand. Its help page, its proposal, and its
+/// decline prove the clap-free baseline at the current package against a real component.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("hand-rolled command-line provider loads");
+    let mut exports = registry
+        .loaded_provider_metadata()
+        .flat_map(|metadata| metadata.exports.into_iter().map(|item| item.name))
+        .collect::<Vec<_>>();
+    exports.sort();
+    assert_eq!(exports, ["describe", "invoke", "run-command"]);
+
+    let outcome = registry
+        .run_command("recall", &["--help".to_owned()], None)
+        .await
+        .expect("help renders");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected rendered help, got {outcome:?}");
+    };
+    assert_eq!(status, 0);
+    assert!(stdout.starts_with("Usage: recall"), "{stdout:?}");
+    assert!(stderr.is_empty(), "{stderr:?}");
+
+    let outcome = registry
+        .run_command("recall", &["yesterday".to_owned()], Some("piped"))
+        .await
+        .expect("the word proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: "ordinary.escape".parse().expect("capability"),
+            input: json!({}),
+        }
+    );
+
+    let outcome = registry
+        .run_command("recall", &["--verbose".to_owned()], None)
+        .await
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(
+            outcome,
+            CommandRunOutcome::Failed { ref error }
+                if error.code == "usage" && error.message.contains("--verbose")
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// The checked-in `cli-probe` component exports `run-command` and renders through the SDK's
+/// `clap` layer: the load reads that export from the component type, the typed
+/// `(list<string>, option<string>)` call delivers the piped value, and clap's help page, clap's
+/// usage error, a proposal, and a decline each parse as the shared outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     let registry = BrokerProviderRegistry::load(
@@ -809,7 +870,10 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
         panic!("expected rendered help, got {outcome:?}");
     };
     assert_eq!(status, 0);
-    assert!(stdout.starts_with("Usage: probe"), "{stdout:?}");
+    assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout:?}");
+    for subcommand in ["upper", "count", "reverse"] {
+        assert!(stdout.contains(&format!("\n  {subcommand} ")), "{stdout:?}");
+    }
     assert!(stderr.is_empty(), "{stderr:?}");
 
     let capability = "cli-probe.count"
@@ -852,7 +916,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     assert_eq!(output.output, json!({"characters": 5}));
 
     let outcome = registry
-        .run_command("probe", &["count".to_owned(), "-".to_owned()], None)
+        .run_command("probe", &["bogus".to_owned()], None)
         .await
         .expect("a usage error is rendered, not a host error");
     let CommandRunOutcome::Rendered {
@@ -865,17 +929,21 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     };
     assert_eq!(status, 2);
     assert!(stdout.is_empty(), "{stdout:?}");
-    assert!(stderr.contains("nothing was piped in"), "{stderr:?}");
+    assert!(
+        stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
 
     let outcome = registry
-        .run_command("probe", &["bogus".to_owned()], None)
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], None)
         .await
         .expect("a decline is an outcome, not a host error");
     assert!(
         matches!(
             outcome,
             CommandRunOutcome::Failed { ref error }
-                if error.code == "usage" && error.message.contains("bogus")
+                if error.code == "usage" && error.message.contains("nothing was piped in")
         ),
         "{outcome:?}"
     );

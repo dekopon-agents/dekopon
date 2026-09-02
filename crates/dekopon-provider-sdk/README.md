@@ -23,7 +23,7 @@ dekopon_provider_sdk::export_provider!(Example);
 
 The immediate host accepts only read-only manifests and supplies no WASI imports. The SDK WIT file is mirrored by `dekopon-provider-host`; update both copies together and keep their equality test passing.
 
-Two more paths exist for a provider that contributes words to the sandboxed shell: [command-line providers](#command-line-providers) (`run-command`, the current contract: help pages, usage errors, stdin, and proposals) and the legacy [command words](#command-words) rewrite (`resolve-command`).
+Two more paths exist for a provider that contributes words to the sandboxed shell: [command-line providers](#command-line-providers) (`run-command`, the current contract: help pages, usage errors, stdin, and proposals, hand-rolled or through the optional [`clap` layer](#the-clap-layer)) and the legacy [command words](#command-words) rewrite (`resolve-command`).
 
 ## Provider-owned worlds
 
@@ -88,7 +88,11 @@ world provider {
 }
 ```
 
-`run_command` returns one of three things. `CommandRun::Proposal` is a capability proposal and is authorized on the same path as any other; `CommandRun::Rendered` is text the guest produced by itself, with separate stdout and stderr and an exit status, so the shell's two streams map one to one (`$(gh bogus)` captures nothing while the error still reaches the model); `Err(ProviderError)` is a decline, reported as a usage error. The trait needs no argument parser — match on argv slices and shift values out by hand:
+`run_command` returns one of three things. `CommandRun::Proposal` is a capability proposal and is authorized on the same path as any other; `CommandRun::Rendered` is text the guest produced by itself, with separate stdout and stderr and an exit status, so the shell's two streams map one to one (`$(gh bogus)` captures nothing while the error still reaches the model); `Err(ProviderError)` is a decline, reported as a usage error. Two paths implement it; both are documented, and the first is the contract the second builds on.
+
+### The hand-rolled baseline
+
+The trait needs no argument parser — match on argv slices and shift values out by hand:
 
 ```rust,ignore
 use dekopon_provider_sdk::{CommandRun, Provider, ProviderError};
@@ -115,9 +119,54 @@ fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, Provi
 dekopon_provider_sdk::export_provider_with_cli!(Example, bindings);
 ```
 
-Keep each capability identifier in one `const` used by both `manifest()` and `run_command`, so renaming one is a compile error rather than an exit code a model discovers mid-session. `stdin` is `None` when nothing was piped into the word. Rendered text authorizes nothing and is produced before authorization, so the same rule as the rewrite applies: pure, and no host imports. A `clap`-based layer that renders help and usage errors from a declared command tree is a later addition; the hand-rolled path above is the contract it will build on.
+Keep each capability identifier in one `const` used by both `manifest()` and `run_command`, so renaming one is a compile error rather than an exit code a model discovers mid-session. `stdin` is `None` when nothing was piped into the word. Rendered text authorizes nothing and is produced before authorization, so the same rule as the rewrite applies: pure, and no host imports. The [`memory-reservation-probe`](../../examples/providers/memory-reservation-probe/README.md) fixture is this path checked in.
 
 The default `run_command` delegates to `resolve_command`, so a provider written against the legacy rewrite can move to `export_provider_with_cli!` and the `provider-cli` world without changing anything else; it then gains no stdin until it implements `run_command`, because the legacy contract has none.
+
+### The `clap` layer
+
+The recommended way to write the same thing. Enable the SDK's `clap` feature and declare the command tree once; `dekopon_provider_sdk::cli::run_command` parses the argv against it and does what the upstream tool's `main` would: `--help`, `--version`, and the `help` subcommand render on stdout at status 0, an unknown subcommand, a missing argument, or a refused value renders clap's own usage error on stderr at status 2, and a well-formed argv reaches a dispatch closure with the piped value, whose proposal is authorized as any other. The SDK re-exports `clap`, so a guest builds its tree — by hand or with `#[derive(Parser)]` — against the SDK's exact version without declaring the dependency:
+
+```toml
+[dependencies]
+dekopon-provider-sdk = { version = "0.12.0", features = ["clap"] }
+```
+
+```rust,ignore
+use dekopon_provider_sdk::clap::{Arg, ArgMatches, Command};
+use dekopon_provider_sdk::{CommandInvocation, CommandRun, ProviderError, cli};
+
+const PR_READ: &str = "gh.pull-request.read";
+
+fn tree() -> Command {
+    Command::new("gh").version("0.1.0").subcommand_required(true).subcommand(
+        Command::new("pr").subcommand_required(true).subcommand(
+            Command::new("view").about("View a pull request").arg(Arg::new("number").required(true)),
+        ),
+    )
+}
+
+fn dispatch(matches: ArgMatches, stdin: Option<&str>) -> Result<CommandInvocation, ProviderError> {
+    match matches.subcommand() {
+        Some(("pr", pr)) => match pr.subcommand() {
+            Some(("view", view)) => Ok(CommandInvocation {
+                capability: PR_READ.parse().expect("static capability ID"),
+                input: serde_json::json!({ "number": view.get_one::<String>("number") }),
+            }),
+            _ => Err(ProviderError::new("usage", "gh pr view <NUMBER>")),
+        },
+        _ => Err(ProviderError::new("usage", "gh pr <COMMAND>")),
+    }
+}
+
+fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
+    cli::run_command(tree(), argv, stdin, dispatch)
+}
+```
+
+The same `const`-per-capability convention applies: `manifest()` and `dispatch` read one identifier, so a rename is a compile error, and a fixture test that walks every dispatch target and finds it in the manifest closes the remaining gap. The tree is built on every call — a command word runs in a fresh store under a fuel bound, and there is no process-lifetime static to hold it — so keep it declarative. What clap cannot know (whether anything was piped into `-`, a bound on a value) is the dispatch closure's to refuse, as a decline naming its cause.
+
+The SDK's clap is deliberately narrow: `std`, `help`, `usage`, `error-context`, and `derive`, declared directly rather than inherited from the workspace so that two features never reach a guest. `env` would let an argument default from a process environment a component does not have and must never read; `color` pulls in a terminal probe and would put escape sequences in text a model reads. The layer never calls `get_matches` (which reads `std::env::args_os`), `Error::exit`, or `Error::print`; rendered text is returned, never printed. The [`cli-probe`](../../examples/providers/cli-probe/README.md) fixture is this path checked in, with clap's exact help page pinned by its lockfile.
 
 ## Command words
 

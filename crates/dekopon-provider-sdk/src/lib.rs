@@ -6,6 +6,13 @@
 //! exports through [`export_provider_with_cli!`], so `gh --help` renders a page and `gh pr view 7`
 //! proposes a capability.
 //!
+//! Hand-rolled argv handling — matching on slices and shifting values out by hand — is the
+//! baseline contract every command-line provider can rely on. The optional `clap` feature adds
+//! [`cli`], the encouraged layer over it: [`cli::run_command`] renders help, a version, and usage
+//! errors from a declared `clap::Command` tree and hands parsed matches to a dispatch closure, and
+//! the crate re-exports [`clap`] so a guest builds its tree against the SDK's exact clap without
+//! declaring the dependency itself.
+//!
 //! The optional `host` feature adds [`host`], the Wasmtime plumbing both Dekopon hosts share. It is
 //! off by default and no guest build enables it.
 
@@ -18,6 +25,11 @@ pub use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "clap")]
+pub use clap;
+
+#[cfg(feature = "clap")]
+pub mod cli;
 #[cfg(feature = "host")]
 pub mod host;
 

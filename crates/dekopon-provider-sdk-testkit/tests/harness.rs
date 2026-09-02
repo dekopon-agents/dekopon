@@ -4,8 +4,8 @@
 //! current-thread runtime deadlocks waiting for a namespace lease.
 
 use dekopon_provider_sdk_testkit::{
-    BrokerHostError, BrokerHostLimits, ContinuityPolicy, FakeBroker, FakeBrokerError,
-    StorageAccess, StorageInterface, StorageLimits,
+    BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FakeBroker,
+    FakeBrokerError, StorageAccess, StorageInterface, StorageLimits,
 };
 use dekopon_test_support::{provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
@@ -144,6 +144,68 @@ async fn two_subjects_do_not_share_a_namespace() {
         .await
         .expect("an empty namespace reads cleanly");
     assert_eq!(recent["turns"].as_array().expect("turns array").len(), 0);
+}
+
+/// A command word runs through the same host the shell uses: the guest's clap help page comes
+/// back rendered, a piped value reaches the proposal, and the proposal runs through `invoke`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_word_renders_its_help_page_and_proposes() {
+    let broker = FakeBroker::builder()
+        .component(provider_fixture("cli-probe-provider.wasm"))
+        .provider("cli-probe")
+        .build()
+        .await
+        .expect("cli-probe loads");
+
+    let outcome = broker
+        .run_command("probe", &["--help".to_owned()], None)
+        .await
+        .expect("help renders");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected rendered help, got {outcome:?}");
+    };
+    assert_eq!(status, 0);
+    assert!(stdout.starts_with("Usage: probe <COMMAND>\n"), "{stdout:?}");
+    assert!(
+        stdout.contains("\n  reverse  Reverse the text\n"),
+        "{stdout:?}"
+    );
+    assert!(stderr.is_empty(), "{stderr:?}");
+
+    let outcome = broker
+        .run_command(
+            "probe",
+            &["reverse".to_owned(), "-".to_owned()],
+            Some("abc"),
+        )
+        .await
+        .expect("a piped value proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: "cli-probe.reverse".parse().expect("capability"),
+            input: json!({"text": "abc"}),
+        }
+    );
+    let output = broker
+        .invoke("cli-probe.reverse", json!({"text": "abc"}))
+        .await
+        .expect("the proposal runs");
+    assert_eq!(output, json!({"text": "cba"}));
+
+    let error = broker
+        .run_command("recall", &[], None)
+        .await
+        .expect_err("a word the component did not declare is refused");
+    assert!(
+        matches!(error, FakeBrokerError::Host(BrokerHostError::UnknownCommandWord { ref word }) if word == "recall"),
+        "{error:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

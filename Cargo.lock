@@ -1060,6 +1060,7 @@ dependencies = [
 name = "dekopon-provider-sdk"
 version = "0.12.0"
 dependencies = [
+ "clap",
  "dekopon-capability",
  "dekopon-core",
  "serde",

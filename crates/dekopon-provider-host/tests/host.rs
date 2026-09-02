@@ -323,9 +323,11 @@ fn a_legacy_resolve_command_provider_runs_through_the_same_path() {
     );
 }
 
-/// The checked-in `cli-probe` component exports `run-command`, so this is where the typed
-/// `(list<string>, option<string>) -> string` lowering, the piped value reaching the guest, and
-/// every answer shape are proven against a real guest rather than an adapted legacy one.
+/// The checked-in `cli-probe` component exports `run-command` and renders through the SDK's
+/// `clap` layer, so this is where the typed `(list<string>, option<string>) -> string` lowering,
+/// the piped value reaching the guest, and every answer shape — clap's help page, clap's usage
+/// error, a proposal, a decline — are proven against a real guest rather than an adapted legacy
+/// one.
 #[test]
 fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     let registry = ProviderRegistry::load(
@@ -355,7 +357,10 @@ fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
         panic!("expected rendered help, got {outcome:?}");
     };
     assert_eq!(status, 0);
-    assert!(stdout.starts_with("Usage: probe"), "{stdout:?}");
+    assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout:?}");
+    for subcommand in ["upper", "count", "reverse"] {
+        assert!(stdout.contains(&format!("\n  {subcommand} ")), "{stdout:?}");
+    }
     assert!(stderr.is_empty(), "{stderr:?}");
 
     let capability = "cli-probe.upper"
@@ -382,7 +387,7 @@ fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     assert_eq!(output.output, json!({"text": "HELLO"}));
 
     let outcome = registry
-        .run_command("probe", &["upper".to_owned(), "-".to_owned()], None)
+        .run_command("probe", &["bogus".to_owned()], None)
         .expect("a usage error is rendered, not a host error");
     let CommandRunOutcome::Rendered {
         stdout,
@@ -394,16 +399,20 @@ fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     };
     assert_eq!(status, 2);
     assert!(stdout.is_empty(), "{stdout:?}");
-    assert!(stderr.contains("nothing was piped in"), "{stderr:?}");
+    assert!(
+        stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
 
     let outcome = registry
-        .run_command("probe", &["bogus".to_owned()], None)
+        .run_command("probe", &["upper".to_owned(), "-".to_owned()], None)
         .expect("a decline is an outcome, not a host error");
     assert!(
         matches!(
             outcome,
             CommandRunOutcome::Failed { ref error }
-                if error.code == "usage" && error.message.contains("bogus")
+                if error.code == "usage" && error.message.contains("nothing was piped in")
         ),
         "{outcome:?}"
     );

@@ -40,6 +40,12 @@ let rows = broker
 # }
 ```
 
+A provider that contributes command words is driven the same way: `broker.run_command("probe",
+&argv, Some("piped"))` returns the `CommandRunOutcome` the broker host decodes from the guest — a
+page it rendered itself (help, a version, a usage error) with its exit status, a capability
+proposal, or a decline. A proposal is the rewrite, not its result; pass it to `invoke` to close the
+loop.
+
 ## Things it does for you that are easy to get wrong
 
 - **Continuity is selectable and defaults to `Stable`.** `ContinuityPolicy`'s own default is

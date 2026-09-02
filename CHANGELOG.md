@@ -17,6 +17,17 @@ All notable changes to Dekopon are documented here. The format is based on
   span records `process.interruptibility` as `cancellable` and a requested cancellation as
   `process.outcome` `cancelled`. Nothing in the repository is cancellable yet; the runner's
   `legacy-shell` node stays non-interruptible.
+- Added an optional `clap` feature to `dekopon-provider-sdk`: `cli::run_command` parses a
+  command word's argv against a declared `clap::Command` tree and answers as the upstream tool's
+  `main` would — `--help`, `--version`, and the `help` subcommand rendered on stdout at status 0,
+  an unknown subcommand or a missing argument rendered as clap's usage error on stderr at status
+  2, and a well-formed argv handed with the piped value to a dispatch closure whose proposal is
+  authorized as any other. The SDK re-exports `clap` so a guest builds its tree (or derives it)
+  against the SDK's exact version, compiled without `env` or `color`: no argument can read a
+  process environment and no escape sequence reaches the model. Hand-rolled argv handling stays
+  the baseline contract; the `cli-probe` fixture now uses the layer and `memory-reservation-probe`
+  is the hand-rolled `run-command` guest. `dekopon-provider-sdk-testkit` gained
+  `FakeBroker::run_command`, which drives a component's command word through the broker host.
 - Added skills, operator-authored reference material an agent reads on demand. `spec.skills` lists
   directories in the Agent Skills `SKILL.md` layout: YAML front matter carrying `name` (equal to
   the directory name; `[a-z0-9-]`, at most 64 bytes) and `description` (at most 1024 bytes), the

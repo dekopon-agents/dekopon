@@ -1,16 +1,17 @@
 //! Import-free fixture whose `probe` command word behaves like a small command-line program.
 //!
-//! It is the checked-in `run-command` guest: `probe --help` renders a help page on stdout at
-//! status 0, `probe upper --text hi` proposes `cli-probe.upper`, `probe upper -` reads the value
-//! piped into the word, `probe upper -` with nothing piped is a usage error on stderr at status 2,
-//! and an unknown subcommand is a decline. The argument handling is hand-rolled on purpose: it is
-//! the clap-free baseline the SDK's `Provider::run_command` contract promises.
+//! It is the checked-in `run-command` guest built on the SDK's `clap` layer: `probe --help` and
+//! `probe --version` render on stdout at status 0, `probe bogus` and `probe count` (missing its
+//! argument) render clap's usage error on stderr at status 2, `probe upper --text hi` proposes
+//! `cli-probe.upper`, `probe upper -` reads the value piped into the word, and `probe upper -`
+//! with nothing piped is declined with a `usage` error. The command tree is declared once through
+//! `#[derive(Parser)]` against the clap the SDK re-exports; the hand-rolled baseline the SDK
+//! documents lives in `memory-reservation-probe`.
 
-use std::fmt::Display;
-
+use dekopon_provider_sdk::clap::{self, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Idempotency, Provider, ProviderApiVersion,
-    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandInvocation, CommandRun, EffectKind, Idempotency, Provider,
+    ProviderApiVersion, ProviderCapability, ProviderError, ProviderManifest, RiskLevel, cli,
 };
 use serde_json::{Value, json};
 
@@ -33,31 +34,80 @@ const COUNT: &str = "cli-probe.count";
 /// Reverses the text.
 const REVERSE: &str = "cli-probe.reverse";
 
-/// Every subcommand and the capability it proposes, the one table `manifest()` and
-/// `run_command()` both read from so a renamed capability is a failing test, never an exit code.
-const SUBCOMMANDS: [(&str, &str, &str); 3] = [
-    ("upper", UPPER, "Upper-case the text"),
-    ("count", COUNT, "Count the characters in the text"),
-    ("reverse", REVERSE, "Reverse the text"),
-];
-
 /// The largest `text` the fixture transforms; anything longer is refused with its length.
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 
-const VERSION: &str = "probe 0.1.0\n";
+// The `probe` command tree, declared once and rendered by clap. A plain comment rather than a doc
+// comment: clap would render a doc comment as the `about` line above `Usage:`.
+#[derive(Parser)]
+#[command(name = "probe", version = "0.1.0")]
+struct Probe {
+    #[command(subcommand)]
+    transform: Transform,
+}
 
-const HELP: &str = "Usage: probe <COMMAND>\n\
-\n\
-Commands:\n\
-\x20 upper    Upper-case the text\n\
-\x20 count    Count the characters in the text\n\
-\x20 reverse  Reverse the text\n\
-\n\
-Each command takes `--text <TEXT>` or `-` to read the value piped into the word.\n\
-\n\
-Options:\n\
-\x20 -h, --help     Print help\n\
-\x20 -V, --version  Print version\n";
+// Every subcommand; each proposes exactly one capability, named by the `const` `manifest()`
+// declares, so a renamed capability is a compile error rather than an exit code. A plain comment
+// for the same reason as on `Probe`: clap renders an enum's doc comment as the parent's `about`.
+#[derive(Subcommand)]
+enum Transform {
+    /// Upper-case the text
+    Upper(TextSource),
+    /// Count the characters in the text
+    Count(TextSource),
+    /// Reverse the text
+    Reverse(TextSource),
+}
+
+impl Transform {
+    /// The capability this subcommand proposes and the description the manifest declares for it.
+    const fn capability(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Upper(_) => (UPPER, "Upper-case the text"),
+            Self::Count(_) => (COUNT, "Count the characters in the text"),
+            Self::Reverse(_) => (REVERSE, "Reverse the text"),
+        }
+    }
+
+    /// The argument every subcommand takes.
+    const fn source(&self) -> &TextSource {
+        match self {
+            Self::Upper(source) | Self::Count(source) | Self::Reverse(source) => source,
+        }
+    }
+}
+
+/// Where a subcommand's text comes from: `--text <TEXT>`, or `-` for the value piped into the word.
+#[derive(Args)]
+struct TextSource {
+    /// The text to transform
+    #[arg(
+        long,
+        value_name = "TEXT",
+        conflicts_with = "piped",
+        required_unless_present = "piped"
+    )]
+    text: Option<String>,
+    /// Read the text piped into the word instead
+    #[arg(value_name = "-", value_parser = ["-"])]
+    piped: Option<String>,
+}
+
+/// Every subcommand the tree declares, in help order; the manifest is derived from it so a
+/// subcommand cannot exist without its capability.
+const SUBCOMMANDS: [Transform; 3] = [
+    Transform::Upper(TextSource::NONE),
+    Transform::Count(TextSource::NONE),
+    Transform::Reverse(TextSource::NONE),
+];
+
+impl TextSource {
+    /// A source with neither argument, for the manifest table only; clap never produces it.
+    const NONE: Self = Self {
+        text: None,
+        piped: None,
+    };
+}
 
 impl Provider for CliProbe {
     fn manifest() -> ProviderManifest {
@@ -69,18 +119,21 @@ impl Provider for CliProbe {
             command_words: vec!["probe".to_owned()],
             capabilities: SUBCOMMANDS
                 .iter()
-                .map(|(_, capability, description)| ProviderCapability {
-                    id: capability.parse().expect("static capability ID"),
-                    description: (*description).to_owned(),
-                    effect: EffectKind::ReadOnly,
-                    risk: RiskLevel::Low,
-                    idempotency: Idempotency::Idempotent,
-                    input_schema: json!({
-                        "type": "object",
-                        "required": ["text"],
-                        "properties": {"text": {"type": "string"}},
-                        "additionalProperties": false
-                    }),
+                .map(|transform| {
+                    let (capability, description) = transform.capability();
+                    ProviderCapability {
+                        id: capability.parse().expect("static capability ID"),
+                        description: description.to_owned(),
+                        effect: EffectKind::ReadOnly,
+                        risk: RiskLevel::Low,
+                        idempotency: Idempotency::Idempotent,
+                        input_schema: json!({
+                            "type": "object",
+                            "required": ["text"],
+                            "properties": {"text": {"type": "string"}},
+                            "additionalProperties": false
+                        }),
+                    }
                 })
                 .collect(),
         }
@@ -100,58 +153,58 @@ impl Provider for CliProbe {
     }
 
     fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        let Some((subcommand, rest)) = argv.split_first() else {
-            return Ok(usage("a subcommand is required"));
-        };
-        match subcommand.as_str() {
-            "--help" | "-h" => return Ok(CommandRun::rendered(HELP, 0)),
-            "--version" | "-V" => return Ok(CommandRun::rendered(VERSION, 0)),
-            _ => {}
-        }
-        let Some(capability) = capability_for(subcommand) else {
-            return Err(ProviderError::new(
-                "usage",
-                format!("unrecognized subcommand '{subcommand}'"),
-            ));
-        };
-        let text = match rest {
-            [flag, text] if flag == "--text" => text.as_str(),
-            [dash] if dash == "-" => match stdin {
-                Some(text) => text,
-                None => return Ok(usage(format!("probe {subcommand} -: nothing was piped in"))),
-            },
-            _ => {
-                return Ok(usage(format!(
-                    "probe {subcommand} takes `--text <TEXT>` or `-`"
-                )));
-            }
-        };
-        if let Err(error) = check_text(text) {
-            return Ok(usage(error.message()));
-        }
-        Ok(CommandRun::proposal(
-            capability.parse().expect("static capability ID"),
-            json!({"text": text}),
-        ))
+        cli::run_command(Probe::command(), argv, stdin, dispatch)
     }
 }
 
-/// The capability a subcommand proposes, `None` for a word the table does not know.
-fn capability_for(subcommand: &str) -> Option<&'static str> {
-    SUBCOMMANDS
-        .iter()
-        .find(|(word, _, _)| *word == subcommand)
-        .map(|(_, capability, _)| *capability)
+/// Turns clap's matches into the proposal for the selected subcommand.
+///
+/// Runs only after clap accepted the argv, so the subcommand and one of its two sources are
+/// present; what remains to check is what clap cannot know — whether anything was piped, and the
+/// text bound — and each refusal is a decline naming its cause.
+fn dispatch(
+    matches: clap::ArgMatches,
+    stdin: Option<&str>,
+) -> Result<CommandInvocation, ProviderError> {
+    let probe = Probe::from_arg_matches(&matches)
+        .map_err(|error| ProviderError::new("usage", error.to_string()))?;
+    let (capability, _) = probe.transform.capability();
+    let source = probe.transform.source();
+    let text = match (&source.text, &source.piped) {
+        (Some(text), _) => text.as_str(),
+        (None, Some(_)) => stdin.ok_or_else(|| {
+            ProviderError::new(
+                "usage",
+                format!(
+                    "probe {} -: nothing was piped in",
+                    subcommand_word(&probe.transform)
+                ),
+            )
+        })?,
+        (None, None) => {
+            return Err(ProviderError::new(
+                "usage",
+                format!(
+                    "probe {} takes `--text <TEXT>` or `-`",
+                    subcommand_word(&probe.transform)
+                ),
+            ));
+        }
+    };
+    check_text(text)?;
+    Ok(CommandInvocation {
+        capability: capability.parse().expect("static capability ID"),
+        input: json!({"text": text}),
+    })
 }
 
-/// A usage error as a command-line program prints one: on stderr, at status 2, naming the fix.
-fn usage(message: impl Display) -> CommandRun {
-    CommandRun::rendered_error(
-        format!(
-            "error: {message}\n\nUsage: probe <COMMAND>\n\nFor more information, try '--help'.\n"
-        ),
-        2,
-    )
+/// The word a subcommand is typed as, for messages.
+const fn subcommand_word(transform: &Transform) -> &'static str {
+    match transform {
+        Transform::Upper(_) => "upper",
+        Transform::Count(_) => "count",
+        Transform::Reverse(_) => "reverse",
+    }
 }
 
 /// Refuses a `text` beyond the fixture's bound, naming both lengths.
@@ -199,10 +252,38 @@ mod tests {
     use dekopon_provider_sdk::{CommandInvocation, CommandRun, Provider};
     use serde_json::json;
 
-    use super::{CliProbe, HELP, MAX_TEXT_BYTES, SUBCOMMANDS, VERSION};
+    use super::{CliProbe, MAX_TEXT_BYTES, SUBCOMMANDS, subcommand_word};
+
+    /// clap's rendering of the tree, pinned byte for byte; the fixture's lockfile pins clap.
+    const HELP: &str = "Usage: probe <COMMAND>\n\
+\n\
+Commands:\n\
+\x20 upper    Upper-case the text\n\
+\x20 count    Count the characters in the text\n\
+\x20 reverse  Reverse the text\n\
+\x20 help     Print this message or the help of the given subcommand(s)\n\
+\n\
+Options:\n\
+\x20 -h, --help     Print help\n\
+\x20 -V, --version  Print version\n";
+
+    const VERSION: &str = "probe 0.1.0\n";
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    fn rendered(words: &[&str], stdin: Option<&str>) -> (String, String, u8) {
+        let run = CliProbe::run_command(&argv(words), stdin).expect("rendered, not declined");
+        let CommandRun::Rendered {
+            stdout,
+            stderr,
+            status,
+        } = run
+        else {
+            panic!("expected rendered text for {words:?}, got {run:?}");
+        };
+        (stdout, stderr, status)
     }
 
     #[test]
@@ -215,10 +296,18 @@ mod tests {
             .iter()
             .map(|capability| capability.id.as_str().to_owned())
             .collect::<Vec<_>>();
-        for (_, capability, _) in SUBCOMMANDS {
+        for transform in &SUBCOMMANDS {
+            let (capability, _) = transform.capability();
             assert!(
                 declared.iter().any(|id| id == capability),
                 "{capability} is dispatched to but not declared"
+            );
+            let run =
+                CliProbe::run_command(&argv(&[subcommand_word(transform), "--text", "x"]), None)
+                    .expect("every subcommand proposes");
+            assert!(
+                matches!(run, CommandRun::Proposal(ref invocation) if invocation.capability.as_str() == capability),
+                "{capability}: {run:?}"
             );
         }
         assert_eq!(declared.len(), SUBCOMMANDS.len());
@@ -227,20 +316,55 @@ mod tests {
     #[test]
     fn help_and_version_render_on_stdout_at_status_zero() {
         for (flag, expected) in [("--help", HELP), ("-h", HELP), ("--version", VERSION)] {
-            let run = CliProbe::run_command(&argv(&[flag]), None).expect("help is not a decline");
-            assert_eq!(
-                run,
-                CommandRun::Rendered {
-                    stdout: expected.to_owned(),
-                    stderr: String::new(),
-                    status: 0,
-                },
-                "{flag}"
+            let (stdout, stderr, status) = rendered(&[flag], None);
+            assert_eq!(status, 0, "{flag}");
+            assert_eq!(stdout, expected, "{flag}");
+            assert!(stderr.is_empty(), "{flag}: {stderr:?}");
+            assert!(!stdout.contains('\u{1b}'), "{flag}: plain, never coloured");
+        }
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_a_usage_error_on_stderr_at_status_two() {
+        let (stdout, stderr, status) = rendered(&["bogus"], None);
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty(), "{stdout:?}");
+        assert!(
+            stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+            "{stderr:?}"
+        );
+        assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
+        assert!(!stderr.contains('\u{1b}'), "plain, never coloured");
+    }
+
+    /// clap answers a bare `probe` with the help page on stderr at status 2, the way a tool with
+    /// a required subcommand does; every other malformed argv gets clap's `error:` line, and the
+    /// ones clap gives a usage line carry the word the model typed, not the bare subcommand.
+    #[test]
+    fn a_missing_or_malformed_argument_is_a_usage_error() {
+        let (stdout, stderr, status) = rendered(&[], None);
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty(), "{stdout:?}");
+        assert_eq!(stderr, HELP);
+        for words in [
+            &["count"][..],
+            &["count", "--text"][..],
+            &["count", "--text", "a", "-"][..],
+            &["count", "+"][..],
+        ] {
+            let (stdout, stderr, status) = rendered(words, None);
+            assert_eq!(status, 2, "{words:?}");
+            assert!(stdout.is_empty(), "{words:?}: {stdout:?}");
+            assert!(stderr.starts_with("error: "), "{words:?}: {stderr:?}");
+            assert!(
+                !stderr.contains('\u{1b}'),
+                "{words:?}: plain, never coloured"
             );
         }
+        let (_, stderr, _) = rendered(&["count"], None);
         assert!(
-            !HELP.contains('\u{1b}'),
-            "help text is plain, never coloured"
+            stderr.contains("\nUsage: probe count --text <TEXT> [-]\n"),
+            "{stderr:?}"
         );
     }
 
@@ -271,42 +395,20 @@ mod tests {
     }
 
     #[test]
-    fn a_dash_without_a_piped_value_is_a_usage_error_on_stderr() {
-        let run = CliProbe::run_command(&argv(&["upper", "-"]), None)
-            .expect("a usage error is rendered, not declined");
-        let CommandRun::Rendered {
-            stdout,
-            stderr,
-            status,
-        } = run
-        else {
-            panic!("expected rendered text, got {run:?}");
-        };
-        assert_eq!(status, 2);
-        assert!(stdout.is_empty(), "{stdout:?}");
-        assert!(stderr.contains("nothing was piped in"), "{stderr:?}");
-    }
-
-    #[test]
-    fn a_missing_or_malformed_argument_is_a_usage_error() {
-        for words in [&[][..], &["count"][..], &["count", "--text"][..]] {
-            let run = CliProbe::run_command(&argv(words), None).expect("rendered, not declined");
-            assert!(
-                matches!(run, CommandRun::Rendered { status: 2, ref stderr, .. } if stderr.starts_with("error: ")),
-                "{words:?}: {run:?}"
-            );
-        }
+    fn a_dash_without_a_piped_value_is_declined_naming_the_cause() {
+        let error = CliProbe::run_command(&argv(&["upper", "-"]), None)
+            .expect_err("nothing piped is a decline, not a proposal");
+        assert_eq!(error.code(), "usage");
+        assert_eq!(error.message(), "probe upper -: nothing was piped in");
     }
 
     #[test]
     fn an_oversized_text_is_refused_by_both_paths_naming_its_length() {
         let text = "x".repeat(MAX_TEXT_BYTES + 1);
-        let run = CliProbe::run_command(&argv(&["upper", "--text", &text]), None)
-            .expect("rendered, not declined");
-        assert!(
-            matches!(run, CommandRun::Rendered { status: 2, ref stderr, .. } if stderr.contains("16385 bytes")),
-            "{run:?}"
-        );
+        let error = CliProbe::run_command(&argv(&["upper", "--text", &text]), None)
+            .expect_err("the bound is a decline");
+        assert_eq!(error.code(), "invalid-input");
+        assert!(error.message().contains("16385 bytes"), "{error:?}");
         let error = CliProbe::invoke(
             &"cli-probe.upper".parse().expect("static capability"),
             json!({"text": text}),
@@ -314,14 +416,6 @@ mod tests {
         .expect_err("invoke enforces the same bound");
         assert_eq!(error.code(), "invalid-input");
         assert!(error.message().contains("16385 bytes"), "{error:?}");
-    }
-
-    #[test]
-    fn an_unknown_subcommand_is_a_decline() {
-        let error = CliProbe::run_command(&argv(&["bogus"]), None)
-            .expect_err("an unknown word is declined");
-        assert_eq!(error.code(), "usage");
-        assert!(error.message().contains("'bogus'"), "{error:?}");
     }
 
     #[test]

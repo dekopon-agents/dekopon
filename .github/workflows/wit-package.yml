@@ -501,13 +501,15 @@ jobs:
           set -euo pipefail
           component=examples/providers/memory-reservation-probe-provider.wasm
           description=target/wit-package/memory-reservation-probe.json
+          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+            examples/providers/memory-reservation-probe/wit/provider.wit
           wasm-tools validate "$component"
           wasm-tools component wit --json "$component" > "$description"
           jq --exit-status '
             (.packages | map(.name) == ["root:component"]) and
             (.worlds | length == 1) and
             (.worlds[0].imports == {}) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke", "resolve-command"])
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"])
           ' "$description"
 
       - name: Verify storage-importing provider fixtures
