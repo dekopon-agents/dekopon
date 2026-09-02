@@ -98,7 +98,7 @@ Branch protection runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on
 
 - Run `ci/fetch-external-provider-components.sh examples/providers` before `cargo test --workspace`; it installs the checksum-pinned echo, JSONPlaceholder, and memory-chat fixtures (gitignored, never committed), without which many tests fail with `NotFound` on `examples/providers/*-provider.wasm`. The CLI smoke and OTLP lanes fetch only `echo`.
 - `target/` grows past 25 GB with test binaries, and a full disk surfaces as LLVM or linker "IO failure" errors rather than test failures. Recover by deleting `target/debug/incremental` and the large test executables under `target/debug/deps`; they regenerate. `CARGO_INCREMENTAL=0` keeps it from regrowing.
-- The `dekopon-brokerd` unit test `a_secret_file_that_cannot_be_opened_still_names_its_errno` chmods a file to `0o000` and expects an open errno; it assumes a non-root user and fails under root (containers). It is not a regression signal there.
+- Three tests assume a non-root user and fail under root (containers): the `dekopon-brokerd` unit test `a_secret_file_that_cannot_be_opened_still_names_its_errno` chmods a file to `0o000` and expects an open errno, the `dekopon-model` unit test `a_rotated_credential_completes_the_turn_when_the_write_fails` makes a directory `0o500` and expects a write to fail, and the `dekopon-storage-host` test `inaccessible_namespace_is_quarantined_without_blocking_a_healthy_neighbor` makes a namespace `0o000` and expects it quarantined. None is a regression signal there.
 - OpenObserve, WIT package round trips, and the container image have their own command groups under [Validation](docs/development.md#validation); run them only when those areas change.
 
 ## When adding X, also update Y
