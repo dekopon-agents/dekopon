@@ -1,5 +1,11 @@
 # Workspace integration tests
 
-Integration tests live with their packages under `crates/*/tests`. The CLI ones are in [`crates/dekopon/tests`](../crates/dekopon/tests) and [`crates/dekopon-run/tests`](../crates/dekopon-run/tests); the end-to-end one that boots a real `dekopon-brokerd` and a real `dekopond` against a mock model endpoint is [`crates/dekopond/tests/gateway.rs`](../crates/dekopond/tests/gateway.rs); the checked-in examples are pinned against the real machinery by [`crates/dekopon-brokerd/tests/examples.rs`](../crates/dekopon-brokerd/tests/examples.rs), [`crates/dekopon-config/tests/examples.rs`](../crates/dekopon-config/tests/examples.rs), and [`crates/dekopond/tests/examples.rs`](../crates/dekopond/tests/examples.rs).
+Integration tests live beside the crate that owns the behavior under `crates/*/tests`; shared scaffolding is `crates/dekopon-test-support`. The complete map from area to implementation and test suite is [Repository map](../docs/development.md#repository-map).
 
-The repository-level black-box observability test lives with its runnable example at [`examples/otel-traces/smoke-test.sh`](../examples/otel-traces/smoke-test.sh). It starts one OpenObserve container, runs an instrumented provider invocation, and searches for expected payload-redacted traces.
+Before running the workspace tests, fetch the gitignored standalone provider fixtures; the full command set is in [Validation](../docs/development.md#validation).
+
+```console
+ci/fetch-external-provider-components.sh examples/providers
+```
+
+The repository-level black-box observability test lives with its runnable example at [`examples/otel-traces/smoke-test.sh`](../examples/otel-traces/smoke-test.sh). It builds the runner, starts one OpenObserve container, runs a direct provider invocation, and searches both streams: the trace stream for the required spans and no sentinel provider input, and the log stream for a lifecycle record carrying the same `trace_id`. It removes the container and its volume afterward ([details](../docs/development.md#openobserve-otlp-end-to-end-test)).

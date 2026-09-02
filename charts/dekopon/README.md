@@ -6,9 +6,10 @@ cluster.
 **Status: published, but never applied to a cluster.** Those are two separate claims and only one of
 them limits you.
 
-*Published* is settled. `dekopon-chart-0.1.0` shipped the chart to
-`oci://ghcr.io/dekopon-agents/charts/dekopon:0.1.0`, and application tags from `v0.4.0` onward
-publish the container image it pulls, so `helm install` from the registry has everything it needs.
+*Published* is settled. `dekopon-chart-0.3.0` shipped the chart to
+`oci://ghcr.io/dekopon-agents/charts/dekopon:0.3.0` (0.1.0, 0.2.0 and 0.2.1 precede it), and
+application tags from `v0.4.0` onward publish the container image it pulls, so `helm install` from
+the registry has everything it needs.
 The chart is consumed from ArgoCD by registry path, not by Git path, and both GHCR packages are
 public. See [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
 
@@ -105,7 +106,15 @@ failure naming that file rather than a broker that starts and then refuses to se
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters
   `broker.yaml`.
 - **The agent catalog.** Tier E. `dekopond` reads `catalogPath` with a plain `read_to_string`, so a
-  ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied.
+  ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
+  for the catalog file alone. An agent that declares `skills:` — an `[Unreleased]` catalog field
+  in [`CHANGELOG.md`](../../CHANGELOG.md), newer than `appVersion` `0.12.0` — needs each skill
+  directory readable in the pod (a relative path resolves against the catalog file's own
+  directory), and `dekopond` refuses the catalog at startup when one cannot be read.
+  `gateway.catalog` projects a single key to a single file and the chart offers no operator-supplied
+  volume mount for the gateway, so a catalog with skills cannot come from `gateway.catalog`: bake
+  the catalog and its skill directories into an image of your own (skill paths must be real
+  directories and files, not symlinks) and name that path as `catalogPath` in `dekopond.yaml`.
 - **Provider components.** The image already bakes `/opt/dekopon/providers/*.wasm` owned by
   `65532:65532` under a `65532`-owned `0755` directory, which is what Tier B wants.
 - **The ChatGPT credential**, for the opposite reason from all of these. `load_credentials` is a
@@ -217,8 +226,8 @@ and every append, checkpoint and rename still has to be crash-safe on its own.
 
 `dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
 waits for a human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription`
-model has to be handed a credential exported from a local login. `dekopon auth chatgpt export`
-produces it — that command lands with the auth-export change, and
+model has to be handed a credential exported from a local login.
+`dekopon auth chatgpt export --expose-credential` produces it, and
 [`docs/chatgpt-credential.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/chatgpt-credential.md)
 is the full lifecycle.
 
@@ -228,7 +237,7 @@ Set `gateway.chatgpt.enabled` and point it at the Secret:
 gateway:
   chatgpt:
     enabled: true
-    existingSecret: dekopon-chatgpt-auth   # what `dekopon auth chatgpt export` emits
+    existingSecret: dekopon-chatgpt-auth   # what `dekopon auth chatgpt export --expose-credential --namespace <ns>` emits
 ```
 
 The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65532`, in a
@@ -349,7 +358,7 @@ refusal and `ENOSPC` in the middle of an append is not. If you raise `auditMaxLi
 `serverLimits` is all-or-nothing: when the section is present every field is required.
 `brokerLimits` and `hostLimits` are not — each of their fields defaults on its own to the value an
 absent section would have produced, which is why the chart's default configuration can set
-`maxReplayIds` and `maxTotalMemoryBytes` without restating the sixteen bounds around them.
+`maxReplayIds` and `maxTotalMemoryBytes` without restating the fifteen bounds around them.
 
 ### Size `maxReplayIds` with it
 
@@ -494,7 +503,7 @@ spec:
   source:
     repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
     chart: dekopon
-    targetRevision: 0.1.0                    # the CHART version, not appVersion
+    targetRevision: 0.3.0                    # the CHART version, not appVersion
     helm:
       valueFiles: []
       values: |
@@ -615,9 +624,9 @@ explicitly, outside the chart. See
 From the registry:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.1.0
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.3.0
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.1.0 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.3.0 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 `helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
@@ -648,16 +657,7 @@ own volume. It may post one review comment and has no approval, request-changes,
 - The daemons have never been started from this configuration. The image an empty `image.tag`
   resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every release from
   `v0.4.0` — but nothing here has watched one boot.
-- `dekopon-chart-0.1.0` is published at `oci://ghcr.io/dekopon-agents/charts/dekopon` and that
-  version is now immutable, so the working tree is ahead of the registry: `appVersion` and every
-  chart change since sit under `[Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md) until a human
-  cuts the next `dekopon-chart-*` tag. Packaging itself is proven on every CI run — the chart is
-  packaged, the archive linted, and the archive's rendered output diffed against the source tree's
-  for both value sets.
-- The daemons have never been started from this configuration. The images exist — application tags
-  from `v0.4.0` onward publish `ghcr.io/dekopon-agents/dekopon:v<VERSION>` — but no pod has run one
-  from these manifests.
-- **The pull path is unproven.** `dekopon-chart-0.1.0` ran `chart-publish.yml` and chart `0.1.0`
+- **The pull path is unproven.** `dekopon-chart-0.3.0` ran `chart-publish.yml` and chart `0.3.0`
   exists at `oci://ghcr.io/dekopon-agents/charts/dekopon`, and packaging is checked continuously:
   CI packages the chart, lints the archive, and diffs the archive's rendered output against the
   source tree's for both value sets, so the pushed tarball is known to be complete and to render

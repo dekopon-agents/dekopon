@@ -46,5 +46,8 @@ The remaining checked components are repository-owned fixtures:
 - [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and is never packaged
   in a scanned image directory.
 
-Regenerate only repository-owned fixtures with their source build scripts. Never edit a `.wasm`
-file directly.
+Regenerate only repository-owned fixtures with their `build.sh`, each of which passes its pinned
+Rust toolchain to the shared [`build-component.sh`](build-component.sh); that script refuses any
+other `rustc` and any `wasm-tools` other than 1.236.1. Never edit a `.wasm` file directly.
+[`JSONPLACEHOLDER.md`](JSONPLACEHOLDER.md) describes the standalone JSONPlaceholder provider's
+linking constraints.

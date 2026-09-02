@@ -45,7 +45,7 @@ Every arrow is a command an operator runs or an edit an operator makes. Skills f
 
 | Mechanism | Where it lives | What the model can do with it | What it never does |
 |---|---|---|---|
-| Skills | The catalog's `spec.skills` directories, `dekopon-run --skill`, the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
+| Skills | The catalog's `spec.skills` directories, `dekopon-run prompt --skill` and `session replay --skill`, the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
 | `suggest_improvement` | The session, when the embedder opted in; the record in the telemetry backend | Record a typed, bounded note for the operator | Change an instruction, skill, limit, or grant; reach the person in chat |
 | Session replay | `dekopon-run session`, reading the OpenObserve stream back | Nothing — it is the operator's tool | Run a capability by default, invent tool output, or score an answer |
 
@@ -149,7 +149,7 @@ dekopon validate
 dekopon describe agent reviewer
 ```
 
-Step 4 repeats until the comparison reads the way the operator wants: the `differs` script is the one the new instruction was meant to change, the replayed answer says what the recorded one should have said, and the replayed model recorded no further suggestion about the thing just fixed. Step 5 is what makes the change real. `dekopond` reads the catalog at startup, so the edit reaches the gateway's sessions on its next start; `dekopon-run --system` and `--skill` take it immediately. Instructions and the skills listing are supplied to each session fresh and never stored in a remembered conversation, so nothing a persistent route holds has to be rewritten. A recording kept under version control beside the catalog is a regression test in the plainest sense: replay it after the next edit too.
+Step 4 repeats until the comparison reads the way the operator wants: the `differs` script is the one the new instruction was meant to change, the replayed answer says what the recorded one should have said, and the replayed model recorded no further suggestion about the thing just fixed. Step 5 is what makes the change real. `dekopond` reads the catalog at startup, so the edit reaches the gateway's sessions on its next start; `dekopon-run prompt --system` and `--skill` take it immediately. Instructions and the skills listing are supplied to each session fresh and never stored in a remembered conversation, so nothing a persistent route holds has to be rewritten. A recording kept under version control beside the catalog is a regression test in the plainest sense: replay it after the next edit too.
 
 ## What is deliberately absent
 

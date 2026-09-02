@@ -123,6 +123,25 @@ bootstrap limitations.
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`
   is the usage error it was before 0.11.0 rather than a full-screen view. Nothing loses authority:
   the console never held any.
+- **Export every `apiKeyEnv` a bound route can reach before starting `dekopond`.** A model's
+  `apiKeyEnv` naming a variable that is unset, exported blank, or not UTF-8 is now a startup
+  refusal naming the model and the variable, never the value. It used to become a tokenless
+  client that answered every message with a 401, and because the gateway builds one client per
+  model and keeps it, exporting the key afterwards needed a restart anyway. Startup now resolves
+  the credential of every model a bound route can reach, beside the image generator's, before any
+  transport authenticates, and reports every unusable one at once. Nothing else changes: leaving
+  `apiKeyEnv` out still means the endpoint needs no key, a configured model no route reaches has
+  its variable left unread, and `dekopon-run` is unchanged — an unset or blank `--api-key-env`
+  variable still means no bearer token. See [`dekopond.md`](dekopond.md#startup-fails-closed).
+- **Model clients no longer follow an ambient `HTTPS_PROXY` or `ALL_PROXY`.** Every
+  `dekopon-model` transport — the OpenAI-compatible chat client, the ChatGPT subscription client
+  and its device-flow login, and the Images client — is built from one agent that sets no proxy
+  and follows no redirect, so an exported proxy variable no longer carries a bearer token, the
+  device-code exchange, or a prompt through a host nobody named to Dekopon. That is the stance
+  `dekopon-http-host` already took for provider HTTP. It reaches `dekopond`, `dekopon-run`, and
+  `dekopon auth chatgpt login`; nothing in a configuration file changes, and there is no field or
+  flag to opt back in, so a model endpoint that was only reachable through that proxy is
+  unreachable after the upgrade.
 
 #### `imageGenerators:` becomes one `imageGenerator:` block
 

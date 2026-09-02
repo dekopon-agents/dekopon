@@ -21,7 +21,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Public inert secret DRNs with a separate Cedar `secret.use` decision, owner-only private source/use map, invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and direct-reflection filtering. Providers see neither references nor values; existing implicit credentials remain compatible. See [`docs/secrets.md`](docs/secrets.md).
 - An offline `dekopon-brokerd provider` manager for exact fully qualified OCI tags or manifest digests: strict desired and generated-lock files, a synchronized content-addressed component store, complete provider-set validation before atomic activation, offline list/verify, and startup comparison of locked digest/length/provider ID with the exact Wasmtime input buffer. It adds no daemon-startup network path.
 - An exact standalone JSONPlaceholder v0.1.0 broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
-- `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP/HTTP traces and audit-safe lifecycle logs, and explicit bounded broker capability/invocation client commands.
+- `dekopon-run` direct invocation, an OpenAI-compatible or ChatGPT-subscription prompt loop offering a single sandboxed scripting tool, local Chrome traces, correlated OTLP traces (HTTP by default, gRPC via `--otlp-transport`) and audit-safe lifecycle logs, explicit bounded broker capability/invocation client commands, and a `dekopon-run chat` client that talks to a running `dekopond` over its local development transport without loading a component or holding a model credential.
 - An unprivileged chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with
   a classic/free `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat
@@ -150,7 +150,7 @@ but finite; recording stops with `dedup-capacity` while reads continue. `dekopon
 the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping
 rather than isolation; a dedicated gateway UID remains committed direction.
 
-There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and nothing else. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
+There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and manages the ChatGPT model-account login, nothing else. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
 ## Install
 
@@ -185,7 +185,7 @@ tar xzf dekopon-0.12.0-aarch64-apple-darwin.tar.gz
 
 ### crates.io
 
-The workspace contains twenty-five public crates, and the `0.12.0` release publishes all of them. Each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
+The workspace contains twenty-five public crates, and each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
 cargo install --locked --version 0.12.0 dekopon
@@ -193,6 +193,8 @@ cargo install --locked --version 0.12.0 dekopon-run
 cargo install --locked --version 0.12.0 dekopon-brokerd
 cargo install --locked --version 0.12.0 dekopond
 ```
+
+`0.12.0` is not on crates.io yet: the `v0.12.0` tag's `publish crates.io packages` job failed partway through `Publish in dependency order` (only `dekopon-core` and `dekopon-provider-http`, the first two in publication order, landed), so the four commands above fail until a maintainer dispatches the `Release` workflow against the existing `v0.12.0` tag with `publish_to_crates=true`, the recovery described under [Maintainer release process](#maintainer-release-process). The four executables top out at `0.11.1` there; substitute `--version 0.11.1` to install from crates.io today, or take 0.12.0 from the tap or archives above or from a checkout below.
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
 
@@ -227,7 +229,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. Direct `inspect`, `invoke`, and `prompt` never connect to it; only explicit `dekopon-run broker ...` commands do.
+See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. `inspect`, `invoke`, and `shell` never connect to it, and `prompt` does not either unless `--broker` is passed; only explicit `dekopon-run broker ...` commands and `dekopon-run prompt --broker` do.
 
 For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace deliberately separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. Chart `0.3.0` declares `appVersion: 0.12.0`, so it deploys `v0.12.0` by default; to run any other release, deployments select it through the chart's `image.tag` or `image.digest` value.
 
@@ -250,7 +252,7 @@ dekopon --config examples/local/dekopon.yaml validate
 dekopon --config examples/local/dekopon.yaml config view -o json
 ```
 
-The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
+The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. The `reviewer` also mounts one skill directory, `skills/pull-request-review`, whose `SKILL.md` name and description the model sees and whose body it reads on demand with `read_skill`; `describe agent reviewer` lists it under `Skills:`. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
 
 See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
 

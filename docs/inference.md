@@ -18,7 +18,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | Is Dekopon's ChatGPT path optimized for caching? | **Yes, deliberately, but only as a best-effort optimization.** Requests carry `prompt_cache_key`; tool-loop turns grow by appending stable replay items; system instructions and tool definitions stay stable; and tests pin that shape. Only provider-reported `cached_input_tokens` proves a hit. |
 | How do we cache calls? | Dekopon relies on the provider's prompt-prefix cache. It sends the complete request every time. It does not memoize model answers or tool effects locally. |
 | How long is the cache fresh on a ChatGPT subscription? | **OpenAI does not publish a retention contract for the subscription endpoint Dekopon calls.** Public API policies range from short in-memory retention to model-specific extended retention, but those values cannot be promised here. |
-| Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. A shared client could reuse connections and coordinate credential refresh, but that is a different optimization. |
+| Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. `dekopond` already shares one client per configured model, which reuses connections and coordinates credential refresh; that is a transport optimization, not a cache lease. |
 | How does outbound image generation work? | A route may explicitly name a separate public OpenAI Images backend. Its chat model can call `generate_image` once; one bounded PNG is carried outside the transcript to the authenticated Slack/Discord/Telegram/local reply target. Existing Chat Completions and private ChatGPT subscription contracts are not claimed to generate images themselves. |
 | How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs per sender in `dekopond` memory, bounded by idle time, turns, bytes, and total conversation count. Every message is authorized afresh. |
 | Does Dekopon have a memory framework? | **No general framework.** It has a focused conversation window plus optional durable on-demand recent/literal-search chat turns—not task, semantic, vector, editable-fact, or automatically replayed memory. |
@@ -83,7 +83,7 @@ The source contracts are in:
 - Requests do not set `prompt_cache_retention`, `prompt_cache_options`, or explicit cache breakpoints.
 - Requests set `store: false` and use neither `previous_response_id` nor a provider conversation identifier.
 - Completed answers are not memoized. Each incoming message makes a fresh model request after authorization.
-- A model client is currently constructed for each gateway message. It is reused across the tool-loop turns inside that message, but not across later Slack messages.
+- `dekopond` builds one model client per configured model on first use and shares it across every later message and session (`ModelCache` in [`crates/dekopond/src/session.rs`](../crates/dekopond/src/session.rs)); the prompt cache key and `CompletionOptions` stay request-scoped. Sharing the client reuses TCP/TLS connections and the loaded credential; it does not make the remote prompt cache more durable.
 - The gateway does not estimate tokens before a request. Its history bound is bytes plus whole turns because provider token counts arrive only after a billed call.
 - Cross-message compaction preserves conversational meaning, not the full prior wire transcript. A follow-up can reuse a leading prefix, but it is not necessarily an append-only extension of the last tool-loop request.
 
@@ -106,7 +106,7 @@ Rotation serves privacy and correctness. Once history is discarded, the replacem
 
 There is no cache-population call to make. The first eligible request warms whatever the provider supports; later requests either match or do not. For the best current odds:
 
-- keep the model, agent instructions, tool descriptions, schemas, and ordering stable;
+- keep the model, agent instructions, the mounted-skills listing (skill names and descriptions, hoisted into `instructions` with the agent instructions), tool descriptions, schemas, and ordering stable;
 - put changing information in the new user turn rather than in standing instructions;
 - use `persistent` only when the product should remember the conversation, not merely to chase a discount;
 - set a conversation window large enough that it does not rewrite the front on every follow-up;
@@ -167,12 +167,9 @@ A local object has no lease on provider memory. The official public API model is
 
 Sending synthetic keep-alive prompts would consume quota, create more retained input, and still provide no subscription-endpoint guarantee. Dekopon should not do that.
 
-There are two separate long-lived optimizations worth evaluating:
+One long-lived optimization is already in place: `dekopond` shares one model client per configured model across gateway messages, reusing connections and the loaded credential, with refreshes coordinated through the client's credential mutex and the cross-process advisory lock beside the auth file. `CompletionOptions` stays request-scoped so a shared client cannot apply one conversation's key to another.
 
-1. **Share model clients across gateway messages.** This could reuse TCP/TLS connections, avoid reopening the auth file, and coordinate refresh through one credential mutex. It does not make the remote prompt cache more durable. `CompletionOptions` must remain request-scoped so one shared client cannot accidentally apply one conversation's key to another.
-2. **Use an explicitly documented retention mode on a public API backend.** This would require a modeled configuration field, supported-model validation, data-retention review, wire tests, and accounting. It would not establish support on the ChatGPT subscription backend.
-
-Both are future implementation choices, not current behavior.
+The remaining candidate is an explicitly documented retention mode on a public API backend. It would require a modeled configuration field, supported-model validation, data-retention review, wire tests, and accounting, and it would not establish support on the ChatGPT subscription backend. That one is a future implementation choice, not current behavior.
 
 ## How Slack conversation memory works
 
@@ -472,7 +469,7 @@ let response = agent
     .header("authorization", "Bearer eyJ.fake-access-token.REDACTED")
     .header("chatgpt-account-id", "acct_example")
     .header("originator", "dekopon")
-    .header("user-agent", "dekopon-run/0.6.0")
+    .header("user-agent", &format!("dekopon-run/{}", env!("CARGO_PKG_VERSION")))
     .header("openai-beta", "responses=experimental")
     .header("accept", "text/event-stream")
     .send_json(&request_1)?;
@@ -599,7 +596,7 @@ let remembered = dekopon_agent::prompt::ConversationTurn::completed(
 );
 ```
 
-When the same sender follows up with “What files did it change?”, the gateway authorizes the message again, rebuilds a model client, and reuses the conversation's opaque key. The new first request's `input` is:
+When the same sender follows up with “What files did it change?”, the gateway authorizes the message again and reuses both the shared model client and the conversation's opaque key. The new first request's `input` is:
 
 ```rust
 let request_3_input = json!([

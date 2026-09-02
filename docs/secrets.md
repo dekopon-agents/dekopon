@@ -1,6 +1,6 @@
 # Public secret references and the private secret map
 
-**Status: current on this development branch.** This document defines the broker-owned secret
+**Status: current (shipped in 0.12.0; see [`upgrading.md`](upgrading.md#0111--0120--optional-public-drns-require-a-private-map-and-second-policy)).** This document defines the broker-owned secret
 system: public inert DRNs, a separate Cedar decision, an owner-only map to physical stores,
 invocation-pinned resolution, and native HTTP Basic/Bearer sinks. Existing implicit
 `credential`/`credentialByAgent` bindings remain supported unchanged.
@@ -157,6 +157,8 @@ secrets:
         maxInjections: 1
 ```
 
+Per binding, `basicUsername` is required for `sink: httpBasic` and must be absent for `httpBearer`;
+`allowQuery` defaults to `false` and `maxInjections` to `1`; every other field is required.
 Every binding is checked against the capability constraint set. Its hosts and methods must be a
 subset, and its injection count cannot exceed `maxRequests`. A map cannot introduce HTTP authority.
 Duplicate DRNs, binding IDs, or `(DRN, capability, sink, username)` tuples fail startup. The map
@@ -204,6 +206,9 @@ The selected value must be a string. Base64 decoding is explicit and occurs afte
 Source and final Basic/Bearer material ceilings are 1 MiB and 4 KiB respectively; source responses also stop at
 128 headers/64 KiB of header bytes, and bootstrap header tokens stop at 16 KiB. Empty material is refused by the
 native Basic/Bearer constructor.
+Every remote source kind also accepts `timeoutMs` (default `10000`, at most `120000`), the deadline
+for its single fetch, and every configured `endpoint` or `vaultUrl` must be a credential-free HTTPS
+URL or a literal loopback HTTP URL; `secureFile` and `kubernetesProjection` take neither field.
 
 ### `secureFile`
 
@@ -304,8 +309,8 @@ sessionToken: ... # optional
 
 The adapter signs one `GetSecretValue` request with SigV4 and accepts `SecretString` or decoded
 `SecretBinary`. No ambient SDK credential chain, instance metadata, role assumption, IRSA, retry,
-or stale cache is used. A loopback `endpoint` override exists for deterministic tests; production
-defaults to the regional AWS endpoint.
+or stale cache is used. A loopback `endpoint` override exists on both AWS kinds for deterministic
+tests; production defaults to the regional AWS endpoint.
 
 ### AWS SSM Parameter Store
 

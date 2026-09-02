@@ -20,9 +20,10 @@ A chat claim carries a fully redacted bounded scope over configured transport ID
 canonical channel, and canonical conversation. Bounded string deserializers reject an oversized
 field while decoding, and `Attestation` renders as `[REDACTED]` whatever shape it holds.
 `RecordDeliveredTurn` carries a tagged service-specific `DeliveryIdentity` whose Slack
-channel/timestamp, Discord channel/snowflake, Telegram chat/topic/message, or local
-transport/conversation/boot nonce is checked against that attested scope. It is a separate typed
-operation; `invoke` cannot reach hidden recording under any attestation. `ChatMemorySurface` is
+channel/timestamp, Discord channel/snowflake, Telegram chat/topic/message, WhatsApp
+WABA/phone-number/canonical message ID, or local transport/conversation/boot nonce is checked
+against that attested scope. It is a separate typed operation; `invoke` cannot reach hidden
+recording under any attestation. `ChatMemorySurface` is
 present only when the broker freshly authorizes the complete surface. `PROTOCOL_VERSION` is
 `dekopon.dev/broker/v1alpha2`; both envelopes are strict-decoded, so a broker and a client from
 different protocol versions refuse each other's first frame as `invalid-request` in either

@@ -72,9 +72,10 @@ and replies with the answer.
 needs to hear a question and to ask a model — and it never holds a provider credential, a
 policy, or an authorization. Every effect a session drives is submitted to
 `dekopon-brokerd` as an on-behalf-of proposal, and the broker alone maps the subject to a
-principal, decides what it may do, resolves credentials, and executes it. The dependency
-set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and
-`dekopon-brokerd`, and CI enforces that.
+principal, decides what it may do, resolves credentials, and executes it. Its normal dependency
+graph excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`,
+`dekopon-storage-host`, and `dekopon-policy`, and CI's `cargo tree` gate enforces that; only its
+tests link `dekopon-brokerd` and `dekopon-storage-host`, as dev-dependencies.
 
 Image generation is model inference, not provider authority. The gateway holds its separately
 named model credential; owner configuration fixes the backend/model and authenticated envelopes fix

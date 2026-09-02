@@ -1,6 +1,6 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated GET-only `dekopon-webui` operational view.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated `GET`/`HEAD`-only `dekopon-webui` operational view.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
@@ -145,14 +145,21 @@ dekopon-brokerd provider verify \
 `--output json` gives deterministic machine-readable command results. Successful lock changes say
 that they apply on the next broker restart; there is no hot reload.
 
+Operator commands never take `--config` or `--http-bind`; combining them is a usage error.
+`provider` requires `--lock-file` and `--store`, `sync` also `--provider-set`, and `audit verify`
+requires `--audit-path`. Usage errors exit 2; a failed command exits 1. Operator modes print
+results on stdout and text diagnostics on stderr at `warn` (override with `RUST_LOG`); the daemon
+logs JSON on stdout at `info`.
+
 Resolution accepts one OCI image manifest with schema 2, exact artifact type
 `application/vnd.dekopon.provider.v1+wasm`, the standard empty OCI config, and exactly one positive,
 bounded `application/wasm` layer. Manifest, token, error, and component streams have independent
 byte ceilings and deadlines. Public registries use anonymous OCI Bearer challenge flow. Private
 registry credentials and custom certificate roots are deliberately not accepted yet; TLS
 verification cannot be disabled, ambient proxy environment variables are ignored, redirects may
-never downgrade to unapproved plaintext, and plain HTTP is available only through an explicit exact
-literal loopback authority for development and tests.
+never downgrade to unapproved plaintext, and plain HTTP is available only to an exact literal
+loopback authority named with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider`
+subcommands only), for development and tests.
 
 Fetched bytes land at:
 
@@ -208,9 +215,10 @@ nothing.
 
 A digest proves byte identity, not publisher identity. This manager does **not** yet verify GitHub
 release provenance or OCI attestations. It therefore does not replace the provenance checks in
-`ci/stage-image-context.sh`, and the Dockerfile remains network-free. Container staging may switch
-to `provider sync --locked` only after a published broker binary contains this command and staging
-continues to verify provenance for each downloaded component.
+`ci/stage-image-context.sh`, and the Dockerfile remains network-free. Container staging still
+fetches each component at a pinned release, checks its SHA-256, and verifies its provenance with
+`gh attestation verify`; it does not use `provider sync --locked`, and a switch would have to keep
+verifying provenance for each downloaded component, because this manager checks byte identity only.
 
 At decision time a capability with no constraint set is denied `unconstrained-capability` before
 Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
@@ -445,7 +453,7 @@ stdout, filtered by `RUST_LOG`.
 
 Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain, the provider-storage GC drain, and the web-UI drain share a single deadline rather than taking one each.
 
-`maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
+`maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. The built-in default does not satisfy this: `brokerLimits.maxReplayIds` defaults to 100 000 while `serverLimits.auditMaxRecords` defaults to 200 000, so a configuration that omits `brokerLimits` refuses every invocation with `capacity-exhausted` at half its audit budget; set `brokerLimits: { maxReplayIds: 200000 }` explicitly. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
 
 ### Compilation cache and the concurrent memory budget
 
@@ -519,11 +527,12 @@ dekopon-brokerd audit verify \
   --audit-path /home/dekopon/.local/state/dekopon/audit.jsonl
 ```
 
-It prints the record count and the chain head, takes the same `--output json` as the provider
-commands, and exits non-zero with the reason on any failure. A broken chain is reported separately
-from a file that could not be read: an interrupted append leaves an unterminated final record,
-which is not the same finding as a record that was edited. The whole chain is held in memory while
-it is checked, so a log past the default `auditMaxRecords` is refused rather than read.
+It prints the record count and the chain head, takes the same `--output json` and the same usage
+and exit rules as the provider commands above, and exits non-zero with the reason on any failure.
+A broken chain is reported separately from a file that could not be read: an interrupted append
+leaves an unterminated final record, which is not the same finding as a record that was edited.
+The whole chain is held in memory while it is checked, so a log past the default
+`auditMaxRecords` is refused rather than read.
 
 ## Boundaries
 

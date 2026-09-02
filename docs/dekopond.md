@@ -11,7 +11,7 @@ tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. A
 dedicated gateway UID remains **committed direction**.
 
-Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
+Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run` and `dekopon`.
 
 [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete
 worked deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
@@ -33,7 +33,7 @@ apiVersion: dekopon.dev/dekopond/v1alpha1
 catalogPath: /path/to/dekopon.yaml            # dekopon-config catalog with the agents routes name
 
 broker:                                       # optional; every field defaults
-  socketPath: /path/to/broker.sock            # default: dekopon-run's documented discovery order
+  socketPath: /path/to/broker.sock            # default: DEKOPON_BROKER_SOCKET, then dekopon-run's documented discovery order; unresolvable is a startup failure
   serverUid: 501                              # default: the daemon's own effective UID
   maxFrameBytes: 2097152                      # default: the protocol's own bound
   ioTimeoutMs: 30000
@@ -43,6 +43,7 @@ transports:
     kind: slackSocketMode
     appTokenEnv: DEKOPOND_SLACK_APP_TOKEN     # environment variable NAMES only
     botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+    endpoint: https://slack.com               # optional, tests only: the pinned origin or a literal loopback http:// URL
     experience: agent                         # optional: classic (default) | agent
     activity:                                 # optional; absent means off
       mode: native                            # off | native
@@ -81,7 +82,7 @@ models:
   - name: subscription
     kind: chatgptSubscription
     model: gpt-5-codex
-    authFile: /path/to/chatgpt-auth.json      # optional; defaults to Dekopon's own credential file
+    authFile: /path/to/chatgpt-auth.json      # optional; else DEKOPON_CHATGPT_AUTH_FILE, else Dekopon's own credential file
                                               # must be in a writable directory: refreshing rewrites it
     timeoutMs: 120000
     classes: [reasoning]
@@ -146,14 +147,18 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
-- a transport endpoint override that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
+- a transport `endpoint` override (`graphEndpoint` on `whatsappCloudApi`) that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
 - a missing or blank chat, named image-generator, or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
 - a route naming an image generator on a text-only transport, which today means `whatsappCloudApi`;
 - an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
   Slack activity with a reaction fallback, or classic native activity with no reaction fallback,
   is also refused because the configured fallback could never take effect;
-- an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`.
+- an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
+- an empty `transports:`, `models:`, or `routes:` list;
+- a model or the image generator with `timeoutMs: 0`, an image generator with a blank `model`, or `shutdownGraceMs: 0`;
+- a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`;
+- broker frame bounds the protocol rejects (`maxFrameBytes` zero or above its hard ceiling, `ioTimeoutMs` zero), a broker socket that neither `broker.socketPath` nor the discovery order starting at `DEKOPON_BROKER_SOCKET` resolves, or a `telemetry:` block `dekopon-telemetry` refuses.
 
 The `conversation:` block adds three more:
 
@@ -308,7 +313,7 @@ Discord Gateway v10 is another outbound WebSocket transport. The daemon discover
 
 ## Chat assets
 
-A screenshot is part of the message that carried it. Slack, Discord, and Telegram deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack and Telegram require the bot token they already terminate here; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
+A screenshot is part of the message that carried it. Slack, Discord, and Telegram deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack and Telegram require the bot token they already terminate here — and on Slack the `files:read` scope, without which Slack withholds the file's id and URL and the upload is reported as one the gateway cannot open; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
 
 What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is *named* in the prompt and fetched only if the model decides the answer depends on it:
 
@@ -463,7 +468,7 @@ Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat m
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
 
-**Abandonment is bounded, so exit is too.** A cancelled prompt loop observes its flag at its next cooperative checkpoint, which can be on the far side of a whole synchronous model round trip, and dropping an async runtime waits for every such thread. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart derives that grace from `drainBudget` and defaults it to 270 s, refusing to render anything shorter ([`charts/dekopon/README.md`](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment still does not leave the broker its 120 s inside it, so a clean stop became SIGKILL in the middle of the broker's drain.
+**Abandonment is bounded, so exit is too.** A cancelled prompt loop observes its flag at its next cooperative checkpoint, which can be on the far side of a whole synchronous model round trip, and dropping an async runtime waits for every such thread. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart defaults that grace to 270 s and asserts at template time that it covers both drains plus `drainBudget.bufferSeconds`, refusing to render anything shorter ([`charts/dekopon/README.md`](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment still does not leave the broker its 120 s inside it, so a clean stop became SIGKILL in the middle of the broker's drain.
 
 **Losing every transport is a failure, not a stop.** A transport that cannot recover on its own ends its own reader — a revoked Discord token, a fatal gateway close code — and the daemon keeps serving whatever is left. That degraded state is re-announced as `gateway_transports_degraded` every 60 seconds rather than logged once, because the deployment has no gateway probe and the condition long outlives the line that reported it. When the *last* reader ends with no shutdown requested, nothing can wake the daemon again: it exits non-zero instead of reporting the success that let a gateway with no workspaces left look like a clean run.
 
@@ -604,7 +609,7 @@ continue. There is no deletion/export UX or encryption-at-rest claim.
 chat service            authenticates the sender
       |
       v
-dekopond                subject = ExternalSubject::{slack,discord,telegram}(...) (routing metadata, not authority)
+dekopond                subject = ExternalSubject::{slack,discord,telegram,whatsapp}(...), or the local caller's declared subject (routing metadata, not authority)
       |                 agent   = the route's catalog agent
       |
       | capabilities(subject, agent, scope)  ── empty ⇒ refuse, no model call
@@ -636,7 +641,7 @@ Spans follow [`observability.md`](observability.md):
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.command`) nest under `gateway.session`, and the broker's spans join the same trace through the proposal's `traceparent`.
+The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` field (a W3C `traceparent` value); [`observability.md`](observability.md#gateway-spans) is the authoritative list.
 
 The metadata-only default carries transport, agent, and outcome and nothing else. Chat text and canonical subject identifiers appear **only** under `telemetryPayloads: true`, as the `gateway.message.received` log event — the same gate `dekopon-run` uses for prompts and script text. Enabling it declares the telemetry sink in scope for the messages this daemon handles. A route with `improvementSuggestions: true` makes one more declaration of the same kind: its `agent.improvement.suggested` records carry the model's bounded suggestion text in either payload mode, which is what setting the flag consents to.
 
@@ -644,7 +649,7 @@ The prompt cache key is behind that same gate, as `gateway.session.cache_key`, a
 
 Conversations add to both lists, and change the meaning of one field that already exists. `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. The second-order effect is the one that catches people: on a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON: `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Beyond lifecycle: `gateway_agent_inventory_reported` / `gateway_agent_inventory_refreshed` (debug) / `gateway_agent_inventory_report_failed`, `gateway_usage_report_failed` / `gateway_usage_report_dropped` / `gateway_usage_reporter_abandoned` (the informational reports above); `gateway_message_ignored` (debug for an unrouted or unaddressed message) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_transport_poll_failed` and `gateway_transport_reconnect_failed`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_image_unsupported`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## The single-UID caveat
 

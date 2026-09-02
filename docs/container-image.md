@@ -6,9 +6,11 @@ still read owner-owned files that the deployment provides.
 
 **Status: current.** [`../Dockerfile`](../Dockerfile) and
 [`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) are in the
-repository and build locally today against the `v0.3.0` archives. Publication runs when a release
-is published, and `v0.4.0` is the first release it runs for; `v0.3.0` predates the workflow and has
-no image.
+repository and build locally today against the `v0.3.0` archives. Publication is a job of
+[`release.yml`](../.github/workflows/release.yml) that runs after the GitHub release and its
+attested archives exist (see [Publication](#publication)); `v0.4.0` is the oldest release with an
+image, and `v0.3.0` and earlier have none. The local build below uses `v0.3.0` only as an example —
+any published tag works.
 
 ## What it is
 
@@ -39,9 +41,10 @@ selects the binary.
 ## The binaries are the release's binaries
 
 Nothing is compiled to build this image. `release.yml` builds `dekopon-<version>-<target>.tar.gz`
-for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, publishes a `.sha256` sidecar for
-each, and attests them with `actions/attest-build-provenance`. The image contains exactly those
-executables.
+for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`, publishes
+a `.sha256` sidecar for each, and attests them with `actions/attest-build-provenance`. The image
+contains exactly the executables from the two Linux archives; the staging script downloads only
+those.
 
 That is the whole point of the design. A second, independently compiled set of binaries would be
 artifacts nobody has verified, produced by a toolchain that can drift away from the one that built
@@ -59,10 +62,13 @@ After building, and before anything is pushed, the workflow extracts each binary
 platform images and compares its SHA-256 against the archive it came from. Eight comparisons, all
 of which must match.
 
-The runtime base is Debian 12 (glibc 2.36) while the release archives are built on `ubuntu-24.04`,
-which is newer. Nothing in the release process knows about the image, so the staging script refuses
-to stage a binary that requires a glibc symbol newer than 2.36. Today the highest any of them
-requires is 2.34.
+The runtime base is Debian 13 (glibc 2.41) while the release archives are built on `ubuntu-24.04`.
+Nothing in the release process knows about the image, so the staging script refuses to stage a
+binary that requires a glibc symbol newer than 2.41 (`max_glibc` in `ci/stage-image-context.sh`;
+it mirrors the `FROM` base, so move the two together). Debian 12 (glibc 2.36) held through v0.10.0;
+the v0.11.0 `dekopon` binary names `GLIBC_2.39` for `pidfd_spawnp`/`pidfd_getpid` — weak
+references Rust's std probes and falls back from, but the dynamic linker still refuses a binary
+naming a version node the runtime lacks — which is what forced the move.
 
 ## The build context is constructed, not filtered
 
@@ -109,14 +115,12 @@ retention. An operator must name the exact optional file or explicitly scan its 
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
 the image.
 
-`dekopon-brokerd` now contains an offline provider-manager mode, but this image-staging path does
-not use it yet. A pull request cannot execute a command that exists only in its own unreleased source
-from the older release archives staging deliberately reuses. More importantly, the current external
-provider path verifies GitHub build provenance as well as SHA-256 integrity, while the manager's
-first exact-reference slice proves byte identity only. After a release contains the command,
-staging may use `provider sync --locked` to materialize reviewed OCI digests only if it retains an
-independent `gh attestation verify` (or an equivalent reviewed provenance policy) for every
-component. Docker build itself remains network-free either way.
+`dekopon-brokerd provider sync --locked` has shipped since 0.12.0, but this image-staging path does
+not use it. The current external provider path verifies GitHub build provenance as well as SHA-256
+integrity, while the manager's first exact-reference slice proves byte identity only. Staging may
+use `provider sync --locked` to materialize reviewed OCI digests only if it retains an independent
+`gh attestation verify` (or an equivalent reviewed provenance policy) for every component. Docker
+build itself remains network-free either way.
 
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.
@@ -139,8 +143,9 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 
 - No broker, gateway, or catalog configuration, and no Cedar policy. Every deployment supplies its
   own owner-owned files.
-- No credentials. `dekopon-brokerd` reads a credentials file; `dekopond` reads environment variables
-  the deployment sets. Neither is baked.
+- No credentials. `dekopon-brokerd` reads an optional legacy credentials file, an optional private
+  secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
+  variables the deployment sets. None is baked.
 - No socket, audit log, or checkpoint. Those are runtime state on a writable volume.
 - No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`.
@@ -194,8 +199,9 @@ subject; it does not grant another registry write path.
 Only the release tag is published. There is no `latest`: release tags are immutable here, a moving
 pointer would contradict that, and it would let a prerelease become the default pull.
 
-Pull requests that touch the image inputs — the `Dockerfile`, either provider fetch/staging script,
-the workflow, a licence, or a repository-owned component — run every step above against the newest published release and
+Pull requests that touch the image inputs — the `Dockerfile`, `.dockerignore`, either provider
+fetch/staging script, the workflow, a licence, or a repository-owned component — run every step
+above against the newest published release and
 push nothing. That validates the part a pull request can actually break: the image's layout, the
 provider ownership, and the byte-identity check.
 
@@ -218,7 +224,7 @@ rather than asserted in prose:
 
 ```text
 ==> verified dekopon-0.3.0-aarch64-unknown-linux-gnu.tar.gz (sha256 and attestation) -> dist/arm64
-==> every binary needs at most glibc 2.36
+==> every binary needs at most glibc 2.41
 ==> staged context (/tmp/tmp.AbC123/context):
           5057  Dockerfile
          10847  LICENSE-APACHE
