@@ -2343,3 +2343,267 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         stderr(&unparseable)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Provider command words as command-line facades
+// ---------------------------------------------------------------------------
+
+/// The clap-layer guest: `probe --help` renders, `probe upper -` reads the piped value.
+fn cli_probe_path() -> PathBuf {
+    imported_provider_path("cli-probe-provider.wasm")
+}
+
+#[test]
+fn prompt_renders_a_direct_command_words_help_page() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let address = listener.local_addr().expect("mock endpoint address");
+    let server = thread::spawn(move || {
+        let (_first, first_stream) = read_request(&listener);
+        respond(first_stream, &bash_tool_call("call-1", "probe --help"));
+        let (second, second_stream) = read_request(&listener);
+        let content = tool_result(&second);
+        respond(second_stream, &final_answer("Read the help."));
+        content
+    });
+
+    let provider = cli_probe_path();
+    let endpoint = format!("http://{address}/v1");
+    let output = run(&[
+        "prompt",
+        "--provider",
+        provider.to_str().expect("UTF-8 fixture path"),
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "Show the probe help",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // The page the guest rendered, at the status the guest chose, and no capability call.
+    let content = server.join().expect("mock endpoint completes");
+    assert!(content.starts_with("Usage: probe <COMMAND>"), "{content}");
+    assert!(content.ends_with("\n[exit code: 0]"), "{content}");
+}
+
+#[test]
+fn a_usage_error_from_a_direct_command_word_exits_2() {
+    let provider = cli_probe_path();
+    let (stdout, code) = shell(
+        "probe bogus",
+        &["--provider", provider.to_str().expect("UTF-8 fixture path")],
+    );
+    assert_eq!(code, 2, "{stdout}");
+    assert!(
+        stdout.contains("error: unrecognized subcommand 'bogus'"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("[exit code: 2]\n"), "{stdout}");
+}
+
+#[test]
+fn piped_text_reaches_a_direct_command_word() {
+    let provider = cli_probe_path();
+    let (stdout, code) = shell(
+        "echo hello | probe upper -",
+        &["--provider", provider.to_str().expect("UTF-8 fixture path")],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    // The proposal `{"text":"hello"}` was invoked directly; the value prints as compact JSON.
+    assert_eq!(stdout, "{\"text\":\"HELLO\"}\n[exit code: 0]\n");
+}
+
+#[test]
+fn a_rendered_page_pipes_like_any_value() {
+    let provider = cli_probe_path();
+    let (stdout, code) = shell(
+        "probe --help | wc -l",
+        &["--provider", provider.to_str().expect("UTF-8 fixture path")],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    let count = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("the line count of the help page: {stdout}"));
+    assert!(count > 1, "{stdout}");
+}
+
+#[test]
+fn an_oversized_piped_value_is_refused_naming_the_bound() {
+    let provider = cli_probe_path();
+    let value = "a".repeat(100);
+    let (stdout, code) = shell(
+        &format!("echo {value} | probe upper -"),
+        &[
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            "--max-input-bytes",
+            "64",
+        ],
+    );
+    // A host refusal is not the provider declining the argv: it exits like a capability that ran
+    // and errored, and the message names the provider and the bound rather than "usage".
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("probe: failed: "), "{stdout}");
+    assert!(stdout.contains("the maximum is 64"), "{stdout}");
+    assert!(stdout.ends_with("[exit code: 1]\n"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_runs_a_command_word_through_the_broker_leg() {
+    // The direct leg is consulted first and owns any word it loaded, so the runner loads only
+    // echo: `probe` must be served by the broker, which renders the help page as the guest wrote
+    // it and authorizes the one proposal the piped value produced.
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("temporary broker directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure broker directory");
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("secure broker socket");
+
+    let registry = BrokerProviderRegistry::load([cli_probe_path()], BrokerHostLimits::default())
+        .await
+        .expect("load the clap-layer guest into the broker");
+    let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
+    let actor = Actor::Agent {
+        agent: "prompt-broker-test"
+            .parse::<AgentId>()
+            .expect("valid agent fixture"),
+    };
+    let principal = "prompt-broker"
+        .parse::<PrincipalId>()
+        .expect("valid principal fixture");
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-prompt-broker".to_owned(),
+            broker_policy(
+                r#"permit(principal == Dekopon::Principal::"prompt-broker",
+                          action == Dekopon::Action::"cli-probe.upper",
+                          resource == Dekopon::Provider::"cli-probe");"#,
+                "prompt-broker",
+                [("cli-probe.upper", "cli-probe")],
+            ),
+            broker_constraints([(
+                "cli-probe.upper",
+                "cli-probe",
+                ExecutionConstraints {
+                    timeout_ms: 5_000,
+                    max_output_bytes: 64 * 1024,
+                    http: None,
+                    storage: None,
+                    secret_use: None,
+                },
+            )]),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("build broker fixture"),
+    );
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        dekopon_brokerd::MappedPeer {
+            context: dekopon_broker::AuthenticatedContext::new(principal, actor)
+                .expect("bind fixture context"),
+            attestor: None,
+        },
+    );
+    let server = BrokerServer::new(
+        broker,
+        identities,
+        ServerLimits {
+            frame: FrameLimits::default(),
+            max_connections: 8,
+            shutdown_grace: Duration::from_secs(5),
+        },
+    )
+    .expect("build server fixture");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.serve(listener, async move {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a dropped sender is a shutdown signal like a sent one: this future exists \
+                      to complete, and a test that panicked before sending must still stop the \
+                      server"
+        )]
+        let _ = shutdown_receive.await;
+    }));
+
+    let script = "probe --help | wc -l\necho hello | probe upper - | jq -r .text";
+    let endpoint_listener = TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
+    let endpoint_address = endpoint_listener
+        .local_addr()
+        .expect("mock endpoint address");
+    let model_server = thread::spawn(move || {
+        let (_first, first_stream) = read_request(&endpoint_listener);
+        respond(first_stream, &bash_tool_call("call-1", script));
+        let (second, second_stream) = read_request(&endpoint_listener);
+        let content = tool_result(&second);
+        respond(second_stream, &final_answer("Upcased hello."));
+        content
+    });
+
+    let socket_text = socket.to_str().expect("UTF-8 socket path").to_owned();
+    let uid_text = uid.to_string();
+    let endpoint = format!("http://{endpoint_address}/v1");
+    let provider = provider_path();
+    let output = tokio::task::spawn_blocking(move || {
+        run(&[
+            "prompt",
+            "--provider",
+            provider.to_str().expect("UTF-8 fixture path"),
+            "--broker",
+            "--socket",
+            &socket_text,
+            "--server-uid",
+            &uid_text,
+            "--model",
+            "test-model",
+            "--endpoint",
+            &endpoint,
+            "--api-key-env",
+            "DEKOPON_RUN_TEST_NO_API_KEY",
+            "Upcase hello with the probe",
+        ])
+    })
+    .await
+    .expect("prompt process task exits");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout UTF-8"),
+        "Upcased hello.\n"
+    );
+
+    // The help page's line count, then the invoked proposal's answer, from one script.
+    let content = model_server.join().expect("mock endpoint completes");
+    let mut lines = content.lines();
+    let count = lines
+        .next()
+        .and_then(|line| line.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("the line count of the help page: {content}"));
+    assert!(count > 1, "{content}");
+    assert_eq!(lines.next(), Some("HELLO"), "{content}");
+    assert_eq!(lines.next(), Some("[exit code: 0]"), "{content}");
+    assert_eq!(lines.next(), None, "{content}");
+    // Rendering decided nothing; the one proposal was one decision and one execution.
+    assert_eq!(audit.records().await.len(), 2);
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    server_task
+        .await
+        .expect("server task exits")
+        .expect("server drains cleanly");
+}

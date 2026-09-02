@@ -6,7 +6,8 @@ use std::{
 
 use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
-    HARD_MAX_PROVIDER_COMPONENT_BYTES, HTTP_WIT, LockedProviderSource, PROVIDER_WIT, STORAGE_WIT,
+    CommandRunOutcome, HARD_MAX_PROVIDER_COMPONENT_BYTES, HTTP_WIT, LockedProviderSource,
+    PROVIDER_WIT, STORAGE_WIT,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation, StorageAccess,
@@ -758,6 +759,238 @@ async fn a_command_word_provider_is_instantiated_once_at_load() {
         "describe is the only instantiation a load needs"
     );
     assert_eq!(stats.stores_created, 1, "{stats:?}");
+    assert_eq!(stats.command_resolutions, 0, "{stats:?}");
+
+    // The first run is the second instantiation, in its own fresh store; this hand-rolled
+    // `run-command` guest ignores the piped value rather than refusing it.
+    let outcome = registry
+        .run_command("recall", &["recall".to_owned()], Some("piped"))
+        .await
+        .expect("the probe rewrites its word");
+    assert!(
+        matches!(outcome, CommandRunOutcome::Proposed { .. }),
+        "{outcome:?}"
+    );
+    let stats = registry.metrics().snapshot();
+    assert_eq!(stats.component_instantiations, 2, "{stats:?}");
+    assert_eq!(stats.stores_created, 2, "{stats:?}");
+    assert_eq!(stats.command_resolutions, 1, "{stats:?}");
+}
+
+/// The checked-in `memory-reservation-probe` component is the hand-rolled `run-command` guest:
+/// no argument parser, values shifted out of argv by hand. Its help page, its proposal, and its
+/// decline prove the clap-free baseline at the current package against a real component.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("hand-rolled command-line provider loads");
+    let mut exports = registry
+        .loaded_provider_metadata()
+        .flat_map(|metadata| metadata.exports.into_iter().map(|item| item.name))
+        .collect::<Vec<_>>();
+    exports.sort();
+    assert_eq!(exports, ["describe", "invoke", "run-command"]);
+
+    let outcome = registry
+        .run_command("recall", &["--help".to_owned()], None)
+        .await
+        .expect("help renders");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected rendered help, got {outcome:?}");
+    };
+    assert_eq!(status, 0);
+    assert!(stdout.starts_with("Usage: recall"), "{stdout:?}");
+    assert!(stderr.is_empty(), "{stderr:?}");
+
+    let outcome = registry
+        .run_command("recall", &["yesterday".to_owned()], Some("piped"))
+        .await
+        .expect("the word proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: "ordinary.escape".parse().expect("capability"),
+            input: json!({}),
+        }
+    );
+
+    let outcome = registry
+        .run_command("recall", &["--verbose".to_owned()], None)
+        .await
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(
+            outcome,
+            CommandRunOutcome::Failed { ref error }
+                if error.code == "usage" && error.message.contains("--verbose")
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// The checked-in `cli-probe` component exports `run-command` and renders through the SDK's
+/// `clap` layer: the load reads that export from the component type, the typed
+/// `(list<string>, option<string>)` call delivers the piped value, and clap's help page, clap's
+/// usage error, a proposal, and a decline each parse as the shared outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("command-line provider loads");
+    assert_eq!(registry.command_words(), vec!["probe".to_owned()]);
+    let mut exports = registry
+        .loaded_provider_metadata()
+        .flat_map(|metadata| metadata.exports.into_iter().map(|item| item.name))
+        .collect::<Vec<_>>();
+    exports.sort();
+    assert_eq!(exports, ["describe", "invoke", "run-command"]);
+
+    let outcome = registry
+        .run_command("probe", &["--help".to_owned()], None)
+        .await
+        .expect("help renders");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected rendered help, got {outcome:?}");
+    };
+    assert_eq!(status, 0);
+    assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout:?}");
+    for subcommand in ["upper", "count", "reverse"] {
+        assert!(stdout.contains(&format!("\n  {subcommand} ")), "{stdout:?}");
+    }
+    assert!(stderr.is_empty(), "{stderr:?}");
+
+    let capability = "cli-probe.count"
+        .parse::<CapabilityId>()
+        .expect("capability");
+    let outcome = registry
+        .run_command(
+            "probe",
+            &["count".to_owned(), "-".to_owned()],
+            Some("héllo"),
+        )
+        .await
+        .expect("a piped value proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: capability.clone(),
+            input: json!({"text": "héllo"}),
+        }
+    );
+    // The proposal is authorized and executed as any other: the loop from word to output closes.
+    let output = registry
+        .invoke(
+            authorized_for(
+                "cli-probe",
+                capability,
+                json!({"text": "héllo"}),
+                ExecutionConstraints {
+                    timeout_ms: 5_000,
+                    max_output_bytes: 4_096,
+                    http: None,
+                    storage: None,
+                    secret_use: None,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("the proposed capability runs");
+    assert_eq!(output.output, json!({"characters": 5}));
+
+    let outcome = registry
+        .run_command("probe", &["bogus".to_owned()], None)
+        .await
+        .expect("a usage error is rendered, not a host error");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected a rendered usage error, got {outcome:?}");
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty(), "{stdout:?}");
+    assert!(
+        stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
+
+    let outcome = registry
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], None)
+        .await
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(
+            outcome,
+            CommandRunOutcome::Failed { ref error }
+                if error.code == "usage" && error.message.contains("nothing was piped in")
+        ),
+        "{outcome:?}"
+    );
+
+    let stats = registry.metrics().snapshot();
+    assert_eq!(stats.command_resolutions, 4, "{stats:?}");
+    assert_eq!(
+        stats.component_instantiations, 6,
+        "describe, four runs, and one invocation each instantiate once: {stats:?}"
+    );
+}
+
+/// A word plus its piped value beyond the input bound is refused before a store exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_input_beyond_the_bound_is_refused_before_a_store_exists() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("memory-reservation-probe-provider.wasm")],
+        BrokerHostLimits {
+            max_input_bytes: 8,
+            ..BrokerHostLimits::default()
+        },
+    )
+    .await
+    .expect("command-word provider loads");
+
+    let error = registry
+        .run_command("recall", &["recall".to_owned()], Some("more than eight"))
+        .await
+        .expect_err("argv plus stdin exceed the bound");
+
+    assert!(
+        matches!(
+            error,
+            BrokerHostError::CommandInputTooLarge {
+                length: 21,
+                maximum: 8,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let stats = registry.metrics().snapshot();
+    assert_eq!(
+        stats.stores_created, 1,
+        "only describe built a store: {stats:?}"
+    );
+    assert_eq!(stats.command_resolutions, 0, "{stats:?}");
 }
 
 /// An aggregate ceiling below one store could never admit an invocation.
@@ -1213,13 +1446,74 @@ async fn an_actual_provider_v0_1_component_remains_compatible() {
     assert_eq!(output.output, json!({"historical": true}));
 
     let error = registry
-        .resolve_command("gh", &["gh".to_owned()])
+        .run_command("gh", &["gh".to_owned()], None)
         .await
         .expect_err("no historical provider owns this word");
     assert!(
         matches!(error, BrokerHostError::UnknownCommandWord { ref word } if word == "gh"),
         "{error:?}"
     );
+}
+
+/// A component generated against the immutable `dekopon:provider@0.2.0` `provider-commands`
+/// world loads, invokes, and runs its word through the legacy `resolve-command` export on the
+/// same path a `run-command` guest takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_actual_provider_v0_2_component_remains_compatible() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("provider-v0-2-compat-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("historical command-word provider component loads");
+
+    assert_eq!(registry.command_words(), vec!["compat".to_owned()]);
+    let capability = "provider-v0-2-compat.echo"
+        .parse::<CapabilityId>()
+        .expect("capability");
+    let output = registry
+        .invoke(
+            authorized_for(
+                "provider-v0-2-compat",
+                capability.clone(),
+                json!({"historical": true}),
+                ExecutionConstraints {
+                    timeout_ms: 5_000,
+                    max_output_bytes: 4_096,
+                    http: None,
+                    storage: None,
+                    secret_use: None,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("historical provider invokes");
+    assert_eq!(output.output, json!({"historical": true}));
+
+    // The legacy export has no stdin parameter: the piped value is dropped by contract, and the
+    // legacy `resolved` answer arrives as a proposal.
+    let outcome = registry
+        .run_command("compat", &["echo".to_owned()], Some("piped"))
+        .await
+        .expect("the historical rewrite still runs");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability,
+            input: json!({}),
+        }
+    );
+    let outcome = registry
+        .run_command("compat", &["bogus".to_owned()], None)
+        .await
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(outcome, CommandRunOutcome::Failed { ref error } if error.code == "usage"),
+        "{outcome:?}"
+    );
+    let stats = registry.metrics().snapshot();
+    assert_eq!(stats.command_resolutions, 2, "{stats:?}");
 }
 
 /// Two providers declaring one capability are reported together, not one restart apart.

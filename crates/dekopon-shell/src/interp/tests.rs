@@ -5,11 +5,17 @@ use std::{cell::RefCell, time::Duration};
 use serde_json::{Value, json};
 
 use crate::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode, Interpreter, Limits,
-    ScriptOutcome,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+    Interpreter, Limits, ScriptOutcome,
 };
 
-/// A fixture exposing a few capabilities with distinguishable outcomes.
+/// The one command word the fixture's provider contributes.
+const PROBE: &str = "probe";
+
+/// The help page `probe --help` renders, newline-terminated the way `clap` writes it.
+const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
+
+/// A fixture exposing a few capabilities with distinguishable outcomes and one command word.
 #[derive(Default)]
 pub(super) struct Fixture {
     pub(super) calls: RefCell<Vec<(String, Value)>>,
@@ -30,6 +36,64 @@ impl CapabilityInvoker for Fixture {
             capability: capability.to_owned(),
             description: "Echoes its input".to_owned(),
             input_schema: json!({"type": "object"}),
+        })
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        vec![PROBE.to_owned()]
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        word == PROBE
+    }
+
+    /// A `clap`-shaped provider command: help and usage errors are rendered text at the status
+    /// `clap` would choose, `upper` proposes the echo capability, and `-` reads stdin.
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if word != PROBE {
+            return None;
+        }
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(match argv.as_slice() {
+            ["--help"] => CommandRun::Rendered {
+                stdout: PROBE_HELP.to_owned(),
+                stderr: String::new(),
+                status: 0,
+            },
+            ["upper", "--text", text] => CommandRun::Proposed {
+                capability: "echo.echo".to_owned(),
+                input: json!({ "text": text }),
+            },
+            ["upper", "-"] => match stdin {
+                Some(text) => CommandRun::Proposed {
+                    capability: "echo.echo".to_owned(),
+                    input: json!({ "text": text }),
+                },
+                None => CommandRun::Failed {
+                    message: "probe: no input was piped for -".to_owned(),
+                },
+            },
+            ["ungranted"] => CommandRun::Proposed {
+                capability: "nothing.granted".to_owned(),
+                input: json!({}),
+            },
+            ["decline"] => CommandRun::Failed {
+                message: "probe: declined".to_owned(),
+            },
+            ["errored"] => CommandRun::Errored {
+                message: "could not connect to broker socket".to_owned(),
+            },
+            ["cancelled"] => CommandRun::Denied {
+                reason: "session-cancelled".to_owned(),
+            },
+            _ => CommandRun::Rendered {
+                stdout: String::new(),
+                stderr: format!(
+                    "error: unrecognized subcommand '{}'\n\nUsage: probe <COMMAND>\n",
+                    argv.first().copied().unwrap_or_default()
+                ),
+                status: 2,
+            },
         })
     }
 
@@ -1785,6 +1849,162 @@ fn a_single_oversized_line_cannot_bypass_the_byte_ceiling() {
     );
     assert!(outcome.truncated);
     assert!(outcome.output.len() < 400, "{}", outcome.output);
+}
+
+// ---------------------------------------------------------------------------
+// Provider command words
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_provider_command_help_page_is_stdout_exit_0_and_capturable() {
+    let fixture = Fixture::default();
+    let outcome = Interpreter::new(Limits::default()).run("probe --help", &fixture);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    // One trailing newline folds into the value model; printing adds it back exactly once.
+    assert_eq!(
+        outcome.output,
+        "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text"
+    );
+    assert_eq!(outcome.capability_calls, 0);
+    assert!(
+        fixture.calls.borrow().is_empty(),
+        "help invoked a capability"
+    );
+
+    let captured = run("h=$(probe --help); echo \"[$?]\"; echo \"$h\"");
+    assert_eq!(
+        captured.output,
+        "[0]\nUsage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text"
+    );
+    assert_eq!(captured.capability_calls, 0);
+}
+
+#[test]
+fn a_provider_command_usage_error_is_a_diagnostic_with_exit_2() {
+    let outcome = run("x=$(probe bogus); echo \"[$x] $?\"");
+    assert_eq!(
+        outcome.output,
+        "error: unrecognized subcommand 'bogus'\n\nUsage: probe <COMMAND>\n[] 2"
+    );
+    assert_eq!(outcome.capability_calls, 0);
+    // Diagnostics stay on the diagnostic stream, so `2>` redirects them like any other.
+    assert_eq!(
+        output("probe bogus 2> log; echo \"status $?\"; cat log"),
+        "status 2\nerror: unrecognized subcommand 'bogus'\n\nUsage: probe <COMMAND>"
+    );
+}
+
+#[test]
+fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
+    let fixture = Fixture::default();
+    let outcome = Interpreter::new(Limits::default()).run(
+        "echo hello | probe upper -\necho.echo --a 1 | probe upper -\nprobe upper --text flag",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        *fixture.calls.borrow(),
+        vec![
+            ("echo.echo".to_owned(), json!({"text": "hello"})),
+            // The producer of the object, then the object as the provider saw it: compact JSON.
+            ("echo.echo".to_owned(), json!({"a": 1})),
+            ("echo.echo".to_owned(), json!({"text": "{\"a\":1}"})),
+            ("echo.echo".to_owned(), json!({"text": "flag"})),
+        ]
+    );
+    assert_eq!(outcome.capability_calls, 4);
+    // Nothing piped is `None`, not an empty string: the provider can tell the two apart.
+    assert_eq!(
+        output("probe upper -; echo $?"),
+        "probe: no input was piped for -\n2"
+    );
+}
+
+#[test]
+fn a_provider_command_proposal_still_needs_the_grant() {
+    let fixture = Fixture::default();
+    let outcome = Interpreter::new(Limits::default()).run("probe ungranted", &fixture);
+    assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
+    assert_eq!(
+        outcome.output,
+        "dekopon-shell: probe: requires capability nothing.granted, which is not granted in this \
+         session"
+    );
+    assert!(
+        fixture.calls.borrow().is_empty(),
+        "an ungranted proposal ran"
+    );
+    assert_eq!(outcome.capability_calls, 0);
+}
+
+#[test]
+fn a_provider_command_decline_is_a_usage_error() {
+    let outcome = run("probe decline");
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert_eq!(outcome.output, "probe: declined");
+    assert_eq!(outcome.capability_calls, 0);
+}
+
+/// A run that never reached the provider's answer takes the exit codes a capability call takes
+/// for the same two facts, so the model reads "retry later" or "stop" rather than "fix the argv".
+#[test]
+fn a_command_run_that_errored_or_was_refused_is_not_a_usage_error() {
+    let errored = run("probe errored; echo $?");
+    assert_eq!(
+        errored.output,
+        "probe: failed: could not connect to broker socket\n1"
+    );
+    assert_eq!(errored.capability_calls, 0);
+
+    let refused = run("probe cancelled; echo $?");
+    assert_eq!(refused.output, "probe: denied: session-cancelled\n126");
+    assert_eq!(refused.capability_calls, 0);
+}
+
+#[test]
+fn a_rendered_page_charges_no_capability_call() {
+    let outcome = run_with(
+        "probe --help > page\nprobe --help > page\nprobe upper --text once\necho $?",
+        Limits {
+            max_capability_calls: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(outcome.output, "{\"text\":\"once\"}\n0");
+    assert_eq!(outcome.capability_calls, 1);
+}
+
+#[test]
+fn rendered_output_obeys_the_output_ceiling() {
+    let outcome = run_with(
+        "probe --help",
+        Limits {
+            max_output_bytes: 16,
+            max_output_lines: 100_000,
+            ..Limits::default()
+        },
+    );
+    assert!(outcome.truncated, "{}", outcome.output);
+    assert!(
+        outcome.output.contains("Output truncated"),
+        "{}",
+        outcome.output
+    );
+    // Rendered bytes also count as materialized value bytes, like anything a script holds.
+    let outcome = run_with(
+        "probe --help",
+        Limits {
+            max_value_bytes: 16,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{}", outcome.output);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
 }
 
 #[test]

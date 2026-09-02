@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
-use dekopon_broker_host::CommandResolution;
+use dekopon_broker_host::CommandRunOutcome;
 use dekopon_broker_protocol::{
     Attestation, BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED,
     ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED,
@@ -238,11 +238,13 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
     }
 }
 
-/// Records why a provider could not rewrite a command word.
+/// Records why a provider could not run a command word.
 ///
-/// The model is told only that the word could not be rewritten, which is right — a guest trap is
-/// not something it can act on — so the host error has to land here or nowhere.
-fn report_command_resolve_failure(word: &str, error: &dekopon_broker_host::BrokerHostError) {
+/// The model is told only that the word could not be run, which is right — a guest trap or an
+/// input past the host bound is not something it can act on from the message — so the host error
+/// has to land here or nowhere. The event keeps its `command.resolve.failed` name: it is the
+/// operator-facing identifier for this class on both the run and the legacy rewrite operation.
+fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHostError) {
     tracing::warn!(
         target: "dekopon_brokerd::audit",
         {
@@ -251,7 +253,7 @@ fn report_command_resolve_failure(word: &str, error: &dekopon_broker_host::Broke
             error.kind = "provider",
             error = %dekopon_core::error_chain(error),
         },
-        "command-word rewrite failed"
+        "command-word run failed"
     );
 }
 
@@ -407,27 +409,66 @@ where
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
+            // The legacy operation: the same run with no piped value, answered in the shape an
+            // older client reads. Rendered text has nowhere to go on that shape, so it travels as
+            // a decline carrying the text, stdout first and then stderr, exactly as it did before
+            // the run operation existed.
             match broker
-                .resolve_command(
+                .run_command(
                     context,
                     peer.attestor.as_ref(),
                     attestation.as_ref(),
                     &word,
                     &argv,
+                    None,
                 )
                 .await
             {
-                Ok(CommandResolution::Resolved { capability, input }) => {
+                Ok(CommandRunOutcome::Proposed { capability, input }) => {
                     ResponseEnvelope::command_resolution(capability, input)
                 }
                 // The provider declined this argv. That is a usage error for the model to read,
                 // not a broker failure, so its own message travels back.
-                Ok(CommandResolution::Failed { error }) => {
+                Ok(CommandRunOutcome::Failed { error }) => {
                     ResponseEnvelope::command_declined(error.message)
                 }
+                Ok(CommandRunOutcome::Rendered { stdout, stderr, .. }) => {
+                    ResponseEnvelope::command_declined(format!("{stdout}{stderr}"))
+                }
                 Err(error) => {
-                    report_command_resolve_failure(&word, &error);
-                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be rewritten")
+                    report_command_run_failure(&word, &error);
+                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
+                }
+            }
+        }
+        BrokerRequest::RunCommand {
+            attestation,
+            word,
+            argv,
+            stdin,
+        } => {
+            if !claim_is_valid(attestation.as_ref(), None) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            match broker
+                .run_command(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    &word,
+                    &argv,
+                    stdin.as_deref(),
+                )
+                .await
+            {
+                // Whatever the guest answered travels intact: a proposal the caller submits next,
+                // text the guest rendered with the status it chose, or its own decline.
+                Ok(result) => ResponseEnvelope::command_run(result),
+                // Everything else — no such word, a trap, an input past the host bound, a host
+                // import — is the one opaque answer, with the cause recorded on this side.
+                Err(error) => {
+                    report_command_run_failure(&word, &error);
+                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
                 }
             }
         }

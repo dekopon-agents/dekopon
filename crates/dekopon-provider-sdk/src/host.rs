@@ -3,9 +3,9 @@
 //! `dekopon-provider-host` runs import-free read-only components synchronously; `dekopon-broker-host`
 //! runs authorized components asynchronously with the project-owned HTTP and storage interfaces
 //! linked. Everything beneath that difference is the same contract: the rules a component manifest
-//! must satisfy, the ambiguities a provider set may not contain, the bounds on one store, and the
-//! engine configuration. They live here so a Wasmtime upgrade or a new manifest rule is reviewed
-//! once instead of twice.
+//! must satisfy, the ambiguities a provider set may not contain, the bounds on one store, the
+//! engine configuration, and which optional command export a component offers. They live here so
+//! a Wasmtime upgrade or a new manifest rule is reviewed once instead of twice.
 //!
 //! The hosts' own machinery stays with each host: the immediate host serializes calls behind a
 //! mutex and interrupts them from a deadline thread, while the broker host yields on fuel so a
@@ -24,9 +24,11 @@ use dekopon_capability::EffectKind;
 use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
 use serde_json::Value;
 use thiserror::Error;
+use wasmtime::component::types::{ComponentFunc, ComponentItem};
+use wasmtime::component::{Component, Type};
 use wasmtime::{Cache, CacheConfig, Config, Engine, StoreLimitsBuilder};
 
-use crate::ProviderManifest;
+use crate::{CommandResolution, CommandRunOutcome, ProviderManifest};
 
 /// Default maximum size of each linear memory in one store (64 MiB).
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -42,6 +44,17 @@ pub const DEFAULT_MAX_MEMORIES: usize = 4;
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// Default maximum serialized provider output or manifest size (1 MiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Export a `provider-cli` component runs one command word through.
+pub const RUN_COMMAND_EXPORT: &str = "run-command";
+/// Export a legacy `provider-commands` component rewrites one command word through.
+pub const RESOLVE_COMMAND_EXPORT: &str = "resolve-command";
+
+/// Maximum bytes of one rendered component signature.
+///
+/// Signatures come from a component's own type, which its author controls, and end up in load
+/// errors and an unauthenticated status page; neither may grow without bound.
+const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 
 /// The bounds Wasmtime itself enforces on one fresh store.
 ///
@@ -377,6 +390,225 @@ impl ConflictScan {
     }
 }
 
+/// Which optional command export a compiled component offers, read from its own type.
+///
+/// Absent and wrong-typed are different operator problems with different fixes, and neither is
+/// worth an instantiation to discover. `run-command` takes precedence: a component exporting both
+/// is called through the newer one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandExport {
+    /// Exports `run-command: func(argv: list<string>, stdin: option<string>) -> string`.
+    RunCommand,
+    /// Exports only the legacy `resolve-command: func(argv: list<string>) -> string`.
+    ResolveCommand,
+    /// Exports neither: the component was built against the base `dekopon:provider` world.
+    Absent,
+    /// Exports the first name found as something the host cannot call.
+    Mismatched {
+        /// Which export name was found.
+        name: &'static str,
+        /// Bounded description of what the component actually exports under it.
+        found: String,
+    },
+}
+
+/// Reads which command export `component` offers from its type.
+#[must_use]
+pub fn command_export(engine: &Engine, component: &Component) -> CommandExport {
+    let component_type = component.component_type();
+    let find = |wanted: &str| {
+        component_type
+            .exports(engine)
+            .find(|(name, _)| *name == wanted)
+            .map(|(_, item)| item)
+    };
+    if let Some(item) = find(RUN_COMMAND_EXPORT) {
+        return classify_export(
+            RUN_COMMAND_EXPORT,
+            &item,
+            runs_commands,
+            CommandExport::RunCommand,
+        );
+    }
+    if let Some(item) = find(RESOLVE_COMMAND_EXPORT) {
+        return classify_export(
+            RESOLVE_COMMAND_EXPORT,
+            &item,
+            resolves_commands,
+            CommandExport::ResolveCommand,
+        );
+    }
+    CommandExport::Absent
+}
+
+fn classify_export(
+    name: &'static str,
+    item: &ComponentItem,
+    has_expected_type: fn(&ComponentFunc) -> bool,
+    present: CommandExport,
+) -> CommandExport {
+    let ComponentItem::ComponentFunc(function) = item else {
+        return CommandExport::Mismatched {
+            name,
+            found: item_kind(item).to_owned(),
+        };
+    };
+    if has_expected_type(function) {
+        present
+    } else {
+        CommandExport::Mismatched {
+            name,
+            found: function_signature(function),
+        }
+    }
+}
+
+/// `func(argv: list<string>, stdin: option<string>) -> string`.
+fn runs_commands(function: &ComponentFunc) -> bool {
+    let mut params = function.params();
+    let argv_is_strings = params.len() == 2
+        && matches!(params.next(), Some((_, Type::List(list))) if list.ty() == Type::String);
+    let stdin_is_optional_string =
+        matches!(params.next(), Some((_, Type::Option(option))) if option.ty() == Type::String);
+    argv_is_strings && stdin_is_optional_string && returns_one_string(function)
+}
+
+/// `func(argv: list<string>) -> string`.
+fn resolves_commands(function: &ComponentFunc) -> bool {
+    let mut params = function.params();
+    let argv_is_strings = params.len() == 1
+        && matches!(params.next(), Some((_, Type::List(list))) if list.ty() == Type::String);
+    argv_is_strings && returns_one_string(function)
+}
+
+fn returns_one_string(function: &ComponentFunc) -> bool {
+    let mut results = function.results();
+    results.len() == 1 && results.next() == Some(Type::String)
+}
+
+/// The broad kind of one item in a component type, as a stable word.
+#[must_use]
+pub const fn item_kind(item: &ComponentItem) -> &'static str {
+    match item {
+        ComponentItem::ComponentFunc(_) => "function",
+        ComponentItem::CoreFunc(_) => "core-function",
+        ComponentItem::Module(_) => "module",
+        ComponentItem::Component(_) => "component",
+        ComponentItem::ComponentInstance(_) => "instance",
+        ComponentItem::Type(_) => "type",
+        ComponentItem::Resource(_) => "resource",
+    }
+}
+
+/// Renders one component function's type as `fn(name: Type, …) -> (Type, …)`, bounded.
+#[must_use]
+pub fn function_signature(function: &ComponentFunc) -> String {
+    let params = function
+        .params()
+        .map(|(name, value)| format!("{name}: {value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let results = function
+        .results()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bounded_signature(format!("fn({params}) -> ({results})"))
+}
+
+/// Truncates a rendered component type to the signature bound, marking the cut.
+#[must_use]
+pub fn bounded_signature(mut value: String) -> String {
+    if value.len() <= MAX_SIGNATURE_BYTES {
+        return value;
+    }
+    let mut end = MAX_SIGNATURE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push('\u{2026}');
+    value
+}
+
+/// Why a manifest's command words cannot be served by the component that declared them.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CommandExportProblem {
+    /// The component exports neither `run-command` nor `resolve-command`.
+    #[error("exports neither {RUN_COMMAND_EXPORT} nor {RESOLVE_COMMAND_EXPORT}")]
+    Missing,
+    /// The component exports the name as something the host cannot call.
+    #[error("exports {name} as {found}")]
+    Mismatched {
+        /// Which export name was found.
+        name: &'static str,
+        /// Bounded description of what the component actually exports under it.
+        found: String,
+    },
+}
+
+/// The load gate for command words: a manifest that declares any needs one callable export.
+///
+/// A manifest promising words the component cannot run would fail at the first `gh …` a model
+/// typed, hours into a session. Both hosts prove it at load instead, from the component's own
+/// type. A manifest declaring no words passes whatever the component exports: nothing will ever
+/// call it.
+///
+/// # Errors
+///
+/// Returns [`CommandExportProblem::Missing`] when words are declared and neither export exists,
+/// and [`CommandExportProblem::Mismatched`] when the export found has a type the host cannot call.
+pub fn check_command_export(
+    manifest: &ProviderManifest,
+    export: &CommandExport,
+) -> Result<(), CommandExportProblem> {
+    if manifest.command_words.is_empty() {
+        return Ok(());
+    }
+    match export {
+        CommandExport::RunCommand | CommandExport::ResolveCommand => Ok(()),
+        CommandExport::Absent => Err(CommandExportProblem::Missing),
+        CommandExport::Mismatched { name, found } => Err(CommandExportProblem::Mismatched {
+            name,
+            found: found.clone(),
+        }),
+    }
+}
+
+/// Bytes a host counts against its input bound for one command run: every argv word plus the
+/// piped value.
+#[must_use]
+pub fn command_input_bytes(argv: &[String], stdin: Option<&str>) -> usize {
+    argv.iter().fold(stdin.map_or(0, str::len), |total, word| {
+        total.saturating_add(word.len())
+    })
+}
+
+/// Decodes what a command export returned, into the one outcome type a host handles.
+///
+/// A legacy `resolve-command` guest answers with a [`CommandResolution`], which converts
+/// losslessly. Anything else is parsed as a [`CommandRunOutcome`] directly: for
+/// [`CommandExport::Absent`] and [`CommandExport::Mismatched`] the caller's gate refused the
+/// component at load, so there is no legacy shape to expect.
+///
+/// # Errors
+///
+/// Returns the JSON error when the text is not the wire type the export produces, so a host can
+/// report it with the provider it came from.
+pub fn parse_command_run(
+    export: &CommandExport,
+    json: &str,
+) -> Result<CommandRunOutcome, serde_json::Error> {
+    match export {
+        CommandExport::ResolveCommand => {
+            serde_json::from_str::<CommandResolution>(json).map(CommandRunOutcome::from)
+        }
+        CommandExport::RunCommand | CommandExport::Absent | CommandExport::Mismatched { .. } => {
+            serde_json::from_str(json)
+        }
+    }
+}
+
 /// Failure to build the shared Wasmtime engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -445,10 +677,15 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConflictScan, ConflictWording, EffectKind, ManifestRejection, StoreLimits, validate_limits,
-        validate_manifest,
+        CommandExport, CommandExportProblem, ConflictScan, ConflictWording, EffectKind,
+        MAX_SIGNATURE_BYTES, ManifestRejection, RESOLVE_COMMAND_EXPORT, RUN_COMMAND_EXPORT,
+        StoreLimits, bounded_signature, check_command_export, command_input_bytes,
+        parse_command_run, validate_limits, validate_manifest,
     };
-    use crate::{ProviderApiVersion, ProviderCapability, ProviderManifest};
+    use crate::{
+        CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability,
+        ProviderManifest,
+    };
 
     const WORDING: ConflictWording = ConflictWording {
         refusing_to: "load",
@@ -529,6 +766,145 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    fn mismatched(name: &'static str) -> CommandExport {
+        CommandExport::Mismatched {
+            name,
+            found: "fn(argv: String) -> (String)".to_owned(),
+        }
+    }
+
+    /// Either callable export satisfies a manifest that declares words.
+    #[test]
+    fn the_command_gate_accepts_both_callable_exports() {
+        let mut fixture = manifest("fixture", "fixture.run", EffectKind::ReadOnly);
+        fixture.command_words = vec!["fixture".to_owned()];
+
+        for export in [CommandExport::RunCommand, CommandExport::ResolveCommand] {
+            check_command_export(&fixture, &export).expect("a callable export serves the words");
+        }
+    }
+
+    #[test]
+    fn the_command_gate_names_what_is_missing_or_mistyped() {
+        let mut fixture = manifest("fixture", "fixture.run", EffectKind::ReadOnly);
+        fixture.command_words = vec!["fixture".to_owned()];
+
+        assert_eq!(
+            check_command_export(&fixture, &CommandExport::Absent),
+            Err(CommandExportProblem::Missing)
+        );
+        let problem = check_command_export(&fixture, &mismatched(RUN_COMMAND_EXPORT))
+            .expect_err("a wrong type is refused");
+        assert_eq!(
+            problem,
+            CommandExportProblem::Mismatched {
+                name: RUN_COMMAND_EXPORT,
+                found: "fn(argv: String) -> (String)".to_owned(),
+            }
+        );
+        assert!(
+            problem.to_string().contains("run-command as fn(argv"),
+            "{problem}"
+        );
+    }
+
+    /// Nothing calls an export no word routes to, so a wordless manifest is not held to it.
+    #[test]
+    fn a_manifest_without_words_passes_the_command_gate_whatever_is_exported() {
+        let fixture = manifest("fixture", "fixture.run", EffectKind::ReadOnly);
+
+        for export in [
+            CommandExport::RunCommand,
+            CommandExport::ResolveCommand,
+            CommandExport::Absent,
+            mismatched(RESOLVE_COMMAND_EXPORT),
+        ] {
+            check_command_export(&fixture, &export).expect("no word will ever reach the export");
+        }
+    }
+
+    #[test]
+    fn a_legacy_export_answer_parses_into_the_shared_outcome() {
+        let outcome = parse_command_run(
+            &CommandExport::ResolveCommand,
+            r#"{"outcome":"resolved","capability":"fixture.run","input":{"last":5}}"#,
+        )
+        .expect("a legacy resolution parses");
+        assert_eq!(
+            outcome,
+            CommandRunOutcome::Proposed {
+                capability: "fixture.run".parse().expect("valid capability fixture"),
+                input: json!({"last": 5}),
+            }
+        );
+
+        let outcome = parse_command_run(
+            &CommandExport::ResolveCommand,
+            r#"{"outcome":"failed","error":{"code":"usage","message":"fixture --last N"}}"#,
+        )
+        .expect("a legacy decline parses");
+        assert_eq!(
+            outcome,
+            CommandRunOutcome::Failed {
+                error: ComponentFailure {
+                    code: "usage".to_owned(),
+                    message: "fixture --last N".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_run_export_answer_parses_only_as_the_run_wire_type() {
+        let outcome = parse_command_run(
+            &CommandExport::RunCommand,
+            r#"{"outcome":"rendered","stdout":"Usage: fixture\n","stderr":"","status":0}"#,
+        )
+        .expect("a rendered page parses");
+        assert_eq!(
+            outcome,
+            CommandRunOutcome::Rendered {
+                stdout: "Usage: fixture\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }
+        );
+
+        let error = parse_command_run(
+            &CommandExport::RunCommand,
+            r#"{"outcome":"resolved","capability":"fixture.run","input":{}}"#,
+        )
+        .expect_err("the legacy tag is not a run outcome");
+        assert!(error.to_string().contains("resolved"), "{error}");
+
+        let error = parse_command_run(
+            &CommandExport::RunCommand,
+            r#"{"outcome":"rendered","stdout":"","stderr":"","status":0,"extra":1}"#,
+        )
+        .expect_err("unknown fields are refused");
+        assert!(error.to_string().contains("extra"), "{error}");
+    }
+
+    #[test]
+    fn command_input_counts_every_argv_word_and_the_piped_value() {
+        let argv = vec!["say".to_owned(), "-".to_owned()];
+
+        assert_eq!(command_input_bytes(&argv, None), 4);
+        assert_eq!(command_input_bytes(&argv, Some("hello")), 9);
+        assert_eq!(command_input_bytes(&[], Some("hello")), 5);
+    }
+
+    #[test]
+    fn an_oversized_signature_is_cut_at_a_character_boundary() {
+        let short = "fn() -> (String)".to_owned();
+        assert_eq!(bounded_signature(short.clone()), short);
+
+        let long = "\u{e9}".repeat(MAX_SIGNATURE_BYTES);
+        let cut = bounded_signature(long);
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
+        assert!(cut.len() <= MAX_SIGNATURE_BYTES + '\u{2026}'.len_utf8());
     }
 
     #[test]

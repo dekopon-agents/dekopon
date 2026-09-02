@@ -150,6 +150,52 @@ pub enum CapabilityCallResult {
     NotFound,
 }
 
+/// What a provider did with one of its command words.
+///
+/// A provider command word behaves like its own command-line program: it can turn an argv into a
+/// capability proposal, print its own help or usage text, or refuse the argv outright. Those are
+/// kept apart because the interpreter charges and reports them differently, and apart again from
+/// a run that never reached the provider's answer, which is not a usage error however it failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandRun {
+    /// The provider proposed a capability, authorized and charged exactly like a direct call.
+    Proposed {
+        /// The capability identifier the provider chose.
+        capability: String,
+        /// The input it assembled from the argv and stdin.
+        input: Value,
+    },
+    /// The provider produced text of its own — help, a version, a usage error — and chose the
+    /// exit status; no capability call is charged.
+    Rendered {
+        /// Text for the script's stdout, exactly as the provider wrote it.
+        stdout: String,
+        /// Text for the script's diagnostic stream, exactly as the provider wrote it.
+        stderr: String,
+        /// The exit status the provider chose, `0` for help and `2` for a usage error by
+        /// convention.
+        status: u8,
+    },
+    /// The provider declined the argv; reported as a usage error at exit `2`.
+    Failed {
+        /// Why the provider declined.
+        message: String,
+    },
+    /// The run itself failed before the provider could answer — the broker was unreachable, the
+    /// host refused or trapped, the task did not complete — and is reported like a capability
+    /// that ran and errored, at exit `1`. Telling the model to fix its argv would be wrong.
+    Errored {
+        /// What failed, naming its cause; never a path.
+        message: String,
+    },
+    /// The run was refused before or during dispatch — the session was cancelled underneath it —
+    /// and is reported like a refused capability, at exit `126`.
+    Denied {
+        /// Why the run was refused.
+        reason: String,
+    },
+}
+
 /// The boundary between this interpreter and the real world.
 ///
 /// Implementations decide what a "capability" is: a direct Wasm component call, a broker proposal,
@@ -200,19 +246,18 @@ pub trait CapabilityInvoker {
             .any(|candidate| candidate == word)
     }
 
-    /// Rewrites one provider command word's argv into a capability proposal.
+    /// Runs one provider command word against its argv and the text piped into it.
     ///
-    /// `Some(Ok((capability, input)))` names the capability to invoke; `Some(Err(message))` is a
-    /// usage error the provider chose to report; `None` means no loaded provider owns the word.
+    /// `stdin` is what the script piped in, already rendered to text by the shell's display rule
+    /// (strings verbatim, other values as compact JSON); `None` when nothing was piped. `None`
+    /// coming back means no loaded provider owns the word; otherwise the [`CommandRun`] says
+    /// whether the provider proposed a capability, rendered text of its own, or declined.
     ///
-    /// The rewrite grants nothing: what comes back is a proposal, invoked on exactly the path a
-    /// direct capability word takes, with the same budget, denial, and telemetry behavior.
-    fn resolve_command(
-        &self,
-        word: &str,
-        argv: &[String],
-    ) -> Option<Result<(String, Value), String>> {
-        let _ = (word, argv);
+    /// Running the word grants nothing: a proposal is invoked on exactly the path a direct
+    /// capability word takes, with the same budget, denial, and telemetry behavior, and rendered
+    /// text is charged only against the script's value and output ceilings.
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        let _ = (word, argv, stdin);
         None
     }
 
@@ -284,12 +329,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().has_command_word(word)
     }
 
-    fn resolve_command(
-        &self,
-        word: &str,
-        argv: &[String],
-    ) -> Option<Result<(String, Value), String>> {
-        self.as_ref().resolve_command(word, argv)
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        self.as_ref().run_command(word, argv, stdin)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -464,7 +505,9 @@ mod tests {
     use dekopon_core::{SecretDrn, SecretUseProposal};
     use serde_json::{Value, json};
 
-    use super::{CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode};
+    use super::{
+        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+    };
 
     /// An invoker that overrides every defaulted method with an answer the default cannot give.
     ///
@@ -497,12 +540,16 @@ mod tests {
             word == "gh-extra"
         }
 
-        fn resolve_command(
+        fn run_command(
             &self,
             word: &str,
             argv: &[String],
-        ) -> Option<Result<(String, Value), String>> {
-            Some(Ok((word.to_owned(), json!({ "argv": argv }))))
+            stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            Some(CommandRun::Proposed {
+                capability: word.to_owned(),
+                input: json!({ "argv": argv, "stdin": stdin }),
+            })
         }
 
         fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -581,8 +628,11 @@ mod tests {
         assert!(shared.has_command_word("gh-extra"));
         // Both default to `None`.
         assert_eq!(
-            shared.resolve_command("gh", &["pr".to_owned()]),
-            Some(Ok(("gh".to_owned(), json!({"argv": ["pr"]}))))
+            shared.run_command("gh", &["pr".to_owned()], Some("piped")),
+            Some(CommandRun::Proposed {
+                capability: "gh".to_owned(),
+                input: json!({"argv": ["pr"], "stdin": "piped"}),
+            })
         );
         assert_eq!(
             shared.describe("gh.pr-view").map(|it| it.description),

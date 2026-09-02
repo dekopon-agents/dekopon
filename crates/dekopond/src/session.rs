@@ -33,6 +33,7 @@ use dekopon_model::{
     image::{ImageGenerationError, ImageGenerator, OpenAiImageGenerator},
     model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
 };
+use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -300,15 +301,26 @@ impl Drop for SessionAdmission {
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionCancellation(Arc<AtomicU8>);
+pub(crate) struct SessionCancellation {
+    state: Arc<AtomicU8>,
+    /// Fired exactly once, by the caller that won the race to cancel, into the broker leg's
+    /// in-flight command-word run.
+    handle: CancelHandle,
+    signal: CancelSignal,
+}
 
 impl SessionCancellation {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(SESSION_RUNNING)))
+        let (handle, signal) = CancelSignal::pair();
+        Self {
+            state: Arc::new(AtomicU8::new(SESSION_RUNNING)),
+            handle,
+            signal,
+        }
     }
 
     fn claim_completion(&self) -> bool {
-        self.0
+        self.state
             .compare_exchange(
                 SESSION_RUNNING,
                 SESSION_COMPLETING,
@@ -319,20 +331,32 @@ impl SessionCancellation {
     }
 
     pub(crate) fn cancel(&self) -> bool {
-        self.0
+        let cancelled = self
+            .state
             .compare_exchange(
                 SESSION_RUNNING,
                 SESSION_CANCELLED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        // Only the winner fires it, so a session that completed normally — whose drop guard
+        // still calls this — never aborts a broker round trip it already finished.
+        if cancelled {
+            self.handle.cancel();
+        }
+        cancelled
+    }
+
+    /// The signal the broker leg supervises its command-word runs against.
+    pub(crate) fn signal(&self) -> CancelSignal {
+        self.signal.clone()
     }
 }
 
 impl CancellationProbe for SessionCancellation {
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire) == SESSION_CANCELLED
+        self.state.load(Ordering::Acquire) == SESSION_CANCELLED
     }
 }
 
@@ -377,12 +401,13 @@ impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
         self.inner.has_command_word(word)
     }
 
-    fn resolve_command(
+    fn run_command(
         &self,
         word: &str,
         argv: &[String],
-    ) -> Option<Result<(String, serde_json::Value), String>> {
-        self.inner.resolve_command(word, argv)
+        stdin: Option<&str>,
+    ) -> Option<dekopon_shell::CommandRun> {
+        self.inner.run_command(word, argv, stdin)
     }
 
     fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
@@ -501,10 +526,9 @@ impl Drop for ActiveRegistration {
             return;
         }
         let mut entries = self.entries.lock().expect("active session registry");
-        if entries
-            .get(&self.key)
-            .is_some_and(|session| Arc::ptr_eq(&session.cancellation.0, &self.cancellation.0))
-        {
+        if entries.get(&self.key).is_some_and(|session| {
+            Arc::ptr_eq(&session.cancellation.state, &self.cancellation.state)
+        }) {
             entries.remove(&self.key);
         }
     }
@@ -835,6 +859,10 @@ async fn session(
     let driver = runner.activities.get(&message.transport).cloned();
     let activity_enabled = driver.is_some() && message.activity.is_some();
     let cancellation = SessionCancellation::new();
+    // A Stop that wins the race also aborts whichever broker command-word run the script is
+    // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
+    // a broker that is still working.
+    let leg = leg.with_cancel_signal(cancellation.signal());
     let mut activity = ActivityLease::start(driver, message.activity.clone());
     let _active_registration = activity_enabled.then(|| {
         runner.active_sessions.register(

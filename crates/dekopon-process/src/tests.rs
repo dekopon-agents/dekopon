@@ -151,28 +151,35 @@ where
         let mut fields = FieldCapture::default();
         values.record(&mut fields);
         let terminal = fields.rendered.contains("process.outcome=");
+        // A later record is prefixed with the span's fixed kind so a test can correlate a
+        // terminal `process.outcome` with the node it belongs to.
+        let kind = self
+            .0
+            .kinds
+            .lock()
+            .expect("span kind lock")
+            .get(span)
+            .cloned();
+        let rendered = match &kind {
+            Some(kind) => format!("process.kind={kind:?};{}", fields.rendered),
+            None => fields.rendered,
+        };
         self.0
             .records
             .lock()
             .expect("capture layer lock")
-            .push(fields.rendered);
-        if terminal {
-            let kind = self
-                .0
-                .kinds
+            .push(rendered);
+        if !terminal {
+            return;
+        }
+        if let Some(sender) = kind.and_then(|kind| {
+            self.0
+                .terminal_waiters
                 .lock()
-                .expect("span kind lock")
-                .get(span)
-                .cloned();
-            if let Some(sender) = kind.and_then(|kind| {
-                self.0
-                    .terminal_waiters
-                    .lock()
-                    .expect("terminal waiter lock")
-                    .remove(&kind)
-            }) {
-                assert!(sender.send(()).is_ok(), "terminal waiter remains");
-            }
+                .expect("terminal waiter lock")
+                .remove(&kind)
+        }) {
+            assert!(sender.send(()).is_ok(), "terminal waiter remains");
         }
     }
 
@@ -214,8 +221,47 @@ async fn trace_fields_are_fixed_and_payload_free() {
         trace.contains("process.interruptibility=\"non-interruptible\""),
         "{trace}"
     );
-    assert!(trace.contains("process.outcome=\"succeeded\""), "{trace}");
+    assert!(
+        trace.contains("process.kind=\"trace-test\";process.outcome=\"succeeded\";"),
+        "{trace}"
+    );
     assert!(!trace.contains("VERY_SECRET_PROCESS_PAYLOAD"), "{trace}");
+
+    let payload = "VERY_SECRET_CANCELLABLE_PAYLOAD".to_owned();
+    let (handle, signal) = CancelSignal::pair();
+    let cancellable = process_fn(
+        ProcessMetadata::cancellable("trace-cancellable-test", signal),
+        move || async move {
+            assert_eq!(payload.len(), 31);
+            Ok::<_, io::Error>(())
+        },
+    );
+    assert!(matches!(
+        ProcessRun::execute(cancellable, |_| {}).await,
+        ProcessOutcome::Completed(Ok(()))
+    ));
+    drop(handle);
+
+    let trace = capture
+        .0
+        .records
+        .lock()
+        .expect("capture layer lock")
+        .join("\n");
+    assert!(
+        trace.contains(
+            "process.kind=\"trace-cancellable-test\";process.interruptibility=\"cancellable\";"
+        ),
+        "{trace}"
+    );
+    assert!(
+        trace.contains("process.kind=\"trace-cancellable-test\";process.outcome=\"succeeded\";"),
+        "{trace}"
+    );
+    assert!(
+        !trace.contains("VERY_SECRET_CANCELLABLE_PAYLOAD"),
+        "{trace}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -345,4 +391,187 @@ async fn caller_abort_then_process_panic_delivers_raw_join_error_to_observer() {
         payload.downcast_ref::<&'static str>(),
         Some(&"exact abandoned panic payload")
     );
+}
+
+fn joined_trace(capture: &CaptureLayer) -> String {
+    capture
+        .0
+        .records
+        .lock()
+        .expect("capture layer lock")
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
+    let capture = CaptureLayer::global();
+    let terminal = capture.terminal("cancel-test");
+    let (started_sender, started_receiver) = oneshot::channel();
+    // The parked receiver's sender stays alive for the whole test, so the process can only leave
+    // its await through the supervisor's abort.
+    let (_park_sender, park_receiver) = oneshot::channel::<()>();
+    let (handle, signal) = CancelSignal::pair();
+    let process = process_fn(
+        ProcessMetadata::cancellable("cancel-test", signal),
+        move || async move {
+            started_sender.send(()).expect("start observer remains");
+            park_receiver
+                .await
+                .expect("the park sender outlives the process");
+            Ok::<_, io::Error>(())
+        },
+    );
+    let execute = tokio::spawn(ProcessRun::execute(process, |_| {}));
+
+    started_receiver.await.expect("process starts");
+    handle.cancel();
+    handle.cancel();
+
+    let error = match execute.await.expect("outer execute task joins") {
+        ProcessOutcome::TaskFailed(error) => error,
+        ProcessOutcome::Completed(_) => panic!("a parked process cannot complete"),
+    };
+    assert!(error.is_cancelled());
+    assert!(!error.is_panic());
+    terminal.await.expect("supervisor records terminal outcome");
+
+    let trace = joined_trace(&capture);
+    assert!(
+        trace.contains("process.kind=\"cancel-test\";process.interruptibility=\"cancellable\";"),
+        "{trace}"
+    );
+    assert!(
+        trace.contains("process.kind=\"cancel-test\";process.outcome=\"cancelled\";"),
+        "{trace}"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_process_wins_over_a_late_signal() {
+    let capture = CaptureLayer::global();
+    let terminal = capture.terminal("late-signal-test");
+    let (handle, signal) = CancelSignal::pair();
+    let process = process_fn(
+        ProcessMetadata::cancellable("late-signal-test", signal),
+        || async { Ok::<_, io::Error>(7_u8) },
+    );
+
+    let outcome = ProcessRun::execute(process, |_| {}).await;
+    handle.cancel();
+
+    assert!(matches!(outcome, ProcessOutcome::Completed(Ok(7))));
+    terminal.await.expect("supervisor records terminal outcome");
+    let trace = joined_trace(&capture);
+    assert!(
+        trace.contains("process.kind=\"late-signal-test\";process.outcome=\"succeeded\";"),
+        "{trace}"
+    );
+}
+
+#[tokio::test]
+async fn a_never_signal_leaves_a_cancellable_process_joined() {
+    let capture = CaptureLayer::global();
+    let terminal = capture.terminal("never-signal-test");
+    let process = process_fn(
+        ProcessMetadata::cancellable("never-signal-test", CancelSignal::never()),
+        || async {
+            // Yield so the supervisor observes the closed signal while the node still runs.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, io::Error>("joined")
+        },
+    );
+
+    assert!(matches!(
+        ProcessRun::execute(process, |_| {}).await,
+        ProcessOutcome::Completed(Ok("joined"))
+    ));
+    terminal.await.expect("supervisor records terminal outcome");
+    let trace = joined_trace(&capture);
+    assert!(
+        trace.contains(
+            "process.kind=\"never-signal-test\";process.interruptibility=\"cancellable\";"
+        ),
+        "{trace}"
+    );
+    assert!(
+        trace.contains("process.kind=\"never-signal-test\";process.outcome=\"succeeded\";"),
+        "{trace}"
+    );
+}
+
+#[tokio::test]
+async fn dropping_every_cancel_handle_does_not_cancel() {
+    let (started_sender, started_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = oneshot::channel();
+    let (handle, signal) = CancelSignal::pair();
+    let second_handle = handle.clone();
+    let process = process_fn(
+        ProcessMetadata::cancellable("dropped-handle-test", signal),
+        move || async move {
+            started_sender.send(()).expect("start observer remains");
+            release_receiver.await.expect("release sender remains");
+            Ok::<_, io::Error>(())
+        },
+    );
+    let execute = tokio::spawn(ProcessRun::execute(process, |_| {}));
+
+    started_receiver.await.expect("process starts");
+    drop(handle);
+    drop(second_handle);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!execute.is_finished(), "a closed signal must not cancel");
+    release_sender
+        .send(())
+        .expect("process still awaits release");
+
+    assert!(matches!(
+        execute.await.expect("outer execute task joins"),
+        ProcessOutcome::Completed(Ok(()))
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abandoned_cancelled_outcome_reaches_the_observer() {
+    let (started_sender, started_receiver) = oneshot::channel();
+    let (_park_sender, park_receiver) = oneshot::channel::<()>();
+    let (observed_sender, observed_receiver) = oneshot::channel();
+    let (handle, signal) = CancelSignal::pair();
+    let process = process_fn(
+        ProcessMetadata::cancellable("abandoned-cancel-test", signal),
+        move || async move {
+            started_sender.send(()).expect("start observer remains");
+            park_receiver
+                .await
+                .expect("the park sender outlives the process");
+            Ok::<_, io::Error>(())
+        },
+    );
+    let mut execute = Box::pin(ProcessRun::execute(process, move |outcome| {
+        assert!(
+            observed_sender.send(outcome).is_ok(),
+            "abandoned cancel observer remains"
+        );
+    }));
+
+    // As in the admission test: one manual poll admits the supervisor and transfers process
+    // ownership before this outer future is dropped.
+    let waker = Waker::noop();
+    let mut context = TaskContext::from_waker(waker);
+    assert!(matches!(
+        std::future::Future::poll(execute.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    drop(execute);
+
+    started_receiver.await.expect("supervised process starts");
+    handle.cancel();
+    let error = match observed_receiver.await.expect("observer receives outcome") {
+        ProcessOutcome::TaskFailed(error) => error,
+        ProcessOutcome::Completed(_) => panic!("observer received the wrong abandoned outcome"),
+    };
+    assert!(error.is_cancelled());
 }

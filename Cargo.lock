@@ -822,6 +822,7 @@ dependencies = [
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
+ "dekopon-process",
  "dekopon-shell",
  "dekopon-telemetry",
  "rustix",
@@ -1060,6 +1061,7 @@ dependencies = [
 name = "dekopon-provider-sdk"
 version = "0.12.0"
 dependencies = [
+ "clap",
  "dekopon-capability",
  "dekopon-core",
  "serde",
@@ -1215,6 +1217,7 @@ dependencies = [
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
+ "dekopon-process",
  "dekopon-shell",
  "dekopon-storage-host",
  "dekopon-telemetry",

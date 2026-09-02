@@ -22,12 +22,15 @@ use std::{
 
 use dekopon_capability::EffectKind;
 use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_provider_sdk::host::CommandExport;
 pub use dekopon_provider_sdk::host::ProviderConflicts;
 use dekopon_provider_sdk::host::{
-    self, ConflictScan, ConflictWording, EngineError, ManifestRejection, StoreLimits,
+    self, CommandExportProblem, ConflictScan, ConflictWording, EngineError, ManifestRejection,
+    RESOLVE_COMMAND_EXPORT, RUN_COMMAND_EXPORT, StoreLimits,
 };
 pub use dekopon_provider_sdk::{
-    ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability, ProviderManifest,
+    CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
+    ProviderManifest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -219,6 +222,8 @@ pub struct WasmProvider {
     component: Component,
     source: PathBuf,
     manifest: ProviderManifest,
+    /// Which command export the component offers, read once from its type at load.
+    command_export: CommandExport,
 }
 
 impl fmt::Debug for WasmProvider {
@@ -263,12 +268,33 @@ impl WasmProvider {
                 }
             })?;
         validate_manifest(&manifest, &source)?;
+        // A manifest that promises command words the component cannot run would fail at the first
+        // `gh …` a model typed. Prove it at load instead, from the component's own type, which
+        // distinguishes "no such export" from "wrong signature" without instantiating again.
+        let command_export = host::command_export(&runtime.engine, &component);
+        if let Err(problem) = host::check_command_export(&manifest, &command_export) {
+            return Err(match problem {
+                CommandExportProblem::Missing => ProviderHostError::MissingCommandExport {
+                    provider: manifest.id,
+                    path: source,
+                },
+                CommandExportProblem::Mismatched { name, found } => {
+                    ProviderHostError::CommandExportSignature {
+                        provider: manifest.id,
+                        path: source,
+                        name,
+                        found,
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             runtime,
             component,
             source,
             manifest,
+            command_export,
         })
     }
 }
@@ -429,6 +455,176 @@ impl WasmProvider {
             }),
         }
     }
+
+    /// Runs one command word's argv inside the component, in a fresh bounded execution context.
+    ///
+    /// The outcome is a proposal, rendered text, or a decline; none of it carries authorization,
+    /// and the run is as import-free as `invoke`: the linker is empty. Which export is called was
+    /// decided at load from the component's type. `run-command` receives `argv` and `stdin`; a
+    /// legacy `resolve-command` guest receives `argv` alone, because its contract has no piped
+    /// value, and its answer is adapted into the same [`CommandRunOutcome`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderHostError::CommandInputTooLarge`] before instantiation when `argv` plus
+    /// `stdin` exceed the input bound, and [`ProviderHostError`] when instantiation or the call
+    /// fails, exceeds a bound, or answers with something that is not its wire type.
+    pub fn run_command(
+        &self,
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Result<CommandRunOutcome, ProviderHostError> {
+        let length = host::command_input_bytes(argv, stdin);
+        if length > self.runtime.limits.max_input_bytes {
+            return Err(ProviderHostError::CommandInputTooLarge {
+                provider: self.manifest.id.clone(),
+                length,
+                maximum: self.runtime.limits.max_input_bytes,
+            });
+        }
+        let export_name = match &self.command_export {
+            CommandExport::RunCommand => RUN_COMMAND_EXPORT,
+            CommandExport::ResolveCommand => RESOLVE_COMMAND_EXPORT,
+            CommandExport::Absent => {
+                return Err(ProviderHostError::MissingCommandExport {
+                    provider: self.manifest.id.clone(),
+                    path: self.source.clone(),
+                });
+            }
+            CommandExport::Mismatched { name, found } => {
+                return Err(ProviderHostError::CommandExportSignature {
+                    provider: self.manifest.id.clone(),
+                    path: self.source.clone(),
+                    name,
+                    found: found.clone(),
+                });
+            }
+        };
+
+        let timeout_ms = self.runtime.limits.timeout.as_millis();
+        // DEBUG rather than INFO: a command run is not budget-bounded the way a capability call
+        // is, and the enclosing shell span carries the outcome once per word.
+        let span = tracing::debug_span!(
+            "provider.run_command",
+            provider.id = %self.manifest.id,
+            provider.path = %self.source.display(),
+            command.export = export_name,
+            input.bytes = length,
+            output.bytes = tracing::field::Empty,
+            fuel.remaining = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        let _execution = self
+            .runtime
+            .execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut store = self.runtime.store()?;
+        // The generated bindings describe the base world, which has no command export; the raw
+        // instance is looked up by name instead, still through an empty linker.
+        let linker = Linker::<StoreState>::new(&self.runtime.engine);
+        let mut deadline = self.runtime.deadline.arm(self.runtime.limits.timeout)?;
+        let instance = match linker.instantiate(&mut store, &self.component) {
+            Ok(instance) => instance,
+            Err(source) => {
+                if deadline.stop() {
+                    tracing::warn!(
+                        provider.id = %self.manifest.id,
+                        command.export = export_name,
+                        timeout_ms = %timeout_ms,
+                        "instantiating a provider component exceeded its wall-clock deadline"
+                    );
+                    return Err(ProviderHostError::Timeout {
+                        operation: format!("instantiate {}", self.manifest.id),
+                        timeout_ms,
+                        source: Some(source),
+                    });
+                }
+                return Err(ProviderHostError::Instantiate {
+                    path: self.source.clone(),
+                    source,
+                });
+            }
+        };
+        let signature = |source: wasmtime::Error| ProviderHostError::CommandExportSignature {
+            provider: self.manifest.id.clone(),
+            path: self.source.clone(),
+            name: export_name,
+            found: source.to_string(),
+        };
+        let result = if export_name == RUN_COMMAND_EXPORT {
+            let function = instance
+                .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
+                    &mut store,
+                    RUN_COMMAND_EXPORT,
+                )
+                .map_err(signature)?;
+            function
+                .call(&mut store, (argv.to_vec(), stdin.map(str::to_owned)))
+                .and_then(|(output,)| function.post_return(&mut store).map(|()| output))
+        } else {
+            let function = instance
+                .get_typed_func::<(Vec<String>,), (String,)>(&mut store, RESOLVE_COMMAND_EXPORT)
+                .map_err(signature)?;
+            function
+                .call(&mut store, (argv.to_vec(),))
+                .and_then(|(output,)| function.post_return(&mut store).map(|()| output))
+        };
+        let expired = deadline.stop();
+        if let Ok(fuel) = store.get_fuel() {
+            span.record("fuel.remaining", fuel);
+        }
+        let output_json = match settle(result, expired) {
+            CallOutcome::Completed(output_json) => output_json,
+            CallOutcome::TimedOut(source) => {
+                tracing::warn!(
+                    provider.id = %self.manifest.id,
+                    command.export = export_name,
+                    timeout_ms = %timeout_ms,
+                    "provider command run exceeded its wall-clock deadline"
+                );
+                return Err(ProviderHostError::Timeout {
+                    operation: format!("{export_name} {}", self.manifest.id),
+                    timeout_ms,
+                    source: Some(source),
+                });
+            }
+            CallOutcome::Failed(source) => {
+                tracing::warn!(
+                    provider.id = %self.manifest.id,
+                    command.export = export_name,
+                    "provider command run trapped or failed inside the component"
+                );
+                return Err(ProviderHostError::RunCommand {
+                    provider: self.manifest.id.clone(),
+                    source,
+                });
+            }
+        };
+
+        span.record("output.bytes", output_json.len());
+        if output_json.len() > self.runtime.limits.max_output_bytes {
+            tracing::warn!(
+                provider.id = %self.manifest.id,
+                command.export = export_name,
+                output.bytes = output_json.len(),
+                maximum = self.runtime.limits.max_output_bytes,
+                "provider returned more command output than the configured maximum"
+            );
+            return Err(ProviderHostError::OutputTooLarge {
+                provider: self.manifest.id.to_string(),
+                length: output_json.len(),
+                maximum: self.runtime.limits.max_output_bytes,
+            });
+        }
+        host::parse_command_run(&self.command_export, &output_json).map_err(|source| {
+            ProviderHostError::InvalidCommandRun {
+                provider: self.manifest.id.clone(),
+                source,
+            }
+        })
+    }
 }
 
 /// How this host addresses an operator in a conflict report.
@@ -510,6 +706,50 @@ impl ProviderRegistry {
                 .expect("registry routes are built from provider manifests");
             (&provider.manifest.id, capability)
         })
+    }
+
+    /// Returns each provider's command words, in load order, skipping providers declaring none.
+    #[must_use]
+    pub fn command_words_by_provider(&self) -> Vec<(&ProviderId, &[String])> {
+        self.providers
+            .iter()
+            .filter(|provider| !provider.manifest.command_words.is_empty())
+            .map(|provider| {
+                (
+                    &provider.manifest.id,
+                    provider.manifest.command_words.as_slice(),
+                )
+            })
+            .collect()
+    }
+
+    /// Runs one command word's argv through the provider that declared it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderHostError::UnknownCommandWord`] when no loaded provider declared the
+    /// word, without instantiating anything, and otherwise whatever
+    /// [`WasmProvider::run_command`] returns.
+    pub fn run_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Result<CommandRunOutcome, ProviderHostError> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| {
+                provider
+                    .manifest
+                    .command_words
+                    .iter()
+                    .any(|candidate| candidate == word)
+            })
+            .ok_or_else(|| ProviderHostError::UnknownCommandWord {
+                word: word.to_owned(),
+            })?;
+        provider.run_command(argv, stdin)
     }
 
     /// Routes and invokes one capability.
@@ -875,6 +1115,68 @@ pub enum ProviderHostError {
     UnknownCapability {
         /// Requested capability.
         capability: CapabilityId,
+    },
+    /// No loaded component declared the requested command word.
+    #[error("no loaded provider declares the command word {word:?}")]
+    UnknownCommandWord {
+        /// The unclaimed word.
+        word: String,
+    },
+    /// A component declared command words but exports no way to run them.
+    #[error(
+        "provider {provider} declares command words but component {} exports neither run-command \
+         nor resolve-command; rebuild it against the dekopon:provider/provider-cli world",
+        path.display()
+    )]
+    MissingCommandExport {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Component path.
+        path: PathBuf,
+    },
+    /// A component exports a command export as something the host cannot call.
+    #[error(
+        "provider {provider} exports {name} from component {} as {found}, not the function the \
+         dekopon:provider package declares",
+        path.display()
+    )]
+    CommandExportSignature {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Component path.
+        path: PathBuf,
+        /// Which export name was found.
+        name: &'static str,
+        /// Bounded description of what the component actually exports.
+        found: String,
+    },
+    /// A command word's argv plus its piped value exceeded the input bound.
+    #[error("command input for provider {provider} is {length} bytes; the maximum is {maximum}")]
+    CommandInputTooLarge {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Actual bytes: every argv word plus the piped value.
+        length: usize,
+        /// Configured bound.
+        maximum: usize,
+    },
+    /// Running a command word trapped or otherwise failed inside the component.
+    #[error("provider {provider} failed while running a command word")]
+    RunCommand {
+        /// Provider identity.
+        provider: ProviderId,
+        /// Wasmtime error.
+        #[source]
+        source: wasmtime::Error,
+    },
+    /// A component answered a command run with something that is not its wire type.
+    #[error("provider {provider} returned an unreadable command run outcome")]
+    InvalidCommandRun {
+        /// Provider identity.
+        provider: ProviderId,
+        /// JSON error.
+        #[source]
+        source: serde_json::Error,
     },
     /// A provider was called with a capability absent from its own manifest.
     #[error("provider {provider} does not implement capability {capability}")]

@@ -1,0 +1,6 @@
+package dekopon:provider-compat-v2@0.1.0;
+
+/// Component compiled against the historical provider package, not the current mirror.
+world provider {
+    include dekopon:provider/provider-commands@0.2.0;
+}

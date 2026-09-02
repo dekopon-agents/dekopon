@@ -18,7 +18,7 @@ use tokio::signal::unix::{SignalKind, signal};
 /// stack logs every connection. The OTLP exporter's own diagnostics are silenced by
 /// `dekopon_telemetry`, which appends that directive to every OTLP layer it installs.
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_shell=trace,dekopon_model=trace,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
+const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
 /// How long exit may still wait on blocking session work after everything else has stopped.
 ///

@@ -10,10 +10,10 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    AgentInventory, Attestation, BrokerClient, BrokerResponse, ClientError,
-    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ReportedAgent, ReportedAgentCapability,
-    RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    AgentInventory, Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError,
+    CommandRunOutcome, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ProtocolVersion, ReportedAgent,
+    ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
@@ -279,6 +279,255 @@ fn server_limits() -> ServerLimits {
         max_connections: 4,
         shutdown_grace: Duration::from_secs(2),
     }
+}
+
+/// The cli-probe twin of the echo grant: `probe` is the word, `cli-probe.upper` the capability.
+const CLI_PROBE_POLICY: &str = r#"
+@id("caller-upper")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
+when { context has agent && context.agent == "brokerd-test" }
+unless { context has via };
+"#;
+
+fn cli_probe_catalog() -> ConstraintCatalog {
+    ConstraintCatalog::new([(
+        "cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("valid capability fixture"),
+        ConstraintSet {
+            provider: "cli-probe"
+                .parse::<ProviderId>()
+                .expect("valid provider fixture"),
+            ..echo_constraint_set()
+        },
+    )])
+    .expect("one capability builds a catalog")
+}
+
+fn cli_probe_engine() -> PolicyEngine {
+    let world = PolicyWorld::new(
+        ["caller"
+            .parse::<PrincipalId>()
+            .expect("valid principal fixture")],
+        [(
+            "cli-probe.upper"
+                .parse::<CapabilityId>()
+                .expect("valid capability fixture"),
+            "cli-probe"
+                .parse::<ProviderId>()
+                .expect("valid provider fixture"),
+        )],
+    )
+    .expect("distinct fixtures build a world");
+    PolicyEngine::new(CLI_PROBE_POLICY, &world).expect("fixture policy validates")
+}
+
+/// A broker over the clap-layer guest, so a socket test can drive a command word end to end.
+async fn cli_probe_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load cli-probe fixture");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test"
+                .parse::<PrincipalId>()
+                .expect("valid broker principal"),
+            "policy-test".to_owned(),
+            cli_probe_engine(),
+            cli_probe_catalog(),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("broker starts"),
+    );
+    (broker, audit)
+}
+
+/// A command word answers over the socket as the tool it fronts: the help page at status 0
+/// decides nothing, and the proposal built from the piped value is what the next frame submits,
+/// so `echo hello | probe upper -` is one run and one authorized invocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_command_over_the_socket_renders_help_then_proposes() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = cli_probe_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let (_, words, _) = client
+        .session_surface(None)
+        .await
+        .expect("inspect the surface");
+    assert_eq!(words, ["probe"]);
+
+    match client
+        .run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None)
+        .await
+        .expect("the help page renders")
+    {
+        CommandRunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        } => {
+            assert_eq!(status, 0);
+            assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+        other => panic!("expected a rendered help page, got {other:?}"),
+    }
+    assert!(
+        audit.records().await.is_empty(),
+        "rendering decides nothing"
+    );
+
+    let (capability, input) = match client
+        .run_command(
+            None,
+            "probe".to_owned(),
+            vec!["upper".to_owned(), "-".to_owned()],
+            Some("hello".to_owned()),
+        )
+        .await
+        .expect("the piped value proposes")
+    {
+        CommandRunOutcome::Proposed { capability, input } => (capability, input),
+        other => panic!("expected a proposal, got {other:?}"),
+    };
+    assert_eq!(capability.as_str(), "cli-probe.upper");
+    assert_eq!(input, json!({"text": "hello"}));
+
+    let result = client
+        .invoke(
+            None,
+            InvocationRequest {
+                id: "invoke-probe-upper"
+                    .parse::<InvocationId>()
+                    .expect("valid invocation fixture"),
+                capability,
+                trace: "trace-brokerd"
+                    .parse::<TraceId>()
+                    .expect("valid trace fixture"),
+                trace_parent: None,
+                secret_use: None,
+                input,
+            },
+        )
+        .await
+        .expect("invoke the proposal");
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(result.output, Some(json!({"text": "HELLO"})));
+    assert_eq!(
+        audit.records().await.len(),
+        2,
+        "one decision and one execution for the one invocation"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
+}
+
+/// An older client's `resolveCommand` is still answered in the shape it reads: a proposal as
+/// before, and a rendered help page as the decline that shape can carry, stdout then stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_resolve_command_frame_is_still_answered() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create server fixture");
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = cli_probe_broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
+
+    async fn legacy(socket_path: &Path, limits: FrameLimits, argv: Vec<String>) -> BrokerResponse {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .expect("connect to the fixture socket");
+        let envelope = RequestEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::ResolveCommand {
+                attestation: None,
+                word: "probe".to_owned(),
+                argv,
+            },
+        };
+        write_frame(&mut stream, &envelope, limits)
+            .await
+            .expect("write the legacy frame");
+        read_frame::<_, ResponseEnvelope>(&mut stream, limits)
+            .await
+            .expect("read the legacy answer")
+            .response
+    }
+
+    match legacy(&socket_path, limits.frame, vec!["--help".to_owned()]).await {
+        BrokerResponse::CommandResolution {
+            capability: None,
+            input: None,
+            message: Some(message),
+        } => assert!(message.starts_with("Usage: probe <COMMAND>"), "{message}"),
+        other => panic!("expected a decline carrying the help page, got {other:?}"),
+    }
+    match legacy(
+        &socket_path,
+        limits.frame,
+        vec!["upper".to_owned(), "--text".to_owned(), "hi".to_owned()],
+    )
+    .await
+    {
+        BrokerResponse::CommandResolution {
+            capability: Some(capability),
+            input: Some(input),
+            message: None,
+        } => {
+            assert_eq!(capability.as_str(), "cli-probe.upper");
+            assert_eq!(input, json!({"text": "hi"}));
+        }
+        other => panic!("expected a legacy resolution, got {other:?}"),
+    }
+    assert!(
+        audit.records().await.is_empty(),
+        "the legacy operation decides nothing either"
+    );
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("server shuts down");
 }
 
 #[tokio::test(flavor = "multi_thread")]

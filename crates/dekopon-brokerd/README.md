@@ -645,7 +645,7 @@ constraintSets:
 `route:` is the only thing that reserves a capability. Omitted, it is `generic`, and the capability
 is an ordinary one on every path however it is spelled: a capability called `memory.chat.export` or
 a provider called `memory-chat` is reserved by nothing. Declared, it takes the capability off the
-generic listing, resolve, and invoke paths, takes every command word of its provider out of the
+generic listing, run, resolve, and invoke paths, takes every command word of its provider out of the
 non-chat vocabulary, and makes the record route reachable only through the delivered-turn
 operation. Renaming the shipped provider therefore drops no reservation, and the reserved names are
 the ones this deployment chose.

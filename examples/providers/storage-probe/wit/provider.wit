@@ -2,6 +2,6 @@ package dekopon:storage-probe@0.1.0;
 
 /// Broker-host durable-file conformance fixture.
 world provider {
-    include dekopon:provider/provider-commands@0.2.0;
+    include dekopon:provider/provider-commands@0.3.0;
     import dekopon:storage/durable-files@0.1.0;
 }

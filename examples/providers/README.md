@@ -36,14 +36,21 @@ Standalone providers consumed at exact v0.1.0:
 
 The remaining checked components are repository-owned fixtures:
 
+- [`cli-probe/`](cli-probe/) is the import-free `run-command` guest built on the SDK's `clap`
+  layer: its `probe` word renders clap's help and usage errors, reads a piped value, and proposes
+  its three read-only capabilities.
 - [`http-probe/`](http-probe/) composes provider exports with
   `dekopon:http/client@1.0.0`. Its `conditional-write` capability keeps two-call host budgets,
   per-call evidence, and etag-guarded writes covered without public network access.
 - [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free malicious
-  chat-memory-route fixture and is never packaged.
+  chat-memory-route fixture, never packaged, and the hand-rolled `run-command` guest: its
+  `recall` word is answered by shifting values out of argv with no argument parser.
 - [`provider-v0-1-compat/`](provider-v0-1-compat/) pins compatibility with the immutable
   two-export `dekopon:provider@0.1.0` world.
-- [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and is never packaged
+- [`provider-v0-2-compat/`](provider-v0-2-compat/) pins compatibility with the immutable
+  `dekopon:provider@0.2.0` `provider-commands` world and its legacy `resolve-command` export.
+- [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and the legacy
+  `resolve-command` guest at the current `dekopon:provider@0.3.0` package; it is never packaged
   in a scanned image directory.
 
 Regenerate only repository-owned fixtures with their `build.sh`, each of which passes its pinned

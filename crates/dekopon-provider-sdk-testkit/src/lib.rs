@@ -55,7 +55,7 @@ use tempfile::TempDir;
 
 pub use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerInvocationFailure,
-    BrokerInvocationOutput, BrokerProviderRegistry,
+    BrokerInvocationOutput, BrokerProviderRegistry, CommandRunOutcome,
 };
 pub use dekopon_capability::{
     AuthorizationError, ExecutionConstraints, ProposedInvocation, StorageAccess,
@@ -77,8 +77,8 @@ pub use dekopon_storage_host::{
 /// here rather than from the guest SDK keeps a test on one side of that line.
 pub mod prelude {
     pub use super::{
-        BrokerInvocationOutput, CapabilityId, FakeBroker, FakeBrokerError, ProviderId,
-        StorageAccess, StorageEvidence, StorageInterface,
+        BrokerInvocationOutput, CapabilityId, CommandRunOutcome, FakeBroker, FakeBrokerError,
+        ProviderId, StorageAccess, StorageEvidence, StorageInterface,
     };
 }
 
@@ -485,6 +485,28 @@ impl FakeBroker {
             .invoke_with_storage(authorized, None, grant)
             .await
             .map_err(|failure| FakeBrokerError::Invocation(Box::new(failure)))
+    }
+
+    /// Runs one command word the component declared, as the sandboxed shell would.
+    ///
+    /// `argv` holds the arguments after the word and `stdin` the value piped into it. The answer
+    /// is what the broker host decodes from the guest: a page the provider rendered itself (help,
+    /// a version, a usage error) with its exit status, a capability proposal, or a decline.
+    /// Nothing is authorized or executed here — a proposal is the rewrite, not its result; run it
+    /// through [`FakeBroker::invoke`] to close the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FakeBrokerError::Host`] when the component declared no such word, `argv` plus
+    /// `stdin` exceed the host's input bound, the guest trapped, or its answer was not the wire
+    /// type.
+    pub async fn run_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Result<CommandRunOutcome, FakeBrokerError> {
+        Ok(self.registry.run_command(word, argv, stdin).await?)
     }
 
     /// Returns the storage root on disk.

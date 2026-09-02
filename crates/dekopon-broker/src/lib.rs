@@ -43,7 +43,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use async_trait::async_trait;
 use dekopon_broker_host::{
-    BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandResolution, HttpCallEvidence,
+    BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandRunOutcome, HttpCallEvidence,
     ProviderCapability,
 };
 pub use dekopon_broker_protocol::{
@@ -3239,36 +3239,43 @@ where
         words
     }
 
-    /// Rewrites one command word's arguments into a capability proposal.
+    /// Runs one command word as the command-line program its provider declared.
     ///
     /// Ungated on purpose. This is a pure function inside the declaring component — no imports,
-    /// bounded by fuel and timeout — and what it returns is a *proposal*. Authorization happens
-    /// where it always happens, on the invocation that follows; a caller who rewrites a word they
-    /// may not use receives a denial one step later, having learned nothing they could not learn
-    /// by asking for the capability directly.
+    /// bounded by fuel and timeout — and what it returns is a *proposal*, or text the guest
+    /// rendered itself, which authorizes nothing. Authorization happens where it always happens,
+    /// on the invocation that follows; a caller who runs a word they may not use receives a denial
+    /// one step later, having learned nothing they could not learn by asking for the capability
+    /// directly.
     ///
-    /// An `attestation` is not a gate on the rewrite either, but it is still a claim, and a claim
-    /// the broker refuses buys nothing: the word answers `UnknownCommandWord` exactly as an
-    /// undeclared word does, because naming it would disclose the surface the refusal withheld.
-    /// The class lands on the broker's own side through `broker_capabilities_refused` instead.
+    /// An `attestation` is not a gate on the run either, but it is still a claim, and a claim the
+    /// broker refuses buys nothing: the word answers `UnknownCommandWord` exactly as an undeclared
+    /// word does, because naming it would disclose the surface the refusal withheld. The class
+    /// lands on the broker's own side through `broker_capabilities_refused` instead.
     ///
     /// The chat-memory words are offered only to a chat-scoped session whose three memory grants
-    /// are effective; every other caller finds them reserved, and a resolution that lands on a
-    /// chat-memory route is refused whatever word produced it. Recording stays unreachable from
-    /// any word.
+    /// are effective; every other caller finds them reserved *before the guest runs*, so a
+    /// reserved provider never renders so much as its help page for them, and a proposal that
+    /// lands on a chat-memory route is refused whatever word produced it. Recording stays
+    /// unreachable from any word.
+    ///
+    /// `stdin` is the value the script piped into the word, already rendered to text; the host
+    /// counts it with the argv against its input bound before a store exists. A legacy
+    /// `resolve-command` guest receives no piped value by contract.
     ///
     /// # Errors
     ///
-    /// Returns a host error when no loaded provider declares the word, when the guest traps, or
-    /// when the rewrite reaches for a host import.
-    pub async fn resolve_command(
+    /// Returns a host error when no loaded provider declares the word, when the input exceeds the
+    /// host bound, when the guest traps, or when the run reaches for a host import.
+    pub async fn run_command(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         attestation: Option<&Attestation>,
         word: &str,
         argv: &[String],
-    ) -> Result<CommandResolution, BrokerHostError> {
+        stdin: Option<&str>,
+    ) -> Result<CommandRunOutcome, BrokerHostError> {
         let attested = match attestation {
             Some(claim) => {
                 let (context, refusal) = self.resolve_context(peer, grant, claim);
@@ -3294,10 +3301,12 @@ where
                 word: word.to_owned(),
             });
         }
-        let resolution = self.registry.resolve_command(word, argv).await?;
+        let outcome = self.registry.run_command(word, argv, stdin).await?;
+        // Only a proposal names a capability, so only a proposal can land on a route. Rendered text
+        // and a decline route nowhere and were already stopped above if the word was reserved.
         if matches!(
-            &resolution,
-            CommandResolution::Resolved { capability, .. } if {
+            &outcome,
+            CommandRunOutcome::Proposed { capability, .. } if {
                 let route = self.route(capability);
                 if memory_word { !route.is_chat_memory_retrieval() } else { route.is_chat_memory() }
             }
@@ -3306,7 +3315,7 @@ where
                 word: word.to_owned(),
             });
         }
-        Ok(resolution)
+        Ok(outcome)
     }
 
     /// Returns only capabilities policy allows for this exact authenticated context.
@@ -5413,8 +5422,8 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         // already survived them — but naming them keeps this match exhaustive by proof rather than
         // by a wildcard that would silently absorb a future variant into the wrong public reason.
         BrokerHostError::ConflictingProviders { .. }
-        | BrokerHostError::MissingResolveCommand { .. }
-        | BrokerHostError::ResolveCommandSignature { .. }
+        | BrokerHostError::MissingCommandExport { .. }
+        | BrokerHostError::CommandExportSignature { .. }
         | BrokerHostError::InvalidArtifactSize { .. }
         | BrokerHostError::InvalidArtifactDigest
         | BrokerHostError::ArtifactTooLarge { .. }
@@ -5425,13 +5434,14 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
         BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
-        | BrokerHostError::InputTooLarge { .. } => "invalid-input",
+        | BrokerHostError::InputTooLarge { .. }
+        | BrokerHostError::CommandInputTooLarge { .. } => "invalid-input",
         BrokerHostError::OutputTooLarge { .. } | BrokerHostError::InvalidOutput { .. } => {
             "invalid-provider-output"
         }
-        BrokerHostError::ResolveCommand { .. }
-        | BrokerHostError::ResolveCommandUsedHostImport { .. }
-        | BrokerHostError::InvalidCommandResolution { .. } => "command-rewrite-failed",
+        BrokerHostError::RunCommand { .. }
+        | BrokerHostError::RunCommandUsedHostImport { .. }
+        | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
         BrokerHostError::StorageCallRejected {

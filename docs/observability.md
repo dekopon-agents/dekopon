@@ -100,10 +100,11 @@ untrusted text that triggered it:
 | `runner.command.failed` | `dekopon-run` | the command name and a stable `error.type`, including the `output-write` failure that has no other surface |
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
-| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word and a stable `error.kind`, recorded when a provider's own rewrite fails rather than declines |
+| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`, or the legacy `resolveCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
 | `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller still sees plain `policy-denied` |
 | `broker.leg.connected` | `dekopon-run` | the broker socket tier, the session trace identifier, and the granted-capability count — never the socket path |
 | `guest.invocation.summary` | `dekopon-run` | provider and capability ids with iteration count and total/mean durations for a `--repeat` run, replacing one record per iteration |
+| `agent.command.unobserved` | `dekopon-agent` | `command.leg` (`broker` or `direct`), a low-cardinality `outcome` (`succeeded`, `operation-error`, `cancelled`, or `task-failed`), and a fixed `error.type` (`none`, the leg's own error kind, `task-cancelled`, or `task-panicked`), recorded when a command-word run's caller was dropped while its process node was still joined; never the word, the argv, the piped value, or the text a provider rendered, and the failure's complete cause goes out as an ordinary error event at the same site rather than into this record |
 
 `agent.improvement.suggested` is the deliberate exception to that sentence. Its four free-text
 fields are model-authored — bounded and stripped of control characters other than newline and
@@ -362,7 +363,7 @@ that a key and a canonical subject never share a record.
 | Span | Crate | Fields |
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
-| `provider.resolve_command` | `dekopon-broker-host` | provider, `word` |
+| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`) |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
@@ -389,12 +390,16 @@ thread.
 `dekopon-brokerd provider sync` and `verify` commands reuse that same host validation and can emit the
 span to their stderr subscriber, but they install no OTLP exporter; normal command output remains on
 stdout. Its fields attribute time to one component, and each loaded provider also emits one info
-event carrying its identity, artifact digest prefix, artifact bytes, and compile milliseconds.
+event carrying its identity, artifact digest prefix, artifact bytes, compile milliseconds, its
+capability and command-word counts, and `command_export` — `run-command`, `resolve-command`, or
+`none` — naming which export the host will call for its words.
 Since components compile concurrently, their spans overlap; the compile times sum to more than the
 wall-clock validation.
 
-`provider.resolve_command` carries the provider and the command word, never the argv. Model-authored
-argv is untrusted content for the same reason `provider.invoke` omits `input`.
+`provider.run_command` carries the provider, the command word, and the export name that served
+it, never the argv or the value piped into the word. Model-authored argv and piped text are
+untrusted content for the same reason `provider.invoke` omits `input`; the help page or usage error
+a `run-command` guest renders travels back in the result, not in telemetry.
 
 A `policy-denied` outcome the policy engine never actually evaluated additionally emits
 `audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The
@@ -438,7 +443,7 @@ only place the cause exists. These events carry it:
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested
-`resolveCommand` answer a refused caller with the same opaque nothing whatever went wrong — a
+`runCommand` (or legacy `resolveCommand`) answer a refused caller with the same opaque nothing whatever went wrong — a
 distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and an unknown
 command word would disclose the surface the refusal withheld. The class, its determining policies,
 and the canonical subject therefore land on the broker's own side of the socket, which is what makes
@@ -701,18 +706,29 @@ One generated OpenTelemetry trace links the command to spans such as:
   (`adopted`, `rotated`, `rotated-unsaved`, or `failed`), `duration_ms`, and the new
   `credential.expires_at`, and never any token material;
 - `prompt.script`, `shell.script`, and `shell.command`; and
-- `provider.compile`, `provider.describe`, and `provider.invoke`.
+- `provider.compile`, `provider.describe`, and `provider.invoke`; and
+- `provider.run_command` at `DEBUG`.
 
 `process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
-private stable `node.id`, root parent, fixed `process.kind`, `non-interruptible` contract, and
-terminal `process.outcome`. Tokio task IDs, scripts, argv, values, diagnostics, provider payloads,
+private stable `node.id`, root parent, fixed `process.kind`, the `process.interruptibility`
+contract (`non-interruptible` or `cancellable`), and terminal `process.outcome` (`succeeded`,
+`operation-error`, `panicked`, `cancelled` for a requested cancellation of a cancellable node, or
+`task-cancelled` for a runtime-driven abort). Tokio task IDs, scripts, argv, values, diagnostics, provider payloads,
 and raw operation errors are absent. These spans are `DEBUG` so normal INFO telemetry volume does
-not grow with frontend process nodes; a diagnostic filter may enable them. The current
-`dekopon-run shell` path contributes exactly one `legacy-shell` node and keeps the existing
-`shell.script`/`shell.command` spans beneath it. The runner's trace filter explicitly includes the
-`dekopon_process` target; when a sink disables these DEBUG spans, `Span::or_current` keeps existing
-shell/provider work under the current `runner.shell` parent. No public process IDs, scopes, ports,
-cancellation, or graph telemetry contract exists yet.
+not grow with frontend process nodes or with the command words a script runs; a diagnostic filter
+may enable them. Three kinds exist. `legacy-shell` is the one non-interruptible node
+`dekopon-run shell` wraps provider loading and the whole interpreter in, keeping the existing
+`shell.script`/`shell.command` spans beneath it. `direct-command` is one non-interruptible node per
+provider command word a direct-mode script runs (`shell`, `prompt`, and `session replay
+--provider`), nested under the command's `shell.command` span; it stays non-interruptible because
+the guest call blocks a thread the supervisor could not join. `broker-command` is one cancellable
+node per command word the broker leg runs: `dekopond` ties it to the session's Stop, which aborts
+and joins the round trip before the script reads `session-cancelled`, while `dekopon-run prompt
+--broker` supplies no signal, so its nodes are cancellable in contract only. Nested nodes still
+report `parent.id` `root`; real parent threading is a follow-up. The runner's and the gateway's
+trace filters both include the `dekopon_process` target; when a sink disables these DEBUG spans,
+`Span::or_current` keeps existing shell/provider work under the current parent. No public process
+IDs, scopes, ports, or graph telemetry contract exists yet.
 
 The runner's own `provider.invoke` — `dekopon-provider-host`, not the broker host — carries provider,
 capability, component path, `input.bytes`, `output.bytes`, and `fuel.remaining`. Counts and fuel
@@ -720,6 +736,16 @@ only; the payloads themselves are governed by the span-payload opt-in below. A c
 than returning also emits a `WARN` naming which wall it hit — the wall-clock deadline, the output
 ceiling and its configured bound, or a trap inside the component — because the runner's shell seam
 flattens errors to their message and would otherwise leave nothing in telemetry saying why.
+
+The runner's `provider.run_command` — again `dekopon-provider-host` — is one span per provider
+command-word run and carries `provider.id`, `provider.path`, `command.export` (`run-command`, or
+the legacy `resolve-command`), `input.bytes` (argv plus the piped value), `output.bytes`, and
+`fuel.remaining`; never the argv, the piped value, or the text the guest rendered. It is `DEBUG`
+rather than `INFO` because a command run is not budget-bounded the way a capability call is, so
+the span that runs the word carries the outcome once instead. A run that dies emits the same
+`WARN` naming the wall it hit as `provider.invoke` does, and an argv-plus-stdin beyond
+`max_input_bytes` is refused before a store exists. Every provider command word a direct-mode
+script runs reaches this span through the runner's `direct-command` process node.
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so `prompt.script` is the span for a whole unit of model-requested work rather than for a single capability invocation.
 
@@ -762,7 +788,7 @@ capabilities one guess at a time.
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code mapping; flattening them would hide an authorization refusal in the noise of ordinary failures. `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this shell excludes, and an exhausted sandbox budget.
 
-Structured log records use stable `audit.event` attributes. They no longer mirror spans: a command's start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream carries only accounting, refusals, errors, and — when opted in — payloads. `runner.shell.unobserved` is the exceptional lifecycle record emitted, while the owning Tokio runtime remains alive, when a dropped `ProcessRun::execute` caller cannot receive its shell outcome: it carries only `command.name`, low-cardinality `outcome`, and `error.type`. A successful abandoned `CommandOutput` is never rendered or logged; an abandoned error's complete cause goes only through the runner's ordinary operator stderr reporter. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
+Structured log records use stable `audit.event` attributes. They no longer mirror spans: a command's start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream carries only accounting, refusals, errors, and — when opted in — payloads. `runner.shell.unobserved` is the exceptional lifecycle record emitted, while the owning Tokio runtime remains alive, when a dropped `ProcessRun::execute` caller cannot receive its shell outcome: it carries only `command.name`, low-cardinality `outcome`, and `error.type`. A successful abandoned `CommandOutput` is never rendered or logged; an abandoned error's complete cause goes only through the runner's ordinary operator stderr reporter. `agent.command.unobserved` is the same record for one command-word run on either leg (`command.leg`), emitted by `dekopon-agent` for the runner and the gateway alike; its failure cause goes out as an ordinary error event beside it, never inside it. Logs emitted inside the runner trace carry its generated `trace_id` and active `span_id`, allowing an OTLP log result to pivot to the corresponding performance trace.
 
 ## Data minimization
 

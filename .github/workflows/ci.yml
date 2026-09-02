@@ -167,6 +167,7 @@ jobs:
       - name: Check guest host-interface bindings for Wasm
         run: |
           cargo check --locked -p dekopon-provider-sdk --target wasm32-unknown-unknown
+          cargo check --locked -p dekopon-provider-sdk --features clap --target wasm32-unknown-unknown
           cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
           cargo check --locked -p dekopon-provider-storage --no-default-features --target wasm32-unknown-unknown
           cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown

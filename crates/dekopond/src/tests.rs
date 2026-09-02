@@ -19,8 +19,8 @@ use dekopon_agent::prompt::{
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
-    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
-    read_frame, write_frame,
+    CommandRunOutcome, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
+    ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
@@ -334,7 +334,7 @@ fn a_secret_use_proposal_reaches_the_broker_leg_through_the_cancellation_boundar
 /// argument was, one method over, and nothing else in this crate pins it.
 #[test]
 fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answering_them() {
-    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun};
 
     /// Every answer here is one the trait default cannot give for this `granted` list.
     struct CommandLeg;
@@ -360,6 +360,19 @@ fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answerin
             word == "gh"
         }
 
+        fn run_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            Some(CommandRun::Rendered {
+                stdout: format!("{word} {}\n", argv.join(" ")),
+                stderr: stdin.unwrap_or_default().to_owned(),
+                status: 3,
+            })
+        }
+
         fn invoke(
             &self,
             _capability: &str,
@@ -377,6 +390,15 @@ fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answerin
 
     assert_eq!(invoker.command_words(), vec!["gh".to_owned()]);
     assert!(invoker.has_command_word("gh"));
+    // Defaults to `None`, which dispatch reports as "command not found".
+    assert_eq!(
+        invoker.run_command("gh", &["--help".to_owned()], Some("piped")),
+        Some(CommandRun::Rendered {
+            stdout: "gh --help\n".to_owned(),
+            stderr: "piped".to_owned(),
+            status: 3,
+        })
+    );
     // Absent from `granted`, so the default scan would refuse both.
     assert!(invoker.is_granted("gh.pr-view"));
     assert!(invoker.grants_namespace("gh"));
@@ -2956,6 +2978,63 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         observed.try_recv().is_err(),
         "no Slack acceptance means no durable-memory record request"
     );
+}
+
+/// A provider command word answers through the broker leg as the tool it fronts: the help page a
+/// guest renders reaches the model with the status the guest chose, over the run operation, and
+/// proposes nothing to invoke.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], vec!["probe".to_owned()]),
+            ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
+                stdout: "Usage: probe <COMMAND>\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("probe --help"), answer("done")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("show me the help"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), ["done"]);
+    assert!(matches!(
+        observed
+            .recv()
+            .await
+            .expect("authorization request")
+            .request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    let run = observed.recv().await.expect("the command run").request;
+    assert!(
+        matches!(
+            &run,
+            BrokerRequest::RunCommand { word, argv, stdin: None, .. }
+                if word == "probe" && argv == &["--help".to_owned()]
+        ),
+        "{run:?}"
+    );
+    assert!(
+        observed.try_recv().is_err(),
+        "rendered text proposes nothing to invoke"
+    );
+    let tool = tool_message(&models, 1);
+    assert!(tool.contains("Usage: probe <COMMAND>"), "{tool}");
+    assert!(tool.contains("[exit code: 0]"), "{tool}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

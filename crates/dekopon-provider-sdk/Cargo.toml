@@ -18,6 +18,10 @@ default = []
 # Host-side plumbing shared by `dekopon-provider-host` and `dekopon-broker-host`. It pulls in
 # Wasmtime, so it is off by default and no `wasm32-unknown-unknown` guest build enables it.
 host = ["dep:thiserror", "dep:wasmtime"]
+# The `clap` layer over `Provider::run_command`: `dekopon_provider_sdk::cli::run_command` renders
+# help, versions, and usage errors from a declared command tree. Off by default; a guest that wants
+# it enables it, and the hand-rolled argv path stays the contract without it.
+clap = ["dep:clap"]
 
 [dependencies]
 # Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel); a wasm guest
@@ -26,6 +30,12 @@ dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Declared directly rather than inherited: features are additive and the workspace entry enables
+# `env`, which Cargo cannot subtract for one crate. A guest must never read a process environment
+# (`env`) or probe a terminal for colour (`color`), so this is the narrowest clap that renders plain
+# help and usage text. It resolves to the workspace's already-locked clap 4.6.x, so cargo deny's
+# multiple-versions rule holds.
+clap = { version = "4.6.4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"], optional = true }
 thiserror = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
 wit-bindgen.workspace = true

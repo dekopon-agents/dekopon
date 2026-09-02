@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use dekopon_provider_host::{
-    HostLimits, HostOptions, PROVIDER_WIT, ProviderHostError, ProviderRegistry,
+    CommandRunOutcome, HostLimits, HostOptions, PROVIDER_WIT, ProviderHostError, ProviderRegistry,
 };
 use dekopon_provider_sdk::host::{
     DEFAULT_MAX_INSTANCES, DEFAULT_MAX_MEMORIES, DEFAULT_MAX_MEMORY_BYTES,
@@ -287,4 +287,213 @@ fn the_table_element_ceiling_reaches_the_store() {
         .expect_err("a one-element table ceiling must stop instantiation");
 
     assert!(matches!(error, ProviderHostError::Instantiate { .. }));
+}
+
+/// A component built against the frozen `dekopon:provider@0.2.0` `provider-commands` world runs
+/// its word through the same `run_command` path a `run-command` guest takes: the legacy
+/// `resolved` answer arrives as a proposal and a decline as a failed outcome, never a host error.
+#[test]
+fn a_legacy_resolve_command_provider_runs_through_the_same_path() {
+    let registry = ProviderRegistry::load(
+        [imported_provider_path("provider-v0-2-compat-provider.wasm")],
+        HostLimits::default(),
+    )
+    .expect("historical command-word provider loads");
+
+    // The legacy export has no stdin parameter, so the piped value is dropped by contract.
+    let outcome = registry
+        .run_command("compat", &["echo".to_owned()], Some("piped"))
+        .expect("the historical rewrite still runs");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: "provider-v0-2-compat.echo"
+                .parse()
+                .expect("valid capability fixture"),
+            input: json!({}),
+        }
+    );
+
+    let outcome = registry
+        .run_command("compat", &["bogus".to_owned()], None)
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(outcome, CommandRunOutcome::Failed { ref error } if error.code == "usage"),
+        "{outcome:?}"
+    );
+}
+
+/// The checked-in `cli-probe` component exports `run-command` and renders through the SDK's
+/// `clap` layer, so this is where the typed `(list<string>, option<string>) -> string` lowering,
+/// the piped value reaching the guest, and every answer shape — clap's help page, clap's usage
+/// error, a proposal, a decline — are proven against a real guest rather than an adapted legacy
+/// one.
+#[test]
+fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
+    let registry = ProviderRegistry::load(
+        [imported_provider_path("cli-probe-provider.wasm")],
+        HostLimits::default(),
+    )
+    .expect("command-line provider loads");
+    let words = registry
+        .command_words_by_provider()
+        .into_iter()
+        .map(|(provider, words)| (provider.to_string(), words.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        words,
+        vec![("cli-probe".to_owned(), vec!["probe".to_owned()])]
+    );
+
+    let outcome = registry
+        .run_command("probe", &["--help".to_owned()], None)
+        .expect("help renders");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected rendered help, got {outcome:?}");
+    };
+    assert_eq!(status, 0);
+    assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout:?}");
+    for subcommand in ["upper", "count", "reverse"] {
+        assert!(stdout.contains(&format!("\n  {subcommand} ")), "{stdout:?}");
+    }
+    assert!(stderr.is_empty(), "{stderr:?}");
+
+    let capability = "cli-probe.upper"
+        .parse::<dekopon_core::CapabilityId>()
+        .expect("valid capability fixture");
+    let outcome = registry
+        .run_command(
+            "probe",
+            &["upper".to_owned(), "-".to_owned()],
+            Some("hello"),
+        )
+        .expect("a piped value proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: capability.clone(),
+            input: json!({"text": "hello"}),
+        }
+    );
+    // The proposal runs through the same registry: the loop from word to output closes.
+    let output = registry
+        .invoke(&capability, &json!({"text": "hello"}))
+        .expect("the proposed capability runs");
+    assert_eq!(output.output, json!({"text": "HELLO"}));
+
+    let outcome = registry
+        .run_command("probe", &["bogus".to_owned()], None)
+        .expect("a usage error is rendered, not a host error");
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = outcome
+    else {
+        panic!("expected a rendered usage error, got {outcome:?}");
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty(), "{stdout:?}");
+    assert!(
+        stderr.starts_with("error: unrecognized subcommand 'bogus'"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
+
+    let outcome = registry
+        .run_command("probe", &["upper".to_owned(), "-".to_owned()], None)
+        .expect("a decline is an outcome, not a host error");
+    assert!(
+        matches!(
+            outcome,
+            CommandRunOutcome::Failed { ref error }
+                if error.code == "usage" && error.message.contains("nothing was piped in")
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn command_words_by_provider_lists_each_declaring_component() {
+    let registry = ProviderRegistry::load(
+        [
+            provider_path(),
+            imported_provider_path("provider-v0-2-compat-provider.wasm"),
+        ],
+        HostLimits::default(),
+    )
+    .expect("a wordless and a command-word provider load together");
+
+    let words = registry
+        .command_words_by_provider()
+        .into_iter()
+        .map(|(provider, words)| (provider.to_string(), words.to_vec()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        words,
+        vec![("provider-v0-2-compat".to_owned(), vec!["compat".to_owned()])],
+        "echo declares no words and is not listed"
+    );
+}
+
+#[test]
+fn an_unknown_command_word_is_refused_without_entering_wasm() {
+    // An input bound of one byte would refuse this argv before instantiation if the run were ever
+    // reached, so an unknown-word refusal proves the lookup answered first, with no store built.
+    let registry = ProviderRegistry::load(
+        [provider_path()],
+        HostLimits {
+            max_input_bytes: 1,
+            ..HostLimits::default()
+        },
+    )
+    .expect("Rust echo provider loads");
+
+    let error = registry
+        .run_command("gh", &["gh".to_owned(), "pr".to_owned()], None)
+        .expect_err("no loaded provider declares this word");
+
+    assert!(
+        matches!(error, ProviderHostError::UnknownCommandWord { ref word } if word == "gh"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn command_input_beyond_the_bound_is_refused_before_entering_wasm() {
+    let registry = ProviderRegistry::load(
+        [imported_provider_path("provider-v0-2-compat-provider.wasm")],
+        HostLimits {
+            max_input_bytes: 8,
+            ..HostLimits::default()
+        },
+    )
+    .expect("the input bound does not affect describe");
+
+    let error = registry
+        .run_command("compat", &["echo".to_owned()], Some("more than eight"))
+        .expect_err("argv plus stdin exceed the bound");
+
+    assert!(
+        matches!(
+            error,
+            ProviderHostError::CommandInputTooLarge {
+                length: 19,
+                maximum: 8,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    // The same argv alone fits, which proves the piped value was counted.
+    let outcome = registry
+        .run_command("compat", &["echo".to_owned()], None)
+        .expect("argv within the bound runs");
+    assert!(matches!(outcome, CommandRunOutcome::Proposed { .. }));
 }

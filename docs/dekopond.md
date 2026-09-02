@@ -262,7 +262,10 @@ and lets the initiating subject win one atomic race against the normal answer. A
 subsequent model turns and capability invocations, suppresses the stale answer/history commit,
 queues `active`, and sends `Stopped.` An already-running synchronous model request or provider
 effect cannot be rolled back and may finish before the prompt loop reaches its next cooperative
-boundary. Unknown, duplicate, and other-user Stop events are ignored.
+boundary. A provider command word the script is waiting on is the exception: its broker round
+trip runs as one cancellable process node tied to the session's Stop, so the run is aborted and
+joined and the script reads `session-cancelled` instead of waiting the broker out. Unknown,
+duplicate, and other-user Stop events are ignored.
 
 The Agent manifest also subscribes to `message.channels` and `message.groups`, requiring
 `channels:history` and `groups:history`, so the transport can hear follow-ups that contain no new

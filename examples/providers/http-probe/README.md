@@ -1,6 +1,6 @@
 # HTTP import probe
 
-A minimal Rust provider that composes `dekopon:provider@0.2.0` with the `dekopon:http/client@1.0.0` import. It validates caller-generated provider worlds, the direct runner's fail-closed import boundary, and the broker component host's authorized path.
+A minimal Rust provider that composes `dekopon:provider@0.3.0` with the `dekopon:http/client@1.0.0` import. It validates caller-generated provider worlds, the direct runner's fail-closed import boundary, and the broker component host's authorized path.
 
 `http-probe.fetch` sends its required `uri` plus an optional arbitrary method token, ordered text headers, and buffered text body. Its test-only `catchError` input demonstrates that guest code cannot mask a policy rejection.
 
