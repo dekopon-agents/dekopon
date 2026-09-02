@@ -52,7 +52,9 @@ skip = [
   { crate = "webpki-roots@0.26.11", reason = "tokio-tungstenite pins the pre-1.0 root bundle; reqwest is already on 1.0, so both TLS stacks trust the same roots from two copies" },
   { crate = "syn@2.0.119", reason = "Wasmtime and WIT macro dependencies have not converged on syn 3" },
   { crate = "unicode-width@0.1.14", reason = "miette's diagnostic renderer trails the pretty printer cedar-policy-formatter uses" },
-  { crate = "wit-bindgen@0.46.0", reason = "getrandom 0.3's target-only WASI adapter is newer than the published provider guest contract" },
+  { crate = "wasm-encoder@0.239.0", reason = "wit-bindgen 0.46's generator uses the 0.239 WIT toolchain while Wasmtime 36 still pins 0.236" },
+  { crate = "wasmparser@0.239.0", reason = "wit-bindgen 0.46's generator uses the 0.239 WIT toolchain while Wasmtime 36 still pins 0.236" },
+  { crate = "wit-parser@0.239.0", reason = "wit-bindgen 0.46's generator uses the 0.239 WIT toolchain while Wasmtime 36 still pins 0.236" },
   { crate = "windows-sys@0.52.0", reason = "ring's Windows support trails the current workspace Windows bindings" },
   { crate = "windows-sys@0.60.2", reason = "Wasmtime pins the preceding Windows bindings release" },
 ]
