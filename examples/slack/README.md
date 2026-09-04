@@ -125,6 +125,12 @@ exact workspace/channel/root-thread/sender tuple in a bounded process-local regi
 that sender's unmentioned follow-ups in that thread. Revocation removes the claim and restart clears
 all claims; another sender must mention and authorize independently.
 
+Persistent history is private per authenticated subject unless the route explicitly sets
+`scope: sharedConversation`. Slack sharing is normally root-thread scoped: independently authorized
+participants in that root thread then share retained turns and attachment references, while every
+message still receives its own broker decision. Shared turns send canonical Slack subject IDs to
+the model provider even when telemetry payloads are disabled; this example does not opt in.
+
 In Agent mode, Dekopon sets `processing` once—Slack owns the standard Working UI and one-hour
 processing timeout—sends the durable reply, and queues `active` cleanup.
 Slack's Stop button produces an authenticated `agent_session_stopped` event. Dekopon cooperatively

@@ -318,20 +318,26 @@ same caution applies to `usage.input_tokens`, which rises for the same reason an
 
 **The history size gets its own fields** rather than being inferred from that step change.
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how many prior exchanges
-this message replayed and how many bytes they occupied. Both are zero on a `oneShot` route and on
-the first message of any conversation, which makes "seeded or not" a filter rather than a guess.
+this message replayed and how many bytes they occupied. On `sharedConversation`, the byte count
+includes each retained gateway-authored canonical-participant label. Both fields are zero on a
+`oneShot` route and on the first message of any conversation, which makes "seeded or not" a filter
+rather than a guess.
 `gateway_conversation_evicted` is a gateway lifecycle event carrying a reason of `idle`, `capacity`,
 or `grant-changed` and nothing else, so a `maxConversations` ceiling set too low reads as eviction
 churn instead of as a bot that intermittently forgets. Its reason is the whole event on purpose: a
-key would carry a conversation identifier and a canonical subject, which are payload fields, and an
-eviction is not the place to leak them at the metadata level.
+key always carries a conversation identifier and a private key additionally carries a canonical
+subject, which are payload fields, and an eviction is not the place to leak either at the metadata
+level. The key types do not implement `Debug`, so an incidental `?key` cannot undo that rule.
 
 The history itself is not a new signal. It is chat text and model output, already excluded by the
 data-minimization rules below, and it appears only where those already send it: with
 `telemetryPayloads` enabled, the session's first `agent.model.prompt` carries its opening message
 list, which on a seeded session now includes the replayed window. That event becomes larger and
 older than it was — enabling payloads on a persistent route declares the sink in scope for a
-conversation rather than for a message.
+conversation rather than for a message. Shared scope adds canonical participant identifiers to
+those prompt payload events, but does not add them to metadata-only spans, eviction events, or cache
+key events. Independently of telemetry, those labels are part of every shared prompt sent to the
+selected model provider; `telemetryPayloads: false` does not redact model input.
 
 ### Reading the prompt cache
 

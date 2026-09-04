@@ -9,6 +9,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Added strict route-level `conversation.scope` for persistent gateway history:
+  `privateConversation` remains the omitted-field default and keys transcript plus attachment state
+  by agent, configured transport, transport-derived conversation, and canonical authenticated
+  subject; explicit `sharedConversation` drops only the subject component. Shared user turns carry a
+  gateway-authored canonical-participant label into current and replayed model prompts, while
+  private and one-shot prompt bytes remain unchanged. Effective scope appears in credential-free
+  agent configuration inspection. Generation-fenced commits prevent stale in-flight work from
+  recreating grant-invalidated, removed, idle-expired, capacity-evicted, or replaced history while
+  retaining append-in-completion-order and cache-lane behavior. Shared scope still authorizes every
+  participant and message independently; it is not global agent/team memory, and its canonical
+  participant identifiers reach the model provider even when telemetry payload export is disabled.
 - Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable
   `CancelHandle` whose idempotent `cancel` makes the supervisor abort a
   `ProcessMetadata::cancellable` node at its next await and then still join it, surfacing

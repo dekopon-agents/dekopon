@@ -16,7 +16,10 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
-    meta::{AgentConfigView, ConversationConfigView, SessionConfigView, SkillView},
+    meta::{
+        AgentConfigView, ConversationConfigView, ConversationScopeView, SessionConfigView,
+        SkillView,
+    },
     prompt::{
         CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
         ReplyDisposition, SessionInputs, run_prompt_session,
@@ -42,7 +45,10 @@ use tracing::Instrument as _;
 use crate::{
     activity::{ActivityControl, ActivityLease},
     asset::{self, AssetStore, SessionAssets},
-    config::{ConversationPolicy, ImageGeneratorConfig, ModelConfig, ResolvedBroker},
+    config::{
+        ConversationPolicy, ConversationScope, ConversationWindow, ImageGeneratorConfig,
+        ModelConfig, ResolvedBroker,
+    },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{
@@ -620,6 +626,38 @@ fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
     }
 }
 
+/// Selects the state audience solely from trusted bound-route configuration.
+fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
+    match route.conversation {
+        ConversationPolicy::Persistent(ConversationWindow {
+            scope: ConversationScope::SharedConversation,
+            ..
+        }) => ConversationKey::shared(&route.agent, &route.transport, &message.conversation_id),
+        ConversationPolicy::OneShot
+        | ConversationPolicy::Persistent(ConversationWindow {
+            scope: ConversationScope::PrivateConversation,
+            ..
+        }) => ConversationKey::private(
+            &route.agent,
+            &route.transport,
+            &message.conversation_id,
+            &message.subject,
+        ),
+    }
+}
+
+/// Adds authoritative gateway provenance to one shared-scope user turn.
+///
+/// The canonical subject came from the authenticated transport envelope. The remaining bytes are
+/// still untrusted user text and can contain lookalike labels or prompt injection; the first line is
+/// the only attribution the gateway vouches for.
+fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> String {
+    bound_inbound(&format!(
+        "[gateway: authenticated participant: {}]\n{text}",
+        subject.canonical()
+    ))
+}
+
 /// Runs one routed message end to end, answering unless an optional continuation declines.
 pub(crate) async fn run_session(
     runner: Arc<SessionRunner>,
@@ -723,11 +761,11 @@ async fn session(
     // Never cached and never remembered as a permission: this is a fresh answer from the broker
     // about what this subject may reach through this agent, on this message.
     let granted = leg.granted();
-    let key = ConversationKey::new(
-        &message.transport,
-        &message.conversation_id,
-        &message.subject.canonical(),
-    );
+    // Only trusted route configuration chooses whether the authenticated subject participates in
+    // the state key. Message text, transport presentation, and model output never reach this
+    // decision. A one-shot route uses the conservative private key for its attachment state while
+    // retaining no transcript history.
+    let key = conversation_key(route, message);
     // The authorization gate, and it costs nothing: an empty answer is a complete answer, so there
     // is no model call to make. Removing the entry rather than only refusing is the other half —
     // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
@@ -760,21 +798,22 @@ async fn session(
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
     let window = route.conversation.window();
-    let ConversationSeed {
-        history: seeded,
-        cache_key,
-    } = match window {
-        Some(window) => runner
-            .conversations
-            .begin(&key, &granted, window, Instant::now()),
-        // A route that remembers nothing has no conversation to name, so its messages route to the
+    let (seeded, cache_key, conversation_lease) = match window {
+        Some(window) => {
+            let ConversationSeed {
+                history,
+                cache_key,
+                lease,
+            } = runner
+                .conversations
+                .begin(&key, &granted, window, Instant::now());
+            (history, cache_key, Some(lease))
+        }
+        // A route that remembers nothing has no history lane to name, so its messages route to the
         // route's own lane: the instructions and tools ahead of every one of them are the only
         // prefix they share, and they share all of it. `routes::BoundRoute::cache_key` has the
         // argument for why that is not a sender leak.
-        None => ConversationSeed {
-            history: History::default(),
-            cache_key: route.cache_key.clone(),
-        },
+        None => (History::default(), route.cache_key.clone(), None),
     };
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
@@ -824,7 +863,7 @@ async fn session(
     // transports minting their own would collide inside one conversation.
     let images_supported = route.model.accepts_images();
     let registered = runner.assets.assets_for(
-        &message.conversation_id,
+        &key,
         message.assets.clone(),
         images_supported,
         Instant::now(),
@@ -836,9 +875,16 @@ async fn session(
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
     };
+    // Shared transcript turns carry gateway-authored provenance from the authenticated transport
+    // subject. The prefix is rendered only after the ordinary private prompt has been assembled,
+    // leaving one-shot and private persistent prompt bytes unchanged.
+    let text = match window.map(|window| window.scope) {
+        Some(ConversationScope::SharedConversation) => attributed_prompt(&message.subject, &text),
+        Some(ConversationScope::PrivateConversation) | None => text,
+    };
     let assets = SessionAssets::new(
         Arc::clone(&runner.assets),
-        message.conversation_id.clone(),
+        key.clone(),
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,
@@ -991,10 +1037,9 @@ async fn session(
     // above and therefore never reaches this commit.
     if let Some(window) = window
         && let Some(turn) = turn
+        && let Some(lease) = conversation_lease
     {
-        runner
-            .conversations
-            .commit(&key, &granted, window, turn, &cache_key, Instant::now());
+        lease.commit(window, turn, &cache_key, Instant::now());
     }
 
     if matches!(
@@ -1089,6 +1134,12 @@ fn agent_config_view(
     let conversation = match conversation {
         ConversationPolicy::OneShot => ConversationConfigView::OneShot,
         ConversationPolicy::Persistent(window) => ConversationConfigView::Persistent {
+            scope: match window.scope {
+                ConversationScope::PrivateConversation => {
+                    ConversationScopeView::PrivateConversation
+                }
+                ConversationScope::SharedConversation => ConversationScopeView::SharedConversation,
+            },
             idle_timeout_ms: u64::try_from(window.idle_timeout.as_millis()).unwrap_or(u64::MAX),
             max_turns: window.limits.max_turns,
             max_bytes: window.limits.max_bytes,

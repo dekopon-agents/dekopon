@@ -53,7 +53,7 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem,
-    ConversationConfig, ConversationPolicy, ConversationWindow, DekopondConfig,
+    ConversationConfig, ConversationPolicy, ConversationScope, ConversationWindow, DekopondConfig,
     HARD_MAX_CONFIG_BYTES, ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig,
     ResolvedRoute, ResolvedTelemetry, SlackActivityConfig, SlackActivityFallback, SlackExperience,
     TelemetryConfig, TransportConfig,

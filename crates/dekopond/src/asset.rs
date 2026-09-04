@@ -11,8 +11,10 @@
 //! dropped when the request they joined is built, so a conversation that mentions a screenshot
 //! forty turns later costs one small reference line rather than a megabyte of retained image.
 //!
-//! Numbering is per conversation and monotonic. `Chat Asset #5` is short enough to replay inside
-//! the history byte budget, and stable enough that a follow-up three turns later still resolves.
+//! Numbering is per scope-aware conversation key and monotonic. `Chat Asset #5` is short enough to
+//! replay inside the history byte budget, and stable enough that a follow-up three turns later still
+//! resolves. The key is exactly the transcript key, so private and shared attachment audiences
+//! cannot drift from the reference notes that name them.
 
 use std::{
     collections::HashMap,
@@ -24,7 +26,7 @@ use std::{
 use dekopon_agent::prompt::{AssetSource, FetchedAsset};
 use tokio::runtime::Handle;
 
-use crate::transport::AssetFetcher;
+use crate::{conversation::ConversationKey, transport::AssetFetcher};
 
 /// Attachments one conversation may accumulate before the oldest are forgotten.
 ///
@@ -119,13 +121,13 @@ impl fmt::Debug for AssetSourceRef {
 
 /// The attachments of every live conversation, bounded and evicted without a timer.
 ///
-/// Shares [`crate::conversation::ConversationStore`]'s shape and lifetime rules on purpose: an
-/// asset outliving the conversation that introduced it would be a reference no prompt can still
-/// name, and an asset dying before it would break the follow-up the numbering exists to serve.
+/// Shares [`crate::conversation::ConversationStore`]'s complete non-debug key on purpose, so agent,
+/// configured transport, conversation, and private/shared audience boundaries apply identically to
+/// transcript and attachment state. It keeps its existing independent idle and LRU bounds.
 pub(crate) struct AssetStore {
     conversations: usize,
     idle_timeout: Duration,
-    entries: Mutex<HashMap<String, ConversationAssets>>,
+    entries: Mutex<HashMap<ConversationKey, ConversationAssets>>,
 }
 
 /// One conversation's attachments, and when it last saw one.
@@ -155,7 +157,7 @@ impl AssetStore {
     /// beside it.
     pub fn register(
         &self,
-        conversation: &str,
+        conversation: &ConversationKey,
         arriving: Vec<PendingAsset>,
         now: Instant,
     ) -> Vec<AssetRef> {
@@ -169,7 +171,7 @@ impl AssetStore {
         });
         Self::expire(&mut entries, self.idle_timeout, now);
         let entry = entries
-            .entry(conversation.to_owned())
+            .entry(conversation.clone())
             .or_insert_with(|| ConversationAssets {
                 assets: Vec::new(),
                 next_id: 1,
@@ -208,7 +210,7 @@ impl AssetStore {
     /// confidently making things up.
     pub fn assets_for(
         &self,
-        conversation: &str,
+        conversation: &ConversationKey,
         arriving: Vec<PendingAsset>,
         images_supported: bool,
         now: Instant,
@@ -232,7 +234,7 @@ impl AssetStore {
     /// Every attachment this conversation can still offer, oldest first.
     ///
     /// Touches the entry, so a conversation that keeps talking keeps its attachments addressable.
-    fn inventory(&self, conversation: &str, now: Instant) -> Vec<AssetRef> {
+    fn inventory(&self, conversation: &ConversationKey, now: Instant) -> Vec<AssetRef> {
         let mut entries = self
             .entries
             .lock()
@@ -246,7 +248,7 @@ impl AssetStore {
     }
 
     /// Looks one attachment up by the number a model named.
-    pub fn get(&self, conversation: &str, id: u64, now: Instant) -> Option<AssetRef> {
+    pub fn get(&self, conversation: &ConversationKey, id: u64, now: Instant) -> Option<AssetRef> {
         let mut entries = self
             .entries
             .lock()
@@ -259,7 +261,7 @@ impl AssetStore {
 
     /// Drops every conversation idle past the timeout, at the lookup that would have used one.
     fn expire(
-        entries: &mut HashMap<String, ConversationAssets>,
+        entries: &mut HashMap<ConversationKey, ConversationAssets>,
         idle_timeout: Duration,
         now: Instant,
     ) {
@@ -267,7 +269,10 @@ impl AssetStore {
     }
 
     /// Evicts least recently used conversations down to the ceiling.
-    fn enforce_ceiling(entries: &mut HashMap<String, ConversationAssets>, capacity: usize) {
+    fn enforce_ceiling(
+        entries: &mut HashMap<ConversationKey, ConversationAssets>,
+        capacity: usize,
+    ) {
         while entries.len() > capacity {
             let Some(oldest) = entries
                 .iter()
@@ -469,7 +474,7 @@ const MAX_FETCHES_PER_SESSION: u32 = 4;
 /// blocking thread rather than a runtime worker — the same reason the loop is on one at all.
 pub(crate) struct SessionAssets {
     store: Arc<AssetStore>,
-    conversation: String,
+    conversation: ConversationKey,
     fetcher: Option<Arc<dyn AssetFetcher>>,
     runtime: Handle,
     images_supported: bool,
@@ -480,7 +485,7 @@ pub(crate) struct SessionAssets {
 impl SessionAssets {
     pub fn new(
         store: Arc<AssetStore>,
-        conversation: String,
+        conversation: ConversationKey,
         fetcher: Option<Arc<dyn AssetFetcher>>,
         runtime: Handle,
         images_supported: bool,

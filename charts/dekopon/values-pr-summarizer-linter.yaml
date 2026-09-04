@@ -224,6 +224,8 @@ gateway:
             maxCapabilityCalls: 16
           conversation:
             mode: persistent
+            # Never broaden the deployment example's replay audience implicitly.
+            scope: privateConversation
             idleTimeoutMs: 900000
             maxTurns: 12
             maxBytes: 65536

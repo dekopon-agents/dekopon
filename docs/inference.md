@@ -20,7 +20,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | How long is the cache fresh on a ChatGPT subscription? | **OpenAI does not publish a retention contract for the subscription endpoint Dekopon calls.** Public API policies range from short in-memory retention to model-specific extended retention, but those values cannot be promised here. |
 | Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. `dekopond` already shares one client per configured model, which reuses connections and coordinates credential refresh; that is a transport optimization, not a cache lease. |
 | How does outbound image generation work? | A route may explicitly name a separate public OpenAI Images backend. Its chat model can call `generate_image` once; one bounded PNG is carried outside the transcript to the authenticated Slack/Discord/Telegram/local reply target. Existing Chat Completions and private ChatGPT subscription contracts are not claimed to generate images themselves. |
-| How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs per sender in `dekopond` memory, bounded by idle time, turns, bytes, and total conversation count. Every message is authorized afresh. |
+| How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs in `dekopond` memory, private per authenticated subject by default or explicitly shared inside one agent/transport/conversation, bounded by idle time, turns, bytes, and total conversation count. Every participant and message is authorized afresh. |
 | Does Dekopon have a memory framework? | **No general framework.** It has a focused conversation window plus optional durable on-demand recent/literal-search chat turns—not task, semantic, vector, editable-fact, or automatically replayed memory. |
 
 ## Three different mechanisms
@@ -30,7 +30,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | Mechanism | Owner | Purpose | Current Dekopon behavior |
 |---|---|---|---|
 | Prompt-prefix cache | Model provider | Avoid recomputing an identical leading prompt | Sends a stable key and stable prefixes; cannot inspect, create, refresh, or delete provider entries |
-| Conversation history | `dekopond` | Let a person ask a follow-up | Optional bounded `(question, final answer)` window in process memory |
+| Conversation history | `dekopond` | Let a person—or an explicitly configured exact-conversation audience—ask a follow-up | Optional bounded `(question, final answer)` window in process memory, private per subject by default |
 | Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns + permanent finite dedup; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
 
 A cache hit never substitutes an old answer. The provider still evaluates the complete current request and produces a new response. “Fresh” therefore refers to whether prefix computation can be reused, not whether the answer or its underlying data is fresh.
@@ -171,28 +171,31 @@ One long-lived optimization is already in place: `dekopond` shares one model cli
 
 The remaining candidate is an explicitly documented retention mode on a public API backend. It would require a modeled configuration field, supported-model validation, data-retention review, wire tests, and accounting, and it would not establish support on the ChatGPT subscription backend. That one is a future implementation choice, not current behavior.
 
-## How Slack conversation memory works
+## How scoped conversation memory works
 
-A route opts into memory explicitly:
+A route opts into memory explicitly and can pin the safer persistent default:
 
 ```yaml
 conversation:
   mode: persistent
+  scope: privateConversation
   idleTimeoutMs: 900000
   maxTurns: 12
   maxBytes: 65536
 ```
 
-`oneShot` remains the default.
+`oneShot` remains the route default. Within persistent mode, omitting `scope` means `privateConversation`; the only other strict camelCase value is the explicit `sharedConversation` audience.
 
-A persistent conversation is keyed by transport, a transport-derived conversation identity, and the canonical sender. Two people in one Slack thread have two histories. On every message:
+Private state is keyed by agent, configured transport, transport-derived conversation identity, and canonical authenticated sender. Shared state drops only the sender component. It does not cross agents, transports, conversations, restarts, or eviction, and it is not global/team memory or the broker's durable memory namespace. On Slack the derived shared identity is normally the opening message plus its root thread. On Discord a guild channel itself is the identity, so enabling shared scope there may expose prior turns across the whole channel; a native thread channel is separate.
+
+A shared user turn is prefixed with `[gateway: authenticated participant: <canonical-subject>]` before it is sent and retained. That canonical ID is model input even when telemetry payloads are disabled. Private and one-shot prompt bytes receive no prefix and remain unchanged. On every message:
 
 1. the gateway opens a fresh attested broker leg;
 2. an empty or refused grant stops before inference and removes remembered history for that key;
-3. the store compares the newly granted capability identifiers with those stored beside the conversation;
-4. an idle or grant-changed entry is dropped;
+3. the store compares the newly granted capability identifiers with those stored beside the conversation; on a shared route, participants with different grant vectors conservatively reset the window;
+4. an idle or grant-changed entry is dropped and its in-flight generation leases are invalidated;
 5. surviving `(question, final answer)` pairs are replayed before the new message;
-6. the new exchange is appended and the oldest whole turns are trimmed until both bounds hold. An
+6. the new exchange is appended only if its generation is still current, and the oldest whole turns are trimmed until both bounds hold. An
    inherited Slack Agent follow-up may explicitly decline its optional reply before capability work;
    that stores the user message alone and performs no Slack delivery or durable recording.
 

@@ -70,6 +70,9 @@ routes:
       # entirely for `mode: oneShot`, where every message starts from an empty prompt. The window
       # is what bounds the bill: it applies however long a conversation has been alive.
       mode: persistent
+      # Keep each authenticated participant's transcript and attachment inventory private. Shared
+      # scope is intentionally not enabled in this deployment example.
+      scope: privateConversation
       idleTimeoutMs: 900000
       maxTurns: 12
       maxBytes: 65536

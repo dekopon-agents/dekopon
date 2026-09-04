@@ -425,13 +425,27 @@ const fn default_max_capability_calls() -> u32 {
     DEFAULT_MAX_CAPABILITY_CALLS
 }
 
+/// Who may share one persistent transcript replay window.
+///
+/// This value comes only from trusted route configuration. A transport kind, conversation kind,
+/// inbound message, or model response can never select it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationScope {
+    /// Keep one history per authenticated transport subject.
+    #[default]
+    PrivateConversation,
+    /// Share one history among authenticated subjects in the exact routed conversation.
+    SharedConversation,
+}
+
 /// What a route remembers between one message and the next.
 ///
 /// Tagged on `mode` in the house style, and strict on both halves, because the failure worth
-/// preventing is a *silent* one: a window bound written next to `mode: oneShot` can never take
-/// effect, and a setting that can never take effect is far more likely a mode typo than an
-/// intention. Rejecting it at decode is what turns that into a startup failure with a field name in
-/// it rather than a bot that quietly forgets everything.
+/// preventing is a *silent* one: a persistent-only setting written next to `mode: oneShot` can
+/// never take effect, and a setting that can never take effect is far more likely a mode typo than
+/// an intention. Rejecting it at decode is what turns that into a startup failure with a field name
+/// in it rather than a bot that quietly forgets everything.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(
     tag = "mode",
@@ -447,8 +461,11 @@ pub enum ConversationConfig {
     /// an `idleTimeoutMs` beside it would decode cleanly and do nothing — exactly the silence this
     /// enum exists to prevent. An empty struct variant under `deny_unknown_fields` rejects it.
     OneShot {},
-    /// A bounded per-sender history is replayed ahead of each new message.
+    /// A bounded private or intentionally shared history is replayed ahead of each new message.
     Persistent {
+        /// Who shares the replay window; private per authenticated subject when omitted.
+        #[serde(default)]
+        scope: ConversationScope,
         /// How long an untouched conversation survives.
         #[serde(default = "default_idle_timeout_ms")]
         idle_timeout_ms: u64,
@@ -514,6 +531,8 @@ pub struct RouteConfig {
 /// same number of turns and very different prompts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConversationWindow {
+    /// Who shares the replay window, resolved from trusted route configuration.
+    pub scope: ConversationScope,
     /// How long an untouched conversation survives before a lookup drops it.
     pub idle_timeout: Duration,
     /// What the replayed window holds.
@@ -525,7 +544,7 @@ pub struct ConversationWindow {
 pub enum ConversationPolicy {
     /// No history: every message is an independent session, which is every route's default.
     OneShot,
-    /// A bounded per-sender history, replayed ahead of each new message.
+    /// A bounded private or intentionally shared history, replayed ahead of each new message.
     Persistent(ConversationWindow),
 }
 
@@ -941,6 +960,7 @@ pub(crate) fn resolve(
         let conversation = match route.conversation {
             ConversationConfig::OneShot {} => ConversationPolicy::OneShot,
             ConversationConfig::Persistent {
+                scope,
                 idle_timeout_ms,
                 max_turns,
                 max_bytes,
@@ -951,6 +971,7 @@ pub(crate) fn resolve(
                     });
                 }
                 ConversationPolicy::Persistent(ConversationWindow {
+                    scope,
                     idle_timeout: Duration::from_millis(idle_timeout_ms),
                     limits: HistoryLimits {
                         max_turns,
