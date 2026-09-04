@@ -39,8 +39,10 @@ and replies with the answer.
   `mode: persistent`, whose `privateConversation` default keeps per-subject history and whose
   explicit `sharedConversation` scope shares one exact agent/transport/conversation window.
   Shared turns carry gateway-authored canonical participant labels; those identifiers reach the
-  model provider even when telemetry payloads are disabled. History is compacted, bounded,
-  generation-fenced, and dropped on idle/LRU/grant change. It caches no authorization.
+  model provider even when telemetry payloads are disabled. History is compacted and bounded;
+  transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
+  one generation that is retired on idle/LRU/grant change or empty-grant removal. It caches no
+  authorization.
 - **Skills** — the agent's catalog skills ride its bound route, read whole into memory when the
   catalog loads and shared by every session on that route, so a session never touches the
   filesystem. When any are mounted, a second system message after the instructions lists each by

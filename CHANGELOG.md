@@ -15,9 +15,10 @@ All notable changes to Dekopon are documented here. The format is based on
   subject; explicit `sharedConversation` drops only the subject component. Shared user turns carry a
   gateway-authored canonical-participant label into current and replayed model prompts, while
   private and one-shot prompt bytes remain unchanged. Effective scope appears in credential-free
-  agent configuration inspection. Generation-fenced commits prevent stale in-flight work from
-  recreating grant-invalidated, removed, idle-expired, capacity-evicted, or replaced history while
-  retaining append-in-completion-order and cache-lane behavior. Shared scope still authorizes every
+  agent configuration inspection. Generation-fenced commits and attachment access prevent stale
+  in-flight work from recreating history, publishing metadata, or fetching bytes after grant
+  changes, empty-grant removal, idle replacement, or capacity eviction, while retaining
+  same-generation append/inventory reuse and cache-lane behavior. Shared scope still authorizes every
   participant and message independently; it is not global agent/team memory, and its canonical
   participant identifiers reach the model provider even when telemetry payload export is disabled.
 - Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable

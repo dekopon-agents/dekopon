@@ -33,7 +33,7 @@ Version 0.2.0 is published as 17 public crates and provenance-attested CLI archi
 - Broker-owned destination-bound credentials in a separate stricter owner-only file, bound per capability constraint set with optional per-agent overrides, injected inside the native HTTP engine after guest headers were validated.
 - Canonical external subjects, owner-controlled subject-to-principal mappings, per-peer attestor grants, and `via`-scoped rules that keep attested and direct authority disjoint.
 - `dekopond`, the unprivileged chat gateway: Slack Socket Mode, Telegram long polling, and an owner-only development transport; first-match routing to catalog agents, including routes that match any channel the bot is summoned in; admission-bounded sessions; and attested on-behalf-of proposals.
-- Bounded per-sender conversation history on `mode: persistent` routes, under a first-class per-transport conversation identity and a minted per-conversation prompt cache key.
+- Bounded scope-aware conversation history on `mode: persistent` routes—private per subject by default or explicitly shared within one exact routed conversation—with generation-bound attachments and a minted per-conversation prompt cache key.
 - `dekopon-agent`, the shared bounded prompt loop and session capability dispatch consumed by both `dekopon-run` and `dekopond`, and `dekopon-run chat` for the gateway's development transport.
 - The `examples/conditional-write` end-to-end walkthrough. The nineteen-capability GitHub provider and its own walkthrough ship from [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh); the image fetches that component at a pinned tag.
 

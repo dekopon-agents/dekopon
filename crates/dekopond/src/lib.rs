@@ -99,11 +99,11 @@ const STATUS_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Re-publishes static inventory so a restarted broker recovers its in-memory view.
 const STATUS_INVENTORY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long a conversation's attachments stay addressable after its last message.
+/// Independent fallback timeout for attachment inventories after their last message.
 ///
-/// Longer than a route's default conversation idle timeout, because the reference lines live in
-/// replayed history and a number that resolved a minute ago should not stop resolving while the
-/// text naming it is still in the prompt.
+/// Persistent access dies earlier whenever its conversation generation does. This remains longer
+/// than the default history timeout so a live reference normally stays resolvable; if this fallback
+/// removes one first, its generation-owned number sequence still prevents a later file alias.
 const ASSET_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The effective UID this daemon runs as, used for every ownership check.
@@ -231,8 +231,8 @@ where
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
-        // Sized and expired like the conversation store, because an attachment reference outliving
-        // the conversation that introduced it is a number no prompt can still name.
+        // Independently bounded for one-shot state; persistent access additionally carries the
+        // conversation generation fence, so transcript invalidation retires its assets immediately.
         assets: Arc::new(AssetStore::new(
             config.sessions.max_conversations,
             ASSET_IDLE_TIMEOUT,

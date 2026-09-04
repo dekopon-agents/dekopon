@@ -44,7 +44,7 @@ use tracing::Instrument as _;
 
 use crate::{
     activity::{ActivityControl, ActivityLease},
-    asset::{self, AssetStore, SessionAssets},
+    asset::{self, AssetAccess, AssetStore, SessionAssets},
     config::{
         ConversationPolicy, ConversationScope, ConversationWindow, ImageGeneratorConfig,
         ModelConfig, ResolvedBroker,
@@ -84,9 +84,9 @@ const SESSION_COMPLETING: u8 = 2;
 
 /// One conversation, for in-flight serialization only.
 ///
-/// Deliberately subject-free, and deliberately not the history key. Two people talking at once in
-/// one thread are one thing to serialize and two things to remember; `ConversationKey` in
-/// [`crate::conversation`] is the other question and carries the sender.
+/// Deliberately subject-free, and deliberately not the state key. Two people talking at once in one
+/// thread are one thing to serialize; `ConversationKey` in [`crate::conversation`] is the other
+/// question and either includes the subject (private scope) or deliberately omits it (shared).
 type AdmissionKey = (String, String, Option<String>);
 
 /// One model client, shared by every session that routes to the same configured model.
@@ -548,7 +548,7 @@ pub(crate) struct SessionRunner {
     pub reply_on_busy: bool,
     /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
     pub conversations: ConversationStore,
-    /// The attachments live conversations carry, numbered so a model can ask for one.
+    /// Scope- and generation-bound attachments, numbered so a model can ask for one.
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -648,9 +648,11 @@ fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> Conversatio
 
 /// Adds authoritative gateway provenance to one shared-scope user turn.
 ///
-/// The canonical subject came from the authenticated transport envelope. The remaining bytes are
-/// still untrusted user text and can contain lookalike labels or prompt injection; the first line is
-/// the only attribution the gateway vouches for.
+/// The canonical subject came from the transport envelope accepted for the fresh broker leg. For
+/// the local development transport, the owner UID is authenticated but its declared subject remains
+/// an owner-trusted claim; the uniform label does not upgrade that claim into service authentication.
+/// The remaining bytes are still untrusted user text and can contain lookalike labels or prompt
+/// injection; the first line is the only attribution the gateway vouches for.
 fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> String {
     bound_inbound(&format!(
         "[gateway: authenticated participant: {}]\n{text}",
@@ -761,8 +763,8 @@ async fn session(
     // Never cached and never remembered as a permission: this is a fresh answer from the broker
     // about what this subject may reach through this agent, on this message.
     let granted = leg.granted();
-    // Only trusted route configuration chooses whether the authenticated subject participates in
-    // the state key. Message text, transport presentation, and model output never reach this
+    // Only trusted route configuration chooses whether the accepted canonical subject participates
+    // in the state key. Message text, transport presentation, and model output never reach this
     // decision. A one-shot route uses the conservative private key for its attachment state while
     // retaining no transcript history.
     let key = conversation_key(route, message);
@@ -798,30 +800,36 @@ async fn session(
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
     let window = route.conversation.window();
-    let (seeded, cache_key, conversation_lease) = match window {
+    let (seeded, cache_key, conversation_lease, asset_access) = match window {
         Some(window) => {
             let ConversationSeed {
                 history,
                 cache_key,
+                assets,
                 lease,
             } = runner
                 .conversations
                 .begin(&key, &granted, window, Instant::now());
-            (history, cache_key, Some(lease))
+            (history, cache_key, Some(lease), assets)
         }
         // A route that remembers nothing has no history lane to name, so its messages route to the
         // route's own lane: the instructions and tools ahead of every one of them are the only
         // prefix they share, and they share all of it. `routes::BoundRoute::cache_key` has the
         // argument for why that is not a sender leak.
-        None => (History::default(), route.cache_key.clone(), None),
+        None => (
+            History::default(),
+            route.cache_key.clone(),
+            None,
+            AssetAccess::one_shot(key.clone()),
+        ),
     };
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
-    // The key names nobody, but it still joins one person's turns to each other, which is the
-    // linkage the metadata-only default exists to withhold. It rides the payload gate for that
-    // reason, and on a line of its own: the canonical subject is on `gateway.message.received`, and
-    // the two must never meet in one record.
+    // The key names nobody, but it still joins one private or shared conversation's turns, which is
+    // the linkage the metadata-only default exists to withhold. It rides the payload gate for that
+    // reason, and on a line of its own: canonical subjects are on `gateway.message.received`, and a
+    // cache key must never meet one in the same record.
     if dekopon_core::telemetry_payloads() {
         tracing::info!(
             target: "dekopond::audit",
@@ -862,8 +870,8 @@ async fn session(
     // Numbered here rather than in the transport: the identifier belongs to the store, and two
     // transports minting their own would collide inside one conversation.
     let images_supported = route.model.accepts_images();
-    let registered = runner.assets.assets_for(
-        &key,
+    let registered = runner.assets.assets_for_access(
+        &asset_access,
         message.assets.clone(),
         images_supported,
         Instant::now(),
@@ -884,7 +892,7 @@ async fn session(
     };
     let assets = SessionAssets::new(
         Arc::clone(&runner.assets),
-        key.clone(),
+        asset_access,
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,

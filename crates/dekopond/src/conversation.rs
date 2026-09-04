@@ -18,8 +18,9 @@
 //!   under a wider grant stops being replayed once the grant narrows.
 //! - **Nothing here caches authorization.** The stored grant is an invalidation input and never a
 //!   permission: every message still opens its own attested leg and asks the broker again.
-//! - **A generation fences every commit.** Removing, replacing, or evicting a slot makes every older
-//!   in-flight session's lease inert, so stale work cannot recreate forgotten text.
+//! - **A generation fences every commit and asset operation.** Removing, replacing, or evicting a
+//!   slot makes every older in-flight session's lease inert and closes its attachment-access fence,
+//!   so stale work can recreate neither forgotten text nor asset metadata.
 //! - **The prompt cache key is minted, not derived.** It is stored beside the history so it lives
 //!   and dies with the prefix it names, and it carries nothing about the audience whose key it sits
 //!   under; [`crate::cache_key`] states why a hashed identifier was refused.
@@ -27,14 +28,18 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use dekopon_agent::prompt::{ConversationTurn, History};
 use dekopon_core::{AgentId, ExternalSubject};
 
-use crate::{cache_key, config::ConversationWindow};
+use crate::{
+    asset::{AssetAccess, AssetFence},
+    cache_key,
+    config::ConversationWindow,
+};
 
 /// The audience discriminant on a remembered transcript.
 ///
@@ -107,8 +112,10 @@ struct Conversation {
 
 /// One current key generation, including sessions that have begun but not committed.
 struct Slot {
-    /// Globally non-reused token fencing leases issued before replacement or removal.
+    /// Globally non-reused token fencing leases and attachment state issued by this generation.
     generation: u64,
+    /// Closed on every replacement/removal so stale sessions cannot publish or fetch assets.
+    asset_fence: Arc<AssetFence>,
     /// Exact sorted capability identifiers reported by the fresh legs in this generation.
     granted: Vec<String>,
     /// Sessions holding a lease for this generation.
@@ -124,9 +131,10 @@ struct StoreState {
 
 /// What one persistent session needs to continue a conversation.
 ///
-/// The lease is the authority to append only to the exact generation this seed observed. It is not
-/// authorization to run a capability; it merely prevents an older in-flight turn from restoring a
-/// conversation that a later fresh grant, empty grant, idle check, or capacity eviction removed.
+/// The lease is the authority to append only to the exact generation this seed observed, and the
+/// asset token reaches only that generation's inventory. Neither is authorization to run a
+/// capability; together they prevent older in-flight work from restoring text or reaching assets
+/// after a later fresh grant, empty grant, idle check, or capacity eviction removed the generation.
 pub(crate) struct ConversationSeed<'a> {
     /// The remembered exchanges to replay, empty on the first message of a conversation.
     pub history: History,
@@ -135,6 +143,8 @@ pub(crate) struct ConversationSeed<'a> {
     /// For a live conversation this is its retained key. Concurrent sessions opening a new
     /// conversation each mint a candidate; the first matching commit chooses the retained lane.
     pub cache_key: String,
+    /// Generation-fenced access to this conversation's attachment inventory.
+    pub assets: AssetAccess,
     /// Generation-fenced append lease. Dropping it without committing stores no turn.
     pub lease: ConversationLease<'a>,
 }
@@ -207,8 +217,8 @@ impl Drop for ConversationLease<'_> {
             decrement_pending(slot);
             slot.pending == 0 && slot.live.is_none()
         });
-        if remove {
-            state.slots.remove(&self.key);
+        if remove && let Some(slot) = state.slots.remove(&self.key) {
+            slot.asset_fence.deactivate();
         }
         self.active = false;
     }
@@ -274,7 +284,7 @@ impl ConversationStore {
     ///
     /// An entry idle past the route's timeout, or built under a different granted capability set, is
     /// dropped rather than used. Every returned seed carries a lease for the selected generation.
-    /// Replacing a generation invalidates all older leases before inference begins.
+    /// Replacing a generation invalidates all older leases and asset access before inference begins.
     pub fn begin(
         &self,
         key: &ConversationKey,
@@ -297,11 +307,11 @@ impl ConversationStore {
             }
         });
 
-        if let Some(reason) = stale {
-            let had_history = state
-                .slots
-                .remove(key)
-                .is_some_and(|slot| slot.live.is_some());
+        if let Some(reason) = stale
+            && let Some(slot) = state.slots.remove(key)
+        {
+            let had_history = slot.live.is_some();
+            slot.asset_fence.deactivate();
             if had_history {
                 evicted(reason);
             }
@@ -309,10 +319,12 @@ impl ConversationStore {
 
         if !state.slots.contains_key(key) {
             let generation = allocate_generation(&mut state);
+            let asset_fence = Arc::new(AssetFence::new());
             state.slots.insert(
                 key.clone(),
                 Slot {
                     generation,
+                    asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
                     pending: 1,
                     live: None,
@@ -321,6 +333,7 @@ impl ConversationStore {
             return ConversationSeed {
                 history: History::new(window.limits),
                 cache_key: cache_key::for_conversation(),
+                assets: AssetAccess::persistent(key.clone(), generation, asset_fence),
                 lease: ConversationLease {
                     store: self,
                     key: key.clone(),
@@ -346,6 +359,11 @@ impl ConversationStore {
         ConversationSeed {
             history,
             cache_key,
+            assets: AssetAccess::persistent(
+                key.clone(),
+                slot.generation,
+                Arc::clone(&slot.asset_fence),
+            ),
             lease: ConversationLease {
                 store: self,
                 key: key.clone(),
@@ -358,20 +376,21 @@ impl ConversationStore {
 
     /// Forgets one selected conversation generation outright.
     ///
-    /// This is what an empty grant gets. Removing a pending-only slot also invalidates its leases,
-    /// but only removal of remembered history emits an eviction and returns `true`.
+    /// This is what an empty grant gets. Removing any slot closes its attachment fence and
+    /// invalidates pending leases, but only removal of remembered history emits an eviction and
+    /// returns `true`.
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {
-        let removed = self
-            .state
-            .lock()
-            .expect("conversation store")
-            .slots
-            .remove(key)
-            .is_some_and(|slot| slot.live.is_some());
-        if removed {
+        let mut state = self.state.lock().expect("conversation store");
+        let removed = state.slots.remove(key);
+        let had_history = removed.as_ref().is_some_and(|slot| slot.live.is_some());
+        if let Some(slot) = removed {
+            slot.asset_fence.deactivate();
+        }
+        drop(state);
+        if had_history {
             evicted(reason);
         }
-        removed
+        had_history
     }
 
     /// How many committed conversations are resident, against `sessions.maxConversations`.
@@ -411,7 +430,9 @@ impl ConversationStore {
             else {
                 return;
             };
-            state.slots.remove(&oldest);
+            if let Some(slot) = state.slots.remove(&oldest) {
+                slot.asset_fence.deactivate();
+            }
             evicted(EvictionReason::Capacity);
         }
     }

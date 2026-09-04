@@ -95,7 +95,7 @@ A key is a routing hint, not a cache handle. Dekopon cannot use it to read anoth
 
 | Route mode | Key scope | Rotation |
 |---|---|---|
-| `persistent` | One `(transport, conversation identity, sender)` conversation | Idle, capacity, changed capability grant, or process restart |
+| `persistent` | One scoped conversation: private `(agent, transport, conversation identity, subject)` or shared `(agent, transport, conversation identity)` | Idle, capacity, changed/empty capability grant, or process restart |
 | `oneShot` | One bound route, shared by its senders | Process restart |
 
 The key is minted from entropy. It is not a subject, channel, phone number, account ID, or hash of one. Sharing a one-shot route key does not share answers: requests can reuse only their identical prefix, and sender-specific text diverges where it differs.
@@ -191,10 +191,10 @@ Private state is keyed by agent, configured transport, transport-derived convers
 A shared user turn is prefixed with `[gateway: authenticated participant: <canonical-subject>]` before it is sent and retained. That canonical ID is model input even when telemetry payloads are disabled. Private and one-shot prompt bytes receive no prefix and remain unchanged. On every message:
 
 1. the gateway opens a fresh attested broker leg;
-2. an empty or refused grant stops before inference and removes remembered history for that key;
+2. an empty grant stops before inference and removes remembered state for that key; a broker/attestation failure also stops before inference but has no fresh grant vector with which to replace state;
 3. the store compares the newly granted capability identifiers with those stored beside the conversation; on a shared route, participants with different grant vectors conservatively reset the window;
-4. an idle or grant-changed entry is dropped and its in-flight generation leases are invalidated;
-5. surviving `(question, final answer)` pairs are replayed before the new message;
+4. an idle or grant-changed entry is dropped, invalidating its in-flight generation leases and closing the same generation's attachment-access fence;
+5. surviving `(question, final answer)` pairs and attachment inventory are available only inside that live generation;
 6. the new exchange is appended only if its generation is still current, and the oldest whole turns are trimmed until both bounds hold. An
    inherited Slack Agent follow-up may explicitly decline its optional reply before capability work;
    that stores the user message alone and performs no Slack delivery or durable recording.

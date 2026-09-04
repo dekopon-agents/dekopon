@@ -358,9 +358,9 @@ is absent rather than zero, so a missing field means "unreported" and not "nothi
 
 **The key itself is a payload field.** It rides `gateway.session.cache_key` with
 `telemetryPayloads` enabled, never the metadata-only default and never a span attribute. It carries
-nothing about the sender by construction, but within one process it does join one person's turns to
-each other, which is precisely the linkage the default withholds. It is emitted on its own event so
-that a key and a canonical subject never share a record.
+nothing about the audience by construction, but within one process it does join one private or
+shared conversation's turns, which is precisely the linkage the default withholds. It is emitted on
+its own event so that a key and a canonical subject never share a record.
 
 ## Broker execution spans
 

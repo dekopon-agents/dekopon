@@ -11,15 +11,19 @@
 //! dropped when the request they joined is built, so a conversation that mentions a screenshot
 //! forty turns later costs one small reference line rather than a megabyte of retained image.
 //!
-//! Numbering is per scope-aware conversation key and monotonic. `Chat Asset #5` is short enough to
-//! replay inside the history byte budget, and stable enough that a follow-up three turns later still
-//! resolves. The key is exactly the transcript key, so private and shared attachment audiences
-//! cannot drift from the reference notes that name them.
+//! Numbering is per scope-aware conversation generation and monotonic within that generation.
+//! `Chat Asset #5` is short enough to replay inside the history byte budget, and stable enough that
+//! a follow-up three turns later still resolves. Persistent assets carry the exact transcript key
+//! and its live generation fence, so private/shared audiences and invalidation cannot drift from
+//! the reference notes that name them.
 
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -119,24 +123,147 @@ impl fmt::Debug for AssetSourceRef {
     }
 }
 
+/// One persistent transcript generation's attachment-access fence.
+///
+/// Conversation invalidation closes the fence under `gate`. Asset publication and lookup hold the
+/// same gate through their store operation, which gives replacement a linear boundary: an asset
+/// operation either finishes before invalidation or observes the retired generation afterwards.
+/// Neither the fence nor the access token implements `Debug`, because its storage key contains the
+/// same sensitive identifiers as [`ConversationKey`].
+pub(crate) struct AssetFence {
+    gate: Mutex<()>,
+    active: AtomicBool,
+    /// Survives independent asset TTL/LRU removal while this transcript generation stays live.
+    next_asset_id: AtomicU64,
+}
+
+impl AssetFence {
+    pub fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+            active: AtomicBool::new(true),
+            next_asset_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Retires this generation and waits for an already-started asset operation to finish.
+    pub fn deactivate(&self) {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+/// Complete key for one attachment inventory.
+///
+/// `None` preserves the independently bounded one-shot inventory. A persistent generation is
+/// globally non-reused for the life of the paired conversation and asset stores, so a number from
+/// a retired generation cannot alias the same number minted by its replacement.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct AssetStateKey {
+    conversation: ConversationKey,
+    generation: Option<u64>,
+}
+
+/// Request-local authority to publish and look up attachment metadata in one state generation.
+///
+/// This is not broker authority and carries no bytes. Persistent access is valid only while the
+/// conversation store keeps its generation live; one-shot access keeps the pre-existing TTL/LRU
+/// behavior because there is no transcript generation to follow.
+#[derive(Clone)]
+pub(crate) struct AssetAccess {
+    key: AssetStateKey,
+    fence: Option<Arc<AssetFence>>,
+}
+
+impl AssetAccess {
+    pub fn one_shot(conversation: ConversationKey) -> Self {
+        Self {
+            key: AssetStateKey {
+                conversation,
+                generation: None,
+            },
+            fence: None,
+        }
+    }
+
+    pub fn persistent(
+        conversation: ConversationKey,
+        generation: u64,
+        fence: Arc<AssetFence>,
+    ) -> Self {
+        Self {
+            key: AssetStateKey {
+                conversation,
+                generation: Some(generation),
+            },
+            fence: Some(fence),
+        }
+    }
+
+    /// Runs one complete store operation while this generation is still current.
+    fn with_active<T>(&self, operation: impl FnOnce(&AssetStateKey) -> T) -> Option<T> {
+        let Some(fence) = self.fence.as_ref() else {
+            return Some(operation(&self.key));
+        };
+        let _gate = fence
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fence.is_active().then(|| operation(&self.key))
+    }
+
+    fn is_active(&self) -> bool {
+        self.with_active(|_| ()).is_some()
+    }
+
+    fn weak_fence(&self) -> Option<Weak<AssetFence>> {
+        self.fence.as_ref().map(Arc::downgrade)
+    }
+
+    fn allocate_id(&self, entry: &mut ConversationAssets) -> u64 {
+        if let Some(fence) = self.fence.as_ref() {
+            return fence
+                .next_asset_id
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                .expect("conversation asset identifier space exhausted");
+        }
+        let id = entry.next_id;
+        entry.next_id = entry
+            .next_id
+            .checked_add(1)
+            .expect("one-shot asset identifier space exhausted");
+        id
+    }
+}
+
 /// The attachments of every live conversation, bounded and evicted without a timer.
 ///
-/// Shares [`crate::conversation::ConversationStore`]'s complete non-debug key on purpose, so agent,
-/// configured transport, conversation, and private/shared audience boundaries apply identically to
-/// transcript and attachment state. It keeps its existing independent idle and LRU bounds.
+/// Persistent entries share [`crate::conversation::ConversationStore`]'s complete non-debug key
+/// and generation fence, so agent, configured transport, conversation, private/shared audience,
+/// and invalidation boundaries apply identically to transcript and attachment state. One-shot
+/// entries retain the independent idle/LRU lifetime they had before persistent history existed.
 pub(crate) struct AssetStore {
     conversations: usize,
     idle_timeout: Duration,
-    entries: Mutex<HashMap<ConversationKey, ConversationAssets>>,
+    entries: Mutex<HashMap<AssetStateKey, ConversationAssets>>,
 }
 
-/// One conversation's attachments, and when it last saw one.
+/// One conversation generation's attachments, and when it last saw one.
 struct ConversationAssets {
     /// Oldest first, so eviction is a pop from the front.
     assets: Vec<AssetRef>,
-    /// Never reused within a conversation, so a number always means one file.
+    /// Never reused within a generation, so a number always means one file while it is live.
     next_id: u64,
     touched: Instant,
+    /// Absent for one-shot state; weak so this map cannot keep a retired generation live.
+    fence: Option<Weak<AssetFence>>,
 }
 
 impl AssetStore {
@@ -150,64 +277,11 @@ impl AssetStore {
         }
     }
 
-    /// Registers what one message carried and returns the references, numbered.
+    /// Registers what one message carried and reports what a one-shot model may be shown.
     ///
-    /// Takes the transport's own description rather than an [`AssetRef`], because the identifier is
-    /// this store's to assign — a transport that numbered its own would collide with the one
-    /// beside it.
-    pub fn register(
-        &self,
-        conversation: &ConversationKey,
-        arriving: Vec<PendingAsset>,
-        now: Instant,
-    ) -> Vec<AssetRef> {
-        if arriving.is_empty() {
-            return Vec::new();
-        }
-        let mut entries = self.entries.lock().unwrap_or_else(|error| {
-            // A poisoned lock means a thread panicked mid-update. The attachments of one
-            // conversation are not worth aborting a daemon over, and the map is still coherent.
-            error.into_inner()
-        });
-        Self::expire(&mut entries, self.idle_timeout, now);
-        let entry = entries
-            .entry(conversation.clone())
-            .or_insert_with(|| ConversationAssets {
-                assets: Vec::new(),
-                next_id: 1,
-                touched: now,
-            });
-        entry.touched = now;
-        let mut registered = Vec::with_capacity(arriving.len());
-        for pending in arriving {
-            let asset = AssetRef {
-                id: entry.next_id,
-                name: pending.name,
-                mime: pending.mime,
-                size: pending.size,
-                source: pending.source,
-            };
-            entry.next_id = entry.next_id.saturating_add(1);
-            entry.assets.push(asset.clone());
-            registered.push(asset);
-        }
-        while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
-            entry.assets.remove(0);
-        }
-        Self::enforce_ceiling(&mut entries, self.conversations);
-        registered
-    }
-
-    /// Registers what one message carried and reports what a model may be shown.
-    ///
-    /// The two halves answer different questions, and conflating them was a bug worth naming. The
-    /// returned refs are *this message's* attachments, because those are the ones a new reference
-    /// note describes. Whether the tool is offered depends on the whole **conversation**: a
-    /// follow-up carries no attachment of its own, and gating on that would withdraw the tool
-    /// exactly when someone asks a second question about the screenshot they already sent — the
-    /// reference line still sitting in replayed history, and nothing able to act on it. A model in
-    /// that position answers from the earlier description instead of looking, which reads as
-    /// confidently making things up.
+    /// One-shot routes have no transcript generation. Their attachment state keeps its historical
+    /// private-keyed TTL/LRU behavior; persistent sessions must use [`Self::assets_for_access`].
+    #[cfg(test)]
     pub fn assets_for(
         &self,
         conversation: &ConversationKey,
@@ -215,64 +289,119 @@ impl AssetStore {
         images_supported: bool,
         now: Instant,
     ) -> Registered {
-        let arrived = self
-            .register(conversation, arriving, now)
-            .into_iter()
-            .map(|asset| asset.id)
-            .collect();
-        let inventory = self.inventory(conversation, now);
-        let fetchable = inventory
-            .iter()
-            .any(|asset| asset.is_fetchable(images_supported));
-        Registered {
-            inventory,
-            arrived,
-            fetchable,
-        }
+        self.assets_for_access(
+            &AssetAccess::one_shot(conversation.clone()),
+            arriving,
+            images_supported,
+            now,
+        )
     }
 
-    /// Every attachment this conversation can still offer, oldest first.
+    /// Registers and inventories assets only if this conversation generation is still live.
     ///
-    /// Touches the entry, so a conversation that keeps talking keeps its attachments addressable.
-    fn inventory(&self, conversation: &ConversationKey, now: Instant) -> Vec<AssetRef> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::expire(&mut entries, self.idle_timeout, now);
-        let Some(entry) = entries.get_mut(conversation) else {
-            return Vec::new();
-        };
-        entry.touched = now;
-        entry.assets.clone()
+    /// Registration and inventory share one fence hold. A grant/idle/capacity replacement cannot
+    /// land between them, and a stale session cannot publish into the replacement's independently
+    /// numbered inventory. Whether the tool is offered depends on the whole live generation: a
+    /// follow-up carries no attachment of its own, while its replayed history can still name an
+    /// earlier one.
+    pub fn assets_for_access(
+        &self,
+        access: &AssetAccess,
+        arriving: Vec<PendingAsset>,
+        images_supported: bool,
+        now: Instant,
+    ) -> Registered {
+        access
+            .with_active(|state_key| {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::expire(&mut entries, self.idle_timeout, now);
+                let mut arrived = Vec::with_capacity(arriving.len());
+                if !arriving.is_empty() {
+                    let entry =
+                        entries
+                            .entry(state_key.clone())
+                            .or_insert_with(|| ConversationAssets {
+                                assets: Vec::new(),
+                                next_id: 1,
+                                touched: now,
+                                fence: access.weak_fence(),
+                            });
+                    entry.touched = now;
+                    for pending in arriving {
+                        let asset = AssetRef {
+                            id: access.allocate_id(entry),
+                            name: pending.name,
+                            mime: pending.mime,
+                            size: pending.size,
+                            source: pending.source,
+                        };
+                        arrived.push(asset.id);
+                        entry.assets.push(asset);
+                    }
+                    while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
+                        entry.assets.remove(0);
+                    }
+                    Self::enforce_ceiling(&mut entries, self.conversations);
+                }
+
+                let inventory = entries.get_mut(state_key).map_or_else(Vec::new, |entry| {
+                    entry.touched = now;
+                    entry.assets.clone()
+                });
+                let fetchable = inventory
+                    .iter()
+                    .any(|asset| asset.is_fetchable(images_supported));
+                Registered {
+                    inventory,
+                    arrived,
+                    fetchable,
+                }
+            })
+            .unwrap_or_else(Registered::empty)
     }
 
-    /// Looks one attachment up by the number a model named.
+    /// Looks one attachment up in independently bounded one-shot state.
+    #[cfg(test)]
     pub fn get(&self, conversation: &ConversationKey, id: u64, now: Instant) -> Option<AssetRef> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::expire(&mut entries, self.idle_timeout, now);
-        let entry = entries.get_mut(conversation)?;
-        entry.touched = now;
-        entry.assets.iter().find(|asset| asset.id == id).cloned()
+        self.get_access(&AssetAccess::one_shot(conversation.clone()), id, now)
     }
 
-    /// Drops every conversation idle past the timeout, at the lookup that would have used one.
+    /// Looks one attachment up only while its exact conversation generation remains live.
+    pub fn get_access(&self, access: &AssetAccess, id: u64, now: Instant) -> Option<AssetRef> {
+        access
+            .with_active(|state_key| {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::expire(&mut entries, self.idle_timeout, now);
+                let entry = entries.get_mut(state_key)?;
+                entry.touched = now;
+                entry.assets.iter().find(|asset| asset.id == id).cloned()
+            })
+            .flatten()
+    }
+
+    /// Drops idle and retired generations at the next attachment-store operation.
     fn expire(
-        entries: &mut HashMap<ConversationKey, ConversationAssets>,
+        entries: &mut HashMap<AssetStateKey, ConversationAssets>,
         idle_timeout: Duration,
         now: Instant,
     ) {
-        entries.retain(|_, entry| now.saturating_duration_since(entry.touched) < idle_timeout);
+        entries.retain(|_, entry| {
+            let active = entry
+                .fence
+                .as_ref()
+                .is_none_or(|fence| fence.upgrade().is_some_and(|fence| fence.is_active()));
+            active && now.saturating_duration_since(entry.touched) < idle_timeout
+        });
     }
 
-    /// Evicts least recently used conversations down to the ceiling.
-    fn enforce_ceiling(
-        entries: &mut HashMap<ConversationKey, ConversationAssets>,
-        capacity: usize,
-    ) {
+    /// Evicts least recently used attachment inventories down to the independent ceiling.
+    fn enforce_ceiling(entries: &mut HashMap<AssetStateKey, ConversationAssets>, capacity: usize) {
         while entries.len() > capacity {
             let Some(oldest) = entries
                 .iter()
@@ -454,6 +583,16 @@ pub(crate) struct Registered {
     pub fetchable: bool,
 }
 
+impl Registered {
+    fn empty() -> Self {
+        Self {
+            inventory: Vec::new(),
+            arrived: Vec::new(),
+            fetchable: false,
+        }
+    }
+}
+
 /// Bytes one session may pull for a single attachment.
 ///
 /// Well under the 50 MB the model APIs accept, because the binding constraint is the prompt rather
@@ -474,7 +613,7 @@ const MAX_FETCHES_PER_SESSION: u32 = 4;
 /// blocking thread rather than a runtime worker — the same reason the loop is on one at all.
 pub(crate) struct SessionAssets {
     store: Arc<AssetStore>,
-    conversation: ConversationKey,
+    access: AssetAccess,
     fetcher: Option<Arc<dyn AssetFetcher>>,
     runtime: Handle,
     images_supported: bool,
@@ -485,7 +624,7 @@ pub(crate) struct SessionAssets {
 impl SessionAssets {
     pub fn new(
         store: Arc<AssetStore>,
-        conversation: ConversationKey,
+        access: AssetAccess,
         fetcher: Option<Arc<dyn AssetFetcher>>,
         runtime: Handle,
         images_supported: bool,
@@ -493,7 +632,7 @@ impl SessionAssets {
     ) -> Self {
         Self {
             store,
-            conversation,
+            access,
             fetcher,
             runtime,
             images_supported,
@@ -505,7 +644,7 @@ impl SessionAssets {
 
 impl AssetSource for SessionAssets {
     fn is_empty(&self) -> bool {
-        !self.available || self.fetcher.is_none()
+        !self.available || self.fetcher.is_none() || !self.access.is_active()
     }
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
@@ -524,7 +663,7 @@ impl AssetSource for SessionAssets {
             }
             *spent += 1;
         }
-        let Some(asset) = self.store.get(&self.conversation, id, Instant::now()) else {
+        let Some(asset) = self.store.get_access(&self.access, id, Instant::now()) else {
             return Err(format!(
                 "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
             ));
@@ -553,6 +692,13 @@ impl AssetSource for SessionAssets {
                 // service text, and this string goes into a prompt.
                 format!("Chat Asset #{id} could not be read ({}).", error.category())
             })?;
+        // A generation can be retired while a transport read is in flight. The read cannot always
+        // be cancelled, but its bytes must not enter the model after the retirement became visible.
+        if !self.access.is_active() {
+            return Err(format!(
+                "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
+            ));
+        }
         Ok(FetchedAsset {
             name: asset.name,
             mime: asset.mime,
