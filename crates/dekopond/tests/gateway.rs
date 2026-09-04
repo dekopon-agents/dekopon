@@ -2,8 +2,8 @@
 //! names the *sender's* principal rather than the daemon's.
 //!
 //! Nothing here is stubbed on the authority side. `dekopon-brokerd` runs for real, with its own
-//! owner-controlled configuration, the exact fetched echo provider component, an attestor grant, an
-//! identity mapping, and one `via`-scoped rule. The only mock is the model endpoint, because a
+//! owner-controlled configuration, the exact fetched echo provider component, an attestor grant,
+//! identity mappings, and `via`-scoped rules. The only mock is the model endpoint, because a
 //! model is the one participant whose answer must be deterministic for a test to assert on it.
 
 #![cfg(unix)]
@@ -27,10 +27,14 @@ use tokio::sync::oneshot;
 
 /// The canonical subject the broker's owner-controlled configuration maps to a principal.
 const MAPPED_SUBJECT: &str = "tel.16034700182";
+/// A second mapped subject used to prove explicitly shared transcript behavior.
+const OTHER_MAPPED_SUBJECT: &str = "tel.16035550100";
 /// A canonical subject nothing maps, which must therefore reach nothing.
 const UNMAPPED_SUBJECT: &str = "tel.19999999999";
-/// The principal that subject resolves to, inside the broker and nowhere else.
+/// The principal the first mapped subject resolves to, inside the broker and nowhere else.
 const MAPPED_PRINCIPAL: &str = "cpetersen";
+/// The independent principal the second mapped subject resolves to.
+const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
 /// The daemon's own peer principal, which is the `via` of every attested decision it makes.
 const GATEWAY_PRINCIPAL: &str = "dekopond-gateway";
 /// The catalog agent both the route and the attested rule name.
@@ -63,29 +67,35 @@ fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("fixture is owner-only");
 }
 
-/// The broker's whole authorization surface: `cpetersen` may drive `chat-agent` and reach
-/// `echo.echo`, but only *via* the gateway that vouched for them.
+/// The broker's whole authorization surface: both mapped principals may drive `chat-agent` and
+/// reach `echo.echo`, but only *via* the gateway that vouched for them.
 ///
 /// The direct twin is deliberately absent. That is the whole point of `via`: configuring a gateway
 /// must not widen anything, so the daemon's own peer identity authorizes nothing on its own.
 fn broker_policies() -> String {
-    format!(
-        r#"
-@id("chat-agent-session")
-permit(principal == Dekopon::Principal::"{MAPPED_PRINCIPAL}",
+    [
+        (MAPPED_PRINCIPAL, "first"),
+        (OTHER_MAPPED_PRINCIPAL, "second"),
+    ]
+    .into_iter()
+    .map(|(principal, suffix)| {
+        format!(
+            r#"
+@id("chat-agent-session-{suffix}")
+permit(principal == Dekopon::Principal::"{principal}",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"{AGENT}")
 when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}" }};
 
-@id("chat-agent-echo")
-permit(principal == Dekopon::Principal::"{MAPPED_PRINCIPAL}",
+@id("chat-agent-echo-{suffix}")
+permit(principal == Dekopon::Principal::"{principal}",
        action == Dekopon::Action::"echo.echo",
        resource == Dekopon::Provider::"echo")
 when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
      && context has agent && context.agent == "{AGENT}" }};
 
-@id("chat-agent-memory")
-permit(principal == Dekopon::Principal::"{MAPPED_PRINCIPAL}",
+@id("chat-agent-memory-{suffix}")
+permit(principal == Dekopon::Principal::"{principal}",
        action in [Dekopon::Action::"memory.chat.record",
                   Dekopon::Action::"memory.chat.recent",
                   Dekopon::Action::"memory.chat.search"],
@@ -97,7 +107,9 @@ when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
      && context has channel && context.channel == "dev"
      && context has conversation && context.conversation == "dev" }};
 "#
-    )
+        )
+    })
+    .collect()
 }
 
 fn broker_config(directory: &Path, uid: u32) -> Value {
@@ -139,7 +151,8 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             }
         }],
         "identityMappings": [
-            {"subject": MAPPED_SUBJECT, "principal": MAPPED_PRINCIPAL}
+            {"subject": MAPPED_SUBJECT, "principal": MAPPED_PRINCIPAL},
+            {"subject": OTHER_MAPPED_SUBJECT, "principal": OTHER_MAPPED_PRINCIPAL}
         ],
         "constraintSets": {
             "echo.echo": {
@@ -206,8 +219,13 @@ fn catalog_text() -> String {
     )
 }
 
-fn gateway_config(directory: &Path, uid: u32, model_endpoint: &str) -> Value {
-    json!({
+fn gateway_config(
+    directory: &Path,
+    uid: u32,
+    model_endpoint: &str,
+    conversation_scope: Option<&str>,
+) -> Value {
+    let mut config = json!({
         "apiVersion": dekopond::CONFIG_API_VERSION,
         "catalogPath": directory.join("dekopon.yaml"),
         "broker": {
@@ -237,7 +255,11 @@ fn gateway_config(directory: &Path, uid: u32, model_endpoint: &str) -> Value {
         }],
         "sessions": {"maxConcurrent": 2},
         "shutdownGraceMs": 30_000
-    })
+    });
+    if let Some(scope) = conversation_scope {
+        config["routes"][0]["conversation"]["scope"] = json!(scope);
+    }
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -505,11 +527,24 @@ impl Fixture {
 
 /// Boots a real broker and a real gateway against one mock model endpoint.
 async fn boot(responses: Vec<Value>) -> Fixture {
-    boot_in(temporary(), responses).await
+    boot_in_with_scope(temporary(), responses, None).await
+}
+
+/// Boots the same real pair with the route's shared scope explicitly enabled.
+async fn boot_shared(responses: Vec<Value>) -> Fixture {
+    boot_in_with_scope(temporary(), responses, Some("sharedConversation")).await
 }
 
 /// Reboots both real processes over the same audit and provider-storage directory.
 async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture {
+    boot_in_with_scope(directory, responses, None).await
+}
+
+async fn boot_in_with_scope(
+    directory: tempfile::TempDir,
+    responses: Vec<Value>,
+    conversation_scope: Option<&str>,
+) -> Fixture {
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
@@ -545,8 +580,13 @@ async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture
     let gateway_path = directory.path().join("dekopond.json");
     write_owner_only(
         &gateway_path,
-        &serde_json::to_vec(&gateway_config(directory.path(), uid, &endpoint))
-            .expect("gateway config serializes"),
+        &serde_json::to_vec(&gateway_config(
+            directory.path(),
+            uid,
+            &endpoint,
+            conversation_scope,
+        ))
+        .expect("gateway config serializes"),
     );
     let (stop_gateway, gateway_stopped) = oneshot::channel::<()>();
     let mut gateway = tokio::spawn(dekopond::run(gateway_path, async move {
@@ -672,6 +712,69 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
     // chain still never contains a word of it.
     let serialized = serde_json::to_string(&audit_events(&audit)).expect("audit serializes");
     assert!(!serialized.contains("what broke"), "{serialized}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_shared_scope_replays_attributed_history_across_two_principals() {
+    let fixture = boot_shared(vec![
+        final_answer("Two things broke."),
+        bash_tool_call(
+            "shared-participant-echo",
+            "echo.echo --message second-participant | jq -r .message",
+        ),
+        final_answer("The second one was the database."),
+    ])
+    .await;
+
+    let socket = fixture.socket();
+    let asked = socket.clone();
+    let first = tokio::task::spawn_blocking(move || ask(&asked, MAPPED_SUBJECT, "what broke?"))
+        .await
+        .expect("the first participant's request completes");
+    assert_eq!(first, "Two things broke.");
+    fixture.wait_for_memory_record().await;
+
+    let second = tokio::task::spawn_blocking(move || {
+        ask_when_idle(&socket, OTHER_MAPPED_SUBJECT, "and the second one?")
+    })
+    .await
+    .expect("the second participant's request completes");
+    assert_eq!(second, "The second one was the database.");
+
+    let first_prompt =
+        format!("[gateway: authenticated participant: {MAPPED_SUBJECT}]\nwhat broke?");
+    let second_prompt = format!(
+        "[gateway: authenticated participant: {OTHER_MAPPED_SUBJECT}]\nand the second one?"
+    );
+    assert_eq!(
+        fixture.prompt(1),
+        vec![
+            (
+                "system".to_owned(),
+                concat!(
+                    "Answer in one short sentence. You have no authority of your own.\n\n",
+                    "Durable chat memory is available on demand. Use `memory recent --last N` or ",
+                    "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
+                    "claim recall without retrieving it."
+                )
+                .to_owned(),
+            ),
+            ("user".to_owned(), first_prompt),
+            ("assistant".to_owned(), "Two things broke.".to_owned()),
+            ("user".to_owned(), second_prompt),
+        ],
+        "the second authenticated principal receives one shared, provenance-labelled transcript"
+    );
+
+    let audit = fixture.audit();
+    let _directory = fixture.shutdown().await;
+    let events = audit_events(&audit);
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "decision" && event["principal"] == OTHER_MAPPED_PRINCIPAL
+        }),
+        "the second participant still receives an independent broker decision"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

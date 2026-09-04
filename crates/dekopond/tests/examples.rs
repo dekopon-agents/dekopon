@@ -85,6 +85,7 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(
         route.conversation,
         dekopond::ConversationConfig::Persistent {
+            scope: dekopond::ConversationScope::PrivateConversation,
             idle_timeout_ms: 900_000,
             max_turns: 12,
             max_bytes: 65_536,
