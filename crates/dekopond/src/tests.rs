@@ -1142,6 +1142,131 @@ async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
     assert!(rendered.contains("session bounds"), "{rendered}");
 }
 
+/// The model-name grammar names the field and the value, and never blames controls.
+///
+/// Every configured model's name is a configured-model identifier whether or not the deployment
+/// uses `controls:`, so a 0.12.0 file with `name: GPT-5` stops starting. That is a breaking change
+/// (`docs/upgrading.md` carries it), and a breaking refusal that says only "invalid configured
+/// model controls" points an operator at a feature they are not using.
+#[tokio::test]
+async fn every_invalid_model_name_is_reported_with_its_field_and_its_value() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["models"][0]["name"] = json!("GPT-5");
+    document["models"]
+        .as_array_mut()
+        .expect("models array")
+        .push(json!({
+            "name": "-leading-punctuation",
+            "kind": "openaiCompatible",
+            "endpoint": "http://127.0.0.1:11434/v1",
+            "model": "qwen3",
+            "timeoutMs": 120_000
+        }));
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("two ungrammatical model names cannot start");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal: {error:?}");
+    };
+    let named = problems
+        .iter()
+        .filter(|problem| matches!(problem, ConfigProblem::InvalidModelName { .. }))
+        .count();
+    assert_eq!(named, 2, "both names, one refusal: {problems:?}");
+    let rendered = error.to_string();
+    assert!(rendered.contains("models[].name"), "{rendered}");
+    assert!(rendered.contains("GPT-5"), "{rendered}");
+    assert!(rendered.contains("-leading-punctuation"), "{rendered}");
+    assert!(
+        !rendered.contains("invalid configured model controls"),
+        "the grammar is not a controls failure: {rendered}"
+    );
+}
+
+/// `sessions.maxConcurrent` is validated against the store ceiling it actually competes for.
+///
+/// Every live session holds a checkpoint lease reserving the whole per-job ceiling, so a gateway
+/// admitting more sessions than `MAX_JOBS` converts the surplus into capacity refusals under load.
+#[tokio::test]
+async fn max_concurrent_beyond_the_checkpoint_lease_ceiling_is_refused_at_startup() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS + 1 });
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("more sessions than leases cannot start");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::ExcessiveMaxConcurrent { .. }
+    )));
+    let rendered = error.to_string();
+    assert!(rendered.contains("sessions.maxConcurrent"), "{rendered}");
+    assert!(rendered.contains("MAX_JOBS"), "{rendered}");
+    assert!(
+        rendered.contains(&dekopon_harness::checkpoint::MAX_JOBS.to_string()),
+        "{rendered}"
+    );
+
+    let mut exact = document.clone();
+    exact["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS });
+    load(directory.path(), &exact)
+        .await
+        .expect("the ceiling itself is admissible");
+}
+
+/// Every offending `activityLabels` entry, with the rule it broke.
+///
+/// One aggregate naming no offender told an operator with twenty labels to go and find it. The
+/// byte rule is the harness's own renderability check rather than a raw byte count here, so this
+/// gate cannot accept a label the transport then truncates.
+#[tokio::test]
+async fn every_offending_activity_label_names_its_key_and_its_rule() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["activityLabels"] = json!({
+        "Not A Capability": "Reading the record",
+        "http-probe.fetch": "x".repeat(dekopon_harness::activity::MAX_ACTIVITY_LABEL_BYTES + 1),
+        // Blank once stripped: the renderer silently replaces it with the default label.
+        "http-probe.write": "\u{202e}\u{200b}",
+        // Stripping alone is not a loss worth refusing; this one renders whole.
+        "http-probe.ok": "Writing\u{202e}the record",
+    });
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("three bad labels cannot start");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal: {error:?}");
+    };
+    let offenders = problems
+        .iter()
+        .filter_map(|problem| match problem {
+            ConfigProblem::InvalidActivityLabel { capability, .. } => Some(capability.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(offenders.len(), 3, "{problems:?}");
+    for offender in ["Not A Capability", "http-probe.fetch", "http-probe.write"] {
+        assert!(offenders.contains(&offender), "{offenders:?}");
+    }
+    assert!(
+        !offenders.contains(&"http-probe.ok"),
+        "a valid label is not an offender: {offenders:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("not a capability identifier"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&dekopon_harness::activity::MAX_ACTIVITY_LABEL_BYTES.to_string()),
+        "{rendered}"
+    );
+}
+
 /// A list that failed is not blamed on the routes that name it.
 ///
 /// `dekopon-config` skips its reference pass when a resource never reached its set, because a
@@ -4941,7 +5066,21 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         "inside the timeout the exchange is replayed"
     );
 
+    // Seeding a session is itself a touch — a message arrived and this history answered it — so
+    // the timeout runs from the warm lookup, not from the last committed turn. That is also what
+    // keeps a concurrent session's ceiling from evicting the conversation this one is answering.
     let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    assert_eq!(
+        cold.history.len(),
+        1,
+        "the warm lookup at 899s reset the idle clock"
+    );
+    let cold = store.begin(
+        &key,
+        &allowed,
+        window(),
+        start + Duration::from_secs(900 + 900),
+    );
     assert!(
         cold.history.is_empty(),
         "past the timeout the next message starts fresh"
@@ -5163,22 +5302,37 @@ fn message_in(conversation: &str, text: &str) -> InboundMessage {
 
 #[test]
 fn a_minted_cache_key_is_opaque_and_never_repeats() {
-    // Both prefixes are crate constants and `IdSequence::new` rejects a malformed one, in which
-    // case minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure
-    // is silent by design — a routing hint must not abort a message — so this is the test that
-    // keeps the constants valid.
-    let first = cache_key::for_conversation();
-    let second = cache_key::for_conversation();
+    // The prefix is a crate constant and `IdSequence::new` rejects a malformed one, in which case
+    // minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure is
+    // silent by design — a routing hint must not abort a message — so this is the test that keeps
+    // the constant valid. The conversation lane is minted in the harness and pinned below.
     let route = cache_key::for_route();
-
-    for key in [&first, &second, &route] {
-        assert!(!key.trim().is_empty(), "an empty key is no key at all");
-    }
-    assert_ne!(
-        first, second,
-        "two conversations minted in one process must not collide"
-    );
+    assert!(!route.trim().is_empty(), "an empty key is no key at all");
     assert_ne!(route, cache_key::for_route());
+}
+
+#[test]
+fn the_route_and_conversation_cache_lanes_cannot_collide() {
+    // Two lanes that shared a prefix would be one lane, and a route's shared instructions prefix
+    // would start being offered to a conversation's cache. One definition of each prefix, pinned
+    // against the harness's own constant rather than a second copy of the string here.
+    let conversation = BoundedConversationStore::new(4)
+        .begin(
+            &conversation_key("dev", "c0123abc", "tel.15558675309"),
+            &granted(&["echo.echo"]),
+            window(),
+            Instant::now(),
+        )
+        .cache_key;
+    assert!(
+        conversation.starts_with(dekopon_harness::conversation::CONVERSATION_CACHE_PREFIX),
+        "{conversation}"
+    );
+    assert!(
+        !cache_key::for_route()
+            .starts_with(dekopon_harness::conversation::CONVERSATION_CACHE_PREFIX),
+        "the route lane must not mint into the conversation lane"
+    );
 }
 
 #[test]
@@ -5231,7 +5385,8 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
         "a live conversation stays in the lane its own turns warmed"
     );
 
-    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    // The warm lookup at 60s is itself a touch, so the idle window runs from there.
+    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(960));
     assert!(
         cold.history.is_empty(),
         "the idle timeout dropped the entry"

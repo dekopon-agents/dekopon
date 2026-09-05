@@ -10,6 +10,30 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// The UTF-8 byte ceiling a sanitized label is bounded to.
+pub const MAX_ACTIVITY_LABEL_BYTES: usize = 80;
+
+/// Operator-authored labels one session binds; the rest are dropped.
+pub const MAX_ACTIVITY_LABELS: usize = 256;
+
+/// Whether an operator-authored label survives sanitizing whole.
+///
+/// Stripping control and directional characters is what makes a label plain text and is never a
+/// loss worth refusing. The other two things sanitizing does *are* silent losses: a label past
+/// [`MAX_ACTIVITY_LABEL_BYTES`] is truncated mid-sentence, and one that is blank once stripped is
+/// replaced by the default. A configuration gate asks here rather than counting raw bytes, so the
+/// bound it enforces is the bound the renderer enforces — one definition, counted the same way.
+pub fn label_is_renderable(raw: &str) -> bool {
+    let stripped = strip(raw);
+    let stripped = stripped.trim();
+    !stripped.is_empty() && stripped.len() <= MAX_ACTIVITY_LABEL_BYTES
+}
+
+/// Removes control and Unicode directional/format characters, leaving the bound to the caller.
+fn strip(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')).collect()
+}
+
 /// A bounded operator-authored label. No description, argument, result or capability name is used.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivityLabel(String);
@@ -17,8 +41,10 @@ impl ActivityLabel {
     /// Strip controls and Unicode directional/format controls, then bound on UTF-8 boundaries.
     pub fn sanitized(text: &str) -> Self {
         let mut label = String::new();
-        for c in text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')) {
-            if label.len() + c.len_utf8() > 80 { break; }
+        for c in strip(text).chars() {
+            if label.len() + c.len_utf8() > MAX_ACTIVITY_LABEL_BYTES {
+                break;
+            }
             label.push(c);
         }
         let label = label.trim();
@@ -104,7 +130,7 @@ impl ActivityPublisher {
             labels: labels
                 .iter()
                 .filter(|(id, _)| capabilities.contains(id))
-                .take(256)
+                .take(MAX_ACTIVITY_LABELS)
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         }

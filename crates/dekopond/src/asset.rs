@@ -28,7 +28,8 @@ use crate::transport::AssetFetcher;
 
 /// Attachments one conversation may accumulate before the oldest are forgotten.
 ///
-/// A ceiling rather than a timer, matching [`crate::conversation::ConversationStore`]: the insert
+/// A ceiling rather than a timer, matching
+/// [`dekopon_harness::conversation::BoundedConversationStore`]: the insert
 /// that would exceed it is the one that evicts. Someone who pastes a long screenshot thread keeps
 /// the recent ones addressable, which is what a follow-up question is ever about.
 const MAX_ASSETS_PER_CONVERSATION: usize = 32;
@@ -119,7 +120,8 @@ impl fmt::Debug for AssetSourceRef {
 
 /// The attachments of every live conversation, bounded and evicted without a timer.
 ///
-/// Shares [`crate::conversation::ConversationStore`]'s shape and lifetime rules on purpose: an
+/// Shares [`dekopon_harness::conversation::BoundedConversationStore`]'s shape and lifetime rules
+/// on purpose: an
 /// asset outliving the conversation that introduced it would be a reference no prompt can still
 /// name, and an asset dying before it would break the follow-up the numbering exists to serve.
 pub(crate) struct AssetStore {

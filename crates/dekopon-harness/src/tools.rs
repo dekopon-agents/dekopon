@@ -447,13 +447,10 @@ pub(crate) fn generate_image_into(
             ));
         }
         Err(error) => {
-            if matches!(
-                error,
-                dekopon_model::image::ImageGenerationError::Accounting(_)
-            ) {
-                return Err(crate::session::PromptError::Accounting(
-                    dekopon_model::usage::AccountingError("image accounting"),
-                ));
+            if let dekopon_model::image::ImageGenerationError::Accounting(accounting) = error {
+                // A fenced ledger is permanent and names where it fenced; a fresh string here
+                // would report the category and drop the reason the ledger actually gave.
+                return Err(crate::session::PromptError::Accounting(accounting));
             }
             // Fixed gateway-authored text: provider diagnostics can contain reflected prompt text
             // and never belong in the next model request.
@@ -687,9 +684,8 @@ pub(crate) const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
 whenever the task needs data or an action the session's capabilities provide, and write the whole \
 job as one script rather than one tool call per step. Send scripts one after another only when \
-the next step genuinely depends on a result you cannot know yet. If you do not yet know what this \
-session can call, the first script is `cap --list`. Returns the script's combined output followed \
-by an `[exit code: N]` trailer, exactly as a terminal would.
+the next step genuinely depends on a result you cannot know yet. Returns the script's combined \
+output followed by an `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
 leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
@@ -774,3 +770,25 @@ There is no `help`. The initial session context lists the available capabilities
 descriptions and complete input schemas; use it without a discovery call. `cap --list` and \
 `cap --describe <capability>` remain fallback inspection commands over that same snapshot. Prefer \
 a single script that does the whole job over many small ones — that is the entire point of this tool.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prompt text is a mirror of the mechanism, and the mechanism changed.
+    ///
+    /// The bootstrap block puts every granted capability's description and complete input schema
+    /// in the session's first request, which is what makes a discovery call unnecessary. A tool
+    /// description still telling the model that "the first script is `cap --list`" spends a paid
+    /// model turn re-reading what it was already handed, so it must not come back.
+    #[test]
+    fn the_script_tool_never_tells_the_model_to_start_with_a_discovery_call() {
+        assert!(
+            !SCRIPT_TOOL_DESCRIPTION.contains("the first script is"),
+            "the discovery instruction is back in the script tool description"
+        );
+        // The builtins survive as fallbacks; what must not survive is being told to open with one.
+        assert!(SCRIPT_TOOL_DESCRIPTION.contains("use it without a discovery call"));
+        assert!(SCRIPT_TOOL_DESCRIPTION.contains("remain fallback inspection commands"));
+    }
+}

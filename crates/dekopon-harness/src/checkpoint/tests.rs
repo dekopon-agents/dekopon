@@ -339,6 +339,123 @@ fn failed_pre_dispatch_save_executes_nothing_and_failed_post_save_retains_live_f
     }
 }
 
+/// The lease ceiling and the byte ceiling agree, and neither destroys a resumable checkpoint.
+///
+/// `MAX_STORE_BYTES` used to be a quarter of `MAX_JOBS` reservations, so the store silently
+/// stopped at 32 concurrent sessions — and it got there destructively: with the byte ceiling full
+/// of leases, the eviction loop drained *every* unleased checkpoint and then returned `Capacity`
+/// anyway, so the refusal that failed this message also destroyed the snapshots the other
+/// in-flight messages were going to resume from.
+#[test]
+fn concurrent_leases_reach_the_job_ceiling_without_destroying_stored_checkpoints() {
+    let store = Arc::new(MemoryCheckpointStore::default());
+    let stored = snapshot();
+    let resumable = stored.record.job.clone();
+    let lease = store.acquire(&resumable, true).expect("fixture lease");
+    store
+        .compare_and_save(&lease, 0, &stored)
+        .expect("fixture checkpoint");
+    store.release(&resumable, &lease, false);
+
+    let mut live = Vec::new();
+    for index in 1..MAX_JOBS {
+        let job = opaque_id();
+        let lease = store
+            .acquire(&job, true)
+            .unwrap_or_else(|error| panic!("lease {index} of {MAX_JOBS}: {error}"));
+        live.push((job, lease));
+        assert!(
+            store.load(&resumable).is_ok(),
+            "lease {index} evicted a dormant snapshot it did not need"
+        );
+    }
+    // The store now holds MAX_JOBS entries: one dormant snapshot and MAX_JOBS - 1 live leases. A
+    // live session outranks a dormant snapshot, so this one is admitted by evicting exactly it.
+    let last = opaque_id();
+    let lease = store.acquire(&last, true).expect("the ceiling itself");
+    live.push((last, lease));
+    assert!(matches!(
+        store.load(&resumable),
+        Err(CheckpointError::NotFound)
+    ));
+
+    let refusal = store.acquire(&opaque_id(), true);
+    assert_eq!(refusal, Err(CheckpointError::Capacity));
+    assert!(
+        refusal
+            .unwrap_err()
+            .to_string()
+            .contains(&MAX_JOBS.to_string()),
+        "the refusal names the ceiling it hit"
+    );
+    for (job, lease) in live {
+        store.release(&job, &lease, false);
+    }
+}
+
+/// A refused blank answer is never recorded as an answer, so a resume cannot deliver one.
+///
+/// The whitespace-only rejection happens after the generated text is written to the checkpoint, so
+/// the failing job left a record claiming an answer of `"   "`. The conversation this job is
+/// appended to then replays a blank assistant turn, and a resumed job hands the transport an empty
+/// `Send` — `SessionExit::answer` is documented empty only when the disposition is `Suppress`.
+#[test]
+fn a_blank_answer_is_neither_recorded_nor_resumed_as_a_delivered_one() {
+    let store = Arc::new(MemoryCheckpointStore::default());
+    let runtime = runtime();
+    let blank = AssistantTurn {
+        content: Some("   \n".to_owned()),
+        tool_calls: Vec::new(),
+        usage: None,
+        replay_items: Vec::new(),
+    };
+    let model = Model::new([blank]);
+    let mut history = History::default();
+    let error = SessionEngine::new(&model, &runtime)
+        .with_checkpoint_store(store.clone())
+        .run(
+            SessionBootstrap::new("request", limits(), "fixture").with_scope("scope"),
+            &mut history,
+        )
+        .expect_err("a blank answer is not an answer");
+    assert!(matches!(error, PromptError::EmptyAnswer));
+
+    let recorded = history.turns().last().expect("the failed job is recorded");
+    assert_eq!(
+        recorded.answer(),
+        None,
+        "the conversation must not claim this turn was answered"
+    );
+    let job = recorded.job.clone();
+    let saved = store
+        .load(&job)
+        .expect("the checkpoint outlived the failure");
+    assert_eq!(saved.record.generated, None);
+
+    // Resuming that job surfaces the failure rather than a blank `Send`: the finished generation
+    // fenced the lease, and a resume that fabricated an answer out of it would be worse than one
+    // that refuses. Nothing in this path can hand a transport an empty answer to deliver.
+    let model = Model::new([answer()]);
+    let error = SessionEngine::new(&model, &runtime)
+        .with_checkpoint_store(store)
+        .run(
+            SessionBootstrap::new("request", limits(), "fixture")
+                .with_scope("scope")
+                .with_resume(&job),
+            &mut history,
+        )
+        .expect_err("a fenced job is not resumable");
+    assert!(matches!(
+        error,
+        PromptError::Checkpoint(CheckpointError::Fenced)
+    ));
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        0,
+        "no resumed inference"
+    );
+}
+
 #[test]
 fn unknown_work_fences_later_dispatch_and_restore_even_after_history_trimming() {
     let store = Arc::new(MemoryCheckpointStore::default());
@@ -464,14 +581,19 @@ fn checkpoint_version_scope_capacity_cas_and_exclusive_live_lease_fail_explicitl
         Err(CheckpointError::Conflict)
     );
     let mut active = vec![(saved.record.job, lease)];
-    for _ in 1..32 {
+    for _ in 1..MAX_JOBS {
         let job = opaque_id();
         let lease = store.acquire(&job, true).expect("reserved bounded slot");
         active.push((job, lease));
     }
-    assert_eq!(
-        store.acquire(&opaque_id(), true),
-        Err(CheckpointError::Capacity)
+    let refusal = store.acquire(&opaque_id(), true);
+    assert_eq!(refusal, Err(CheckpointError::Capacity));
+    assert!(
+        refusal
+            .unwrap_err()
+            .to_string()
+            .contains(&MAX_JOBS.to_string()),
+        "the refusal names the ceiling it hit"
     );
     for (job, lease) in active {
         store.release(&job, &lease, false);

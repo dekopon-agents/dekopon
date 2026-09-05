@@ -63,7 +63,8 @@ routes:
     agent: xaviers-conditional-writer
     # Public labels only, intersected with fresh grants; omitted IDs use Running capability.
     activityLabels:
-      http-probe.fetch: Fetching GitHub pull request details
+      http-probe.fetch: Reading the shared record
+      http-probe.conditional-write: Updating the shared record
     # Optional core controls, disabled here. The baseline must be included; add configured aliases
     # to permit model-selection proposals. Broker controlTargets and Cedar permits are independent.
     # controls: { models: [local-reasoning], maxAttempts: 4 }

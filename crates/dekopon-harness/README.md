@@ -10,8 +10,11 @@ The unprivileged runtime for configured Dekopon agents, replacing `dekopon-agent
   using the same scoped snapshot as inspection and fallback shell discovery; explicit bounds refuse
   overflow rather than truncating schemas.
 - `history`, `context` and `conversation` own bounded portable tool groups, execution evidence,
-  generated-versus-accepted delivery and scoped append leases. `checkpoint` provides versioned
-  bounded memory CAS storage, not crash durability or an effect receipt.
+  generated-versus-accepted delivery and scoped append leases. Both byte ceilings read running
+  totals maintained where turns change, so no lookup or eviction step encodes the corpus.
+  `checkpoint` provides versioned bounded memory CAS storage, not crash durability or an effect
+  receipt; `checkpoint::MAX_JOBS` is the lease ceiling, and therefore the concurrency ceiling an
+  embedder validates its own session limit against. No shipped binary resumes a checkpoint today.
 - `accounting::TokenTracker` is mandatory across calls, HTTP attempts, model segments and resume.
   Retain `JobAccounting` through delivery and finalize with the actual disposition. Unknown usage
   stays unknown; subset tokens and aggregation levels are never added twice.

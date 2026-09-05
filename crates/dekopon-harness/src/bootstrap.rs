@@ -21,6 +21,7 @@ pub struct SessionBootstrap<'a> {
     pub(crate) surface_epoch: Option<&'a dekopon_core::SurfaceEpoch>,
     pub(crate) controls: Option<&'a crate::control::SessionControls<'a>>,
     pub(crate) resume: Option<&'a str>,
+    pub(crate) capabilities: Option<&'a CapabilitySnapshot>,
     pub(crate) context_policy: Option<&'a dyn crate::context::ContextPolicy>,
     pub(crate) prompt: &'a str,
     pub(crate) selected_model: &'a str,
@@ -51,6 +52,7 @@ impl<'a> SessionBootstrap<'a> {
             surface_epoch: None,
             controls: None,
             resume: None,
+            capabilities: None,
             context_policy: None,
             prompt,
             selected_model,
@@ -105,8 +107,26 @@ impl<'a> SessionBootstrap<'a> {
     }
 
     /// Restore the latest checkpoint after fresh host admission; no recorded grant is reused.
-    pub const fn with_resume(mut self, job: &'a str) -> Self {
+    ///
+    /// Test-only: no shipped binary resumes a checkpoint, so publishing this as an API would
+    /// advertise a path nothing reaches. The engine's own tests are what exercise it, and
+    /// `docs/harness.md` says plainly that resume has no consumer today.
+    #[cfg(test)]
+    pub(crate) const fn with_resume(mut self, job: &'a str) -> Self {
         self.resume = Some(job);
+        self
+    }
+
+    /// Supplies the fresh scoped capability snapshot the host already built for this message.
+    ///
+    /// The snapshot is the same bounded projection [`crate::runtime::ScriptRuntime`] would answer
+    /// with; a host that needs its fingerprint before starting a session (to key a conversation on
+    /// the grant it was built under, say) would otherwise build it twice per message. It is
+    /// metadata, never a grant: every invocation is still authorized afresh by the broker, and the
+    /// per-turn freshness check still refuses a surface that moved underneath the session.
+    #[must_use]
+    pub const fn with_capability_snapshot(mut self, capabilities: &'a CapabilitySnapshot) -> Self {
+        self.capabilities = Some(capabilities);
         self
     }
 
@@ -280,6 +300,7 @@ impl CapabilitySnapshot {
         let ids = invoker.granted();
         validate_ids(ids.iter().map(String::as_str), ids.len())?;
         let mut capabilities = Vec::new();
+        let mut used = 0usize;
         for id in ids {
             let description =
                 invoker
@@ -290,12 +311,23 @@ impl CapabilitySnapshot {
             if description.capability != id {
                 return Err(BootstrapError::MismatchedDescription { capability: id });
             }
-            capabilities.push(CapabilityMetadata {
+            let metadata = CapabilityMetadata {
                 id,
                 description: description.description,
                 input_schema: description.input_schema,
-            });
-            bounded_json(&capabilities, MAX_CAPABILITY_METADATA_BYTES)?;
+            };
+            // Bound the surface as it is read, by adding each capability's own encoded size to a
+            // running total rather than re-encoding everything read so far on every iteration. The
+            // parts are a subset of the document, so a total over the ceiling means the document
+            // is over it too; `validate` still measures the exact document once, at the end.
+            used =
+                used.saturating_add(bounded_json(&metadata, MAX_CAPABILITY_METADATA_BYTES)?.len());
+            if used > MAX_CAPABILITY_METADATA_BYTES {
+                return Err(BootstrapError::MetadataTooLarge {
+                    maximum: MAX_CAPABILITY_METADATA_BYTES,
+                });
+            }
+            capabilities.push(metadata);
         }
         Self {
             capabilities,
@@ -314,12 +346,20 @@ impl CapabilitySnapshot {
         // Check the serialized bound before recursively sorting/cloning any schema. The capped
         // writer never retains a partial over-limit document and no schema is ever truncated.
         bounded_json(&self, MAX_CAPABILITY_METADATA_BYTES)?;
+        // Every non-object schema is reported at once: an operator repairing a runtime that
+        // answers three capabilities badly should learn all three from one refusal.
+        let invalid = self
+            .capabilities
+            .iter()
+            .filter(|capability| !capability.input_schema.is_object())
+            .map(|capability| capability.id.clone())
+            .collect::<Vec<_>>();
+        if !invalid.is_empty() {
+            return Err(BootstrapError::InvalidSchema {
+                capabilities: invalid.join(", "),
+            });
+        }
         for capability in &mut self.capabilities {
-            if !capability.input_schema.is_object() {
-                return Err(BootstrapError::InvalidSchema {
-                    capability: capability.id.clone(),
-                });
-            }
             capability.input_schema.sort_all_objects();
         }
         self.capabilities
@@ -411,12 +451,21 @@ fn validate_ids<'a>(
     }
     let mut seen = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
+    let mut malformed = Vec::new();
     for id in ids {
-        id.parse::<CapabilityId>()
-            .map_err(BootstrapError::Identifier)?;
+        // Every malformed identifier, each with the reason it was refused: a runtime answering
+        // with three bad IDs is three repairs, not three restarts.
+        if let Err(error) = id.parse::<CapabilityId>() {
+            malformed.push(format!("{id:?} ({error})"));
+        }
         if !seen.insert(id) {
             duplicates.insert(id);
         }
+    }
+    if !malformed.is_empty() {
+        return Err(BootstrapError::Identifier {
+            problems: malformed.join("; "),
+        });
     }
     if !duplicates.is_empty() {
         return Err(BootstrapError::DuplicateCapabilities {
@@ -476,18 +525,18 @@ pub enum BootstrapError {
     /// A metadata lookup answered for a different identifier.
     #[error("bootstrap description does not match capability {capability}")]
     MismatchedDescription { capability: String },
-    /// The input schema was not an object.
-    #[error("bootstrap capability {capability} has a non-object input schema")]
-    InvalidSchema { capability: String },
+    /// Every capability whose input schema was not an object.
+    #[error("bootstrap capabilities have non-object input schemas: {capabilities}")]
+    InvalidSchema { capabilities: String },
     /// The complete serialized surface did not fit; nothing was truncated.
     #[error("bootstrap metadata exceeds {maximum} bytes")]
     MetadataTooLarge { maximum: usize },
     /// Selected model display names are nonempty and byte bounded.
     #[error("bootstrap selected model must be nonblank and at most 256 bytes")]
     ModelIdentity,
-    /// Invalid identifier from a runtime.
-    #[error("bootstrap capability identifier is invalid: {0}")]
-    Identifier(#[source] dekopon_core::IdentifierError),
+    /// Every invalid identifier a runtime answered with, each with its own reason.
+    #[error("bootstrap capability identifiers are invalid: {problems}")]
+    Identifier { problems: String },
     /// Invalid JSON in a recording or a serialization failure.
     #[error("bootstrap metadata JSON failed: {0}")]
     Encoding(#[source] serde_json::Error),
@@ -825,6 +874,44 @@ mod tests {
         assert!(model.requests.lock().expect("requests lock").is_empty());
     }
 
+    /// Every malformed identifier in one refusal, each carrying the reason it was refused.
+    ///
+    /// A runtime answering with three unusable IDs is three repairs; reporting the first one is
+    /// three restarts to learn that. The refusal names the offending strings, and the identifier
+    /// parser's own reason survives rather than being flattened to "invalid".
+    #[test]
+    fn every_malformed_identifier_is_reported_with_its_own_reason() {
+        let surface = Surface::new(&["Probe.Upper", "probe.ok", "-leading"]);
+        let error = CapabilitySnapshot::from_invoker(&surface).expect_err("malformed identifiers");
+        let BootstrapError::Identifier { problems } = &error else {
+            panic!("one aggregated identifier refusal: {error:?}");
+        };
+        assert!(problems.contains("Probe.Upper"), "{problems}");
+        assert!(problems.contains("-leading"), "{problems}");
+        assert!(!problems.contains("probe.ok"), "{problems}");
+        assert_eq!(problems.matches("; ").count(), 1, "both, once: {problems}");
+        let reason = "-leading".parse::<CapabilityId>().expect_err("reason");
+        assert!(problems.contains(&reason.to_string()), "{problems}");
+        assert!(
+            surface.described.lock().expect("described lock").is_empty(),
+            "nothing is described before the identifiers are valid"
+        );
+    }
+
+    /// Every non-object schema in one refusal too.
+    #[test]
+    fn every_non_object_schema_is_reported_in_one_refusal() {
+        let mut surface = Surface::new(&["probe.a", "probe.b", "probe.c"]);
+        for id in ["probe.a", "probe.c"] {
+            surface.metadata.get_mut(id).expect("metadata").input_schema = json!(true);
+        }
+        let error = CapabilitySnapshot::from_invoker(&surface).expect_err("non-object schemas");
+        let BootstrapError::InvalidSchema { capabilities } = &error else {
+            panic!("one aggregated schema refusal: {error:?}");
+        };
+        assert_eq!(capabilities, "probe.a, probe.c", "{capabilities}");
+    }
+
     #[test]
     fn missing_mismatched_and_non_object_schemas_fail_instead_of_inventing_metadata() {
         for case in ["missing", "mismatched", "non-object"] {
@@ -900,7 +987,10 @@ mod tests {
             limits: Limits::default(),
             curl_capability: None,
         };
-        let store = crate::checkpoint::memory_checkpoints();
+        // This test's own store rather than the process-global one: the resume below must fail
+        // because the epoch changed, never because a sibling test's session evicted the entry.
+        let store: std::sync::Arc<dyn crate::checkpoint::CheckpointStore> =
+            std::sync::Arc::new(crate::checkpoint::MemoryCheckpointStore::default());
         let engine = SessionEngine::new(&model, &runtime).with_checkpoint_store(store);
         let mut history = History::default();
         let first: dekopon_core::SurfaceEpoch = "private-first-epoch".parse().unwrap();
