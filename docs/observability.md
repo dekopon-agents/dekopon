@@ -309,10 +309,20 @@ refused entropy, carrying the `getrandom` failure and nothing else; that attempt
 back to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect.
 
 In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
-only `operation` plus the stable transport-error category. A permanent Slack installation fallback
+only `operation` plus a stable category — for a lease that is `busy` (a live generation holds the
+thread), `quarantined` (an uncertain native write still does), or `capacity` (the 128-lease ceiling).
+The one exception is warn level: `operation="quarantine"` with `cause_type="activity-quarantine-full"`,
+emitted once when the separately counted 128-entry quarantine fills rather than once per refused
+lease. A permanent Slack installation fallback
 emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
+
+`gateway_reply_rate_limited` is the warn-level record of a channel-creating post the service rate
+limited. It carries `transport`, the `method` (`chat.postMessage` or `files.completeUploadExternal`),
+and `retry_after_seconds` — how long the physical channel slot stays parked, which is the stated
+`Retry-After` capped at sixty seconds or five seconds when the header is absent or unparsable. It
+records no channel, thread, subject, or answer text.
 
 The informational broker reports behind the web UI are never retried, so their warning is the whole
 record of a failure. `gateway_agent_inventory_report_failed` and `gateway_usage_report_failed` carry

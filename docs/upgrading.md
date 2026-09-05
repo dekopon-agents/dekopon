@@ -95,6 +95,11 @@ Controls are disabled without `controlTargets`. Opt-in requires separate `agent.
 chat controls. No subject-only scope fallback applies. Both changed dimensions require both
 permissions. Configured model aliases are not endpoints and allowlisting them grants nothing.
 
+`policy_digest` now hashes the two reserved control actions (`agent.model.select`,
+`agent.effort.set`) unconditionally, so every deployment's digest changes on upgrade even when the
+policy set is byte-identical. Audit records written either side of the upgrade carry different
+digests for the same policy; that is expected and is not evidence of a policy change.
+
 ### 0.12.0 → next (unreleased) — command words run over `runCommand`
 
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a

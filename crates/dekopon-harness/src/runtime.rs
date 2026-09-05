@@ -2061,10 +2061,11 @@ mod tests {
             }
             for uncertain in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
-                // Three surface answers, one invocation, then the change: the turn's pre-model
-                // check, its post-completion disclosure check, and the tool-call check. Dispatch
-                // itself no longer refetches the surface — the broker authorizes it.
-                let mut responses = (0..3)
+                // Two surface answers, one invocation, then the change: the turn's pre-model check
+                // and its post-completion disclosure check, which are the only two freshness
+                // points in a turn. Neither dispatch nor the per-tool-call step refetches the
+                // surface — the broker authorizes every invocation against its live policy.
+                let mut responses = (0..2)
                     .map(|_| {
                         ResponseEnvelope::capabilities(
                             vec![available(CAPABILITY)],
@@ -2122,7 +2123,7 @@ mod tests {
                 while received.try_recv().is_ok() {
                     count += 1;
                 }
-                assert_eq!(count, 5);
+                assert_eq!(count, 4);
             }
         }
 

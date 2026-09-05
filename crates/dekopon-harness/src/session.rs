@@ -842,7 +842,6 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
 
             for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
                 check_cancelled(cancellation)?;
-                check_freshness(runtime, journal)?;
                 state.current_tool = call.id.clone();
                 journal.update(|c| {
                     c.state = state.clone();
@@ -1236,6 +1235,9 @@ impl PromptError {
             Self::Bootstrap(_) => "invalid-bootstrap",
             Self::Cancelled => "cancelled",
             Self::ZeroSteps => "zero-steps",
+            // A ledger refusal is permanent and this process caused it; `model` tells an
+            // operator the endpoint misbehaved and that a retry is reasonable. Both are false.
+            Self::Model(ModelError::Accounting(_)) => "accounting",
             Self::Model(_) => "model",
             Self::UnknownTool(_) => "unknown-tool",
             Self::TooManyToolCalls { .. } => "too-many-tool-calls",

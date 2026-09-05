@@ -348,21 +348,9 @@ fn one_inconsistent_field_is_unreported_without_blanking_the_rest_of_the_delta()
 
 #[test]
 fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
-    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
-    let captured = dekopon_test_support::CaptureLayer::new();
-    let test_thread = std::thread::current().id();
-    // tracing-core's single-dispatch fast path registers new callsites against the current
-    // thread's dispatcher. A thread-local capture plus rebuild_interest_cache cannot prevent
-    // a parallel, unsubscribed test from subsequently caching Interest::never. Install the
-    // subscriber globally, but capture only this test's thread; sibling tests remain parallel
-    // and cannot contaminate the exact accounting counts or retain their payloads here.
-    let subscriber = tracing_subscriber::registry().with(captured.clone().with_filter(
-        tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
-            std::thread::current().id() == test_thread
-        }),
-    ));
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("only global subscriber in this binary");
+    // One permanent process-global subscriber, routed to this thread. A scoped dispatcher
+    // races a sibling test's first registration of a callsite; see `CaptureSession`.
+    let captured = dekopon_test_support::CaptureLayer::install();
     let job = {
         let root = tracing::info_span!("host-message");
         let _root = root.enter();

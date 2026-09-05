@@ -120,8 +120,15 @@ or final-delivery I/O lock. Physical channel post pacing can delay acceptance.
 Posts may notify or remain platform-retained after failed removal. See
 [activity lifecycle and platform bounds](dekopond.md#structured-activity-and-slack-progress-unreleased).
 
-Ordinary safe boundaries now revalidate the broker's authenticated surface/epoch before inference,
-after completion before disclosure, and before tool/capability dispatch. Changed or uncertain
+Freshness is a disclosure gate, not an authorization one. It runs at exactly two places in a turn:
+before each model request, and after a completion and before any of it is disclosed. It does not run
+per capability invocation or per provider command word, because the broker authorizes every `invoke`
+and `runCommand` at dispatch against its live policy and epoch — a client-side refetch immediately in
+front of one decides nothing the broker is not about to decide, and cost a full round trip per
+capability a script drove. A failed check names which part of the surface moved: the epoch, the
+descriptions, the effective views, the command words, or the chat-memory surface. The comparison is
+five per-component digests taken once when the session's broker leg is built, so a check costs the
+round trip and nothing else. Changed or uncertain
 responses fence the checkpoint and retain live observations privately; they do not authorize effects.
 Inactive fenced entries can be evicted under the same bounded store policy; restore then fails, never
 selects an older snapshot. Model-selected capability identifiers are validated before reservation.

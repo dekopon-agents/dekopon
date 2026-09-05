@@ -186,6 +186,12 @@ the separate broker must also allow the aliases/efforts in `controlTargets` and 
 `agent.prompt` plus `agent.model.select` and/or `agent.effort.set` for the authenticated sender.
 Controls require an explicit broker chat-scope grant; no legacy scope-less fallback applies.
 
+The gateway offers all four efforts for every configured model because it cannot see the broker's
+`controlTargets`. The broker checks both `from` and `to` against that list, so a route whose
+baseline effort is missing from it gets `target-denied` on every proposal — including the very
+first — while still spending one of the job's four control attempts. List the route's own baseline
+effort there, not only the ones a model may switch to.
+
 Without the route block no control tool or authorizer is installed. Enabled sessions offer
 `select_model({model, effort?})` and, when usable, `set_effort({effort})`. Endpoints, credentials,
 identity fields and arbitrary options are never accepted. Omitted selection effort preserves
@@ -344,8 +350,9 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 
 ### Structured activity and Slack progress (Unreleased)
 
-`routes[].activityLabels` is a strict capability-ID-to-label mapping, at most 256 entries and
-80 UTF-8 bytes per authored label. For example:
+`routes[].activityLabels` is a strict capability-ID-to-label mapping, at most 256 entries; each
+label must be at most 80 UTF-8 bytes and must not be blank once control and directional marks are
+stripped, and startup names every offending entry with the rule it broke. For example:
 
 ```yaml
 activityLabels:

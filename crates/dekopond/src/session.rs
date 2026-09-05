@@ -444,7 +444,7 @@ pub(crate) struct CancelAwareInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
-    fn check_freshness(&self) -> Result<(), String> {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         self.inner.check_freshness()
     }
 
@@ -733,7 +733,8 @@ async fn session(
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
-                category = error.category()
+                category = error.category(),
+                cause = %dekopon_core::error_chain(&error)
             );
             answer(replier, message, FAILURE_REPLY).await;
             return "failed";
@@ -918,7 +919,8 @@ async fn session(
             Err(error) => {
                 tracing::error!(
                     event = "gateway_session_failed",
-                    category = error.category()
+                    category = error.category(),
+                    cause = %dekopon_core::error_chain(&error)
                 );
                 answer(replier, message, FAILURE_REPLY).await;
                 return "failed";
@@ -1155,7 +1157,8 @@ async fn session(
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
-                category = error.category()
+                category = error.category(),
+                cause = %dekopon_core::error_chain(&error)
             );
             (FAILURE_REPLY.to_owned(), "failed", false)
         }
