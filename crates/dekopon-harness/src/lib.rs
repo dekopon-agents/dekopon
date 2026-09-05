@@ -10,12 +10,12 @@
 pub mod accounting;
 pub mod activity;
 pub mod bootstrap;
-pub mod checkpoint;
 pub mod context;
 pub mod control;
 pub mod conversation;
 pub mod history;
 pub mod improvement;
+pub mod journal;
 pub mod meta;
 pub mod replay;
 pub mod runtime;

@@ -207,7 +207,7 @@ impl JobRecord {
         record
     }
     pub fn unanswered(user: impl Into<String>) -> Self {
-        Self::new(crate::checkpoint::opaque_id(), &user.into())
+        Self::new(crate::journal::opaque_id(), &user.into())
     }
     pub fn user(&self) -> &str {
         &self.user
@@ -313,7 +313,7 @@ impl History {
     pub fn has_unknown_work(&self) -> bool {
         self.unresolved || self.turns.iter().any(JobRecord::has_unknown_work)
     }
-    pub(crate) fn checkpoint_seed(&self) -> Self {
+    pub(crate) fn journal_seed(&self) -> Self {
         let mut seed = self.clone();
         while seed.bytes > 256 * 1024 && !seed.turns.is_empty() {
             seed.drop_oldest();
@@ -412,9 +412,9 @@ mod tests {
         assert_eq!(decoded, history);
     }
 
-    /// The checkpoint seed drops whole oldest turns and keeps its own total exact.
+    /// The journal seed drops whole oldest turns and keeps its own total exact.
     #[test]
-    fn the_checkpoint_seed_keeps_the_running_total_exact_while_it_drops_turns() {
+    fn the_journal_seed_keeps_the_running_total_exact_while_it_drops_turns() {
         let mut history = History::new(HistoryLimits {
             max_turns: 128,
             max_bytes: HistoryLimits::MAX_BYTES,
@@ -422,7 +422,7 @@ mod tests {
         for index in 0..64 {
             history.record(turn(&"q".repeat(8 * 1024), &format!("answer {index}")));
         }
-        let seed = history.checkpoint_seed();
+        let seed = history.journal_seed();
         assert!(seed.bytes() <= 256 * 1024, "{}", seed.bytes());
         assert!(seed.len() < history.len());
         assert_eq!(seed.bytes(), exact(&seed));

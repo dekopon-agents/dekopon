@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    checkpoint::{CheckpointError, ExecutionJournal},
+    journal::{ExecutionJournal, JournalError},
     session::{CancellationProbe, PromptError, SessionState},
 };
 
@@ -35,7 +35,7 @@ pub(crate) fn transition(
         let record = state.transitions.last_mut().expect("reserved transition");
         if result.is_err() && record.outcome == TransitionOutcome::Pending {
             // Still pending after an error means the transition never reached the broker's answer:
-            // a checkpoint write or the host itself failed underneath it.
+            // a journal write or the host itself failed underneath it.
             record.outcome = TransitionOutcome::AuthorizationFailed {
                 cause: ControlFailureKind::Interrupted,
             };
@@ -60,10 +60,10 @@ fn transition_inner(
         || snapshot.record.has_unknown_work()
         || snapshot.history.has_unknown_work()
     {
-        return Err(CheckpointError::UnknownWork.into());
+        return Err(JournalError::UnknownWork.into());
     }
     if state.transitions.len() >= 128 * crate::tools::MAX_TOOL_CALLS_PER_TURN {
-        return Err(CheckpointError::Capacity.into());
+        return Err(JournalError::Capacity.into());
     }
     let attempt = if state.spent.control_attempts
         < controls.map_or(MAX_CONTROL_ATTEMPTS, SessionControls::max_attempts)
@@ -100,7 +100,7 @@ fn transition_inner(
         decision_ref: None,
         context_revision: snapshot.context_revision,
     });
-    // The attempt and intent are checkpointed before client preparation or broker transmission.
+    // The attempt and intent are journalled before client preparation or broker transmission.
     journal.update(|c| c.state = state.clone())?;
     if outcome != TransitionOutcome::Pending {
         return Ok(outcome);
@@ -140,7 +140,7 @@ fn transition_inner(
         state.control_fenced = true;
         return Err(PromptError::Cancelled);
     }
-    let id: InvocationId = crate::checkpoint::opaque_id()
+    let id: InvocationId = crate::journal::opaque_id()
         .parse()
         .expect("opaque control ID");
     record.control_id = Some(id.clone());
@@ -184,13 +184,14 @@ fn transition_inner(
     }
 
     // No model call here. Opaque continuation/context is replaced by the caller before its
-    // post-transition checkpoint. Neither evidence nor any spent limit or one-attempt flag resets.
+    // post-transition journal write. Neither evidence nor any spent limit or one-attempt flag
+    // resets.
     active.identity = prepared.identity.clone();
     active.options = active
         .options
         .clone()
         .with_effort(active.identity.effort)
-        .with_prompt_cache_key(crate::checkpoint::opaque_id());
+        .with_prompt_cache_key(crate::journal::opaque_id());
     active.prepared = Some(prepared);
     state.current_model = Some(active.identity.clone());
     state.agent_config_shown = false;
@@ -199,7 +200,7 @@ fn transition_inner(
     record.context_revision = snapshot
         .context_revision
         .checked_add(1)
-        .ok_or(CheckpointError::Capacity)?;
+        .ok_or(JournalError::Capacity)?;
     Ok(record.outcome)
 }
 
@@ -207,7 +208,7 @@ pub(crate) fn save_boundary(
     state: &SessionState,
     journal: &ExecutionJournal<'_>,
     messages: &[dekopon_model::model::ModelMessage],
-) -> Result<(), CheckpointError> {
+) -> Result<(), JournalError> {
     journal.update(|c| {
         c.state = state.clone();
         if let Some(model) = &state.current_model {

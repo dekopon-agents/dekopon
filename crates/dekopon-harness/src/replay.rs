@@ -931,7 +931,7 @@ fn outcome_from_result(result: &str) -> ScriptOutcome {
 impl ReplayRuntime<'_> {
     /// Marks the current assistant batch as one a live dispatch entered, and takes back any
     /// `RecordedReplay` label an earlier recorded sibling in the same batch already stamped.
-    fn disqualify_group(&self, journal: &crate::checkpoint::ExecutionJournal) {
+    fn disqualify_group(&self, journal: &crate::journal::ExecutionJournal) {
         let Some(call) = journal
             .snapshot()
             .record
@@ -960,7 +960,7 @@ impl ReplayRuntime<'_> {
         &self,
         script: &str,
         max_capability_calls: u32,
-        journal: Option<&crate::checkpoint::ExecutionJournal>,
+        journal: Option<&crate::journal::ExecutionJournal>,
     ) -> ScriptOutcome {
         self.requested
             .lock()
@@ -1051,7 +1051,7 @@ impl ScriptRuntime for ReplayRuntime<'_> {
         &self,
         script: &str,
         maximum: u32,
-        journal: &crate::checkpoint::ExecutionJournal,
+        journal: &crate::journal::ExecutionJournal,
     ) -> ScriptOutcome {
         self.run_script_inner(script, maximum, Some(journal))
     }
@@ -1226,8 +1226,8 @@ mod tests {
     };
     use crate::{
         bootstrap::{BootstrapError, CapabilitySnapshot},
-        checkpoint::ExecutionJournal,
         history::{ExecutionProvenance, JobRecord},
+        journal::ExecutionJournal,
         runtime::ScriptRuntime,
         session::PromptLimits,
         tools::{MAX_TOOL_CALLS_PER_TURN, SCRIPT_TOOL_NAME},
@@ -1545,7 +1545,7 @@ mod tests {
     }
 
     /// A live runtime for the scripts the recording cannot answer, which reports what the
-    /// checkpoint said about each assistant batch at the moment it was asked to run one.
+    /// journal said about each assistant batch at the moment it was asked to run one.
     struct LiveScripts {
         records: Mutex<Vec<JobRecord>>,
     }

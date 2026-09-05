@@ -12,7 +12,7 @@ The unprivileged runtime for configured Dekopon agents, replacing `dekopon-agent
 - `history`, `context` and `conversation` own bounded portable tool groups, execution evidence,
   generated-versus-accepted delivery and scoped append leases. Both byte ceilings read running
   totals maintained where turns change, so no lookup or eviction step encodes the corpus.
-  `checkpoint::ExecutionJournal` owns one session's live state directly — no store, no lease, no
+  `journal::ExecutionJournal` owns one session's live state directly — no store, no lease, no
   revision and no persistence — and revalidates every bound on every mutation. An embedder that
   must remember the completed job reads the untrimmed record from `with_final_state`.
 - `accounting::TokenTracker` is mandatory across calls, HTTP attempts and model segments.

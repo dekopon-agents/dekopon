@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
     bootstrap::SessionBootstrap,
-    checkpoint::FinalState,
     conversation::{BoundedConversationStore, ConversationKey, ConversationWindow},
     history::{ExecutionOutcome, ExecutionProvenance, HistoryLimits},
+    journal::FinalState,
     runtime::ShellRuntime,
     session::{CancellationProbe, PromptError, SessionEngine},
 };
@@ -166,10 +166,10 @@ fn answer() -> AssistantTurn {
         replay_items: Vec::new(),
     }
 }
-fn snapshot() -> Checkpoint {
+fn snapshot() -> JobState {
     let record = JobRecord::unanswered("request");
     let accounting = crate::accounting::fixture_tracker(&record.job, &[]);
-    Checkpoint {
+    JobState {
         scope: "scope".to_owned(),
         surface: "surface".to_owned(),
         model: "fixture".to_owned(),
@@ -298,17 +298,17 @@ fn a_fence_after_dispatch_retains_live_facts_and_stops_the_session() {
             &mut history,
         )
         .expect_err("a fenced surface halts the session");
-    let PromptError::Interrupted { source, checkpoint } = error else {
+    let PromptError::Interrupted { source, state } = error else {
         panic!("the latest live state must accompany a fence");
     };
-    assert_eq!(source, CheckpointError::ScopeChanged);
+    assert_eq!(source, JournalError::ScopeChanged);
     assert_eq!(runtime.invoker.count.load(Ordering::SeqCst), 1);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1, "no fenced inference");
     assert_eq!(
-        checkpoint.record.executions[0].outcome,
+        state.record.executions[0].outcome,
         ExecutionOutcome::Succeeded
     );
-    assert_eq!(checkpoint.state.spent.capability_invocations, 1);
+    assert_eq!(state.state.spent.capability_invocations, 1);
     assert_eq!(
         history.turns()[0].executions[0].outcome,
         ExecutionOutcome::Succeeded,
@@ -367,10 +367,7 @@ fn unknown_work_fences_later_dispatch_even_after_history_trimming() {
     journal
         .observe(id, |r| r.outcome = ExecutionOutcome::Unknown)
         .expect("observation saved");
-    assert_eq!(
-        journal.reserve("test.read"),
-        Err(CheckpointError::UnknownWork)
-    );
+    assert_eq!(journal.reserve("test.read"), Err(JournalError::UnknownWork));
     let saved = journal.snapshot();
     let mut history = History::new(HistoryLimits {
         max_turns: 0,
@@ -399,12 +396,12 @@ fn a_mutation_that_breaks_a_field_bound_is_refused_and_fences_the_job() {
     let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
     assert_eq!(
         journal.update(|c| c.state.spent.capability_invocations = 5),
-        Err(CheckpointError::Invalid),
+        Err(JournalError::Invalid),
         "a spend past the session ceiling is not a valid state"
     );
     assert_eq!(
         journal.update(|c| c.state.spent.capability_invocations = 0),
-        Err(CheckpointError::Invalid),
+        Err(JournalError::Invalid),
         "the fence is sticky; a later well-formed mutation does not clear it"
     );
     assert_eq!(
@@ -416,27 +413,27 @@ fn a_mutation_that_breaks_a_field_bound_is_refused_and_fences_the_job() {
     for (name, break_it) in [
         (
             "effort",
-            Box::new(|c: &mut Checkpoint| c.effort = "exhaustive".to_owned())
-                as Box<dyn Fn(&mut Checkpoint)>,
+            Box::new(|c: &mut JobState| c.effort = "exhaustive".to_owned())
+                as Box<dyn Fn(&mut JobState)>,
         ),
         (
             "control attempts",
-            Box::new(|c: &mut Checkpoint| c.state.spent.control_attempts = 5),
+            Box::new(|c: &mut JobState| c.state.spent.control_attempts = 5),
         ),
         (
             "execution job",
-            Box::new(|c: &mut Checkpoint| c.record.executions[0].job = "other".to_owned()),
+            Box::new(|c: &mut JobState| c.record.executions[0].job = "other".to_owned()),
         ),
         (
             "model calls",
-            Box::new(|c: &mut Checkpoint| c.state.spent.model_calls = c.limits.max_steps + 1),
+            Box::new(|c: &mut JobState| c.state.spent.model_calls = c.limits.max_steps + 1),
         ),
     ] {
         let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
         journal.reserve("test.read").expect("reservation");
         assert_eq!(
             journal.update(&break_it),
-            Err(CheckpointError::Invalid),
+            Err(JournalError::Invalid),
             "{name}"
         );
     }
@@ -445,7 +442,7 @@ fn a_mutation_that_breaks_a_field_bound_is_refused_and_fences_the_job() {
     oversized.record.user = "x".repeat(128 * 1024 + 1);
     assert_eq!(
         ExecutionJournal::new(oversized, None).err(),
-        Some(CheckpointError::Invalid),
+        Some(JournalError::Invalid),
         "an invalid opening state never opens a journal at all"
     );
 }
@@ -714,9 +711,9 @@ fn one_mutation_encodes_only_the_model_facing_batches() {
                 })
                 .collect();
         }
-        let groups = crate::checkpoint::encoded_len(&stored.record.groups).expect("groups encode");
-        let rest = crate::checkpoint::encoded_len(&stored.record.user).expect("user text encodes")
-            + crate::checkpoint::encoded_len(&stored.record.executions).expect("ledger encodes");
+        let groups = crate::journal::encoded_len(&stored.record.groups).expect("groups encode");
+        let rest = crate::journal::encoded_len(&stored.record.user).expect("user text encodes")
+            + crate::journal::encoded_len(&stored.record.executions).expect("ledger encodes");
         assert_eq!(
             large,
             groups > crate::context::MAX_GROUP_BYTES / 2
@@ -786,7 +783,7 @@ fn a_mutation_over_the_group_ceiling_omits_batches_until_the_rest_fits() {
         );
     }
     assert!(
-        crate::checkpoint::encoded_len(groups).expect("the groups encode")
+        crate::journal::encoded_len(groups).expect("the groups encode")
             <= crate::context::MAX_GROUP_BYTES,
         "the retained groups are inside the model-facing ceiling"
     );

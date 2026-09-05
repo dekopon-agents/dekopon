@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     bootstrap::{CapabilitySnapshot, SessionBootstrap},
-    checkpoint::{Checkpoint, CheckpointError, FinalState},
     history::History,
+    journal::{FinalState, JobState, JournalError},
     runtime::ScriptRuntime,
     session::{CancellationProbe, PromptError, PromptLimits, SessionEngine},
 };
@@ -276,7 +276,7 @@ impl Fixture {
             epoch: "epoch".parse().unwrap(),
             scope: ControlScope {
                 agent: "agent".parse().unwrap(),
-                job: crate::checkpoint::opaque_id().parse().unwrap(),
+                job: crate::journal::opaque_id().parse().unwrap(),
                 session: "session".parse().unwrap(),
                 request: "request".parse().unwrap(),
                 generation: "generation".parse().unwrap(),
@@ -309,10 +309,10 @@ impl Fixture {
         .with_controls(controls)
     }
 }
-fn saved(state: &FinalState, f: &Fixture) -> Checkpoint {
-    let checkpoint = state.take().expect("the session published its final state");
-    assert_eq!(checkpoint.record.job, f.scope.job.as_str());
-    checkpoint
+fn saved(state: &FinalState, f: &Fixture) -> JobState {
+    let published = state.take().expect("the session published its final state");
+    assert_eq!(published.record.job, f.scope.job.as_str());
+    published
 }
 
 #[test]
@@ -689,8 +689,8 @@ fn epoch_change_and_stop_after_admission_halt_without_applying_or_calling_the_ta
         assert!(cp.state.control_fenced);
         assert!(b.requests.lock().unwrap().is_empty());
         if !stop {
-            // The checkpointed record says *which* client failure fenced the job, not just that
-            // one did. A reader of this checkpoint can tell "the broker restarted underneath us"
+            // The journalled record says *which* client failure fenced the job, not just that
+            // one did. A reader of this job state can tell "the broker restarted underneath us"
             // from "something answered the socket with a decision bound to another proposal".
             assert_eq!(
                 cp.state.transitions.last().map(|t| t.outcome),
@@ -845,16 +845,16 @@ fn a_fence_after_a_switch_retains_the_live_transition_and_prevents_target_infere
     let error = SessionEngine::new(a.as_ref(), &runtime)
         .run(f.inputs(&controls, 3), &mut History::default())
         .unwrap_err();
-    let PromptError::Interrupted { checkpoint, source } = error else {
+    let PromptError::Interrupted { state, source } = error else {
         panic!("expected the latest live state")
     };
-    assert_eq!(source, CheckpointError::ScopeChanged);
-    assert_eq!(checkpoint.model, "wire-b");
+    assert_eq!(source, JournalError::ScopeChanged);
+    assert_eq!(state.model, "wire-b");
     assert_eq!(
-        checkpoint.state.transitions[0].outcome,
+        state.state.transitions[0].outcome,
         TransitionOutcome::Applied
     );
-    assert_eq!(checkpoint.state.spent.model_calls, 1);
+    assert_eq!(state.state.spent.model_calls, 1);
     assert!(b.requests.lock().unwrap().is_empty());
 }
 

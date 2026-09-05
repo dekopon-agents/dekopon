@@ -160,7 +160,7 @@ log sink in scope for that text, and nothing else widens with it: the record car
 the gateway holds and no subject, only what the model chose to write into those fields.
 
 Two harness failures have no audit record because neither is a decision about a request; each is an
-error-level log line carrying a stable `cause_type` and the underlying failure. `live-checkpoint-lock`
+error-level log line carrying a stable `cause_type` and the underlying failure. `live-job-state-lock`
 is a poisoned session-state mutex: a read recovers it, because the observations already recorded are
 exactly what a failing session still has to report, while a write refuses and fences the job, and
 the token is how an operator tells a fence caused by a panic from one caused by a broken bound.

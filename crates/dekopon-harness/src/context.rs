@@ -100,7 +100,7 @@ pub(crate) fn replay_job(job: &JobRecord, messages: &mut Vec<ModelMessage>) {
 /// The caller repairs repeated-read pointers and invalidates opaque continuation when this changes.
 pub(crate) fn bound_live(
     messages: &mut Vec<ModelMessage>,
-) -> Result<bool, crate::checkpoint::CheckpointError> {
+) -> Result<bool, crate::journal::JournalError> {
     let mut changed = false;
     loop {
         let sizes: Vec<usize> = messages
@@ -122,7 +122,7 @@ pub(crate) fn bound_live(
         // Only remove complete assistant/result batches. Never mistake a labelled evidence
         // summary (also a user-role item) for the inbound request and trim the request itself.
         let Some(start) = messages.iter().position(|m| m.role() == "assistant") else {
-            return Err(crate::checkpoint::CheckpointError::Capacity);
+            return Err(crate::journal::JournalError::Capacity);
         };
         let end = messages
             .iter()

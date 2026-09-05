@@ -379,7 +379,7 @@ pub(crate) fn generate_image_into(
     call: &ModelToolCall,
     model_turn: u32,
     tool_call_index: usize,
-    journal: &crate::checkpoint::ExecutionJournal<'_>,
+    journal: &crate::journal::ExecutionJournal<'_>,
 ) -> Result<(), PromptError> {
     let prompt = match image_prompt_argument(&call.function.name, &call.function.arguments) {
         Ok(prompt) => prompt,

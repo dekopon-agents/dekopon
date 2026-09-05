@@ -81,7 +81,7 @@ pub enum ActivityPhase {
     Finished,
 }
 
-/// Private job coordinates plus a safe label. Never stored in history, replay or checkpoints.
+/// Private job coordinates plus a safe label. Never stored in history, replay or job state.
 #[derive(Clone, Debug)]
 pub struct ActivityEvent {
     pub job: String,
@@ -131,7 +131,7 @@ impl ActivityPublisher {
         // Intersect even trusted mappings with the same fresh snapshot used before inference.
         ActivityEmitter {
             publisher: self.clone(),
-            generation: crate::checkpoint::opaque_id(),
+            generation: crate::journal::opaque_id(),
             job,
             labels: labels
                 .iter()

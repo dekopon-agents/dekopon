@@ -136,7 +136,7 @@ and removal are best effort and separate from delivery receipts/history; notific
 artifacts can survive failed cleanup. Other transports retain native typing/no-op behavior.
 See the [consumed configuration schema and lifecycle bounds](../../docs/dekopond.md#structured-activity-and-slack-progress-unreleased).
 
-The clean-break runtime, checkpoint bounds, delivery/accounting ownership and known integration
+The clean-break runtime, job-state bounds, delivery/accounting ownership and known integration
 limitations are documented in [`docs/harness.md`](../../docs/harness.md).
 
 Slack refuses duplicate authenticated endpoint/team/bot installations, naming every transport that

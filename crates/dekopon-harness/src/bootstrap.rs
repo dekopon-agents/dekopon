@@ -20,7 +20,7 @@ pub struct SessionBootstrap<'a> {
     pub(crate) scope: Option<&'a str>,
     pub(crate) surface_epoch: Option<&'a dekopon_core::SurfaceEpoch>,
     pub(crate) controls: Option<&'a crate::control::SessionControls<'a>>,
-    pub(crate) final_state: Option<&'a crate::checkpoint::FinalState>,
+    pub(crate) final_state: Option<&'a crate::journal::FinalState>,
     pub(crate) capabilities: Option<&'a CapabilitySnapshot>,
     pub(crate) context_policy: Option<&'a dyn crate::context::ContextPolicy>,
     pub(crate) prompt: &'a str,
@@ -94,7 +94,7 @@ impl<'a> SessionBootstrap<'a> {
         self
     }
 
-    /// Pins broker startup identity for checkpoint restore without exposing it to the model.
+    /// Pins broker startup identity into the freshness fence without exposing it to the model.
     pub const fn with_surface_epoch(mut self, epoch: &'a dekopon_core::SurfaceEpoch) -> Self {
         self.surface_epoch = Some(epoch);
         self
@@ -112,7 +112,7 @@ impl<'a> SessionBootstrap<'a> {
     /// it there. A host that appends the completed job to a conversation of its own reads it from
     /// here so a tiny window cannot silently drop the job it just ran.
     #[must_use]
-    pub const fn with_final_state(mut self, state: &'a crate::checkpoint::FinalState) -> Self {
+    pub const fn with_final_state(mut self, state: &'a crate::journal::FinalState) -> Self {
         self.final_state = Some(state);
         self
     }
@@ -259,7 +259,7 @@ pub struct CapabilitySnapshot {
     command_words: Vec<String>,
     /// This document's digest, computed at most once for the life of the snapshot.
     ///
-    /// A validated snapshot never changes, and both the engine's checkpoint surface and the
+    /// A validated snapshot never changes, and both the engine's journalled surface and the
     /// gateway's conversation key ask for the fingerprint of the same one, so the serialization
     /// behind it happens once per message rather than once per asker.
     #[serde(skip)]

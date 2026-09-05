@@ -19,7 +19,7 @@ use thiserror::Error;
 /// and `serde_json::to_vec` would allocate and discard a copy of the batches each time. The count
 /// is the same one the encoder would have written, so there is still exactly one definition of
 /// "how big is this".
-fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
+fn encoded_len(value: &impl Serialize) -> Result<usize, JournalError> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -32,8 +32,8 @@ fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
     }
     let mut counter = Counter(0);
     serde_json::to_writer(&mut counter, value).map_err(|error| {
-        tracing::error!(cause_type = "checkpoint-encoding", %error);
-        CheckpointError::Invalid
+        tracing::error!(cause_type = "journal-encoding", %error);
+        JournalError::Invalid
     })?;
     #[cfg(test)]
     ENCODED_BYTES.with(|total| total.set(total.get() + counter.0));
@@ -61,7 +61,7 @@ pub(crate) fn opaque_id() -> String {
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum CheckpointError {
+pub enum JournalError {
     #[error("bounded session state cannot grow further")]
     Capacity,
     #[error("job is fenced; latest live observations must not be replaced or continued")]
@@ -86,7 +86,7 @@ pub enum CheckpointError {
 /// through [`FinalState`], and a fenced one through
 /// [`crate::session::PromptError::Interrupted`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct Checkpoint {
+pub struct JobState {
     pub scope: String,
     pub surface: String,
     pub model: String,
@@ -98,9 +98,9 @@ pub struct Checkpoint {
     pub state: SessionState,
     pub pending_execution: Option<u32>,
 }
-impl Checkpoint {
+impl JobState {
     /// Everything the state must satisfy after any mutation. Each field is bounded on its own.
-    fn validate(&self) -> Result<(), CheckpointError> {
+    fn validate(&self) -> Result<(), JournalError> {
         if self.record.job.is_empty()
             || self.scope.len() > 256
             || self.surface.len() > 256
@@ -145,7 +145,7 @@ impl Checkpoint {
                     .is_some_and(|e| e.text.len() > MAX_EXCERPT_BYTES)
             })
         {
-            return Err(CheckpointError::Invalid);
+            return Err(JournalError::Invalid);
         }
         Ok(())
     }
@@ -160,16 +160,16 @@ impl Checkpoint {
 /// nothing, and a fenced one publishes the same state
 /// [`crate::session::PromptError::Interrupted`] carries.
 #[derive(Default)]
-pub struct FinalState(Mutex<Option<Checkpoint>>);
+pub struct FinalState(Mutex<Option<JobState>>);
 impl FinalState {
-    pub(crate) fn publish(&self, checkpoint: Checkpoint) {
+    pub(crate) fn publish(&self, state: JobState) {
         if let Ok(mut slot) = self.0.lock() {
-            *slot = Some(checkpoint);
+            *slot = Some(state);
         }
     }
     /// Consumes the published state, leaving nothing behind for a second reader.
     #[must_use]
-    pub fn take(&self) -> Option<Checkpoint> {
+    pub fn take(&self) -> Option<JobState> {
         self.0.lock().map_or(None, |mut slot| slot.take())
     }
 }
@@ -182,24 +182,21 @@ pub struct ExecutionJournal<'a> {
     inner: Mutex<Live>,
 }
 struct Live {
-    checkpoint: Checkpoint,
-    error: Option<CheckpointError>,
+    job: JobState,
+    error: Option<JournalError>,
 }
 impl<'a> ExecutionJournal<'a> {
     pub(crate) fn new(
-        checkpoint: Checkpoint,
+        job: JobState,
         accounting: Option<&crate::accounting::JobAccounting>,
-    ) -> Result<Self, CheckpointError> {
+    ) -> Result<Self, JournalError> {
         let accounting = accounting.cloned().unwrap_or_default();
-        accounting.install(checkpoint.state.accounting.clone())?;
+        accounting.install(job.state.accounting.clone())?;
         let journal = Self {
             activity: None,
             accounting,
             cancellation: None,
-            inner: Mutex::new(Live {
-                checkpoint,
-                error: None,
-            }),
+            inner: Mutex::new(Live { job, error: None }),
         };
         journal.update(|_| {})?;
         Ok(journal)
@@ -229,25 +226,25 @@ impl<'a> ExecutionJournal<'a> {
     /// report. The write path (`update`) still refuses under a poisoned lock and fences the job.
     fn live(&self) -> std::sync::MutexGuard<'_, Live> {
         self.inner.lock().unwrap_or_else(|error| {
-            tracing::error!(cause_type = "live-checkpoint-lock", %error);
+            tracing::error!(cause_type = "live-job-state-lock", %error);
             error.into_inner()
         })
     }
-    pub(crate) fn snapshot(&self) -> Checkpoint {
-        let mut snapshot = self.live().checkpoint.clone();
+    pub(crate) fn snapshot(&self) -> JobState {
+        let mut snapshot = self.live().job.clone();
         snapshot.state.accounting = self.accounting.snapshot();
         snapshot
     }
-    pub(crate) fn error(&self) -> Option<CheckpointError> {
+    pub(crate) fn error(&self) -> Option<JournalError> {
         self.live().error
     }
-    pub(crate) fn update(&self, f: impl FnOnce(&mut Checkpoint)) -> Result<(), CheckpointError> {
+    pub(crate) fn update(&self, f: impl FnOnce(&mut JobState)) -> Result<(), JournalError> {
         let mut live = self.inner.lock().map_err(|error| {
-            tracing::error!(cause_type = "live-checkpoint-lock", %error);
-            CheckpointError::Poisoned
+            tracing::error!(cause_type = "live-job-state-lock", %error);
+            JournalError::Poisoned
         })?;
-        f(&mut live.checkpoint); // preserve newly observed facts even when already fenced
-        live.checkpoint.state.accounting = self.accounting.snapshot();
+        f(&mut live.job); // preserve newly observed facts even when already fenced
+        live.job.state.accounting = self.accounting.snapshot();
         // Independently bound model-facing groups without erasing the execution ledger. Keep a
         // labelled position marker for an omitted batch rather than orphaning its results. Each
         // omission adjusts the running group total by its own before/after size, so trimming
@@ -256,52 +253,52 @@ impl<'a> ExecutionJournal<'a> {
         // Only the groups are measured. `update` runs several times per tool call and holds the
         // live lock while it does, so the one bound that needs an encoding pays for that field and
         // nothing else; every other field below is bounded by a length or a counter.
-        let mut groups = encoded_len(&live.checkpoint.record.groups)?;
+        let mut groups = encoded_len(&live.job.record.groups)?;
         let mut index = 0;
         while groups > crate::context::MAX_GROUP_BYTES {
-            let Some(position) = live.checkpoint.record.groups[index..]
+            let Some(position) = live.job.record.groups[index..]
                 .iter()
                 .position(|g| !g.omitted)
                 .map(|offset| index + offset)
             else {
                 break;
             };
-            let group = &mut live.checkpoint.record.groups[position];
+            let group = &mut live.job.record.groups[position];
             let before = encoded_len(group)?;
             group.calls.clear();
             group.results.clear();
             group.omitted = true;
-            groups = groups - before + encoded_len(&live.checkpoint.record.groups[position])?;
+            groups = groups - before + encoded_len(&live.job.record.groups[position])?;
             index = position + 1;
         }
         if let Some(error) = live.error {
             return Err(error);
         }
-        if let Err(error) = live.checkpoint.validate() {
+        if let Err(error) = live.job.validate() {
             live.error = Some(error);
             return Err(error);
         }
         Ok(())
     }
-    pub(crate) fn reserve(&self, capability: &str) -> Result<u32, CheckpointError> {
+    pub(crate) fn reserve(&self, capability: &str) -> Result<u32, JournalError> {
         // Model-selected escape-hatch names must not poison an otherwise valid job.
         capability
             .parse::<dekopon_core::CapabilityId>()
             .map_err(|error| {
                 tracing::debug!(cause_type = "invalid-capability-identifier", reason = ?std::mem::discriminant(&error));
-                CheckpointError::Invalid
+                JournalError::Invalid
             })?;
         if let Some(error) = self.error() {
             return Err(error);
         }
         let snapshot = self.snapshot();
         if snapshot.record.has_unknown_work() || snapshot.pending_execution.is_some() {
-            return Err(CheckpointError::UnknownWork);
+            return Err(JournalError::UnknownWork);
         }
         if snapshot.record.executions.len() >= MAX_EXECUTIONS
             || snapshot.state.spent.capability_invocations >= snapshot.limits.max_capability_calls
         {
-            return Err(CheckpointError::Budget);
+            return Err(JournalError::Budget);
         }
         let sequence = snapshot.record.executions.len() as u32 + 1;
         let reserved = self.update(|c| {
@@ -333,7 +330,7 @@ impl<'a> ExecutionJournal<'a> {
             if let Err(fenced) =
                 self.observe(sequence, |r| r.outcome = ExecutionOutcome::NotExecuted)
             {
-                tracing::warn!(cause_type = "checkpoint-reservation-fenced", cause = %fenced);
+                tracing::warn!(cause_type = "journal-reservation-fenced", cause = %fenced);
             }
             return Err(error);
         }
@@ -343,7 +340,7 @@ impl<'a> ExecutionJournal<'a> {
         &self,
         sequence: u32,
         observation: impl FnOnce(&mut ExecutionRecord),
-    ) -> Result<(), CheckpointError> {
+    ) -> Result<(), JournalError> {
         self.update(|c| {
             if let Some(record) = c
                 .record
@@ -356,7 +353,7 @@ impl<'a> ExecutionJournal<'a> {
             c.pending_execution = None;
         })
     }
-    pub(crate) fn failure(&self, error: CheckpointError) {
+    pub(crate) fn failure(&self, error: JournalError) {
         self.live().error.get_or_insert(error);
     }
 }
@@ -366,14 +363,14 @@ pub fn finalize_delivery(
     job: &str,
     delivery: DeliveryDisposition,
     accounting: &crate::accounting::JobAccounting,
-) -> Result<(), CheckpointError> {
+) -> Result<(), JournalError> {
     if accounting.snapshot().job != job {
-        return Err(CheckpointError::Invalid);
+        return Err(JournalError::Invalid);
     }
     if accounting.finalize(&delivery) {
         Ok(())
     } else {
-        Err(CheckpointError::Fenced)
+        Err(JournalError::Fenced)
     }
 }
 

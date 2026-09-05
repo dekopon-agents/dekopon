@@ -76,7 +76,7 @@ pub trait ScriptRuntime {
         &self,
         script: &str,
         maximum: u32,
-        _journal: &crate::checkpoint::ExecutionJournal,
+        _journal: &crate::journal::ExecutionJournal,
     ) -> ScriptOutcome {
         self.run_script(script, maximum)
     }
@@ -103,7 +103,7 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
         &self,
         script: &str,
         maximum: u32,
-        journal: &crate::checkpoint::ExecutionJournal,
+        journal: &crate::journal::ExecutionJournal,
     ) -> ScriptOutcome {
         let limits = ShellLimits {
             max_capability_calls: self.limits.max_capability_calls.min(maximum),
@@ -269,7 +269,7 @@ fn dispatch_detail(detail: DispatchDetail) {
 
 struct ObservedInvoker<'a, I> {
     inner: &'a I,
-    journal: &'a crate::checkpoint::ExecutionJournal<'a>,
+    journal: &'a crate::journal::ExecutionJournal<'a>,
 }
 impl<I: CapabilityInvoker> CapabilityInvoker for ObservedInvoker<'_, I> {
     fn granted(&self) -> Vec<String> {
@@ -360,7 +360,7 @@ impl<I: CapabilityInvoker> CapabilityInvoker for ObservedInvoker<'_, I> {
             record.invocation = detail.invocation;
             record.evidence = detail.evidence;
             record.outcome = detail.outcome;
-            record.result = Some(crate::checkpoint::result_excerpt(&text));
+            record.result = Some(crate::journal::result_excerpt(&text));
         }) {
             self.journal.failure(error);
         }
@@ -2105,17 +2105,17 @@ mod tests {
                             &mut history,
                         )
                         .unwrap_err();
-                    let PromptError::Interrupted { checkpoint, source } = error else {
-                        panic!("must fence checkpoint")
+                    let PromptError::Interrupted { state, source } = error else {
+                        panic!("must fence the job state")
                     };
-                    assert_eq!(source, crate::checkpoint::CheckpointError::ScopeChanged);
-                    assert_eq!(checkpoint.record.executions.len(), 1);
+                    assert_eq!(source, crate::journal::JournalError::ScopeChanged);
+                    assert_eq!(state.record.executions.len(), 1);
                     assert_eq!(
-                        checkpoint.record.executions[0].outcome,
+                        state.record.executions[0].outcome,
                         crate::history::ExecutionOutcome::Succeeded
                     );
-                    assert_eq!(checkpoint.state.accounting.calls.len(), 1);
-                    assert!(checkpoint.record.generated.is_none());
+                    assert_eq!(state.state.accounting.calls.len(), 1);
+                    assert!(state.record.generated.is_none());
                 })
                 .await
                 .unwrap();

@@ -103,7 +103,7 @@ permission to silently choose another setting or model. Loopback wire tests cove
 The gateway's opt-in [route controls](dekopond.md#configured-model-and-effort-controls-unreleased)
 select configured cached clients through `dekopon-harness::control::ModelRegistry`, not arbitrary
 model endpoints. Only a live `VerifiedControlDecision` from the server-UID-verified broker client
-can admit application. The harness never deserializes admission from a provider or checkpoint.
+can admit application. The harness never deserializes admission from a provider or its own job state.
 Each request must be its own tool turn, with a job-wide maximum of four attempts including local
 refusals. Selecting the current model/effort is a refused no-op, not a new segment.
 
@@ -119,7 +119,8 @@ is introduced. Direct/replay runners omit controls even when they have a provide
 `SessionState.transitions` retains typed immutable from/to metadata, requesting model-call index,
 charged attempt, decision reference and application/refusal outcome. It contains no guessed token
 or dollar totals; the strict per-job accounting tracker owns accounting across these boundaries.
-Checkpoint receipts remain process-local bounded storage receipts, not crash-durability guarantees.
+Job state is live and process-local for the length of one turn; nothing about it is persistence or
+a crash-durability guarantee.
 
 ## Prompt cache key lifecycle
 
@@ -225,7 +226,7 @@ or Stop wins. Generated text is distinct from exact accepted text. Reasoning, bi
 provider continuation are excluded; selected model context has independent bounds.
 
 History is untrusted prompt text, never policy input. The broker still authorizes each invocation.
-Unknown effects fence further work. Memory checkpoints are supplied process-local storage, not
+Unknown effects fence further work. Live job state is process-local, not
 crash durability or broker audit. See [harness.md](harness.md) for exact bounds, retention trade-offs
 and remaining recording and validation limitations.
 
@@ -676,8 +677,8 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 - [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state) — public Responses state patterns, not current Dekopon behavior.
 
 Token accounting is owned by the mandatory harness ledger, across attempts, model/effort segments,
-checkpoint restore and terminal delivery dispositions. See [Accounting](observability.md#accounting)
+and terminal delivery dispositions. See [Accounting](observability.md#accounting)
 for optional usage, subset arithmetic, unknown spend and aggregation levels. Direct model adapters
 must accept an `AttemptRecorder`; standalone callers can supply a bounded `AttemptLog`, while the
-harness supplies its checkpoint-backed recorder. A completion return value is not the accounting
+harness supplies its journal-backed recorder. A completion return value is not the accounting
 commit point.

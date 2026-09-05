@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-harness"
-description = "Unprivileged checkpointed session runtime and token accounting for Dekopon agents"
+description = "Unprivileged session runtime and token accounting for Dekopon agents"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

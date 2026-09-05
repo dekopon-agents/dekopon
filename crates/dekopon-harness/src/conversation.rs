@@ -41,7 +41,7 @@ impl ConversationKey {
             subject: subject.to_owned(),
         }
     }
-    /// Scope commitment for checkpoint comparison; never sent to a model or used as a cache key.
+    /// Scope commitment for the journal's freshness fence; never sent to a model or used as a cache key.
     pub fn commitment(&self) -> String {
         crate::history::digest(
             &serde_json::to_vec(&[
@@ -190,7 +190,7 @@ impl BoundedConversationStore {
                 surface: surface.to_vec(),
                 cache_key: format!(
                     "{CONVERSATION_CACHE_PREFIX}-{}",
-                    crate::checkpoint::opaque_id()
+                    crate::journal::opaque_id()
                 ),
                 touched: now,
                 bytes: 0,

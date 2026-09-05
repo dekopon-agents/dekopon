@@ -40,5 +40,5 @@ there is no automatic effort fallback. Options remain per-call even on shared ca
 Reserve each inference HTTP attempt before transmission and observe normalized optional fields
 before content validation. The built-in subscription adapter counts its one explicit-401 retry
 separately; credential refresh is not inference. `AttemptLog` is a bounded standalone recorder,
-not a job accumulator. Harness consumers supply the job-owned checkpointed recorder. Cached input
+not a job accumulator. Harness consumers supply the job-owned journalled recorder. Cached input
 and reasoning output are subsets; no dollar pricing is inferred.

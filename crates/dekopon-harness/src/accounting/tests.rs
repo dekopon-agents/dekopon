@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     bootstrap::{BootstrapError, CapabilitySnapshot, SessionBootstrap},
-    checkpoint::FinalState,
     history::History,
+    journal::FinalState,
     runtime::ScriptRuntime,
     session::{CancellationProbe, PromptError, PromptLimits, SessionEngine},
 };
@@ -277,12 +277,12 @@ fn a_fence_after_a_completion_keeps_live_observations_and_terminalizes_with_them
             &mut History::default(),
         )
         .unwrap_err();
-    let PromptError::Interrupted { checkpoint, source } = error else {
+    let PromptError::Interrupted { state, source } = error else {
         panic!("the latest live state is carried")
     };
-    assert_eq!(source, CheckpointError::ScopeChanged);
+    assert_eq!(source, JournalError::ScopeChanged);
     assert_eq!(
-        checkpoint.state.accounting.totals().cumulative.input.known,
+        state.state.accounting.totals().cumulative.input.known,
         Some(100)
     );
     assert!(ledger.finalize(&DeliveryDisposition::Unknown));

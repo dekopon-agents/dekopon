@@ -782,7 +782,7 @@ async fn session(
     // re-read and re-encoded every granted schema for a projection the leg already validated.
     let capabilities = leg.capability_snapshot().clone();
     let surface = vec![capabilities.fingerprint(), leg.surface_epoch().to_string()];
-    let checkpoint_scope = key.commitment();
+    let journal_scope = key.commitment();
     let window = route.conversation.window();
     let ConversationSeed {
         history: seeded,
@@ -1024,7 +1024,7 @@ async fn session(
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
         let generated_image = GeneratedImageOutput::default();
-        let final_state = dekopon_harness::checkpoint::FinalState::default();
+        let final_state = dekopon_harness::journal::FinalState::default();
         let mut inputs = SessionBootstrap::new(
             &text,
             limits,
@@ -1034,7 +1034,7 @@ async fn session(
             },
         )
         .with_surface_epoch(&surface_epoch)
-        .with_scope(&checkpoint_scope)
+        .with_scope(&journal_scope)
         .with_capability_snapshot(&capabilities)
         .with_system(instructions.as_deref())
         .with_skills(&skills)
@@ -1077,8 +1077,8 @@ async fn session(
         // below. A session that never reached inference publishes nothing and is remembered as
         // nothing.
         let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::Interrupted { checkpoint, .. })) => {
-                Some(checkpoint.record.clone())
+            Err(SessionError::Prompt(PromptError::Interrupted { state, .. })) => {
+                Some(state.record.clone())
             }
             _ => final_state.take().map(|state| state.record),
         };
@@ -1116,13 +1116,10 @@ async fn session(
     let remember = |turn: Option<JobRecord>, delivery: DeliveryDisposition| {
         let job = usage.snapshot().job;
         if !job.is_empty()
-            && let Err(error) = dekopon_harness::checkpoint::finalize_delivery(
-                &job,
-                delivery.clone(),
-                usage.as_ref(),
-            )
+            && let Err(error) =
+                dekopon_harness::journal::finalize_delivery(&job, delivery.clone(), usage.as_ref())
         {
-            tracing::error!(event = "gateway_session_failed", category = "checkpoint-finalization", cause = %error);
+            tracing::error!(event = "gateway_session_failed", category = "journal-finalization", cause = %error);
         }
         if let Some(mut turn) = turn {
             turn.delivery = delivery;

@@ -1,8 +1,8 @@
 //! One factual ledger per logical job. Aggregation levels are projections, never additive spends.
 use crate::{
-    checkpoint::{CheckpointError, ExecutionJournal},
     control::{ModelIdentity, TransitionOutcome, TransitionRecord},
     history::DeliveryDisposition,
+    journal::{ExecutionJournal, JournalError},
 };
 use dekopon_model::{
     model::ModelUsage,
@@ -193,7 +193,7 @@ pub struct AccountingTotals {
     pub segments: Vec<SegmentTotals>,
 }
 
-/// Checkpointed source of truth. Totals are bounded checked projections, not independently mutable
+/// Journalled source of truth. Totals are bounded checked projections, not independently mutable
 /// counters. Restoring this value neither emits observations nor adds previously observed spend.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -310,13 +310,13 @@ impl JobAccounting {
     pub fn snapshot(&self) -> TokenTracker {
         self.lock().tracker.clone()
     }
-    pub(crate) fn install(&self, tracker: TokenTracker) -> Result<(), CheckpointError> {
+    pub(crate) fn install(&self, tracker: TokenTracker) -> Result<(), JournalError> {
         let mut live = self.lock();
         if !live.tracker.job.is_empty() {
             return if !live.tracker.finalized && live.tracker == tracker {
                 Ok(())
             } else {
-                Err(CheckpointError::Fenced)
+                Err(JournalError::Fenced)
             };
         }
         live.span = Some(
@@ -605,7 +605,7 @@ impl<'a, 'b> CallRecorder<'a, 'b> {
         outcome: CallOutcome,
         reason: &str,
         answer: bool,
-    ) -> Result<(), CheckpointError> {
+    ) -> Result<(), JournalError> {
         self.span.record("outcome", outcome.name());
         self.span.record("reason", reason);
         self.span
@@ -652,7 +652,7 @@ impl Drop for CallRecorder<'_, '_> {
             .is_none()
             && let Err(error) = self.finish(CallOutcome::Abandoned, "abandoned", false)
         {
-            tracing::error!(cause_type="abandoned-call-checkpoint", %error);
+            tracing::error!(cause_type="abandoned-call-journal", %error);
         }
     }
 }
@@ -703,7 +703,7 @@ impl AttemptRecorder for CallRecorder<'_, '_> {
         };
         self.journal.update(|_| {}).map_err(|e| {
             tracing::error!(cause_type="accounting-reservation", %e);
-            AccountingError("checkpoint reservation")
+            AccountingError("journal reservation")
         })?;
         Ok(attempt)
     }
@@ -715,7 +715,7 @@ impl AttemptRecorder for CallRecorder<'_, '_> {
     /// A second, differing report of the same attempt is provider-controlled data — duplicate
     /// `"usage"` keys in one object are legal JSON, and a stream can contradict itself — so making
     /// it fence the ledger handed a provider a way to end every later turn of the job and to make
-    /// the checkpoint unresumable. The disagreeing *fields* become unknown, named in a warning; the
+    /// the job state unusable. The disagreeing *fields* become unknown, named in a warning; the
     /// job keeps counting. A terminal report still supersedes an interim one outright.
     fn observe_ranked(
         &self,
@@ -777,7 +777,7 @@ impl AttemptRecorder for CallRecorder<'_, '_> {
         // Live evidence is installed before persistence can fail. Never retry from an older copy.
         self.journal.update(|_| {}).map_err(|e| {
             tracing::error!(cause_type="accounting-observation", %e);
-            AccountingError("checkpoint observation")
+            AccountingError("journal observation")
         })
     }
 }

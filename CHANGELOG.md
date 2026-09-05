@@ -166,8 +166,8 @@ All notable changes to Dekopon are documented here. The format is based on
   `gateway_activity_failed` cause types `activity-quarantine-full` and `activity-cleanup-abandoned`;
   the warn-level `conflicting-usage-observation` and `accounting-field-unreported` records naming
   the usage fields a tracker stopped trusting and the job they belong to; the error-level
-  `live-checkpoint-lock`, emitted where a poisoned checkpoint lock is recovered or fences the
-  lease; and the error-level `control-surface`, which names every conflict in a route's `controls:`
+  `live-job-state-lock`, emitted where a poisoned live-state lock is recovered or fences the
+  job; and the error-level `control-surface`, which names every conflict in a route's `controls:`
   block at construction. No new `audit.event` name.
 
 ### Changed
@@ -285,12 +285,24 @@ All notable changes to Dekopon are documented here. The format is based on
   and a defaulted `AttemptRecorder::observe_ranked`, and `ChatGptError` gains `Accounting`;
   `dekopon-harness` gains `control::ControlFailureKind` and `ControlError::Surface`, makes
   `TransitionOutcome::AuthorizationFailed` a struct variant carrying `cause`, adds `precedence` to
-  `AttemptRecord`, and publishes `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `checkpoint::FinalState`
+  `AttemptRecord`, and publishes `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `journal::FinalState`
   with `SessionBootstrap::with_final_state`, `CONVERSATION_CACHE_PREFIX`,
   `MAX_ACTIVITY_LABEL_BYTES`, `MAX_ACTIVITY_LABELS`, and `label_is_renderable`;
   `PolicyBuildError::{ReservedAction, DuplicateCapability}` and `BootstrapError::{Identifier,
   InvalidSchema}` carry every collision rather than one; and `dekopond`'s `cache_key::for_conversation`
   is deleted in favor of the harness-owned prefix constant both minting sites now share.
+
+- Renamed the harness checkpoint vocabulary to what the module is now. `dekopon_harness::checkpoint`
+  is `dekopon_harness::journal`, `Checkpoint` is `JobState`, `CheckpointError` is `JournalError`,
+  `PromptError::Checkpoint` is `PromptError::Journal`, and `PromptError::Interrupted`'s `checkpoint`
+  field is `state`. Nothing checkpoints: there is no store, no save, no revision and no resume, and
+  a name that says otherwise invites the store back. Emitted names moved with the code — the
+  `cause_type` tokens `live-checkpoint-lock`, `checkpoint-encoding`,
+  `checkpoint-reservation-fenced` and `abandoned-call-checkpoint` are now `live-job-state-lock`,
+  `journal-encoding`, `journal-reservation-fenced` and `abandoned-call-journal`, `dekopond`'s
+  `gateway_session_failed` category `checkpoint-finalization` is `journal-finalization`, and
+  `PromptError::telemetry_kind` answers `job-state` rather than `checkpoint` for a fenced session.
+  No `audit.event` name, span name or metric changed. Behavior is identical throughout.
 
 ### Removed
 
@@ -302,8 +314,8 @@ All notable changes to Dekopon are documented here. The format is based on
   distributed store with one in-process `BTreeMap` behind it: dekopon runs as a single executable
   on one machine, nothing ever resumed a snapshot, and if high availability arrives it will be
   Kubernetes leases in front of the process rather than an application-level protocol inside it.
-  `ExecutionJournal` now owns its `Checkpoint` directly and revalidates every field bound on every
-  mutation; `CheckpointError` keeps only the variants that still fire (`Capacity`, `Fenced`,
+  `ExecutionJournal` now owns its state directly and revalidates every field bound on every
+  mutation; the error type keeps only the variants that still fire (`Capacity`, `Fenced`,
   `Poisoned`, `Invalid`, `ScopeChanged`, `UnknownWork`, `Budget`), and `Checkpoint::{version,
   revision, finalized}` go with the terminal write that set them. The `Position` enum and
   `Checkpoint::position` are gone with the same design: the field told a resumer where to pick up,
@@ -312,7 +324,7 @@ All notable changes to Dekopon are documented here. The format is based on
   now measures only `record.groups`, the one field whose bound is a byte count, instead of
   encoding the whole document to check a store ceiling. A host that must remember the completed job
   reads the untrimmed record from the new `SessionBootstrap::with_final_state`
-  (`checkpoint::FinalState`), which is also how `dekopond` keeps a job whose text a narrow
+  (`journal::FinalState`), which is also how `dekopond` keeps a job whose text a narrow
   conversation window evicted.
 - `dekopond` no longer refuses to start on `sessions.maxConcurrent` above 128, and
   `ConfigProblem::ExcessiveMaxConcurrent` is gone. That ceiling was the checkpoint store's
@@ -332,7 +344,7 @@ All notable changes to Dekopon are documented here. The format is based on
 - Repair gateway test compilation and parallel accounting trace capture; pin interpreter job-span
   ancestry and make oversized-frame refusal tests independent of socket write buffering.
 - Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
-  before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
+  before journal reservation and bound eviction of inactive fenced jobs. Preserve batch-local
   results, restored history, failed/nullable response usage and terminal host delivery accounting.
 - Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
   authenticated installations, and coordinate final/progress channel posts with definitive-429-only
@@ -379,7 +391,7 @@ All notable changes to Dekopon are documented here. The format is based on
   and output the same attempt reported, and the calls it covered are no longer skipped for good;
   the field and the job are named in a warn-level `accounting-field-unreported` record.
 - A second, differing usage observation on one attempt marks that attempt's usage unknown instead
-  of fencing the job and its checkpoint. Duplicate `"usage"` keys in one JSON object and a
+  of fencing the job and its live state. Duplicate `"usage"` keys in one JSON object and a
   non-terminal SSE usage that disagrees with the terminal one are both handled that way, and a
   terminal `response.completed` usage wins over a non-terminal one when they differ.
 - `modelTurns` is unknown rather than zero for a recording whose call list names no chat call at

@@ -48,4 +48,4 @@ or permission to reuse a decision. A dropped/failed exchange fences the client; 
 
 `session_surface` now returns `(capabilities, command_words, chat_memory, surface_epoch)`.
 The required random startup epoch stays host-only: compare it along with metadata for history and
-checkpoint invalidation, never place it in a prompt. Old envelopes refuse before dispatch.
+freshness invalidation, never place it in a prompt. Old envelopes refuse before dispatch.

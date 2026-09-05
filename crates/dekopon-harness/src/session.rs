@@ -13,8 +13,8 @@ use crate::{
     tools::*,
 };
 use crate::{
-    checkpoint::{Checkpoint, CheckpointError, ExecutionJournal},
     history::{DeliveryDisposition, ToolGroup},
+    journal::{ExecutionJournal, JobState, JournalError},
 };
 use dekopon_config::Skill;
 use dekopon_model::model::{
@@ -171,7 +171,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
         }
 
         if prompt.len() > 128 * 1024 || limits.max_steps > 128 {
-            return Err(CheckpointError::Capacity.into());
+            return Err(JournalError::Capacity.into());
         }
         // The host may hand over the snapshot it already built for this message from the same
         // scoped runtime; building it twice per message is the same bounded projection twice.
@@ -249,17 +249,17 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
         let scope = scope.unwrap_or("direct");
         messages.extend(context_policy.unwrap_or(&default_policy).select(history));
         messages.push(ModelMessage::user(prompt));
-        let mut checkpoint = Checkpoint {
+        let mut job_state = JobState {
             scope: scope.to_owned(),
             surface,
             model: active.identity.model.clone(),
             effort: active.identity.effort.to_string(),
             context_revision: 0,
             record: JobRecord::new(
-                controls.map_or_else(crate::checkpoint::opaque_id, |c| c.job().to_owned()),
+                controls.map_or_else(crate::journal::opaque_id, |c| c.job().to_owned()),
                 prompt,
             ),
-            history: history.checkpoint_seed(),
+            history: history.journal_seed(),
             limits,
             state: SessionState {
                 current_model: Some(active.identity.clone()),
@@ -269,11 +269,11 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             },
             pending_execution: None,
         };
-        checkpoint.state.accounting.job = checkpoint.record.job.clone();
-        let activity = activity
-            .map(|(p, labels)| p.bind(checkpoint.record.job.clone(), labels, &capabilities));
-        let mut state = checkpoint.state.clone();
-        let journal = ExecutionJournal::new(checkpoint, accounting)?
+        job_state.state.accounting.job = job_state.record.job.clone();
+        let activity =
+            activity.map(|(p, labels)| p.bind(job_state.record.job.clone(), labels, &capabilities));
+        let mut state = job_state.state.clone();
+        let journal = ExecutionJournal::new(job_state, accounting)?
             .with_cancellation(cancellation)
             .with_activity(activity);
         let job_span = journal.accounting.span();
@@ -344,10 +344,10 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
         if let Err(source) = persisted {
             journal
                 .accounting
-                .generation(crate::accounting::CallOutcome::Failed, "checkpoint");
+                .generation(crate::accounting::CallOutcome::Failed, "job-state");
             result = Err(PromptError::Interrupted {
                 source,
-                checkpoint: Box::new(journal.snapshot()),
+                state: Box::new(journal.snapshot()),
             });
         }
         result
@@ -453,7 +453,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             if journal.snapshot().record.has_unknown_work()
                 || journal.snapshot().history.has_unknown_work()
             {
-                return Err(CheckpointError::UnknownWork.into());
+                return Err(JournalError::UnknownWork.into());
             }
             if crate::context::bound_live(messages)? {
                 state.skill_reads = SkillReads::default();
@@ -468,7 +468,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
                 journal.update(|c| c.context_revision += 1)?;
             }
             state.spent.model_calls = model_turns;
-            // Reserve the logical call before any checkpoint or transmission can fail.
+            // Reserve the logical call before any journal write or transmission can fail.
             let call_sequence = journal.accounting.reserve(
                 active.identity.clone(),
                 crate::accounting::CallKind::Chat,
@@ -598,9 +598,9 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
                         .expect("opaque items serialize")
                         .len(),
                 )
-                .ok_or(CheckpointError::Capacity)?;
+                .ok_or(JournalError::Capacity)?;
             if opaque_bytes > crate::context::MAX_GROUP_BYTES {
-                return Err(CheckpointError::Capacity.into());
+                return Err(JournalError::Capacity.into());
             }
             messages.push(assistant_message(&turn));
 
@@ -656,7 +656,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
                 .len()
                 > crate::context::MAX_GROUP_BYTES;
             if oversized {
-                return Err(CheckpointError::Capacity.into());
+                return Err(JournalError::Capacity.into());
             }
             journal.update(|c| {
                 c.record.groups.push(ToolGroup {
@@ -832,7 +832,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
                     && let Some(source) = assets
                 {
                     if state.spent.asset_fetches >= 4 {
-                        return Err(CheckpointError::Budget.into());
+                        return Err(JournalError::Budget.into());
                     }
                     state.spent.asset_fetches += 1;
                     journal.update(|c| c.state = state.clone())?;
@@ -939,7 +939,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
                     return Err(error.into());
                 }
                 if journal.snapshot().record.has_unknown_work() {
-                    return Err(CheckpointError::UnknownWork.into());
+                    return Err(JournalError::UnknownWork.into());
                 }
                 check_cancelled(cancellation)?;
             }
@@ -957,8 +957,8 @@ fn check_freshness<R: ScriptRuntime + ?Sized>(
 ) -> Result<(), PromptError> {
     runtime.check_freshness().map_err(|error| {
         tracing::warn!(cause_type = "session-surface-fenced", cause = %error);
-        journal.failure(CheckpointError::ScopeChanged);
-        PromptError::Checkpoint(CheckpointError::ScopeChanged)
+        journal.failure(JournalError::ScopeChanged);
+        PromptError::Journal(JournalError::ScopeChanged)
     })
 }
 
@@ -1035,12 +1035,12 @@ pub enum PromptError {
     /// A fenced session hands back its latest live state; no observation is rolled back.
     #[error("session fenced: {source}; live observations retained, no automatic retry is safe")]
     Interrupted {
-        source: CheckpointError,
-        checkpoint: Box<Checkpoint>,
+        source: JournalError,
+        state: Box<JobState>,
     },
     /// A state, evidence-capacity or unresolved-work fence halted the session.
     #[error(transparent)]
-    Checkpoint(#[from] CheckpointError),
+    Journal(#[from] JournalError),
     /// The fresh capability surface or selected model identity was invalid or oversized.
     #[error(transparent)]
     Bootstrap(#[from] BootstrapError),
@@ -1169,7 +1169,7 @@ impl PromptError {
     #[must_use]
     pub fn telemetry_kind(&self) -> &'static str {
         match self {
-            Self::Checkpoint(_) | Self::Interrupted { .. } => "checkpoint",
+            Self::Journal(_) | Self::Interrupted { .. } => "job-state",
             Self::Accounting(_) => "accounting",
             Self::Control(_) => "model-control",
             Self::Bootstrap(_) => "invalid-bootstrap",

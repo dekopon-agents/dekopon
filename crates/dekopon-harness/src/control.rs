@@ -1,4 +1,4 @@
-//! Configured model intent and checkpointed safe-boundary application. Tools confer no authority.
+//! Configured model intent and journalled safe-boundary application. Tools confer no authority.
 use std::sync::{Arc, Mutex};
 
 use dekopon_broker_protocol::{
@@ -79,14 +79,14 @@ pub enum ControlError {
 
 /// Why a control transition could not be authorized, on the axis an operator acts on.
 ///
-/// Carried by [`TransitionOutcome::AuthorizationFailed`] so it survives into the checkpointed
+/// Carried by [`TransitionOutcome::AuthorizationFailed`] so it survives into the journalled
 /// transition record and the accounting event. `AuthorizationFailed` on its own collapses a
 /// substituted decision binding, a broker that never answered, and a spent attempt budget into one
 /// token, and the underlying `ClientError` was logged nowhere at all.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ControlFailureKind {
-    /// The transition was interrupted before any broker answer — a checkpoint or host failure.
+    /// The transition was interrupted before any broker answer — a journal or host failure.
     Interrupted,
     /// This session's own control surface or client was unusable.
     Configuration,
