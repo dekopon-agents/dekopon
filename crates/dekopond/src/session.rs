@@ -83,8 +83,8 @@ const SESSION_COMPLETING: u8 = 2;
 /// One conversation, for in-flight serialization only.
 ///
 /// Deliberately subject-free, and deliberately not the history key. Two people talking at once in
-/// one thread are one thing to serialize and two things to remember; `ConversationKey` in
-/// [`crate::conversation`] is the other question and carries the sender.
+/// one thread are one thing to serialize and two things to remember;
+/// [`dekopon_harness::conversation::ConversationKey`] is the other question and carries the sender.
 type AdmissionKey = (String, String, Option<String>);
 
 /// One model client, shared by every session that routes to the same configured model.
@@ -774,14 +774,18 @@ async fn session(
     // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
-    let surface = match dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&leg) {
-        Ok(snapshot) => vec![snapshot.fingerprint(), leg.surface_epoch().to_string()],
+    // Built once for this message and handed to the engine below. It is the same bounded
+    // projection the session's runtime would build for itself; building it twice per message
+    // re-read and re-encoded every granted schema for a fingerprint we already have.
+    let capabilities = match dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&leg) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::error!(event = "gateway_session_failed", category = "invalid-bootstrap", cause = %error);
             answer(replier, message, FAILURE_REPLY).await;
             return "failed";
         }
     };
+    let surface = vec![capabilities.fingerprint(), leg.surface_epoch().to_string()];
     let checkpoint_scope = key.commitment();
     let window = route.conversation.window();
     let ConversationSeed {
@@ -1010,6 +1014,7 @@ async fn session(
         )
         .with_surface_epoch(&surface_epoch)
                 .with_scope(&checkpoint_scope)
+        .with_capability_snapshot(&capabilities)
         .with_system(instructions.as_deref())
         .with_skills(&skills)
         .with_options(&options)

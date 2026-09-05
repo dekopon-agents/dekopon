@@ -891,9 +891,13 @@ pub(crate) fn resolve(
             models_incomplete = true;
             continue;
         }
-        if name.parse::<dekopon_core::ConfiguredModelId>().is_err() {
-            problems.push(ConfigProblem::InvalidControlConfiguration {
-                reason: "model name is not a configured-model identifier".into(),
+        // The grammar applies whether or not this deployment configures `controls:`, because the
+        // name is the configured-model identity everywhere it is used. Blaming a feature the
+        // operator is not using, and never printing the name, was a refusal nobody could act on.
+        if let Err(error) = name.parse::<dekopon_core::ConfiguredModelId>() {
+            problems.push(ConfigProblem::InvalidModelName {
+                name: name.clone(),
+                reason: error.to_string(),
             });
         }
         if !model_names.insert(name.clone()) {
@@ -942,13 +946,19 @@ pub(crate) fn resolve(
                 || controls.models.len() > dekopon_broker_protocol::MAX_CONTROL_TARGETS
             {
                 problems.push(ConfigProblem::InvalidControlConfiguration {
-                    reason: "controls.models must contain 1..=16 candidates".into(),
+                    reason: format!(
+                        "controls.models must contain 1..={} candidates",
+                        dekopon_broker_protocol::MAX_CONTROL_TARGETS
+                    ),
                 });
             }
             if !(1..=dekopon_broker_protocol::MAX_CONTROL_ATTEMPTS).contains(&controls.max_attempts)
             {
                 problems.push(ConfigProblem::InvalidControlConfiguration {
-                    reason: "controls.maxAttempts must be 1..=4".into(),
+                    reason: format!(
+                        "controls.maxAttempts must be 1..={}",
+                        dekopon_broker_protocol::MAX_CONTROL_ATTEMPTS
+                    ),
                 });
             }
             let mut seen = BTreeSet::new();
@@ -965,12 +975,34 @@ pub(crate) fn resolve(
                 }
             }
         }
-        if route.activity_labels.len() > 256
-            || route.activity_labels.iter().any(|(id, label)| {
-                id.parse::<dekopon_core::CapabilityId>().is_err() || label.len() > 80
-            })
-        {
-            problems.push(ConfigProblem::InvalidActivityLabels);
+        if route.activity_labels.len() > dekopon_harness::activity::MAX_ACTIVITY_LABELS {
+            problems.push(ConfigProblem::TooManyActivityLabels {
+                agent: route.agent.to_string(),
+                actual: route.activity_labels.len(),
+                maximum: dekopon_harness::activity::MAX_ACTIVITY_LABELS,
+            });
+        }
+        // Every offending entry, with the rule it broke. The byte bound is the harness's own
+        // renderability check rather than a raw byte count, so a label this gate accepts is the
+        // label the transport shows: counting raw bytes accepted strings the harness truncates.
+        for (id, label) in &route.activity_labels {
+            let reason = if id.parse::<dekopon_core::CapabilityId>().is_err() {
+                Some("the key is not a capability identifier".to_owned())
+            } else if !dekopon_harness::activity::label_is_renderable(label) {
+                Some(format!(
+                    "the label must be at most {} UTF-8 bytes and must not be blank once control and directional characters are stripped",
+                    dekopon_harness::activity::MAX_ACTIVITY_LABEL_BYTES
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                problems.push(ConfigProblem::InvalidActivityLabel {
+                    agent: route.agent.to_string(),
+                    capability: id.clone(),
+                    reason,
+                });
+            }
         }
         if route.image_generator && config.image_generator.is_none() {
             problems.push(ConfigProblem::UnconfiguredRouteImageGenerator {
@@ -1029,6 +1061,15 @@ pub(crate) fn resolve(
 
     if config.sessions.max_concurrent == 0 {
         problems.push(ConfigProblem::InvalidSessionLimits);
+    }
+    // Every live session holds a checkpoint lease, and every lease reserves the whole per-job
+    // ceiling in the harness's bounded store. Admitting more sessions than the store admits leases
+    // turns the surplus into `Capacity` refusals under load, which is the worst place to find out.
+    if config.sessions.max_concurrent > dekopon_harness::checkpoint::MAX_JOBS {
+        problems.push(ConfigProblem::ExcessiveMaxConcurrent {
+            actual: config.sessions.max_concurrent,
+            maximum: dekopon_harness::checkpoint::MAX_JOBS,
+        });
     }
     if config.sessions.max_conversations == 0 {
         problems.push(ConfigProblem::InvalidMaxConversations);
@@ -1317,6 +1358,10 @@ pub enum ConfigProblem {
     UnnamedModel,
     #[error("model name {name:?} is declared more than once")]
     DuplicateModel { name: String },
+    #[error(
+        "models[].name {name:?} is not a configured-model identifier: {reason}. The grammar applies to every configured model, whether or not the deployment configures controls"
+    )]
+    InvalidModelName { name: String, reason: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
     #[error("the image generator must name a model")]
@@ -1327,10 +1372,20 @@ pub enum ConfigProblem {
         "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none and progressMessage false, and classic native activity requires fallback reaction or progressMessage true"
     )]
     InvalidSlackActivity { name: String },
+    #[error("route for agent {agent:?} declares {actual} activityLabels; at most {maximum} bind")]
+    TooManyActivityLabels {
+        agent: String,
+        actual: usize,
+        maximum: usize,
+    },
     #[error(
-        "activityLabels requires at most 256 valid capability IDs with labels of at most 80 UTF-8 bytes"
+        "route for agent {agent:?} has an invalid activityLabels entry {capability:?}: {reason}"
     )]
-    InvalidActivityLabels,
+    InvalidActivityLabel {
+        agent: String,
+        capability: String,
+        reason: String,
+    },
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
@@ -1353,6 +1408,10 @@ pub enum ConfigProblem {
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
     InvalidSessionLimits,
+    #[error(
+        "sessions.maxConcurrent is {actual}; at most {maximum} sessions can hold a checkpoint lease at once (dekopon_harness::checkpoint::MAX_JOBS)"
+    )]
+    ExcessiveMaxConcurrent { actual: usize, maximum: usize },
     #[error(
         "route for agent {agent:?} declares a persistent conversation with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
     )]

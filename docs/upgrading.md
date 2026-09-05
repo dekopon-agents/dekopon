@@ -67,6 +67,20 @@ New transcript events identify context revision/full versus delta; the reader cu
 later full rebuilds. Checkpoints are version 2 process-local memory, not on-disk upgrade state.
 See [the runtime contract and remaining integration gaps](harness.md).
 
+**Every `models[].name` in `dekopond.yaml` must now be a configured-model identifier**:
+`[a-z0-9][a-z0-9._-]{0,63}`, so lowercase, starting with a letter or digit, at most 64 bytes.
+A 0.12.0 file naming a model `GPT-5`, `Local Qwen` or `_scratch` no longer starts, and the grammar
+applies whether or not the deployment configures `controls:` — the name is the model's configured
+identity everywhere it is used, not a controls field. Rename the model and every `routes[].model`
+and `controls.models` entry that points at it in the same edit; the name is a local alias, so
+renaming it changes no endpoint and no credential. The refusal names `models[].name` and the
+offending value, and every offending name is reported in one startup failure.
+
+`sessions.maxConcurrent` is now validated against the harness checkpoint store's lease ceiling
+(`dekopon_harness::checkpoint::MAX_JOBS`, 128). A configuration asking for more sessions than the
+store admits leases is refused at startup instead of turning the surplus into capacity failures
+under load; the refusal names the field, the value and the constant.
+
 ### 0.12.0 → next (unreleased) — core controls and `v1alpha3`
 
 Upgrade all four executables together. `authorizeControl` and the required host-only
