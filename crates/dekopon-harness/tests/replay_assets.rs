@@ -181,7 +181,7 @@ fn emitted_asset_interleaving_reconstructs_with_both_results_and_without_bytes()
                 inputs(),
             );
             assert_eq!(report.error, None);
-            assert_eq!(report.recorded.model_turns, 2);
+            assert_eq!(report.recorded.model_turns, Some(2));
             for id in ["asset", "script"] {
                 let mut broken = records.clone();
                 let delta = broken

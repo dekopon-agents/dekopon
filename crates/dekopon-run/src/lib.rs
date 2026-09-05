@@ -1182,7 +1182,9 @@ fn render_replay(report: &ReplayReport) -> String {
     ] {
         text.push_str(&format!(
             "{label}: {} turn(s), {} script(s), {} token(s), answer: {}\n",
-            summary.model_turns,
+            summary
+                .model_turns
+                .map_or_else(|| "-".to_owned(), |turns| turns.to_string()),
             summary.scripts.len(),
             summary
                 .usage
@@ -1209,6 +1211,12 @@ fn render_replay(report: &ReplayReport) -> String {
             ));
         }
         None => text.push_str("divergence: none\n"),
+    }
+    if report.dropped_history_turns > 0 {
+        text.push_str(&format!(
+            "history: {} recorded exchange(s) did not fit the replay's retention window\n",
+            report.dropped_history_turns
+        ));
     }
     let width = report
         .recorded

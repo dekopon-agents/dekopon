@@ -203,7 +203,7 @@ fn persistent_tool_history_and_model_switch_revisions_reconstruct_without_recoun
     assert_eq!(report.error, None);
     assert_eq!(report.divergence, None);
     assert_eq!(report.replayed.scripts, ["posts.count"]);
-    assert_eq!(report.replayed.model_turns, 2);
+    assert_eq!(report.replayed.model_turns, Some(2));
     assert_eq!(
         ledger.snapshot().calls.len(),
         2,
@@ -332,4 +332,110 @@ fn full_revisions_can_trim_groups_but_cannot_change_observed_results() {
             .to_string()
             .contains("conflicting tool results")
     );
+}
+
+/// The replay validator and the live enforcer must agree about where a byte group ends.
+///
+/// `context::bound_live` resets its group at any non-`tool` message, the byte-free attachment
+/// summary asset dispatch appends included. A validator that kept counting across that summary
+/// refused portable context the live session had itself produced and accepted.
+#[test]
+fn the_replay_validator_and_the_live_enforcer_agree_on_group_bytes() {
+    fn recorded(role: &str, content: &str, calls: &[ModelToolCall], id: Option<&str>) -> Value {
+        json!({
+            "role": role,
+            "content": content,
+            "tool_calls": calls,
+            "tool_call_id": id,
+        })
+    }
+    fn live(role: &str, content: &str, calls: &[ModelToolCall], id: Option<&str>) -> ModelMessage {
+        match (role, id) {
+            ("assistant", _) => assistant_message(&AssistantTurn {
+                content: (!content.is_empty()).then(|| content.to_owned()),
+                tool_calls: calls.to_vec(),
+                usage: None,
+                replay_items: Vec::new(),
+            }),
+            ("tool", Some(id)) => ModelMessage::tool(id, content),
+            _ => ModelMessage::user(content),
+        }
+    }
+    // Both accounting rules see the same sequence; only where they reset the group differs.
+    let asset = tool(
+        "asset-call",
+        crate::tools::ASSET_TOOL_NAME,
+        json!({"id": "a"}),
+    );
+    let script = tool("script-call", "bash", json!({"script": "posts.count"}));
+    let cases = [
+        // The whole batch is over the ceiling only if the attachment summary is counted with it.
+        (300 * 1024, 300 * 1024, 100 * 1024, false),
+        // Genuinely oversized under either rule: one result alone passes the group ceiling.
+        (600 * 1024, 1, 1, true),
+    ];
+    for (asset_bytes, attachment_bytes, script_bytes, refused) in cases {
+        let parts: Vec<(&str, String, Vec<ModelToolCall>, Option<&str>)> = vec![
+            ("user", "prompt".to_owned(), vec![], None),
+            (
+                "assistant",
+                String::new(),
+                vec![asset.clone(), script.clone()],
+                None,
+            ),
+            ("tool", "a".repeat(asset_bytes), vec![], Some("asset-call")),
+            ("user", "b".repeat(attachment_bytes), vec![], None),
+            (
+                "tool",
+                "c".repeat(script_bytes),
+                vec![],
+                Some("script-call"),
+            ),
+        ];
+        let contexts: Vec<RecordedContext> = vec![
+            serde_json::from_value(json!({
+                "turn": 1, "revision": 0, "scope": "full",
+                "messages": [recorded(parts[0].0, &parts[0].1, &parts[0].2, parts[0].3)],
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "turn": 2, "revision": 0, "scope": "delta",
+                "messages": parts[1..]
+                    .iter()
+                    .map(|(role, content, calls, id)| recorded(role, content, calls, *id))
+                    .collect::<Vec<_>>(),
+            }))
+            .unwrap(),
+        ];
+        let mut messages: Vec<ModelMessage> = parts
+            .iter()
+            .map(|(role, content, calls, id)| live(role, content, calls, *id))
+            .collect();
+
+        let validator = super::context::validate_contexts(&contexts);
+        let enforcer = crate::context::bound_live(&mut messages).expect("the request has a batch");
+
+        assert_eq!(
+            validator.is_err(),
+            enforcer,
+            "validator {validator:?} disagreed with the live enforcer (trimmed: {enforcer}) for \
+             {asset_bytes}/{attachment_bytes}/{script_bytes}"
+        );
+        assert_eq!(validator.is_err(), refused, "{validator:?}");
+    }
+}
+
+/// Two malformed revisions in one recording are both named, not just the first.
+#[test]
+fn two_simultaneous_context_conflicts_are_both_reported() {
+    let (mut records, _) = fixture();
+    records[3]["context_revision"] = json!(1);
+    records[6]["transcript_scope"] = json!("other");
+
+    let error = RecordedSession::from_records("portable", &records)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("turn 2 has invalid"), "{error}");
+    assert!(error.contains("turn 3 has invalid"), "{error}");
 }
