@@ -55,20 +55,40 @@ writing back cloned windows. Refusal, idle/capacity eviction or changed full met
 fences late appends and rotates cache keys, including A→B→A. `oneShot` imports no previous jobs.
 These comparisons do not cache authorization; every provider invocation still reaches the broker.
 
+Seeding a session touches the conversation, so the idle timeout runs from the last *message* and
+the conversation a session is answering is never that session's or a concurrent one's eviction
+victim. Both ceilings are read from running byte totals maintained where turns are appended and
+dropped — `History::bytes()` and the store's own total are O(1) — so neither a lookup nor an
+eviction step ever encodes the retained corpus. `HistoryLimits::MAX_TURNS` and
+`HistoryLimits::MAX_BYTES` are the hard clamps any configured window is reduced to, published so a
+reader reconstructing a recorded history can report what the clamp dropped.
+
 ## Checkpoints, accounting and controls
 
 All engines consume supplied bounded memory checkpoints by default. Version 2 snapshots contain
 position/revision/scope/surface, model/effort, portable history/evidence, pending work, spent budgets,
 one-attempt flags, skill state and the mandatory token tracker including sequences/report cursor
 and terminal flags. Storage uses exclusive live-job leases and compare-and-save receipts; limits
-are 128 jobs, 64 MiB total and 2 MiB per snapshot. Active jobs reserve worst-case space and are not
-evicted. Capacity failure precedes work. Saves surround dispatch observations, transitions and
-terminalization; failed persistence fences old copies and retains live observations.
+are `MAX_JOBS` = 128 jobs, 2 MiB per snapshot, and a store ceiling of exactly
+`MAX_JOBS * MAX_CHECKPOINT_BYTES` = 256 MiB so the two agree. Active jobs reserve worst-case space
+and are not evicted, which makes `MAX_JOBS` a **concurrency ceiling**: every live session holds one
+lease, so `dekopond` refuses a `sessions.maxConcurrent` above it at startup rather than converting
+the surplus into capacity refusals under load. A store already holding `MAX_JOBS` leases refuses
+the next one before evicting anything, so a refusal never destroys the snapshots the other
+in-flight messages still need. Capacity failure precedes work, and the refusal names the ceiling.
+Each stored snapshot's encoded size is measured once by the save that stored it, so eviction reads
+cached sizes rather than re-encoding every stored checkpoint on every step. Saves surround dispatch
+observations, transitions and terminalization; failed persistence fences old copies and retains
+live observations.
 
 These are **process-local storage receipts**, not crash durability, broker audit checkpoints,
 automatic recovery of binary assets or exactly-once execution. Resume requires matching scope and
 fresh surface, preserves consumed limits and refuses unresolved work. A noninitial model selection
 requires fresh admission from the configured baseline; stored decisions grant nothing.
+**No shipped binary resumes a checkpoint today.** Neither `dekopond` nor `dekopon-run` calls the
+resume path: a checkpoint is what a failing session leaves behind for inspection and what fences a
+retry, not a queue something drains. `SessionBootstrap::with_resume` is crate-visible for that
+reason, and the engine's own tests are what exercise the path.
 
 `TokenTracker` owns logical chat/image calls and bounded inference-attempt observations across
 model segments and resume. `ChatModel`/`ImageGenerator` require `AttemptRecorder`: reserve before

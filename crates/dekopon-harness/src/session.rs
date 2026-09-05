@@ -159,6 +159,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             scope,
             surface_epoch,
             resume,
+            capabilities: prebuilt_capabilities,
             controls,
             context_policy,
             prompt,
@@ -187,7 +188,12 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
         if prompt.len() > 128 * 1024 || limits.max_steps > 128 {
             return Err(CheckpointError::Capacity.into());
         }
-        let capabilities = self.runtime.capability_snapshot()?;
+        // The host may hand over the snapshot it already built for this message from the same
+        // scoped runtime; building it twice per message is the same bounded projection twice.
+        let capabilities = match prebuilt_capabilities {
+            Some(capabilities) => capabilities.clone(),
+            None => self.runtime.capability_snapshot()?,
+        };
         if let Some(controls) = controls
             && (surface_epoch != Some(controls.epoch())
                 || resume.is_some_and(|job| job != controls.job()))
@@ -635,7 +641,15 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             drop(recorder);
             drop(model_span);
             if turn.tool_calls.is_empty() {
-                journal.update(|c| c.record.generated = turn.content.clone())?;
+                // Only text that would actually be sent is recorded as generated. Storing the raw
+                // content here and rejecting whitespace-only content a few lines below left the
+                // checkpoint claiming an answer the session then refused to deliver, so a resumed
+                // job — and the conversation this turn is appended to — reported a blank answer.
+                let generated = turn
+                    .content
+                    .clone()
+                    .filter(|content| !content.trim().is_empty());
+                journal.update(|c| c.record.generated = generated)?;
             }
             check_cancelled(cancellation)?;
             opaque_bytes = opaque_bytes

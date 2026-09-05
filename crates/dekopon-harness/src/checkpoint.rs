@@ -16,8 +16,40 @@ use thiserror::Error;
 
 pub const CHECKPOINT_VERSION: u32 = 2;
 pub const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_JOBS: usize = 128;
-const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
+/// Live checkpoint leases the bounded store admits at once.
+///
+/// Every lease reserves [`MAX_CHECKPOINT_BYTES`] of the store's ceiling before any work, so this
+/// is a **concurrency ceiling**, not just a memory one: an embedder that admits more sessions than
+/// this concurrently gets `Capacity` refusals instead of answers. `dekopond` validates
+/// `sessions.maxConcurrent` against it at startup rather than discovering it under load.
+pub const MAX_JOBS: usize = 128;
+/// The store ceiling, sized so the byte bound and the lease bound agree at [`MAX_JOBS`].
+const MAX_STORE_BYTES: usize = MAX_JOBS * MAX_CHECKPOINT_BYTES;
+
+/// Measures a value's JSON encoding without building it.
+///
+/// A bound is measured, never materialized: the ceiling checks on this hot path run several times
+/// per tool call, and `serde_json::to_vec` would allocate and discard a copy of the snapshot each
+/// time. The count is the same one the encoder would have written, so there is still exactly one
+/// definition of "how big is this".
+fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|error| {
+        tracing::error!(cause_type = "checkpoint-encoding", %error);
+        CheckpointError::Invalid
+    })?;
+    Ok(counter.0)
+}
 
 pub(crate) fn opaque_id() -> String {
     let mut a = std::collections::hash_map::RandomState::new().build_hasher();
@@ -29,7 +61,9 @@ pub(crate) fn opaque_id() -> String {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CheckpointError {
-    #[error("checkpoint capacity exhausted before work")]
+    #[error(
+        "checkpoint capacity exhausted before work; the store admits at most {MAX_JOBS} live leases of {MAX_CHECKPOINT_BYTES} bytes each"
+    )]
     Capacity,
     #[error(
         "checkpoint lease is fenced; latest live observations must not be replaced by an older copy"
@@ -135,12 +169,7 @@ impl Checkpoint {
         {
             return Err(CheckpointError::Invalid);
         }
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| {
-                tracing::error!(cause_type = "checkpoint-encoding", %error);
-                CheckpointError::Invalid
-            })?
-            .len();
+        let bytes = encoded_len(self)?;
         if bytes > MAX_CHECKPOINT_BYTES {
             return Err(CheckpointError::Capacity);
         }
@@ -198,6 +227,11 @@ struct Entry {
     lease: Option<String>,
     fenced: bool,
     touched: u64,
+    /// Encoded size of `checkpoint`, measured once by the save that stored it.
+    ///
+    /// Eviction walks every entry on every step; re-encoding each stored snapshot there made a
+    /// capacity refusal cost megabytes of JSON per iteration.
+    bytes: usize,
 }
 #[derive(Default)]
 pub struct MemoryCheckpointStore {
@@ -240,6 +274,13 @@ impl CheckpointStore for MemoryCheckpointStore {
         } else if !new {
             return Err(CheckpointError::NotFound);
         }
+        // Leases alone can fill the store, and evicting stored checkpoints cannot make room for
+        // one more of them. Refuse first: a full store must not destroy every resumable snapshot
+        // on its way to reporting that it had no room to begin with.
+        let leased = entries.values().filter(|e| e.lease.is_some()).count();
+        if leased >= MAX_JOBS {
+            return Err(CheckpointError::Capacity);
+        }
         // Reserve the entire per-job ceiling before work; active jobs cannot be evicted.
         loop {
             let used: usize = entries
@@ -248,9 +289,7 @@ impl CheckpointStore for MemoryCheckpointStore {
                     if e.lease.is_some() {
                         MAX_CHECKPOINT_BYTES
                     } else {
-                        e.checkpoint.as_ref().map_or(0, |c| {
-                            serde_json::to_vec(c).expect("checkpoint serializes").len()
-                        })
+                        e.bytes
                     }
                 })
                 .sum();
@@ -271,6 +310,7 @@ impl CheckpointStore for MemoryCheckpointStore {
             lease: None,
             fenced: false,
             touched,
+            bytes: 0,
         });
         entry.lease = Some(lease.clone());
         entry.touched = touched;
@@ -282,7 +322,7 @@ impl CheckpointStore for MemoryCheckpointStore {
         expected: u64,
         checkpoint: &Checkpoint,
     ) -> Result<SaveReceipt, CheckpointError> {
-        checkpoint.validate()?;
+        let bytes = checkpoint.validate()?;
         let mut entries = self.entries.lock().map_err(|error| {
             tracing::error!(cause_type = "checkpoint-lock", %error);
             CheckpointError::Poisoned
@@ -300,6 +340,9 @@ impl CheckpointStore for MemoryCheckpointStore {
         let mut next = checkpoint.clone();
         next.revision = revision;
         entry.checkpoint = Some(next);
+        // The revision bump changes the encoding by at most a few digits; the eviction ceiling is
+        // a bound, not an audited total, and this keeps it one measurement per save.
+        entry.bytes = bytes;
         Ok(SaveReceipt { revision })
     }
     fn release(&self, job: &str, lease: &str, fenced: bool) {
@@ -381,18 +424,24 @@ impl<'a> ExecutionJournal<'a> {
         self.cancellation
             .is_some_and(crate::session::CancellationProbe::is_cancelled)
     }
+    /// Reads the live state, recovering a poisoned lock the way [`Drop`] does.
+    ///
+    /// A panic inside an update closure must not turn every later read of the ledger into a second
+    /// panic: the observations already recorded are exactly what a failing session still has to
+    /// report. The write path (`update`) still refuses under a poisoned lock and fences the lease.
+    fn live(&self) -> std::sync::MutexGuard<'_, Live> {
+        self.inner.lock().unwrap_or_else(|error| {
+            tracing::error!(cause_type = "live-checkpoint-lock", %error);
+            error.into_inner()
+        })
+    }
     pub(crate) fn snapshot(&self) -> Checkpoint {
-        let mut snapshot = self
-            .inner
-            .lock()
-            .expect("live checkpoint")
-            .checkpoint
-            .clone();
+        let mut snapshot = self.live().checkpoint.clone();
         snapshot.state.accounting = self.accounting.snapshot();
         snapshot
     }
     pub(crate) fn error(&self) -> Option<CheckpointError> {
-        self.inner.lock().expect("live checkpoint").error
+        self.live().error
     }
     pub(crate) fn update(&self, f: impl FnOnce(&mut Checkpoint)) -> Result<(), CheckpointError> {
         let mut live = self.inner.lock().map_err(|error| {
@@ -402,12 +451,9 @@ impl<'a> ExecutionJournal<'a> {
         f(&mut live.checkpoint); // preserve newly observed facts even when already fenced
         live.checkpoint.state.accounting = self.accounting.snapshot();
         // Independently bound model-facing groups without erasing the execution ledger. Keep a
-        // labelled position marker for an omitted batch rather than orphaning its results.
-        while serde_json::to_vec(&live.checkpoint.record.groups)
-            .expect("groups serialize")
-            .len()
-            > crate::context::MAX_GROUP_BYTES
-        {
+        // labelled position marker for an omitted batch rather than orphaning its results. The
+        // bound is measured, never materialized: `update` runs several times per tool call.
+        while encoded_len(&live.checkpoint.record.groups)? > crate::context::MAX_GROUP_BYTES {
             let Some(group) = live
                 .checkpoint
                 .record
@@ -513,19 +559,12 @@ impl<'a> ExecutionJournal<'a> {
         })
     }
     pub(crate) fn failure(&self, error: CheckpointError) {
-        self.inner
-            .lock()
-            .expect("live checkpoint")
-            .error
-            .get_or_insert(error);
+        self.live().error.get_or_insert(error);
     }
 }
 impl Drop for ExecutionJournal<'_> {
     fn drop(&mut self) {
-        let live = self.inner.lock().unwrap_or_else(|error| {
-            tracing::error!(cause_type = "checkpoint-drop-lock", %error);
-            error.into_inner()
-        });
+        let live = self.live();
         self.store.release(
             &live.checkpoint.record.job,
             &self.lease,

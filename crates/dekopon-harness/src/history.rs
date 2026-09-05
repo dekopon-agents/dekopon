@@ -15,6 +15,15 @@ pub struct HistoryLimits {
     pub max_turns: usize,
     pub max_bytes: usize,
 }
+impl HistoryLimits {
+    /// Hard turn ceiling [`History::new`] clamps any configured window to.
+    ///
+    /// Public because a reader that reconstructs a recorded history has to know how many turns the
+    /// clamp can silently drop before it reports the reconstruction as complete.
+    pub const MAX_TURNS: usize = 128;
+    /// Hard retained-byte ceiling [`History::new`] clamps any configured window to.
+    pub const MAX_BYTES: usize = 1024 * 1024;
+}
 impl Default for HistoryLimits {
     fn default() -> Self {
         Self {
@@ -222,23 +231,56 @@ impl JobRecord {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+/// The wire shape of a [`History`]. The cached byte totals are derived, never transported.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HistoryFields {
+    turns: Vec<JobRecord>,
+    limits: HistoryLimits,
+    unresolved: bool,
+}
+impl From<HistoryFields> for History {
+    fn from(fields: HistoryFields) -> Self {
+        let sizes = fields
+            .turns
+            .iter()
+            .map(JobRecord::bytes)
+            .collect::<Vec<_>>();
+        Self {
+            bytes: sizes.iter().sum(),
+            sizes,
+            turns: fields.turns,
+            limits: fields.limits,
+            unresolved: fields.unresolved,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(from = "HistoryFields")]
 pub struct History {
     turns: Vec<JobRecord>,
     limits: HistoryLimits,
     // Never erase unresolved-effect warnings merely because the evidence window was trimmed.
     unresolved: bool,
+    /// Encoded size of each retained turn, in `turns` order.
+    ///
+    /// Maintained where turns are appended and dropped so that [`History::bytes`] — which a store
+    /// ceiling evaluates on every append and on every eviction step — never serializes the corpus.
+    #[serde(skip)]
+    sizes: Vec<usize>,
+    /// Running total of `sizes`.
+    #[serde(skip)]
+    bytes: usize,
 }
 impl History {
     pub fn new(limits: HistoryLimits) -> Self {
         Self {
-            turns: Vec::new(),
             limits: HistoryLimits {
-                max_turns: limits.max_turns.min(128),
-                max_bytes: limits.max_bytes.min(1024 * 1024),
+                max_turns: limits.max_turns.min(HistoryLimits::MAX_TURNS),
+                max_bytes: limits.max_bytes.min(HistoryLimits::MAX_BYTES),
             },
-            unresolved: false,
+            ..Self::default()
         }
     }
     #[cfg(test)]
@@ -264,16 +306,17 @@ impl History {
     pub fn is_empty(&self) -> bool {
         self.turns.is_empty()
     }
+    /// Retained bytes, read from the running total rather than by encoding the corpus.
     pub fn bytes(&self) -> usize {
-        self.turns.iter().map(JobRecord::bytes).sum()
+        self.bytes
     }
     pub fn has_unknown_work(&self) -> bool {
         self.unresolved || self.turns.iter().any(JobRecord::has_unknown_work)
     }
     pub(crate) fn checkpoint_seed(&self) -> Self {
         let mut seed = self.clone();
-        while seed.bytes() > 256 * 1024 && !seed.turns.is_empty() {
-            seed.turns.remove(0);
+        while seed.bytes > 256 * 1024 && !seed.turns.is_empty() {
+            seed.drop_oldest();
         }
         seed
     }
@@ -281,27 +324,118 @@ impl History {
         self.unresolved |= turn.has_unknown_work();
         // Drop whole tool groups first, not result halves. Executions retain their independent
         // provenance/digests even when model-facing call text no longer fits the retention lane.
-        while turn.bytes() > self.limits.max_bytes && !turn.groups.is_empty() {
+        let mut size = turn.bytes();
+        while size > self.limits.max_bytes && !turn.groups.is_empty() {
             turn.groups.remove(0);
+            size = turn.bytes();
         }
-        if turn.bytes() > self.limits.max_bytes {
+        if size > self.limits.max_bytes {
             for execution in &mut turn.executions {
                 if let Some(excerpt) = &mut execution.result {
                     excerpt.text.clear();
                     excerpt.truncated = excerpt.original_bytes > 0;
                 }
             }
+            size = turn.bytes();
         }
         self.turns.push(turn);
-        while self.turns.len() > self.limits.max_turns || self.bytes() > self.limits.max_bytes {
+        self.sizes.push(size);
+        self.bytes += size;
+        while self.turns.len() > self.limits.max_turns || self.bytes > self.limits.max_bytes {
             if self.turns.is_empty() {
                 break;
             }
-            self.turns.remove(0);
+            self.drop_oldest();
         }
+    }
+    /// Drops the oldest retained turn, keeping the running total exact.
+    fn drop_oldest(&mut self) {
+        self.turns.remove(0);
+        self.bytes -= self.sizes.remove(0);
     }
     #[cfg(test)]
     pub(crate) fn replay_into(&self, messages: &mut Vec<ModelMessage>) {
         crate::context::WindowContext.replay(self, messages);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(user: &str, answer: &str) -> JobRecord {
+        JobRecord::completed(user, answer)
+    }
+
+    fn exact(history: &History) -> usize {
+        history.turns().iter().map(JobRecord::bytes).sum()
+    }
+
+    /// The running total is the number a full re-encoding would produce, at every step.
+    ///
+    /// `bytes()` is read on every conversation-store append and on every eviction step, so it is
+    /// answered from a counter rather than by serializing the corpus. A counter that drifts from
+    /// the encoding is worse than the O(corpus) call it replaced, so this pins them equal across
+    /// an append, a byte-bound trim, a turn-bound eviction, and a decode.
+    #[test]
+    fn the_cached_byte_total_equals_the_encoded_size_after_record_trim_and_eviction() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 3,
+            max_bytes: 64 * 1024,
+        });
+        assert_eq!(history.bytes(), 0);
+        for index in 0..3 {
+            history.record(turn(&format!("question {index}"), "answer"));
+            assert_eq!(history.bytes(), exact(&history), "after append {index}");
+        }
+        history.record(turn("question 3", "answer"));
+        assert_eq!(history.len(), 3, "the turn bound evicted the oldest");
+        assert_eq!(
+            history.bytes(),
+            exact(&history),
+            "after turn-bound eviction"
+        );
+
+        let mut narrow = History::new(HistoryLimits {
+            max_turns: 8,
+            max_bytes: 512,
+        });
+        for index in 0..8 {
+            narrow.record(turn(&"q".repeat(200), &format!("answer {index}")));
+            assert_eq!(narrow.bytes(), exact(&narrow), "narrow append {index}");
+        }
+
+        let encoded = serde_json::to_string(&history).expect("history serializes");
+        let decoded: History = serde_json::from_str(&encoded).expect("history decodes");
+        assert_eq!(decoded.bytes(), history.bytes());
+        assert_eq!(decoded.bytes(), exact(&decoded));
+        assert_eq!(decoded, history);
+    }
+
+    /// The checkpoint seed drops whole oldest turns and keeps its own total exact.
+    #[test]
+    fn the_checkpoint_seed_keeps_the_running_total_exact_while_it_drops_turns() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 128,
+            max_bytes: HistoryLimits::MAX_BYTES,
+        });
+        for index in 0..64 {
+            history.record(turn(&"q".repeat(8 * 1024), &format!("answer {index}")));
+        }
+        let seed = history.checkpoint_seed();
+        assert!(seed.bytes() <= 256 * 1024, "{}", seed.bytes());
+        assert!(seed.len() < history.len());
+        assert_eq!(seed.bytes(), exact(&seed));
+    }
+
+    /// The clamp is the published constant, so a reader can report what it dropped.
+    #[test]
+    fn configured_windows_are_clamped_to_the_published_ceilings() {
+        let history = History::new(HistoryLimits {
+            max_turns: usize::MAX,
+            max_bytes: usize::MAX,
+        });
+        assert_eq!(history.limits().max_turns, HistoryLimits::MAX_TURNS);
+        assert_eq!(history.limits().max_bytes, HistoryLimits::MAX_BYTES);
     }
 }
