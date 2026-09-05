@@ -158,6 +158,15 @@ All notable changes to Dekopon are documented here. The format is based on
   than a divergence stop. Turns before the divergence are a faithful comparison and turns after a
   live one are a new session; replay never invents tool output. There is deliberately no durable
   store, no automatic rewriting, and no grader: the loop is `list`, `show`, edit, `replay`, commit.
+- Added the telemetry this round's refusals needed, all of it category-only and all of it recorded
+  in `docs/observability.md`: warn-level `gateway_reply_rate_limited` (`transport`, `method`,
+  `retry_after_seconds`) for a channel-creating post the service rate limited; the
+  `gateway_activity_failed` cause types `activity-quarantine-full` and `activity-cleanup-abandoned`;
+  the warn-level `conflicting-usage-observation` and `accounting-field-unreported` records naming
+  the usage fields a tracker stopped trusting and the job they belong to; the error-level
+  `live-checkpoint-lock`, emitted where a poisoned checkpoint lock is recovered or fences the
+  lease; and the error-level `control-surface`, which names every conflict in a route's `controls:`
+  block at construction. No new `audit.event` name.
 
 ### Changed
 
@@ -235,6 +244,64 @@ All notable changes to Dekopon are documented here. The format is based on
   `SurfaceChange` names which half of the surface moved (`Epoch`, `Descriptions`, `EffectiveViews`,
   `CommandWords`, `ChatMemory`), so a log site records a stable token rather than a sentence; an
   out-of-tree implementor changes its signature and returns the typed value.
+- A session compares its capability surface against the broker's at exactly two points in a turn —
+  before each model request, and after a completion before it is disclosed — where it also compared
+  before every capability invocation and every tool call. The broker authorizes each `invoke` and
+  `runCommand` at dispatch, under the live epoch and the policy loaded then, so the client-side
+  comparison guards disclosure rather than authority; dropping it from the inner loops removes one
+  broker round trip per tool call and per invocation without moving where a decision is made.
+  `docs/security-model.md` and `docs/harness.md` name the two checks that remain.
+- The harness checkpoint store's byte ceiling is `MAX_JOBS * MAX_CHECKPOINT_BYTES`, so its lease
+  ceiling and its byte ceiling agree at 128 rather than exhausting the second at 32 reservations —
+  which is what silently capped a deployment's concurrent sessions at a quarter of the leases it
+  advertised. A store already holding `MAX_JOBS` leases refuses the next one with `Capacity` before
+  it evicts anything, so reaching the ceiling no longer destroys every stored checkpoint on the way
+  to an error, and the refusal names the ceiling. `MAX_JOBS` is public and `docs/harness.md` states
+  the relationship.
+- A conversation's idle timeout runs from its last message rather than from its last committed
+  turn: `begin` touches the entry the way `commit` already did. Without it a session that answered
+  slowly left its own conversation the least recently touched candidate at the moment it finished,
+  which is the eviction the **Fixed** entry below closes.
+- `routes[].activityLabels` reports every offending entry in one refusal, each named with the rule
+  it broke, instead of stopping at the first. A label the renderer would truncate past
+  `MAX_ACTIVITY_LABEL_BYTES` (80 UTF-8 bytes) or leave blank once control characters and
+  directional marks are stripped is refused at startup rather than shown clipped or empty; the
+  gate calls the renderer's own `label_is_renderable` rather than mirroring its constant.
+- A quarantined activity target — one an uncertain native write may still own — is tracked apart
+  from the live leases, under its own 128-entry ceiling, and ages out after fifteen minutes. A full
+  quarantine used to consume the lease ceiling and disable activity process-wide behind a debug
+  log; it now costs one warn-level `gateway_activity_failed` when it fills and live leases keep
+  acquiring. That event's category is `busy`, `quarantined`, or `capacity`, where one combined
+  token could not tell a contended thread from an exhausted ceiling.
+- `select_model`'s `effort` enum offers only the efforts the candidate list actually carries,
+  mirroring `set_effort`. The gateway still offers all four, because it cannot see the broker's
+  `controlTargets`; `docs/dekopond.md` states that a route whose baseline effort is absent from
+  that list is answered `target-denied` on every proposal while still spending an attempt.
+- `policy_digest` hashes the two reserved control actions unconditionally, so every deployment's
+  digest changes on upgrade even where the policy set is byte-identical. `docs/upgrading.md`
+  records that as expected rather than as evidence that a policy moved.
+- A recording carries `version` at its top level and refuses an unknown top-level key. A file
+  written before the field is read as version 1, and a version this build does not read is refused
+  naming it; a hand-written recording carrying an extra key that used to be ignored is now a
+  read-side break. `ReplayReport` gains `droppedHistoryTurns`, and a replay whose recorded exchanges
+  did not fit `HistoryLimits` says how many turns it dropped rather than replaying a short history
+  silently.
+- An `agent.model.answer` row claiming more than `MAX_TOOL_CALLS_PER_TURN` tool calls is refused
+  before the reconstruction iterates it, naming the turn, the claimed count, and the limit; the
+  writer never produces such a row, so it is a corrupt or hostile one.
+- Public API, for anyone rebasing on this branch: `dekopon-shell` gains `SurfaceChange` and
+  `FreshnessError`; `dekopon-broker-protocol` gains `ClientErrorKind` and `ClientError::kind()` and
+  drops the unconsumed `ERROR_CONTROL_DENIED`; `dekopon-model`'s `usage` module gains
+  `USAGE_FIELD_NAMES`, `ObservationPrecedence`, `LoggedAttempt`, `AttemptLog`, `conflicting_fields`,
+  and a defaulted `AttemptRecorder::observe_ranked`, and `ChatGptError` gains `Accounting`;
+  `dekopon-harness` gains `control::ControlFailureKind` and `ControlError::Surface`, makes
+  `TransitionOutcome::AuthorizationFailed` a struct variant carrying `cause` (a checkpoint JSON
+  shape change, unreleased), adds `precedence` to `AttemptRecord`, and publishes
+  `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `checkpoint::MAX_JOBS`, `CONVERSATION_CACHE_PREFIX`,
+  `MAX_ACTIVITY_LABEL_BYTES`, `MAX_ACTIVITY_LABELS`, and `label_is_renderable`;
+  `PolicyBuildError::{ReservedAction, DuplicateCapability}` and `BootstrapError::{Identifier,
+  InvalidSchema}` carry every collision rather than one; and `dekopond`'s `cache_key::for_conversation`
+  is deleted in favor of the harness-owned prefix constant both minting sites now share.
 
 ### Removed
 
@@ -318,6 +385,57 @@ All notable changes to Dekopon are documented here. The format is based on
   identical bare sentences collapsed into a single line naming none of them.
 - `gateway_stopped` reports how many conversations were still resident at exit, the denominator for
   the `gateway_conversation_evicted` churn an operator sizing `sessions.maxConversations` watches.
+- A whitespace-only completion is no longer stored as the job's generated answer before it is
+  rejected, so a job resumed from that checkpoint can no longer deliver an empty answer with a
+  `Send` outcome. `SessionBootstrap::with_resume` is `pub(crate)`, and `docs/harness.md` says
+  plainly that no shipped binary resumes a checkpoint today.
+- A control authorization failure carries a typed `ControlFailureKind` instead of a discarded
+  `ClientError`: the kind reaches the checkpointed transition record, the `accounting.model.transition`
+  event, and the gateway's `gateway_session_failed` through `cause`, so a `ControlBinding` refusal
+  and a `ConnectTimeout` are no longer the same line in the log.
+- A ledger refusal is reported as what it is. `ChatGptRequestError` and `ChatGptError` gain
+  `Accounting`, which maps to `ModelError::Accounting` and to a `PromptError` whose
+  `telemetry_kind()` is `accounting` rather than a retryable transport `Request`, on the image path
+  as well as the chat one — a fenced tracker is an operator problem, and dashboards counting model
+  transport errors were counting it.
+- A broken policy stays visible: once a proposal's reason is `policy-error`, a later dimension's
+  ordinary `policy-denied` does not overwrite it, so the operator signal that a policy failed to
+  evaluate survives a denial that happened to follow it in the same proposal.
+- The 30-per-minute cosmetic budget is reserved after the local gates rather than before them, so a
+  cosmetic call refused because the route sends nothing, or because the channel's post rate is
+  already spent, no longer spends an installation's budget on work that never left the process.
+- A replay group claims `RecordedReplay` provenance only when every result in the batch was answered
+  from the recording. A batch mixing recorded answers with a live dispatch carries the live
+  provenance and shows no banner, where the group label used to promise that no new capability
+  execution was claimed while one had just happened.
+- `list_sessions` deduplicates by job and call coordinate *after* it filters on `audit.event`, so a
+  non-accounting row sharing a coordinate with a real accounting row no longer suppresses it and
+  drops the session from the listing. `docs/run.md` states that sessions recorded before the
+  accounting rename appear in `show` but not `list`.
+- Reconstruction, context validation, and recording validation each report every conflict they find
+  before failing, instead of stopping at the first, and a `duration_ms` disagreement between
+  duplicate exports is a conflict rather than a last-wins overwrite. `PolicyWorld::new` reports
+  every reserved-action and duplicate-capability collision at once, bootstrap reports every
+  malformed identifier and every non-object schema at once, `SessionControls::new` collects all
+  three surface conflicts, and gateway startup names every transport that could not connect —
+  `DekopondError::TransportConnect` carries the whole list — where each of these used to make an
+  operator fix one problem per run.
+- The replay validator and the live enforcer agree on what a message group's bytes are: both reset
+  the count on any non-`tool` message, including the attachment summary, and an equality test feeds
+  the same message sequence to both so the two cannot drift apart again.
+- `begin` and `commit` no longer serialize the whole conversation corpus. `History::bytes()` is
+  O(1) against a size maintained in `record`, trim, and eviction, and the store keeps a running
+  byte total, where enforcing the ceiling used to re-encode every resident conversation on every
+  message. Checkpoint sizes are likewise measured once per save through a counting writer and cached
+  on the stored entry, so eviction reads cached sizes instead of re-encoding every stored checkpoint
+  per step, and `CapabilitySnapshot::from_invoker` bounds itself with a running count rather than
+  re-encoding the accumulated vector per capability.
+- The scripting tool's description no longer tells the model to open with a `cap --list` discovery
+  call. Request-one bootstrap already carries fresh descriptions and complete input schemas, so that
+  sentence bought nothing and spent a paid model turn; a test pins that the description instructs no
+  discovery call.
+- `examples/conditional-write/dekopond.yaml`'s `http-probe` activity labels describe what that
+  example's capabilities actually do, rather than naming work it never performs.
 
 ## [0.12.0] - 2026-08-29
 

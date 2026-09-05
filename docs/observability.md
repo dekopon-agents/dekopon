@@ -160,6 +160,17 @@ opted in: `dekopon-run prompt --suggestions`, `session replay --suggestions`, or
 log sink in scope for that text, and nothing else widens with it: the record carries no chat text
 the gateway holds and no subject, only what the model chose to write into those fields.
 
+Two harness failures have no audit record because neither is a decision about a request; each is an
+error-level log line carrying a stable `cause_type` and the underlying failure. `live-checkpoint-lock`
+is a poisoned checkpoint mutex: a read recovers it, because the observations already recorded are
+exactly what a failing session still has to report, while a write refuses and fences the lease, and
+the token is how an operator tells a fenced job caused by a panic from one caused by a full store.
+`control-surface` is emitted where a session's control surface cannot be built — invalid configured
+control targets, an attempt budget outside `1..=MAX_CONTROL_ATTEMPTS`, or a baseline selection that
+is not one of those targets — and its `cause` carries every one of those conflicts joined, so an
+operator whose budget *and* baseline are both wrong learns that in one refusal rather than one
+restart per mistake. Neither event carries a subject, chat text, or a credential.
+
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
 

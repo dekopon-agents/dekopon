@@ -80,12 +80,11 @@ Provider JSON Schemas are exposed to the model, but there is no general JSON Sch
 
 ### Harness integration
 
-The clean-break runtime contract and known gaps are in [harness.md](harness.md). Source ownership:
-`bootstrap.rs` (request-one metadata), `session.rs`/`runtime.rs` (loop and observed dispatch),
-`history.rs`/`context.rs`/`conversation.rs` (portable evidence and scoped leases), `checkpoint.rs`
-(memory CAS), `accounting.rs` (mandatory token tracker), `control.rs`/`control/transition.rs`
-(verified decisions and safe application), and `activity.rs` (cosmetic publication). Model adapters
-in `dekopon-model/src/{model,chatgpt,image,usage}.rs` record attempts independently of decoding.
+The clean-break runtime contract and known gaps are in [harness.md](harness.md); which module owns
+what is the `dekopon-harness` row of the [Repository map](#repository-map) above, kept in one place
+so a new module is listed once. Model adapters in `dekopon-model/src/{model,chatgpt,image,usage}.rs`
+record attempts independently of decoding, which is why a ledger refusal surfaces as
+`ModelError::Accounting` rather than as a transport error a caller would retry.
 
 Start with `cargo test -p dekopon-harness -p dekopon-model -p dekopon-core -p dekopon-policy
 -p dekopon-broker-protocol --locked`, then pinned fixture fetch and broker/brokerd/gateway/runner
