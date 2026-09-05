@@ -51,6 +51,56 @@ fn channel_post_park(stated: Option<Duration>) -> Duration {
         .min(POST_WAIT_CEILING)
 }
 
+/// Whole seconds of backoff, rounding a partial second up: a refusal that says `0s` says nothing.
+fn backoff_seconds(remaining: Duration) -> u64 {
+    remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+}
+
+/// How a parked channel names itself in telemetry.
+///
+/// A Slack channel identifier is chat metadata — a DM one names a person — so it rides the same
+/// process-wide payload gate as the subject on `gateway.message.received`, and a metadata-only
+/// deployment gets the marker. The seconds are never gated: they are the operator's whole answer
+/// to "how long is this channel down for", and they identify nobody.
+fn parked_channel_field(channel: &str) -> &str {
+    if dekopon_core::telemetry_payloads() {
+        channel
+    } else {
+        "redacted"
+    }
+}
+
+/// Refuses a channel-creating post, naming how much backoff is left in the error and once in a log.
+///
+/// Both refusals come through here so the seconds reach the caller and the operator by one route:
+/// `post-capacity` (this caller spent its own wait budget on a park somebody else's 429 created)
+/// and `ratelimited` (this caller drew the 429 itself). The two durations differ on purpose —
+/// `remaining` is what *this* caller must wait, the full uncapped value the service stated, while
+/// `parked` is what the slot everyone shares is held for, capped at [`POST_WAIT_CEILING`]. Logging
+/// only the capped one reported a `Retry-After: 120` as 60.
+fn refuse_parked_channel(
+    channel: &str,
+    method: &str,
+    code: &'static str,
+    remaining: Duration,
+    parked: Duration,
+) -> TransportError {
+    let remaining_seconds = backoff_seconds(remaining);
+    tracing::warn!(
+        event = "gateway_reply_rate_limited",
+        transport = "slack",
+        method,
+        cause_type = code,
+        channel = parked_channel_field(channel),
+        retry_after_seconds = remaining_seconds,
+        channel_parked_seconds = backoff_seconds(parked)
+    );
+    TransportError::ChannelBackoff {
+        code,
+        remaining_seconds,
+    }
+}
+
 /// Only a validated creation response can construct this handle. Not a delivery receipt.
 pub(crate) struct OwnedProgressArtifact {
     channel: String,
@@ -167,6 +217,7 @@ impl SlackReplier {
     async fn reserve_channel_post(
         &self,
         channel: &str,
+        method: &str,
         entered: Instant,
     ) -> Result<(), TransportError> {
         loop {
@@ -178,9 +229,16 @@ impl SlackReplier {
             let limit = (Instant::now() + POST_WAIT_CEILING).min(entered + POST_TOTAL_WAIT_CEILING);
             match reservation {
                 Ok(slot) if slot > limit => {
-                    return Err(TransportError::Service {
-                        code: "post-capacity".into(),
-                    });
+                    // The park this caller will not wait out is exactly what it must wait before
+                    // coming back, so the refusal names one number and the log repeats it.
+                    let remaining = slot.saturating_duration_since(Instant::now());
+                    return Err(refuse_parked_channel(
+                        channel,
+                        method,
+                        "post-capacity",
+                        remaining,
+                        remaining,
+                    ));
                 }
                 // Waiting senders recheck the slot at transmission time, so a reservation taken
                 // while this one slept is never reused.
@@ -217,7 +275,7 @@ impl SlackReplier {
     ) -> Result<Value, TransportError> {
         let entered = Instant::now();
         for attempt in 0..2 {
-            self.reserve_channel_post(channel, entered).await?;
+            self.reserve_channel_post(channel, method, entered).await?;
             let response = self
                 .http
                 .post(format!("{}/api/{method}", self.endpoint))
@@ -250,20 +308,23 @@ impl SlackReplier {
                 .filter(|stated| *stated <= MAX_HONORED_RETRY)
                 .filter(|stated| Instant::now() + *stated <= entered + POST_TOTAL_WAIT_CEILING);
             let Some(honored) = honored else {
-                tracing::warn!(
-                    event = "gateway_reply_rate_limited",
-                    transport = "slack",
+                // The stating caller keeps the whole stated backoff, capped only against the day
+                // the header may name; the shared slot keeps the capped park.
+                return Err(refuse_parked_channel(
+                    channel,
                     method,
-                    retry_after_seconds = penalty.as_secs()
-                );
-                return Err(TransportError::Service {
-                    code: "ratelimited".into(),
-                });
+                    "ratelimited",
+                    stated.unwrap_or(UNSTATED_RETRY_PENALTY),
+                    penalty,
+                ));
             };
             tokio::time::sleep(honored).await;
         }
-        Err(TransportError::Service {
-            code: "ratelimited".into(),
+        // Unreachable: the second attempt's 429 is refused above, because `honored` requires
+        // `attempt == 0`. It is the loop's exit type, and it says the same thing that refusal does.
+        Err(TransportError::ChannelBackoff {
+            code: "ratelimited",
+            remaining_seconds: backoff_seconds(MAX_HONORED_RETRY),
         })
     }
 
@@ -556,7 +617,7 @@ mod rate_tests {
         replier.channel_post_completed("C1", Duration::from_secs(30));
         let start = Instant::now();
         replier
-            .reserve_channel_post("C1", Instant::now())
+            .reserve_channel_post("C1", "chat.postMessage", Instant::now())
             .await
             .expect("a backoff inside the ceiling is waited out, not refused");
         assert!(
@@ -570,7 +631,11 @@ mod rate_tests {
         replier.channel_post_completed("C2", POST_WAIT_CEILING);
         let start = Instant::now();
         replier
-            .reserve_channel_post("C2", Instant::now() - Duration::from_secs(30))
+            .reserve_channel_post(
+                "C2",
+                "chat.postMessage",
+                Instant::now() - Duration::from_secs(30),
+            )
             .await
             .expect("somebody else's full-ceiling park is waited out, not refused");
         assert!(
@@ -580,25 +645,42 @@ mod rate_tests {
         );
 
         // Only a slot no park could have produced, or a caller already at its total budget, is
-        // refused — and the refusal costs no further waiting.
+        // refused — and the refusal costs no further waiting. Each one names what is left of the
+        // park it will not sit through, so the operator reading the failure knows when to retry.
         replier.channel_post_completed("C3", POST_WAIT_CEILING + Duration::from_secs(1));
         let start = Instant::now();
+        let refused = replier
+            .reserve_channel_post("C3", "chat.postMessage", Instant::now())
+            .await
+            .expect_err("a slot beyond the per-observation ceiling is refused");
         assert!(
             matches!(
-                replier.reserve_channel_post("C3", Instant::now()).await,
-                Err(TransportError::Service { code }) if code == "post-capacity"
+                &refused,
+                TransportError::ChannelBackoff { code, remaining_seconds }
+                    if *code == "post-capacity" && *remaining_seconds == 61
             ),
-            "a slot beyond the per-observation ceiling is refused"
+            "the refusal names the 61 s of park it declined to wait: {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("61s"),
+            "the rendered cause carries the seconds too: {refused}"
         );
         replier.channel_post_completed("C4", Duration::from_secs(30));
+        let spent = replier
+            .reserve_channel_post(
+                "C4",
+                "chat.postMessage",
+                Instant::now() - POST_TOTAL_WAIT_CEILING,
+            )
+            .await
+            .expect_err("a caller that has spent its total budget is its own refusal");
         assert!(
             matches!(
-                replier
-                    .reserve_channel_post("C4", Instant::now() - POST_TOTAL_WAIT_CEILING)
-                    .await,
-                Err(TransportError::Service { code }) if code == "post-capacity"
+                &spent,
+                TransportError::ChannelBackoff { code, remaining_seconds }
+                    if *code == "post-capacity" && *remaining_seconds == 30
             ),
-            "a caller that has spent its total budget is its own refusal"
+            "the exhausted caller learns the park still has 30 s left: {spent:?}"
         );
         assert_eq!(
             start.elapsed(),
@@ -628,8 +710,9 @@ mod rate_tests {
             .await
             .expect_err("a 120 s backoff is longer than this caller sits through");
         assert!(
-            matches!(&refused, TransportError::Service { code } if code == "ratelimited"),
-            "{refused:?}"
+            matches!(&refused, TransportError::ChannelBackoff { code, remaining_seconds }
+                if *code == "ratelimited" && *remaining_seconds == 120),
+            "the caller that drew the 429 keeps the whole stated backoff, uncapped: {refused:?}"
         );
         let park = transport.replier.post_rate.lock().unwrap().next["C1"];
         assert!(
@@ -642,7 +725,7 @@ mod rate_tests {
         tokio::time::pause();
         transport
             .replier
-            .reserve_channel_post("C1", queued_entry)
+            .reserve_channel_post("C1", "chat.postMessage", queued_entry)
             .await
             .expect("the queued sender waits the park out rather than failing post-capacity");
         assert!(Instant::now() >= park, "it waited for the whole park");
@@ -660,11 +743,18 @@ mod rate_tests {
 
     #[tokio::test]
     async fn an_unbounded_retry_after_parks_the_channel_only_to_the_wait_ceiling() {
-        for (header, parked) in [
-            ("Retry-After: 120\r\n", POST_WAIT_CEILING),
-            ("Retry-After: 86400\r\n", POST_WAIT_CEILING),
-            ("", UNSTATED_RETRY_PENALTY),
-            ("Retry-After: soon\r\n", UNSTATED_RETRY_PENALTY),
+        // `refused_seconds` is the other half of the same rule: the shared slot is capped, and the
+        // caller that drew the 429 is refused with the *uncapped* value the service stated, so a
+        // `Retry-After: 86400` is never reported to it as the 60 s park.
+        for (header, parked, refused_seconds) in [
+            ("Retry-After: 120\r\n", POST_WAIT_CEILING, 120),
+            ("Retry-After: 86400\r\n", POST_WAIT_CEILING, 86400),
+            ("", UNSTATED_RETRY_PENALTY, UNSTATED_RETRY_PENALTY.as_secs()),
+            (
+                "Retry-After: soon\r\n",
+                UNSTATED_RETRY_PENALTY,
+                UNSTATED_RETRY_PENALTY.as_secs(),
+            ),
         ] {
             let server = dekopon_test_support::LoopbackServer::once(
                 format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n")
@@ -683,8 +773,9 @@ mod rate_tests {
                 .await
                 .expect_err("a backoff this caller cannot sit through is its own refusal");
             assert!(
-                matches!(&error, TransportError::Service { code } if code == "ratelimited"),
-                "{error:?}"
+                matches!(&error, TransportError::ChannelBackoff { code, remaining_seconds }
+                    if *code == "ratelimited" && *remaining_seconds == refused_seconds),
+                "{header:?} refuses the caller with {refused_seconds}s: {error:?}"
             );
             assert_eq!(
                 server.recorded().len(),
@@ -731,7 +822,7 @@ mod rate_tests {
         tokio::time::pause();
         let start = Instant::now();
         replier
-            .reserve_channel_post("C1", Instant::now())
+            .reserve_channel_post("C1", "chat.postMessage", Instant::now())
             .await
             .expect("a following answer waits the progress post's park out, not `post-capacity`");
         assert!(

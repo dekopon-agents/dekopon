@@ -462,6 +462,18 @@ pub enum TransportError {
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
     Service { code: String },
+    /// A channel-creating post refused before it was transmitted, because the shared per-channel
+    /// slot is parked longer than this caller can wait out.
+    ///
+    /// `code` is the stable token the gateway already classifies on — `post-capacity` when this
+    /// caller spent its own wait budget, `ratelimited` when it observed the 429 itself — and
+    /// `remaining_seconds` is how much of that backoff was left at the refusal. Both are safe to
+    /// log; the channel the park belongs to is not part of the message.
+    #[error("channel post refused as {code}: {remaining_seconds}s of channel backoff remain")]
+    ChannelBackoff {
+        code: &'static str,
+        remaining_seconds: u64,
+    },
     #[error("chat service response was not the expected shape")]
     Response,
     /// A service response was not JSON at all, as opposed to JSON missing a field the call needs.
@@ -494,6 +506,9 @@ impl TransportError {
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
+            // The code is already the stable token, so the caller's `gateway_reply_failed` says
+            // which refusal this was rather than the useless `service`.
+            Self::ChannelBackoff { code, .. } => code,
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",
             Self::PartialDelivery => "partial-delivery",

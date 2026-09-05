@@ -1191,7 +1191,10 @@ async fn session(
             "reply-failed"
         }
         Err(error) => {
-            let disposition = if matches!(&error, TransportError::Service { code } if matches!(code.as_str(), "ratelimited" | "post-capacity" | "invalid_auth" | "token_revoked" | "missing_scope"))
+            // A channel-backoff refusal is a post that was never transmitted, so it is as certainly
+            // undelivered as an authentication refusal is.
+            let disposition = if matches!(&error, TransportError::ChannelBackoff { .. })
+                || matches!(&error, TransportError::Service { code } if matches!(code.as_str(), "ratelimited" | "post-capacity" | "invalid_auth" | "token_revoked" | "missing_scope"))
             {
                 DeliveryDisposition::Failed
             } else {

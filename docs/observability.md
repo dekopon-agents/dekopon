@@ -336,11 +336,17 @@ emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-s
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
 
-`gateway_reply_rate_limited` is the warn-level record of a channel-creating post the service rate
-limited. It carries `transport`, the `method` (`chat.postMessage` or `files.completeUploadExternal`),
-and `retry_after_seconds` — how long the physical channel slot stays parked, which is the stated
-`Retry-After` capped at sixty seconds or five seconds when the header is absent or unparsable. It
-records no channel, thread, subject, or answer text.
+`gateway_reply_rate_limited` is the warn-level record of a channel-creating post refused because the
+physical channel is parked. It carries `transport`, the `method` (`chat.postMessage` or
+`files.completeUploadExternal`), `cause_type` — `ratelimited` when this sender drew the 429 itself,
+`post-capacity` when it spent its own wait budget on somebody else's park — and two durations that
+differ on purpose: `retry_after_seconds` is what *this* sender must wait, the whole stated
+`Retry-After` uncapped, and `channel_parked_seconds` is how long the slot every sender in that
+channel shares is held, which is that value capped at sixty seconds, or five seconds when the header
+is absent or unparsable. The same seconds ride the refusal the session sees, whose category on
+`gateway_reply_failed` is the `cause_type` token rather than the generic `service`. The record names
+the parked `channel` only when payloads are enabled below; metadata-only deployments get `redacted`,
+and neither mode records a thread, subject, or answer text.
 
 The informational broker reports behind the web UI are never retried, so their warning is the whole
 record of a failure. `gateway_agent_inventory_report_failed` and `gateway_usage_report_failed` carry
@@ -632,6 +638,7 @@ With `telemetryPayloads` enabled, these events join the accounting and refusal o
 | `agent.tool.output` | That script's combined output |
 | `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
+| `gateway_reply_rate_limited` | The parked `channel` in place of `redacted`; unlike the rows above, the record and its seconds fire in either mode |
 
 `agent.model.prompt` emits `transcript.version=2`, `context.revision` and `transcript.scope`
 (`full` or `delta`). Within a revision deltas append; trimming, restore and switches require a new
