@@ -7,22 +7,6 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
-
-- Reconstruct persistent portable tool history and model-switch/full context revisions in session
-  show/replay; reject conflicting revisions and preserve independent failure/image usage without
-  recounting remembered calls or restoring opaque provider continuation. Accept byte-free asset
-  summaries interleaved within tool batches and count failed chat calls in replay comparisons.
-- Repair gateway test compilation and parallel accounting trace capture; pin interpreter job-span
-  ancestry and make oversized-frame refusal tests independent of socket write buffering.
-- Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
-  before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
-  results, restored history, failed/nullable response usage and terminal host delivery accounting.
-- Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
-  authenticated installations, and coordinate final/progress channel posts with definitive-429-only
-  recovery. Recheck physical post slots after response arrival to prevent concurrent retries from
-  colliding; preserve cleanup uncertainty and forward gateway safe-yield authorization checks.
-
 ### Added
 
 - Harness-owned execution-aware history, scoped generation leases and bounded versioned memory
@@ -234,6 +218,76 @@ All notable changes to Dekopon are documented here. The format is based on
   crate, and the same gate covers `dekopond`.
   `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and
   `dekopon-protocol`'s `AgentSpec` gains `skills`, absent from serialized output when empty.
+  `dekopon-harness` also gains `sha2`, for the per-component surface digests a session's freshness
+  check compares, and `dekopon-broker` gains `getrandom`, for the startup epoch every control
+  admission is bound to.
+- `sessions.maxConcurrent` is validated at startup against `dekopon_harness::checkpoint::MAX_JOBS`
+  (128), the checkpoint-lease ceiling every live session holds one of, and the refusal names the
+  field, the value and the constant. A configured model whose `name` is not a configured-model
+  identifier is refused with `models[].name` and the offending value, whether or not the deployment
+  configures `controls:`; `docs/upgrading.md` carries the migration.
+- `CheckpointStore::compare_and_save` takes the encoded length of the document its caller built, so
+  a store checks its ceiling against that measurement instead of re-encoding the snapshot; an
+  out-of-tree implementation must accept the added argument.
+
+### Removed
+
+- Removed `dekopon-agent`. `dekopon-harness` replaces it outright — no compatibility crate, no
+  alias, no `run_prompt_session` facade — so there is no newer `dekopon-agent` version to move a
+  pin to; an out-of-tree embedder migrates its dependency, its imports, and its
+  `BrokerLeg::connect_attested` call sites, as `docs/upgrading.md` records.
+
+### Fixed
+
+- Reconstruct persistent portable tool history and model-switch/full context revisions in session
+  show/replay; reject conflicting revisions and preserve independent failure/image usage without
+  recounting remembered calls or restoring opaque provider continuation. Accept byte-free asset
+  summaries interleaved within tool batches and count failed chat calls in replay comparisons.
+- Repair gateway test compilation and parallel accounting trace capture; pin interpreter job-span
+  ancestry and make oversized-frame refusal tests independent of socket write buffering.
+- Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
+  before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
+  results, restored history, failed/nullable response usage and terminal host delivery accounting.
+- Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
+  authenticated installations, and coordinate final/progress channel posts with definitive-429-only
+  recovery. Recheck physical post slots after response arrival to prevent concurrent retries from
+  colliding; preserve cleanup uncertainty and forward gateway safe-yield authorization checks.
+- A Slack 429 now makes later senders in that channel wait rather than turning their paid-for
+  answers into an instant `post-capacity`. The wait each sender can afford is measured from the
+  moment it observes the slot, not from when it entered, so a sender already queued behind another
+  when the 429 lands waits the whole park out instead of inheriting somebody else's backoff as a
+  refusal; a sender waits at most two minutes in total, a stated `Retry-After` parks the channel
+  for at most sixty seconds, and a missing or unparsable one parks it for five. Image answers take
+  the same channel slot as text ones, because `files.completeUploadExternal` creates a channel
+  message exactly as `chat.postMessage` does.
+- Gateway shutdown drains the activity workers after the sessions and inside the same
+  `shutdownGraceMs`, so an ordinary SIGTERM no longer strands a ⌛ progress message in a channel.
+  A grace that expires before the removals land reports what it abandoned: one warn-level
+  `gateway_activity_failed` with `cause_type="activity-cleanup-abandoned"` counting the artifacts
+  left behind, separate from `gateway_sessions_abandoned`, which now means what it says. The
+  workers are owned by the gateway rather than by the process, so two gateways in one process
+  cannot drain or abandon each other's.
+- Conversation eviction no longer takes a conversation another in-flight session is answering
+  under: the store records the outstanding generation and evicts one nobody is answering first, so
+  one sender's arrival cannot rotate another's cache key and turn a delivered answer into a
+  refused append. When every candidate is in flight the least recently touched still goes, and a
+  generation nobody committed stops protecting its conversation once it is idle.
+- A checkpoint mutation encodes the snapshot once, not twice: the model-facing group ceiling, the
+  per-checkpoint byte ceiling and the save share one measurement, where the size check and the save
+  each used to traverse up to 2 MiB of JSON under the live lock five to eight times per tool call.
+  Resuming an existing dormant entry at the lease ceiling is admitted rather than refused for a
+  slot it already occupies.
+- The gateway builds one capability snapshot per message. The broker leg keeps the projection it
+  validated when it connected, and the fingerprint behind a conversation's surface is computed
+  once, where each was built and encoded twice per inbound message.
+- An operator-authored `activityLabels` value is accepted exactly when the renderer keeps it whole:
+  the gate bounded the trimmed text while the renderer bounded the untrimmed one, so surrounding
+  whitespace bought a label that passed startup validation and then lost its last characters in the
+  channel.
+- `modelTurns` is unknown rather than zero for a recording whose call list names no chat call at
+  all — image calls only, which a truncated page set produces — and the transcript query is ordered
+  like the accounting one, so a truncated fetch keeps the start of a session rather than an
+  arbitrary slice.
 
 ## [0.12.0] - 2026-08-29
 

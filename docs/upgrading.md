@@ -186,10 +186,12 @@ bootstrap limitations.
   A fifth broker client lives outside this repository:
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
   `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
-  `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
-  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
-  0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
-  that lands, and do not run the console against an upgraded broker.
+  `v1alpha1` and cannot talk to a broker built from this tree. There is no newer `dekopon-agent` to
+  move that pin to: the crate was replaced outright by `dekopon-harness`, as
+  [0.12.0 → next](#0120--next-unreleased--harness-apis-and-accounting) records, and the console's
+  `BrokerLeg::connect_attested` call no longer exists either. Migrating it is that source change in
+  `crates/dekopon-tui/src/session.rs` against the new crate, not a version bump. Leave the pin where
+  it is until that lands, and do not run the console against an upgraded broker.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
   now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`
