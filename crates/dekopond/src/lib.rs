@@ -187,15 +187,21 @@ where
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
+    // Every transport that cannot connect is named in one refusal. A duplicate installation is
+    // reported against *both* configurations, and an operator who mis-scoped two workspaces does
+    // not have to restart the daemon once per conflict to discover the second one.
+    let mut connect_problems = Vec::new();
     for (spec, mut transport) in config.transports.iter().zip(built_transports) {
-        let identity =
-            transport
-                .connect()
-                .await
-                .map_err(|source| DekopondError::TransportConnect {
+        let identity = match transport.connect().await {
+            Ok(identity) => identity,
+            Err(source) => {
+                connect_problems.push(TransportConnectProblem {
                     transport: spec.name().to_owned(),
                     source,
-                })?;
+                });
+                continue;
+            }
+        };
         tracing::info!(
             event = "gateway_transport_connected",
             transport = spec.name(),
@@ -215,6 +221,11 @@ where
             thread_ownership.insert(spec.name().to_owned(), ownership);
         }
         transports.push(transport);
+    }
+    if !connect_problems.is_empty() {
+        return Err(DekopondError::TransportConnect {
+            problems: connect_problems,
+        });
     }
 
     let (usage_sender, usage_receiver) = mpsc::channel(USAGE_REPORT_BUFFER);
@@ -632,11 +643,14 @@ where
     }
 
     // In-flight sessions are given the configured grace to finish: a model call is already paid
-    // for, and abandoning it means a person watching a chat window never hears back.
+    // for, and abandoning it means a person watching a chat window never hears back. The activity
+    // supervisors drain inside the same grace and after the sessions, because a session's last act
+    // is to queue the removal of its ⌛ progress message onto one of them.
     if timeout(grace, async {
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
         }
+        activity::drain().await;
     })
     .await
     .is_err()
@@ -644,6 +658,7 @@ where
         tracing::warn!(event = "gateway_sessions_abandoned");
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
+        activity::abandon();
     }
     outcome
 }
@@ -985,13 +1000,14 @@ pub enum DekopondError {
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
-    /// A transport could not authenticate or open its wakeup path.
-    #[error("chat transport {transport} could not connect")]
+    /// One or more transports could not authenticate or open their wakeup path.
+    ///
+    /// Every failing transport is reported together: two configurations claiming one Slack
+    /// installation fail each other, and naming only the first hides the conflict's other half.
+    #[error("{}", render_problems(.problems))]
     TransportConnect {
-        /// Configured transport name.
-        transport: String,
-        #[source]
-        source: TransportError,
+        /// Every transport that could not connect, in configured order.
+        problems: Vec<TransportConnectProblem>,
     },
     /// Every transport ended on its own, with no shutdown asked for.
     ///
@@ -999,6 +1015,16 @@ pub enum DekopondError {
     /// difference between a supervisor restarting the gateway and a pod that stays green.
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
+}
+
+/// One transport that could not connect, reported through [`DekopondError::TransportConnect`].
+#[derive(Debug, Error)]
+#[error("chat transport {transport} could not connect")]
+pub struct TransportConnectProblem {
+    /// Configured transport name, carried by the rendered message rather than read directly.
+    transport: String,
+    #[source]
+    source: TransportError,
 }
 
 /// One thing the daemon must hold before any transport authenticates.
