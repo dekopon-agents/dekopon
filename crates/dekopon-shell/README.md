@@ -254,3 +254,7 @@ Licensed under either of [Apache-2.0](../../LICENSE-APACHE) or [MIT](../../LICEN
 
 `CapabilityInvoker::check_freshness` lets a remote adapter reject stale session metadata at host
 safe boundaries; immutable direct dispatch defaults to no I/O. It supplies no invocation authority.
+It answers with a typed `FreshnessError`: `Unavailable` when the host could not be asked at all, and
+`Changed(SurfaceChange)` naming which part moved — the epoch, the descriptions, the effective views,
+the command words, or the chat-memory surface. A restarted host, a redeployed provider, and a
+narrowed policy are different incidents, so they are different values rather than one string.

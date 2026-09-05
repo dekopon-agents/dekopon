@@ -666,7 +666,136 @@ fn epoch_change_and_stop_after_admission_halt_without_applying_or_calling_the_ta
         assert_eq!(cp.model, "wire-a");
         assert!(cp.state.control_fenced);
         assert!(b.requests.lock().unwrap().is_empty());
+        if !stop {
+            // The checkpointed record says *which* client failure fenced the job, not just that
+            // one did. A reader of this checkpoint can tell "the broker restarted underneath us"
+            // from "something answered the socket with a decision bound to another proposal".
+            assert_eq!(
+                cp.state.transitions.last().map(|t| t.outcome),
+                Some(TransitionOutcome::AuthorizationFailed {
+                    cause: ControlFailureKind::Client(ClientErrorKind::SurfaceChanged),
+                })
+            );
+        }
     }
+}
+
+#[test]
+fn an_unusable_control_surface_reports_every_conflict_in_one_refusal() {
+    // Two independent things are wrong: the attempt budget is out of range and the baseline
+    // selection is not a candidate. One silent `Configuration` made the operator fix one, restart,
+    // and discover the other.
+    struct Elsewhere;
+    impl ModelRegistry for Elsewhere {
+        fn candidates(&self) -> Vec<ControlTarget> {
+            vec![ControlTarget {
+                model: "elsewhere".parse().unwrap(),
+                efforts: vec![Effort::Low],
+            }]
+        }
+        fn prepare(&self, _: &ModelSelection) -> Result<PreparedModel, PreparationError> {
+            Err(PreparationError::UnknownModel)
+        }
+    }
+    let f = Fixture::new(vec![], false, None);
+    let error = SessionControls::new(
+        &Elsewhere,
+        selection("a"),
+        f.client
+            .control_client(f.scope.clone(), f.epoch.clone(), None, 0)
+            .unwrap(),
+        f.rt.handle().clone(),
+        99,
+    );
+    let Err(error) = error else {
+        panic!("an unusable control surface must refuse")
+    };
+    let message = error.to_string();
+    for cause in ["control attempt budget 99", "baseline selection a/"] {
+        assert!(message.contains(cause), "{cause:?} missing from {message}");
+    }
+    assert_eq!(
+        ControlFailureKind::of(&error),
+        ControlFailureKind::Configuration
+    );
+}
+
+#[test]
+fn select_model_offers_only_efforts_the_configured_targets_carry() {
+    // The gateway's mirror must not offer what `controlTargets` rejects: a proposal naming an
+    // effort no candidate lists is `target-denied` at the broker while still costing prompt tokens
+    // and one of the job's four attempts.
+    struct Narrow;
+    impl ModelRegistry for Narrow {
+        fn candidates(&self) -> Vec<ControlTarget> {
+            ["a", "b"]
+                .into_iter()
+                .map(|model| ControlTarget {
+                    model: model.parse().unwrap(),
+                    efforts: vec![Effort::Low, Effort::High],
+                })
+                .collect()
+        }
+        fn prepare(&self, _: &ModelSelection) -> Result<PreparedModel, PreparationError> {
+            Err(PreparationError::UnknownModel)
+        }
+    }
+    let f = Fixture::new(vec![], false, None);
+    let controls = SessionControls::new(
+        &Narrow,
+        ModelSelection {
+            model: "a".parse().unwrap(),
+            effort: Effort::Low,
+        },
+        f.client
+            .control_client(f.scope.clone(), f.epoch.clone(), None, 0)
+            .unwrap(),
+        f.rt.handle().clone(),
+        4,
+    )
+    .expect("a narrow but coherent surface builds");
+    let current = ModelIdentity {
+        configured: Some("a".parse().unwrap()),
+        backend: "wire".into(),
+        model: "wire-a".into(),
+        effort: Effort::Low,
+    };
+    let model = Model::new(vec![]);
+    let tools = controls.tools(&current, model.as_ref(), 0);
+    let select = tools
+        .iter()
+        .find(|tool| tool.name == SELECT_MODEL_TOOL)
+        .expect("a second candidate offers select_model");
+    let efforts = select.parameters["properties"]["effort"]["enum"].clone();
+    assert_eq!(efforts, serde_json::json!(["low", "high"]));
+}
+
+#[test]
+fn two_different_client_failures_are_two_different_authorization_outcomes() {
+    // `AuthorizationFailed` on its own collapsed every one of these into one token, and the
+    // `ClientError` behind it was logged nowhere, so a response substitution and an unreachable
+    // broker produced byte-identical evidence.
+    let binding = TransitionOutcome::AuthorizationFailed {
+        cause: ControlFailureKind::of(&ControlError::Authorization(
+            dekopon_broker_protocol::ClientError::ControlBinding,
+        )),
+    };
+    let timeout = TransitionOutcome::AuthorizationFailed {
+        cause: ControlFailureKind::of(&ControlError::Authorization(
+            dekopon_broker_protocol::ClientError::ConnectTimeout,
+        )),
+    };
+    assert_ne!(binding, timeout);
+    let rendered = |outcome| serde_json::to_string(&outcome).expect("outcome serializes");
+    assert!(rendered(binding).contains("control-binding"), "{binding:?}");
+    assert!(rendered(timeout).contains("connect-timeout"), "{timeout:?}");
+    // And the interrupted case is neither: nothing reached the broker at all.
+    assert_ne!(
+        binding,
+        TransitionOutcome::AuthorizationFailed {
+            cause: ControlFailureKind::Interrupted,
+        }
+    );
 }
 
 struct FailApplied(MemoryCheckpointStore);

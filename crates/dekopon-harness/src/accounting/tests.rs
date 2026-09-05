@@ -43,7 +43,7 @@ impl ChatModel for Model {
         recorder: &dyn AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
         let attempt = recorder.begin(AttemptKind::Adapter)?;
-        if self.mode != "missing" {
+        if !matches!(self.mode, "missing" | "supersede") {
             recorder.observe(attempt, observation())?;
             recorder.observe(attempt, observation())?; // identical delivery is idempotent
         }
@@ -51,6 +51,16 @@ impl ChatModel for Model {
             let mut other = observation();
             other.usage.input_tokens = Some(101);
             recorder.observe(attempt, other)?;
+        }
+        if self.mode == "supersede" {
+            use dekopon_model::usage::ObservationPrecedence;
+            // A streaming adapter reporting an early estimate, then the provider's own final
+            // count, then one more interim event: the terminal report wins and is not displaced.
+            let mut interim = observation();
+            interim.usage.output_tokens = Some(1);
+            recorder.observe_ranked(attempt, interim, ObservationPrecedence::Interim)?;
+            recorder.observe_ranked(attempt, observation(), ObservationPrecedence::Final)?;
+            recorder.observe_ranked(attempt, interim, ObservationPrecedence::Interim)?;
         }
         if self.mode == "model-error" {
             return Err(ModelError::Response("late decode failure".into()));
@@ -93,6 +103,7 @@ fn observed_usage_survives_later_model_tool_cancellation_and_delivery_failures_o
         "cancelled",
         "missing",
         "conflict",
+        "supersede",
     ] {
         let model = Model {
             mode,
@@ -110,7 +121,9 @@ fn observed_usage_survives_later_model_tool_cancellation_and_delivery_failures_o
             );
         assert_eq!(
             outcome.is_ok(),
-            matches!(mode, "success" | "missing"),
+            // A provider that reports usage twice, differently, no longer ends the job: the fields
+            // it disagreed with itself about go unknown and the turn is delivered.
+            matches!(mode, "success" | "missing" | "conflict" | "supersede"),
             "{mode}"
         );
         let snapshot = ledger.snapshot();
@@ -120,19 +133,36 @@ fn observed_usage_survives_later_model_tool_cancellation_and_delivery_failures_o
         if mode == "missing" {
             assert_eq!(total.input.complete(), None);
             assert_eq!(total.input.unreported, 1);
+        } else if mode == "conflict" {
+            // Only `input_tokens` differed between the two reports, so only it is unknown.
+            assert_eq!(total.input.complete(), None);
+            assert_eq!(total.input.unreported, 1);
+            assert!(total.input.invalid);
+            assert_eq!(total.cached_input.known, Some(60));
+            assert_eq!(total.output.known, Some(20));
+            assert_eq!(total.reasoning_output.known, Some(10));
+            assert_eq!(total.input_plus_output(), None);
         } else {
+            // "supersede" lands here too: the terminal report's counts, not the interim ones.
             assert_eq!(total.input.known, Some(100));
             assert_eq!(total.cached_input.known, Some(60));
             assert_eq!(total.output.known, Some(20));
             assert_eq!(total.reasoning_output.known, Some(10));
             assert_eq!(total.input_plus_output(), Some(120));
         }
-        assert_eq!(snapshot.invalid, mode == "conflict");
+        assert!(!snapshot.invalid, "{mode} must not fence the ledger");
+        // Nothing here fences the ledger for the rest of the job either.
+        assert!(
+            ledger
+                .reserve(snapshot.calls[0].identity.clone(), CallKind::Image, 1)
+                .is_ok(),
+            "{mode} left the ledger unusable"
+        );
         assert_eq!(
             snapshot.calls[0].outcome,
             if mode == "cancelled" {
                 CallOutcome::Cancelled
-            } else if matches!(mode, "model-error" | "conflict") {
+            } else if mode == "model-error" {
                 CallOutcome::Failed
             } else {
                 CallOutcome::Succeeded
@@ -291,6 +321,32 @@ fn report_deltas_come_only_from_the_tracker_and_restore_the_consume_cursor() {
 }
 
 #[test]
+fn one_inconsistent_field_is_unreported_without_blanking_the_rest_of_the_delta() {
+    // `provider_total != input + output` is a real disagreement about the total — several
+    // OpenAI-compatible endpoints define it differently — and it used to blank the whole delta
+    // *after* the cursor had already moved past it, so the broker's live token view stayed empty
+    // for the rest of the job.
+    let store = Arc::new(MemoryCheckpointStore::default());
+    let ledger = JobAccounting::default();
+    ledger
+        .install(
+            fixture_tracker("opaque-job", &[[Some(4), None, Some(2), None, Some(99)]]),
+            store.clone(),
+        )
+        .unwrap();
+    let report = ledger.take_report().expect("the valid fields still report");
+    assert_eq!(report.model_calls, 1);
+    assert_eq!(report.input_tokens, 4);
+    assert_eq!(report.input_unreported_calls, 0);
+    assert_eq!(report.output_tokens, 2);
+    assert_eq!(report.output_unreported_calls, 0);
+    assert_eq!(report.total_tokens, 0);
+    assert_eq!(report.total_unreported_calls, 1);
+    // Advanced exactly once: the same delta is not offered twice.
+    assert!(ledger.take_report().is_none());
+}
+
+#[test]
 fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
     use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
     let captured = dekopon_test_support::CaptureLayer::new();
@@ -326,7 +382,11 @@ fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
         let before = ledger.snapshot().totals();
         for (i, outcome) in [
             TransitionOutcome::Denied,
-            TransitionOutcome::AuthorizationFailed,
+            TransitionOutcome::AuthorizationFailed {
+                cause: crate::control::ControlFailureKind::Client(
+                    dekopon_broker_protocol::ClientErrorKind::ControlBinding,
+                ),
+            },
             TransitionOutcome::Applied,
         ]
         .into_iter()
@@ -399,9 +459,14 @@ fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
             && text.contains("model.name=fixture")
             && text.contains("model.effort=providerDefault")
     );
+    // The authorization failure carries *which* client failure produced it all the way into the
+    // transition event, so an operator reading the audit stream can tell a substituted decision
+    // binding from an unreachable broker.
     assert!(
         text.contains("\"outcome\":\"denied\"")
-            && text.contains("\"outcome\":\"authorizationFailed\"")
+            && text
+                .contains("\"authorizationFailed\":{\"cause\":{\"client\":\"control-binding\"}}"),
+        "{text}"
     );
     assert!(
         text.contains("\"before\":")

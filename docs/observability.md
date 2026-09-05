@@ -57,9 +57,18 @@ A logical call is not an HTTP attempt. Every inference transmission reserves one
 sending, including the subscription client's single explicit-401 retry. Refresh/adoption is not
 inference. Built-in clients record `kind=http`; non-HTTP adapters explicitly record `kind=adapter`.
 A call whose adapter supplied no attempt has `attempts_complete=false` and an `unobserved_calls`
-marker; this is unknown transmission/spend, not an invented HTTP request. There are at most 128
-chat calls plus one image call per job, and two attempts per call. There is no retry of uncertain
+marker; this is unknown transmission/spend, not an invented HTTP request. A job records at most 129
+calls in total — the ceiling is on calls, not on kinds, so 129 chat calls and no image is as valid
+as 128 and one — and two attempts per call. There is no retry of uncertain
 inference. Attempt sequence is local to its call; call/event sequences and segments are job-local.
+
+A provider that reports usage for one attempt twice, differently, does not fence the job. Duplicate
+`"usage"` keys in one JSON object are legal, and a stream can report an interim count and then a
+different terminal one; the terminal report wins outright, and two reports of equal standing that
+disagree leave exactly the fields they disagree about unknown. The
+`conflicting-usage-observation` warning names those fields. A field the ledger cannot trust is
+reported to the broker as unreported for those calls rather than blanking the other four, under the
+`accounting-field-unreported` warning.
 Opaque job IDs correlate spans across resume without exposing sender/conversation coordinates.
 
 `usage.input_tokens` includes the cached-input subset; `usage.output_tokens` includes the reasoning
@@ -290,7 +299,7 @@ attested context was derived.
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-The prompt loop's spans (`prompt.session`, `accounting.model.call`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content. `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
+The prompt loop's spans (`prompt.session`, `accounting.model.call`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". An image generation is a call like any other: it opens `accounting.model.call` with `model.kind=image` and the same identity, duration, outcome and usage fields a chat call carries, never prompt or PNG content. Every path that opens that span — an ordinary call and the finalize sweep that closes an abandoned one — builds it with the same field set, so filtering on `model.name` cannot silently omit the calls whose outcome was in doubt. `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.
 

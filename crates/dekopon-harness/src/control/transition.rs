@@ -34,7 +34,11 @@ pub(crate) fn transition(
     if state.transitions.len() > prior {
         let record = state.transitions.last_mut().expect("reserved transition");
         if result.is_err() && record.outcome == TransitionOutcome::Pending {
-            record.outcome = TransitionOutcome::AuthorizationFailed;
+            // Still pending after an error means the transition never reached the broker's answer:
+            // a checkpoint write or the host itself failed underneath it.
+            record.outcome = TransitionOutcome::AuthorizationFailed {
+                cause: ControlFailureKind::Interrupted,
+            };
         }
         journal
             .accounting
@@ -157,8 +161,16 @@ fn transition_inner(
     let decision = match decision {
         Ok(decision) => decision,
         Err(error) => {
-            tracing::error!(cause_type = "control-authorization");
-            record.outcome = TransitionOutcome::AuthorizationFailed;
+            // The kind, not just the category. `control-authorization` alone made a substituted
+            // decision binding — the one failure that says something answered the socket and lied —
+            // indistinguishable from a broker that was simply not running.
+            let cause = ControlFailureKind::of(&error);
+            tracing::error!(
+                cause_type = "control-authorization",
+                cause = %cause,
+                error = %dekopon_core::error_chain(&error),
+            );
+            record.outcome = TransitionOutcome::AuthorizationFailed { cause };
             state.control_fenced = true;
             return Err(error.into());
         }
