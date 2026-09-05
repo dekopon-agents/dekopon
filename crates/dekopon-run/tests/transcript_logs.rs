@@ -2,10 +2,14 @@
 //!
 //! # Why this is its own test binary
 //!
-//! Same reason as `prompt_tracing.rs`: `tracing` caches per-callsite interest globally the first
-//! time a callsite is hit, so a callsite first reached with no subscriber installed stays disabled
-//! for every later thread-local subscriber. Sharing a binary with other tests that call
-//! `run_prompt` would make these assertions depend on execution order.
+//! Same reason as `prompt_tracing.rs`: `tracing` caches per-callsite interest for the whole
+//! process the first time a callsite is registered, and a callsite first reached by a thread with
+//! no subscriber installed is cached off for every later scoped subscriber. This binary holds one
+//! test, so nothing else can reach these callsites first and the scoped dispatcher below is safe;
+//! a test that must share a binary uses `dekopon_test_support::CaptureLayer::install` instead,
+//! which installs one permanent process-global subscriber and routes captures by thread. Sharing
+//! a binary with other tests that drive `SessionEngine::run` under a scoped dispatcher would make
+//! these assertions depend on execution order.
 
 use dekopon_harness::tools::SCRIPT_TOOL_NAME;
 use dekopon_harness::{

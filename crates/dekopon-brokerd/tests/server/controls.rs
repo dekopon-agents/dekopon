@@ -649,10 +649,6 @@ async fn controls_real_service_checkpoint_precedes_admission_and_failure_poisons
 
 #[tokio::test]
 async fn controls_audit_fields_are_correlated_admission_only_and_prompt_permission_is_required() {
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::prelude::*;
-    let capture = dekopon_test_support::CaptureLayer::with_target_prefix("dekopon_broker");
-    let subscriber = tracing_subscriber::registry().with(capture.clone());
     let audit = Arc::new(InMemoryAuditLog::new(8).unwrap());
     let policy = policies(true, true)
         .lines()
@@ -661,9 +657,13 @@ async fn controls_audit_fields_are_correlated_admission_only_and_prompt_permissi
         .join("\n");
     let broker = build(&policy, audit.clone(), vec![], 8).await;
     let p = proposal("prompt-required", broker.surface_epoch(), "brokerd-test");
+    // A scoped dispatcher here raced a sibling test's first registration of the
+    // `broker.control.decision` callsite and failed as `missing broker.control.decision` under
+    // parallel load. The capture is opened around the one call it asserts on, so the broker's
+    // construction events stay out of it.
+    let capture = dekopon_test_support::CaptureLayer::install_with_target_prefix("dekopon_broker");
     let denied = broker
         .authorize_control(&context("caller"), None, None, p.clone())
-        .with_subscriber(subscriber)
         .await
         .unwrap();
     assert_eq!(denied.outcome, ControlOutcome::Denied);

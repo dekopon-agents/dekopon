@@ -2146,7 +2146,11 @@ fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
     let shown_json = run(&["session", "show", "--from-file", transcript_path, "--json"]);
     assert_eq!(shown_json.status.code(), Some(0), "{}", stderr(&shown_json));
     let round_trip: Value = serde_json::from_slice(&shown_json.stdout).expect("JSON transcript");
-    assert_eq!(round_trip, recorded_session(script));
+    // The file on disk carries no `version`, so this also pins that a recording written before
+    // the field existed reads back as version 1 and is printed with it.
+    let mut expected = recorded_session(script);
+    expected["version"] = json!(1);
+    assert_eq!(round_trip, expected);
 
     // On the recorded trajectory the script is answered from the recording: no provider is
     // loaded, and the tool result is byte-for-byte what was recorded.

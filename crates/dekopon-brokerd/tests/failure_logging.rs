@@ -21,8 +21,8 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    BrokerClient, BrokerResponse, ERROR_INVALID_REQUEST, FrameLimits, RequestEnvelope,
-    ResponseEnvelope, read_frame,
+    BrokerClient, BrokerResponse, ClientError, ERROR_INVALID_REQUEST, ExchangePhase, FrameLimits,
+    ProtocolError, RequestEnvelope, ResponseEnvelope, read_frame,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
@@ -213,10 +213,14 @@ async fn framing_and_audit_failures_name_their_cause() {
     // The bound and the attempted size are the whole answer to "why did that call fail".
     assert!(oversized.contains("65536"), "{oversized}");
 
-    // A piped value rides a `runCommand` frame under the same ceiling: a real frame carrying a
-    // value twice the bound is refused from its length prefix before a byte of it is read.
-    // Withhold the body to prove that refusal does not wait for it. Sending it with write_all
-    // is not atomic and races the server closing the socket after rejecting the prefix.
+    // A piped value rides a `runCommand` frame under the same ceiling. Two halves, because they
+    // fail in two different places and only one of them is deterministic on the wire.
+    //
+    // The server half: a real frame's length prefix, declaring twice the bound, is refused before
+    // a byte of the body is read. The body is deliberately withheld — writing it is not atomic and
+    // races the server closing the socket after rejecting the prefix — so this proves only that the
+    // refusal does not wait for the body, and the prefix is the one a real `runCommand` frame
+    // would carry.
     let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
@@ -240,9 +244,38 @@ async fn framing_and_audit_failures_name_their_cause() {
     );
     assert!(oversized_stdin.contains("65536"), "{oversized_stdin}");
 
+    // The client half, which is the deterministic one: the same `runCommand` with the same
+    // oversized `stdin`, sent through the real client against this running server, fails in the
+    // request phase before a byte reaches the socket, names this deployment's ceiling, and says
+    // the word never executed.
+    let client = BrokerClient::new(&socket_path, uid, limits().frame).expect("client starts");
+    let refused = client
+        .run_command(
+            None,
+            "probe".to_owned(),
+            vec!["upper".to_owned(), "-".to_owned()],
+            Some("x".repeat(128 * 1024)),
+        )
+        .await
+        .expect_err("an oversized piped value never reaches the broker");
+    assert!(
+        matches!(
+            &refused,
+            ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::FrameTooLarge { .. },
+            }
+        ),
+        "expected a request-phase frame bound, got {refused}"
+    );
+    assert!(!refused.may_have_executed());
+    assert!(
+        refused.to_string().contains("maximum is 65536"),
+        "{refused}"
+    );
+
     // The consequential one: the decision landed, the provider ran, and nothing recorded the
     // outcome. The invocation identifier and the audit cause both have to survive to the log.
-    let client = BrokerClient::new(&socket_path, uid, limits().frame).expect("client starts");
     let request = InvocationRequest {
         id: "invoke-unaudited"
             .parse::<InvocationId>()

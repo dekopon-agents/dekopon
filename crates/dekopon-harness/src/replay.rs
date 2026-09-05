@@ -47,9 +47,13 @@ use crate::{
 /// This is also the on-disk shape `dekopon-run session show --json` prints and `session replay
 /// --from-file` reads back, so a recording can be kept, edited, and replayed without a telemetry
 /// backend in the loop.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecordedSession {
+    /// On-disk shape version, checked before any other field. Files written before this field
+    /// existed are read as version 1, which is what this crate has always written.
+    #[serde(default = "legacy_recording_version")]
+    pub version: u32,
     /// The telemetry trace the records were read from.
     pub trace_id: String,
     /// Leading system messages, in order: standing instructions, then any skills listing.
@@ -73,6 +77,29 @@ pub struct RecordedSession {
     /// The final answer, when the session produced one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+}
+
+/// The only on-disk shape this crate has ever written, and the only one it reads.
+pub const RECORDING_VERSION: u32 = 1;
+
+fn legacy_recording_version() -> u32 {
+    RECORDING_VERSION
+}
+
+impl Default for RecordedSession {
+    fn default() -> Self {
+        Self {
+            version: RECORDING_VERSION,
+            trace_id: String::new(),
+            system: Vec::new(),
+            history: Vec::new(),
+            contexts: Vec::new(),
+            prompt: String::new(),
+            turns: Vec::new(),
+            calls: None,
+            answer: None,
+        }
+    }
 }
 
 /// A job/call coordinate is independent of any provider assistant/tool ID.
@@ -219,9 +246,48 @@ pub enum RecordingError {
     Malformed {
         /// The trace asked for.
         trace_id: String,
-        /// What was wrong, naming the event.
+        /// What was wrong, naming the event. Several problems are reported together.
         detail: String,
     },
+    /// The recording file declares a shape this build does not read.
+    #[error(
+        "recording for trace {trace_id} declares version {version}; this build reads version {supported}"
+    )]
+    UnsupportedVersion {
+        /// The trace asked for.
+        trace_id: String,
+        /// The version the file declared.
+        version: u32,
+        /// The version this build reads.
+        supported: u32,
+    },
+}
+
+/// Collects every problem a reconstruction found, so one failure names all of them.
+///
+/// A recording is edited by hand and rebuilt from rows a backend returned in any order; stopping at
+/// the first conflict makes fixing one a round trip per problem.
+#[derive(Default)]
+struct Problems(Vec<String>);
+
+impl Problems {
+    fn push(&mut self, detail: impl Into<String>) {
+        self.0.push(detail.into());
+    }
+    fn extend(&mut self, detail: Result<(), String>) {
+        if let Err(detail) = detail {
+            self.push(detail);
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Every problem in one message, deduplicated: repeated exports repeat their conflicts.
+    fn detail(mut self) -> String {
+        self.0.sort_unstable();
+        self.0.dedup();
+        self.0.join("; ")
+    }
 }
 
 /// Reads one attribute off a flattened telemetry record.
@@ -261,11 +327,20 @@ fn float(record: &Value, name: &str) -> Option<f64> {
 }
 
 impl RecordedSession {
-    fn model_turns(&self) -> u32 {
-        let count = self.calls.as_ref().map_or(self.turns.len(), |calls| {
-            calls.iter().filter(|call| call.kind == "chat").count()
-        });
-        u32::try_from(count).unwrap_or(u32::MAX)
+    /// Recorded chat calls, or `None` when nothing in the recording says how many there were.
+    ///
+    /// An empty `calls` list is unknown, never zero: it is what a session whose accounting rows the
+    /// receiver did not return looks like, and reporting `0` there reads as free inference. A file
+    /// written before independent call accounting existed carries no `calls` at all, and its
+    /// answered turns are then the honest count.
+    fn model_turns(&self) -> Option<u32> {
+        let count = match &self.calls {
+            Some(calls) if calls.is_empty() => return None,
+            Some(calls) => calls.iter().filter(|call| call.kind == "chat").count(),
+            None if self.turns.is_empty() => return None,
+            None => self.turns.len(),
+        };
+        Some(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Reconstructs one session from the log records exported under its trace.
@@ -293,6 +368,7 @@ impl RecordedSession {
             trace_id: trace_id.to_owned(),
             detail,
         };
+        let mut problems = Problems::default();
 
         let mut prompts = BTreeMap::<u64, RecordedContext>::new();
         let mut answers = BTreeMap::<u64, (String, String)>::new();
@@ -307,28 +383,34 @@ impl RecordedSession {
             let turn = unsigned(record, "model.turn");
             match event.as_str() {
                 "agent.model.prompt" => {
-                    let turn = turn.ok_or_else(|| {
-                        malformed("agent.model.prompt without model.turn".to_owned())
-                    })?;
-                    let context = context::decode_prompt(record, turn).map_err(&malformed)?;
+                    let Some(turn) = turn else {
+                        problems.push("agent.model.prompt without model.turn");
+                        continue;
+                    };
                     if let Some(id) = text(record, "job.id") {
                         if job.as_ref().is_some_and(|old| old != &id) {
-                            return Err(malformed("conflicting prompt job IDs".into()));
+                            problems.push("conflicting prompt job IDs");
                         }
                         job = Some(id);
                     }
+                    let context = match context::decode_prompt(record, turn) {
+                        Ok(context) => context,
+                        Err(detail) => {
+                            problems.push(detail);
+                            continue;
+                        }
+                    };
                     if let Some(old) = prompts.insert(turn, context.clone())
                         && old != context
                     {
-                        return Err(malformed(format!(
-                            "conflicting prompt records for turn {turn}"
-                        )));
+                        problems.push(format!("conflicting prompt records for turn {turn}"));
                     }
                 }
                 "agent.model.answer" => {
-                    let turn = turn.ok_or_else(|| {
-                        malformed("agent.model.answer without model.turn".to_owned())
-                    })?;
+                    let Some(turn) = turn else {
+                        problems.push("agent.model.answer without model.turn");
+                        continue;
+                    };
                     let answer = (
                         text(record, "answer").unwrap_or_default(),
                         text(record, "tool_calls").unwrap_or_else(|| "[]".to_owned()),
@@ -336,9 +418,7 @@ impl RecordedSession {
                     if let Some(old) = answers.insert(turn, answer.clone())
                         && old != answer
                     {
-                        return Err(malformed(format!(
-                            "conflicting answer records for turn {turn}"
-                        )));
+                        problems.push(format!("conflicting answer records for turn {turn}"));
                     }
                 }
                 "accounting.model.call" | "accounting.model.turn" => {
@@ -349,22 +429,29 @@ impl RecordedSession {
                         reasoning_output_tokens: unsigned(record, "usage.reasoning_output_tokens"),
                         total_tokens: unsigned(record, "usage.total_tokens"),
                     };
-                    let (job, sequence) = if event == "accounting.model.call" {
-                        (
-                            text(record, "job.id").ok_or_else(|| {
-                                malformed("accounting.model.call without job.id".into())
-                            })?,
-                            unsigned(record, "call.sequence").ok_or_else(|| {
-                                malformed("accounting.model.call without call.sequence".into())
-                            })?,
-                        )
+                    let coordinate = if event == "accounting.model.call" {
+                        match (text(record, "job.id"), unsigned(record, "call.sequence")) {
+                            (Some(job), Some(sequence)) => Some((job, sequence)),
+                            (None, _) => {
+                                problems.push("accounting.model.call without job.id");
+                                None
+                            }
+                            (Some(_), None) => {
+                                problems.push("accounting.model.call without call.sequence");
+                                None
+                            }
+                        }
                     } else {
-                        (
-                            format!("historical-{trace_id}"),
-                            turn.ok_or_else(|| {
-                                malformed("accounting.model.turn without model.turn".into())
-                            })?,
-                        )
+                        match turn {
+                            Some(turn) => Some((format!("historical-{trace_id}"), turn)),
+                            None => {
+                                problems.push("accounting.model.turn without model.turn");
+                                None
+                            }
+                        }
+                    };
+                    let Some((job, sequence)) = coordinate else {
+                        continue;
                     };
                     let kind = text(record, "model.kind").unwrap_or_else(|| "chat".into());
                     let call = RecordedAccountingCall {
@@ -376,7 +463,7 @@ impl RecordedSession {
                     if let Some(old) = calls.insert((job, sequence), call.clone())
                         && old != call
                     {
-                        return Err(malformed("conflicting accounting call records".into()));
+                        problems.push("conflicting accounting call records");
                     }
                     if kind != "image"
                         && let Some(turn) = turn
@@ -385,11 +472,18 @@ impl RecordedSession {
                         if let Some(old) = coordinates.insert(turn, (call.job.clone(), sequence))
                             && old != (call.job.clone(), sequence)
                         {
-                            return Err(malformed(format!(
-                                "conflicting chat calls for turn {turn}"
-                            )));
+                            problems.push(format!("conflicting chat calls for turn {turn}"));
                         }
-                        accounting.insert(turn, (usage, float(record, "duration_ms")));
+                        // A duplicate export is idempotent only if it agrees about the round trip
+                        // too; a last-wins duration silently picks one of two disagreeing rows.
+                        let observation = (usage, float(record, "duration_ms"));
+                        if let Some(old) = accounting.insert(turn, observation)
+                            && old != observation
+                        {
+                            problems.push(format!(
+                                "conflicting accounting observations for turn {turn}"
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -397,13 +491,19 @@ impl RecordedSession {
         }
 
         if prompts.is_empty() {
+            if !problems.is_empty() {
+                return Err(malformed(problems.detail()));
+            }
             return Err(RecordingError::NoTranscript {
                 trace_id: trace_id.to_owned(),
                 turns: accounting.len(),
             });
         }
         let contexts: Vec<_> = prompts.into_values().collect();
-        context::validate_contexts(&contexts).map_err(&malformed)?;
+        problems.extend(context::validate_contexts(&contexts));
+        if !problems.is_empty() {
+            return Err(malformed(problems.detail()));
+        }
         let first = &contexts[0].messages;
         let system_end = first.iter().take_while(|m| m.role == "system").count();
         let system = first[..system_end]
@@ -417,15 +517,38 @@ impl RecordedSession {
         let mut turns = Vec::new();
         for (number, (answer, encoded)) in answers {
             if !contexts.iter().any(|c| u64::from(c.turn) == number) {
-                return Err(malformed(format!(
-                    "answer without prompt for turn {number}"
-                )));
+                problems.push(format!("answer without prompt for turn {number}"));
+                continue;
             }
-            let calls = serde_json::from_str::<Vec<dekopon_model::model::ModelToolCall>>(&encoded)
-                .map_err(|error| malformed(format!("turn {number} tool calls: {error}")))?;
+            let calls =
+                match serde_json::from_str::<Vec<dekopon_model::model::ModelToolCall>>(&encoded) {
+                    Ok(calls) => calls,
+                    Err(error) => {
+                        problems.push(format!("turn {number} tool calls: {error}"));
+                        continue;
+                    }
+                };
+            // The writer caps a turn at MAX_TOOL_CALLS_PER_TURN, so a row claiming more is not a
+            // transcript this loop wrote. Refuse it before the reconstruction iterates it: the
+            // correlation walk is contexts × messages × turns × calls.
+            if calls.len() > crate::tools::MAX_TOOL_CALLS_PER_TURN {
+                problems.push(format!(
+                    "agent.model.answer for turn {number} claims {} tool calls; at most {} are written per turn",
+                    calls.len(),
+                    crate::tools::MAX_TOOL_CALLS_PER_TURN
+                ));
+                continue;
+            }
             let (usage, duration_ms) = accounting.get(&number).copied().unwrap_or((None, None));
+            let turn = match u32::try_from(number) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    problems.push(error.to_string());
+                    continue;
+                }
+            };
             turns.push(RecordedTurn {
-                turn: u32::try_from(number).map_err(|error| malformed(error.to_string()))?,
+                turn,
                 content: (!answer.is_empty()).then_some(answer),
                 tool_calls: calls
                     .into_iter()
@@ -440,8 +563,18 @@ impl RecordedSession {
                 duration_ms,
             });
         }
-        context::capture_results(&contexts, &mut turns, &coordinates, job.as_deref())
-            .map_err(&malformed)?;
+        if !problems.is_empty() {
+            return Err(malformed(problems.detail()));
+        }
+        problems.extend(context::capture_results(
+            &contexts,
+            &mut turns,
+            &coordinates,
+            job.as_deref(),
+        ));
+        if !problems.is_empty() {
+            return Err(malformed(problems.detail()));
+        }
         let answer = turns
             .last()
             .filter(|turn| turn.tool_calls.is_empty())
@@ -449,36 +582,54 @@ impl RecordedSession {
             .filter(|content| !content.trim().is_empty());
 
         Ok(Self {
+            version: RECORDING_VERSION,
             trace_id: trace_id.to_owned(),
             system,
             history,
             contexts,
             prompt,
             turns,
-            calls: Some(calls.into_values().collect()),
+            // No accounting row is unknown, not zero calls: the `calls` list means "this is every
+            // call", and an empty one would claim the session made none.
+            calls: (!calls.is_empty()).then(|| calls.into_values().collect()),
             answer,
         })
     }
 
-    /// Checks portable context revisions and independent call coordinates in an edited recording.
+    /// Checks the declared version, portable context revisions, and independent call coordinates.
     ///
     /// # Errors
-    /// Returns [`RecordingError::Malformed`] for conflicting or incomplete portable context.
+    /// Returns [`RecordingError::UnsupportedVersion`] for a shape this build does not read, and
+    /// [`RecordingError::Malformed`] for conflicting or incomplete portable context — every
+    /// conflict found, in one message.
     pub fn validate(&self) -> Result<(), RecordingError> {
+        if self.version != RECORDING_VERSION {
+            return Err(RecordingError::UnsupportedVersion {
+                trace_id: self.trace_id.clone(),
+                version: self.version,
+                supported: RECORDING_VERSION,
+            });
+        }
         let malformed = |detail| RecordingError::Malformed {
             trace_id: self.trace_id.clone(),
             detail,
         };
-        context::ReplayContext::new(self).map_err(&malformed)?;
+        let mut problems = Problems::default();
+        problems.extend(context::ReplayContext::new(self).map(|_| ()));
         let mut calls = std::collections::BTreeSet::new();
         for call in self.calls.iter().flatten() {
             if !calls.insert((&call.job, call.sequence)) {
-                return Err(malformed(
-                    "duplicate accounting call in recording file".into(),
+                problems.push(format!(
+                    "duplicate accounting call {}/{} in recording file",
+                    call.job, call.sequence
                 ));
             }
         }
-        Ok(())
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(malformed(problems.detail()))
+        }
     }
 
     /// The scripts the recorded model wrote, in order.
@@ -549,11 +700,6 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
     let mut sessions: BTreeMap<String, SessionListing> = BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
     for record in records {
-        if let (Some(job), Some(call)) = (text(record, "job.id"), unsigned(record, "call.sequence"))
-            && !seen.insert((job, call))
-        {
-            continue;
-        }
         if !matches!(
             text(record, "audit.event").as_deref(),
             Some("accounting.model.call" | "accounting.model.turn")
@@ -563,6 +709,13 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
         let Some(trace_id) = text(record, "trace_id") else {
             continue;
         };
+        // Dedup only what is actually counted. A transcript row carrying the same job/call
+        // coordinates used to consume the slot and then be discarded, hiding the accounting row.
+        if let (Some(job), Some(call)) = (text(record, "job.id"), unsigned(record, "call.sequence"))
+            && !seen.insert((job, call))
+        {
+            continue;
+        }
         let timestamp = field(record, "_timestamp")
             .and_then(Value::as_i64)
             .or_else(|| text(record, "_timestamp").and_then(|value| value.trim().parse().ok()))
@@ -662,8 +815,9 @@ pub struct Divergence {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
-    /// Model turns the session made.
-    pub model_turns: u32,
+    /// Model turns the session made, or `None` when the recording does not say.
+    #[serde(default)]
+    pub model_turns: Option<u32>,
     /// Scripts the model wrote, in order.
     pub scripts: Vec<String>,
     /// The final answer, when one was produced.
@@ -689,6 +843,13 @@ pub struct ReplayReport {
     /// Suggestions the replayed model recorded.
     #[serde(default)]
     pub suggestions: Vec<ImprovementSuggestion>,
+    /// Recorded history exchanges the replay could not carry, because retention is bounded.
+    ///
+    /// A recording whose route remembered more turns than [`History`] retains replays the newest
+    /// ones; this says how many older ones the replayed model never saw, so a comparison against
+    /// the recorded session is not read as like-for-like when it is not.
+    #[serde(default)]
+    pub dropped_history_turns: usize,
     /// A session failure that ended the replay, other than a divergence stop.
     #[serde(default)]
     pub error: Option<String>,
@@ -699,6 +860,13 @@ struct ReplayRuntime<'a> {
     recorded: Mutex<VecDeque<(String, ScriptOutcome)>>,
     requested: Mutex<Vec<String>>,
     divergence: Mutex<Option<Divergence>>,
+    /// Assistant batches in which at least one script was dispatched live, by call sequence.
+    ///
+    /// `ToolGroup::provenance` labels the whole batch, and the label a later turn shows the model
+    /// says "no new capability execution is claimed". That is only true of a batch every one of
+    /// whose results came out of the recording, so a batch is disqualified the moment one script
+    /// reaches the live runtime — before or after a recorded sibling in the same batch.
+    live_dispatched_groups: Mutex<std::collections::BTreeSet<u32>>,
     live: Option<&'a (dyn ScriptRuntime + Sync)>,
     recorded_system: &'a [String],
 }
@@ -744,6 +912,33 @@ fn outcome_from_result(result: &str) -> ScriptOutcome {
 }
 
 impl ReplayRuntime<'_> {
+    /// Marks the current assistant batch as one a live dispatch entered, and takes back any
+    /// `RecordedReplay` label an earlier recorded sibling in the same batch already stamped.
+    fn disqualify_group(&self, journal: &crate::checkpoint::ExecutionJournal) {
+        let Some(call) = journal
+            .snapshot()
+            .record
+            .groups
+            .last()
+            .map(|group| group.call)
+        else {
+            return;
+        };
+        self.live_dispatched_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(call);
+        if let Err(error) = journal.update(|c| {
+            if let Some(group) = c.record.groups.last_mut()
+                && group.provenance == Some(crate::history::ExecutionProvenance::RecordedReplay)
+            {
+                group.provenance = None;
+            }
+        }) {
+            journal.failure(error);
+        }
+    }
+
     fn run_script_inner(
         &self,
         script: &str,
@@ -762,15 +957,22 @@ impl ReplayRuntime<'_> {
         // may reorder two independent scripts and still be on the recorded trajectory.
         if let Some(position) = recorded.iter().position(|(recorded, _)| recorded == script) {
             let (_, outcome) = recorded.remove(position).expect("position is in range");
-            if let Some(journal) = journal
-                && let Err(error) = journal.update(|c| {
-                    if let Some(group) = c.record.groups.last_mut() {
+            if let Some(journal) = journal {
+                let live_dispatched = self
+                    .live_dispatched_groups
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(error) = journal.update(|c| {
+                    if let Some(group) = c.record.groups.last_mut()
+                        && !live_dispatched.contains(&group.call)
+                    {
                         group.provenance =
                             Some(crate::history::ExecutionProvenance::RecordedReplay);
                     }
-                })
-            {
-                journal.failure(error);
+                }) {
+                    drop(live_dispatched);
+                    journal.failure(error);
+                }
             }
             return outcome;
         }
@@ -795,6 +997,7 @@ impl ReplayRuntime<'_> {
                 drop(divergence);
                 match journal {
                     Some(journal) => {
+                        self.disqualify_group(journal);
                         live.run_script_observed(script, max_capability_calls, journal)
                     }
                     None => live.run_script(script, max_capability_calls),
@@ -869,6 +1072,7 @@ where
         recorded: Mutex::new(ReplayRuntime::recorded_outcomes(recorded)),
         requested: Mutex::new(Vec::new()),
         divergence: Mutex::new(None),
+        live_dispatched_groups: Mutex::new(std::collections::BTreeSet::new()),
         live: inputs.live,
         recorded_system: &recorded.system,
     };
@@ -895,6 +1099,10 @@ where
             None => crate::history::JobRecord::unanswered(&exchange.user),
         });
     }
+    // `History::new` clamps the retention window it is asked for, and `record` trims to it, so a
+    // recording with more remembered exchanges than the harness retains loses the oldest ones. The
+    // count is measured rather than derived, so it stays right whatever the clamp is.
+    let dropped_history_turns = recorded.history.len().saturating_sub(history.len());
     let fallback_accounting = crate::accounting::JobAccounting::default();
     let accounting = inputs.accounting.unwrap_or(&fallback_accounting);
     let mut session = SessionBootstrap::new(&recorded.prompt, inputs.limits, inputs.selected_model)
@@ -925,6 +1133,7 @@ where
                 replayed: SessionSummary::default(),
                 divergence: None,
                 suggestions: Vec::new(),
+                dropped_history_turns,
                 error: Some(error),
             };
         }
@@ -959,11 +1168,16 @@ where
             usage: recorded.usage(),
         },
         replayed: SessionSummary {
-            model_turns: tracked
-                .calls
-                .iter()
-                .filter(|c| c.kind == crate::accounting::CallKind::Chat)
-                .count() as u32,
+            model_turns: Some(
+                u32::try_from(
+                    tracked
+                        .calls
+                        .iter()
+                        .filter(|c| c.kind == crate::accounting::CallKind::Chat)
+                        .count(),
+                )
+                .unwrap_or(u32::MAX),
+            ),
             scripts: runtime
                 .requested
                 .lock()
@@ -974,6 +1188,7 @@ where
         },
         divergence,
         suggestions,
+        dropped_history_turns,
         error,
     }
 }
@@ -989,10 +1204,18 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DivergenceHandling, RecordedSession, RecordingError, ReplayInputs, SessionListing,
-        list_sessions, outcome_from_result, replay,
+        DivergenceHandling, RECORDING_VERSION, RecordedSession, RecordingError, ReplayInputs,
+        SessionListing, list_sessions, outcome_from_result, replay,
     };
-    use crate::{session::PromptLimits, tools::SCRIPT_TOOL_NAME};
+    use crate::{
+        bootstrap::{BootstrapError, CapabilitySnapshot},
+        checkpoint::ExecutionJournal,
+        history::{ExecutionProvenance, JobRecord},
+        runtime::ScriptRuntime,
+        session::PromptLimits,
+        tools::{MAX_TOOL_CALLS_PER_TURN, SCRIPT_TOOL_NAME},
+    };
+    use dekopon_shell::{ExitCode, ScriptOutcome};
 
     #[test]
     fn independent_accounting_includes_failed_calls_images_and_unknown_fields() {
@@ -1034,17 +1257,17 @@ mod tests {
             inputs(None),
         );
         assert_eq!(report.error, None);
-        assert_eq!(report.recorded.model_turns, 2);
+        assert_eq!(report.recorded.model_turns, Some(2));
         assert_eq!(report.recorded.usage.total_tokens, Some(39));
         let mut malformed = recorded.clone();
         malformed.contexts[0].scope = "invalid".into();
         let report = replay(&ScriptedModel::new([]), &malformed, inputs(None));
         assert!(report.error.unwrap().contains("revision ordering"));
-        assert_eq!(report.recorded.model_turns, 2);
+        assert_eq!(report.recorded.model_turns, Some(2));
         assert_eq!(report.recorded.usage.total_tokens, Some(39));
         let mut historical = recorded;
         historical.calls = None;
-        assert_eq!(historical.model_turns(), 1);
+        assert_eq!(historical.model_turns(), Some(1));
     }
 
     /// A listing is built from accounting alone, so it covers sessions with no transcript.
@@ -1287,7 +1510,7 @@ mod tests {
         assert!(report.divergence.is_none(), "{report:?}");
         assert_eq!(report.error, None);
         assert_eq!(report.replayed.answer.as_deref(), Some("Forty-two posts."));
-        assert_eq!(report.replayed.model_turns, 2);
+        assert_eq!(report.replayed.model_turns, Some(2));
         assert_eq!(
             report.replayed.scripts,
             vec!["posts.count | jq .n".to_owned()]
@@ -1302,6 +1525,333 @@ mod tests {
         assert_eq!(systems[0][0], "Be terse.");
         assert!(crate::bootstrap::is_prompt_block(&systems[0][1]));
         assert!(systems[0][1].contains("replay-model"));
+    }
+
+    /// A live runtime for the scripts the recording cannot answer, which reports what the
+    /// checkpoint said about each assistant batch at the moment it was asked to run one.
+    struct LiveScripts {
+        records: Mutex<Vec<JobRecord>>,
+    }
+
+    impl LiveScripts {
+        fn new() -> Self {
+            Self {
+                records: Mutex::new(Vec::new()),
+            }
+        }
+        fn record(&self, index: usize) -> JobRecord {
+            self.records.lock().expect("observed records")[index].clone()
+        }
+    }
+
+    impl ScriptRuntime for LiveScripts {
+        fn run_script(&self, script: &str, _maximum: u32) -> ScriptOutcome {
+            ScriptOutcome {
+                output: format!("live {script}"),
+                exit_code: ExitCode::SUCCESS,
+                truncated: false,
+                capability_calls: 0,
+                steps: 0,
+            }
+        }
+        fn run_script_observed(
+            &self,
+            script: &str,
+            maximum: u32,
+            journal: &ExecutionJournal,
+        ) -> ScriptOutcome {
+            self.records
+                .lock()
+                .expect("observed records")
+                .push(journal.snapshot().record);
+            self.run_script(script, maximum)
+        }
+        fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
+            Ok(CapabilitySnapshot::empty())
+        }
+    }
+
+    fn live_inputs(live: &LiveScripts) -> ReplayInputs<'_> {
+        ReplayInputs {
+            live: Some(live),
+            limits: PromptLimits {
+                max_steps: 6,
+                max_capability_calls: 8,
+            },
+            ..inputs(None)
+        }
+    }
+
+    fn banner_shown(record: &JobRecord) -> bool {
+        let mut messages = Vec::new();
+        crate::context::replay_job(record, &mut messages);
+        messages
+            .iter()
+            .filter_map(ModelMessage::content)
+            .any(|text| text.contains("no new capability execution is claimed"))
+    }
+
+    /// The banner speaks for the whole assistant batch, so one live dispatch in it makes the
+    /// claim false, whichever order the recorded and unrecorded scripts ran in.
+    #[test]
+    fn a_batch_with_one_live_script_claims_no_recorded_replay_for_the_group() {
+        let recorded = RecordedSession::from_records("t1", &records()).expect("transcript loads");
+        let mixed_first = AssistantTurn {
+            content: None,
+            tool_calls: ["posts.count | jq .n", "posts.list | jq length"]
+                .iter()
+                .enumerate()
+                .map(|(index, script)| {
+                    let mut call = script_call(script).tool_calls.remove(0);
+                    call.id = format!("replay-call-{index}");
+                    call
+                })
+                .collect(),
+            usage: None,
+            replay_items: Vec::new(),
+        };
+        let live = LiveScripts::new();
+        let report = replay(
+            &ScriptedModel::new([
+                mixed_first,
+                script_call("posts.tail | jq .n"),
+                answer("mixed"),
+            ]),
+            &recorded,
+            live_inputs(&live),
+        );
+        assert_eq!(report.error, None, "{report:?}");
+        // Observed while the second batch's live script ran, so the first batch is settled.
+        let settled = live.record(1);
+        assert_eq!(
+            settled.groups[0].provenance, None,
+            "a batch a live script entered is not a recorded replay"
+        );
+        assert!(!banner_shown(&settled), "{settled:?}");
+
+        // The control: a batch every one of whose results came from the recording keeps the label.
+        let live = LiveScripts::new();
+        let report = replay(
+            &ScriptedModel::new([
+                script_call("posts.count | jq .n"),
+                script_call("posts.tail | jq .n"),
+                answer("all recorded first"),
+            ]),
+            &recorded,
+            live_inputs(&live),
+        );
+        assert_eq!(report.error, None, "{report:?}");
+        let settled = live.record(0);
+        assert_eq!(
+            settled.groups[0].provenance,
+            Some(ExecutionProvenance::RecordedReplay)
+        );
+        assert!(banner_shown(&settled), "{settled:?}");
+    }
+
+    /// The writer caps a turn at ten calls, so the reconstruction refuses more before iterating.
+    #[test]
+    fn an_answer_row_claiming_more_tool_calls_than_a_turn_can_hold_is_refused() {
+        let calls = (0..=MAX_TOOL_CALLS_PER_TURN)
+            .map(|index| {
+                json!({"id": format!("call-{index}"), "type": "function",
+                       "function": {"name": "bash", "arguments": json!({"script": "x"}).to_string()}})
+            })
+            .collect::<Vec<_>>();
+        let mut rows = records();
+        rows.retain(|row| row["audit_event"] != "agent.model.answer" || row["model_turn"] != 1);
+        rows.push(
+            json!({"trace_id": "t1", "audit_event": "agent.model.answer", "model_turn": 1,
+                   "answer": "", "tool_calls": json!(calls).to_string()}),
+        );
+        let error = RecordedSession::from_records("t1", &rows)
+            .expect_err("eleven tool calls are not a transcript this loop wrote")
+            .to_string();
+        assert!(error.contains("claims 11 tool calls"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "at most {MAX_TOOL_CALLS_PER_TURN} are written per turn"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("turn 1"), "{error}");
+    }
+
+    /// No accounting row is unknown, not zero calls.
+    #[test]
+    fn a_recording_with_no_accounting_rows_reports_unknown_model_turns_not_zero() {
+        let mut rows = records();
+        rows.retain(|row| {
+            !row["audit_event"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("accounting")
+        });
+        let recorded = RecordedSession::from_records("t1", &rows).expect("transcript loads");
+        assert_eq!(
+            recorded.calls, None,
+            "no rows is not an empty list of calls"
+        );
+        // Answered turns are still an honest count when nothing else says otherwise.
+        assert_eq!(recorded.model_turns(), Some(2));
+
+        let mut emptied = recorded.clone();
+        emptied.calls = Some(Vec::new());
+        assert_eq!(
+            emptied.model_turns(),
+            None,
+            "an empty call list is unknown, never zero"
+        );
+        let report = replay(&ScriptedModel::new([]), &emptied, inputs(None));
+        assert_eq!(report.recorded.model_turns, None);
+        let encoded = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(encoded["recorded"]["modelTurns"], Value::Null);
+    }
+
+    /// The dedup slot belongs to the rows the listing counts, not to the ones it discards.
+    #[test]
+    fn a_transcript_row_sharing_a_call_coordinate_does_not_hide_its_accounting_row() {
+        let records = vec![
+            json!({"trace_id": "t", "audit_event": "agent.model.answer", "job_id": "job",
+                   "call_sequence": 1, "model_turn": 1, "_timestamp": 1_000}),
+            json!({"trace_id": "t", "audit_event": "accounting.model.call", "job_id": "job",
+                   "call_sequence": 1, "model_turn": 1, "_timestamp": 2_000,
+                   "usage_total_tokens": 11, "answer_present": true, "outcome": "succeeded"}),
+            // The same accounting row exported twice still counts once.
+            json!({"trace_id": "t", "audit_event": "accounting.model.call", "job_id": "job",
+                   "call_sequence": 1, "model_turn": 1, "_timestamp": 2_000,
+                   "usage_total_tokens": 11, "answer_present": true, "outcome": "succeeded"}),
+            json!({"trace_id": "t", "audit_event": "accounting.model.call", "job_id": "job",
+                   "call_sequence": 2, "model_turn": 2, "_timestamp": 3_000,
+                   "usage_total_tokens": 7, "answer_present": true, "outcome": "cancelled"}),
+        ];
+
+        let listing = list_sessions(&records);
+
+        assert_eq!(
+            listing,
+            vec![SessionListing {
+                trace_id: "t".to_owned(),
+                service: None,
+                started_us: 2_000,
+                ended_us: 3_000,
+                model_turns: 2,
+                total_tokens: Some(18),
+                failed: true,
+                answered: true,
+            }]
+        );
+    }
+
+    /// A reconstruction reports every conflict it found, not the first one it hit.
+    #[test]
+    fn two_simultaneous_reconstruction_conflicts_are_both_reported() {
+        let mut rows = records();
+        let mut answer = rows[2].clone();
+        answer["answer"] = json!("a different answer");
+        let mut accounting = rows[1].clone();
+        accounting["duration_ms"] = json!(99.5);
+        rows.extend([answer, accounting]);
+
+        let error = RecordedSession::from_records("t1", &rows)
+            .expect_err("two conflicts")
+            .to_string();
+
+        assert!(
+            error.contains("conflicting answer records for turn 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("conflicting accounting observations for turn 1"),
+            "{error}"
+        );
+    }
+
+    /// Two duplicate coordinates in an edited file are both named.
+    #[test]
+    fn every_duplicate_accounting_call_in_a_recording_file_is_named() {
+        let mut recorded = RecordedSession::from_records("t1", &records()).expect("loads");
+        let calls = recorded.calls.get_or_insert_with(Vec::new);
+        let first = calls[0].clone();
+        let mut second = first.clone();
+        second.sequence = first.sequence.checked_add(1).expect("fits");
+        calls.push(second.clone());
+        calls.push(first.clone());
+        calls.push(second);
+
+        let error = recorded.validate().expect_err("two duplicates").to_string();
+
+        assert!(
+            error.contains(&format!("{}/{}", first.job, first.sequence)),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("{}/{}", first.job, first.sequence + 1)),
+            "{error}"
+        );
+    }
+
+    /// The declared shape is checked before anything else, and an unknown key is not a recording.
+    #[test]
+    fn a_recording_file_declares_a_version_and_refuses_unknown_top_level_keys() {
+        let recorded = RecordedSession::from_records("t1", &records()).expect("loads");
+        assert_eq!(recorded.version, RECORDING_VERSION);
+        let encoded = serde_json::to_value(&recorded).expect("serializes");
+        assert_eq!(encoded["version"], json!(RECORDING_VERSION));
+
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().expect("object").remove("version");
+        let decoded: RecordedSession =
+            serde_json::from_value(legacy).expect("a file written before the field reads as 1");
+        assert_eq!(decoded.version, RECORDING_VERSION);
+        decoded.validate().expect("a version-1 recording validates");
+
+        let mut unknown = encoded;
+        unknown["surprise"] = json!(true);
+        let error = serde_json::from_value::<RecordedSession>(unknown)
+            .expect_err("an unknown top-level key is not this shape")
+            .to_string();
+        assert!(error.contains("surprise"), "{error}");
+
+        let mut future = recorded;
+        future.version = 99;
+        let error = future.validate().expect_err("version 99 is not read");
+        assert!(
+            matches!(
+                error,
+                RecordingError::UnsupportedVersion { version: 99, .. }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("99"), "{error}");
+    }
+
+    /// A route that remembered more than the harness retains replays fewer turns, and says so.
+    #[test]
+    fn history_the_replay_could_not_carry_is_counted_in_the_report() {
+        let mut recorded = RecordedSession::from_records("t1", &records()).expect("loads");
+        recorded.contexts.clear();
+        recorded.history = (0..200)
+            .map(|index| super::RecordedExchange {
+                user: format!("question {index}"),
+                answer: Some(format!("answer {index}")),
+            })
+            .collect();
+
+        let report = replay(
+            &ScriptedModel::new([answer("done")]),
+            &recorded,
+            inputs(None),
+        );
+
+        assert_eq!(report.error, None, "{report:?}");
+        assert_eq!(report.dropped_history_turns, 200 - 128);
+        let encoded = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(encoded["droppedHistoryTurns"], json!(72));
+
+        let short = RecordedSession::from_records("t1", &records()).expect("loads");
+        let report = replay(&ScriptedModel::new([answer("done")]), &short, inputs(None));
+        assert_eq!(report.dropped_history_turns, 0);
     }
 
     #[test]
@@ -1324,7 +1874,7 @@ mod tests {
         );
         assert_eq!(report.replayed.answer, None);
         assert_eq!(report.error, None, "a divergence stop is not a failure");
-        assert_eq!(report.replayed.model_turns, 1);
+        assert_eq!(report.replayed.model_turns, Some(1));
         // Without an override the recorded instructions were replayed.
         let systems = model.systems.lock().expect("systems");
         assert_eq!(systems[0].len(), 2);

@@ -98,17 +98,31 @@ pub(super) fn decode_prompt(record: &Value, turn: u64) -> Result<RecordedContext
     })
 }
 
+/// Every distinct problem in one message, in the order they were found; `Ok` when there were none.
+fn joined(mut problems: Vec<String>) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    problems.retain(|problem| seen.insert(problem.clone()));
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Reports every conflict in one message rather than stopping at the first: a recording is edited
+/// by hand, and one round trip per malformed revision is one round trip too many.
 pub(super) fn validate_contexts(contexts: &[RecordedContext]) -> Result<(), String> {
     if contexts.is_empty() || contexts.len() > 128 {
         return Err("request context count must be 1..=128".into());
     }
+    let mut problems = Vec::new();
     let mut previous: Option<&RecordedContext> = None;
     let mut messages = Vec::new();
     for context in contexts {
         if context.turn == 0
             || previous.is_some_and(|p| p.turn.checked_add(1) != Some(context.turn))
         {
-            return Err(format!(
+            problems.push(format!(
                 "missing or out-of-order prompt before turn {}",
                 context.turn
             ));
@@ -121,7 +135,7 @@ pub(super) fn validate_contexts(contexts: &[RecordedContext]) -> Result<(), Stri
                     .is_some_and(|(old, new)| new > old) => {}
             ("delta", Some(p)) if p.revision == context.revision => {}
             _ => {
-                return Err(format!(
+                problems.push(format!(
                     "turn {} has invalid full/delta context revision ordering",
                     context.turn
                 ));
@@ -131,13 +145,15 @@ pub(super) fn validate_contexts(contexts: &[RecordedContext]) -> Result<(), Stri
             messages.clear();
         }
         messages.extend(context.messages.iter());
-        validate_messages(&messages).map_err(|e| format!("turn {}: {e}", context.turn))?;
+        if let Err(e) = validate_messages(&messages) {
+            problems.push(format!("turn {}: {e}", context.turn));
+        }
         if previous.is_none() && messages.last().is_none_or(|m| m.role != "user") {
-            return Err("first request does not end with the user prompt".into());
+            problems.push("first request does not end with the user prompt".to_owned());
         }
         previous = Some(context);
     }
-    Ok(())
+    joined(problems)
 }
 
 fn validate_messages(messages: &[&RecordedMessage]) -> Result<(), String> {
@@ -146,9 +162,10 @@ fn validate_messages(messages: &[&RecordedMessage]) -> Result<(), String> {
         .map(|message| serde_json::to_vec(message).map(|encoded| encoded.len()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    let mut problems = Vec::new();
     let size = sizes.iter().sum::<usize>();
     if size > crate::context::MAX_CONTEXT_BYTES {
-        return Err("portable request exceeds context byte limit".into());
+        problems.push("portable request exceeds context byte limit".to_owned());
     }
     let mut pending = BTreeMap::new();
     let mut group_bytes = 0;
@@ -156,24 +173,28 @@ fn validate_messages(messages: &[&RecordedMessage]) -> Result<(), String> {
     let mut asset_result = false;
     for (message, size) in messages.iter().zip(sizes) {
         // Asset dispatch appends a byte-free user attachment summary immediately after its
-        // result, even when other calls in the assistant batch are still pending.
+        // result, even when other calls in the assistant batch are still pending — so it does not
+        // close an open group. It does end the *byte* group, exactly as the live enforcer in
+        // `context::bound_live` does: that resets on any non-`tool` message, and a validator
+        // stricter than the enforcer refuses context the session itself would have accepted.
         let attachment = message.role == "user" && asset_result;
         asset_result = false;
-        if message.role != "tool" && !attachment {
-            if !pending.is_empty() {
-                return Err("incomplete assistant tool group in request".into());
+        if message.role != "tool" {
+            if !attachment && !pending.is_empty() {
+                problems.push("incomplete assistant tool group in request".to_owned());
+                pending.clear();
             }
             group_bytes = 0;
         }
         group_bytes += size;
         if group_bytes > crate::context::MAX_GROUP_BYTES {
-            return Err("portable tool group exceeds byte limit".into());
+            problems.push("portable tool group exceeds byte limit".to_owned());
         }
         if message.role != "assistant" && !message.tool_calls.is_empty() {
-            return Err("tool calls outside assistant message".into());
+            problems.push("tool calls outside assistant message".to_owned());
         }
         if message.role != "tool" && message.tool_call_id.is_some() {
-            return Err("tool_call_id outside tool message".into());
+            problems.push("tool_call_id outside tool message".to_owned());
         }
         match message.role.as_str() {
             "system" if leading => {}
@@ -186,26 +207,28 @@ fn validate_messages(messages: &[&RecordedMessage]) -> Result<(), String> {
                             .insert(call.id.as_str(), call.function.name.as_str())
                             .is_some()
                     {
-                        return Err("empty or duplicate assistant tool call ID".into());
+                        problems.push("empty or duplicate assistant tool call ID".to_owned());
                     }
                 }
             }
             "tool" => {
                 leading = false;
-                let name = message
+                match message
                     .tool_call_id
                     .as_deref()
                     .and_then(|id| pending.remove(id))
-                    .ok_or("orphan or duplicate tool result in request")?;
-                asset_result = name == crate::tools::ASSET_TOOL_NAME;
+                {
+                    Some(name) => asset_result = name == crate::tools::ASSET_TOOL_NAME,
+                    None => problems.push("orphan or duplicate tool result in request".to_owned()),
+                }
             }
-            _ => return Err(format!("unexpected message role {:?}", message.role)),
+            _ => problems.push(format!("unexpected message role {:?}", message.role)),
         }
     }
     if !pending.is_empty() {
-        return Err("incomplete assistant tool group in request".into());
+        problems.push("incomplete assistant tool group in request".to_owned());
     }
-    Ok(())
+    joined(problems)
 }
 
 /// Keep the old text-pair projection only where it is lossless. Portable contexts are authoritative.
@@ -240,6 +263,7 @@ pub(super) fn capture_results(
     coordinates: &BTreeMap<u64, (String, u64)>,
     job: Option<&str>,
 ) -> Result<(), String> {
+    let mut problems = Vec::new();
     for turn in turns.iter() {
         let mut ids = BTreeSet::new();
         if turn
@@ -247,41 +271,48 @@ pub(super) fn capture_results(
             .iter()
             .any(|c| c.id.is_empty() || !ids.insert(&c.id))
         {
-            return Err(format!(
+            problems.push(format!(
                 "turn {} has empty or duplicate tool call IDs",
                 turn.turn
             ));
         }
     }
+    if !problems.is_empty() {
+        return joined(problems);
+    }
     for context in contexts.iter().skip(1) {
         if context.scope == "delta" {
-            let previous = turns
-                .iter()
-                .find(|t| t.turn + 1 == context.turn)
-                .ok_or_else(|| format!("turn {} delta has no preceding answer", context.turn))?;
-            let assistants: Vec<_> = context
-                .messages
-                .iter()
-                .filter(|m| m.role == "assistant")
-                .collect();
-            if assistants.len() != 1
-                || assistants[0].content.as_deref().unwrap_or_default()
-                    != previous.content.as_deref().unwrap_or_default()
-                || assistants[0].tool_calls.len() != previous.tool_calls.len()
-                || assistants[0]
-                    .tool_calls
-                    .iter()
-                    .zip(&previous.tool_calls)
-                    .any(|(a, b)| {
-                        a.id != b.id
-                            || a.function.name != b.name
-                            || a.function.arguments != b.arguments
-                    })
-            {
-                return Err(format!(
-                    "turn {} delta conflicts with preceding answer",
+            match turns.iter().find(|t| t.turn + 1 == context.turn) {
+                None => problems.push(format!(
+                    "turn {} delta has no preceding answer",
                     context.turn
-                ));
+                )),
+                Some(previous) => {
+                    let assistants: Vec<_> = context
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == "assistant")
+                        .collect();
+                    if assistants.len() != 1
+                        || assistants[0].content.as_deref().unwrap_or_default()
+                            != previous.content.as_deref().unwrap_or_default()
+                        || assistants[0].tool_calls.len() != previous.tool_calls.len()
+                        || assistants[0]
+                            .tool_calls
+                            .iter()
+                            .zip(&previous.tool_calls)
+                            .any(|(a, b)| {
+                                a.id != b.id
+                                    || a.function.name != b.name
+                                    || a.function.arguments != b.arguments
+                            })
+                    {
+                        problems.push(format!(
+                            "turn {} delta conflicts with preceding answer",
+                            context.turn
+                        ));
+                    }
+                }
             }
         }
         let mut seen = BTreeSet::new();
@@ -303,6 +334,9 @@ pub(super) fn capture_results(
                 .iter()
                 .find(|c| c.id == id)
                 .expect("validated correlation");
+            // The walk is contexts × messages × turns × calls, so the host coordinate this ID
+            // carries is parsed once here rather than formatted once per call in the inner loop.
+            let claimed = host_coordinate(id);
             for turn in turns.iter_mut().filter(|t| t.turn < context.turn) {
                 // Deltas carry only the immediately preceding batch. Full rebuilds normalize IDs
                 // using the host job and logical call sequence, not a provider ID or text search.
@@ -313,7 +347,7 @@ pub(super) fn capture_results(
                     } else {
                         coordinate.is_some_and(|(call_job, sequence)| {
                             job == Some(call_job.as_str())
-                                && id == format!("{call_job}-{sequence}-{index}")
+                                && claimed == Some((call_job.as_str(), *sequence, index))
                         })
                     };
                     if !matches {
@@ -323,16 +357,18 @@ pub(super) fn capture_results(
                         || (source.function.arguments != call.arguments
                             && call.name != crate::tools::IMAGE_GENERATION_TOOL_NAME)
                     {
-                        return Err(format!(
+                        problems.push(format!(
                             "turn {} tool call conflicts with request context",
                             turn.turn
                         ));
+                        continue;
                     }
                     if !seen.insert((turn.turn, index)) {
-                        return Err(format!(
+                        problems.push(format!(
                             "turn {} repeats a tool group in full context",
                             context.turn
                         ));
+                        continue;
                     }
                     // A bounded rebuild can repeat an exact excerpt of an earlier result. It must
                     // not replace that result, count as new execution, or invent a missing exit code.
@@ -342,7 +378,8 @@ pub(super) fn capture_results(
                             crate::history::Excerpt::new(old, crate::history::MAX_EXCERPT_BYTES)
                                 .render();
                         if result != *old && result != excerpt {
-                            return Err(format!("turn {} has conflicting tool results", turn.turn));
+                            problems
+                                .push(format!("turn {} has conflicting tool results", turn.turn));
                         }
                     } else if context.scope == "delta" || !result.contains("\n[excerpt; original ")
                     {
@@ -352,7 +389,25 @@ pub(super) fn capture_results(
             }
         }
     }
-    Ok(())
+    joined(problems)
+}
+
+/// Splits a host-minted tool call ID back into `(job, call sequence, index)`.
+///
+/// `context::replay_job` mints these as `{job}-{call}-{index}` with canonical decimals, so parsing
+/// is reading back what this crate wrote — and it is one parse per ID rather than one `format!`
+/// per tool call of every earlier turn.
+fn host_coordinate(id: &str) -> Option<(&str, u64, usize)> {
+    fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
+        // A leading zero is not what the minting site writes, so it is not the same coordinate.
+        if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let (head, index) = id.rsplit_once('-')?;
+    let (job, sequence) = head.rsplit_once('-')?;
+    Some((job, decimal(sequence)?, decimal(index)?))
 }
 
 pub(super) struct ReplayContext(Vec<ModelMessage>);
