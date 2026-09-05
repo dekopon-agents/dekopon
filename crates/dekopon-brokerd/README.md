@@ -702,7 +702,17 @@ controlTargets:
 At most 16 entries; model IDs match `[a-z0-9][a-z0-9._-]{0,63}`. Duplicate models, repeated efforts,
 and empty effort sets are reported together. These aliases name configured gateway clients,
 never endpoints or credentials. Gateway route configuration must independently narrow candidates;
-an allowlist is not a policy grant. Alongside a separate `agent.prompt` permit, for example:
+an allowlist is not a policy grant.
+
+Both halves of a proposal must be listed here. A route whose baseline model and effort do not
+themselves appear in that model's `efforts` makes *every* proposal from that route `target-denied`,
+because the broker checks the `from` selection as well as the `to` one — and each of those refusals
+still spends one of the job's four control attempts. So list the route's own baseline effort, not
+only the ones a model may switch to. The gateway's `select_model` tool mirrors this by offering only
+efforts some candidate actually carries; an effort no candidate lists would cost prompt tokens and
+an attempt to be refused by the broker.
+
+Alongside a separate `agent.prompt` permit, for example:
 
 ```cedar
 permit(principal == Dekopon::Principal::"maintainer",

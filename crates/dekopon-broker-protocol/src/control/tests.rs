@@ -26,10 +26,44 @@ fn selection(name: &str) -> ModelSelection {
 }
 
 #[test]
+fn every_client_failure_has_its_own_stable_kind() {
+    use crate::ClientErrorKind;
+    // A control-binding failure — the broker answered with a decision bound to something else —
+    // and a connect timeout are the same `Err` shape to a caller that only logs a category. They
+    // are not the same incident, and the kind is what keeps them apart in a checkpointed record.
+    assert_eq!(
+        ClientError::ControlBinding.kind(),
+        ClientErrorKind::ControlBinding
+    );
+    assert_eq!(
+        ClientError::ConnectTimeout.kind(),
+        ClientErrorKind::ConnectTimeout
+    );
+    assert_ne!(
+        ClientError::ControlBinding.kind().as_str(),
+        ClientError::ConnectTimeout.kind().as_str()
+    );
+    let kinds = [
+        ClientError::UnsafeSocket,
+        ClientError::ConnectTimeout,
+        ClientError::UnexpectedResponse,
+        ClientError::InvalidControl,
+        ClientError::ControlAttempts,
+        ClientError::ControlFenced,
+        ClientError::SurfaceChanged,
+        ClientError::ControlBinding,
+    ]
+    .map(|error| error.kind().as_str());
+    let unique = kinds.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), kinds.len(), "two failures share one kind");
+}
+
+#[test]
 fn controls_are_strict_and_all_target_conflicts_are_reported() {
+    // The wire token has one definition — this enum's serde rename — and this pins it.
     assert_eq!(
         serde_json::to_value(ControlOutcome::Denied).unwrap(),
-        ERROR_CONTROL_DENIED
+        "control-denied"
     );
     let targets = vec![
         ControlTarget {

@@ -13,10 +13,16 @@ use crate::{Attestation, TraceParent};
 
 /// Independent startup ceiling on configured model targets.
 pub const MAX_CONTROL_TARGETS: usize = 16;
-/// Host-wide ceiling per logical job, including refused transitions.
+/// The range a proposal's `sequence` must fall in, and the ceiling a control client spends against.
+///
+/// Two things enforce it, and neither is a host-wide count of transitions. [`ControlClient`] refuses
+/// to transmit once a job's own monotonic sequence reaches it, and the broker refuses any proposal
+/// whose `sequence` falls outside `1..=MAX_CONTROL_ATTEMPTS` ([`ControlProposal::is_well_formed`]).
+/// The broker keeps no per-job attempt counter: distinct proposal identifiers each carrying
+/// `sequence: 1` are each well formed, and the replay reservation — not this constant — is what
+/// stops the same identifier twice. The budget is therefore the host's to spend honestly, which is
+/// the scope `docs/security-model.md` states for every client-side bound.
 pub const MAX_CONTROL_ATTEMPTS: u32 = 4;
-/// Opaque policy, target, no-op, replay, or attestation refusal.
-pub const ERROR_CONTROL_DENIED: &str = "control-denied";
 
 /// Broker-owned allowlist entry; no endpoints, credentials, or client options live here.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
