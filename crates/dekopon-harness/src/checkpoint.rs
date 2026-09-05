@@ -33,8 +33,6 @@ const MAX_STORE_BYTES: usize = MAX_JOBS * MAX_CHECKPOINT_BYTES;
 /// time. The count is the same one the encoder would have written, so there is still exactly one
 /// definition of "how big is this".
 fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
-    #[cfg(test)]
-    ENCODINGS.with(|count| count.set(count.get() + 1));
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -50,16 +48,22 @@ fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
         tracing::error!(cause_type = "checkpoint-encoding", %error);
         CheckpointError::Invalid
     })?;
+    #[cfg(test)]
+    ENCODED_BYTES.with(|total| total.set(total.get() + counter.0));
     Ok(counter.0)
 }
 
 #[cfg(test)]
 thread_local! {
-    /// How many JSON encodings this thread has performed, so a test can pin the count per mutation.
+    /// How many JSON bytes this thread has measured, so a test can pin the work per mutation.
     ///
-    /// Per thread rather than per process: the count is only meaningful for one sequence of calls,
-    /// and a process-wide counter would make every test here observe its siblings' work.
-    pub(crate) static ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes rather than calls, because "one encoding per mutation" is a claim about traversal
+    /// cost: a mutation that measures the groups apart from the rest of the document has walked
+    /// the document once, and one that measures the whole snapshot twice has not. A call count
+    /// cannot tell those apart. Per thread rather than per process: the total is only meaningful
+    /// for one sequence of calls, and a process-wide one would make every test here observe its
+    /// siblings' work.
+    pub(crate) static ENCODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn opaque_id() -> String {
@@ -195,7 +199,15 @@ impl Checkpoint {
         Ok(bytes)
     }
     /// This snapshot's JSON-encoded length, for a caller that is about to save it.
-    pub(crate) fn measure(&self) -> Result<usize, CheckpointError> {
+    ///
+    /// Public because [`CheckpointStore`] is an extension point and its `measured` argument is a
+    /// number the caller supplies: an out-of-crate store that wants to enforce
+    /// [`MAX_CHECKPOINT_BYTES`] against the document rather than trust that argument measures it
+    /// here, with the one definition of "how big is this" the in-tree store uses.
+    ///
+    /// # Errors
+    /// Returns [`CheckpointError::Invalid`] when the snapshot cannot be encoded at all.
+    pub fn measure(&self) -> Result<usize, CheckpointError> {
         encoded_len(self)
     }
     /// Validates a snapshot this caller has not measured, measuring it here.
@@ -246,7 +258,9 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// `measured` is the JSON-encoded length of *this* document, taken once by the caller that
     /// built it: a mutation encodes the snapshot exactly once, and a store that re-encoded it to
-    /// check its own ceiling would make every write cost the corpus twice under the live lock.
+    /// check its own ceiling would make every write cost the corpus twice under the live lock. An
+    /// implementation that will not take a caller's word for its own ceiling measures the document
+    /// itself with [`Checkpoint::measure`] rather than reimplementing the encoding.
     fn compare_and_save(
         &self,
         lease: &str,
@@ -491,34 +505,41 @@ impl<'a> ExecutionJournal<'a> {
         })?;
         f(&mut live.checkpoint); // preserve newly observed facts even when already fenced
         live.checkpoint.state.accounting = self.accounting.snapshot();
-        // One encoding per mutation, shared by the group bound and the save: `update` runs several
-        // times per tool call, and each encoding is the whole corpus under the live lock.
-        let mut measured = encoded_len(&live.checkpoint)?;
+        // One document's worth of encoding per mutation, whatever the snapshot's size, shared by
+        // the model-facing group bound, the per-checkpoint ceiling and the save. `update` runs
+        // several times per tool call and holds the live lock while it does, so measuring the
+        // whole snapshot and then measuring it again to bound its groups cost the corpus twice.
+        //
+        // The two measurements below are of *disjoint* halves of the same document: the groups
+        // alone, and the snapshot with them removed. An empty `Vec` is the two bytes `[]` and
+        // `groups` is never skipped, so the whole document is `rest - 2 + groups` exactly —
+        // pinned by `the_split_measurement_equals_one_encoding_of_the_whole_checkpoint`.
+        let detached = std::mem::take(&mut live.checkpoint.record.groups);
+        let rest = encoded_len(&live.checkpoint)?;
+        live.checkpoint.record.groups = detached;
+        let mut groups = encoded_len(&live.checkpoint.record.groups)?;
         // Independently bound model-facing groups without erasing the execution ledger. Keep a
-        // labelled position marker for an omitted batch rather than orphaning its results. The
-        // groups are part of this document, so a snapshot inside the group ceiling has groups
-        // inside it too and needs no measurement of its own; only a larger one pays for the loop.
-        if measured > crate::context::MAX_GROUP_BYTES {
-            let mut trimmed = false;
-            while encoded_len(&live.checkpoint.record.groups)? > crate::context::MAX_GROUP_BYTES {
-                let Some(group) = live
-                    .checkpoint
-                    .record
-                    .groups
-                    .iter_mut()
-                    .find(|g| !g.omitted)
-                else {
-                    break;
-                };
-                group.calls.clear();
-                group.results.clear();
-                group.omitted = true;
-                trimmed = true;
-            }
-            if trimmed {
-                measured = encoded_len(&live.checkpoint)?;
-            }
+        // labelled position marker for an omitted batch rather than orphaning its results. Each
+        // omission adjusts the running group total by its own before/after size, so trimming
+        // re-encodes one group at a time rather than the whole list once per omission.
+        let mut index = 0;
+        while groups > crate::context::MAX_GROUP_BYTES {
+            let Some(position) = live.checkpoint.record.groups[index..]
+                .iter()
+                .position(|g| !g.omitted)
+                .map(|offset| index + offset)
+            else {
+                break;
+            };
+            let group = &mut live.checkpoint.record.groups[position];
+            let before = encoded_len(group)?;
+            group.calls.clear();
+            group.results.clear();
+            group.omitted = true;
+            groups = groups - before + encoded_len(&live.checkpoint.record.groups[position])?;
+            index = position + 1;
         }
+        let measured = rest - 2 + groups;
         if let Some(error) = live.error {
             return Err(error);
         }

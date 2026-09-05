@@ -82,10 +82,15 @@ the surplus into capacity refusals under load. A store already holding `MAX_JOBS
 the next one before evicting anything, so a refusal never destroys the snapshots the other
 in-flight messages still need. Capacity failure precedes work, and the refusal names the ceiling.
 Each stored snapshot's encoded size is measured once by the save that stored it, so eviction reads
-cached sizes rather than re-encoding every stored checkpoint on every step. A mutation encodes the
-snapshot exactly once as well: the model-facing group ceiling, the per-checkpoint byte ceiling and
-the save all share that single measurement, because a mutation runs several times per tool call and
-holds the live lock while it does. Saves surround dispatch
+cached sizes rather than re-encoding every stored checkpoint on every step. A mutation walks the
+snapshot exactly once as well, at any size: the model-facing group ceiling, the per-checkpoint byte
+ceiling and the save all come from one traversal, taken as two measurements of disjoint halves —
+the tool groups, and the document with them removed — rather than two measurements of the whole.
+That matters because a mutation runs several times per tool call and holds the live lock while it
+does, and because a checkpoint well inside its 2 MiB ceiling is already several times the 512 KiB
+group ceiling. Trimming an oversized group set re-measures one omitted batch at a time, never the
+list per omission. An out-of-crate `CheckpointStore` measures a document with `Checkpoint::measure`
+rather than trusting the length its caller passed. Saves surround dispatch
 observations, transitions and terminalization; failed persistence fences old copies and retains
 live observations.
 

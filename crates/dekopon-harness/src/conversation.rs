@@ -281,12 +281,11 @@ impl BoundedConversationStore {
     }
     /// How many conversations are resident, against the capacity this store was built with.
     ///
-    /// The count an embedder sizing `sessions.maxConversations` asks for, and the only thing this
-    /// store will say about what it holds: never a key, a surface, a generation or any text. The
-    /// daemon itself does not read it, and deliberately does not report it into telemetry, because
-    /// a size published per message would be one more place a conversation could be described;
-    /// eviction is observable through `gateway_conversation_evicted`, which is what an operator
-    /// watching a ceiling set too low actually needs.
+    /// The only thing this store will say about what it holds: never a key, a surface, a
+    /// generation or any text. `dekopond` reads it exactly once per run, on the `gateway_stopped`
+    /// record at exit, so an operator sizing `sessions.maxConversations` has the denominator for
+    /// the `gateway_conversation_evicted` churn. Deliberately not reported per message: a size
+    /// published that often would be one more place a live conversation could be described.
     pub fn tracked(&self) -> usize {
         self.entries.lock().expect("conversation store").map.len()
     }
@@ -440,6 +439,73 @@ mod tests {
                 .is_empty(),
             "the conversation nobody was answering was the victim instead"
         );
+    }
+
+    /// The byte ceiling picks its victim the same way the entry ceiling does.
+    ///
+    /// `enforce_ceiling` is one loop over two ceilings, and every other test here drives the entry
+    /// count. A store that reached `MAX_STORE_BYTES` first — the ceiling a deployment with a large
+    /// `maxConversations` and long windows actually reaches — took the same victim search, but
+    /// nothing said so, and the entry-count tests would still pass if the byte arm had been
+    /// written to evict the arriving conversation.
+    #[test]
+    fn the_retained_byte_ceiling_never_evicts_the_arriving_conversation() {
+        let store = BoundedConversationStore::new(4096);
+        let now = Instant::now();
+        // The widest window a route can configure, so the store reaches 64 MiB in a few dozen
+        // conversations rather than a thousand.
+        let wide = ConversationWindow {
+            idle_timeout: Duration::from_secs(900),
+            limits: HistoryLimits {
+                max_turns: 8,
+                max_bytes: HistoryLimits::MAX_BYTES,
+            },
+        };
+        let bulky = || {
+            JobRecord::completed(
+                "what broke?".to_owned(),
+                "b".repeat(HistoryLimits::MAX_BYTES / 2),
+            )
+        };
+        // Sized from one conversation's measured footprint rather than from the window, because
+        // what the ceiling counts is the retained encoding, not the configured bound.
+        let probe = key("probe");
+        let seeded = store.begin(&probe, &surface(), wide, now);
+        store
+            .commit(&probe, &surface(), wide, bulky(), &seeded.cache_key, now)
+            .expect("live lease");
+        let filling = 2 + MAX_STORE_BYTES / total(&store);
+        assert!(filling < 256, "the fixture stays small: {filling}");
+        for index in 0..filling {
+            let key = key(&format!("c{index}"));
+            let seeded = store.begin(&key, &surface(), wide, now);
+            store
+                .commit(&key, &surface(), wide, bulky(), &seeded.cache_key, now)
+                .expect("live lease");
+        }
+        assert!(
+            store.tracked() < filling,
+            "the byte ceiling bound before the entry ceiling did: {} of {filling} retained",
+            store.tracked()
+        );
+        assert!(total(&store) <= MAX_STORE_BYTES, "{} bytes", total(&store));
+
+        // A returning sender arrives with the store already at the byte ceiling. Its own seeding
+        // pushes the total over, so eviction runs inside its own `begin`.
+        let returning = key("returning");
+        let seeded = store.begin(&returning, &surface(), wide, now);
+        assert!(total(&store) <= MAX_STORE_BYTES);
+        store
+            .commit(
+                &returning,
+                &surface(),
+                wide,
+                bulky(),
+                &seeded.cache_key,
+                now,
+            )
+            .expect("the arriving conversation is never its own eviction victim");
+        assert_eq!(total(&store), recomputed(&store), "the total stays exact");
     }
 
     /// A generation nobody ever committed stops protecting its conversation once it goes idle.

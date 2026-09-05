@@ -965,24 +965,144 @@ fn unfinished_batch_reusing_a_provider_id_cannot_capture_earlier_success() {
 /// `update` runs five to eight times per tool call, under the live lock, and used to encode the
 /// whole corpus twice each time: once to bound `record.groups` in a `while` condition and again
 /// inside `validate`. Both bounds are still exact; neither pays for its own traversal.
+///
+/// Driven at both sizes on purpose. The ceiling that used to select the second encoding is the
+/// *group* ceiling, so a snapshot under 512 KiB never showed the cost at all: the corpus a busy
+/// session actually accumulates is the one that paid it.
 #[test]
 fn one_mutation_encodes_the_checkpoint_once() {
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let journal = ExecutionJournal::new(store.clone(), snapshot(), true, None).expect("journal");
-
-    for mutations in 1..4 {
-        ENCODINGS.with(|count| count.set(0));
-        for _ in 0..mutations {
-            journal
-                .update(|c| c.context_revision += 1)
-                .expect("the mutation persists");
+    for large in [false, true] {
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let mut stored = snapshot();
+        if large {
+            // Comfortably past MAX_GROUP_BYTES with no oversized group: user text plus a ledger,
+            // which is what a long-running session with a large corpus looks like.
+            stored.record.user = "u".repeat(120 * 1024);
+            stored.record.executions = (0..96)
+                .map(|i| ExecutionRecord {
+                    job: stored.record.job.clone(),
+                    call: 1,
+                    tool: format!("call-{i}"),
+                    sequence: i + 1,
+                    capability: "test.read".into(),
+                    provenance: ExecutionProvenance::DirectReadOnly,
+                    invocation: None,
+                    evidence: vec![],
+                    outcome: ExecutionOutcome::Succeeded,
+                    result: Some(Excerpt::new(&"e".repeat(4096), MAX_EXCERPT_BYTES)),
+                })
+                .collect();
         }
+        let measured = stored.measure().expect("the fixture encodes");
         assert_eq!(
-            ENCODINGS.with(std::cell::Cell::get),
-            mutations,
-            "{mutations} mutations encode the checkpoint {mutations} times"
+            measured > crate::context::MAX_GROUP_BYTES,
+            large,
+            "the fixture sits on the side of the group ceiling this pass is about"
+        );
+        let journal =
+            ExecutionJournal::new(store.clone(), stored, true, None).expect("journal opens");
+
+        for mutations in 1..4_usize {
+            ENCODED_BYTES.with(|total| total.set(0));
+            for _ in 0..mutations {
+                journal
+                    .update(|c| c.context_revision += 1)
+                    .expect("the mutation persists");
+            }
+            let encoded = ENCODED_BYTES.with(std::cell::Cell::get);
+            assert!(
+                encoded <= mutations * (measured + 64),
+                "{mutations} mutations walk the {measured}-byte document {mutations} times, \
+                 not twice each: {encoded} bytes measured"
+            );
+        }
+    }
+}
+
+/// The two halves `update` measures are the whole document, exactly.
+///
+/// `update` bounds `record.groups` and the snapshot from one traversal by measuring the groups
+/// apart from the rest, which is only sound while `groups` is always serialized as an array. A
+/// `skip_serializing_if` on that field would silently make the checkpoint ceiling measure two
+/// bytes less than the document being saved.
+#[test]
+fn the_split_measurement_equals_one_encoding_of_the_whole_checkpoint() {
+    let mut checkpoint = snapshot();
+    for groups in [0, 1, 3] {
+        checkpoint.record.groups = (0..groups)
+            .map(|call| crate::history::ToolGroup {
+                call,
+                calls: script("echo one").tool_calls,
+                results: vec![crate::history::ToolResult {
+                    id: "call-a".into(),
+                    result: Excerpt::new("result text", MAX_EXCERPT_BYTES),
+                }],
+                omitted: false,
+                provenance: None,
+            })
+            .collect();
+        let whole = checkpoint.measure().expect("the whole document encodes");
+        let detached = std::mem::take(&mut checkpoint.record.groups);
+        let rest = checkpoint.measure().expect("the remainder encodes");
+        checkpoint.record.groups = detached;
+        let groups_bytes =
+            crate::checkpoint::encoded_len(&checkpoint.record.groups).expect("the groups encode");
+        assert_eq!(
+            rest - 2 + groups_bytes,
+            whole,
+            "{groups} groups: the split measurement is the document, not an approximation"
         );
     }
+}
+
+/// Trimming an oversized group set marks what it omitted, and stops as soon as the rest fits.
+///
+/// The group ceiling is enforced on every mutation, but nothing pinned what enforcement does:
+/// `update`'s loop is the only place a live session's model-facing batches are dropped, and an
+/// omitted batch that lost its `omitted` marker would orphan its results in the ledger.
+#[test]
+fn a_mutation_over_the_group_ceiling_omits_batches_until_the_rest_fits() {
+    let store = Arc::new(MemoryCheckpointStore::default());
+    let journal = ExecutionJournal::new(store.clone(), snapshot(), true, None).expect("journal");
+    journal
+        .update(|c| {
+            c.record.groups = (0..4)
+                .map(|call| crate::history::ToolGroup {
+                    call,
+                    calls: script("echo one").tool_calls,
+                    results: vec![crate::history::ToolResult {
+                        id: "call-a".into(),
+                        result: Excerpt::new(&"r".repeat(200 * 1024), 256 * 1024),
+                    }],
+                    omitted: false,
+                    provenance: None,
+                })
+                .collect();
+        })
+        .expect("the mutation persists");
+
+    let groups = &journal.snapshot().record.groups;
+    assert_eq!(
+        groups.len(),
+        4,
+        "an omitted batch keeps its position marker"
+    );
+    let omitted = groups.iter().filter(|g| g.omitted).count();
+    assert!(
+        (1..4).contains(&omitted),
+        "it omits only as many as the ceiling needs: {omitted} of 4"
+    );
+    for group in groups.iter().filter(|g| g.omitted) {
+        assert!(
+            group.calls.is_empty() && group.results.is_empty(),
+            "an omitted batch carries no calls or results"
+        );
+    }
+    assert!(
+        crate::checkpoint::encoded_len(groups).expect("the groups encode")
+            <= crate::context::MAX_GROUP_BYTES,
+        "the retained groups are inside the model-facing ceiling"
+    );
 }
 
 /// Taking a lease reads cached sizes; it never re-encodes a stored snapshot.
@@ -1006,11 +1126,11 @@ fn acquiring_a_lease_encodes_no_stored_checkpoint() {
         store.release(&stored.record.job, &lease, false);
     }
 
-    ENCODINGS.with(|count| count.set(0));
+    ENCODED_BYTES.with(|total| total.set(0));
     let job = opaque_id();
     store.acquire(&job, true).expect("a ninth lease");
     assert_eq!(
-        ENCODINGS.with(std::cell::Cell::get),
+        ENCODED_BYTES.with(std::cell::Cell::get),
         0,
         "admission reads the sizes the saves recorded"
     );
