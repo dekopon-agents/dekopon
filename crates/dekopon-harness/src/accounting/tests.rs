@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     bootstrap::{BootstrapError, CapabilitySnapshot, SessionBootstrap},
-    checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore, SaveReceipt},
+    checkpoint::FinalState,
     history::History,
     runtime::ScriptRuntime,
     session::{CancellationProbe, PromptError, PromptLimits, SessionEngine},
@@ -9,10 +9,22 @@ use crate::{
 use dekopon_model::model::{
     AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-struct Runtime;
+/// A dispatch-free runtime whose host surface can be made to go stale after `fresh_checks` looks.
+#[derive(Default)]
+struct Runtime {
+    fresh_checks: Option<AtomicUsize>,
+}
 impl ScriptRuntime for Runtime {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
+        match &self.fresh_checks {
+            Some(remaining) if remaining.fetch_sub(1, Ordering::SeqCst) == 0 => Err(
+                dekopon_shell::FreshnessError::Unavailable("fixture".to_owned()),
+            ),
+            _ => Ok(()),
+        }
+    }
     fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
         Ok(CapabilitySnapshot::empty())
     }
@@ -110,15 +122,14 @@ fn observed_usage_survives_later_model_tool_cancellation_and_delivery_failures_o
             cancelled: AtomicBool::new(false),
         };
         let ledger = JobAccounting::default();
-        let store = Arc::new(MemoryCheckpointStore::default());
-        let outcome = SessionEngine::new(&model, &Runtime)
-            .with_checkpoint_store(store.clone())
-            .run(
-                SessionBootstrap::new("prompt", limits(), "fixture")
-                    .with_accounting(&ledger)
-                    .with_cancellation(&model),
-                &mut History::default(),
-            );
+        let final_state = FinalState::default();
+        let outcome = SessionEngine::new(&model, &Runtime::default()).run(
+            SessionBootstrap::new("prompt", limits(), "fixture")
+                .with_accounting(&ledger)
+                .with_cancellation(&model)
+                .with_final_state(&final_state),
+            &mut History::default(),
+        );
         assert_eq!(
             outcome.is_ok(),
             // A provider that reports usage twice, differently, no longer ends the job: the fields
@@ -172,12 +183,17 @@ fn observed_usage_survives_later_model_tool_cancellation_and_delivery_failures_o
         assert!(!ledger.finalize(&DeliveryDisposition::Accepted {
             text: "must not replace failure".into()
         }));
-        let saved = store.load(&snapshot.job).unwrap();
-        assert!(saved.finalized && saved.state.accounting.finalized);
-        assert_eq!(saved.state.accounting.totals(), ledger.snapshot().totals());
+        // The ledger is the terminal record, and the state the session published carries the same
+        // observations rather than a second, independently mutable copy of them.
+        assert!(ledger.snapshot().finalized);
         assert_eq!(
-            saved.validate_resume("direct", &saved.surface),
-            Err(CheckpointError::Fenced)
+            final_state
+                .take()
+                .expect("the session published its final state")
+                .state
+                .accounting
+                .totals(),
+            snapshot.totals()
         );
     }
 }
@@ -239,61 +255,35 @@ fn repeated_serialized_restore_preserves_call_event_and_segment_sequences_withou
     }
 }
 
-struct FailAfterObservation(MemoryCheckpointStore);
-impl CheckpointStore for FailAfterObservation {
-    fn load(&self, job: &str) -> Result<Checkpoint, CheckpointError> {
-        self.0.load(job)
-    }
-    fn acquire(&self, job: &str, new: bool) -> Result<String, CheckpointError> {
-        self.0.acquire(job, new)
-    }
-    fn release(&self, job: &str, lease: &str, fenced: bool) {
-        self.0.release(job, lease, fenced)
-    }
-    fn compare_and_save(
-        &self,
-        lease: &str,
-        expected: u64,
-        c: &Checkpoint,
-        measured: usize,
-    ) -> Result<SaveReceipt, CheckpointError> {
-        if c.state
-            .accounting
-            .calls
-            .iter()
-            .any(|c| c.attempts.iter().any(|a| a.observation.is_some()))
-        {
-            Err(CheckpointError::Conflict)
-        } else {
-            self.0.compare_and_save(lease, expected, c, measured)
-        }
-    }
-}
+/// A fenced job keeps every observation it made and terminalizes with them.
+///
+/// The engine re-checks the host surface after a completion is recorded and before it is acted on.
+/// A session fenced there has already paid for the tokens it reported, so the ledger must
+/// terminalize with those counts rather than an emptier earlier view of them.
 #[test]
-fn checkpoint_failure_keeps_live_observations_and_terminalizes_without_an_older_restore() {
+fn a_fence_after_a_completion_keeps_live_observations_and_terminalizes_with_them() {
     let ledger = JobAccounting::default();
-    let store = Arc::new(FailAfterObservation(MemoryCheckpointStore::default()));
     let model = Model {
         mode: "success",
         cancelled: AtomicBool::new(false),
     };
-    let error = SessionEngine::new(&model, &Runtime)
-        .with_checkpoint_store(store.clone())
+    // Admit the check before inference, then report the surface as gone before the answer is used.
+    let runtime = Runtime {
+        fresh_checks: Some(AtomicUsize::new(1)),
+    };
+    let error = SessionEngine::new(&model, &runtime)
         .run(
             SessionBootstrap::new("prompt", limits(), "fixture").with_accounting(&ledger),
             &mut History::default(),
         )
         .unwrap_err();
-    let PromptError::Interrupted { checkpoint, .. } = error else {
-        panic!("latest checkpoint is carried")
+    let PromptError::Interrupted { checkpoint, source } = error else {
+        panic!("the latest live state is carried")
     };
+    assert_eq!(source, CheckpointError::ScopeChanged);
     assert_eq!(
         checkpoint.state.accounting.totals().cumulative.input.known,
         Some(100)
-    );
-    assert_eq!(
-        store.load(&checkpoint.record.job),
-        Err(CheckpointError::Fenced)
     );
     assert!(ledger.finalize(&DeliveryDisposition::Unknown));
     assert_eq!(ledger.snapshot().generation, CallOutcome::Failed);
@@ -302,13 +292,12 @@ fn checkpoint_failure_keeps_live_observations_and_terminalizes_without_an_older_
 
 #[test]
 fn report_deltas_come_only_from_the_tracker_and_restore_the_consume_cursor() {
-    let store = Arc::new(MemoryCheckpointStore::default());
     let ledger = JobAccounting::default();
     ledger
-        .install(
-            fixture_tracker("opaque-job", &[[Some(4), None, Some(2), None, None]]),
-            store.clone(),
-        )
+        .install(fixture_tracker(
+            "opaque-job",
+            &[[Some(4), None, Some(2), None, None]],
+        ))
         .unwrap();
     let report = ledger.take_report().unwrap();
     assert_eq!(report.model_calls, 1);
@@ -317,7 +306,7 @@ fn report_deltas_come_only_from_the_tracker_and_restore_the_consume_cursor() {
     assert!(ledger.take_report().is_none());
     let saved = ledger.snapshot();
     let restored = JobAccounting::default();
-    restored.install(saved, store).unwrap();
+    restored.install(saved).unwrap();
     assert!(restored.take_report().is_none());
 }
 
@@ -327,13 +316,12 @@ fn one_inconsistent_field_is_unreported_without_blanking_the_rest_of_the_delta()
     // OpenAI-compatible endpoints define it differently — and it used to blank the whole delta
     // *after* the cursor had already moved past it, so the broker's live token view stayed empty
     // for the rest of the job.
-    let store = Arc::new(MemoryCheckpointStore::default());
     let ledger = JobAccounting::default();
     ledger
-        .install(
-            fixture_tracker("opaque-job", &[[Some(4), None, Some(2), None, Some(99)]]),
-            store.clone(),
-        )
+        .install(fixture_tracker(
+            "opaque-job",
+            &[[Some(4), None, Some(2), None, Some(99)]],
+        ))
         .unwrap();
     let report = ledger.take_report().expect("the valid fields still report");
     assert_eq!(report.model_calls, 1);
@@ -360,7 +348,7 @@ fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
             mode: "success",
             cancelled: AtomicBool::new(false),
         };
-        SessionEngine::new(&model, &Runtime)
+        SessionEngine::new(&model, &Runtime::default())
             .run(
                 SessionBootstrap::new("private-prompt-sentinel", limits(), "fixture")
                     .with_accounting(&ledger),
@@ -523,7 +511,6 @@ fn exported_calls_equal_tracker_totals_across_models_failures_images_and_missing
             let mut live = LiveAccounting {
                 tracker,
                 span: None,
-                store: None,
             };
             for sequence in 1..=4 {
                 finish_call(

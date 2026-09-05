@@ -20,7 +20,6 @@ pub struct SessionBootstrap<'a> {
     pub(crate) scope: Option<&'a str>,
     pub(crate) surface_epoch: Option<&'a dekopon_core::SurfaceEpoch>,
     pub(crate) controls: Option<&'a crate::control::SessionControls<'a>>,
-    pub(crate) resume: Option<&'a str>,
     pub(crate) final_state: Option<&'a crate::checkpoint::FinalState>,
     pub(crate) capabilities: Option<&'a CapabilitySnapshot>,
     pub(crate) context_policy: Option<&'a dyn crate::context::ContextPolicy>,
@@ -52,7 +51,6 @@ impl<'a> SessionBootstrap<'a> {
             scope: None,
             surface_epoch: None,
             controls: None,
-            resume: None,
             final_state: None,
             capabilities: None,
             context_policy: None,
@@ -105,17 +103,6 @@ impl<'a> SessionBootstrap<'a> {
     /// Opaque scope commitment derived by the host from trusted routing, never model text.
     pub const fn with_scope(mut self, scope: &'a str) -> Self {
         self.scope = Some(scope);
-        self
-    }
-
-    /// Restore the latest checkpoint after fresh host admission; no recorded grant is reused.
-    ///
-    /// Test-only: no shipped binary resumes a checkpoint, so publishing this as an API would
-    /// advertise a path nothing reaches. The engine's own tests are what exercise it, and
-    /// `docs/harness.md` says plainly that resume has no consumer today.
-    #[cfg(test)]
-    pub(crate) const fn with_resume(mut self, job: &'a str) -> Self {
-        self.resume = Some(job);
         self
     }
 
@@ -1090,57 +1077,35 @@ mod tests {
         ));
     }
 
+    /// The broker's startup identity is host-only: it commits the session's surface and is never
+    /// shown to a model.
     #[test]
-    fn broker_epoch_is_host_only_and_changed_epoch_refuses_checkpoint_restore() {
+    fn broker_epoch_is_host_only_and_never_joins_model_context() {
         let model = Model::default();
         let runtime = ShellRuntime {
             invoker: Surface::new(&["probe.read"]),
             limits: Limits::default(),
             curl_capability: None,
         };
-        // This test's own store rather than the process-global one: the resume below must fail
-        // because the epoch changed, never because a sibling test's session evicted the entry.
-        let store: std::sync::Arc<dyn crate::checkpoint::CheckpointStore> =
-            std::sync::Arc::new(crate::checkpoint::MemoryCheckpointStore::default());
-        let engine = SessionEngine::new(&model, &runtime).with_checkpoint_store(store);
+        let engine = SessionEngine::new(&model, &runtime);
         let mut history = History::default();
-        let first: dekopon_core::SurfaceEpoch = "private-first-epoch".parse().unwrap();
-        let second: dekopon_core::SurfaceEpoch = "private-second-epoch".parse().unwrap();
+        let epoch: dekopon_core::SurfaceEpoch = "private-first-epoch".parse().unwrap();
         let limits = PromptLimits {
             max_steps: 2,
             max_capability_calls: 3,
         };
-        let exit = engine
+        engine
             .run(
                 SessionBootstrap::new("question", limits, "model")
                     .with_scope("trusted-scope")
-                    .with_surface_epoch(&first),
+                    .with_surface_epoch(&epoch),
                 &mut history,
             )
             .unwrap();
-        let before = model.requests.lock().unwrap().clone();
-        let serialized = serde_json::to_string(&before).unwrap();
+        let serialized = serde_json::to_string(&*model.requests.lock().unwrap()).unwrap();
         assert!(
-            !serialized.contains(first.as_str()),
+            !serialized.contains(epoch.as_str()),
             "epoch never joins model context"
-        );
-        let error = engine
-            .run(
-                SessionBootstrap::new("question", limits, "model")
-                    .with_scope("trusted-scope")
-                    .with_surface_epoch(&second)
-                    .with_resume(&exit.job),
-                &mut history,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            PromptError::Checkpoint(crate::checkpoint::CheckpointError::ScopeChanged)
-        ));
-        assert_eq!(
-            model.requests.lock().unwrap().len(),
-            1,
-            "no resumed inference under a new authority epoch"
         );
     }
 }

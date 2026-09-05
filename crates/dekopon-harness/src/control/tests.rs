@@ -1,9 +1,7 @@
 use super::*;
 use crate::{
     bootstrap::{CapabilitySnapshot, SessionBootstrap},
-    checkpoint::{
-        Checkpoint, CheckpointError, CheckpointStore, MemoryCheckpointStore, SaveReceipt,
-    },
+    checkpoint::{Checkpoint, CheckpointError, FinalState},
     history::History,
     runtime::ScriptRuntime,
     session::{CancellationProbe, PromptError, PromptLimits, SessionEngine},
@@ -120,11 +118,23 @@ fn answer() -> AssistantTurn {
         replay_items: vec![],
     }
 }
+/// Counts scripts, and can be told to report its host surface stale after `fresh_checks` looks.
 #[derive(Default)]
-struct Runtime(AtomicU32);
+struct Runtime {
+    scripts: AtomicU32,
+    fresh_checks: Option<AtomicU32>,
+}
 impl ScriptRuntime for Runtime {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
+        match &self.fresh_checks {
+            Some(remaining) if remaining.fetch_sub(1, Ordering::SeqCst) == 0 => Err(
+                dekopon_shell::FreshnessError::Unavailable("fixture".to_owned()),
+            ),
+            _ => Ok(()),
+        }
+    }
     fn run_script(&self, _: &str, _: u32) -> ScriptOutcome {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.scripts.fetch_add(1, Ordering::SeqCst);
         ScriptOutcome {
             output: "observed output".into(),
             exit_code: ExitCode::SUCCESS,
@@ -299,8 +309,10 @@ impl Fixture {
         .with_controls(controls)
     }
 }
-fn saved(store: &dyn CheckpointStore, f: &Fixture) -> Checkpoint {
-    store.load(f.scope.job.as_str()).unwrap()
+fn saved(state: &FinalState, f: &Fixture) -> Checkpoint {
+    let checkpoint = state.take().expect("the session published its final state");
+    assert_eq!(checkpoint.record.job, f.scope.job.as_str());
+    checkpoint
 }
 
 #[test]
@@ -323,15 +335,17 @@ fn mixed_and_multiple_controls_refuse_every_correlated_tool_without_execution() 
     };
     let f = Fixture::new(vec![], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     let runtime = Runtime::default();
     SessionEngine::new(a.as_ref(), &runtime)
-        .with_checkpoint_store(store.clone())
-        .run(f.inputs(&controls, 4), &mut History::default())
+        .run(
+            f.inputs(&controls, 4).with_final_state(&final_state),
+            &mut History::default(),
+        )
         .unwrap();
-    assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.scripts.load(Ordering::SeqCst), 0);
     assert!(f.seen.lock().unwrap().is_empty());
-    let cp = saved(store.as_ref(), &f);
+    let cp = saved(&final_state, &f);
     assert_eq!(cp.state.spent.control_attempts, 3);
     assert!(
         cp.state
@@ -356,13 +370,14 @@ fn cross_provider_switch_rebuilds_identity_and_portable_context_without_resettin
     };
     let f = Fixture::new(vec![ControlOutcome::Admitted], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     let runtime = Runtime::default();
     let options = CompletionOptions::default().with_prompt_cache_key("old-lane");
     let exit = SessionEngine::new(a.as_ref(), &runtime)
-        .with_checkpoint_store(store.clone())
         .run(
-            f.inputs(&controls, 4).with_options(&options),
+            f.inputs(&controls, 4)
+                .with_options(&options)
+                .with_final_state(&final_state),
             &mut History::default(),
         )
         .unwrap();
@@ -374,7 +389,7 @@ fn cross_provider_switch_rebuilds_identity_and_portable_context_without_resettin
         ),
         (3, 1, 1)
     );
-    let cp = saved(store.as_ref(), &f);
+    let cp = saved(&final_state, &f);
     assert_eq!(cp.model, "wire-b");
     assert_eq!(cp.state.accounting.calls.len(), 3);
     assert_eq!(cp.state.transitions[0].outcome, TransitionOutcome::Applied);
@@ -417,7 +432,7 @@ fn cross_provider_switch_rebuilds_identity_and_portable_context_without_resettin
             .any(|m| m.content().is_some_and(|s| s.contains("observed output")))
     );
     assert!(
-        !serde_json::to_string(&cp)
+        !serde_json::to_string(&cp.record)
             .unwrap()
             .contains("opaque-sentinel")
     );
@@ -444,12 +459,14 @@ fn same_target_unknown_unsupported_and_denied_switches_preserve_the_old_selectio
     };
     let f = Fixture::new(vec![ControlOutcome::Denied], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     SessionEngine::new(a.as_ref(), &Runtime::default())
-        .with_checkpoint_store(store.clone())
-        .run(f.inputs(&controls, 6), &mut History::default())
+        .run(
+            f.inputs(&controls, 6).with_final_state(&final_state),
+            &mut History::default(),
+        )
         .unwrap();
-    let cp = saved(store.as_ref(), &f);
+    let cp = saved(&final_state, &f);
     assert_eq!(cp.model, "wire-a");
     assert_eq!(cp.state.spent.control_attempts, 4);
     assert_eq!(
@@ -495,12 +512,14 @@ fn client_preparation_failure_and_unsupported_adapter_effort_are_certain_local_r
         };
         let f = Fixture::new(vec![], false, None);
         let controls = f.controls(&registry, 0, 4);
-        let store = Arc::new(MemoryCheckpointStore::default());
+        let final_state = FinalState::default();
         SessionEngine::new(a.as_ref(), &Runtime::default())
-            .with_checkpoint_store(store.clone())
-            .run(f.inputs(&controls, 3), &mut History::default())
+            .run(
+                f.inputs(&controls, 3).with_final_state(&final_state),
+                &mut History::default(),
+            )
             .unwrap();
-        let cp = saved(store.as_ref(), &f);
+        let cp = saved(&final_state, &f);
         assert_eq!(
             cp.state.transitions[0].outcome,
             if fail {
@@ -530,12 +549,14 @@ fn oscillation_is_bounded_and_new_segments_do_not_reset_control_or_model_budgets
     };
     let f = Fixture::new(vec![ControlOutcome::Admitted; 4], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     SessionEngine::new(a.as_ref(), &Runtime::default())
-        .with_checkpoint_store(store.clone())
-        .run(f.inputs(&controls, 6), &mut History::default())
+        .run(
+            f.inputs(&controls, 6).with_final_state(&final_state),
+            &mut History::default(),
+        )
         .unwrap();
-    let cp = saved(store.as_ref(), &f);
+    let cp = saved(&final_state, &f);
     assert_eq!(cp.state.spent.control_attempts, 4);
     assert_eq!(cp.state.spent.model_calls, 6);
     assert_eq!(
@@ -611,7 +632,7 @@ fn direct_mode_has_no_authorizer_or_tools_and_forged_mixed_batches_execute_nothi
             &mut history,
         )
         .unwrap();
-    assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.scripts.load(Ordering::SeqCst), 0);
     assert!(
         model.requests.lock().unwrap()[0]
             .1
@@ -644,11 +665,12 @@ fn epoch_change_and_stop_after_admission_halt_without_applying_or_calling_the_ta
             stop.then_some(cancelled),
         );
         let controls = f.controls(&registry, 0, 4);
-        let store = Arc::new(MemoryCheckpointStore::default());
+        let final_state = FinalState::default();
         let error = SessionEngine::new(a.as_ref(), &Runtime::default())
-            .with_checkpoint_store(store.clone())
             .run(
-                f.inputs(&controls, 3).with_cancellation(&cancel),
+                f.inputs(&controls, 3)
+                    .with_cancellation(&cancel)
+                    .with_final_state(&final_state),
                 &mut History::default(),
             )
             .unwrap_err();
@@ -662,7 +684,7 @@ fn epoch_change_and_stop_after_admission_halt_without_applying_or_calling_the_ta
                 ))
             )
         });
-        let cp = saved(store.as_ref(), &f);
+        let cp = saved(&final_state, &f);
         assert_eq!(cp.model, "wire-a");
         assert!(cp.state.control_fenced);
         assert!(b.requests.lock().unwrap().is_empty());
@@ -798,37 +820,13 @@ fn two_different_client_failures_are_two_different_authorization_outcomes() {
     );
 }
 
-struct FailApplied(MemoryCheckpointStore);
-impl CheckpointStore for FailApplied {
-    fn load(&self, j: &str) -> Result<Checkpoint, CheckpointError> {
-        self.0.load(j)
-    }
-    fn acquire(&self, j: &str, n: bool) -> Result<String, CheckpointError> {
-        self.0.acquire(j, n)
-    }
-    fn compare_and_save(
-        &self,
-        l: &str,
-        e: u64,
-        c: &Checkpoint,
-        measured: usize,
-    ) -> Result<SaveReceipt, CheckpointError> {
-        if c.state
-            .transitions
-            .last()
-            .is_some_and(|t| t.outcome == TransitionOutcome::Applied)
-        {
-            Err(CheckpointError::Conflict)
-        } else {
-            self.0.compare_and_save(l, e, c, measured)
-        }
-    }
-    fn release(&self, j: &str, l: &str, f: bool) {
-        self.0.release(j, l, f)
-    }
-}
+/// A fence after an applied switch keeps the live transition and never reaches the target model.
+///
+/// The switch is recorded before the next request is built, and the host surface is re-checked at
+/// that boundary. A session fenced there has already changed its identity — the transition record
+/// says so — but must not spend a request on the model it switched to.
 #[test]
-fn failed_post_switch_checkpoint_retains_live_transition_and_prevents_target_inference() {
+fn a_fence_after_a_switch_retains_the_live_transition_and_prevents_target_inference() {
     let a = Model::new(vec![select("switch", "b")]);
     let b = Model::new(vec![]);
     let registry = Registry {
@@ -838,14 +836,19 @@ fn failed_post_switch_checkpoint_retains_live_transition_and_prevents_target_inf
     };
     let f = Fixture::new(vec![ControlOutcome::Admitted], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(FailApplied(MemoryCheckpointStore::default()));
-    let error = SessionEngine::new(a.as_ref(), &Runtime::default())
-        .with_checkpoint_store(store.clone())
+    // Admit the checks around the first turn, then report the surface as gone at the boundary the
+    // switched-to model would be asked across.
+    let runtime = Runtime {
+        scripts: AtomicU32::new(0),
+        fresh_checks: Some(AtomicU32::new(2)),
+    };
+    let error = SessionEngine::new(a.as_ref(), &runtime)
         .run(f.inputs(&controls, 3), &mut History::default())
         .unwrap_err();
-    let PromptError::Interrupted { checkpoint, .. } = error else {
-        panic!("expected live checkpoint")
+    let PromptError::Interrupted { checkpoint, source } = error else {
+        panic!("expected the latest live state")
     };
+    assert_eq!(source, CheckpointError::ScopeChanged);
     assert_eq!(checkpoint.model, "wire-b");
     assert_eq!(
         checkpoint.state.transitions[0].outcome,
@@ -853,60 +856,6 @@ fn failed_post_switch_checkpoint_retains_live_transition_and_prevents_target_inf
     );
     assert_eq!(checkpoint.state.spent.model_calls, 1);
     assert!(b.requests.lock().unwrap().is_empty());
-    assert_eq!(
-        store.load(f.scope.job.as_str()).unwrap_err(),
-        CheckpointError::Fenced
-    );
-}
-
-#[test]
-fn restored_noninitial_selection_requires_fresh_baseline_authorization_without_recounting_calls() {
-    let a = Model::new(vec![select("switch", "b")]);
-    let b = Model::new(vec![answer()]);
-    let registry = Registry {
-        a: a.clone(),
-        b: b.clone(),
-        fail_b: false,
-    };
-    let f = Fixture::new(vec![ControlOutcome::Admitted; 2], false, None);
-    let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let runtime = Runtime::default();
-    let engine = SessionEngine::new(a.as_ref(), &runtime).with_checkpoint_store(store.clone());
-    let ledger = crate::accounting::JobAccounting::default();
-    let first = engine
-        .run(
-            f.inputs(&controls, 3).with_accounting(&ledger),
-            &mut History::default(),
-        )
-        .unwrap();
-    let controls = f.controls(&registry, 1, 4);
-    let resumed = engine
-        .run(
-            f.inputs(&controls, 3)
-                .with_accounting(&ledger)
-                .with_resume(&first.job),
-            &mut History::default(),
-        )
-        .unwrap();
-    assert_eq!(resumed.model_turns, 2);
-    assert_eq!(first.job, resumed.job);
-    assert_eq!(b.requests.lock().unwrap().len(), 1);
-    let cp = saved(store.as_ref(), &f);
-    assert_eq!(cp.state.spent.control_attempts, 2);
-    assert_eq!(cp.state.accounting.calls.len(), 2);
-    assert_eq!(
-        cp.state.accounting.segment, 1,
-        "restore admission is not another spend segment"
-    );
-    assert_eq!(
-        cp.state.accounting.totals().cumulative.input.known,
-        Some(10)
-    );
-    let seen = f.seen.lock().unwrap();
-    assert_eq!(seen[1].from, selection("a"));
-    assert_eq!(seen[1].to, selection("b"));
-    assert_eq!(seen[1].sequence, 2);
 }
 
 struct EvidenceInvoker;
@@ -981,18 +930,18 @@ fn execution_evidence_and_image_attempt_flag_survive_a_switch_and_failed_final_i
     };
     let image = FailingImage(AtomicU32::new(0));
     let output = crate::tools::GeneratedImageOutput::default();
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     let mut history = History::default();
     let error = SessionEngine::new(a.as_ref(), &runtime)
-        .with_checkpoint_store(store.clone())
         .run(
             f.inputs(&controls, 6)
+                .with_final_state(&final_state)
                 .with_image_generation(&image, &output),
             &mut history,
         )
         .unwrap_err();
     assert!(matches!(error, PromptError::Model(ModelError::Request(_))));
-    let cp = saved(store.as_ref(), &f);
+    let cp = saved(&final_state, &f);
     assert_eq!(cp.state.spent.capability_invocations, 1);
     assert_eq!(cp.state.spent.script_calls, 1);
     assert!(cp.state.image_generation_attempted);
@@ -1064,20 +1013,21 @@ fn decline_precedence_refuses_controls_without_authorization_or_other_tools() {
     };
     let f = Fixture::new(vec![], false, None);
     let controls = f.controls(&registry, 0, 4);
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     let runtime = Runtime::default();
     let exit = SessionEngine::new(a.as_ref(), &runtime)
-        .with_checkpoint_store(store.clone())
         .run(
-            f.inputs(&controls, 2).with_optional_reply(),
+            f.inputs(&controls, 2)
+                .with_optional_reply()
+                .with_final_state(&final_state),
             &mut History::default(),
         )
         .unwrap();
     assert_eq!(exit.disposition, crate::session::ReplyDisposition::Suppress);
-    assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.scripts.load(Ordering::SeqCst), 0);
     assert!(f.seen.lock().unwrap().is_empty());
     assert_eq!(
-        saved(store.as_ref(), &f).state.transitions[0].outcome,
+        saved(&final_state, &f).state.transitions[0].outcome,
         TransitionOutcome::BatchRefused
     );
 }

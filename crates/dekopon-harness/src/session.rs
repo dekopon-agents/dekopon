@@ -13,10 +13,7 @@ use crate::{
     tools::*,
 };
 use crate::{
-    checkpoint::{
-        Checkpoint, CheckpointError, CheckpointStore, ExecutionJournal, Position,
-        memory_checkpoints,
-    },
+    checkpoint::{Checkpoint, CheckpointError, ExecutionJournal, Position},
     history::{DeliveryDisposition, ToolGroup},
 };
 use dekopon_config::Skill;
@@ -24,7 +21,6 @@ use dekopon_model::model::{
     ChatModel, CompletionOptions, ModelError, ModelMessage, ModelToolCall, assistant_message,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use thiserror::Error;
 
 /// Request-scoped cooperative cancellation visible from the synchronous prompt loop.
@@ -101,7 +97,6 @@ struct SessionExtensions<'a> {
 pub struct SessionEngine<'a, M: ?Sized, R: ?Sized> {
     model: &'a M,
     runtime: &'a R,
-    checkpoints: Arc<dyn CheckpointStore>,
 }
 
 /// Monotonic work already spent by this logical job, including failed attempts.
@@ -133,18 +128,8 @@ pub struct SessionState {
 
 impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, R> {
     /// Borrows a selected model client and the request's scoped, unprivileged runtime.
-    pub fn new(model: &'a M, runtime: &'a R) -> Self {
-        Self {
-            model,
-            runtime,
-            checkpoints: memory_checkpoints(),
-        }
-    }
-
-    /// Supply bounded storage; every engine, including runner and replay, consumes checkpoints.
-    pub fn with_checkpoint_store(mut self, store: Arc<dyn CheckpointStore>) -> Self {
-        self.checkpoints = store;
-        self
+    pub const fn new(model: &'a M, runtime: &'a R) -> Self {
+        Self { model, runtime }
     }
 
     /// Runs one bounded session, recording its exchange even when inference or tool parsing fails.
@@ -158,7 +143,6 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             activity,
             scope,
             surface_epoch,
-            resume,
             final_state,
             capabilities: prebuilt_capabilities,
             controls,
@@ -196,8 +180,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             None => self.runtime.capability_snapshot()?,
         };
         if let Some(controls) = controls
-            && (surface_epoch != Some(controls.epoch())
-                || resume.is_some_and(|job| job != controls.job()))
+            && surface_epoch != Some(controls.epoch())
         {
             return Err(control::ControlError::Configuration.into());
         }
@@ -264,79 +247,36 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             None => capabilities.fingerprint(),
         };
         let scope = scope.unwrap_or("direct");
-        let checkpoint = match resume {
-            Some(job) => {
-                let mut saved = self.checkpoints.load(job)?;
-                saved.validate_resume(scope, &surface)?;
-                if saved.limits != limits
-                    || saved.state.control_scope.as_ref() != controls.map(SessionControls::scope)
-                    || saved.state.control_baseline != controls.map(|_| active.identity.clone())
-                    || (controls.is_none()
-                        && (saved.model != selected_model
-                            || saved.effort != active.identity.effort.to_string()))
-                {
-                    return Err(CheckpointError::ScopeChanged.into());
-                }
-                // Fresh runtime has no binary assets or opaque continuation. Repeated-read pointers
-                // cannot point at text an excerpt/trim omitted.
-                saved.state.skill_reads = SkillReads::default();
-                saved.state.agent_config_shown = false;
-                saved.context_revision = saved
-                    .context_revision
-                    .checked_add(1)
-                    .ok_or(CheckpointError::Capacity)?;
-                messages.extend(
-                    context_policy
-                        .unwrap_or(&default_policy)
-                        .select(&saved.history),
-                );
-                crate::context::replay_job(&saved.record, &mut messages);
-                saved
-            }
-            None => {
-                messages.extend(context_policy.unwrap_or(&default_policy).select(history));
-                messages.push(ModelMessage::user(prompt));
-                Checkpoint {
-                    version: crate::checkpoint::CHECKPOINT_VERSION,
-                    revision: 0,
-                    position: Position::Ready,
-                    scope: scope.to_owned(),
-                    surface,
-                    model: active.identity.model.clone(),
-                    effort: active.identity.effort.to_string(),
-                    context_revision: 0,
-                    record: JobRecord::new(
-                        controls.map_or_else(crate::checkpoint::opaque_id, |c| c.job().to_owned()),
-                        prompt,
-                    ),
-                    history: history.checkpoint_seed(),
-                    limits,
-                    state: SessionState {
-                        current_model: Some(active.identity.clone()),
-                        control_baseline: controls.map(|_| active.identity.clone()),
-                        control_scope: controls.map(|c| c.scope().clone()),
-                        ..SessionState::default()
-                    },
-                    pending_execution: None,
-                    finalized: false,
-                }
-            }
+        messages.extend(context_policy.unwrap_or(&default_policy).select(history));
+        messages.push(ModelMessage::user(prompt));
+        let mut checkpoint = Checkpoint {
+            position: Position::Ready,
+            scope: scope.to_owned(),
+            surface,
+            model: active.identity.model.clone(),
+            effort: active.identity.effort.to_string(),
+            context_revision: 0,
+            record: JobRecord::new(
+                controls.map_or_else(crate::checkpoint::opaque_id, |c| c.job().to_owned()),
+                prompt,
+            ),
+            history: history.checkpoint_seed(),
+            limits,
+            state: SessionState {
+                current_model: Some(active.identity.clone()),
+                control_baseline: controls.map(|_| active.identity.clone()),
+                control_scope: controls.map(|c| c.scope().clone()),
+                ..SessionState::default()
+            },
+            pending_execution: None,
         };
-        let mut checkpoint = checkpoint;
-        if resume.is_none() {
-            checkpoint.state.accounting.job = checkpoint.record.job.clone();
-        }
+        checkpoint.state.accounting.job = checkpoint.record.job.clone();
         let activity = activity
             .map(|(p, labels)| p.bind(checkpoint.record.job.clone(), labels, &capabilities));
         let mut state = checkpoint.state.clone();
-        let journal = ExecutionJournal::new(
-            self.checkpoints.clone(),
-            checkpoint,
-            resume.is_none(),
-            accounting,
-        )?
-        .with_cancellation(cancellation)
-        .with_activity(activity);
+        let journal = ExecutionJournal::new(checkpoint, accounting)?
+            .with_cancellation(cancellation)
+            .with_activity(activity);
         let job_span = journal.accounting.span();
         let _job_entered = job_span.enter();
         let mut result = self.run_session(
@@ -396,7 +336,8 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             }
             c.position = Position::GenerationFinished;
         });
-        // Failure/Stop/persistence errors never erase observations. A fenced store copy cannot be resumed.
+        // Failure, Stop and a fenced job never erase observations: the turn the host remembers is
+        // recorded from the latest live state whichever way the session ended.
         let snapshot = journal.snapshot();
         if let Some(sink) = final_state {
             sink.publish(snapshot.clone());
@@ -648,8 +589,8 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             if turn.tool_calls.is_empty() {
                 // Only text that would actually be sent is recorded as generated. Storing the raw
                 // content here and rejecting whitespace-only content a few lines below left the
-                // checkpoint claiming an answer the session then refused to deliver, so a resumed
-                // job — and the conversation this turn is appended to — reported a blank answer.
+                // record claiming an answer the session then refused to deliver, so the
+                // conversation this turn is appended to reported a blank answer.
                 let generated = turn
                     .content
                     .clone()
@@ -1097,13 +1038,13 @@ pub enum PromptError {
     /// A fenced or invalid configured model control cannot admit further inference.
     #[error(transparent)]
     Control(#[from] control::ControlError),
-    /// Latest live observations survive persistence failure; never resume the store's older copy.
+    /// A fenced session hands back its latest live state; no observation is rolled back.
     #[error("session fenced: {source}; live observations retained, no automatic retry is safe")]
     Interrupted {
         source: CheckpointError,
         checkpoint: Box<Checkpoint>,
     },
-    /// Checkpoint, evidence capacity, or unresolved-work fence halted the session.
+    /// A state, evidence-capacity or unresolved-work fence halted the session.
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     /// The fresh capability surface or selected model identity was invalid or oversized.

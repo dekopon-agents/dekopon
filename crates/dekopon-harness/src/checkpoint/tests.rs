@@ -1,9 +1,10 @@
 use super::*;
 use crate::{
     bootstrap::SessionBootstrap,
+    checkpoint::FinalState,
     conversation::{BoundedConversationStore, ConversationKey, ConversationWindow},
     history::{ExecutionOutcome, ExecutionProvenance, HistoryLimits},
-    runtime::{ScriptRuntime, ShellRuntime},
+    runtime::ShellRuntime,
     session::{CancellationProbe, PromptError, SessionEngine},
 };
 use dekopon_model::model::{
@@ -14,7 +15,10 @@ use dekopon_shell::{CapabilityCallResult, CapabilityDescription, CapabilityInvok
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -71,9 +75,21 @@ struct Invoker {
     count: AtomicUsize,
     stop: Option<Arc<Stop>>,
     fail: bool,
-    persist_failure: Option<Arc<AtomicBool>>,
+    /// Freshness checks to admit before the host surface is reported as changed.
+    ///
+    /// The real fence: the engine re-checks the surface at every turn boundary, and a broker whose
+    /// policy moved underneath a running session is what makes that check fail.
+    fresh_checks: Option<AtomicUsize>,
 }
 impl CapabilityInvoker for Invoker {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
+        match &self.fresh_checks {
+            Some(remaining) if remaining.fetch_sub(1, Ordering::SeqCst) == 0 => Err(
+                dekopon_shell::FreshnessError::Unavailable("fixture".to_owned()),
+            ),
+            _ => Ok(()),
+        }
+    }
     fn granted(&self) -> Vec<String> {
         vec!["test.read".to_owned()]
     }
@@ -94,9 +110,6 @@ impl CapabilityInvoker for Invoker {
         if let Some(stop) = &self.stop {
             stop.0.store(true, Ordering::SeqCst);
         }
-        if let Some(fail) = &self.persist_failure {
-            fail.store(true, Ordering::SeqCst);
-        }
         if self.fail {
             CapabilityCallResult::Failed {
                 error: "failed after work".to_owned(),
@@ -112,7 +125,7 @@ fn runtime() -> ShellRuntime<Invoker> {
             count: AtomicUsize::new(0),
             stop: None,
             fail: false,
-            persist_failure: None,
+            fresh_checks: None,
         },
         limits: Limits::default(),
         curl_capability: None,
@@ -157,8 +170,6 @@ fn snapshot() -> Checkpoint {
     let record = JobRecord::unanswered("request");
     let accounting = crate::accounting::fixture_tracker(&record.job, &[]);
     Checkpoint {
-        version: CHECKPOINT_VERSION,
-        revision: 0,
         position: Position::Ready,
         scope: "scope".to_owned(),
         surface: "surface".to_owned(),
@@ -173,7 +184,6 @@ fn snapshot() -> Checkpoint {
             ..SessionState::default()
         },
         pending_execution: None,
-        finalized: false,
     }
 }
 
@@ -186,14 +196,12 @@ fn nested_execution_and_budget_evidence_survive_success_and_final_inference_fail
         }
         let model = Model::new(turns);
         let runtime = runtime();
-        let store = Arc::new(MemoryCheckpointStore::default());
+        let final_state = FinalState::default();
         let mut history = History::default();
-        let result = SessionEngine::new(&model, &runtime)
-            .with_checkpoint_store(store.clone())
-            .run(
-                SessionBootstrap::new("request", limits(), "fixture"),
-                &mut history,
-            );
+        let result = SessionEngine::new(&model, &runtime).run(
+            SessionBootstrap::new("request", limits(), "fixture").with_final_state(&final_state),
+            &mut history,
+        );
         assert_eq!(result.is_ok(), final_answer);
         assert_eq!(runtime.invoker.count.load(Ordering::SeqCst), 2);
         let record = &history.turns()[0];
@@ -220,7 +228,10 @@ fn nested_execution_and_budget_evidence_survive_success_and_final_inference_fail
                     .contains("fixture evidence")
             );
         }
-        let saved = store.load(&record.job).expect("saved latest");
+        let saved = final_state
+            .take()
+            .expect("the session published its final state");
+        assert_eq!(saved.record.job, record.job);
         assert_eq!(saved.state.spent.capability_invocations, 2);
         assert_eq!(saved.state.spent.model_calls, 2);
         assert_eq!(
@@ -233,10 +244,13 @@ fn nested_execution_and_budget_evidence_survive_success_and_final_inference_fail
                 .collect::<Vec<_>>(),
             vec![[Some(10), Some(3), Some(4), Some(1), Some(14)], [None; 5]]
         );
-        let encoded = serde_json::to_string(&saved).expect("checkpoint JSON");
-        assert!(!encoded.contains("opaque-never-portable"));
-        let decoded: Checkpoint = serde_json::from_str(&encoded).expect("strict restore shape");
-        assert_eq!(decoded, saved);
+        // The provider's opaque continuation is request-local and never reaches portable state.
+        let portable = format!(
+            "{}{}",
+            serde_json::to_string(&saved.record).expect("the record is portable"),
+            serde_json::to_string(&saved.state).expect("the loop state is portable"),
+        );
+        assert!(!portable.contains("opaque-never-portable"));
     }
 }
 
@@ -265,162 +279,52 @@ fn failed_capability_and_stop_keep_observed_outcomes_before_cancellation_checks(
     assert!(record.generated.is_none());
 }
 
-struct FailingStore {
-    inner: MemoryCheckpointStore,
-    failed: Arc<AtomicBool>,
-    fail_before_dispatch: bool,
-}
-impl CheckpointStore for FailingStore {
-    fn load(&self, job: &str) -> Result<Checkpoint, CheckpointError> {
-        self.inner.load(job)
-    }
-    fn acquire(&self, job: &str, new: bool) -> Result<String, CheckpointError> {
-        self.inner.acquire(job, new)
-    }
-    fn compare_and_save(
-        &self,
-        lease: &str,
-        revision: u64,
-        c: &Checkpoint,
-        measured: usize,
-    ) -> Result<SaveReceipt, CheckpointError> {
-        if self.failed.load(Ordering::SeqCst)
-            || (self.fail_before_dispatch && c.position == Position::DispatchPending)
-        {
-            Err(CheckpointError::Conflict)
-        } else {
-            self.inner.compare_and_save(lease, revision, c, measured)
-        }
-    }
-    fn release(&self, job: &str, lease: &str, fenced: bool) {
-        self.inner.release(job, lease, fenced);
-    }
-}
-#[test]
-fn failed_pre_dispatch_save_executes_nothing_and_failed_post_save_retains_live_facts() {
-    for before in [true, false] {
-        let failure = Arc::new(AtomicBool::new(false));
-        let store = Arc::new(FailingStore {
-            inner: MemoryCheckpointStore::default(),
-            failed: failure.clone(),
-            fail_before_dispatch: before,
-        });
-        let mut runtime = runtime();
-        runtime.invoker.persist_failure = Some(failure);
-        let model = Model::new([script("test.read; test.read"), answer()]);
-        let mut history = History::default();
-        let error = SessionEngine::new(&model, &runtime)
-            .with_checkpoint_store(store.clone())
-            .run(
-                SessionBootstrap::new("request", limits(), "fixture"),
-                &mut history,
-            )
-            .expect_err("save failure halts");
-        let PromptError::Interrupted { source, checkpoint } = error else {
-            panic!("latest live checkpoint must accompany persistence failure");
-        };
-        assert_eq!(source, CheckpointError::Conflict);
-        assert_eq!(
-            runtime.invoker.count.load(Ordering::SeqCst),
-            usize::from(!before)
-        );
-        assert_eq!(
-            checkpoint.record.executions[0].outcome,
-            if before {
-                ExecutionOutcome::NotExecuted
-            } else {
-                ExecutionOutcome::Succeeded
-            }
-        );
-        assert_eq!(checkpoint.state.spent.capability_invocations, 1);
-        assert!(matches!(
-            store.load(&checkpoint.record.job),
-            Err(CheckpointError::Fenced)
-        ));
-    }
-}
-
-/// The lease ceiling and the byte ceiling agree, and neither destroys a resumable checkpoint.
+/// A fence after dispatch keeps every observed outcome and stops before the next model turn.
 ///
-/// `MAX_STORE_BYTES` used to be a quarter of `MAX_JOBS` reservations, so the store silently
-/// stopped at 32 concurrent sessions — and it got there destructively: with the byte ceiling full
-/// of leases, the eviction loop drained *every* unleased checkpoint and then returned `Capacity`
-/// anyway, so the refusal that failed this message also destroyed the snapshots the other
-/// in-flight messages were going to resume from.
+/// The engine re-checks the host surface at each turn boundary, and a broker whose policy moved
+/// under a running session fails that check. Nothing about the work already done is rolled back:
+/// the capability ran, its outcome is recorded, and the session hands the whole live state back
+/// rather than an older copy of it.
 #[test]
-fn concurrent_leases_reach_the_job_ceiling_without_destroying_stored_checkpoints() {
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let stored = snapshot();
-    let resumable = stored.record.job.clone();
-    let lease = store.acquire(&resumable, true).expect("fixture lease");
-    store
-        .compare_and_save(
-            &lease,
-            0,
-            &stored,
-            stored.measure().expect("the fixture encodes"),
+fn a_fence_after_dispatch_retains_live_facts_and_stops_the_session() {
+    let mut runtime = runtime();
+    // Admit the checks this session makes before and after its first answer, then report the
+    // surface as gone at the boundary of the second turn.
+    runtime.invoker.fresh_checks = Some(AtomicUsize::new(2));
+    let model = Model::new([script("test.read"), answer()]);
+    let mut history = History::default();
+    let error = SessionEngine::new(&model, &runtime)
+        .run(
+            SessionBootstrap::new("request", limits(), "fixture"),
+            &mut history,
         )
-        .expect("fixture checkpoint");
-    store.release(&resumable, &lease, false);
-
-    let mut live = Vec::new();
-    for index in 1..MAX_JOBS {
-        let job = opaque_id();
-        let lease = store
-            .acquire(&job, true)
-            .unwrap_or_else(|error| panic!("lease {index} of {MAX_JOBS}: {error}"));
-        live.push((job, lease));
-        assert!(
-            store.load(&resumable).is_ok(),
-            "lease {index} evicted a dormant snapshot it did not need"
-        );
-    }
-    // The store now holds MAX_JOBS entries: one dormant snapshot and MAX_JOBS - 1 live leases.
-    // Resuming that dormant entry is the 128th lease, within the ceiling: it adds no entry and its
-    // reservation replaces its own stored bytes, so it is admitted rather than refused for a slot
-    // it already occupies — and it evicts nothing on the way in.
-    let resume = store
-        .acquire(&resumable, false)
-        .expect("the 128th lease is inside the ceiling when it is a resume");
+        .expect_err("a fenced surface halts the session");
+    let PromptError::Interrupted { source, checkpoint } = error else {
+        panic!("the latest live state must accompany a fence");
+    };
+    assert_eq!(source, CheckpointError::ScopeChanged);
+    assert_eq!(runtime.invoker.count.load(Ordering::SeqCst), 1);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1, "no fenced inference");
     assert_eq!(
-        store.load(&resumable).map(|c| c.record.job.clone()),
-        Ok(resumable.clone()),
-        "resuming did not destroy the snapshot it was taken for"
+        checkpoint.record.executions[0].outcome,
+        ExecutionOutcome::Succeeded
     );
-    store.release(&resumable, &resume, false);
-
-    // A live session outranks a dormant snapshot, so a new job is admitted by evicting exactly it.
-    let last = opaque_id();
-    let lease = store.acquire(&last, true).expect("the ceiling itself");
-    live.push((last, lease));
-    assert!(matches!(
-        store.load(&resumable),
-        Err(CheckpointError::NotFound)
-    ));
-
-    let refusal = store.acquire(&opaque_id(), true);
-    assert_eq!(refusal, Err(CheckpointError::Capacity));
-    assert!(
-        refusal
-            .unwrap_err()
-            .to_string()
-            .contains(&MAX_JOBS.to_string()),
-        "the refusal names the ceiling it hit"
+    assert_eq!(checkpoint.state.spent.capability_invocations, 1);
+    assert_eq!(
+        history.turns()[0].executions[0].outcome,
+        ExecutionOutcome::Succeeded,
+        "the recorded turn keeps what the fence interrupted"
     );
-    for (job, lease) in live {
-        store.release(&job, &lease, false);
-    }
 }
 
-/// A refused blank answer is never recorded as an answer, so a resume cannot deliver one.
+/// A refused blank answer is never recorded as an answer.
 ///
-/// The whitespace-only rejection happens after the generated text is written to the checkpoint, so
+/// The whitespace-only rejection happens after the generated text is written to the live state, so
 /// the failing job left a record claiming an answer of `"   "`. The conversation this job is
-/// appended to then replays a blank assistant turn, and a resumed job hands the transport an empty
-/// `Send` — `SessionExit::answer` is documented empty only when the disposition is `Suppress`.
+/// appended to then replays a blank assistant turn, and the transport is handed an empty `Send` —
+/// `SessionExit::answer` is documented empty only when the disposition is `Suppress`.
 #[test]
-fn a_blank_answer_is_neither_recorded_nor_resumed_as_a_delivered_one() {
-    let store = Arc::new(MemoryCheckpointStore::default());
+fn a_blank_answer_is_never_recorded_as_a_delivered_one() {
     let runtime = runtime();
     let blank = AssistantTurn {
         content: Some("   \n".to_owned()),
@@ -429,11 +333,13 @@ fn a_blank_answer_is_neither_recorded_nor_resumed_as_a_delivered_one() {
         replay_items: Vec::new(),
     };
     let model = Model::new([blank]);
+    let final_state = FinalState::default();
     let mut history = History::default();
     let error = SessionEngine::new(&model, &runtime)
-        .with_checkpoint_store(store.clone())
         .run(
-            SessionBootstrap::new("request", limits(), "fixture").with_scope("scope"),
+            SessionBootstrap::new("request", limits(), "fixture")
+                .with_scope("scope")
+                .with_final_state(&final_state),
             &mut history,
         )
         .expect_err("a blank answer is not an answer");
@@ -445,40 +351,19 @@ fn a_blank_answer_is_neither_recorded_nor_resumed_as_a_delivered_one() {
         None,
         "the conversation must not claim this turn was answered"
     );
-    let job = recorded.job.clone();
-    let saved = store
-        .load(&job)
-        .expect("the checkpoint outlived the failure");
-    assert_eq!(saved.record.generated, None);
-
-    // Resuming that job surfaces the failure rather than a blank `Send`: the finished generation
-    // fenced the lease, and a resume that fabricated an answer out of it would be worse than one
-    // that refuses. Nothing in this path can hand a transport an empty answer to deliver.
-    let model = Model::new([answer()]);
-    let error = SessionEngine::new(&model, &runtime)
-        .with_checkpoint_store(store)
-        .run(
-            SessionBootstrap::new("request", limits(), "fixture")
-                .with_scope("scope")
-                .with_resume(&job),
-            &mut history,
-        )
-        .expect_err("a fenced job is not resumable");
-    assert!(matches!(
-        error,
-        PromptError::Checkpoint(CheckpointError::Fenced)
-    ));
     assert_eq!(
-        model.calls.load(Ordering::SeqCst),
-        0,
-        "no resumed inference"
+        final_state
+            .take()
+            .expect("the session published its final state")
+            .record
+            .generated,
+        None
     );
 }
 
 #[test]
-fn unknown_work_fences_later_dispatch_and_restore_even_after_history_trimming() {
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let journal = ExecutionJournal::new(store.clone(), snapshot(), true, None).expect("lease");
+fn unknown_work_fences_later_dispatch_even_after_history_trimming() {
+    let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
     let id = journal.reserve("test.read").expect("reserve");
     journal
         .observe(id, |r| r.outcome = ExecutionOutcome::Unknown)
@@ -488,10 +373,6 @@ fn unknown_work_fences_later_dispatch_and_restore_even_after_history_trimming() 
         Err(CheckpointError::UnknownWork)
     );
     let saved = journal.snapshot();
-    assert_eq!(
-        saved.validate_resume("scope", "surface"),
-        Err(CheckpointError::UnknownWork)
-    );
     let mut history = History::new(HistoryLimits {
         max_turns: 0,
         max_bytes: 0,
@@ -508,130 +389,66 @@ fn unknown_work_fences_later_dispatch_and_restore_even_after_history_trimming() 
     );
 }
 
+/// Every field bound is enforced on the mutation that broke it, and the break fences the job.
+///
+/// The bounds are the whole of what makes the live state trustworthy — a spend past the session's
+/// own ceiling, a control scope naming another job, an identity disagreeing with the model the
+/// turn is running under — so each one is checked after every mutation rather than at some
+/// terminal point a fenced session never reaches.
 #[test]
-fn latest_restore_keeps_job_usage_sequences_and_budgets_without_replaying_effects() {
-    let runtime = runtime();
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let mut saved = snapshot();
-    saved.surface = runtime
-        .capability_snapshot()
-        .expect("surface")
-        .fingerprint();
-    saved.state.spent.model_calls = 1;
-    saved.state.spent.capability_invocations = 3;
-    saved.state.spent.script_calls = 1;
-    saved.state.spent.control_attempts = 2;
-    saved.state.accounting = crate::accounting::fixture_tracker(
-        &saved.record.job,
-        &[[Some(7), None, Some(2), None, None]],
-    );
-    let job = saved.record.job.clone();
-    let lease = store.acquire(&job, true).expect("fixture lease");
-    store
-        .compare_and_save(
-            &lease,
-            0,
-            &saved,
-            saved.measure().expect("the fixture encodes"),
-        )
-        .expect("fixture checkpoint");
-    store.release(&job, &lease, false);
-    let model = Model::new([answer()]);
-    let mut history = History::default();
-    let result = SessionEngine::new(&model, &runtime)
-        .with_checkpoint_store(store.clone())
-        .run(
-            SessionBootstrap::new("request", limits(), "fixture")
-                .with_scope("scope")
-                .with_resume(&job),
-            &mut history,
-        )
-        .expect("resume latest");
-    assert_eq!(result.job, job);
-    assert_eq!(result.model_turns, 2);
-    assert_eq!(result.capability_invocations, 3);
-    assert_eq!(runtime.invoker.count.load(Ordering::SeqCst), 0);
-    let saved = store.load(&job).expect("latest");
-    assert_eq!(saved.state.accounting.calls.len(), 2);
+fn a_mutation_that_breaks_a_field_bound_is_refused_and_fences_the_job() {
+    let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
     assert_eq!(
-        saved.state.accounting.calls[0].attempts[0]
-            .observation
-            .unwrap()
-            .usage
-            .fields(),
-        [Some(7), None, Some(2), None, None]
+        journal.update(|c| c.state.spent.capability_invocations = 5),
+        Err(CheckpointError::Invalid),
+        "a spend past the session ceiling is not a valid state"
     );
-    assert_eq!(saved.state.spent.control_attempts, 2);
-    assert_eq!(saved.context_revision, 1);
-}
+    assert_eq!(
+        journal.update(|c| c.state.spent.capability_invocations = 0),
+        Err(CheckpointError::Invalid),
+        "the fence is sticky; a later well-formed mutation does not clear it"
+    );
+    assert_eq!(
+        journal.snapshot().state.spent.capability_invocations,
+        0,
+        "the mutation is still applied: a fenced job keeps observing"
+    );
 
-#[test]
-fn checkpoint_version_scope_capacity_cas_and_exclusive_live_lease_fail_explicitly() {
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let saved = snapshot();
-    assert_eq!(
-        saved.validate_resume("other", "surface"),
-        Err(CheckpointError::ScopeChanged)
-    );
-    let mut invalid = saved.clone();
-    invalid.version += 1;
-    assert_eq!(
-        invalid.validate_resume("scope", "surface"),
-        Err(CheckpointError::Invalid)
-    );
-    let mut attempted = saved.clone();
-    attempted.state.image_generation_attempted = true;
-    assert_eq!(
-        attempted.validate_resume("scope", "surface"),
-        Err(CheckpointError::AssetsUnavailable)
-    );
-    let mut invalid = saved.clone();
-    invalid.state.spent.capability_invocations = 5;
-    assert_eq!(
-        invalid.validate_resume("scope", "surface"),
-        Err(CheckpointError::Invalid)
-    );
-    let lease = store.acquire(&saved.record.job, true).expect("first lease");
-    assert_eq!(
-        store.acquire(&saved.record.job, false),
-        Err(CheckpointError::Active)
-    );
-    let receipt = store
-        .compare_and_save(
-            &lease,
-            0,
-            &saved,
-            saved.measure().expect("the fixture encodes"),
-        )
-        .expect("first save");
-    assert_eq!(receipt.revision, 1);
-    assert_eq!(
-        store.compare_and_save(
-            &lease,
-            0,
-            &saved,
-            saved.measure().expect("the fixture encodes")
+    for (name, break_it) in [
+        (
+            "effort",
+            Box::new(|c: &mut Checkpoint| c.effort = "exhaustive".to_owned())
+                as Box<dyn Fn(&mut Checkpoint)>,
         ),
-        Err(CheckpointError::Conflict)
-    );
-    let mut active = vec![(saved.record.job, lease)];
-    for _ in 1..MAX_JOBS {
-        let job = opaque_id();
-        let lease = store.acquire(&job, true).expect("reserved bounded slot");
-        active.push((job, lease));
+        (
+            "control attempts",
+            Box::new(|c: &mut Checkpoint| c.state.spent.control_attempts = 5),
+        ),
+        (
+            "execution job",
+            Box::new(|c: &mut Checkpoint| c.record.executions[0].job = "other".to_owned()),
+        ),
+        (
+            "model calls",
+            Box::new(|c: &mut Checkpoint| c.state.spent.model_calls = c.limits.max_steps + 1),
+        ),
+    ] {
+        let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
+        journal.reserve("test.read").expect("reservation");
+        assert_eq!(
+            journal.update(&break_it),
+            Err(CheckpointError::Invalid),
+            "{name}"
+        );
     }
-    let refusal = store.acquire(&opaque_id(), true);
-    assert_eq!(refusal, Err(CheckpointError::Capacity));
-    assert!(
-        refusal
-            .unwrap_err()
-            .to_string()
-            .contains(&MAX_JOBS.to_string()),
-        "the refusal names the ceiling it hit"
+
+    let mut oversized = snapshot();
+    oversized.record.user = "x".repeat(128 * 1024 + 1);
+    assert_eq!(
+        ExecutionJournal::new(oversized, None).err(),
+        Some(CheckpointError::Invalid),
+        "an invalid opening state never opens a journal at all"
     );
-    for (job, lease) in active {
-        store.release(&job, &lease, false);
-    }
 }
 
 #[test]
@@ -740,71 +557,53 @@ fn excerpts_and_whole_batches_are_bounded_and_delivery_is_not_generation() {
     );
 }
 
+/// A model-authored capability name that is not one is refused before any dispatch.
+///
+/// The name reaches the journal straight from model output, so an escape-hatch string must fence
+/// the reservation rather than land in the ledger: nothing is invoked, the execution ledger stays
+/// empty, and the next session is unaffected by the one that tried.
 #[test]
-fn invalid_names_and_terminal_validation_failures_cannot_pin_checkpoint_capacity() {
-    let store = Arc::new(MemoryCheckpointStore::default());
+fn an_invalid_capability_name_is_refused_without_dispatch_or_a_ledger_entry() {
     let runtime = runtime();
-    let mut jobs = Vec::new();
-    for _ in 0..MAX_JOBS {
-        let model = Model::new([script(&format!("cap {}", "a".repeat(257)))]);
-        let mut history = History::default();
-        assert!(
-            SessionEngine::new(&model, &runtime)
-                .with_checkpoint_store(store.clone())
-                .run(
-                    SessionBootstrap::new("request", limits(), "fixture"),
-                    &mut history
-                )
-                .is_err()
-        );
-        let record = &history.turns()[0];
-        assert!(record.executions.is_empty());
-        jobs.push(record.job.clone());
-    }
+    let model = Model::new([script(&format!("cap {}", "a".repeat(257)))]);
+    let mut history = History::default();
+    assert!(
+        SessionEngine::new(&model, &runtime)
+            .run(
+                SessionBootstrap::new("request", limits(), "fixture"),
+                &mut history
+            )
+            .is_err()
+    );
+    assert!(history.turns()[0].executions.is_empty());
     assert_eq!(runtime.invoker.count.load(Ordering::SeqCst), 0);
     SessionEngine::new(&Model::new([answer()]), &runtime)
-        .with_checkpoint_store(store.clone())
         .run(
             SessionBootstrap::new("valid", limits(), "fixture"),
             &mut History::default(),
         )
-        .unwrap();
-    assert!(jobs.iter().all(|job| matches!(
-        store.load(job),
-        Err(CheckpointError::NotFound | CheckpointError::Fenced)
-    )));
-    for _ in 0..MAX_JOBS {
-        let mut saved = snapshot();
-        saved.record.user = "x".repeat(128 * 1024 + 1);
-        assert!(ExecutionJournal::new(store.clone(), saved, true, None).is_err());
-    }
-    SessionEngine::new(&Model::new([answer()]), &runtime)
-        .with_checkpoint_store(store)
-        .run(
-            SessionBootstrap::new("valid again", limits(), "fixture"),
-            &mut History::default(),
-        )
-        .unwrap();
+        .expect("the refused name fenced its own job and nothing else");
 }
 
 #[test]
 fn repeated_provider_ids_bind_only_their_own_batch_results_and_portable_ids_are_unique() {
     let runtime = runtime();
-    let store = Arc::new(MemoryCheckpointStore::default());
+    let final_state = FinalState::default();
     let mut history = History::default();
     let model = Model::new([
         script("echo first-success"),
         script("echo second-denial; false"),
         answer(),
     ]);
-    let exit = SessionEngine::new(&model, &runtime)
-        .with_checkpoint_store(store.clone())
+    SessionEngine::new(&model, &runtime)
         .run(
-            SessionBootstrap::new("first job", limits(), "fixture"),
+            SessionBootstrap::new("first job", limits(), "fixture").with_final_state(&final_state),
             &mut history,
         )
         .unwrap();
-    let saved = store.load(&exit.job).unwrap();
+    let saved = final_state
+        .take()
+        .expect("the session published its final state");
     assert!(
         saved.record.groups[0].results[0]
             .result
@@ -825,7 +624,6 @@ fn repeated_provider_ids_bind_only_their_own_batch_results_and_portable_ids_are_
     );
     let second = Model::new([script("echo another-job"), answer()]);
     SessionEngine::new(&second, &runtime)
-        .with_checkpoint_store(store)
         .run(
             SessionBootstrap::new("second job", limits(), "fixture"),
             &mut history,
@@ -851,95 +649,6 @@ fn repeated_provider_ids_bind_only_their_own_batch_results_and_portable_ids_are_
 }
 
 #[test]
-fn resume_uses_saved_history_once_not_the_callers_empty_seed() {
-    struct Inspect;
-    impl ChatModel for Inspect {
-        fn complete(
-            &self,
-            messages: &[ModelMessage],
-            _: &[ModelTool],
-            recorder: &dyn dekopon_model::usage::AttemptRecorder,
-        ) -> Result<AssistantTurn, ModelError> {
-            recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
-            for text in ["previous request", "previous answer", "current request"] {
-                assert_eq!(
-                    messages
-                        .iter()
-                        .filter(|m| m.content() == Some(text))
-                        .count(),
-                    1,
-                    "{text}"
-                );
-            }
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|m| m.role() == "tool" && m.content() == Some("prior-result"))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|m| m.content().is_some_and(|s| s.contains("execution-excerpt")))
-                    .count(),
-                1
-            );
-            Ok(answer())
-        }
-    }
-    let runtime = runtime();
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let mut saved = snapshot();
-    saved.surface = runtime.capability_snapshot().unwrap().fingerprint();
-    saved.record.user = "current request".to_owned();
-    let mut prior = JobRecord::completed("previous request", "previous answer");
-    prior.groups.push(crate::history::ToolGroup {
-        call: 1,
-        calls: script("echo prior-result").tool_calls,
-        results: vec![crate::history::ToolResult {
-            id: "call-a".into(),
-            result: Excerpt::new("prior-result", MAX_EXCERPT_BYTES),
-        }],
-        omitted: false,
-        provenance: None,
-    });
-    prior.executions.push(ExecutionRecord {
-        job: prior.job.clone(),
-        call: 1,
-        tool: "call-a".into(),
-        sequence: 1,
-        capability: "test.read".into(),
-        provenance: ExecutionProvenance::DirectReadOnly,
-        invocation: None,
-        evidence: vec![],
-        outcome: ExecutionOutcome::Succeeded,
-        result: Some(Excerpt::new("execution-excerpt", MAX_EXCERPT_BYTES)),
-    });
-    saved.history.record(prior);
-    let job = saved.record.job.clone();
-    let lease = store.acquire(&job, true).unwrap();
-    store
-        .compare_and_save(
-            &lease,
-            0,
-            &saved,
-            saved.measure().expect("the fixture encodes"),
-        )
-        .unwrap();
-    store.release(&job, &lease, false);
-    SessionEngine::new(&Inspect, &runtime)
-        .with_checkpoint_store(store)
-        .run(
-            SessionBootstrap::new("ignored", limits(), "fixture")
-                .with_scope("scope")
-                .with_resume(&job),
-            &mut History::default(),
-        )
-        .unwrap();
-}
-
-#[test]
 fn unfinished_batch_reusing_a_provider_id_cannot_capture_earlier_success() {
     let first = script("echo first");
     let second = script("echo denied");
@@ -960,31 +669,24 @@ fn unfinished_batch_reusing_a_provider_id_cannot_capture_earlier_success() {
     assert!(!group.complete());
 }
 
-/// One mutation encodes the snapshot once — the size checks and the save share that encoding.
+/// One mutation encodes the model-facing batches and nothing else.
 ///
-/// `update` runs five to eight times per tool call, under the live lock, and used to encode the
-/// whole corpus twice each time: once to bound `record.groups` in a `while` condition and again
-/// inside `validate`. Both bounds are still exact; neither pays for its own traversal.
+/// `update` runs five to eight times per tool call, under the live lock. Exactly one field needs
+/// an encoding to bound it — `record.groups`, whose ceiling is the model's context window — and
+/// every other bound is a length or a counter. A mutation that walked the whole document, as it
+/// did while a store ceiling was measured in JSON bytes, charged a busy session the user text and
+/// the entire execution ledger on every step.
 ///
-/// Driven at both sizes on purpose. The ceiling that used to select the second encoding is the
-/// *group* ceiling, so a snapshot under 512 KiB never showed the cost at all: the corpus a busy
-/// session actually accumulates is the one that paid it.
-///
-/// The large fixture carries its corpus in `record.groups` deliberately. That field is the one the
-/// old algorithm walked a second time — once whole in the `while` condition that bounded it, once
-/// more as part of the document `validate` encoded — so a corpus parked anywhere else (user text,
-/// the execution ledger) leaves `groups` encoding to the two bytes `[]` and makes the two
-/// algorithms cost the same. Only a large `groups` can fail on the old code.
+/// Driven at both sizes on purpose: a state whose corpus lives outside the groups is exactly the
+/// one a document-wide measurement would still make look cheap.
 #[test]
-fn one_mutation_encodes_the_checkpoint_once() {
+fn one_mutation_encodes_only_the_model_facing_batches() {
     for large in [false, true] {
-        let store = Arc::new(MemoryCheckpointStore::default());
         let mut stored = snapshot();
         if large {
-            // Comfortably past MAX_GROUP_BYTES with no oversized group: model-facing batches plus
-            // user text and a ledger, which is what a long-running session with a large corpus
-            // looks like. The batches stay just under the group ceiling, so the trimming loop
-            // never runs and what this measures is the encoding rather than the omissions.
+            // A long-running session's corpus: model-facing batches just under the group ceiling
+            // so the trimming loop never runs, plus user text and an execution ledger that dwarf
+            // them and that nothing here has any reason to walk.
             stored.record.groups = (0..118)
                 .map(|call| crate::history::ToolGroup {
                     call,
@@ -1013,74 +715,32 @@ fn one_mutation_encodes_the_checkpoint_once() {
                 })
                 .collect();
         }
-        let measured = stored.measure().expect("the fixture encodes");
         let groups = crate::checkpoint::encoded_len(&stored.record.groups).expect("groups encode");
-        assert_eq!(
-            measured > crate::context::MAX_GROUP_BYTES,
-            large,
-            "the fixture sits on the side of the group ceiling this pass is about"
-        );
+        let rest = crate::checkpoint::encoded_len(&stored.record.user).expect("user text encodes")
+            + crate::checkpoint::encoded_len(&stored.record.executions).expect("ledger encodes");
         assert_eq!(
             large,
             groups > crate::context::MAX_GROUP_BYTES / 2
                 && groups <= crate::context::MAX_GROUP_BYTES,
-            "the large pass parks its corpus in the groups, under the ceiling that would trim \
-             them: {groups} bytes of groups"
+            "the large pass parks its batches under the ceiling that would trim them: \
+             {groups} bytes of groups"
         );
-        let journal =
-            ExecutionJournal::new(store.clone(), stored, true, None).expect("journal opens");
+        let journal = ExecutionJournal::new(stored, None).expect("journal opens");
 
         for mutations in 1..4_usize {
             ENCODED_BYTES.with(|total| total.set(0));
             for _ in 0..mutations {
                 journal
                     .update(|c| c.context_revision += 1)
-                    .expect("the mutation persists");
+                    .expect("the mutation is applied");
             }
             let encoded = ENCODED_BYTES.with(std::cell::Cell::get);
             assert!(
-                encoded <= mutations * (measured + 64),
-                "{mutations} mutations walk the {measured}-byte document {mutations} times, \
-                 not twice each: {encoded} bytes measured. Encoding the {groups} bytes of groups \
-                 a second time each, as the old algorithm did, exceeds this bound."
+                encoded <= mutations * (groups + 64),
+                "{mutations} mutations measure the {groups} bytes of batches {mutations} times \
+                 and not the {rest} bytes beside them: {encoded} bytes measured"
             );
         }
-    }
-}
-
-/// The two halves `update` measures are the whole document, exactly.
-///
-/// `update` bounds `record.groups` and the snapshot from one traversal by measuring the groups
-/// apart from the rest, which is only sound while `groups` is always serialized as an array. A
-/// `skip_serializing_if` on that field would silently make the checkpoint ceiling measure two
-/// bytes less than the document being saved.
-#[test]
-fn the_split_measurement_equals_one_encoding_of_the_whole_checkpoint() {
-    let mut checkpoint = snapshot();
-    for groups in [0, 1, 3] {
-        checkpoint.record.groups = (0..groups)
-            .map(|call| crate::history::ToolGroup {
-                call,
-                calls: script("echo one").tool_calls,
-                results: vec![crate::history::ToolResult {
-                    id: "call-a".into(),
-                    result: Excerpt::new("result text", MAX_EXCERPT_BYTES),
-                }],
-                omitted: false,
-                provenance: None,
-            })
-            .collect();
-        let whole = checkpoint.measure().expect("the whole document encodes");
-        let detached = std::mem::take(&mut checkpoint.record.groups);
-        let rest = checkpoint.measure().expect("the remainder encodes");
-        checkpoint.record.groups = detached;
-        let groups_bytes =
-            crate::checkpoint::encoded_len(&checkpoint.record.groups).expect("the groups encode");
-        assert_eq!(
-            rest - 2 + groups_bytes,
-            whole,
-            "{groups} groups: the split measurement is the document, not an approximation"
-        );
     }
 }
 
@@ -1091,8 +751,7 @@ fn the_split_measurement_equals_one_encoding_of_the_whole_checkpoint() {
 /// omitted batch that lost its `omitted` marker would orphan its results in the ledger.
 #[test]
 fn a_mutation_over_the_group_ceiling_omits_batches_until_the_rest_fits() {
-    let store = Arc::new(MemoryCheckpointStore::default());
-    let journal = ExecutionJournal::new(store.clone(), snapshot(), true, None).expect("journal");
+    let journal = ExecutionJournal::new(snapshot(), None).expect("journal opens");
     journal
         .update(|c| {
             c.record.groups = (0..4)
@@ -1108,7 +767,7 @@ fn a_mutation_over_the_group_ceiling_omits_batches_until_the_rest_fits() {
                 })
                 .collect();
         })
-        .expect("the mutation persists");
+        .expect("the mutation is applied");
 
     let groups = &journal.snapshot().record.groups;
     assert_eq!(
@@ -1131,36 +790,5 @@ fn a_mutation_over_the_group_ceiling_omits_batches_until_the_rest_fits() {
         crate::checkpoint::encoded_len(groups).expect("the groups encode")
             <= crate::context::MAX_GROUP_BYTES,
         "the retained groups are inside the model-facing ceiling"
-    );
-}
-
-/// Taking a lease reads cached sizes; it never re-encodes a stored snapshot.
-///
-/// The eviction sum used to `serde_json::to_vec` every stored checkpoint on every step, so a busy
-/// store paid megabytes of JSON per admission before it had done any work at all.
-#[test]
-fn acquiring_a_lease_encodes_no_stored_checkpoint() {
-    let store = MemoryCheckpointStore::default();
-    for _ in 0..8 {
-        let stored = snapshot();
-        let lease = store.acquire(&stored.record.job, true).expect("lease");
-        store
-            .compare_and_save(
-                &lease,
-                0,
-                &stored,
-                stored.measure().expect("the fixture encodes"),
-            )
-            .expect("fixture checkpoint");
-        store.release(&stored.record.job, &lease, false);
-    }
-
-    ENCODED_BYTES.with(|total| total.set(0));
-    let job = opaque_id();
-    store.acquire(&job, true).expect("a ninth lease");
-    assert_eq!(
-        ENCODED_BYTES.with(std::cell::Cell::get),
-        0,
-        "admission reads the sizes the saves recorded"
     );
 }

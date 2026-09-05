@@ -298,13 +298,6 @@ async fn gateway_answers_survive_enforced_slack_channel_quota_with_progress_on_o
                     }
                 }
             );
-            let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
-                .load(&record.job)
-                .unwrap();
-            assert!(checkpoint.finalized);
-            assert_eq!(checkpoint.record, *record);
-            assert_eq!(checkpoint.state.accounting.calls.len(), 1);
-            assert_eq!(checkpoint.state.accounting.calls[0].attempts.len(), 1);
             if !outage {
                 let target = inbound.reply.clone();
                 let replier = transport.replier();

@@ -1,5 +1,5 @@
 use super::*;
-use dekopon_harness::{accounting::CallOutcome, history::DeliveryDisposition};
+use dekopon_harness::history::DeliveryDisposition;
 
 #[derive(Clone, Copy)]
 enum SendResult {
@@ -29,15 +29,14 @@ impl ChatReplier for ReceiptReplier {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generation_delivery_and_terminal_checkpoint_receipts_remain_distinct() {
-    for (generated, send, disposition, delivery) in [
+async fn generation_delivery_and_spend_receipts_remain_distinct() {
+    for (generated, send, disposition) in [
         (
             true,
             SendResult::Accepted,
             DeliveryDisposition::Accepted {
                 text: "generated answer".into(),
             },
-            "accepted",
         ),
         (
             false,
@@ -45,26 +44,10 @@ async fn generation_delivery_and_terminal_checkpoint_receipts_remain_distinct() 
             DeliveryDisposition::Accepted {
                 text: FAILURE_REPLY.into(),
             },
-            "accepted",
         ),
-        (
-            true,
-            SendResult::Partial,
-            DeliveryDisposition::Partial,
-            "partial",
-        ),
-        (
-            true,
-            SendResult::Failed,
-            DeliveryDisposition::Failed,
-            "failed",
-        ),
-        (
-            true,
-            SendResult::Unknown,
-            DeliveryDisposition::Unknown,
-            "unknown",
-        ),
+        (true, SendResult::Partial, DeliveryDisposition::Partial),
+        (true, SendResult::Failed, DeliveryDisposition::Failed),
+        (true, SendResult::Unknown, DeliveryDisposition::Unknown),
     ] {
         let directory = temporary();
         let mut responses = vec![memory_surface_response(); if generated { 3 } else { 2 }];
@@ -73,6 +56,7 @@ async fn generation_delivery_and_terminal_checkpoint_receipts_remain_distinct() 
             None,
         )));
         let (broker, mut observed) = stub_broker(directory.path(), responses).await;
+        let (usage, mut reports) = mpsc::channel(1);
         let models = ModelScript::scripted([generated.then(|| {
             let mut turn = answer("generated answer");
             turn.usage = Some(dekopon_model::model::ModelUsage::from_fields([
@@ -84,7 +68,10 @@ async fn generation_delivery_and_terminal_checkpoint_receipts_remain_distinct() 
             ]));
             turn
         })]);
-        let runner = runner(broker, models.clone(), 4);
+        let mut runner = runner(broker, models.clone(), 4);
+        Arc::get_mut(&mut runner)
+            .expect("fixture has one runner owner")
+            .usage_reports = Some(usage);
         let bound = persistent_route(model_config(), window());
         let inbound = message("receipt matrix");
         run_session(
@@ -103,36 +90,15 @@ async fn generation_delivery_and_terminal_checkpoint_receipts_remain_distinct() 
             generated.then_some("generated answer")
         );
         assert_eq!(record.delivery, disposition);
-        let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
-            .load(&record.job)
-            .unwrap();
-        assert!(checkpoint.finalized);
-        assert_eq!(checkpoint.record, *record);
-        let tracker = checkpoint.state.accounting;
-        assert!(tracker.finalized);
-        assert_eq!(tracker.delivery, delivery);
+        // Spend is reported whatever the transport did with the answer: the model call is paid
+        // for at generation, and a partial, failed or unknown delivery does not unspend it.
+        let report = reports.recv().await.expect("the session reports its spend");
+        assert_eq!(report.model_calls, 1);
+        assert_eq!(report.input_tokens, if generated { 11 } else { 0 });
+        assert_eq!(report.output_tokens, if generated { 7 } else { 0 });
         assert_eq!(
-            tracker.generation,
-            if generated {
-                CallOutcome::Succeeded
-            } else {
-                CallOutcome::Failed
-            }
-        );
-        assert_eq!(tracker.calls.len(), 1);
-        assert_eq!(tracker.calls[0].attempts.len(), 1);
-        assert_eq!(
-            tracker.totals().cumulative.input.complete(),
-            generated.then_some(11)
-        );
-        assert_eq!(
-            tracker.totals().cumulative.output.complete(),
-            generated.then_some(7)
-        );
-        assert_eq!(
-            tracker.totals().cumulative.reasoning_output.complete(),
-            None,
-            "missing usage stays unknown after delivery"
+            report.reasoning_unreported_calls, 1,
+            "missing usage stays unknown rather than becoming zero"
         );
         assert_surface_checks(&mut observed, if generated { 3 } else { 2 });
         if generated && matches!(send, SendResult::Accepted) {

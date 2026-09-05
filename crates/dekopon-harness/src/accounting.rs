@@ -297,7 +297,6 @@ pub struct JobAccounting(Arc<Mutex<LiveAccounting>>);
 struct LiveAccounting {
     tracker: TokenTracker,
     span: Option<tracing::Span>,
-    store: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
 }
 impl JobAccounting {
     fn lock(&self) -> std::sync::MutexGuard<'_, LiveAccounting> {
@@ -311,11 +310,7 @@ impl JobAccounting {
     pub fn snapshot(&self) -> TokenTracker {
         self.lock().tracker.clone()
     }
-    pub(crate) fn install(
-        &self,
-        tracker: TokenTracker,
-        store: Arc<dyn crate::checkpoint::CheckpointStore>,
-    ) -> Result<(), CheckpointError> {
+    pub(crate) fn install(&self, tracker: TokenTracker) -> Result<(), CheckpointError> {
         let mut live = self.lock();
         if !live.tracker.job.is_empty() {
             return if !live.tracker.finalized && live.tracker == tracker {
@@ -324,7 +319,6 @@ impl JobAccounting {
                 Err(CheckpointError::Fenced)
             };
         }
-        live.store = Some(store);
         live.span = Some(
             tracing::info_span!("accounting.model.job", accounting.version = ACCOUNTING_VERSION, job.id = %tracker.job),
         );
@@ -566,30 +560,7 @@ fn finalize(live: &mut LiveAccounting, disposition: &DeliveryDisposition) -> boo
         totals: t.totals(),
     };
     tracing::info!(target:"dekopon_harness::audit", parent:parent, { audit.event="accounting.model.job", accounting.version=ACCOUNTING_VERSION, job.id=%t.job, event.sequence=event, outcome=t.generation.name(), delivery, accounting=%json(&record) }, "job accounted");
-    if let Some(store) = &live.store
-        && let Err(error) = persist_terminal(store.as_ref(), t, disposition)
-    {
-        tracing::error!(cause_type="accounting-terminal-checkpoint", %error);
-    }
     true
-}
-fn persist_terminal(
-    store: &dyn crate::checkpoint::CheckpointStore,
-    tracker: &TokenTracker,
-    delivery: &DeliveryDisposition,
-) -> Result<(), CheckpointError> {
-    let lease = store.acquire(&tracker.job, false)?;
-    let result = (|| {
-        let mut c = store.load(&tracker.job)?;
-        c.state.accounting = tracker.clone();
-        c.finalized = true;
-        c.position = crate::checkpoint::Position::Finalized;
-        c.record.delivery = delivery.clone();
-        let measured = c.measure()?;
-        store.compare_and_save(&lease, c.revision, &c, measured)
-    })();
-    store.release(&tracker.job, &lease, result.is_err());
-    result.map(|_| ())
 }
 impl Drop for LiveAccounting {
     fn drop(&mut self) {

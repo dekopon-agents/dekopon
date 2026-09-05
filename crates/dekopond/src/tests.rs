@@ -3267,12 +3267,6 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         record.delivery,
         dekopon_harness::history::DeliveryDisposition::Suppressed
     );
-    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
-        .load(&record.job)
-        .unwrap();
-    assert!(checkpoint.finalized);
-    assert_eq!(checkpoint.record.delivery, record.delivery);
-    assert_eq!(checkpoint.state.accounting.delivery, "suppressed");
     assert!(matches!(
         observed
             .recv()
@@ -3899,13 +3893,6 @@ async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
         record.delivery,
         dekopon_harness::history::DeliveryDisposition::Cancelled
     );
-    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
-        .load(&record.job)
-        .unwrap();
-    assert!(checkpoint.finalized);
-    assert_eq!(checkpoint.record.delivery, record.delivery);
-    assert_eq!(checkpoint.state.accounting.delivery, "cancelled");
-    assert_eq!(checkpoint.state.accounting.calls.len(), 1);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities {
