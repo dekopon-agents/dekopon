@@ -421,6 +421,29 @@ pub fn memory_checkpoints() -> Arc<dyn CheckpointStore> {
         .clone()
 }
 
+/// Where a finished session leaves the state it ended with.
+///
+/// The engine records the job's turn into the caller's [`History`] as well, but that copy is
+/// trimmed to the conversation's retention window on the way in. A host that must remember the
+/// whole job — an unresolved execution whose model-facing text no longer fits the window, say —
+/// reads the untrimmed record here instead. A session that never reached inference publishes
+/// nothing, and a fenced one publishes the same state
+/// [`crate::session::PromptError::Interrupted`] carries.
+#[derive(Default)]
+pub struct FinalState(Mutex<Option<Checkpoint>>);
+impl FinalState {
+    pub(crate) fn publish(&self, checkpoint: Checkpoint) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(checkpoint);
+        }
+    }
+    /// Consumes the published state, leaving nothing behind for a second reader.
+    #[must_use]
+    pub fn take(&self) -> Option<Checkpoint> {
+        self.0.lock().map_or(None, |mut slot| slot.take())
+    }
+}
+
 /// The live ledger outlives persistence errors. No observation is undone by a failed save.
 pub struct ExecutionJournal<'a> {
     pub(crate) activity: Option<crate::activity::ActivityEmitter>,

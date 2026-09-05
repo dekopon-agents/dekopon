@@ -21,6 +21,7 @@ pub struct SessionBootstrap<'a> {
     pub(crate) surface_epoch: Option<&'a dekopon_core::SurfaceEpoch>,
     pub(crate) controls: Option<&'a crate::control::SessionControls<'a>>,
     pub(crate) resume: Option<&'a str>,
+    pub(crate) final_state: Option<&'a crate::checkpoint::FinalState>,
     pub(crate) capabilities: Option<&'a CapabilitySnapshot>,
     pub(crate) context_policy: Option<&'a dyn crate::context::ContextPolicy>,
     pub(crate) prompt: &'a str,
@@ -52,6 +53,7 @@ impl<'a> SessionBootstrap<'a> {
             surface_epoch: None,
             controls: None,
             resume: None,
+            final_state: None,
             capabilities: None,
             context_policy: None,
             prompt,
@@ -114,6 +116,17 @@ impl<'a> SessionBootstrap<'a> {
     #[cfg(test)]
     pub(crate) const fn with_resume(mut self, job: &'a str) -> Self {
         self.resume = Some(job);
+        self
+    }
+
+    /// Collects the state the finished session leaves behind, untrimmed.
+    ///
+    /// The engine also records the turn into the caller's `History`, but bounded retention trims
+    /// it there. A host that appends the completed job to a conversation of its own reads it from
+    /// here so a tiny window cannot silently drop the job it just ran.
+    #[must_use]
+    pub const fn with_final_state(mut self, state: &'a crate::checkpoint::FinalState) -> Self {
+        self.final_state = Some(state);
         self
     }
 

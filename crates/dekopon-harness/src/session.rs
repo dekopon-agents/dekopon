@@ -159,6 +159,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             scope,
             surface_epoch,
             resume,
+            final_state,
             capabilities: prebuilt_capabilities,
             controls,
             context_policy,
@@ -396,7 +397,11 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             c.position = Position::GenerationFinished;
         });
         // Failure/Stop/persistence errors never erase observations. A fenced store copy cannot be resumed.
-        history.record(journal.snapshot().record);
+        let snapshot = journal.snapshot();
+        if let Some(sink) = final_state {
+            sink.publish(snapshot.clone());
+        }
+        history.record(snapshot.record);
         if let Err(source) = persisted {
             journal
                 .accounting

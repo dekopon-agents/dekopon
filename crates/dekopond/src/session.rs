@@ -984,13 +984,31 @@ async fn session(
         };
         let registry = GatewayModelRegistry {
             cache: Arc::clone(&models),
-            models: configured_controls.as_ref().map_or_else(Vec::new, |c| c.models.clone()),
+            models: configured_controls
+                .as_ref()
+                .map_or_else(Vec::new, |c| c.models.clone()),
         };
-        let controls = match control_client.map(|client| SessionControls::new(
-            &registry, dekopon_core::ModelSelection {
-                model: model_config.name().parse().expect("validated configured model ID"), effort: model_config.effort(),
-            }, client, control_executor, configured_controls.as_ref().expect("enabled controls").max_attempts,
-        )).transpose() {
+        let controls = match control_client
+            .map(|client| {
+                SessionControls::new(
+                    &registry,
+                    dekopon_core::ModelSelection {
+                        model: model_config
+                            .name()
+                            .parse()
+                            .expect("validated configured model ID"),
+                        effort: model_config.effort(),
+                    },
+                    client,
+                    control_executor,
+                    configured_controls
+                        .as_ref()
+                        .expect("enabled controls")
+                        .max_attempts,
+                )
+            })
+            .transpose()
+        {
             Ok(controls) => controls,
             Err(error) => return (Err(SessionError::Prompt(error.into())), None, None),
         };
@@ -1006,6 +1024,7 @@ async fn session(
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
         let generated_image = GeneratedImageOutput::default();
+        let final_state = dekopon_harness::checkpoint::FinalState::default();
         let mut inputs = SessionBootstrap::new(
             &text,
             limits,
@@ -1015,18 +1034,31 @@ async fn session(
             },
         )
         .with_surface_epoch(&surface_epoch)
-                .with_scope(&checkpoint_scope)
+        .with_scope(&checkpoint_scope)
         .with_capability_snapshot(&capabilities)
         .with_system(instructions.as_deref())
         .with_skills(&skills)
         .with_options(&options)
         .with_assets(&assets)
         .with_accounting(observed_usage.as_ref())
-        .with_model_identity(ModelIdentity { configured: Some(model_config.name().parse().expect("configured model")), backend: model.model_identity().0.to_owned(), model: match model_config.as_ref() { ModelConfig::OpenaiCompatible { model, .. } | ModelConfig::ChatgptSubscription { model, .. } => model.clone() }, effort: model_config.effort() })
+        .with_model_identity(ModelIdentity {
+            configured: Some(model_config.name().parse().expect("configured model")),
+            backend: model.model_identity().0.to_owned(),
+            model: match model_config.as_ref() {
+                ModelConfig::OpenaiCompatible { model, .. }
+                | ModelConfig::ChatgptSubscription { model, .. } => model.clone(),
+            },
+            effort: model_config.effort(),
+        })
         .with_agent_config(&agent_config)
+        .with_final_state(&final_state)
         .with_cancellation(&prompt_cancellation);
-        if let Some(publisher) = &activity_publisher { inputs = inputs.with_activity(publisher, &activity_labels); }
-        if let Some(controls) = &controls { inputs = inputs.with_controls(controls); }
+        if let Some(publisher) = &activity_publisher {
+            inputs = inputs.with_activity(publisher, &activity_labels);
+        }
+        if let Some(controls) = &controls {
+            inputs = inputs.with_controls(controls);
+        }
         if let Some(generator) = image_generator.as_deref() {
             inputs = inputs.with_image_generation(generator, &generated_image);
         }
@@ -1036,26 +1068,19 @@ async fn session(
         if reply_optional {
             inputs = inputs.with_optional_reply();
         }
-        let prior_job = history.turns().last().map(|r| r.job.clone());
         let outcome = SessionEngine::new(model.as_ref(), &runtime)
             .run(inputs, &mut history)
             .map_err(SessionError::from);
-        // The independent checkpoint owns every started job, even when bounded history evicts
-        // its text. Unknown effects and Stop must still reach the scoped store and finalizer.
+        // The untrimmed record, not the copy `history` retained: this conversation's window can be
+        // narrower than one job's text, and a turn it evicted is still a started job whose
+        // unresolved effects and Stop have to reach the conversation store and the finalizer
+        // below. A session that never reached inference publishes nothing and is remembered as
+        // nothing.
         let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::Interrupted { checkpoint, .. })) => Some(checkpoint.record.clone()),
-            _ => {
-                let job = observed_usage.snapshot().job;
-                if job.is_empty() { None } else {
-                    match dekopon_harness::checkpoint::memory_checkpoints().load(&job) {
-                        Ok(saved) => Some(saved.record),
-                        Err(error) => {
-                            tracing::error!(event = "gateway_session_failed", category = "checkpoint-load", cause = %error);
-                            history.turns().last().filter(|r| Some(&r.job) != prior_job.as_ref()).cloned()
-                        }
-                    }
-                }
+            Err(SessionError::Prompt(PromptError::Interrupted { checkpoint, .. })) => {
+                Some(checkpoint.record.clone())
             }
+            _ => final_state.take().map(|state| state.record),
         };
         let image = outcome.is_ok().then(|| generated_image.take()).flatten();
         (outcome, turn, image)
