@@ -13,7 +13,7 @@ use crate::{
     tools::*,
 };
 use crate::{
-    checkpoint::{Checkpoint, CheckpointError, ExecutionJournal, Position},
+    checkpoint::{Checkpoint, CheckpointError, ExecutionJournal},
     history::{DeliveryDisposition, ToolGroup},
 };
 use dekopon_config::Skill;
@@ -250,7 +250,6 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
         messages.extend(context_policy.unwrap_or(&default_policy).select(history));
         messages.push(ModelMessage::user(prompt));
         let mut checkpoint = Checkpoint {
-            position: Position::Ready,
             scope: scope.to_owned(),
             surface,
             model: active.identity.model.clone(),
@@ -334,7 +333,6 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             if matches!(result, Err(PromptError::Cancelled)) {
                 c.record.delivery = DeliveryDisposition::Cancelled;
             }
-            c.position = Position::GenerationFinished;
         });
         // Failure, Stop and a fenced job never erase observations: the turn the host remembers is
         // recorded from the latest live state whichever way the session ended.
@@ -478,7 +476,6 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             )?;
             journal.update(|c| {
                 c.state = state.clone();
-                c.position = Position::ModelPending;
                 if let Some(group) = c.record.groups.last_mut() {
                     group.capture_results(messages);
                 }
@@ -565,10 +562,7 @@ impl<'a, M: ChatModel + ?Sized, R: ScriptRuntime + ?Sized> SessionEngine<'a, M, 
             )?;
             state.accounting = journal.accounting.snapshot();
             let turn = completion?;
-            journal.update(|c| {
-                c.state = state.clone();
-                c.position = Position::Tools;
-            })?;
+            journal.update(|c| c.state = state.clone())?;
             // Usage is already retained. Fence before exporting or acting on generated content.
             check_freshness(runtime, journal)?;
             if dekopon_core::telemetry_payloads() {

@@ -170,7 +170,6 @@ fn snapshot() -> Checkpoint {
     let record = JobRecord::unanswered("request");
     let accounting = crate::accounting::fixture_tracker(&record.job, &[]);
     Checkpoint {
-        position: Position::Ready,
         scope: "scope".to_owned(),
         surface: "surface".to_owned(),
         model: "fixture".to_owned(),

@@ -71,10 +71,9 @@ reader reconstructing a recorded history can report what the clamp dropped.
 ## Job state, accounting and controls
 
 A session's state is live, in-process and request-scoped: `ExecutionJournal` owns one `Checkpoint`
-for the duration of one turn and nothing outside that turn reads it. It holds position,
-scope/surface, model/effort, portable history and evidence, pending work, spent budgets,
-one-attempt flags, skill state and the mandatory token tracker including sequences, report cursor
-and terminal flags. There is no store, no lease, no revision and no persistence: dekopon runs as a
+for the duration of one turn and nothing outside that turn reads it. It holds scope/surface,
+model/effort, portable history and evidence, pending work, spent budgets, one-attempt flags, skill
+state and the mandatory token tracker including sequences, report cursor and terminal flags. There is no store, no lease, no revision and no persistence: dekopon runs as a
 single executable on one machine, and if high availability ever arrives it will be Kubernetes
 leases in front of the process, not an application-level lease/CAS protocol inside it. Nothing
 here is crash durability, a broker audit checkpoint, automatic recovery of binary assets or

@@ -304,8 +304,11 @@ All notable changes to Dekopon are documented here. The format is based on
   Kubernetes leases in front of the process rather than an application-level protocol inside it.
   `ExecutionJournal` now owns its `Checkpoint` directly and revalidates every field bound on every
   mutation; `CheckpointError` keeps only the variants that still fire (`Capacity`, `Fenced`,
-  `Poisoned`, `Invalid`, `ScopeChanged`, `UnknownWork`, `Budget`), and `Position::Finalized` and
-  `Checkpoint::{version, revision, finalized}` go with the terminal write that set them. A mutation
+  `Poisoned`, `Invalid`, `ScopeChanged`, `UnknownWork`, `Budget`), and `Checkpoint::{version,
+  revision, finalized}` go with the terminal write that set them. The `Position` enum and
+  `Checkpoint::position` are gone with the same design: the field told a resumer where to pick up,
+  it was assigned in seven places and read in none, and neither `validate` nor any branch in the
+  session, the journal or the control path ever looked at it. A mutation
   now measures only `record.groups`, the one field whose bound is a byte count, instead of
   encoding the whole document to check a store ceiling. A host that must remember the completed job
   reads the untrimmed record from the new `SessionBootstrap::with_final_state`

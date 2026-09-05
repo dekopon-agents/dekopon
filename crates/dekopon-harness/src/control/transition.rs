@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    checkpoint::{CheckpointError, ExecutionJournal, Position},
+    checkpoint::{CheckpointError, ExecutionJournal},
     session::{CancellationProbe, PromptError, SessionState},
 };
 
@@ -101,10 +101,7 @@ fn transition_inner(
         context_revision: snapshot.context_revision,
     });
     // The attempt and intent are checkpointed before client preparation or broker transmission.
-    journal.update(|c| {
-        c.state = state.clone();
-        c.position = Position::ControlPending;
-    })?;
+    journal.update(|c| c.state = state.clone())?;
     if outcome != TransitionOutcome::Pending {
         return Ok(outcome);
     }
@@ -213,7 +210,6 @@ pub(crate) fn save_boundary(
 ) -> Result<(), CheckpointError> {
     journal.update(|c| {
         c.state = state.clone();
-        c.position = Position::Tools;
         if let Some(model) = &state.current_model {
             c.model = model.model.clone();
             c.effort = model.effort.to_string();

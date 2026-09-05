@@ -78,16 +78,6 @@ pub enum CheckpointError {
     Budget,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Position {
-    Ready,
-    ModelPending,
-    Tools,
-    DispatchPending,
-    ControlPending,
-    GenerationFinished,
-}
-
 /// One job's live state: the mandatory attempt tracker plus everything the turn has observed.
 ///
 /// In-process and request-scoped, held by exactly one [`ExecutionJournal`] for the life of one
@@ -97,7 +87,6 @@ pub enum Position {
 /// [`crate::session::PromptError::Interrupted`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Checkpoint {
-    pub position: Position,
     pub scope: String,
     pub surface: String,
     pub model: String,
@@ -317,7 +306,6 @@ impl<'a> ExecutionJournal<'a> {
         let sequence = snapshot.record.executions.len() as u32 + 1;
         let reserved = self.update(|c| {
             c.state.spent.capability_invocations += 1;
-            c.position = Position::DispatchPending;
             c.pending_execution = Some(sequence);
             c.record.executions.push(ExecutionRecord {
                 job: c.record.job.clone(),
@@ -366,7 +354,6 @@ impl<'a> ExecutionJournal<'a> {
                 observation(record);
             }
             c.pending_execution = None;
-            c.position = Position::Tools;
         })
     }
     pub(crate) fn failure(&self, error: CheckpointError) {
