@@ -277,25 +277,36 @@ fn emit_flood(publisher: dekopon_harness::activity::ActivityPublisher) {
         "step exhaustion does not erase submitted activity"
     );
 }
-#[tokio::test]
+/// Lets the worker run to the point the assertion is about, without spending wall-clock time.
+async fn settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+// The clock is paused rather than slept through: the two-second update interval is the property
+// under test, and a test that proves it by waiting 2.1 real seconds proves it only on a machine
+// that was not busy. `emit_flood` runs inline rather than on the blocking pool so the runtime is
+// never idle with the clock free to auto-advance past the interval.
+#[tokio::test(start_paused = true)]
 async fn runtime_flood_coalesces_to_one_update_and_optional_work_enables_posting() {
     let fake = Arc::new(Fake::default());
     let mut lease = ActivityLease::start(Some(fake.clone()), Some(target("flood")), false);
     wait(&fake.entered).await;
-    let feed = lease.publisher().unwrap();
-    tokio::task::spawn_blocking(move || emit_flood(feed))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    emit_flood(lease.publisher().unwrap());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    settle().await;
     assert!(
         !fake
             .events
             .lock()
             .unwrap()
             .iter()
-            .any(|e| e.starts_with("update:"))
+            .any(|e| e.starts_with("update:")),
+        "a flood inside one interval posts nothing"
     );
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    tokio::time::advance(Duration::from_millis(2000)).await;
+    settle().await;
     let events = fake.events.lock().unwrap().clone();
     assert_eq!(
         events.iter().filter(|e| e.starts_with("update:")).count(),
@@ -307,10 +318,7 @@ async fn runtime_flood_coalesces_to_one_update_and_optional_work_enables_posting
     wait(&fake.hidden).await;
     let optional = Arc::new(Fake::default());
     let mut lease = ActivityLease::start(Some(optional.clone()), Some(target("work")), true);
-    let feed = lease.publisher().unwrap();
-    tokio::task::spawn_blocking(move || emit_flood(feed))
-        .await
-        .unwrap();
+    emit_flood(lease.publisher().unwrap());
     wait(&optional.entered).await;
     lease.finish_in_background();
     wait(&optional.hidden).await;
