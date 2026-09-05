@@ -1185,36 +1185,29 @@ async fn every_invalid_model_name_is_reported_with_its_field_and_its_value() {
     );
 }
 
-/// `sessions.maxConcurrent` is validated against the store ceiling it actually competes for.
+/// A large `sessions.maxConcurrent` starts: nothing in the harness caps how many sessions run.
 ///
-/// Every live session holds a checkpoint lease reserving the whole per-job ceiling, so a gateway
-/// admitting more sessions than `MAX_JOBS` converts the surplus into capacity refusals under load.
+/// The old ceiling of 128 was a heap-size artifact of a bounded checkpoint store that reserved
+/// worst-case bytes per live lease. The store is gone, so refusing to boot on a number above it
+/// would refuse an operator a concurrency the gateway can serve.
 #[tokio::test]
-async fn max_concurrent_beyond_the_checkpoint_lease_ceiling_is_refused_at_startup() {
+async fn max_concurrent_well_above_the_old_lease_ceiling_starts() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS + 1 });
-
-    let error = load(directory.path(), &document)
+    document["sessions"] = json!({ "maxConcurrent": 1024 });
+    load(directory.path(), &document)
         .await
-        .expect_err("more sessions than leases cannot start");
+        .expect("no application-level ceiling refuses this");
+
+    let mut zero = document.clone();
+    zero["sessions"] = json!({ "maxConcurrent": 0 });
+    let error = load(directory.path(), &zero)
+        .await
+        .expect_err("a zero bound is still refused");
     assert!(reports(&error, |problem| matches!(
         problem,
-        ConfigProblem::ExcessiveMaxConcurrent { .. }
+        ConfigProblem::InvalidSessionLimits
     )));
-    let rendered = error.to_string();
-    assert!(rendered.contains("sessions.maxConcurrent"), "{rendered}");
-    assert!(rendered.contains("MAX_JOBS"), "{rendered}");
-    assert!(
-        rendered.contains(&dekopon_harness::checkpoint::MAX_JOBS.to_string()),
-        "{rendered}"
-    );
-
-    let mut exact = document.clone();
-    exact["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS });
-    load(directory.path(), &exact)
-        .await
-        .expect("the ceiling itself is admissible");
 }
 
 /// Every offending `activityLabels` entry, with the rule it broke.

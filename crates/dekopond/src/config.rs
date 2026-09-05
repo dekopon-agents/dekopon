@@ -1062,15 +1062,6 @@ pub(crate) fn resolve(
     if config.sessions.max_concurrent == 0 {
         problems.push(ConfigProblem::InvalidSessionLimits);
     }
-    // Every live session holds a checkpoint lease, and every lease reserves the whole per-job
-    // ceiling in the harness's bounded store. Admitting more sessions than the store admits leases
-    // turns the surplus into `Capacity` refusals under load, which is the worst place to find out.
-    if config.sessions.max_concurrent > dekopon_harness::checkpoint::MAX_JOBS {
-        problems.push(ConfigProblem::ExcessiveMaxConcurrent {
-            actual: config.sessions.max_concurrent,
-            maximum: dekopon_harness::checkpoint::MAX_JOBS,
-        });
-    }
     if config.sessions.max_conversations == 0 {
         problems.push(ConfigProblem::InvalidMaxConversations);
     }
@@ -1408,10 +1399,6 @@ pub enum ConfigProblem {
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
     InvalidSessionLimits,
-    #[error(
-        "sessions.maxConcurrent is {actual}; at most {maximum} sessions can hold a checkpoint lease at once (dekopon_harness::checkpoint::MAX_JOBS)"
-    )]
-    ExcessiveMaxConcurrent { actual: usize, maximum: usize },
     #[error(
         "route for agent {agent:?} declares a persistent conversation with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
     )]
