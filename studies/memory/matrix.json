@@ -1,0 +1,884 @@
+{
+  "hypotheses": [
+    {
+      "id": "RT-H01",
+      "lane": "runtime",
+      "subsystem": "native-accounting",
+      "question": "Like-for-like release baseline",
+      "reference": "R:brokerd/src/lib.rs:219-247,355-391",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md RT-H01; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H02",
+      "lane": "runtime",
+      "subsystem": "native-allocator",
+      "question": "Free-but-retained glibc memory",
+      "reference": "R:broker-host/src/lib.rs:599-721,1198-1231",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md RT-H02; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H03",
+      "lane": "runtime",
+      "subsystem": "wasmtime-residency",
+      "question": "Provider count/composition sensitivity",
+      "reference": "R:broker-host/src/lib.rs:555-582,724-808",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md RT-H03; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H04",
+      "lane": "runtime",
+      "subsystem": "wasmtime-lifecycle",
+      "question": "Compiler scratch vs retained runtime",
+      "reference": "R:broker-host/src/lib.rs:416-465,679-721",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md RT-H04; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H05",
+      "lane": "runtime",
+      "subsystem": "wasmtime-cache",
+      "question": "Cache-populated startup and retained memory",
+      "reference": "R:provider-sdk/src/host.rs:427-438",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md RT-H05; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H06",
+      "lane": "runtime",
+      "subsystem": "native-parallelism",
+      "question": "Arena and compiler concurrency tradeoffs",
+      "reference": "R:broker-host/src/lib.rs:1202-1228",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md RT-H06; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H07",
+      "lane": "runtime",
+      "subsystem": "wasmtime-stores",
+      "question": "Store destruction and guest capacity",
+      "reference": "R:provider-sdk/src/host.rs:31-89",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md RT-H07; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H08",
+      "lane": "runtime",
+      "subsystem": "wasmtime-aggregate",
+      "question": "Per-store token vs multi-memory capacity",
+      "reference": "R:broker-host/src/lib.rs:376-413,468-495",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md RT-H08; source-supported question, not an executed result."
+    },
+    {
+      "id": "RT-H09",
+      "lane": "runtime",
+      "subsystem": "broker-admission",
+      "question": "Connections vs active store ceilings",
+      "reference": "R:brokerd/src/server.rs:99-174",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md RT-H09; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-001",
+      "lane": "state",
+      "subsystem": "broker-policy",
+      "question": "Cedar construction/retained state/authorization",
+      "reference": "M:policy/src/lib.rs:103-202,514-707",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-001; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-002",
+      "lane": "state",
+      "subsystem": "broker-replay",
+      "question": "Permanent replay metadata vs streaming audit",
+      "reference": "M:broker/src/lib.rs:2217-2452,2790-2810",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-002; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-003",
+      "lane": "state",
+      "subsystem": "gateway-history",
+      "question": "Window retention/clones and lazy expiry",
+      "reference": "M:agent/src/prompt/history.rs:184-288",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-003; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-004",
+      "lane": "state",
+      "subsystem": "agent-transcript",
+      "question": "Tool transcript amplification/cancellation",
+      "reference": "M:agent/src/prompt.rs:637-774,935-974",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-004; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-005",
+      "lane": "state",
+      "subsystem": "storage-overlay",
+      "question": "Chunk reads vs whole-file append overlays",
+      "reference": "M:storage-host/src/jsonl.rs:15-149",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-005; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-006",
+      "lane": "state",
+      "subsystem": "telemetry-queues",
+      "question": "Queue saturation/drops/drain",
+      "reference": "M:telemetry/src/lib.rs:226-283,340-360",
+      "disposition": "accepted",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-006; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-007",
+      "lane": "state",
+      "subsystem": "gateway-admission",
+      "question": "Slow rejected-reply tasks outside permits",
+      "reference": "M:dekopond/src/lib.rs:588-738",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-007; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-008",
+      "lane": "state",
+      "subsystem": "replay-index",
+      "question": "Exact disk index and fail-closed recovery",
+      "reference": "M:broker/src/lib.rs:2333-2347,2971-2995",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-008; source-supported question, not an executed result."
+    },
+    {
+      "id": "H-STATE-009",
+      "lane": "state",
+      "subsystem": "storage-recovery",
+      "question": "Unknown outcome/leases/GC recovery",
+      "reference": "M:storage-host/src/transaction.rs:576-619,646-860",
+      "disposition": "deferred",
+      "limitation": "See DESIGN_DIGEST.md H-STATE-009; source-supported question, not an executed result."
+    }
+  ],
+  "recipes": [
+    {
+      "id": "unsupported",
+      "implementation": "unsupported",
+      "classification": "unsupported",
+      "timeout_s": 180,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "build-collector",
+      "implementation": "build-collector",
+      "classification": "infra",
+      "timeout_s": 120,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "build-history",
+      "implementation": "build-history",
+      "classification": "infra",
+      "timeout_s": 120,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "smoke",
+      "implementation": "smoke",
+      "classification": "infra",
+      "timeout_s": 15,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "broker",
+      "implementation": "broker",
+      "classification": "release-replica",
+      "timeout_s": 180,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "history",
+      "implementation": "history",
+      "classification": "source-kernel",
+      "timeout_s": 30,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "history-smoke",
+      "implementation": "history-smoke",
+      "classification": "infra",
+      "timeout_s": 30,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "watchdog",
+      "implementation": "watchdog",
+      "classification": "infra",
+      "timeout_s": 2,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    },
+    {
+      "id": "deadline-smoke",
+      "implementation": "deadline-smoke",
+      "classification": "infra",
+      "timeout_s": 10,
+      "memory_bytes": 1073741824,
+      "pids": 64,
+      "cpus": 1,
+      "output_bytes": 8388608
+    }
+  ],
+  "builds": [
+    {
+      "id": "release",
+      "source": "R",
+      "image": "ghcr.io/dekopon-agents/dekopon@sha256:2639863b542ef202fd4efb65ae68e9d5f5395391df7d5f13f8b8dbfbfeb2e768",
+      "compiler": null,
+      "flags": "thin LTO;codegen-units=4;stripped (source-supported)",
+      "allocator": "glibc identity captured from release image; not allocation ownership"
+    },
+    {
+      "id": "builder",
+      "source": null,
+      "image": "rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff",
+      "compiler": "must capture actual cc/rustc",
+      "flags": "cc -O2 -static; rustc -O -C target-feature=+crt-static",
+      "allocator": "container toolchain; host sccache not used"
+    },
+    {
+      "id": "history",
+      "source": "M",
+      "image": "ghcr.io/dekopon-agents/dekopon@sha256:2639863b542ef202fd4efb65ae68e9d5f5395391df7d5f13f8b8dbfbfeb2e768",
+      "compiler": "rustc 1.89.0 (capture actual build output)",
+      "flags": "standalone source kernel; -O -C target-feature=+crt-static",
+      "allocator": "static glibc from builder; not release allocator"
+    },
+    {
+      "id": "builder-arm64-1.86",
+      "source": null,
+      "image": "rust@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081",
+      "compiler": "rustc 1.86.0 / container cc; actual versions retained",
+      "flags": "cc -O2 -static; rustc -O -C target-feature=+crt-static",
+      "allocator": "container toolchain; host sccache not used"
+    },
+    {
+      "id": "history-arm64-1.86",
+      "source": "M",
+      "image": "ghcr.io/dekopon-agents/dekopon@sha256:2639863b542ef202fd4efb65ae68e9d5f5395391df7d5f13f8b8dbfbfeb2e768",
+      "compiler": "rustc 1.86.0; actual retained build output required",
+      "flags": "source kernel; -O -C target-feature=+crt-static -C strip=symbols",
+      "allocator": "static glibc from builder; not release allocator"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "BUILD-COLLECTOR",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "build-collector",
+      "stage": 0,
+      "priority": 0,
+      "build": "builder",
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "BUILD-HISTORY",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "build-history",
+      "stage": 0,
+      "priority": 0,
+      "build": "builder",
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "INFRA-SMOKE",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "smoke",
+      "stage": 0,
+      "priority": 0,
+      "build": "release",
+      "providers": null,
+      "prerequisites": [
+        "collector"
+      ],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "RT-C01",
+      "lane": "runtime",
+      "hypothesis": "RT-H01",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "off",
+        "instrumentation": "external",
+        "trim": false,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-C02",
+      "lane": "runtime",
+      "hypothesis": "RT-H03",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "echo",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 1,
+        "compile_cache": "off",
+        "instrumentation": "external",
+        "trim": false,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-C03",
+      "lane": "runtime",
+      "hypothesis": "RT-H05",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "empty",
+        "instrumentation": "external",
+        "trim": false,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-C04",
+      "lane": "runtime",
+      "hypothesis": "RT-H05",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "populated",
+        "instrumentation": "external",
+        "trim": false,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-C05",
+      "lane": "runtime",
+      "hypothesis": "RT-H02",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "off",
+        "instrumentation": "allocator",
+        "trim": false,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-C06",
+      "lane": "runtime",
+      "hypothesis": "RT-H02",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "off",
+        "instrumentation": "allocator",
+        "trim": true,
+        "idle_seconds": 60
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-D04",
+      "lane": "runtime",
+      "hypothesis": "RT-H04",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-D06",
+      "lane": "runtime",
+      "hypothesis": "RT-H06",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-D07",
+      "lane": "runtime",
+      "hypothesis": "RT-H07",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-D08",
+      "lane": "runtime",
+      "hypothesis": "RT-H08",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-D09",
+      "lane": "runtime",
+      "hypothesis": "RT-H09",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-001",
+      "lane": "state",
+      "hypothesis": "H-STATE-001",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "principals": 256,
+        "capabilities": 32,
+        "policies": 128,
+        "requests": 10000,
+        "warmups": 100,
+        "concurrency": 1,
+        "provider_count": 4
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-002",
+      "lane": "state",
+      "hypothesis": "H-STATE-002",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "records": 2048,
+        "line_bytes": 8192,
+        "replay_ids": 2048,
+        "concurrency": 1
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-003",
+      "lane": "state",
+      "hypothesis": "H-STATE-003",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "keys": 129,
+        "capacity": 128,
+        "turns": 12,
+        "window_bytes": 65536,
+        "user_bytes": 2048,
+        "answer_bytes": 4096,
+        "held_clones": 4,
+        "idle_timeout_ms": 900000
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-004",
+      "lane": "state",
+      "hypothesis": "H-STATE-004",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "steps": 8,
+        "capability_calls": 16,
+        "result_bytes": 262144,
+        "prompt_bytes": 16384,
+        "system_bytes": 1024,
+        "answer_bytes": 8192,
+        "concurrency": 4,
+        "sessions": 100
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-005",
+      "lane": "state",
+      "hypothesis": "H-STATE-005",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "file_bytes": 2097152,
+        "chunk_bytes": 65536,
+        "reads": 100,
+        "appends": 100,
+        "record_bytes": 1024,
+        "root_bytes": 33554432,
+        "namespace_bytes": 16777216,
+        "max_file_bytes": 8388608
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "C-STATE-006",
+      "lane": "state",
+      "hypothesis": "H-STATE-006",
+      "recipe": "unsupported",
+      "stage": 1,
+      "priority": 10,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {
+        "records_per_signal": 10000,
+        "attribute_bytes": 512,
+        "queue_size": 256,
+        "batch_size": 64,
+        "delay_ms": 100,
+        "block_ms": 1000
+      },
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "D-STATE-007",
+      "lane": "state",
+      "hypothesis": "H-STATE-007",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "D-STATE-008",
+      "lane": "state",
+      "hypothesis": "H-STATE-008",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "D-STATE-009",
+      "lane": "state",
+      "hypothesis": "H-STATE-009",
+      "recipe": "unsupported",
+      "stage": 2,
+      "priority": 30,
+      "build": null,
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "unsupported",
+      "reason": "Missing validated driver/measurement prerequisite; see DESIGN_DIGEST.md."
+    },
+    {
+      "id": "RT-X01",
+      "lane": "runtime",
+      "hypothesis": "RT-H01",
+      "recipe": "broker",
+      "stage": 1,
+      "priority": 1,
+      "build": "release",
+      "providers": "P4",
+      "prerequisites": [
+        "collector"
+      ],
+      "factors": {
+        "provider_count": 4,
+        "compile_cache": "off",
+        "instrumentation": "in-container-static-v1",
+        "idle_seconds": 60
+      },
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "RT-X02",
+      "lane": "runtime",
+      "hypothesis": "RT-H03",
+      "recipe": "broker",
+      "stage": 1,
+      "priority": 2,
+      "build": "release",
+      "providers": "echo",
+      "prerequisites": [
+        "collector"
+      ],
+      "factors": {
+        "provider_count": 1,
+        "compile_cache": "off",
+        "instrumentation": "in-container-static-v1",
+        "idle_seconds": 60
+      },
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "ST-X01",
+      "lane": "state",
+      "hypothesis": "H-STATE-003",
+      "recipe": "history",
+      "stage": 1,
+      "priority": 1,
+      "build": "history",
+      "providers": null,
+      "prerequisites": [
+        "collector",
+        "history"
+      ],
+      "factors": {
+        "keys": 128,
+        "turns": 12,
+        "window_bytes": 65536,
+        "user_bytes": 2048,
+        "answer_bytes": 4096,
+        "held_clones": 4,
+        "instrumentation": "in-container-static-v1"
+      },
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "BUILD-COLLECTOR-ARM64",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "build-collector",
+      "stage": 0,
+      "priority": 1,
+      "build": "builder-arm64-1.86",
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "BUILD-HISTORY-ARM64",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "build-history",
+      "stage": 0,
+      "priority": 1,
+      "build": "builder-arm64-1.86",
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "ST-X01-ARM64",
+      "lane": "state",
+      "hypothesis": "H-STATE-003",
+      "recipe": "history",
+      "stage": 1,
+      "priority": 1,
+      "build": "history-arm64-1.86",
+      "providers": null,
+      "prerequisites": [
+        "collector",
+        "history"
+      ],
+      "factors": {
+        "keys": 128,
+        "turns": 12,
+        "window_bytes": 65536,
+        "user_bytes": 2048,
+        "answer_bytes": 4096,
+        "held_clones": 4,
+        "instrumentation": "in-container-static-v1"
+      },
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "INFRA-HISTORY",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "history-smoke",
+      "stage": 0,
+      "priority": 1,
+      "build": "history-arm64-1.86",
+      "providers": null,
+      "prerequisites": [
+        "collector",
+        "history"
+      ],
+      "factors": {
+        "keys": 128,
+        "turns": 12,
+        "window_bytes": 65536,
+        "user_bytes": 2048,
+        "answer_bytes": 4096,
+        "held_clones": 4,
+        "instrumentation": "in-container-static-v1"
+      },
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "INFRA-WATCHDOG",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "watchdog",
+      "stage": 0,
+      "priority": 1,
+      "build": "builder-arm64-1.86",
+      "providers": null,
+      "prerequisites": [],
+      "factors": {},
+      "status": "ready",
+      "reason": ""
+    },
+    {
+      "id": "INFRA-DEADLINE",
+      "lane": "infra",
+      "hypothesis": null,
+      "recipe": "deadline-smoke",
+      "stage": 0,
+      "priority": 1,
+      "build": "release",
+      "providers": null,
+      "prerequisites": [
+        "collector"
+      ],
+      "factors": {},
+      "status": "ready",
+      "reason": "Container-owned PID1 deadline with a setsid/non-cooperative descendant; expected exit 124. Infrastructure only."
+    }
+  ]
+}

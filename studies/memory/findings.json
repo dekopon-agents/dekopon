@@ -1,0 +1,136 @@
+[
+  {
+    "id": "F-INFRA-001",
+    "status": "observed",
+    "claim": "The isolated arm64 collector smoke read back Linux cgroup v2 1GiB memory, zero swap, 64 pids, one CPU and 4096-byte pages, then exited and its container was removed.",
+    "limitation": "Infrastructure validation only, one smoke observation; collector static libc is not broker allocator identity or Pi evidence.",
+    "evidence": [
+      {
+        "artifact_id": "741ef512b5f84449b7a8f5f3b33dfc83"
+      },
+      {
+        "artifact_id": "cf2b772eef694ba6b594f801f7c04b4d"
+      },
+      {
+        "parse_id": "9981d231fe674ec7a710c4214536b3c2"
+      }
+    ]
+  },
+  {
+    "id": "F-INFRA-002",
+    "status": "observed",
+    "claim": "The unchanged source History kernel passed synthetic trim/clone/drop assertions in the isolated fixture smoke: each 64KiB window retained ten 6144-byte turns.",
+    "limitation": "Fixture correctness only, not comparative performance, resident heap ownership, full ConversationStore behavior, or a production memory reduction.",
+    "evidence": [
+      {
+        "artifact_id": "12bfb8803c4740f38f96d6be74c9d751"
+      },
+      {
+        "parse_id": "46e41f43af394b2d9e9766cedc55888e"
+      },
+      {
+        "reference_id": "H-STATE-003-source"
+      }
+    ]
+  },
+  {
+    "id": "F-INFRA-003",
+    "status": "observed",
+    "claim": "The hard-timeout smoke stopped an isolated shell tree with a setsid descendant: exit 137 and a retained resource-exhaustion failure, followed by verified container deletion and free slots.",
+    "limitation": "Intentional infrastructure failure, not a failed Dekopon benchmark. A trustworthy local Docker daemon/kernel is assumed; unavailable inspection must keep the lease.",
+    "evidence": [
+      {
+        "artifact_id": "f4eb60c60f1f4ea9b2a55288ed56a029"
+      },
+      {
+        "artifact_id": "1343cc45b9e440af8a8d7cea21536d43"
+      }
+    ]
+  },
+  {
+    "id": "F-E2E-001",
+    "status": "observed",
+    "claim": "One real RT-X02 startup/idle trial completed before the screen. All 841 sample values and 33 summaries matched raw evidence; sanitized export restored into an analysis-only SQLite DB with the same idle RSS mean 26340368.786885247 B and maximum 26361856 B.",
+    "limitation": "One trial proves the pipeline, not comparison, production parity, exact readiness latency or allocator attribution. No provider invocation occurred.",
+    "evidence": [
+      {
+        "parse_id": "c43bac2278a844398e2c395ea5631b20"
+      },
+      {
+        "artifact_id": "d4e873332c1945c6b2d0421a79d7722b"
+      },
+      {
+        "artifact_id": "82cfe57cc8f04ab58648c9881149dbad"
+      }
+    ]
+  },
+  {
+    "id": "F-PILOT-RT-001",
+    "status": "observed",
+    "claim": "Three fresh sequential release-replica trials each of P4 and echo in approved-v4-pilot-01-screen had mean idle RSS 61.187842 versus 24.850090 MiB, sampled-ready latency 746.737603 versus 203.370553 ms, and joined-child CPU 722.766333 versus 105.912000 ms.",
+    "limitation": "Descriptive tiny screen, not per-provider cost, causal allocator attribution or production parity. Provider metadata/world/code change together; in-container observer is not calibrated; filesystem cache and guest interference are uncontrolled; readiness is a socket-polling proxy.",
+    "evidence": [
+      {
+        "artifact_id": "e81c1138097f4c9b8665aa3eb26da2e6"
+      },
+      {
+        "parse_id": "71ad4b38a7ab4f6694b441630ab79bef"
+      },
+      {
+        "parse_id": "d6d14c382d1c4086bf89516df21bc0d7"
+      },
+      {
+        "parse_id": "f27057cbcc514ea4ab39ce438d8d65e4"
+      },
+      {
+        "parse_id": "10c1be3a353d4701a832a9c11ac4c420"
+      },
+      {
+        "parse_id": "44a6553b73ac4509aefe27a6f78880d3"
+      },
+      {
+        "parse_id": "90fb46c9c79a4b8abb78b5b5cac7e4a7"
+      }
+    ]
+  },
+  {
+    "id": "F-PILOT-ST-001",
+    "status": "observed",
+    "claim": "Three synchronized source-History trials retained 1280 turns / 7864320 logical text bytes and 245760 held-clone bytes. After dropping windows the logical retained count was zero while process RSS remained 8957952 to 8962048 B.",
+    "limitation": "Real fenced History methods with unused model-type stubs, not whole gateway/ConversationStore/lazy expiry. Logical counts are not allocation capacity or live heap. Resident pages after drop do not identify allocator retention, diagnose a leak or establish a production saving.",
+    "evidence": [
+      {
+        "reference_id": "H-STATE-003-source"
+      },
+      {
+        "parse_id": "1d398ba0676e41ffa20b0a6d7b39d75e"
+      },
+      {
+        "parse_id": "2d3acd5e3c034036a24bcf6d57cf9983"
+      },
+      {
+        "parse_id": "fbff4b13fde3430fae455366957de93d"
+      },
+      {
+        "artifact_id": "2044658e6c484741b7ee35db299daf4a"
+      }
+    ]
+  },
+  {
+    "id": "F-PILOT-LIFECYCLE-001",
+    "status": "observed",
+    "claim": "All ten proof/screen attempts succeeded on their first attempt. Their raw/input/binary evidence was retained before exact container/volume deletion; independent checks observed both slots empty and no study host targets.",
+    "limitation": "Trusted same-daemon ownership assumptions remain. The earlier pre-create-failure volume is safety-retained because it has no archive endpoint. The canonical database, worktree and immutable raw evidence must remain local; no off-machine backup is claimed.",
+    "evidence": [
+      {
+        "artifact_id": "d4e873332c1945c6b2d0421a79d7722b"
+      },
+      {
+        "artifact_id": "2044658e6c484741b7ee35db299daf4a"
+      },
+      {
+        "artifact_id": "3f9e4a3d3e7145ef99e6c428c9a5f9d5"
+      }
+    ]
+  }
+]
