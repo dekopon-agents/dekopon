@@ -70,8 +70,11 @@ pub struct RecordedSession {
     /// Every model turn, in order.
     #[serde(default)]
     pub turns: Vec<RecordedTurn>,
-    /// Independent call accounting, including failed/no-answer calls and images. Absent only in
-    /// historical transcript files; an empty current list means unknown, never free inference.
+    /// Independent call accounting, including failed/no-answer calls and images.
+    ///
+    /// Absent only in transcript files written before this field existed. A reconstruction always
+    /// states the list, even empty: an empty one means the receiver returned no accounting rows
+    /// for this trace, which is unknown, never free inference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls: Option<Vec<RecordedAccountingCall>>,
     /// The final answer, when the session produced one.
@@ -332,7 +335,8 @@ impl RecordedSession {
     /// An empty `calls` list is unknown, never zero: it is what a session whose accounting rows the
     /// receiver did not return looks like, and reporting `0` there reads as free inference. A file
     /// written before independent call accounting existed carries no `calls` at all, and its
-    /// answered turns are then the honest count.
+    /// answered turns are then the honest count; a reconstruction never produces that shape, so the
+    /// fallback cannot fire for a current trace whose accounting rows simply did not come back.
     fn model_turns(&self) -> Option<u32> {
         let count = match &self.calls {
             // A call set naming no chat call at all — empty, or image calls only, which is what a
@@ -393,8 +397,10 @@ impl RecordedSession {
                         continue;
                     };
                     if let Some(id) = text(record, "job.id") {
-                        if job.as_ref().is_some_and(|old| old != &id) {
-                            problems.push("conflicting prompt job IDs");
+                        if let Some(old) = job.as_ref().filter(|old| *old != &id) {
+                            problems.push(format!(
+                                "conflicting prompt job IDs {old} and {id} at turn {turn}"
+                            ));
                         }
                         job = Some(id);
                     }
@@ -465,10 +471,12 @@ impl RecordedSession {
                         kind: kind.clone(),
                         usage,
                     };
-                    if let Some(old) = calls.insert((job, sequence), call.clone())
+                    if let Some(old) = calls.insert((job.clone(), sequence), call.clone())
                         && old != call
                     {
-                        problems.push("conflicting accounting call records");
+                        problems.push(format!(
+                            "conflicting accounting call records for job {job} call {sequence}"
+                        ));
                     }
                     if kind != "image"
                         && let Some(turn) = turn
@@ -594,9 +602,13 @@ impl RecordedSession {
             contexts,
             prompt,
             turns,
-            // No accounting row is unknown, not zero calls: the `calls` list means "this is every
-            // call", and an empty one would claim the session made none.
-            calls: (!calls.is_empty()).then(|| calls.into_values().collect()),
+            // Always present, even empty. Absent means "written before call accounting existed",
+            // and a reconstruction is not that: a current trace whose accounting rows the receiver
+            // did not return — a truncated page set, a partial fetch — has an *unknown* call
+            // count, which is what a present-but-empty list says. Reporting no list at all would
+            // send `model_turns` to the legacy fallback and print the answered turns as a
+            // confident chat-call count, which is a different number.
+            calls: Some(calls.into_values().collect()),
             answer,
         })
     }
@@ -1694,14 +1706,24 @@ mod tests {
         });
         let recorded = RecordedSession::from_records("t1", &rows).expect("transcript loads");
         assert_eq!(
-            recorded.calls, None,
-            "no rows is not an empty list of calls"
+            recorded.calls,
+            Some(Vec::new()),
+            "a reconstruction always states its call set, even when the receiver returned none"
         );
-        // Answered turns are still an honest count when nothing else says otherwise.
-        assert_eq!(recorded.model_turns(), Some(2));
+        assert_eq!(
+            recorded.model_turns(),
+            None,
+            "a current trace whose accounting rows did not come back is unknown, not two turns: \
+             answered turns are a different quantity from chat calls"
+        );
 
-        let mut emptied = recorded.clone();
-        emptied.calls = Some(Vec::new());
+        // Absent — never produced by a reconstruction — means the file predates call accounting,
+        // and there its answered turns are the honest count.
+        let mut legacy = recorded.clone();
+        legacy.calls = None;
+        assert_eq!(legacy.model_turns(), Some(2));
+
+        let emptied = recorded.clone();
         assert_eq!(
             emptied.model_turns(),
             None,
@@ -1783,6 +1805,46 @@ mod tests {
         );
         assert!(
             error.contains("conflicting accounting observations for turn 1"),
+            "{error}"
+        );
+    }
+
+    /// Two conflicting call records name their own coordinates, so both survive the dedup.
+    ///
+    /// `Problems::detail` sorts and dedups identical strings, so a bare "conflicting accounting
+    /// call records" collapsed every conflict in the export into one line naming none of them: an
+    /// operator editing the recording could not fix them one at a time. The same held for a
+    /// conflicting `job.id` across prompt rows.
+    #[test]
+    fn every_conflicting_call_record_and_job_id_names_which_one_it_was() {
+        let call = |sequence: u32, tokens: u32| {
+            json!({"trace_id": "t1", "audit_event": "accounting.model.call", "job.id": "job-a",
+                   "call.sequence": sequence, "model_turn": sequence, "model.kind": "chat",
+                   "usage_input_tokens": tokens})
+        };
+        let mut rows = records();
+        rows.retain(|row| row["audit_event"] != json!("accounting.model.turn"));
+        rows.extend([call(1, 100), call(1, 101), call(2, 200), call(2, 201)]);
+        rows.push(
+            json!({"trace_id": "t1", "audit_event": "agent.model.prompt", "model_turn": 2,
+                         "transcript_scope": "delta", "messages": "[]", "job.id": "job-b"}),
+        );
+        rows[0]["job.id"] = json!("job-a");
+
+        let error = RecordedSession::from_records("t1", &rows)
+            .expect_err("four conflicting rows")
+            .to_string();
+
+        assert!(
+            error.contains("conflicting accounting call records for job job-a call 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("conflicting accounting call records for job job-a call 2"),
+            "the second conflict is not deduplicated away by the first: {error}"
+        );
+        assert!(
+            error.contains("conflicting prompt job IDs job-a and job-b"),
             "{error}"
         );
     }
