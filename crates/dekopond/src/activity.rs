@@ -160,47 +160,81 @@ impl Drop for TargetLease {
     }
 }
 
-/// Activity supervisors the gateway still owns.
+/// The activity supervisors one gateway owns.
 ///
 /// Cleanup of a progress message is the last thing a session's activity does, and it outlives the
-/// session task that started it. Shutdown drains this so a SIGTERM does not strand a ⌛ message in
-/// somebody's channel.
-static SUPERVISORS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+/// session task that started it. `serve` drains this so a SIGTERM does not strand a ⌛ message in
+/// somebody's channel. It is owned by the gateway rather than by the process because two gateways
+/// in one process (or two tests) must not drain — or abandon — each other's workers.
+#[derive(Clone, Default)]
+pub(crate) struct ActivitySupervisors(Arc<Mutex<Vec<JoinHandle<()>>>>);
 
-fn track(handle: JoinHandle<()>) {
-    let mut supervisors = SUPERVISORS.lock().expect("activity supervisors");
-    supervisors.retain(|handle| !handle.is_finished());
-    supervisors.push(handle);
-}
+impl ActivitySupervisors {
+    fn track(&self, handle: JoinHandle<()>) {
+        let mut supervisors = self.0.lock().expect("activity supervisors");
+        supervisors.retain(|handle| !handle.is_finished());
+        supervisors.push(handle);
+    }
 
-/// Awaits every activity supervisor still posting, updating, or cleaning up.
-///
-/// Called by `serve` after the sessions, inside the same shutdown grace: an activity worker holds
-/// no session admission, so nothing here can be waiting on work the sessions had not finished.
-pub(crate) async fn drain() {
-    loop {
-        let pending = std::mem::take(&mut *SUPERVISORS.lock().expect("activity supervisors"));
-        if pending.is_empty() {
-            return;
+    /// Awaits every activity supervisor still posting, updating, or cleaning up.
+    ///
+    /// Called by `serve` after the sessions, inside the same shutdown grace: an activity worker
+    /// holds no session admission, so nothing here can be waiting on work the sessions had not
+    /// finished.
+    pub(crate) async fn drain(&self) {
+        // Handles are moved out so nothing awaits under the lock, and put back on the way out: a
+        // drain cancelled by the shutdown grace expiring must leave them for `abandon` to count,
+        // rather than dropping them and reporting that nothing was stranded.
+        struct Restore<'a>(&'a ActivitySupervisors, Vec<JoinHandle<()>>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .0
+                    .lock()
+                    .expect("activity supervisors")
+                    .append(&mut self.1);
+            }
         }
-        for handle in pending {
-            if let Err(error) = handle.await
-                && !error.is_cancelled()
-            {
-                tracing::debug!(
-                    event = "gateway_activity_failed",
-                    operation = "supervisor",
-                    category = "panic"
-                );
+        loop {
+            let pending = std::mem::take(&mut *self.0.lock().expect("activity supervisors"));
+            if pending.is_empty() {
+                return;
+            }
+            let mut remaining = Restore(self, pending);
+            // Awaited in place and popped after it finishes, so a cancellation here leaves the
+            // handle in the vector the guard puts back rather than dropping it mid-await.
+            while let Some(handle) = remaining.1.last_mut() {
+                let outcome = handle.await;
+                remaining.1.pop();
+                if let Err(error) = outcome
+                    && !error.is_cancelled()
+                {
+                    tracing::debug!(
+                        event = "gateway_activity_failed",
+                        operation = "supervisor",
+                        category = "panic",
+                        cause = %error
+                    );
+                }
             }
         }
     }
-}
 
-/// Gives up on the supervisors the shutdown grace did not cover.
-pub(crate) fn abandon() {
-    for handle in std::mem::take(&mut *SUPERVISORS.lock().expect("activity supervisors")) {
-        handle.abort();
+    /// Gives up on the supervisors the shutdown grace did not cover.
+    ///
+    /// Each one that was still running owns a ⌛ message it had not finished removing, so the
+    /// count is how many progress artifacts this shutdown leaves in somebody's channel. Nothing
+    /// else observes an aborted supervisor's exit, so the caller reports the count rather than
+    /// letting a stranded artifact be the one shutdown outcome that is invisible.
+    pub(crate) fn abandon(&self) -> usize {
+        let mut abandoned = 0;
+        for handle in std::mem::take(&mut *self.0.lock().expect("activity supervisors")) {
+            if !handle.is_finished() {
+                abandoned += 1;
+            }
+            handle.abort();
+        }
+        abandoned
     }
 }
 
@@ -242,6 +276,7 @@ pub(crate) struct ActivityLease {
 }
 impl ActivityLease {
     pub(crate) fn start(
+        supervisors: &ActivitySupervisors,
         driver: Option<Arc<dyn ChatActivity>>,
         target: Option<ActivityTarget>,
         optional_reply: bool,
@@ -266,7 +301,7 @@ impl ActivityLease {
         // supervisor observes panics, and conservatively quarantines uncertain ordering on unwind.
         // The worker rides a `JoinSet` rather than a bare spawn so that abandoning the supervisor
         // abandons the worker with it, and the supervisor itself is owned by the gateway.
-        track(tokio::spawn(async move {
+        supervisors.track(tokio::spawn(async move {
             let mut lease = lease;
             lease.quarantine = true;
             let mut worker = tokio::task::JoinSet::new();
@@ -280,7 +315,8 @@ impl ActivityLease {
                         "panic"
                     } else {
                         "cancelled"
-                    }
+                    },
+                    cause = %error
                 ),
                 None => tracing::debug!(
                     event = "gateway_activity_failed",

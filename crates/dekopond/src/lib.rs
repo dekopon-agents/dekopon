@@ -187,9 +187,10 @@ where
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
-    // Every transport that cannot connect is named in one refusal. A duplicate installation is
-    // reported against *both* configurations, and an operator who mis-scoped two workspaces does
-    // not have to restart the daemon once per conflict to discover the second one.
+    // Every transport that cannot connect is named in one refusal, so an operator who mis-scoped
+    // two workspaces does not restart the daemon once per conflict to discover the next one. A
+    // duplicate Slack installation is one such failure: the first configuration to claim it keeps
+    // it, and the configuration refused for it is the one this list names.
     let mut connect_problems = Vec::new();
     for (spec, mut transport) in config.transports.iter().zip(built_transports) {
         let identity = match transport.connect().await {
@@ -254,6 +255,7 @@ where
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
+        activity_supervisors: activity::ActivitySupervisors::default(),
     });
 
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
@@ -646,19 +648,36 @@ where
     // for, and abandoning it means a person watching a chat window never hears back. The activity
     // supervisors drain inside the same grace and after the sessions, because a session's last act
     // is to queue the removal of its ⌛ progress message onto one of them.
-    if timeout(grace, async {
+    let deadline = tokio::time::Instant::now() + grace;
+    let sessions_finished = tokio::time::timeout_at(deadline, async {
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
         }
-        activity::drain().await;
     })
     .await
-    .is_err()
-    {
+    .is_ok();
+    if !sessions_finished {
         tracing::warn!(event = "gateway_sessions_abandoned");
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
-        activity::abandon();
+    }
+    // Cleanup is what removes the ⌛ from somebody's channel, and an abandoned supervisor leaves
+    // it there. The two outcomes are reported apart because "a person never heard back" and "a
+    // progress message is stuck in a channel" are different things for an operator to act on.
+    let drained = sessions_finished
+        && tokio::time::timeout_at(deadline, runner.activity_supervisors.drain())
+            .await
+            .is_ok();
+    if !drained {
+        let abandoned = runner.activity_supervisors.abandon();
+        if abandoned > 0 {
+            tracing::warn!(
+                event = "gateway_activity_failed",
+                operation = "cleanup",
+                cause_type = "activity-cleanup-abandoned",
+                abandoned
+            );
+        }
     }
     outcome
 }
@@ -1002,8 +1021,10 @@ pub enum DekopondError {
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
     /// One or more transports could not authenticate or open their wakeup path.
     ///
-    /// Every failing transport is reported together: two configurations claiming one Slack
-    /// installation fail each other, and naming only the first hides the conflict's other half.
+    /// Every failing transport is reported together rather than only the first, so two mis-scoped
+    /// transports are one refusal and one restart. A duplicate Slack installation appears here as
+    /// the configuration that was refused it; the one already holding it connected and is not a
+    /// failure to report.
     #[error("{}", render_problems(.problems))]
     TransportConnect {
         /// Every transport that could not connect, in configured order.

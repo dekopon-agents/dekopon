@@ -107,13 +107,23 @@ async fn delayed_creation_is_owned_by_old_generation_and_never_blocks_final_deli
         ..Default::default()
     });
     let driver = fake.clone() as Arc<dyn ChatActivity>;
-    let mut lease = ActivityLease::start(Some(driver.clone()), Some(target("U1")), false);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(driver.clone()),
+        Some(target("U1")),
+        false,
+    );
     wait(&fake.entered).await;
     lease.seal();
     fake.record("final-delivery");
     lease.finish_in_background();
     // Native status shares the target across users and inbound message generations.
-    let later = ActivityLease::start(Some(driver), Some(target("U2")), false);
+    let later = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(driver),
+        Some(target("U2")),
+        false,
+    );
     assert!(later.publisher().is_none());
     assert_eq!(
         *fake.events.lock().unwrap(),
@@ -137,7 +147,12 @@ async fn delayed_creation_is_owned_by_old_generation_and_never_blocks_final_deli
 async fn stop_drop_and_explicit_terminal_paths_cleanup_only_confirmed_creation() {
     for exit in ["stop", "drop", "failed", "declined", "reply-failed"] {
         let fake = Arc::new(Fake::default());
-        let mut lease = ActivityLease::start(Some(fake.clone()), Some(target(exit)), false);
+        let mut lease = ActivityLease::start(
+            &crate::activity::ActivitySupervisors::default(),
+            Some(fake.clone()),
+            Some(target(exit)),
+            false,
+        );
         wait(&fake.entered).await;
         match exit {
             "stop" => lease.control().finish(),
@@ -154,7 +169,12 @@ async fn stop_drop_and_explicit_terminal_paths_cleanup_only_confirmed_creation()
         fail_post: true,
         ..Default::default()
     });
-    let mut lease = ActivityLease::start(Some(fake.clone()), Some(target("unknown")), false);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(fake.clone()),
+        Some(target("unknown")),
+        false,
+    );
     wait(&fake.entered).await;
     lease.finish_in_background();
     wait(&fake.hidden).await;
@@ -176,7 +196,12 @@ async fn stop_drop_and_explicit_terminal_paths_cleanup_only_confirmed_creation()
 #[tokio::test]
 async fn optional_continuation_decline_posts_nothing_and_cleanup_honors_retry_after() {
     let fake = Arc::new(Fake::default());
-    let mut lease = ActivityLease::start(Some(fake.clone()), Some(target("optional")), true);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(fake.clone()),
+        Some(target("optional")),
+        true,
+    );
     tokio::time::sleep(Duration::from_millis(30)).await;
     lease.finish_in_background();
     wait(&fake.hidden).await;
@@ -185,7 +210,12 @@ async fn optional_continuation_decline_posts_nothing_and_cleanup_honors_retry_af
         retry_delete: true,
         ..Default::default()
     });
-    let mut lease = ActivityLease::start(Some(retry.clone()), Some(target("retry")), false);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(retry.clone()),
+        Some(target("retry")),
+        false,
+    );
     wait(&retry.entered).await;
     let start = Instant::now();
     lease.finish_in_background();
@@ -291,7 +321,12 @@ async fn settle() {
 #[tokio::test(start_paused = true)]
 async fn runtime_flood_coalesces_to_one_update_and_optional_work_enables_posting() {
     let fake = Arc::new(Fake::default());
-    let mut lease = ActivityLease::start(Some(fake.clone()), Some(target("flood")), false);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(fake.clone()),
+        Some(target("flood")),
+        false,
+    );
     wait(&fake.entered).await;
     emit_flood(lease.publisher().unwrap());
     tokio::time::advance(Duration::from_millis(100)).await;
@@ -317,7 +352,12 @@ async fn runtime_flood_coalesces_to_one_update_and_optional_work_enables_posting
     lease.finish_in_background();
     wait(&fake.hidden).await;
     let optional = Arc::new(Fake::default());
-    let mut lease = ActivityLease::start(Some(optional.clone()), Some(target("work")), true);
+    let mut lease = ActivityLease::start(
+        &crate::activity::ActivitySupervisors::default(),
+        Some(optional.clone()),
+        Some(target("work")),
+        true,
+    );
     emit_flood(lease.publisher().unwrap());
     wait(&optional.entered).await;
     lease.finish_in_background();
@@ -371,7 +411,12 @@ async fn uncertain_native_status_quarantines_later_generations_even_after_fallba
         let server = dekopon_test_support::LoopbackServer::sequence(responses);
         let transport = native(server.url());
         let driver = transport.activity().unwrap();
-        let mut lease = ActivityLease::start(Some(driver.clone()), Some(target("U1")), false);
+        let mut lease = ActivityLease::start(
+            &crate::activity::ActivitySupervisors::default(),
+            Some(driver.clone()),
+            Some(target("U1")),
+            false,
+        );
         let mut calls = Vec::new();
         until(|| {
             calls.extend(server.recorded());
@@ -382,7 +427,12 @@ async fn uncertain_native_status_quarantines_later_generations_even_after_fallba
         until(|| transport.replier.active_activity.lock().unwrap().is_empty()).await;
         calls.extend(server.recorded());
         assert_eq!(calls.len(), if owned_reaction { 4 } else { 3 });
-        let later = ActivityLease::start(Some(driver), Some(target("U2")), false);
+        let later = ActivityLease::start(
+            &crate::activity::ActivitySupervisors::default(),
+            Some(driver),
+            Some(target("U2")),
+            false,
+        );
         assert!(
             later.publisher().is_none(),
             "successful fallback/cleanup cannot establish ordering of the lost native write"
@@ -410,6 +460,7 @@ async fn repeated_native_hide_refusals_retire_ownership_without_disabling_new_ge
         let mut admitted = None;
         until(|| {
             let lease = ActivityLease::start(
+                &crate::activity::ActivitySupervisors::default(),
                 Some(driver.clone()),
                 Some(target(&format!("U{generation}"))),
                 false,

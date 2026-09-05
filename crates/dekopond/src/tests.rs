@@ -2920,6 +2920,7 @@ fn runner_tracking(
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
         usage_reports: None,
+        activity_supervisors: crate::activity::ActivitySupervisors::default(),
     })
 }
 
@@ -5304,8 +5305,9 @@ fn message_in(conversation: &str, text: &str) -> InboundMessage {
 fn a_minted_cache_key_is_opaque_and_never_repeats() {
     // The prefix is a crate constant and `IdSequence::new` rejects a malformed one, in which case
     // minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure is
-    // silent by design — a routing hint must not abort a message — so this is the test that keeps
-    // the constant valid. The conversation lane is minted in the harness and pinned below.
+    // silent by design — a routing hint must not abort a message — so a bad prefix would reach
+    // production as every route quietly losing its cache lane, and this is what catches it. The
+    // conversation lane is minted in the harness and pinned below.
     let route = cache_key::for_route();
     assert!(!route.trim().is_empty(), "an empty key is no key at all");
     assert_ne!(route, cache_key::for_route());

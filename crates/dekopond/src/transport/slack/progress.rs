@@ -4,12 +4,22 @@ use super::*;
 use dekopon_harness::activity::ActivityLabel;
 use tokio::time::Instant;
 
-/// Longest a channel-creating post waits for its physical slot before it gives up.
+/// Longest a channel-creating post waits for a slot *it observed*, before it gives up.
 ///
 /// A 429 penalty parks the slot for *every* sender in that channel, so this ceiling is what makes
-/// an unrelated session's answer wait rather than fail instantly. Nothing parks the slot for
-/// longer than this, so a wait past it means this caller has already spent the budget waiting.
+/// an unrelated session's answer wait rather than fail instantly. Nothing parks the slot further
+/// than this into the future, so a slot beyond it was never one this caller could reach.
+///
+/// It is deliberately measured from the observation and not from the caller's entry: a sender
+/// already queued behind another when the 429 lands would otherwise be refused for somebody
+/// else's backoff after a wait of its own that never approached the ceiling.
 const POST_WAIT_CEILING: Duration = Duration::from_secs(60);
+/// Longest a channel-creating post waits in total, however many parks land while it is queued.
+///
+/// The per-observation ceiling above bounds one park. This bounds the caller: a channel whose
+/// senders keep being rate limited must not hold a session task forever, so a sender waits out
+/// the queue delay it had already spent plus one full park, and no more.
+const POST_TOTAL_WAIT_CEILING: Duration = Duration::from_secs(120);
 /// What a 429 whose `Retry-After` is absent or unparsable parks the channel slot for.
 const UNSTATED_RETRY_PENALTY: Duration = Duration::from_secs(5);
 /// Longest server-stated backoff this process sleeps through before retrying the same post once.
@@ -121,14 +131,17 @@ fn body(label: ActivityLabel) -> Value {
         "blocks":[{"type":"section", "text":{"type":"plain_text", "text":detail, "emoji":false}}]})
 }
 impl SlackReplier {
-    /// Waits for this physical channel's next post slot, refusing only a wait past `deadline`.
+    /// Waits for this physical channel's next post slot, refusing only a wait it cannot afford.
     ///
     /// A channel parked by somebody else's 429 makes this caller *wait*; it never turns an
-    /// unrelated session's paid-for answer into an instant `post-capacity`.
+    /// unrelated session's paid-for answer into an instant `post-capacity`. The affordable wait is
+    /// recomputed against each observation ([`POST_WAIT_CEILING`]) rather than frozen at `entered`,
+    /// because a park that lands while this caller is queued is dated from the 429's arrival, not
+    /// from this caller's entry; `entered` bounds only the total ([`POST_TOTAL_WAIT_CEILING`]).
     async fn reserve_channel_post(
         &self,
         channel: &str,
-        deadline: Instant,
+        entered: Instant,
     ) -> Result<(), TransportError> {
         loop {
             let reservation = self
@@ -136,8 +149,9 @@ impl SlackReplier {
                 .lock()
                 .expect("Slack channel post rate")
                 .reserve(channel, true);
+            let limit = (Instant::now() + POST_WAIT_CEILING).min(entered + POST_TOTAL_WAIT_CEILING);
             match reservation {
-                Ok(slot) if slot > deadline => {
+                Ok(slot) if slot > limit => {
                     return Err(TransportError::Service {
                         code: "post-capacity".into(),
                     });
@@ -147,7 +161,7 @@ impl SlackReplier {
                 Ok(slot) if slot > Instant::now() => tokio::time::sleep_until(slot).await,
                 Ok(_) => return Ok(()),
                 Err(TransportError::ActivityRateLimited { retry_after })
-                    if Instant::now() + retry_after < deadline =>
+                    if Instant::now() + retry_after <= limit =>
                 {
                     tokio::time::sleep(retry_after).await;
                 }
@@ -175,9 +189,9 @@ impl SlackReplier {
         body: &Value,
         channel: &str,
     ) -> Result<Value, TransportError> {
-        let deadline = Instant::now() + POST_WAIT_CEILING;
+        let entered = Instant::now();
         for attempt in 0..2 {
-            self.reserve_channel_post(channel, deadline).await?;
+            self.reserve_channel_post(channel, entered).await?;
             let response = self
                 .http
                 .post(format!("{}/api/{method}", self.endpoint))
@@ -215,7 +229,7 @@ impl SlackReplier {
             let honored = stated
                 .filter(|_| attempt == 0)
                 .filter(|stated| *stated <= MAX_HONORED_RETRY)
-                .filter(|stated| Instant::now() + *stated <= deadline);
+                .filter(|stated| Instant::now() + *stated <= entered + POST_TOTAL_WAIT_CEILING);
             let Some(honored) = honored else {
                 tracing::warn!(
                     event = "gateway_reply_rate_limited",
@@ -525,7 +539,7 @@ mod rate_tests {
         replier.channel_post_completed("C1", Duration::from_secs(30));
         let start = Instant::now();
         replier
-            .reserve_channel_post("C1", Instant::now() + POST_WAIT_CEILING)
+            .reserve_channel_post("C1", Instant::now())
             .await
             .expect("a backoff inside the ceiling is waited out, not refused");
         assert!(
@@ -534,17 +548,97 @@ mod rate_tests {
             start.elapsed()
         );
 
-        // A budget already spent waiting refuses rather than waiting past the ceiling.
+        // A park that lands after this caller queued is dated from the 429, not from the entry, so
+        // a full-ceiling park is still waited out by a sender that had already been waiting.
         replier.channel_post_completed("C2", POST_WAIT_CEILING);
+        let start = Instant::now();
+        replier
+            .reserve_channel_post("C2", Instant::now() - Duration::from_secs(30))
+            .await
+            .expect("somebody else's full-ceiling park is waited out, not refused");
+        assert!(
+            start.elapsed() >= POST_WAIT_CEILING,
+            "the whole park is waited through: {:?}",
+            start.elapsed()
+        );
+
+        // Only a slot no park could have produced, or a caller already at its total budget, is
+        // refused — and the refusal costs no further waiting.
+        replier.channel_post_completed("C3", POST_WAIT_CEILING + Duration::from_secs(1));
+        let start = Instant::now();
+        assert!(
+            matches!(
+                replier.reserve_channel_post("C3", Instant::now()).await,
+                Err(TransportError::Service { code }) if code == "post-capacity"
+            ),
+            "a slot beyond the per-observation ceiling is refused"
+        );
+        replier.channel_post_completed("C4", Duration::from_secs(30));
         assert!(
             matches!(
                 replier
-                    .reserve_channel_post("C2", Instant::now() + Duration::from_secs(10))
+                    .reserve_channel_post("C4", Instant::now() - POST_TOTAL_WAIT_CEILING)
                     .await,
                 Err(TransportError::Service { code }) if code == "post-capacity"
             ),
-            "a wait past this caller's deadline is its own refusal"
+            "a caller that has spent its total budget is its own refusal"
         );
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "neither refusal waits first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_429_does_not_refuse_a_sender_that_entered_before_it() {
+        // A real `Retry-After: 120` through the whole post path, then the sender that was already
+        // in this channel when it landed — the population a Slack 429 implies. Its paid-for answer
+        // waits the park out and posts; the park is dated from the 429, not from its own entry.
+        let server = dekopon_test_support::LoopbackServer::sequence([
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            response(200, r#"{"ok":true,"channel":"C1","ts":"1700000000.000003"}"#),
+        ]);
+        let transport = with_endpoint(server.url(), false);
+        let queued_entry = Instant::now();
+        let reply_target = ReplyTarget::Slack {
+            channel: "C1".into(),
+            thread_ts: None,
+        };
+        let refused = transport
+            .replier
+            .reply(reply_target.clone(), OutboundReply::text("first"))
+            .await
+            .expect_err("a 120 s backoff is longer than this caller sits through");
+        assert!(
+            matches!(&refused, TransportError::Service { code } if code == "ratelimited"),
+            "{refused:?}"
+        );
+        let park = transport.replier.post_rate.lock().unwrap().next["C1"];
+        assert!(
+            park > queued_entry + POST_WAIT_CEILING,
+            "the park outlives a deadline frozen at the queued sender's entry"
+        );
+
+        // The waiting is virtual from here; the request above needed a real clock because a paused
+        // one auto-advances through the client's own timeout while the socket is in flight.
+        tokio::time::pause();
+        transport
+            .replier
+            .reserve_channel_post("C1", queued_entry)
+            .await
+            .expect("the queued sender waits the park out rather than failing post-capacity");
+        assert!(Instant::now() >= park, "it waited for the whole park");
+        tokio::time::resume();
+        assert!(
+            transport
+                .replier
+                .reply(reply_target, OutboundReply::text("second"))
+                .await
+                .expect("the second session's answer posts")
+                .accepted()
+        );
+        assert_eq!(server.recorded().len(), 2, "one post each, no retry");
     }
 
     #[tokio::test]

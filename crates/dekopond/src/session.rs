@@ -626,6 +626,8 @@ pub(crate) struct SessionRunner {
     pub active_sessions: ActiveSessions,
     /// Best-effort informational usage deltas for the broker-hosted web UI.
     pub usage_reports: Option<mpsc::Sender<ModelUsageReport>>,
+    /// The activity supervisors this gateway owns, drained by `serve` at shutdown.
+    pub activity_supervisors: crate::activity::ActivitySupervisors,
 }
 
 /// Runs one routed message end to end, answering unless an optional continuation declines.
@@ -775,17 +777,10 @@ async fn session(
     // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
-    // Built once for this message and handed to the engine below. It is the same bounded
-    // projection the session's runtime would build for itself; building it twice per message
-    // re-read and re-encoded every granted schema for a fingerprint we already have.
-    let capabilities = match dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&leg) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            tracing::error!(event = "gateway_session_failed", category = "invalid-bootstrap", cause = %error);
-            answer(replier, message, FAILURE_REPLY).await;
-            return "failed";
-        }
-    };
+    // Built once, when this message's leg connected, and handed to the engine below. It is the
+    // same bounded projection the session's runtime would build for itself; building it again here
+    // re-read and re-encoded every granted schema for a projection the leg already validated.
+    let capabilities = leg.capability_snapshot().clone();
     let surface = vec![capabilities.fingerprint(), leg.surface_epoch().to_string()];
     let checkpoint_scope = key.commitment();
     let window = route.conversation.window();
@@ -944,7 +939,12 @@ async fn session(
         .thread_continuation
         .as_ref()
         .is_some_and(|c| c.inherited);
-    let mut activity = ActivityLease::start(driver, message.activity.clone(), reply_optional);
+    let mut activity = ActivityLease::start(
+        &runner.activity_supervisors,
+        driver,
+        message.activity.clone(),
+        reply_optional,
+    );
     let activity_publisher = activity.publisher();
     let activity_labels = route.activity_labels.clone();
     let _active_registration = activity_enabled.then(|| {

@@ -449,6 +449,7 @@ async fn an_image_answer_takes_the_same_physical_channel_slot_as_a_text_answer()
 struct SlowCleanupActivity {
     posted: Arc<tokio::sync::Notify>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
+    removal: Duration,
 }
 impl ChatActivity for SlowCleanupActivity {
     fn show(&self, _: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
@@ -482,7 +483,7 @@ impl ChatActivity for SlowCleanupActivity {
         _: &'a crate::transport::slack::OwnedProgressArtifact,
     ) -> BoxFuture<'a, Result<(), TransportError>> {
         Box::pin(async {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(self.removal).await;
             self.deleted
                 .store(true, std::sync::atomic::Ordering::Release);
             Ok(())
@@ -490,17 +491,26 @@ impl ChatActivity for SlowCleanupActivity {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn shutdown_drains_activity_cleanup_before_the_routing_loop_returns() {
-    // A SIGTERM mid-session used to tear the runtime down on top of a detached worker that had
-    // only just started removing the ⌛ message, leaving it in somebody's channel forever.
+/// Runs one gateway to shutdown with a live progress artifact whose removal takes `removal`.
+///
+/// Returns whether the ⌛ was actually removed, and every event the shutdown emitted.
+async fn shutdown_with_progress_removal(removal: Duration, grace: Duration) -> (bool, String) {
+    let capture = dekopon_test_support::CaptureLayer::install();
     let posted = Arc::new(tokio::sync::Notify::new());
     let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let driver: Arc<dyn ChatActivity> = Arc::new(SlowCleanupActivity {
         posted: Arc::clone(&posted),
         deleted: Arc::clone(&deleted),
+        removal,
     });
-    let mut lease = ActivityLease::start(Some(driver), Some(progress_target()), false);
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let mut lease = ActivityLease::start(
+        &runner.activity_supervisors,
+        Some(driver),
+        Some(progress_target()),
+        false,
+    );
     tokio::time::timeout(Duration::from_secs(4), posted.notified())
         .await
         .expect("the progress artifact is created");
@@ -510,8 +520,6 @@ async fn shutdown_drains_activity_cleanup_before_the_routing_loop_returns() {
         "removal is still in flight when shutdown begins"
     );
 
-    let directory = temporary();
-    let (runner, routes) = idle_routing_loop(directory.path()).await;
     let (_sender, receiver) = mpsc::channel(4);
     let outcome = crate::serve(
         runner,
@@ -520,14 +528,52 @@ async fn shutdown_drains_activity_cleanup_before_the_routing_loop_returns() {
         Arc::new(BTreeMap::new()),
         receiver,
         std::future::ready(()),
-        Duration::from_secs(5),
+        grace,
     )
     .await;
-
     assert_eq!(outcome, crate::ServeOutcome::Shutdown);
-    assert!(
+    (
         deleted.load(std::sync::atomic::Ordering::Acquire),
+        capture.events_text(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_drains_activity_cleanup_before_the_routing_loop_returns() {
+    // A SIGTERM mid-session used to tear the runtime down on top of a detached worker that had
+    // only just started removing the ⌛ message, leaving it in somebody's channel forever.
+    let (deleted, events) =
+        shutdown_with_progress_removal(Duration::from_millis(250), Duration::from_secs(5)).await;
+    assert!(
+        deleted,
         "the routing loop drains activity cleanup inside the shutdown grace"
+    );
+    assert!(
+        !events.contains("activity-cleanup-abandoned"),
+        "nothing was abandoned: {events}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_progress_message_abandoned_by_the_grace_is_reported_as_its_own_outcome() {
+    // The grace can expire on cleanup alone — a model call outlasting `shutdownGraceMs` is the
+    // ordinary way — and the ⌛ then stays in somebody's channel. Aborting the supervisor observes
+    // no exit, so without this report the one artifact a person can still see is the one outcome
+    // nothing says anything about, and `gateway_sessions_abandoned` names sessions that were fine.
+    let (deleted, events) =
+        shutdown_with_progress_removal(Duration::from_secs(30), Duration::from_millis(50)).await;
+    assert!(!deleted, "the removal outlived the grace");
+    let abandoned = events
+        .lines()
+        .find(|line| line.contains("activity-cleanup-abandoned"))
+        .unwrap_or_else(|| panic!("the stranded progress message is reported: {events}"));
+    assert!(
+        abandoned.contains("operation=\"cleanup\"") && abandoned.contains("abandoned=1"),
+        "the report says how many artifacts are stranded: {abandoned}"
+    );
+    assert!(
+        !events.contains("gateway_sessions_abandoned"),
+        "no session was abandoned, only the cleanup: {events}"
     );
 }
 
