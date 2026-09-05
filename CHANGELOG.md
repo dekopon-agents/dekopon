@@ -160,7 +160,9 @@ All notable changes to Dekopon are documented here. The format is based on
   store, no automatic rewriting, and no grader: the loop is `list`, `show`, edit, `replay`, commit.
 - Added the telemetry this round's refusals needed, all of it category-only and all of it recorded
   in `docs/observability.md`: warn-level `gateway_reply_rate_limited` (`transport`, `method`,
-  `retry_after_seconds`) for a channel-creating post the service rate limited; the
+  `cause_type`, `retry_after_seconds` for the refused sender and `channel_parked_seconds` for the
+  shared slot, plus the `channel` only under the payload gate) for a channel-creating post refused
+  because the channel is parked; the
   `gateway_activity_failed` cause types `activity-quarantine-full` and `activity-cleanup-abandoned`;
   the warn-level `conflicting-usage-observation` and `accounting-field-unreported` records naming
   the usage fields a tracker stopped trusting and the job they belong to; the error-level
@@ -330,7 +332,10 @@ All notable changes to Dekopon are documented here. The format is based on
   moment it observes the slot, not from when it entered, so a sender already queued behind another
   when the 429 lands waits the whole park out instead of inheriting somebody else's backoff as a
   refusal; a sender waits at most two minutes in total, a stated `Retry-After` parks the channel
-  for at most sixty seconds, and a missing or unparsable one parks it for five. Image answers take
+  for at most sixty seconds, and a missing or unparsable one parks it for five. A sender that is
+  refused — because it spent that total, or because it drew the 429 itself — is told how many
+  seconds of backoff are left, uncapped for the sender the service told to come back later, and
+  `gateway_reply_failed` names the refusal rather than the generic `service`. Image answers take
   the same channel slot as text ones, because `files.completeUploadExternal` creates a channel
   message exactly as `chat.postMessage` does.
 - Gateway shutdown drains the activity workers after the sessions and inside the same
