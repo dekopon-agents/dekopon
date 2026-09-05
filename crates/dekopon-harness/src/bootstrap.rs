@@ -257,6 +257,13 @@ recording only and never permits live execution.\n";
 pub struct CapabilitySnapshot {
     capabilities: Vec<CapabilityMetadata>,
     command_words: Vec<String>,
+    /// This document's digest, computed at most once for the life of the snapshot.
+    ///
+    /// A validated snapshot never changes, and both the engine's checkpoint surface and the
+    /// gateway's conversation key ask for the fingerprint of the same one, so the serialization
+    /// behind it happens once per message rather than once per asker.
+    #[serde(skip)]
+    fingerprint: std::sync::OnceLock<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,7 +285,13 @@ struct BootstrapDocument {
 impl CapabilitySnapshot {
     /// Exact bounded metadata commitment for invalidation, never a grant or a model cache key.
     pub fn fingerprint(&self) -> String {
-        crate::history::digest(&serde_json::to_vec(self).expect("validated metadata serializes"))
+        self.fingerprint
+            .get_or_init(|| {
+                crate::history::digest(
+                    &serde_json::to_vec(self).expect("validated metadata serializes"),
+                )
+            })
+            .clone()
     }
 
     /// An explicitly empty surface, for a runtime with no live providers or recorded metadata.
@@ -287,6 +300,7 @@ impl CapabilitySnapshot {
         Self {
             capabilities: Vec::new(),
             command_words: Vec::new(),
+            fingerprint: std::sync::OnceLock::new(),
         }
     }
 
@@ -332,6 +346,7 @@ impl CapabilitySnapshot {
         Self {
             capabilities,
             command_words: invoker.command_words(),
+            fingerprint: std::sync::OnceLock::new(),
         }
         .validate()
     }
@@ -426,6 +441,7 @@ impl CapabilitySnapshot {
                     Self {
                         capabilities: document.capabilities,
                         command_words: document.command_words,
+                        fingerprint: std::sync::OnceLock::new(),
                     }
                     .validate()?,
                 );
@@ -475,6 +491,13 @@ fn validate_ids<'a>(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// JSON bytes produced while bounding metadata, so a test can pin that reading a surface costs
+    /// one encoding per capability rather than one of everything read so far, per capability.
+    pub(crate) static ENCODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn bounded_json(value: &impl Serialize, maximum: usize) -> Result<String, BootstrapError> {
     struct BoundedWriter {
         bytes: Vec<u8>,
@@ -488,6 +511,8 @@ fn bounded_json(value: &impl Serialize, maximum: usize) -> Result<String, Bootst
                 return Err(io::Error::other("bootstrap metadata byte bound exceeded"));
             }
             self.bytes.extend_from_slice(bytes);
+            #[cfg(test)]
+            ENCODED_BYTES.with(|count| count.set(count.get() + bytes.len()));
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -740,6 +765,79 @@ mod tests {
         let listed = runtime.run_script("cap --list", 3);
         assert!(!listed.output.contains("private.hidden"));
         assert_eq!(runtime.invoker.invoked.load(Ordering::SeqCst), 0);
+    }
+
+    /// The engine uses the snapshot the host hands it, and describes nothing a second time.
+    ///
+    /// A gateway builds this projection once per message — its broker leg validated one at connect
+    /// — and hands it over; the engine building its own would describe, serialize and sort every
+    /// granted capability again for an identical document.
+    #[test]
+    fn a_prebuilt_capability_snapshot_is_the_one_the_prompt_carries() {
+        let prebuilt = CapabilitySnapshot::from_invoker(&Surface::new(&["probe.prebuilt"]))
+            .expect("the host's snapshot");
+        let model = Model::default();
+        let runtime = ShellRuntime {
+            invoker: Surface::new(&["probe.a", "probe.z"]),
+            limits: Limits::default(),
+            curl_capability: None,
+        };
+        let mut history = History::default();
+        SessionEngine::new(&model, &runtime)
+            .run(
+                SessionBootstrap::new(
+                    "question",
+                    PromptLimits {
+                        max_steps: 2,
+                        max_capability_calls: 3,
+                    },
+                    "selected-model",
+                )
+                .with_capability_snapshot(&prebuilt),
+                &mut history,
+            )
+            .expect("session succeeds");
+        assert!(
+            runtime
+                .invoker
+                .described
+                .lock()
+                .expect("described lock")
+                .is_empty(),
+            "the runtime was not asked to describe its own surface a second time"
+        );
+        let requests = model.requests.lock().expect("requests lock");
+        let context = requests[0][0].content().expect("bootstrap text");
+        let document: Value = serde_json::from_str(
+            context
+                .strip_prefix(BOOTSTRAP_PREFIX)
+                .expect("bootstrap prefix"),
+        )
+        .expect("bootstrap JSON");
+        assert_eq!(document["capabilities"][0]["id"], "probe.prebuilt");
+        assert_eq!(document["capabilities"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// Reading a surface encodes each capability once, not everything read so far per capability.
+    ///
+    /// The bound used to re-encode the accumulated vector on every iteration, so a surface of N
+    /// capabilities cost O(N²) bytes of JSON before the session had asked a model anything.
+    #[test]
+    fn reading_a_surface_encodes_each_capability_once() {
+        let ids = (0..40)
+            .map(|index| format!("probe.c{index:02}"))
+            .collect::<Vec<_>>();
+        let surface = Surface::new(&ids.iter().map(String::as_str).collect::<Vec<_>>());
+        ENCODED_BYTES.with(|count| count.set(0));
+        let snapshot = CapabilitySnapshot::from_invoker(&surface).expect("snapshot");
+        let encoded = ENCODED_BYTES.with(std::cell::Cell::get);
+        let document = serde_json::to_vec(&snapshot).expect("snapshot serializes");
+        assert!(
+            encoded < 4 * document.len(),
+            "{} capabilities encoded {encoded} bytes for a {}-byte document",
+            ids.len(),
+            document.len()
+        );
     }
 
     #[test]

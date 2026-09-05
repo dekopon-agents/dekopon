@@ -585,7 +585,8 @@ fn persist_terminal(
         c.finalized = true;
         c.position = crate::checkpoint::Position::Finalized;
         c.record.delivery = delivery.clone();
-        store.compare_and_save(&lease, c.revision, &c)
+        let measured = c.measure()?;
+        store.compare_and_save(&lease, c.revision, &c, measured)
     })();
     store.release(&tracker.job, &lease, result.is_err());
     result.map(|_| ())

@@ -147,8 +147,11 @@ impl OpenObserveClient {
                 "trace identifier {trace_id:?} must be 1-128 letters, digits, '-', '_', or '.'"
             )));
         }
+        // Ordered for the same reason the accounting query is: a session's records can exceed the
+        // page cap, and an unordered scan then truncates to an arbitrary subset. Oldest first, so
+        // what a truncated fetch keeps is the start of the session rather than a random slice.
         Ok(format!(
-            "SELECT * FROM \"{}\" WHERE trace_id = '{trace_id}'",
+            "SELECT * FROM \"{}\" WHERE trace_id = '{trace_id}' ORDER BY _timestamp ASC",
             self.stream
         ))
     }
@@ -294,7 +297,8 @@ mod tests {
             client
                 .trace_sql("4bf92f3577b34da6a3ce929d0e0e4736")
                 .expect("valid trace"),
-            "SELECT * FROM \"dekopon\" WHERE trace_id = '4bf92f3577b34da6a3ce929d0e0e4736'"
+            "SELECT * FROM \"dekopon\" WHERE trace_id = '4bf92f3577b34da6a3ce929d0e0e4736' \
+             ORDER BY _timestamp ASC"
         );
         assert!(
             client

@@ -255,6 +255,7 @@ impl CheckpointStore for FailAfterObservation {
         lease: &str,
         expected: u64,
         c: &Checkpoint,
+        measured: usize,
     ) -> Result<SaveReceipt, CheckpointError> {
         if c.state
             .accounting
@@ -264,7 +265,7 @@ impl CheckpointStore for FailAfterObservation {
         {
             Err(CheckpointError::Conflict)
         } else {
-            self.0.compare_and_save(lease, expected, c)
+            self.0.compare_and_save(lease, expected, c, measured)
         }
     }
 }
@@ -476,6 +477,13 @@ fn exported_calls_equal_tracker_totals_across_models_failures_images_and_missing
             Ok(())
         }
     }
+    // This test needs the JSON *shape* a collector receives, not `Record`, so it scopes its own
+    // `fmt().json()` dispatcher. That is safe only behind the permanent process-global subscriber:
+    // callsite interest is cached per process, and its `Interest::always()` for workspace targets
+    // is what stops a sibling test in this 180-test binary from caching `never` first and leaving
+    // the JSON sink empty under parallel load. Installing it here rather than relying on the
+    // sibling that happens to run earlier is the difference between safe and incidentally safe.
+    dekopon_test_support::CaptureLayer::install_global();
     let known = [Some(100), Some(60), Some(20), Some(10), Some(120)];
     for missing in [false, true] {
         let bytes = Arc::new(Mutex::new(Vec::new()));

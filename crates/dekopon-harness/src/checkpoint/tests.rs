@@ -282,13 +282,14 @@ impl CheckpointStore for FailingStore {
         lease: &str,
         revision: u64,
         c: &Checkpoint,
+        measured: usize,
     ) -> Result<SaveReceipt, CheckpointError> {
         if self.failed.load(Ordering::SeqCst)
             || (self.fail_before_dispatch && c.position == Position::DispatchPending)
         {
             Err(CheckpointError::Conflict)
         } else {
-            self.inner.compare_and_save(lease, revision, c)
+            self.inner.compare_and_save(lease, revision, c, measured)
         }
     }
     fn release(&self, job: &str, lease: &str, fenced: bool) {
@@ -353,7 +354,12 @@ fn concurrent_leases_reach_the_job_ceiling_without_destroying_stored_checkpoints
     let resumable = stored.record.job.clone();
     let lease = store.acquire(&resumable, true).expect("fixture lease");
     store
-        .compare_and_save(&lease, 0, &stored)
+        .compare_and_save(
+            &lease,
+            0,
+            &stored,
+            stored.measure().expect("the fixture encodes"),
+        )
         .expect("fixture checkpoint");
     store.release(&resumable, &lease, false);
 
@@ -369,8 +375,21 @@ fn concurrent_leases_reach_the_job_ceiling_without_destroying_stored_checkpoints
             "lease {index} evicted a dormant snapshot it did not need"
         );
     }
-    // The store now holds MAX_JOBS entries: one dormant snapshot and MAX_JOBS - 1 live leases. A
-    // live session outranks a dormant snapshot, so this one is admitted by evicting exactly it.
+    // The store now holds MAX_JOBS entries: one dormant snapshot and MAX_JOBS - 1 live leases.
+    // Resuming that dormant entry is the 128th lease, within the ceiling: it adds no entry and its
+    // reservation replaces its own stored bytes, so it is admitted rather than refused for a slot
+    // it already occupies — and it evicts nothing on the way in.
+    let resume = store
+        .acquire(&resumable, false)
+        .expect("the 128th lease is inside the ceiling when it is a resume");
+    assert_eq!(
+        store.load(&resumable).map(|c| c.record.job.clone()),
+        Ok(resumable.clone()),
+        "resuming did not destroy the snapshot it was taken for"
+    );
+    store.release(&resumable, &resume, false);
+
+    // A live session outranks a dormant snapshot, so a new job is admitted by evicting exactly it.
     let last = opaque_id();
     let lease = store.acquire(&last, true).expect("the ceiling itself");
     live.push((last, lease));
@@ -509,7 +528,12 @@ fn latest_restore_keeps_job_usage_sequences_and_budgets_without_replaying_effect
     let job = saved.record.job.clone();
     let lease = store.acquire(&job, true).expect("fixture lease");
     store
-        .compare_and_save(&lease, 0, &saved)
+        .compare_and_save(
+            &lease,
+            0,
+            &saved,
+            saved.measure().expect("the fixture encodes"),
+        )
         .expect("fixture checkpoint");
     store.release(&job, &lease, false);
     let model = Model::new([answer()]);
@@ -573,11 +597,21 @@ fn checkpoint_version_scope_capacity_cas_and_exclusive_live_lease_fail_explicitl
         Err(CheckpointError::Active)
     );
     let receipt = store
-        .compare_and_save(&lease, 0, &saved)
+        .compare_and_save(
+            &lease,
+            0,
+            &saved,
+            saved.measure().expect("the fixture encodes"),
+        )
         .expect("first save");
     assert_eq!(receipt.revision, 1);
     assert_eq!(
-        store.compare_and_save(&lease, 0, &saved),
+        store.compare_and_save(
+            &lease,
+            0,
+            &saved,
+            saved.measure().expect("the fixture encodes")
+        ),
         Err(CheckpointError::Conflict)
     );
     let mut active = vec![(saved.record.job, lease)];
@@ -885,7 +919,14 @@ fn resume_uses_saved_history_once_not_the_callers_empty_seed() {
     saved.history.record(prior);
     let job = saved.record.job.clone();
     let lease = store.acquire(&job, true).unwrap();
-    store.compare_and_save(&lease, 0, &saved).unwrap();
+    store
+        .compare_and_save(
+            &lease,
+            0,
+            &saved,
+            saved.measure().expect("the fixture encodes"),
+        )
+        .unwrap();
     store.release(&job, &lease, false);
     SessionEngine::new(&Inspect, &runtime)
         .with_checkpoint_store(store)
@@ -917,4 +958,60 @@ fn unfinished_batch_reusing_a_provider_id_cannot_capture_earlier_success() {
     group.capture_results(&messages);
     assert!(group.results.is_empty());
     assert!(!group.complete());
+}
+
+/// One mutation encodes the snapshot once — the size checks and the save share that encoding.
+///
+/// `update` runs five to eight times per tool call, under the live lock, and used to encode the
+/// whole corpus twice each time: once to bound `record.groups` in a `while` condition and again
+/// inside `validate`. Both bounds are still exact; neither pays for its own traversal.
+#[test]
+fn one_mutation_encodes_the_checkpoint_once() {
+    let store = Arc::new(MemoryCheckpointStore::default());
+    let journal = ExecutionJournal::new(store.clone(), snapshot(), true, None).expect("journal");
+
+    for mutations in 1..4 {
+        ENCODINGS.with(|count| count.set(0));
+        for _ in 0..mutations {
+            journal
+                .update(|c| c.context_revision += 1)
+                .expect("the mutation persists");
+        }
+        assert_eq!(
+            ENCODINGS.with(std::cell::Cell::get),
+            mutations,
+            "{mutations} mutations encode the checkpoint {mutations} times"
+        );
+    }
+}
+
+/// Taking a lease reads cached sizes; it never re-encodes a stored snapshot.
+///
+/// The eviction sum used to `serde_json::to_vec` every stored checkpoint on every step, so a busy
+/// store paid megabytes of JSON per admission before it had done any work at all.
+#[test]
+fn acquiring_a_lease_encodes_no_stored_checkpoint() {
+    let store = MemoryCheckpointStore::default();
+    for _ in 0..8 {
+        let stored = snapshot();
+        let lease = store.acquire(&stored.record.job, true).expect("lease");
+        store
+            .compare_and_save(
+                &lease,
+                0,
+                &stored,
+                stored.measure().expect("the fixture encodes"),
+            )
+            .expect("fixture checkpoint");
+        store.release(&stored.record.job, &lease, false);
+    }
+
+    ENCODINGS.with(|count| count.set(0));
+    let job = opaque_id();
+    store.acquire(&job, true).expect("a ninth lease");
+    assert_eq!(
+        ENCODINGS.with(std::cell::Cell::get),
+        0,
+        "admission reads the sizes the saves recorded"
+    );
 }

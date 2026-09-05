@@ -46,9 +46,11 @@ pub trait ScriptRuntime {
     ///
     /// This is a *disclosure* gate, not an authorization one, and it belongs at the turn
     /// boundaries: before a model request and before a completion is disclosed. Dispatch-time
-    /// authority is the broker's — every `invoke` and every `runCommand` is authorized there under
-    /// the current policy and the live epoch — so running this per capability call bought no
-    /// authority and cost one broker round trip per call.
+    /// authority is the broker's — every `invoke` is authorized there under the current policy and
+    /// the live epoch — so running this per capability call bought no authority and cost one broker
+    /// round trip per call. A command word needs no check of its own for a different reason:
+    /// `runCommand` is deliberately ungated and grants nothing, and the proposal it returns is
+    /// authorized on the `invoke` path.
     fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         Ok(())
     }
@@ -473,28 +475,6 @@ pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
     }
 }
 
-/// The stable kind of one broker-client failure, for the unobserved-run record.
-#[cfg(unix)]
-fn client_error_kind(error: &ClientError) -> &'static str {
-    match error {
-        ClientError::SocketMetadata { .. } => "socket-metadata",
-        ClientError::UnsafeSocket => "unsafe-socket",
-        ClientError::ConnectTimeout => "connect-timeout",
-        ClientError::Connect { .. } => "connect",
-        ClientError::PeerCredentials { .. } => "peer-credentials",
-        ClientError::ServerIdentity { .. } => "server-identity",
-        ClientError::Limits(_) => "limits",
-        ClientError::Protocol { .. } => "protocol",
-        ClientError::Remote { .. } => "remote",
-        ClientError::UnexpectedResponse => "unexpected-response",
-        ClientError::InvalidControl => "invalid-control",
-        ClientError::ControlAttempts => "control-attempts",
-        ClientError::ControlFenced => "control-fenced",
-        ClientError::SurfaceChanged => "surface-changed",
-        ClientError::ControlBinding => "control-binding",
-    }
-}
-
 /// Failure to open a session's broker leg.
 #[cfg(unix)]
 #[derive(Debug, Error)]
@@ -555,6 +535,12 @@ pub struct BrokerLeg {
     /// What cancels a command-word run in flight: [`CancelSignal::never`] until an embedder ties
     /// it to its own session with [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
+    /// The bounded model-facing projection of this leg's surface, built once when the leg was.
+    ///
+    /// Construction validates it anyway, so keeping it costs nothing and saves the embedder a
+    /// second pass that would describe, serialize and sort every granted capability again for a
+    /// projection identical to this one.
+    snapshot: CapabilitySnapshot,
 }
 
 /// One commitment per component of a session surface, so a change names the component it hit.
@@ -753,7 +739,7 @@ impl BrokerLeg {
         );
         let (capabilities, effective_capabilities) = snapshot(available)?;
         let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
-        let leg = Self {
+        let mut leg = Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
@@ -767,8 +753,9 @@ impl BrokerLeg {
             chat_memory,
             surface_epoch,
             cancel: CancelSignal::never(),
+            snapshot: CapabilitySnapshot::empty(),
         };
-        CapabilitySnapshot::from_invoker(&leg)?;
+        leg.snapshot = CapabilitySnapshot::from_invoker(&leg)?;
         Ok(leg)
     }
 
@@ -781,6 +768,16 @@ impl BrokerLeg {
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
         self
+    }
+
+    /// The bounded model-facing projection of this leg's capability surface.
+    ///
+    /// Built and validated when the leg connected, so an embedder that needs the same projection —
+    /// the gateway hands one to the session engine per message — reads it here instead of building
+    /// a second, identical one out of the same descriptions.
+    #[must_use]
+    pub fn capability_snapshot(&self) -> &CapabilitySnapshot {
+        &self.snapshot
     }
 
     /// Returns this session's trusted, subject-specific effective capability classification.
@@ -942,7 +939,9 @@ impl CapabilityInvoker for BrokerLeg {
         let outcome = self
             .runtime
             .block_on(ProcessRun::execute(operation, |outcome| {
-                report_unobserved_command_run("broker", outcome, client_error_kind);
+                report_unobserved_command_run("broker", outcome, |error: &ClientError| {
+                    error.kind().as_str()
+                });
             }));
         Some(match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
@@ -1740,6 +1739,7 @@ mod tests {
                     &"fixture-epoch".parse().expect("fixture epoch"),
                 ),
                 cancel: CancelSignal::never(),
+                snapshot: crate::bootstrap::CapabilitySnapshot::empty(),
             }
         }
 
@@ -2290,20 +2290,20 @@ mod tests {
                 max_lookback_turns: 4,
                 prompt_note: "note".to_owned(),
             };
-            let words = vec!["probe".to_owned()];
+            let words = vec!["probe".to_owned(), "echo".to_owned()];
             let base = crate::runtime::surface_digest(
-                &[available(CAPABILITY)],
+                &[available(CAPABILITY), available("echo.echo")],
                 &words,
                 Some(&memory),
                 &epoch(),
             );
 
-            // Same surface, capabilities listed in the other order: not a change. The two indexed
-            // views are order-independent, so reporting a reordered answer as a fence would stop
-            // sessions for nothing.
+            // The same surface with the capabilities and the command words listed in the other
+            // order: not a change. Both indexed views and the word list are order-independent, so
+            // reporting a reordered answer as a fence would stop live sessions for nothing.
             let reordered = crate::runtime::surface_digest(
-                &[available(CAPABILITY)],
-                &words,
+                &[available("echo.echo"), available(CAPABILITY)],
+                &["echo".to_owned(), "probe".to_owned(), "echo".to_owned()],
                 Some(&memory),
                 &epoch(),
             );
@@ -2311,8 +2311,11 @@ mod tests {
 
             let mut redescribed = available(CAPABILITY);
             redescribed.capability.description = "Fetches something else".to_owned();
+            let redescribed = [redescribed, available("echo.echo")];
             let mut reclassified = available(CAPABILITY);
             reclassified.provider = "other-probe".parse().expect("provider fixture");
+            let reclassified = [reclassified, available("echo.echo")];
+            let unchanged = [available(CAPABILITY), available("echo.echo")];
             let quieter = ChatMemorySurface {
                 max_lookback_turns: 2,
                 prompt_note: memory.prompt_note.clone(),
@@ -2320,7 +2323,7 @@ mod tests {
             for (fresh, expected) in [
                 (
                     crate::runtime::surface_digest(
-                        &[available(CAPABILITY)],
+                        &unchanged,
                         &words,
                         Some(&memory),
                         &"restarted-epoch".parse().expect("fixture epoch"),
@@ -2328,34 +2331,19 @@ mod tests {
                     SurfaceChange::Epoch,
                 ),
                 (
-                    crate::runtime::surface_digest(&[redescribed], &words, Some(&memory), &epoch()),
+                    crate::runtime::surface_digest(&redescribed, &words, Some(&memory), &epoch()),
                     SurfaceChange::Descriptions,
                 ),
                 (
-                    crate::runtime::surface_digest(
-                        &[reclassified],
-                        &words,
-                        Some(&memory),
-                        &epoch(),
-                    ),
+                    crate::runtime::surface_digest(&reclassified, &words, Some(&memory), &epoch()),
                     SurfaceChange::EffectiveViews,
                 ),
                 (
-                    crate::runtime::surface_digest(
-                        &[available(CAPABILITY)],
-                        &[],
-                        Some(&memory),
-                        &epoch(),
-                    ),
+                    crate::runtime::surface_digest(&unchanged, &[], Some(&memory), &epoch()),
                     SurfaceChange::CommandWords,
                 ),
                 (
-                    crate::runtime::surface_digest(
-                        &[available(CAPABILITY)],
-                        &words,
-                        Some(&quieter),
-                        &epoch(),
-                    ),
+                    crate::runtime::surface_digest(&unchanged, &words, Some(&quieter), &epoch()),
                     SurfaceChange::ChatMemory,
                 ),
             ] {

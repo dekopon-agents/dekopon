@@ -4003,4 +4003,23 @@ mod tests {
             "no skill tool either: the default session is exactly the pre-skills session"
         );
     }
+
+    /// A ledger refusal that reached the model client is reported as `accounting`, never `model`.
+    ///
+    /// `model` tells an operator the endpoint misbehaved and that a retry is reasonable; a fenced
+    /// job is permanent and this process caused it. The distinction lives in one arm above a
+    /// catch-all, so nothing but this assertion keeps it there.
+    #[test]
+    fn a_fenced_ledger_is_an_accounting_failure_and_not_a_model_one() {
+        let fenced = PromptError::from(ModelError::Accounting(
+            dekopon_model::usage::AccountingError("job fenced"),
+        ));
+        assert_eq!(fenced.telemetry_kind(), "accounting", "{fenced}");
+        assert!(
+            fenced.to_string().contains("job fenced"),
+            "the cause travels with it: {fenced}"
+        );
+        let transport = PromptError::from(ModelError::Request("connection reset".to_owned()));
+        assert_eq!(transport.telemetry_kind(), "model");
+    }
 }

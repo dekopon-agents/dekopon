@@ -1923,8 +1923,6 @@ mod tests {
     fn a_secret_file_that_cannot_be_opened_still_names_its_errno() {
         use std::fs;
 
-        use tracing_subscriber::{layer::SubscriberExt as _, registry};
-
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1940,12 +1938,13 @@ mod tests {
             .raw_os_error()
             .expect("an unreadable file fails with an errno");
 
-        let capture = dekopon_test_support::CaptureLayer::workspace();
-        let refused = tracing::subscriber::with_default(registry().with(capture.clone()), || {
-            runtime
-                .block_on(super::read_private_file(&path, uid(), 4096))
-                .expect_err("an unreadable secret file is refused")
-        });
+        // Through the process-global subscriber, routed to this thread: a scoped dispatcher in a
+        // shared test binary races a sibling's first registration of the same callsite, and the
+        // event is then cached `never` and this test fails only under parallel load.
+        let capture = dekopon_test_support::CaptureLayer::install();
+        let refused = runtime
+            .block_on(super::read_private_file(&path, uid(), 4096))
+            .expect_err("an unreadable secret file is refused");
 
         assert!(matches!(refused, super::SourceError::Io), "{refused:?}");
         let events = capture.events_text();

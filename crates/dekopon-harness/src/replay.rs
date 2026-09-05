@@ -335,8 +335,13 @@ impl RecordedSession {
     /// answered turns are then the honest count.
     fn model_turns(&self) -> Option<u32> {
         let count = match &self.calls {
-            Some(calls) if calls.is_empty() => return None,
-            Some(calls) => calls.iter().filter(|call| call.kind == "chat").count(),
+            // A call set naming no chat call at all — empty, or image calls only, which is what a
+            // truncated or hand-edited recording produces — says nothing about how many chat calls
+            // this session made. Zero there would read as free inference.
+            Some(calls) => match calls.iter().filter(|call| call.kind == "chat").count() {
+                0 => return None,
+                chat => chat,
+            },
             None if self.turns.is_empty() => return None,
             None => self.turns.len(),
         };
@@ -1701,6 +1706,21 @@ mod tests {
             emptied.model_turns(),
             None,
             "an empty call list is unknown, never zero"
+        );
+
+        // A list that names only image calls is the same kind of unknown: a truncated page set or
+        // a hand-edited recording can produce one, and "0 turn(s)" there reads as free inference.
+        let mut image_only = recorded.clone();
+        image_only.calls = Some(vec![super::RecordedAccountingCall {
+            job: "job".to_owned(),
+            sequence: 1,
+            kind: "image".to_owned(),
+            usage: super::RecordedUsage::default(),
+        }]);
+        assert_eq!(
+            image_only.model_turns(),
+            None,
+            "a call set naming no chat call says nothing about chat calls"
         );
         let report = replay(&ScriptedModel::new([]), &emptied, inputs(None));
         assert_eq!(report.recorded.model_turns, None);

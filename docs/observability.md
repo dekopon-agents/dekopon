@@ -81,7 +81,8 @@ fits. Partial known sums remain available in the typed totals, not mislabeled co
 
 Usage is observed independently before tool/content/image validation, including failed/incomplete
 SSE, JSON usage preceding a later decode/read error and JSON error bodies. Identical observations
-are idempotent; conflicting reports fence further inference and preserve the first observed facts.
+are idempotent; a terminal report supersedes an interim one; and two reports of equal standing that
+disagree leave only the fields they disagree about unknown, fencing neither the call nor the job.
 A later Stop, tool error, persistence failure or reply failure cannot erase observed tokens. Live
 Stop drains synchronous bounded inference before terminal accounting. Dropping the last finalizer
 after workers settle records abandoned/unknown delivery; process death can leave an unterminated,
@@ -116,8 +117,11 @@ Method/authority/status are absent when unknown, and paths, queries, headers and
 `ModelUsageReport` is a best-effort delta projection of the harness tracker, not another accumulator.
 Its historical `modelCalls`/`unreportedCalls` fields count attempt observations (including explicitly
 unknown adapter operations), including failed and cancelled calls and images. A checkpointed report
-cursor prevents reporting old observations again on resume. Invalid/overflowed deltas are refused
-rather than converted to successful counters. A full/closed queue or failed export loses UI data,
+cursor prevents reporting old observations again on resume, and it advances only after every field
+of the delta has been decided. A field the tracker cannot trust — an untrusted or overflowed known
+sum — is reported as unreported calls for that field rather than dropping the whole delta, so one
+bad field never converts the other four into silence; nothing else is refused here, and the broker
+refuses only a structurally malformed report. A full/closed queue or failed export loses UI data,
 never spend in the tracker. The broker UI remains process-local, self-reported, non-authoritative,
 and resets on restart; it is not billing reconciliation or durable authorization audit.
 
@@ -311,9 +315,12 @@ back to its unjittered step, which costs a fleet its de-synchronization rather t
 In-flight presentation remains metadata-minimal. `gateway_activity_failed` is debug-level and carries
 only `operation` plus a stable category — for a lease that is `busy` (a live generation holds the
 thread), `quarantined` (an uncertain native write still does), or `capacity` (the 128-lease ceiling).
-The one exception is warn level: `operation="quarantine"` with `cause_type="activity-quarantine-full"`,
+Two exceptions are warn level: `operation="quarantine"` with `cause_type="activity-quarantine-full"`,
 emitted once when the separately counted 128-entry quarantine fills rather than once per refused
-lease. A permanent Slack installation fallback
+lease, and `operation="cleanup"` with `cause_type="activity-cleanup-abandoned"` and an `abandoned`
+count, emitted once when the shutdown grace expires before the progress removals finish — the count
+is how many ⌛ messages that shutdown left in their channels, which is a different operator problem
+from the `gateway_sessions_abandoned` that reports sessions nobody heard back from. A permanent Slack installation fallback
 emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.

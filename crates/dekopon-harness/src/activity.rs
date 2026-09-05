@@ -24,9 +24,12 @@ pub const MAX_ACTIVITY_LABELS: usize = 256;
 /// replaced by the default. A configuration gate asks here rather than counting raw bytes, so the
 /// bound it enforces is the bound the renderer enforces — one definition, counted the same way.
 pub fn label_is_renderable(raw: &str) -> bool {
+    // Asking the renderer rather than re-deriving its arithmetic: measuring the stripped text here
+    // while `sanitized` bounded it before trimming let surrounding whitespace spend budget, so a
+    // label this gate accepted came back from the renderer a character or two short.
     let stripped = strip(raw);
     let stripped = stripped.trim();
-    !stripped.is_empty() && stripped.len() <= MAX_ACTIVITY_LABEL_BYTES
+    !stripped.is_empty() && ActivityLabel::sanitized(raw).as_str() == stripped
 }
 
 /// Removes control and Unicode directional/format characters, leaving the bound to the caller.
@@ -41,7 +44,10 @@ impl ActivityLabel {
     /// Strip controls and Unicode directional/format controls, then bound on UTF-8 boundaries.
     pub fn sanitized(text: &str) -> Self {
         let mut label = String::new();
-        for c in strip(text).chars() {
+        // Trimmed before bounding, not after: surrounding whitespace is not content, and letting
+        // it consume the budget truncated the words this label exists to show.
+        let stripped = strip(text);
+        for c in stripped.trim().chars() {
             if label.len() + c.len_utf8() > MAX_ACTIVITY_LABEL_BYTES {
                 break;
             }

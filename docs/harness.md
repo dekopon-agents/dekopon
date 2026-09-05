@@ -55,9 +55,14 @@ writing back cloned windows. Refusal, idle/capacity eviction or changed full met
 fences late appends and rotates cache keys, including A→B→A. `oneShot` imports no previous jobs.
 These comparisons do not cache authorization; every provider invocation still reaches the broker.
 
-Seeding a session touches the conversation, so the idle timeout runs from the last *message* and
-the conversation a session is answering is never that session's or a concurrent one's eviction
-victim. Both ceilings are read from running byte totals maintained where turns are appended and
+Seeding a session touches the conversation, so the idle timeout runs from the last *message*, and
+the conversation a session is answering is never that session's own eviction victim. A conversation
+a *concurrent* session is still answering under is passed over too: the store records the
+outstanding generation, and eviction takes a conversation nobody is answering first, so one
+session's arrival does not rotate another's cache key and turn its delivered answer into a refused
+append. Only when every candidate has a session in flight does the least recently touched go
+anyway — the ceiling is a bound before it is a courtesy — and a generation that was never committed
+stops protecting its conversation once it is older than the idle timeout. Both ceilings are read from running byte totals maintained where turns are appended and
 dropped — `History::bytes()` and the store's own total are O(1) — so neither a lookup nor an
 eviction step ever encodes the retained corpus. `HistoryLimits::MAX_TURNS` and
 `HistoryLimits::MAX_BYTES` are the hard clamps any configured window is reduced to, published so a
@@ -77,7 +82,10 @@ the surplus into capacity refusals under load. A store already holding `MAX_JOBS
 the next one before evicting anything, so a refusal never destroys the snapshots the other
 in-flight messages still need. Capacity failure precedes work, and the refusal names the ceiling.
 Each stored snapshot's encoded size is measured once by the save that stored it, so eviction reads
-cached sizes rather than re-encoding every stored checkpoint on every step. Saves surround dispatch
+cached sizes rather than re-encoding every stored checkpoint on every step. A mutation encodes the
+snapshot exactly once as well: the model-facing group ceiling, the per-checkpoint byte ceiling and
+the save all share that single measurement, because a mutation runs several times per tool call and
+holds the live lock while it does. Saves surround dispatch
 observations, transitions and terminalization; failed persistence fences old copies and retains
 live observations.
 
@@ -122,10 +130,13 @@ Posts may notify or remain platform-retained after failed removal. See
 
 Freshness is a disclosure gate, not an authorization one. It runs at exactly two places in a turn:
 before each model request, and after a completion and before any of it is disclosed. It does not run
-per capability invocation or per provider command word, because the broker authorizes every `invoke`
-and `runCommand` at dispatch against its live policy and epoch — a client-side refetch immediately in
-front of one decides nothing the broker is not about to decide, and cost a full round trip per
-capability a script drove. A failed check names which part of the surface moved: the epoch, the
+per capability invocation, because the broker authorizes every `invoke` at dispatch against its live
+policy and epoch — a client-side refetch immediately in front of one decides nothing the broker is
+not about to decide, and cost a full round trip per capability a script drove. It does not run per
+provider command word either, for a different reason: `runCommand` is deliberately ungated and
+grants nothing, so there is no authorization for a freshness check to anticipate — the broker runs
+the declaring component's import-free argv handling and authorizes only the proposal that comes
+back, on the `invoke` path. A failed check names which part of the surface moved: the epoch, the
 descriptions, the effective views, the command words, or the chat-memory surface. The comparison is
 five per-component digests taken once when the session's broker leg is built, so a check costs the
 round trip and nothing else. Changed or uncertain

@@ -33,6 +33,8 @@ const MAX_STORE_BYTES: usize = MAX_JOBS * MAX_CHECKPOINT_BYTES;
 /// time. The count is the same one the encoder would have written, so there is still exactly one
 /// definition of "how big is this".
 fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
+    #[cfg(test)]
+    ENCODINGS.with(|count| count.set(count.get() + 1));
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -49,6 +51,15 @@ fn encoded_len(value: &impl Serialize) -> Result<usize, CheckpointError> {
         CheckpointError::Invalid
     })?;
     Ok(counter.0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many JSON encodings this thread has performed, so a test can pin the count per mutation.
+    ///
+    /// Per thread rather than per process: the count is only meaningful for one sequence of calls,
+    /// and a process-wide counter would make every test here observe its siblings' work.
+    pub(crate) static ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn opaque_id() -> String {
@@ -121,7 +132,8 @@ pub struct Checkpoint {
     pub finalized: bool,
 }
 impl Checkpoint {
-    fn validate(&self) -> Result<usize, CheckpointError> {
+    /// Everything a snapshot must satisfy that costs no encoding.
+    fn validate_fields(&self) -> Result<(), CheckpointError> {
         if self.version != CHECKPOINT_VERSION
             || self.record.job.is_empty()
             || self.scope.len() > 256
@@ -169,11 +181,27 @@ impl Checkpoint {
         {
             return Err(CheckpointError::Invalid);
         }
-        let bytes = encoded_len(self)?;
+        Ok(())
+    }
+    /// The same checks, against a length the caller already measured from *this* document.
+    ///
+    /// The encoding is the expensive half of validation and a mutation performs exactly one, so
+    /// the size check and the save share it rather than each paying for their own.
+    fn validate_measured(&self, bytes: usize) -> Result<usize, CheckpointError> {
+        self.validate_fields()?;
         if bytes > MAX_CHECKPOINT_BYTES {
             return Err(CheckpointError::Capacity);
         }
         Ok(bytes)
+    }
+    /// This snapshot's JSON-encoded length, for a caller that is about to save it.
+    pub(crate) fn measure(&self) -> Result<usize, CheckpointError> {
+        encoded_len(self)
+    }
+    /// Validates a snapshot this caller has not measured, measuring it here.
+    fn validate(&self) -> Result<usize, CheckpointError> {
+        let bytes = encoded_len(self)?;
+        self.validate_measured(bytes)
     }
     pub fn validate_resume(&self, scope: &str, surface: &str) -> Result<(), CheckpointError> {
         self.validate()?;
@@ -214,11 +242,17 @@ pub struct SaveReceipt {
 pub trait CheckpointStore: Send + Sync {
     fn load(&self, job: &str) -> Result<Checkpoint, CheckpointError>;
     fn acquire(&self, job: &str, new: bool) -> Result<String, CheckpointError>;
+    /// Saves `checkpoint` when `expected` is still its stored revision.
+    ///
+    /// `measured` is the JSON-encoded length of *this* document, taken once by the caller that
+    /// built it: a mutation encodes the snapshot exactly once, and a store that re-encoded it to
+    /// check its own ceiling would make every write cost the corpus twice under the live lock.
     fn compare_and_save(
         &self,
         lease: &str,
         expected: u64,
         checkpoint: &Checkpoint,
+        measured: usize,
     ) -> Result<SaveReceipt, CheckpointError>;
     fn release(&self, job: &str, lease: &str, fenced: bool);
 }
@@ -281,19 +315,25 @@ impl CheckpointStore for MemoryCheckpointStore {
         if leased >= MAX_JOBS {
             return Err(CheckpointError::Capacity);
         }
-        // Reserve the entire per-job ceiling before work; active jobs cannot be evicted.
+        // Reserve the entire per-job ceiling before work; active jobs cannot be evicted. Both
+        // conditions describe the store *after* this acquire: resuming an entry the store already
+        // holds adds no entry, and its reservation replaces its stored bytes rather than adding to
+        // them, so the 128th lease is admitted rather than refused for a slot it already occupies.
+        let resuming = entries.contains_key(job);
+        let addition = usize::from(!resuming);
         loop {
-            let used: usize = entries
-                .values()
-                .map(|e| {
-                    if e.lease.is_some() {
+            let reserved: usize = entries
+                .iter()
+                .map(|(id, e)| {
+                    if id.as_str() == job || e.lease.is_some() {
                         MAX_CHECKPOINT_BYTES
                     } else {
                         e.bytes
                     }
                 })
-                .sum();
-            if entries.len() < MAX_JOBS && used + MAX_CHECKPOINT_BYTES <= MAX_STORE_BYTES {
+                .sum::<usize>()
+                + addition * MAX_CHECKPOINT_BYTES;
+            if entries.len() + addition <= MAX_JOBS && reserved <= MAX_STORE_BYTES {
                 break;
             }
             let oldest = entries
@@ -321,8 +361,9 @@ impl CheckpointStore for MemoryCheckpointStore {
         lease: &str,
         expected: u64,
         checkpoint: &Checkpoint,
+        measured: usize,
     ) -> Result<SaveReceipt, CheckpointError> {
-        let bytes = checkpoint.validate()?;
+        let bytes = checkpoint.validate_measured(measured)?;
         let mut entries = self.entries.lock().map_err(|error| {
             tracing::error!(cause_type = "checkpoint-lock", %error);
             CheckpointError::Poisoned
@@ -450,30 +491,43 @@ impl<'a> ExecutionJournal<'a> {
         })?;
         f(&mut live.checkpoint); // preserve newly observed facts even when already fenced
         live.checkpoint.state.accounting = self.accounting.snapshot();
+        // One encoding per mutation, shared by the group bound and the save: `update` runs several
+        // times per tool call, and each encoding is the whole corpus under the live lock.
+        let mut measured = encoded_len(&live.checkpoint)?;
         // Independently bound model-facing groups without erasing the execution ledger. Keep a
         // labelled position marker for an omitted batch rather than orphaning its results. The
-        // bound is measured, never materialized: `update` runs several times per tool call.
-        while encoded_len(&live.checkpoint.record.groups)? > crate::context::MAX_GROUP_BYTES {
-            let Some(group) = live
-                .checkpoint
-                .record
-                .groups
-                .iter_mut()
-                .find(|g| !g.omitted)
-            else {
-                break;
-            };
-            group.calls.clear();
-            group.results.clear();
-            group.omitted = true;
+        // groups are part of this document, so a snapshot inside the group ceiling has groups
+        // inside it too and needs no measurement of its own; only a larger one pays for the loop.
+        if measured > crate::context::MAX_GROUP_BYTES {
+            let mut trimmed = false;
+            while encoded_len(&live.checkpoint.record.groups)? > crate::context::MAX_GROUP_BYTES {
+                let Some(group) = live
+                    .checkpoint
+                    .record
+                    .groups
+                    .iter_mut()
+                    .find(|g| !g.omitted)
+                else {
+                    break;
+                };
+                group.calls.clear();
+                group.results.clear();
+                group.omitted = true;
+                trimmed = true;
+            }
+            if trimmed {
+                measured = encoded_len(&live.checkpoint)?;
+            }
         }
         if let Some(error) = live.error {
             return Err(error);
         }
-        match self
-            .store
-            .compare_and_save(&self.lease, live.checkpoint.revision, &live.checkpoint)
-        {
+        match self.store.compare_and_save(
+            &self.lease,
+            live.checkpoint.revision,
+            &live.checkpoint,
+            measured,
+        ) {
             Ok(receipt) => {
                 live.checkpoint.revision = receipt.revision;
                 Ok(())

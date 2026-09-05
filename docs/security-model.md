@@ -198,11 +198,13 @@ and fresh per-invocation authorization is still mandatory.
 
 This client-side check is a **disclosure** gate, not an authorization one, and it runs at the turn
 boundaries: before each model request, and again after a completion and before any of it is
-disclosed. It deliberately does not run per capability invocation or per provider command word. The
-broker is the authority at dispatch time — every `invoke` and every `runCommand` is authorized there
-against the live policy and the live epoch a moment later — so a client-side refetch immediately in
-front of one decided nothing the broker was not about to decide, and cost a full round trip for each
-capability a script drove. What the check reports is *which* part of the surface moved: the epoch,
+disclosed. It deliberately does not run per capability invocation: the broker is the
+authority at dispatch time — every `invoke` is authorized there against the live policy and the live
+epoch a moment later — so a client-side refetch immediately in front of one decided nothing the
+broker was not about to decide, and cost a full round trip for each capability a script drove. Nor
+does it run per provider command word, on the separate ground stated below: `runCommand` is
+deliberately ungated and carries no capability to decide on, so the run is a pure import-free guest
+producing text or a proposal, and it is the proposal that is authorized, on the `invoke` path. What the check reports is *which* part of the surface moved: the epoch,
 the descriptions, the effective views, the command words, or the chat-memory surface. A restarted
 broker, a redeployed provider, and a narrowed policy are different incidents and no longer share one
 error string. The comparison itself is a per-component digest taken once when the session's broker

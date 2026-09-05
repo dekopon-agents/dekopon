@@ -2280,7 +2280,10 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
 
         let (_headers, second, second_stream) = read_http_request(&listener);
         let sql = second["query"]["sql"].as_str().expect("SQL is a string");
-        assert_eq!(sql, "SELECT * FROM \"dekopon\" WHERE trace_id = 'newer'");
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"dekopon\" WHERE trace_id = 'newer' ORDER BY _timestamp ASC"
+        );
         let call = json!([{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]);
         let delta = json!([
             {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]},
@@ -2694,7 +2697,7 @@ fn session_show_and_replay_preserve_exported_portable_history_and_full_revisions
         let (_, request, stream) = read_http_request(&receiver);
         assert_eq!(
             request["query"]["sql"],
-            "SELECT * FROM \"dekopon\" WHERE trace_id = 'portable'"
+            "SELECT * FROM \"dekopon\" WHERE trace_id = 'portable' ORDER BY _timestamp ASC"
         );
         respond(stream, &json!({"hits":records}));
     });

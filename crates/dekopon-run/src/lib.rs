@@ -1985,6 +1985,40 @@ impl AppError {
 mod tests {
     use std::{fs, time::Duration};
 
+    /// An unknown turn count renders as `-`, never as `0`.
+    ///
+    /// The JSON half of this is pinned in the harness; the text line is what an operator actually
+    /// reads, and "0 turn(s)" for a recording that never said how many is a claim about spend.
+    #[test]
+    fn an_unknown_recorded_turn_count_renders_as_a_dash() {
+        use dekopon_harness::replay::{ReplayReport, SessionSummary};
+        let unknown = SessionSummary {
+            model_turns: None,
+            ..SessionSummary::default()
+        };
+        let known = SessionSummary {
+            model_turns: Some(2),
+            ..SessionSummary::default()
+        };
+        let text = super::render_replay(&ReplayReport {
+            trace_id: "t1".to_owned(),
+            recorded: unknown,
+            replayed: known,
+            divergence: None,
+            suggestions: Vec::new(),
+            dropped_history_turns: 0,
+            error: None,
+        });
+        assert!(
+            text.contains("recorded: - turn(s)"),
+            "an unknown count is a dash: {text}"
+        );
+        assert!(
+            text.contains("replayed: 2 turn(s)"),
+            "a known count is the number: {text}"
+        );
+    }
+
     use serde_json::json;
 
     #[cfg(unix)]

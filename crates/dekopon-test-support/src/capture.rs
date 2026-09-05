@@ -167,6 +167,19 @@ impl CaptureLayer {
         Self::install_with_target_prefix(GLOBAL_TARGET_PREFIX)
     }
 
+    /// Installs the process-global capture subscriber and captures nothing on this thread.
+    ///
+    /// For the test that needs a differently *shaped* record than [`Record`] — JSON out of
+    /// `tracing_subscriber::fmt().json()`, say — and therefore has to scope its own dispatcher.
+    /// A scoped dispatcher is safe only once a permanent global one exists: callsite interest is
+    /// cached per process, and it is this subscriber's `Interest::always()` for workspace targets
+    /// that stops a sibling test from caching `never` while no dispatcher is live and leaving the
+    /// scoped one empty under parallel load. Call this first, then scope; do not rely on some
+    /// other test in the binary having installed it, which is a race decided by test order.
+    pub fn install_global() {
+        install_global_subscriber();
+    }
+
     /// The same, narrowed to callsites whose target begins with `prefix`.
     ///
     /// # Panics
@@ -478,6 +491,42 @@ mod tests {
         tracing::info!(marker = "second", "capture routing fixture");
         assert!(capture.saw("second"));
         assert!(!capture.saw("between"), "{}", capture.events_text());
+    }
+
+    /// `install_global` makes a workspace callsite reachable by a dispatcher scoped after it.
+    ///
+    /// That is the whole contract for a test that needs a differently shaped record and therefore
+    /// scopes its own subscriber: without a permanent global one, the callsite it is about to use
+    /// can already be cached `Interest::never()` and its sink stays empty.
+    #[test]
+    fn a_dispatcher_scoped_after_the_global_install_still_receives_workspace_events() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("scoped sink").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        CaptureLayer::install_global();
+        CaptureLayer::install_global(); // idempotent: one global for the binary, installed once
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(marker = "scoped", "capture routing fixture");
+        });
+        let text = String::from_utf8(bytes.lock().expect("scoped sink").clone())
+            .expect("the scoped sink is UTF-8");
+        assert!(text.contains("\"marker\":\"scoped\""), "{text}");
     }
 
     #[test]

@@ -811,6 +811,7 @@ impl CheckpointStore for FailApplied {
         l: &str,
         e: u64,
         c: &Checkpoint,
+        measured: usize,
     ) -> Result<SaveReceipt, CheckpointError> {
         if c.state
             .transitions
@@ -819,7 +820,7 @@ impl CheckpointStore for FailApplied {
         {
             Err(CheckpointError::Conflict)
         } else {
-            self.0.compare_and_save(l, e, c)
+            self.0.compare_and_save(l, e, c, measured)
         }
     }
     fn release(&self, j: &str, l: &str, f: bool) {

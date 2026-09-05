@@ -179,3 +179,35 @@ fn labels_remove_controls_directional_marks_and_bound_utf8() {
         "Running capability"
     );
 }
+
+/// The configuration gate accepts exactly the labels the renderer keeps whole.
+///
+/// A mirror that accepts what the authority truncates is worse than no mirror: the gate measured
+/// the trimmed text while the renderer bounded the untrimmed one, so two leading spaces bought a
+/// label that passed startup validation and then lost its last two characters in the channel.
+#[test]
+fn the_label_gate_accepts_exactly_what_the_renderer_keeps_whole() {
+    let longest = "a".repeat(MAX_ACTIVITY_LABEL_BYTES);
+    for (raw, rendered) in [
+        (longest.clone(), longest.clone()),
+        (format!("  {longest}  "), longest.clone()),
+        (format!("\u{202e}{longest}"), longest.clone()),
+        (
+            " Reading the shared record ".to_owned(),
+            "Reading the shared record".to_owned(),
+        ),
+    ] {
+        assert!(crate::activity::label_is_renderable(&raw), "{raw:?}");
+        assert_eq!(
+            ActivityLabel::sanitized(&raw).as_str(),
+            rendered,
+            "the gate accepted a label the renderer then truncated: {raw:?}"
+        );
+    }
+    for raw in [format!("{longest}b"), "   ".to_owned(), String::new()] {
+        assert!(
+            !crate::activity::label_is_renderable(&raw),
+            "the gate accepted a label the renderer cannot keep whole: {raw:?}"
+        );
+    }
+}
