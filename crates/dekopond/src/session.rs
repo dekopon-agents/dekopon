@@ -444,6 +444,10 @@ pub(crate) struct CancelAwareInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
+    fn check_freshness(&self) -> Result<(), String> {
+        self.inner.check_freshness()
+    }
+
     fn granted(&self) -> Vec<String> {
         self.inner.granted()
     }
@@ -1062,7 +1066,8 @@ async fn session(
 
     let (outcome, turn, generated_image) = match result {
         Ok(session) => session,
-        Err(_) => {
+        Err(error) => {
+            tracing::error!(event = "gateway_session_failed", category = "session-task", cause = %error);
             if !cancellation.claim_completion() {
                 tracing::info!(event = "gateway_session_cancelled");
                 activity.finish_in_background();
@@ -1070,7 +1075,6 @@ async fn session(
             }
             // The task itself died, so there is no history to trust and nothing to record.
             activity.seal();
-            tracing::error!(event = "gateway_session_failed", category = "session-task");
             let replied = answer(replier, message, FAILURE_REPLY).await;
             activity.finish_in_background();
             return if replied { "failed" } else { "reply-failed" };

@@ -29,6 +29,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod context;
+pub use context::{RecordedContext, RecordedMessage};
+
 use crate::{
     bootstrap::{self, BootstrapError, CapabilitySnapshot, SessionBootstrap},
     history::{History, HistoryLimits},
@@ -55,6 +58,9 @@ pub struct RecordedSession {
     /// Exchanges replayed ahead of the prompt on a persistent route, oldest first.
     #[serde(default)]
     pub history: Vec<RecordedExchange>,
+    /// Portable full/delta request contexts, ordered by model turn. Historical files omit these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<RecordedContext>,
     /// The message this session answered.
     pub prompt: String,
     /// Every model turn, in order.
@@ -254,45 +260,20 @@ fn float(record: &Value, name: &str) -> Option<f64> {
     }
 }
 
-/// One message as the transcript's redacted rendering carries it.
-#[derive(Debug, Deserialize)]
-struct TranscriptMessage {
-    role: String,
-    #[serde(default)]
-    content: Option<TranscriptContent>,
-    #[serde(default)]
-    tool_calls: Vec<TranscriptToolCall>,
-    #[serde(default)]
-    tool_call_id: Option<String>,
-}
-
-/// Text, or the attachment summaries a multimodal message renders to.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TranscriptContent {
-    Text(String),
-    Parts(Vec<String>),
-}
-
-#[derive(Debug, Deserialize)]
-struct TranscriptToolCall {
-    id: String,
-    function: TranscriptFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct TranscriptFunction {
-    name: String,
-    arguments: String,
-}
-
 impl RecordedSession {
+    fn model_turns(&self) -> u32 {
+        let count = self.calls.as_ref().map_or(self.turns.len(), |calls| {
+            calls.iter().filter(|call| call.kind == "chat").count()
+        });
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
     /// Reconstructs one session from the log records exported under its trace.
     ///
     /// Records may arrive in any order and may include events from other sessions; only the
-    /// transcript and accounting events of `trace_id` are read. The message vector is rebuilt from
-    /// the first turn's full prompt plus each later turn's delta, exactly as the loop emitted them,
-    /// and the final turn's answer — which no later prompt carries — is taken from its own record.
+    /// transcript and accounting events of `trace_id` are read. Full/delta request revisions remain
+    /// separate from answered turns and independent calls, so rebuilt or trimmed portable context
+    /// neither duplicates work nor loses earlier observed results.
     ///
     /// # Errors
     ///
@@ -313,9 +294,11 @@ impl RecordedSession {
             detail,
         };
 
-        let mut prompts = BTreeMap::<u64, (String, String)>::new();
+        let mut prompts = BTreeMap::<u64, RecordedContext>::new();
         let mut answers = BTreeMap::<u64, (String, String)>::new();
         let mut accounting = BTreeMap::<u64, (Option<RecordedUsage>, Option<f64>)>::new();
+        let mut coordinates = BTreeMap::new();
+        let mut job = None;
         let mut calls = BTreeMap::<(String, u64), RecordedAccountingCall>::new();
         for record in owned {
             let Some(event) = text(record, "audit.event") else {
@@ -327,25 +310,36 @@ impl RecordedSession {
                     let turn = turn.ok_or_else(|| {
                         malformed("agent.model.prompt without model.turn".to_owned())
                     })?;
-                    let scope = text(record, "transcript.scope").unwrap_or_default();
-                    let messages = text(record, "messages").ok_or_else(|| {
-                        malformed(format!(
-                            "agent.model.prompt turn {turn} carries no messages"
-                        ))
-                    })?;
-                    prompts.insert(turn, (scope, messages));
+                    let context = context::decode_prompt(record, turn).map_err(&malformed)?;
+                    if let Some(id) = text(record, "job.id") {
+                        if job.as_ref().is_some_and(|old| old != &id) {
+                            return Err(malformed("conflicting prompt job IDs".into()));
+                        }
+                        job = Some(id);
+                    }
+                    if let Some(old) = prompts.insert(turn, context.clone())
+                        && old != context
+                    {
+                        return Err(malformed(format!(
+                            "conflicting prompt records for turn {turn}"
+                        )));
+                    }
                 }
                 "agent.model.answer" => {
                     let turn = turn.ok_or_else(|| {
                         malformed("agent.model.answer without model.turn".to_owned())
                     })?;
-                    answers.insert(
-                        turn,
-                        (
-                            text(record, "answer").unwrap_or_default(),
-                            text(record, "tool_calls").unwrap_or_else(|| "[]".to_owned()),
-                        ),
+                    let answer = (
+                        text(record, "answer").unwrap_or_default(),
+                        text(record, "tool_calls").unwrap_or_else(|| "[]".to_owned()),
                     );
+                    if let Some(old) = answers.insert(turn, answer.clone())
+                        && old != answer
+                    {
+                        return Err(malformed(format!(
+                            "conflicting answer records for turn {turn}"
+                        )));
+                    }
                 }
                 "accounting.model.call" | "accounting.model.turn" => {
                     let usage = RecordedUsage {
@@ -388,6 +382,13 @@ impl RecordedSession {
                         && let Some(turn) = turn
                     {
                         let usage = (usage != RecordedUsage::default()).then_some(usage);
+                        if let Some(old) = coordinates.insert(turn, (call.job.clone(), sequence))
+                            && old != (call.job.clone(), sequence)
+                        {
+                            return Err(malformed(format!(
+                                "conflicting chat calls for turn {turn}"
+                            )));
+                        }
                         accounting.insert(turn, (usage, float(record, "duration_ms")));
                     }
                 }
@@ -401,183 +402,46 @@ impl RecordedSession {
                 turns: accounting.len(),
             });
         }
-        let (&first_turn, (first_scope, _)) = prompts.iter().next().expect("checked non-empty");
-        if first_scope != "full" {
-            return Err(malformed(format!(
-                "the earliest prompt record (turn {first_turn}) is a {first_scope:?} transcript rather than the full one"
-            )));
-        }
-
-        // The message vector, exactly as the loop grew it.
-        let mut messages = Vec::new();
-        for (turn, (scope, encoded)) in &prompts {
-            if *turn != first_turn && scope == "full" {
-                return Err(malformed("context was rebuilt; multi-revision replay cannot be reconstructed by concatenating deltas".into()));
-            }
-            let appended = serde_json::from_str::<Vec<TranscriptMessage>>(encoded)
-                .map_err(|error| malformed(format!("turn {turn} messages: {error}")))?;
-            messages.extend(appended);
-        }
-        let last_prompt_turn = *prompts.keys().next_back().expect("checked non-empty");
-        for (turn, (answer, tool_calls)) in &answers {
-            // Turn N's answer rides turn N+1's delta, so only the answer of the last requested
-            // turn — the one no later request carried — has to come from its own record.
-            if *turn < last_prompt_turn {
-                continue;
-            }
-            let tool_calls = serde_json::from_str::<Vec<TranscriptToolCall>>(tool_calls)
-                .map_err(|error| malformed(format!("turn {turn} tool calls: {error}")))?;
-            messages.push(TranscriptMessage {
-                role: "assistant".to_owned(),
-                content: (!answer.is_empty()).then(|| TranscriptContent::Text(answer.clone())),
-                tool_calls,
-                tool_call_id: None,
-            });
-        }
-
-        // Leading system messages.
-        let mut index = 0;
-        let mut system = Vec::new();
-        while let Some(message) = messages
-            .get(index)
-            .filter(|message| message.role == "system")
-        {
-            system.push(
-                message
-                    .content
-                    .as_ref()
-                    .map_or(String::new(), |content| match content {
-                        TranscriptContent::Text(text) => text.clone(),
-                        TranscriptContent::Parts(parts) => parts.join("\n"),
-                    }),
-            );
-            index += 1;
-        }
-
-        // The prompt is the user message just before turn 1's answer; what precedes it is history.
-        // Turn 1 is recognized by its own answer record, because a replayed history pair looks
-        // exactly like a plain-text turn.
-        let first_answer_index = answers
-            .get(&first_turn)
-            .and_then(|(answer, tool_calls)| {
-                let calls = serde_json::from_str::<Vec<TranscriptToolCall>>(tool_calls).ok()?;
-                messages
-                    .iter()
-                    .enumerate()
-                    .skip(index)
-                    .position(|(_, message)| {
-                        message.role == "assistant"
-                        && message.content.as_ref().map_or(answer.is_empty(), |content| {
-                            matches!(content, TranscriptContent::Text(text) if text == answer)
-                        })
-                        && message.tool_calls.len() == calls.len()
-                        && message
-                            .tool_calls
-                            .iter()
-                            .zip(&calls)
-                            .all(|(left, right)| left.id == right.id)
-                    })
-            })
-            .map(|position| position + index)
-            .or_else(|| {
-                // No answer record for turn 1: the session failed before a model answered, so
-                // the prompt is simply the last user message.
-                messages
-                    .iter()
-                    .rposition(|message| message.role == "user")
-                    .map(|position| position + 1)
-            })
-            .ok_or_else(|| {
-                malformed("no user message precedes the first model answer".to_owned())
-            })?;
-        if first_answer_index == 0
-            || messages
-                .get(first_answer_index - 1)
-                .is_none_or(|message| message.role != "user")
-        {
-            return Err(malformed(
-                "the message before the first model answer is not the user prompt".to_owned(),
-            ));
-        }
-        let prompt_index = first_answer_index - 1;
-        let mut history = Vec::new();
-        let mut cursor = index;
-        while cursor < prompt_index {
-            let message = &messages[cursor];
-            if message.role != "user" {
+        let contexts: Vec<_> = prompts.into_values().collect();
+        context::validate_contexts(&contexts).map_err(&malformed)?;
+        let first = &contexts[0].messages;
+        let system_end = first.iter().take_while(|m| m.role == "system").count();
+        let system = first[..system_end]
+            .iter()
+            .map(RecordedMessage::text)
+            .collect();
+        // The first request ends at the inbound prompt, not an answer-content heuristic: a prior
+        // answer may be byte-identical to the new one, and evidence summaries also use user roles.
+        let prompt = first.last().expect("validated first request").text();
+        let history = context::legacy_exchanges(&first[system_end..first.len() - 1]);
+        let mut turns = Vec::new();
+        for (number, (answer, encoded)) in answers {
+            if !contexts.iter().any(|c| u64::from(c.turn) == number) {
                 return Err(malformed(format!(
-                    "history message {cursor} has role {:?} where a user message belongs",
-                    message.role
+                    "answer without prompt for turn {number}"
                 )));
             }
-            let user = content_text(&message.content);
-            cursor += 1;
-            let answer = messages
-                .get(cursor)
-                .filter(|next| cursor < prompt_index && next.role == "assistant")
-                .map(|next| {
-                    cursor += 1;
-                    content_text(&next.content)
-                });
-            history.push(RecordedExchange { user, answer });
+            let calls = serde_json::from_str::<Vec<dekopon_model::model::ModelToolCall>>(&encoded)
+                .map_err(|error| malformed(format!("turn {number} tool calls: {error}")))?;
+            let (usage, duration_ms) = accounting.get(&number).copied().unwrap_or((None, None));
+            turns.push(RecordedTurn {
+                turn: u32::try_from(number).map_err(|error| malformed(error.to_string()))?,
+                content: (!answer.is_empty()).then_some(answer),
+                tool_calls: calls
+                    .into_iter()
+                    .map(|call| RecordedToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                        result: None,
+                    })
+                    .collect(),
+                usage,
+                duration_ms,
+            });
         }
-        let prompt = content_text(&messages[prompt_index].content);
-
-        // Every assistant message after the prompt is one turn; the tool messages after it are its
-        // results, matched by call identifier.
-        let mut turns = Vec::<RecordedTurn>::new();
-        for message in messages.iter().skip(prompt_index + 1) {
-            match message.role.as_str() {
-                "assistant" => {
-                    let number = u32::try_from(turns.len() + 1).unwrap_or(u32::MAX);
-                    let (usage, duration_ms) = accounting
-                        .get(&u64::from(number))
-                        .copied()
-                        .unwrap_or((None, None));
-                    turns.push(RecordedTurn {
-                        turn: number,
-                        content: message.content.as_ref().map(|content| match content {
-                            TranscriptContent::Text(text) => text.clone(),
-                            TranscriptContent::Parts(parts) => parts.join("\n"),
-                        }),
-                        tool_calls: message
-                            .tool_calls
-                            .iter()
-                            .map(|call| RecordedToolCall {
-                                id: call.id.clone(),
-                                name: call.function.name.clone(),
-                                arguments: call.function.arguments.clone(),
-                                result: None,
-                            })
-                            .collect(),
-                        usage,
-                        duration_ms,
-                    });
-                }
-                "tool" => {
-                    let Some(id) = message.tool_call_id.as_deref() else {
-                        return Err(malformed(
-                            "a tool message carries no tool_call_id".to_owned(),
-                        ));
-                    };
-                    let result = content_text(&message.content);
-                    let matched = turns
-                        .iter_mut()
-                        .rev()
-                        .find_map(|turn| turn.tool_calls.iter_mut().find(|call| call.id == id));
-                    match matched {
-                        Some(call) => call.result = Some(result),
-                        None => {
-                            return Err(malformed(format!(
-                                "a tool result answers unknown call {id:?}"
-                            )));
-                        }
-                    }
-                }
-                // A chat asset's bytes follow its tool result as a user message; nothing to keep.
-                _ => {}
-            }
-        }
+        context::capture_results(&contexts, &mut turns, &coordinates, job.as_deref())
+            .map_err(&malformed)?;
         let answer = turns
             .last()
             .filter(|turn| turn.tool_calls.is_empty())
@@ -588,11 +452,33 @@ impl RecordedSession {
             trace_id: trace_id.to_owned(),
             system,
             history,
+            contexts,
             prompt,
             turns,
             calls: Some(calls.into_values().collect()),
             answer,
         })
+    }
+
+    /// Checks portable context revisions and independent call coordinates in an edited recording.
+    ///
+    /// # Errors
+    /// Returns [`RecordingError::Malformed`] for conflicting or incomplete portable context.
+    pub fn validate(&self) -> Result<(), RecordingError> {
+        let malformed = |detail| RecordingError::Malformed {
+            trace_id: self.trace_id.clone(),
+            detail,
+        };
+        context::ReplayContext::new(self).map_err(&malformed)?;
+        let mut calls = std::collections::BTreeSet::new();
+        for call in self.calls.iter().flatten() {
+            if !calls.insert((&call.job, call.sequence)) {
+                return Err(malformed(
+                    "duplicate accounting call in recording file".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The scripts the recorded model wrote, in order.
@@ -725,14 +611,6 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
             .then_with(|| left.trace_id.cmp(&right.trace_id))
     });
     listing
-}
-
-fn content_text(content: &Option<TranscriptContent>) -> String {
-    match content {
-        Some(TranscriptContent::Text(text)) => text.clone(),
-        Some(TranscriptContent::Parts(parts)) => parts.join("\n"),
-        None => String::new(),
-    }
 }
 
 /// What the replayed session runs under, beyond the model.
@@ -1027,7 +905,30 @@ where
     if inputs.improvement_suggestions {
         session = session.with_improvement_suggestions();
     }
-    let outcome = SessionEngine::new(model, &runtime).run(session, &mut history);
+    let portable = recorded
+        .validate()
+        .map_err(|error| error.to_string())
+        .and_then(|()| context::ReplayContext::new(recorded));
+    let outcome = match portable {
+        Ok(Some(ref policy)) => SessionEngine::new(model, &runtime)
+            .run(session.with_context_policy(policy), &mut history),
+        Ok(None) => SessionEngine::new(model, &runtime).run(session, &mut history),
+        Err(error) => {
+            return ReplayReport {
+                trace_id: recorded.trace_id.clone(),
+                recorded: SessionSummary {
+                    model_turns: recorded.model_turns(),
+                    scripts: recorded.scripts(),
+                    answer: recorded.answer.clone(),
+                    usage: recorded.usage(),
+                },
+                replayed: SessionSummary::default(),
+                divergence: None,
+                suggestions: Vec::new(),
+                error: Some(error),
+            };
+        }
+    };
     let tracked = accounting.snapshot();
     let divergence = runtime
         .divergence
@@ -1052,7 +953,7 @@ where
     ReplayReport {
         trace_id: recorded.trace_id.clone(),
         recorded: SessionSummary {
-            model_turns: u32::try_from(recorded.turns.len()).unwrap_or(u32::MAX),
+            model_turns: recorded.model_turns(),
             scripts: recorded.scripts(),
             answer: recorded.answer.clone(),
             usage: recorded.usage(),
@@ -1113,6 +1014,37 @@ mod tests {
             RecordedSession::default().usage(),
             super::RecordedUsage::default()
         );
+    }
+
+    #[test]
+    fn replay_summary_counts_independent_chat_calls_including_failed_inference() {
+        let mut rows = records();
+        rows.retain(|row| row["audit_event"] != "accounting.model.turn");
+        rows.retain(|row| !(row["audit_event"] == "agent.model.answer" && row["model_turn"] == 2));
+        for (sequence, kind, total) in [(1, "chat", 12), (2, "chat", 7), (3, "image", 20)] {
+            let row = json!({"trace_id":"t1", "audit_event":"accounting.model.call", "job_id":"job", "call_sequence":sequence, "model_turn":sequence.min(2), "model_kind":kind, "usage_total_tokens":total});
+            rows.extend([row.clone(), row]);
+        }
+        let recorded = RecordedSession::from_records("t1", &rows).unwrap();
+        assert_eq!(recorded.turns.len(), 1);
+        assert_eq!(recorded.calls.as_ref().unwrap().len(), 3);
+        let report = replay(
+            &ScriptedModel::new([answer("done")]),
+            &recorded,
+            inputs(None),
+        );
+        assert_eq!(report.error, None);
+        assert_eq!(report.recorded.model_turns, 2);
+        assert_eq!(report.recorded.usage.total_tokens, Some(39));
+        let mut malformed = recorded.clone();
+        malformed.contexts[0].scope = "invalid".into();
+        let report = replay(&ScriptedModel::new([]), &malformed, inputs(None));
+        assert!(report.error.unwrap().contains("revision ordering"));
+        assert_eq!(report.recorded.model_turns, 2);
+        assert_eq!(report.recorded.usage.total_tokens, Some(39));
+        let mut historical = recorded;
+        historical.calls = None;
+        assert_eq!(historical.model_turns(), 1);
     }
 
     /// A listing is built from accounting alone, so it covers sessions with no transcript.
@@ -1401,3 +1333,6 @@ mod tests {
         assert!(systems[0][1].contains("replay-model"));
     }
 }
+
+#[cfg(test)]
+mod portable_tests;

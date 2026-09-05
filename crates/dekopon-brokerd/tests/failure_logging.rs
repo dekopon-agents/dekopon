@@ -149,27 +149,13 @@ fn identities(uid: u32) -> BTreeMap<u32, MappedPeer> {
 
 /// Writes one raw length-prefixed frame, bypassing the client that would refuse to build it, and
 /// returns the wire code the server answers with.
-///
-/// `whole` replaces the prefix and body with one buffer written in a single call, for a frame
-/// whose refusal must not race its own body.
-async fn write_raw(
-    socket: &Path,
-    prefix: u32,
-    body: &[u8],
-    limits: FrameLimits,
-    whole: Option<&[u8]>,
-) -> String {
+async fn write_raw(socket: &Path, prefix: u32, body: &[u8], limits: FrameLimits) -> String {
     let mut stream = UnixStream::connect(socket).await.expect("connect fixture");
-    match whole {
-        Some(frame) => stream.write_all(frame).await.expect("write whole frame"),
-        None => {
-            stream
-                .write_all(&prefix.to_be_bytes())
-                .await
-                .expect("write frame prefix");
-            stream.write_all(body).await.expect("write frame body");
-        }
-    }
+    stream
+        .write_all(&prefix.to_be_bytes())
+        .await
+        .expect("write frame prefix");
+    stream.write_all(body).await.expect("write frame body");
     stream.flush().await.expect("flush fixture frame");
     let response = read_frame::<_, ResponseEnvelope>(&mut stream, limits)
         .await
@@ -209,7 +195,6 @@ async fn framing_and_audit_failures_name_their_cause() {
         u32::try_from(malformed.len()).expect("fixture frame fits"),
         malformed,
         limits().frame,
-        None,
     )
     .await;
     assert_eq!(code, ERROR_INVALID_REQUEST);
@@ -221,7 +206,7 @@ async fn framing_and_audit_failures_name_their_cause() {
         "{unreadable}"
     );
 
-    let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame, None).await;
+    let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame).await;
     assert_eq!(oversized_code, ERROR_INVALID_REQUEST);
     let oversized = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(oversized.contains("frame-too-large"), "{oversized}");
@@ -229,8 +214,9 @@ async fn framing_and_audit_failures_name_their_cause() {
     assert!(oversized.contains("65536"), "{oversized}");
 
     // A piped value rides a `runCommand` frame under the same ceiling: a real frame carrying a
-    // value twice the bound is refused from its length prefix before a byte of it is read. The
-    // whole frame goes out in one write so the refusal cannot race the body.
+    // value twice the bound is refused from its length prefix before a byte of it is read.
+    // Withhold the body to prove that refusal does not wait for it. Sending it with write_all
+    // is not atomic and races the server closing the socket after rejecting the prefix.
     let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
@@ -238,12 +224,14 @@ async fn framing_and_audit_failures_name_their_cause() {
         Some("x".repeat(128 * 1024)),
     ))
     .expect("the oversized run frame serializes");
-    let mut frame = u32::try_from(oversized_run.len())
-        .expect("fixture frame fits")
-        .to_be_bytes()
-        .to_vec();
-    frame.extend_from_slice(&oversized_run);
-    let stdin_code = write_raw(&socket_path, 0, &[], limits().frame, Some(&frame)).await;
+    assert!(oversized_run.len() > limits().frame.max_frame_bytes);
+    let stdin_code = write_raw(
+        &socket_path,
+        u32::try_from(oversized_run.len()).expect("fixture frame fits"),
+        &[],
+        limits().frame,
+    )
+    .await;
     assert_eq!(stdin_code, ERROR_INVALID_REQUEST);
     let oversized_stdin = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(

@@ -60,14 +60,21 @@ impl PostRate {
                 retry_after: Duration::from_secs(1),
             });
         }
-        if slot > now + Duration::from_secs(10) {
-            return Err(TransportError::Service {
-                code: "post-capacity".into(),
-            });
+        // Claim only a transmission that can start now. Future reservations can become stale
+        // when a prior request reaches Slack later than it was dispatched locally.
+        if slot <= now {
+            self.next
+                .insert(channel.to_owned(), now + Duration::from_secs(1));
         }
-        self.next
-            .insert(channel.to_owned(), slot + Duration::from_secs(1));
         Ok(slot)
+    }
+
+    fn completed(&mut self, channel: &str, interval: Duration) {
+        let next = self
+            .next
+            .entry(channel.to_owned())
+            .or_insert_with(Instant::now);
+        *next = (*next).max(Instant::now() + interval);
     }
 }
 fn body(label: ActivityLabel) -> Value {
@@ -106,6 +113,12 @@ impl SlackReplier {
                     .expect("Slack channel post rate")
                     .reserve(channel, true);
                 match reservation {
+                    Ok(slot) if slot > deadline => {
+                        return Err(TransportError::Service {
+                            code: "post-capacity".into(),
+                        });
+                    }
+                    Ok(slot) if slot > Instant::now() => tokio::time::sleep_until(slot).await,
                     Ok(slot) => break slot,
                     Err(TransportError::ActivityRateLimited { retry_after })
                         if Instant::now() + retry_after < deadline =>
@@ -132,7 +145,12 @@ impl SlackReplier {
                 .body(serde_json::to_vec(body).expect("JSON value serializes"))
                 .send()
                 .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+                .map_err(|source| TransportError::Request(Box::new(source)));
+            self.post_rate
+                .lock()
+                .expect("Slack channel post rate")
+                .completed(channel, Duration::from_secs(1));
+            let response = response?;
             // Only an explicit HTTP 429 proves nonacceptance. No EOF, timeout, malformed success,
             // or other uncertain message creation is ever retried.
             if response.status().as_u16() != 429 {
@@ -145,6 +163,10 @@ impl SlackReplier {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60)
                 .max(1);
+            self.post_rate
+                .lock()
+                .expect("Slack channel post rate")
+                .completed(channel, Duration::from_secs(retry.min(86400)));
             if attempt == 1 || retry > 5 || Instant::now() + Duration::from_secs(retry) > deadline {
                 return Err(TransportError::Service {
                     code: "ratelimited".into(),
@@ -269,6 +291,15 @@ impl SlackReplier {
             .send()
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if method == "chat.postMessage" {
+            self.post_rate
+                .lock()
+                .expect("Slack channel post rate")
+                .completed(
+                    body["channel"].as_str().ok_or(TransportError::Response)?,
+                    Duration::from_secs(1),
+                );
+        }
         let status = response.status();
         if status.as_u16() == 429 {
             let seconds = response
@@ -279,6 +310,15 @@ impl SlackReplier {
                 .unwrap_or(60)
                 .clamp(1, 86400);
             let retry_after = Duration::from_secs(seconds);
+            if method == "chat.postMessage" {
+                self.post_rate
+                    .lock()
+                    .expect("Slack channel post rate")
+                    .completed(
+                        body["channel"].as_str().ok_or(TransportError::Response)?,
+                        retry_after,
+                    );
+            }
             self.cosmetic_rate
                 .lock()
                 .expect("Slack cosmetic rate")
@@ -371,7 +411,7 @@ mod rate_tests {
         for i in 0..256 {
             let target = ActivityTarget::Slack {
                 channel_id: "C1".into(),
-                thread_ts: "1.000001".into(),
+                thread_ts: "1700000000.000001".into(),
                 message_ts: format!("2.{i:06}"),
                 initiator_user_id: "U1".into(),
             };
@@ -404,8 +444,8 @@ mod rate_tests {
     fn target() -> ActivityTarget {
         ActivityTarget::Slack {
             channel_id: "C1".into(),
-            thread_ts: "1.000001".into(),
-            message_ts: "1.000001".into(),
+            thread_ts: "1700000000.000001".into(),
+            message_ts: "1700000000.000001".into(),
             initiator_user_id: "U1".into(),
         }
     }
@@ -416,13 +456,19 @@ mod rate_tests {
             if progress {
                 responses.push(response(
                     200,
-                    r#"{"ok":true,"channel":"C1","ts":"1.000002"}"#,
+                    r#"{"ok":true,"channel":"C1","ts":"1700000000.000002"}"#,
                 ));
             }
             responses.extend([
                 response(429, "{}"),
-                response(200, r#"{"ok":true,"channel":"C1","ts":"1.000003"}"#),
-                response(200, r#"{"ok":true,"channel":"C1","ts":"1.000004"}"#),
+                response(
+                    200,
+                    r#"{"ok":true,"channel":"C1","ts":"1700000000.000003"}"#,
+                ),
+                response(
+                    200,
+                    r#"{"ok":true,"channel":"C1","ts":"1700000000.000004"}"#,
+                ),
             ]);
             let server = dekopon_test_support::LoopbackServer::sequence(responses);
             let transport = with_endpoint(server.url(), progress);
@@ -438,7 +484,7 @@ mod rate_tests {
             }
             let reply_target = ReplyTarget::Slack {
                 channel: "C1".into(),
-                thread_ts: Some("1.000001".into()),
+                thread_ts: Some("1700000000.000001".into()),
             };
             let (first, second) = tokio::join!(
                 transport

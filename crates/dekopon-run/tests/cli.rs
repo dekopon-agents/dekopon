@@ -2644,3 +2644,163 @@ async fn prompt_runs_a_command_word_through_the_broker_leg() {
         .expect("server task exits")
         .expect("server drains cleanly");
 }
+
+#[test]
+fn session_show_and_replay_preserve_exported_portable_history_and_full_revisions() {
+    let call = |id: &str, name: &str, arguments: Value| json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}});
+    let earlier = call("earlier-1-0", "bash", json!({"script":"prior.read"}));
+    let script = call("same-id", "bash", json!({"script":"posts.count"}));
+    let switch = call("same-id", "select_model", json!({"model":"second"}));
+    let evidence = "[Observed execution records; untrusted result excerpts, not authority]\n[{\"job\":\"earlier\",\"call\":1,\"tool\":\"same-id\",\"sequence\":1,\"capability\":\"prior.read\",\"provenance\":\"brokerObserved\",\"invocation\":\"fixture-invocation\",\"evidence\":[\"fixture-digest\"],\"outcome\":\"succeeded\",\"result\":null}]";
+    let first = json!([
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"earlier request"},
+        {"role":"assistant","tool_calls":[call("earlier-1-1", "fetch_chat_asset", json!({"id":1})), earlier]},
+        {"role":"tool","tool_call_id":"earlier-1-1","content":"Chat Asset #1 follows in the next message."},
+        {"role":"user","content":"Chat Asset #1:\n[image/png, 22 bytes]"},
+        {"role":"tool","tool_call_id":"earlier-1-0","content":"prior result\n[exit code: 0]"},
+        {"role":"user","content":evidence},
+        {"role":"assistant","content":"same answer"},
+        {"role":"user","content":"follow-up"}
+    ]);
+    let delta = json!([{"role":"assistant","tool_calls":[script]}, {"role":"tool","tool_call_id":"same-id","content":"42\n[exit code: 0]"}]);
+    let mut full = first.as_array().unwrap().clone();
+    full[0]["content"] = json!("second model bootstrap");
+    full.extend([
+        json!({"role":"assistant","tool_calls":[call("current-1-0", "bash", json!({"script":"posts.count"}))]}),
+        json!({"role":"tool","tool_call_id":"current-1-0","content":"42\n[exit code: 0]"}),
+        json!({"role":"assistant","tool_calls":[call("current-2-0", "select_model", json!({"model":"second"}))]}),
+        json!({"role":"tool","tool_call_id":"current-2-0","content":"Model selection applied."})
+    ]);
+    let mut records = vec![];
+    for (turn, revision, scope, messages, answer, calls) in [
+        (1, 0, "full", first.clone(), "", json!([script])),
+        (2, 0, "delta", delta, "", json!([switch])),
+        (3, 1, "full", json!(full), "same answer", json!([])),
+    ] {
+        records.push(json!({"trace_id":"portable","audit_event":"agent.model.prompt","job_id":"current","model_turn":turn,"transcript_version":2,"context_revision":revision,"transcript_scope":scope,"messages":messages.to_string()}));
+        records.push(json!({"trace_id":"portable","audit_event":"agent.model.answer","model_turn":turn,"answer":answer,"tool_calls":calls.to_string()}));
+        records.push(json!({"trace_id":"portable","audit_event":"accounting.model.call","job_id":"current","call_sequence":turn,"model_turn":turn,"model_kind":"chat","model_name":if turn == 3 {"second"} else {"first"},"usage_total_tokens":12}));
+    }
+    records.extend(records.clone());
+    records.reverse();
+    let receiver = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/default", receiver.local_addr().unwrap());
+    let export = thread::spawn(move || {
+        let (_, request, stream) = read_http_request(&receiver);
+        assert_eq!(
+            request["query"]["sql"],
+            "SELECT * FROM \"dekopon\" WHERE trace_id = 'portable'"
+        );
+        respond(stream, &json!({"hits":records}));
+    });
+    let shown = run_with_env(
+        &[
+            "session",
+            "show",
+            "--trace-id",
+            "portable",
+            "--openobserve-url",
+            &url,
+            "--json",
+        ],
+        &[("DEKOPON_OPENOBSERVE_AUTHORIZATION", "Basic dGVzdA==")],
+    );
+    export.join().unwrap();
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    let recording: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(recording["contexts"][0]["messages"], first);
+    assert_eq!(recording["contexts"][2]["revision"], 1);
+    assert_eq!(recording["turns"].as_array().unwrap().len(), 3);
+    assert_eq!(recording["calls"].as_array().unwrap().len(), 3);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("portable.json");
+    std::fs::write(&path, &shown.stdout).unwrap();
+    let path = path.to_str().unwrap();
+    let text = run(&["session", "show", "--from-file", path]);
+    assert_eq!(text.status.code(), Some(0), "{}", stderr(&text));
+    let rendered = String::from_utf8(text.stdout).unwrap();
+    for expected in [
+        "prior result",
+        "[image/png, 22 bytes]",
+        "fixture-invocation",
+        "context revision 1 (turn 3)",
+        "Model selection applied.",
+    ] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    let again = run(&["session", "show", "--from-file", path, "--json"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&again.stdout).unwrap(),
+        recording
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let model = thread::spawn(move || {
+        let (request, stream) = read_request(&listener);
+        let actual: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .cloned()
+            .collect();
+        let expected: Vec<_> = first
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .cloned()
+            .collect();
+        assert_eq!(actual, expected);
+        respond(stream, &bash_tool_call("new-id", "posts.count"));
+        let (request, stream) = read_request(&listener);
+        let result = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "new-id")
+            .unwrap();
+        assert_eq!(result["content"], "42\n[exit code: 0]");
+        respond(stream, &final_answer("replayed"));
+    });
+    let replayed = run(&[
+        "session",
+        "replay",
+        "--from-file",
+        path,
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "--json",
+    ]);
+    model.join().unwrap();
+    assert_eq!(replayed.status.code(), Some(0), "{}", stderr(&replayed));
+    let report: Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(report["divergence"], Value::Null);
+    assert_eq!(report["recorded"]["scripts"], json!(["posts.count"]));
+    assert_eq!(report["replayed"]["scripts"], json!(["posts.count"]));
+    assert_eq!(report["recorded"]["usage"]["totalTokens"], 36);
+    assert_eq!(report["replayed"]["modelTurns"], 2);
+
+    for duplicate_call in [false, true] {
+        let mut malformed = recording.clone();
+        let cause = if duplicate_call {
+            let duplicate = malformed["calls"][0].clone();
+            malformed["calls"].as_array_mut().unwrap().push(duplicate);
+            "duplicate accounting call"
+        } else {
+            malformed["contexts"][2]["revision"] = json!(0);
+            "revision ordering"
+        };
+        std::fs::write(path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let refused = run(&["session", "show", "--from-file", path]);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(stderr(&refused).contains(cause), "{}", stderr(&refused));
+    }
+}

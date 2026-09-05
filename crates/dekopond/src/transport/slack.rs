@@ -861,9 +861,24 @@ impl ChatActivity for SlackReplier {
                     .set_reaction(channel_id, message_ts, "reactions.remove")
                     .await
                 && !matches!(&error, TransportError::Service { code } if code == "no_reaction")
-                && first_error.is_none()
             {
-                first_error = Some(error);
+                if let Some(prior) = &first_error {
+                    // Both failures matter, especially an uncertain removal after a definitive
+                    // status refusal. Preserve uncertainty for the coordinator's quarantine.
+                    let displaced = if crate::activity::uncertain(&error) {
+                        prior
+                    } else {
+                        &error
+                    };
+                    tracing::debug!(
+                        event = "gateway_activity_failed",
+                        operation = "hide-additional",
+                        category = displaced.category()
+                    );
+                }
+                if first_error.is_none() || crate::activity::uncertain(&error) {
+                    first_error = Some(error);
+                }
             }
             match first_error {
                 Some(error) => Err(error),

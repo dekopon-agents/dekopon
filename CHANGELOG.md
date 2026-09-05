@@ -9,12 +9,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Reconstruct persistent portable tool history and model-switch/full context revisions in session
+  show/replay; reject conflicting revisions and preserve independent failure/image usage without
+  recounting remembered calls or restoring opaque provider continuation. Accept byte-free asset
+  summaries interleaved within tool batches and count failed chat calls in replay comparisons.
+- Repair gateway test compilation and parallel accounting trace capture; pin interpreter job-span
+  ancestry and make oversized-frame refusal tests independent of socket write buffering.
 - Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
   before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
   results, restored history, failed/nullable response usage and terminal host delivery accounting.
 - Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
   authenticated installations, and coordinate final/progress channel posts with definitive-429-only
-  recovery. Portable multi-revision recording reconstruction remains incomplete.
+  recovery. Recheck physical post slots after response arrival to prevent concurrent retries from
+  colliding; preserve cleanup uncertainty and forward gateway safe-yield authorization checks.
 
 ### Added
 

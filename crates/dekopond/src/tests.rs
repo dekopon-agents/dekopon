@@ -2492,6 +2492,117 @@ async fn stub_broker(
     )
 }
 
+/// Repeat each nonempty initial surface for the explicitly expected safe-boundary checks.
+/// Refusals are terminal and therefore still receive only one exchange.
+async fn stub_broker_with_checks(
+    checks: usize,
+    directory: &Path,
+    responses: Vec<ResponseEnvelope>,
+) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
+    stub_broker(
+        directory,
+        responses
+            .into_iter()
+            .flat_map(|response| {
+                let count = if matches!(&response.response,
+            dekopon_broker_protocol::BrokerResponse::Capabilities { capabilities, .. }
+                if !capabilities.is_empty())
+                {
+                    checks
+                } else {
+                    1
+                };
+                std::iter::repeat_n(response, count)
+            })
+            .collect(),
+    )
+    .await
+}
+
+async fn stub_broker_with_effect(
+    before: usize,
+    after: usize,
+    directory: &Path,
+    responses: Vec<ResponseEnvelope>,
+) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
+    let [surface, effect]: [ResponseEnvelope; 2] = responses.try_into().unwrap();
+    let mut responses = vec![surface.clone(); before];
+    responses.push(effect);
+    responses.extend(std::iter::repeat_n(surface, after));
+    stub_broker(directory, responses).await
+}
+
+fn session_seed(
+    runner: &SessionRunner,
+    route: &crate::routes::BoundRoute,
+    inbound: &InboundMessage,
+    surface: ResponseEnvelope,
+) -> dekopon_harness::conversation::ConversationSeed {
+    let key = ConversationKey::scoped(
+        route.agent.as_str(),
+        &route.cache_key,
+        &inbound.transport,
+        &inbound.channel,
+        &inbound.conversation_id,
+        &inbound.subject.canonical(),
+    );
+    runner.conversations.begin(
+        &key,
+        &conversation_surface(surface),
+        route.conversation.window().unwrap(),
+        Instant::now(),
+    )
+}
+
+fn conversation_surface(response: ResponseEnvelope) -> Vec<String> {
+    match response.response {
+        dekopon_broker_protocol::BrokerResponse::Capabilities {
+            capabilities,
+            command_words,
+            surface_epoch,
+            ..
+        } => {
+            struct Metadata(
+                Vec<dekopon_broker_protocol::AvailableCapability>,
+                Vec<String>,
+            );
+            impl dekopon_shell::CapabilityInvoker for Metadata {
+                fn granted(&self) -> Vec<String> {
+                    self.0.iter().map(|c| c.capability.id.to_string()).collect()
+                }
+                fn command_words(&self) -> Vec<String> {
+                    self.1.clone()
+                }
+                fn describe(&self, id: &str) -> Option<dekopon_shell::CapabilityDescription> {
+                    self.0
+                        .iter()
+                        .find(|c| c.capability.id.as_str() == id)
+                        .map(|c| dekopon_shell::CapabilityDescription {
+                            capability: id.into(),
+                            description: c.capability.description.clone(),
+                            input_schema: c.capability.input_schema.clone(),
+                        })
+                }
+                fn invoke(
+                    &self,
+                    _: &str,
+                    _: Value,
+                    _: Option<dekopon_core::SecretUseProposal>,
+                ) -> dekopon_shell::CapabilityCallResult {
+                    panic!("metadata only")
+                }
+            }
+            let metadata = dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&Metadata(
+                capabilities,
+                command_words,
+            ))
+            .unwrap();
+            vec![metadata.fingerprint(), surface_epoch.to_string()]
+        }
+        _ => panic!("capability fixture"),
+    }
+}
+
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         transport: "dev".to_owned(),
@@ -2787,7 +2898,8 @@ impl ChatModel for BlockedHandle {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -2842,7 +2954,8 @@ impl ImageGenerator for TestImageGenerator {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_explicit_route_generator_yields_an_image_reply() {
     let directory = temporary();
-    let (broker, _) = stub_broker(
+    let (broker, _) = stub_broker_with_checks(
+        6,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -2884,7 +2997,8 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Claimed.")]);
     let replier = Arc::new(RecordingReplier::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
@@ -2957,7 +3071,8 @@ async fn a_revoked_sender_loses_owned_thread_continuation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -2989,52 +3104,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &message.conversation_id,
         &message.subject.canonical(),
     );
-    let surface = match memory_surface_response().response {
-        dekopon_broker_protocol::BrokerResponse::Capabilities {
-            capabilities,
-            command_words,
-            surface_epoch,
-            ..
-        } => {
-            struct Metadata(
-                Vec<dekopon_broker_protocol::AvailableCapability>,
-                Vec<String>,
-            );
-            impl dekopon_shell::CapabilityInvoker for Metadata {
-                fn granted(&self) -> Vec<String> {
-                    self.0.iter().map(|c| c.capability.id.to_string()).collect()
-                }
-                fn command_words(&self) -> Vec<String> {
-                    self.1.clone()
-                }
-                fn describe(&self, id: &str) -> Option<dekopon_shell::CapabilityDescription> {
-                    self.0
-                        .iter()
-                        .find(|c| c.capability.id.as_str() == id)
-                        .map(|c| dekopon_shell::CapabilityDescription {
-                            capability: id.into(),
-                            description: c.capability.description.clone(),
-                            input_schema: c.capability.input_schema.clone(),
-                        })
-                }
-                fn invoke(
-                    &self,
-                    _: &str,
-                    _: Value,
-                    _: Option<dekopon_core::SecretUseProposal>,
-                ) -> dekopon_shell::CapabilityCallResult {
-                    panic!("metadata only")
-                }
-            }
-            let metadata = dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&Metadata(
-                capabilities,
-                command_words,
-            ))
-            .unwrap();
-            vec![metadata.fingerprint(), surface_epoch.to_string()]
-        }
-        _ => panic!("capability fixture"),
-    };
+    let surface = conversation_surface(memory_surface_response());
 
     run_session(
         Arc::clone(&runner),
@@ -3073,6 +3143,17 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     assert_eq!(remembered.history.turns().len(), 1);
     assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
     assert_eq!(remembered.history.turns()[0].answer(), None);
+    let record = &remembered.history.turns()[0];
+    assert_eq!(
+        record.delivery,
+        dekopon_harness::history::DeliveryDisposition::Suppressed
+    );
+    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
+        .load(&record.job)
+        .unwrap();
+    assert!(checkpoint.finalized);
+    assert_eq!(checkpoint.record.delivery, record.delivery);
+    assert_eq!(checkpoint.state.accounting.delivery, "suppressed");
     assert!(matches!(
         observed
             .recv()
@@ -3083,6 +3164,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "no Slack acceptance means no durable-memory record request"
@@ -3095,7 +3177,9 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_effect(
+        4,
+        2,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -3132,6 +3216,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
+    assert_surface_checks(&mut observed, 3);
     let run = observed.recv().await.expect("the command run").request;
     assert!(
         matches!(
@@ -3141,6 +3226,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
         ),
         "{run:?}"
     );
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "rendered text proposes nothing to invoke"
@@ -3153,7 +3239,9 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_effect(
+        5,
+        2,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -3190,6 +3278,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 4);
     assert!(matches!(
         observed
             .recv()
@@ -3201,6 +3290,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             ..
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "the warning is not a delivered model answer and must not be durably recorded"
@@ -3210,7 +3300,8 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_retried() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             memory_surface_response(),
@@ -3241,6 +3332,7 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     let record = observed.recv().await.expect("one record request");
     let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
         panic!("expected hidden record operation: {record:?}");
@@ -3346,7 +3438,8 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
     ] {
         let directory = temporary();
         let result = record_result(outcome, error);
-        let (broker, mut observed) = stub_broker(
+        let (broker, mut observed) = stub_broker_with_checks(
+            3,
             directory.path(),
             vec![
                 memory_surface_response(),
@@ -3376,6 +3469,7 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
                 attestation: Some(Attestation { scope: Some(_), .. })
             }
         ));
+        assert_surface_checks(&mut observed, 2);
         assert!(matches!(
             observed.recv().await.expect("record request").request,
             BrokerRequest::RecordDeliveredTurn { .. }
@@ -3390,7 +3484,8 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
 #[tokio::test(flavor = "multi_thread")]
 async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_text() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        2,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -3411,13 +3506,15 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 1);
     assert!(
         observed.try_recv().is_err(),
         "the fixed gateway failure reply must not be recorded"
     );
 
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -3436,6 +3533,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "partial transport delivery must not be recorded"
@@ -3445,7 +3543,8 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
 #[tokio::test(flavor = "multi_thread")]
 async fn authorized_work_shows_activity_until_after_the_durable_reply() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -3491,7 +3590,8 @@ async fn authorized_work_shows_activity_until_after_the_durable_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -3602,7 +3702,7 @@ async fn unauthorized_work_never_publishes_activity() {
 async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
     let directory = temporary();
     let (broker, mut observed) =
-        stub_broker(directory.path(), vec![memory_surface_response()]).await;
+        stub_broker_with_checks(3, directory.path(), vec![memory_surface_response()]).await;
     let model = BlockedModel::new("stale answer");
     let surface = Arc::new(RecordingSurface::default());
     let mut runner = runner_with(
@@ -3628,8 +3728,8 @@ async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
     let session_runner = Arc::clone(&runner);
     let session = tokio::spawn(run_session(
         session_runner,
-        route,
-        inbound,
+        route.clone(),
+        inbound.clone(),
         Arc::clone(&surface) as Arc<dyn ChatReplier>,
     ));
     surface.wait_until_shown().await;
@@ -3674,12 +3774,26 @@ async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
         1,
         "Stop retains the independently recorded job, not a delivery receipt"
     );
+    let seed = session_seed(&runner, &route, &inbound, memory_surface_response());
+    let record = &seed.history.turns()[0];
+    assert_eq!(
+        record.delivery,
+        dekopon_harness::history::DeliveryDisposition::Cancelled
+    );
+    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
+        .load(&record.job)
+        .unwrap();
+    assert!(checkpoint.finalized);
+    assert_eq!(checkpoint.record.delivery, record.delivery);
+    assert_eq!(checkpoint.state.accounting.delivery, "cancelled");
+    assert_eq!(checkpoint.state.accounting.calls.len(), 1);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "a cancelled turn is never durably recorded"
@@ -3689,7 +3803,8 @@ async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
 #[tokio::test(flavor = "multi_thread")]
 async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -3740,6 +3855,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         }
     ));
 
+    assert_surface_checks(&mut observed, 1);
     session.abort();
     assert!(
         session
@@ -3749,6 +3865,20 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         "the async owner is gone"
     );
     model.release();
+    let freshness = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            freshness.request,
+            BrokerRequest::Capabilities {
+                attestation: Some(_),
+                ..
+            }
+        ),
+        "the late model result still crosses a fresh authorization check, never an invocation"
+    );
 
     assert!(
         tokio::time::timeout(Duration::from_millis(300), observed.recv())
@@ -3788,7 +3918,8 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
 async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let directory = temporary();
     let skill = mounted_skill(directory.path(), "counting");
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        9,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -3855,7 +3986,8 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        6,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -3924,7 +4056,8 @@ async fn improvement_suggestions_are_a_per_route_opt_in() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        6,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -3999,6 +4132,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 5);
     assert!(
         observed.try_recv().is_err(),
         "meta inspection makes no broker call"
@@ -4008,7 +4142,8 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -4195,7 +4330,8 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     // A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic.
     // Chat is the last place any of those belong.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        2,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -4245,7 +4381,8 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -4291,17 +4428,21 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
 
 /// A prompt written the way a test reads it.
 fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
-    messages
+    let mut expected: Vec<_> = messages
         .iter()
         .map(|(role, content)| ((*role).to_owned(), (*content).to_owned()))
-        .collect()
+        .collect();
+    expected.insert(1, ("system".into(), concat!(
+        "Host-selected inference identity (not authorization): ",
+        r#"{"configured":"local-qwen","backend":"adapter","model":"qwen3","effort":"providerDefault"}"#
+    ).into()));
+    expected
 }
 
 /// Every broker request the stub saw, asserting each one was a capability listing.
 ///
-/// The count is the assertion that matters: `stub_broker` serves one connection per response, so
-/// "N messages produced N attested `capabilities` envelopes" is what proves authorization is asked again
-/// per message rather than remembered with the conversation.
+/// The exact count includes initial admission plus safe boundaries, proving that authorization
+/// is freshly checked rather than remembered with the conversation.
 fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> usize {
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
@@ -4319,7 +4460,21 @@ fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) 
     count
 }
 
-/// One capability listing per message, so a two-message test needs two of them.
+fn assert_surface_checks(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>, count: usize) {
+    for _ in 0..count {
+        assert!(matches!(
+            observed
+                .try_recv()
+                .expect("expected fresh surface check")
+                .request,
+            BrokerRequest::Capabilities {
+                attestation: Some(Attestation { scope: Some(_), .. })
+            }
+        ));
+    }
+}
+
+/// Exactly `count` surface exchanges; callers include every safe-yield check they expect.
 fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
     (0..count)
         .map(|_| {
@@ -4363,7 +4518,8 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
     // because the exchange before it is in the prompt, in order, ahead of the new message.
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, mut observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -4406,13 +4562,14 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     );
     // Persistence remembers text and never a decision: both messages asked the broker for
     // themselves.
-    assert_eq!(capability_listings(&mut observed), 2);
+    assert_eq!(capability_listings(&mut observed), 6);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4448,7 +4605,8 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
     // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
     // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4476,7 +4634,8 @@ async fn two_configured_models_never_share_one_client() {
     // The key is the configured name the loader already proved unique. Two endpoints sharing a
     // client would send one route's messages to the other's host.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("from one"), answer("from the other")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4508,7 +4667,8 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
     // in it; the history key deliberately does, and this is the difference that makes.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Your deploy failed."),
         answer("Yours is still running."),
@@ -4556,7 +4716,8 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
     // reach without dropping it would keep replaying that output after the capability that produced
     // it was taken away.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -4600,7 +4761,8 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_message() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -4656,11 +4818,10 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_session_records_the_question_it_could_not_answer() {
-    // The fixed failure line is this daemon's sentence rather than the agent's, and storing it
-    // would teach the model to keep producing it. The question still happened, though: dropping it
-    // would leave the retry with nothing to refer back to.
+    // The fixed failure line is a delivery fact, never generated assistant text. Both the question
+    // and the exact accepted warning survive so a retry can distinguish observation from generation.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) = stub_broker(directory.path(), listings(5, &["echo.echo"])).await;
     let models = ModelScript::scripted([None, Some(answer("It was the database."))]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4688,9 +4849,13 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what broke?"),
+            (
+                "user",
+                "[Exact transport-accepted text, distinct from generation]\nThe agent could not complete this request."
+            ),
             ("user", "try again"),
         ]),
-        "an unanswered turn replays the question and nothing in the answer's place"
+        "the accepted warning is a delivery fact, never generated assistant text"
     );
     let replies = replier.replies();
     assert!(
@@ -4723,10 +4888,12 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
         4,
     );
 
+    let bound = persistent_route(model_config(), window());
+    let inbound = message("what broke?");
     run_session(
         Arc::clone(&runner),
-        persistent_route(model_config(), window()),
-        message("what broke?"),
+        bound.clone(),
+        inbound.clone(),
         Arc::clone(&replier) as Arc<dyn ChatReplier>,
     )
     .await;
@@ -4734,8 +4901,18 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
     assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(
         runner.conversations.tracked(),
-        0,
-        "a message nothing was ever asked about leaves no exchange behind"
+        1,
+        "admission reserves one empty generation"
+    );
+    let seed = session_seed(
+        &runner,
+        &bound,
+        &inbound,
+        listings(1, &["echo.echo"]).remove(0),
+    );
+    assert!(
+        seed.history.is_empty(),
+        "pre-model failure commits no job, including seeded jobs"
     );
 }
 
@@ -4847,13 +5024,13 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
             max_bytes: 64 * 1024,
         },
     };
-    // Each exchange below is a ten-byte question and a nine-byte answer, so two fit under this
-    // ceiling and three do not, while the turn count stays well inside `max_turns`.
+    // Portable structure and IDs count too, not just the question and answer text.
+    let record_bytes = JobRecord::completed("question a", "an answer").bytes();
     let by_bytes = ConversationWindow {
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
-            max_bytes: 40,
+            max_bytes: record_bytes * 2,
         },
     };
 
@@ -5071,7 +5248,8 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
     // as its prefix, and declaring the same lane is what lets the provider serve that prefix from
     // its cache instead of reading it again.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -5115,7 +5293,8 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     // request and give up the only caching a stateless route can have.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5197,7 +5376,8 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     // `complete_with` is a provided method precisely so this keeps working: an implementation that
     // ignores the options loses a cache lookup, never an answer.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner_with(broker, Arc::new(KeylessModel) as Arc<dyn ModelFactory>, 4);
 
@@ -5472,7 +5652,8 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
     );
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Useful follow-up.")]);
     let runner = runner(broker, Arc::clone(&models), 4);
     let replier = Arc::new(RecordingReplier::default());
@@ -5983,7 +6164,8 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -6909,7 +7091,8 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -8904,7 +9087,8 @@ async fn bootstrap_uses_each_fresh_chat_surface_before_request_one_without_disco
     first_capability.capability.description = "Return the specified message".to_owned();
     first_capability.capability.input_schema = json!({"type":"object", "properties":{"message":{"type":"string"}}, "required":["message"], "additionalProperties":false});
     let schema = first_capability.capability.input_schema.clone();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
@@ -8984,6 +9168,7 @@ async fn bootstrap_uses_each_fresh_chat_surface_before_request_one_without_disco
             }
         ));
     }
+    assert_surface_checks(&mut observed, 4);
     assert!(
         observed.try_recv().is_err(),
         "bootstrap runs no discovery commands or broker invocations"
@@ -9033,7 +9218,7 @@ async fn configured_controls_reuse_gateway_clients_and_authorize_each_job_from_i
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let (send, mut recv) = mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
-        for _ in 0..4 {
+        for _ in 0..12 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request: RequestEnvelope = read_frame(&mut stream, FrameLimits::default())
                 .await
@@ -9144,6 +9329,7 @@ async fn configured_controls_reuse_gateway_clients_and_authorize_each_job_from_i
 }
 
 mod activity_progress;
+mod lifecycle_receipts;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repair_unknown_work_survives_evicted_history_before_a_followup() {

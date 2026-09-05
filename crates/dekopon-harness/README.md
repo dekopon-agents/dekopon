@@ -33,5 +33,6 @@ requires a later explicitly authorized bootstrap; no published-library compatibi
 Ordinary broker-backed safe boundaries revalidate the authenticated surface/epoch; changed or
 uncertain checks fence inference/disclosure without erasing observations. Inactive fenced jobs may
 be evicted (restore then fails). Portable replay context uses job/call-local tool IDs. Recording
-accounting includes failed and image calls independently of assistant turns; the legacy portable
-history/multi-revision decoder remains incomplete. See [harness sessions](../../docs/harness.md).
+accounting includes failed and image calls independently of assistant turns. Recording reconstruction
+retains portable tool/evidence context across full revisions, rejects conflicting exports and never
+recounts remembered calls or restores opaque continuation. See [harness sessions](../../docs/harness.md).

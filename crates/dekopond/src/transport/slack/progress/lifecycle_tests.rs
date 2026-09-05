@@ -56,7 +56,7 @@ impl ChatActivity for Fake {
             self.record("post-finish");
             Ok(Some(OwnedProgressArtifact {
                 channel: "C1".into(),
-                timestamp: "1.000002".into(),
+                timestamp: "1700000000.000002".into(),
             }))
         })
     }
@@ -89,8 +89,8 @@ impl ChatActivity for Fake {
 fn target(user: &str) -> ActivityTarget {
     ActivityTarget::Slack {
         channel_id: "C1".into(),
-        thread_ts: "1.000001".into(),
-        message_ts: "1.000001".into(),
+        thread_ts: "1700000000.000001".into(),
+        message_ts: "1700000000.000001".into(),
         initiator_user_id: user.into(),
     }
 }
@@ -315,4 +315,141 @@ async fn runtime_flood_coalesces_to_one_update_and_optional_work_enables_posting
     lease.finish_in_background();
     wait(&optional.hidden).await;
     assert_eq!(optional.deletes.load(Ordering::Acquire), 1);
+}
+
+fn native(endpoint: String) -> SlackTransport {
+    SlackTransport::new(
+        "native-fixture".into(),
+        endpoint,
+        "app".into(),
+        "bot".into(),
+        SlackExperience::Agent,
+        SlackActivityConfig {
+            mode: ActivityMode::Native,
+            classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
+        },
+    )
+    .unwrap()
+}
+fn wire(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+async fn until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("bounded native activity lifecycle");
+}
+
+#[tokio::test]
+async fn uncertain_native_status_quarantines_later_generations_even_after_fallback_and_cleanup() {
+    for fallback in [
+        r#"{"ok":true}"#,
+        r#"{"ok":false,"error":"already_reacted"}"#,
+    ] {
+        let owned_reaction = fallback == r#"{"ok":true}"#;
+        let mut responses = vec![vec![], wire(fallback), wire(r#"{"ok":true}"#)];
+        if owned_reaction {
+            responses.push(wire(r#"{"ok":true}"#));
+        }
+        let server = dekopon_test_support::LoopbackServer::sequence(responses);
+        let transport = native(server.url());
+        let driver = transport.activity().unwrap();
+        let mut lease = ActivityLease::start(Some(driver.clone()), Some(target("U1")), false);
+        let mut calls = Vec::new();
+        until(|| {
+            calls.extend(server.recorded());
+            calls.len() >= 2
+        })
+        .await;
+        lease.finish_in_background();
+        until(|| transport.replier.active_activity.lock().unwrap().is_empty()).await;
+        calls.extend(server.recorded());
+        assert_eq!(calls.len(), if owned_reaction { 4 } else { 3 });
+        let later = ActivityLease::start(Some(driver), Some(target("U2")), false);
+        assert!(
+            later.publisher().is_none(),
+            "successful fallback/cleanup cannot establish ordering of the lost native write"
+        );
+        assert!(
+            server.recorded().is_empty(),
+            "quarantine issues no new native writes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeated_native_hide_refusals_retire_ownership_without_disabling_new_generations() {
+    let responses = (0..8).flat_map(|_| {
+        [
+            wire(r#"{"ok":true}"#),
+            wire(r#"{"ok":false,"error":"missing_scope"}"#),
+        ]
+    });
+    let server = dekopon_test_support::LoopbackServer::sequence(responses);
+    let transport = native(server.url());
+    let driver = transport.activity().unwrap();
+    let mut calls = Vec::new();
+    for generation in 0..8 {
+        let mut admitted = None;
+        until(|| {
+            let lease = ActivityLease::start(
+                Some(driver.clone()),
+                Some(target(&format!("U{generation}"))),
+                false,
+            );
+            if lease.publisher().is_some() {
+                admitted = Some(lease);
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+        let mut lease = admitted.unwrap();
+        until(|| {
+            calls.extend(server.recorded());
+            calls.len() == generation * 2 + 1
+        })
+        .await;
+        lease.finish_in_background();
+        until(|| {
+            calls.extend(server.recorded());
+            calls.len() == (generation + 1) * 2
+                && transport.replier.active_activity.lock().unwrap().is_empty()
+        })
+        .await;
+    }
+    assert_eq!(
+        calls.len(),
+        16,
+        "each native generation shows and attempts one definitive refused hide"
+    );
+    assert!(transport.replier.active_activity.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn uncertain_reaction_cleanup_is_not_hidden_by_a_definitive_native_cleanup_error() {
+    let server = dekopon_test_support::LoopbackServer::sequence([
+        wire(r#"{"ok":false,"error":"temporary_failure"}"#),
+        wire(r#"{"ok":true}"#),
+        wire(r#"{"ok":false,"error":"missing_scope"}"#),
+        vec![],
+    ]);
+    let transport = native(server.url());
+    transport.replier.show(target("U1")).await.unwrap();
+    let error = transport.replier.hide(target("U1")).await.unwrap_err();
+    assert!(
+        crate::activity::uncertain(&error),
+        "uncertain removal must reach quarantine, not be discarded behind missing_scope"
+    );
+    transport.replier.retire(&target("U1"));
 }

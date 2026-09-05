@@ -3,7 +3,7 @@
 use crate::transport::{ActivityTarget, ChatActivity, TransportError};
 use dekopon_harness::activity::{ActivityEvent, ActivityLabel, ActivityPublisher};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     future::Future,
     sync::{
         Arc, Mutex, OnceLock,
@@ -23,7 +23,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 static REQUESTS: Semaphore = Semaphore::const_new(16);
 // Active/cleanup targets and quarantined uncertain native targets share the same hard ceiling.
-static TARGETS: OnceLock<Mutex<HashSet<(usize, ActivityTarget)>>> = OnceLock::new();
+type Targets = HashMap<(usize, ActivityTarget), std::sync::Weak<dyn ChatActivity>>;
+static TARGETS: OnceLock<Mutex<Targets>> = OnceLock::new();
 
 struct TargetLease {
     key: (usize, ActivityTarget),
@@ -47,9 +48,12 @@ impl TargetLease {
             .get_or_init(Default::default)
             .lock()
             .expect("activity targets");
-        if targets.len() >= 128 || !targets.insert(key.clone()) {
+        if targets.len() >= 128 || targets.contains_key(&key) {
             return None;
         }
+        // Keep the allocation identity reserved even after a quarantined driver drops. A reused
+        // Arc address must not accidentally quarantine an unrelated later installation.
+        targets.insert(key.clone(), Arc::downgrade(driver));
         Some(Self {
             key,
             quarantine: false,

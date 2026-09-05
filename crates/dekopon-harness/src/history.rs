@@ -69,6 +69,16 @@ pub struct Excerpt {
     pub truncated: bool,
 }
 impl Excerpt {
+    pub(crate) fn render(&self) -> String {
+        if self.truncated {
+            format!(
+                "{}\n[excerpt; original {} bytes, sha256 {}]",
+                self.text, self.original_bytes, self.digest
+            )
+        } else {
+            self.text.clone()
+        }
+    }
     pub(crate) fn new(text: &str, maximum: usize) -> Self {
         let mut end = text.len().min(maximum);
         while !text.is_char_boundary(end) {

@@ -892,10 +892,13 @@ fn run_replay(
 async fn load_recorded(source: &SessionSourceArgs) -> Result<RecordedSession, AppError> {
     if let Some(path) = &source.from_file {
         let text = read_text_file(path)?;
-        return serde_json::from_str(&text).map_err(|error| AppError::ParseRecording {
-            path: path.clone(),
-            source: error,
-        });
+        let recorded: RecordedSession =
+            serde_json::from_str(&text).map_err(|error| AppError::ParseRecording {
+                path: path.clone(),
+                source: error,
+            })?;
+        recorded.validate().map_err(AppError::Recording)?;
+        return Ok(recorded);
     }
     let trace_id = source
         .trace_id
@@ -1064,14 +1067,40 @@ fn render_transcript(recorded: &RecordedSession) -> String {
     for system in &recorded.system {
         text.push_str(&format!("system:\n{}\n", indented(system)));
     }
-    for exchange in &recorded.history {
-        text.push_str(&format!("user (earlier):\n{}\n", indented(&exchange.user)));
-        if let Some(answer) = &exchange.answer {
-            text.push_str(&format!("assistant (earlier):\n{}\n", indented(answer)));
+    if let Some(initial) = recorded.contexts.first() {
+        for message in initial
+            .messages
+            .iter()
+            .take(initial.messages.len().saturating_sub(1))
+            .filter(|m| m.role != "system")
+        {
+            render_context_message(&mut text, message, " (earlier)");
+        }
+    } else {
+        for exchange in &recorded.history {
+            text.push_str(&format!("user (earlier):\n{}\n", indented(&exchange.user)));
+            if let Some(answer) = &exchange.answer {
+                text.push_str(&format!("assistant (earlier):\n{}\n", indented(answer)));
+            }
         }
     }
     text.push_str(&format!("user:\n{}\n", indented(&recorded.prompt)));
     for turn in &recorded.turns {
+        if let Some(context) = recorded
+            .contexts
+            .iter()
+            .skip(1)
+            .find(|c| c.turn == turn.turn && c.scope == "full")
+        {
+            text.push_str(&format!(
+                "context revision {} (turn {}):\n",
+                context.revision.unwrap_or_default(),
+                context.turn
+            ));
+            for message in &context.messages {
+                render_context_message(&mut text, message, " (context)");
+            }
+        }
         let mut header = format!("turn {}", turn.turn);
         if let Some(duration) = turn.duration_ms {
             header.push_str(&format!(" [{duration:.0} ms"));
@@ -1099,6 +1128,29 @@ fn render_transcript(recorded: &RecordedSession) -> String {
         None => text.push_str("answer: (none recorded)\n"),
     }
     text
+}
+
+fn render_context_message(
+    text: &mut String,
+    message: &dekopon_harness::replay::RecordedMessage,
+    label: &str,
+) {
+    text.push_str(&format!(
+        "{}{label}:\n{}\n",
+        message.role,
+        indented(message.content.as_deref().unwrap_or_default())
+    ));
+    for call in &message.tool_calls {
+        text.push_str(&format!(
+            "  tool {} [{}]:\n{}\n",
+            call.function.name,
+            call.id,
+            indented(&call.function.arguments)
+        ));
+    }
+    if let Some(id) = &message.tool_call_id {
+        text.push_str(&format!("  answers tool {id}\n"));
+    }
 }
 
 fn render_tool_call(text: &mut String, call: &RecordedToolCall) {

@@ -140,7 +140,9 @@ The clean-break runtime, checkpoint bounds, delivery/accounting ownership and kn
 limitations are documented in [`docs/harness.md`](../../docs/harness.md).
 
 Slack refuses duplicate authenticated endpoint/team/bot installations. Final/progress posts share
-bounded one-second channel slots; only a definitive HTTP 429 can retry a final post once (bounded
-Retry-After). Unknown creations never retry. Native cleanup metadata retires after bounded cleanup;
+bounded one-second channel slots, rechecked before transmission and extended from response arrival;
+only a definitive HTTP 429 can retry a final post once (Retry-After at most five seconds inside a
+ten-second pacing budget). Unknown creations never retry. Native cleanup metadata retires after bounded cleanup;
 unknown native ordering remains under the coordinator's counted quarantine. Platform pacing can
-delay acceptance, independently of cosmetic I/O.
+delay acceptance, independently of cosmetic I/O. Gateway cancellation wrappers forward fresh broker
+surface checks; a broker restart or Cedar revocation during inference fences stale disclosure.

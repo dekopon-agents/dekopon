@@ -292,11 +292,22 @@ fn report_deltas_come_only_from_the_tracker_and_restore_the_consume_cursor() {
 
 #[test]
 fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
     let captured = dekopon_test_support::CaptureLayer::new();
-    let subscriber = tracing_subscriber::registry().with(captured.clone());
-    let job = tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    let test_thread = std::thread::current().id();
+    // tracing-core's single-dispatch fast path registers new callsites against the current
+    // thread's dispatcher. A thread-local capture plus rebuild_interest_cache cannot prevent
+    // a parallel, unsubscribed test from subsequently caching Interest::never. Install the
+    // subscriber globally, but capture only this test's thread; sibling tests remain parallel
+    // and cannot contaminate the exact accounting counts or retain their payloads here.
+    let subscriber = tracing_subscriber::registry().with(captured.clone().with_filter(
+        tracing_subscriber::filter::dynamic_filter_fn(move |_, _| {
+            std::thread::current().id() == test_thread
+        }),
+    ));
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("only global subscriber in this binary");
+    let job = {
         let root = tracing::info_span!("host-message");
         let _root = root.enter();
         let ledger = JobAccounting::default();
@@ -347,7 +358,13 @@ fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
         assert!(ledger.finalize(&DeliveryDisposition::Failed));
         assert!(!ledger.finalize(&DeliveryDisposition::Unknown));
         ledger.snapshot().job
-    });
+    };
+    for record in captured.records() {
+        if let dekopon_test_support::Record::Event { level, target, .. } = record {
+            assert_eq!(level, "INFO");
+            assert_eq!(target, "dekopon_harness::audit");
+        }
+    }
     let events = captured.events();
     let mut counts = [0; 3];
     for (fields, parent) in &events {
@@ -392,4 +409,128 @@ fn accounting_events_pin_typed_levels_fields_and_matching_span_parentage() {
             && text.contains("\"cumulative\":")
     );
     assert!(text.contains("delivery=\"failed\""));
+}
+
+#[test]
+fn exported_calls_equal_tracker_totals_across_models_failures_images_and_missing_usage() {
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let known = [Some(100), Some(60), Some(20), Some(10), Some(120)];
+    for missing in [false, true] {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let tracked = tracing::subscriber::with_default(subscriber, || {
+            let mut tracker = fixture_tracker("export-job", &[known; 4]);
+            tracker.calls[1].identity.model = "second-model".into();
+            tracker.calls[1].identity.backend = "other-backend".into();
+            tracker.calls[2].kind = CallKind::Image;
+            tracker.calls[2].identity.model = "image-model".into();
+            tracker.calls[2].model_turn = 2; // image and chat can share a model turn
+            tracker.calls[3].model_turn = 3;
+            tracker.calls[3].identity = tracker.calls[1].identity.clone();
+            // A retry is another observed attempt, not another logical call or aggregation row.
+            let mut retry = tracker.calls[1].attempts[0].clone();
+            retry.sequence = 2;
+            tracker.calls[1].attempts.push(retry);
+            if missing {
+                tracker.calls[0].attempts[0].observation = None;
+                tracker.calls[2].attempts[0]
+                    .observation
+                    .as_mut()
+                    .unwrap()
+                    .usage
+                    .total_tokens = None;
+                tracker.calls[3].attempts.clear();
+                tracker.calls[3].attempts_complete = false;
+            }
+            for call in &mut tracker.calls {
+                call.event_sequence = None;
+            }
+            let mut live = LiveAccounting {
+                tracker,
+                span: None,
+                store: None,
+            };
+            for sequence in 1..=4 {
+                finish_call(
+                    &mut live,
+                    sequence,
+                    if sequence == 1 || sequence == 3 {
+                        CallOutcome::Failed
+                    } else {
+                        CallOutcome::Succeeded
+                    },
+                    "fixture",
+                    0,
+                    false,
+                );
+            }
+            finalize(&mut live, &DeliveryDisposition::Failed);
+            live.tracker.clone()
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let mut records: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                let mut fields = event["fields"].clone();
+                fields["trace_id"] = serde_json::json!("export");
+                fields
+            })
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["audit.event"] == "accounting.model.call")
+                .count(),
+            4
+        );
+        records.push(serde_json::json!({"trace_id":"export","audit.event":"agent.model.prompt","model.turn":1,"transcript.scope":"full","messages":"[{\"role\":\"user\",\"content\":\"request\"}]"}));
+        records.extend(records.clone());
+        records.reverse();
+        let recorded = crate::replay::RecordedSession::from_records("export", &records).unwrap();
+        assert!(
+            recorded.turns.is_empty(),
+            "failed calls need no assistant transcript"
+        );
+        assert_eq!(recorded.calls.as_ref().unwrap().len(), 4);
+        assert_eq!(
+            recorded
+                .calls
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|c| c.kind == "image")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded.usage(),
+            crate::replay::RecordedUsage::from(tracked.totals().cumulative.usage())
+        );
+        assert_eq!(tracked.totals().per_model.len(), 3);
+        if missing {
+            assert_eq!(recorded.usage(), crate::replay::RecordedUsage::default());
+        } else {
+            assert_eq!(recorded.usage().total_tokens, Some(600));
+            assert_eq!(recorded.usage().input_tokens, Some(500));
+            assert_eq!(recorded.usage().cached_input_tokens, Some(300));
+        }
+        let file = serde_json::to_vec(&recorded).unwrap();
+        let decoded: crate::replay::RecordedSession = serde_json::from_slice(&file).unwrap();
+        assert_eq!(decoded.usage(), recorded.usage());
+    }
 }

@@ -159,3 +159,252 @@ async fn progress_message_and_activity_labels_configuration_is_strict_bounded_an
     );
     assert!(load(directory.path(), &doc).await.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_answers_survive_enforced_slack_channel_quota_with_progress_on_or_off() {
+    use dekopon_harness::history::DeliveryDisposition;
+    for progress in [false, true] {
+        for outage in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let recorded = calls.clone();
+            let posted = Arc::new(tokio::sync::Notify::new());
+            let post_seen = posted.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut stopped = std::pin::pin!(stopped);
+                let mut last = HashMap::<String, Instant>::new();
+                let mut sequence = 1;
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        result = &mut stopped => { result.unwrap(); break; }
+                        accepted = tokio::time::timeout(Duration::from_secs(15), listener.accept()) => accepted.unwrap().unwrap(),
+                    };
+                    let (path, _, body) = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        read_http_request_parts(&mut stream),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let body: Value = serde_json::from_str(&body).unwrap();
+                    let channel = body["channel"].as_str().unwrap().to_owned();
+                    let cosmetic = body["text"] == "Working…";
+                    let now = Instant::now();
+                    let status = match path.as_str() {
+                        "/api/chat.postMessage" => {
+                            if (outage && !cosmetic)
+                                || last.get(&channel).is_some_and(|prior| {
+                                    now.duration_since(*prior) < Duration::from_secs(1)
+                                })
+                            {
+                                429
+                            } else {
+                                last.insert(channel.clone(), now);
+                                sequence += 1;
+                                200
+                            }
+                        }
+                        "/api/chat.delete" => 200,
+                        _ => panic!("unexpected Slack endpoint {path}"),
+                    };
+                    let timestamp = if path == "/api/chat.delete" {
+                        body["ts"].as_str().unwrap().to_owned()
+                    } else {
+                        format!("1700000000.{sequence:06}")
+                    };
+                    let response =
+                        json!({"ok":status == 200,"channel":channel,"ts":timestamp}).to_string();
+                    let retry = if outage { 6 } else { 1 };
+                    let wire = format!(
+                        "HTTP/1.1 {status} OK\r\nRetry-After: {retry}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    );
+                    recorded.lock().unwrap().push((path, body, status));
+                    stream.write_all(wire.as_bytes()).await.unwrap();
+                    if cosmetic {
+                        post_seen.notify_one();
+                    }
+                }
+            });
+            let transport = slack_with(
+                &base,
+                SlackExperience::Classic,
+                SlackActivityConfig {
+                    mode: if progress {
+                        ActivityMode::Native
+                    } else {
+                        ActivityMode::Off
+                    },
+                    classic_fallback: SlackActivityFallback::None,
+                    progress_message: progress,
+                },
+            );
+            let directory = temporary();
+            let (broker, mut observed) =
+                stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+            let model = BlockedModel::new("same paid-for answer");
+            let mut runner = runner_with(broker, Arc::new(model.clone()), 4);
+            if let Some(driver) = transport.activity() {
+                Arc::get_mut(&mut runner)
+                    .unwrap()
+                    .activities
+                    .insert("dev".into(), driver);
+            }
+            let bound = persistent_route(model_config(), window());
+            let mut inbound = message("same request");
+            inbound.activity = Some(progress_target());
+            inbound.reply = ReplyTarget::Slack {
+                channel: "C1".into(),
+                thread_ts: Some("1700000000.000001".into()),
+            };
+            let session = tokio::spawn(run_session(
+                runner.clone(),
+                bound.clone(),
+                inbound.clone(),
+                transport.replier(),
+            ));
+            model.wait_until_entered().await;
+            if progress {
+                tokio::time::timeout(Duration::from_secs(3), posted.notified())
+                    .await
+                    .unwrap();
+            }
+            model.release();
+            tokio::time::timeout(Duration::from_secs(12), session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_surface_checks(&mut observed, 3);
+            let seed = session_seed(
+                &runner,
+                &bound,
+                &inbound,
+                listings(1, &["echo.echo"]).remove(0),
+            );
+            let [record] = seed.history.turns() else {
+                panic!("one completed job")
+            };
+            assert_eq!(record.generated.as_deref(), Some("same paid-for answer"));
+            assert_eq!(
+                record.delivery,
+                if outage {
+                    DeliveryDisposition::Failed
+                } else {
+                    DeliveryDisposition::Accepted {
+                        text: "same paid-for answer".into(),
+                    }
+                }
+            );
+            let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
+                .load(&record.job)
+                .unwrap();
+            assert!(checkpoint.finalized);
+            assert_eq!(checkpoint.record, *record);
+            assert_eq!(checkpoint.state.accounting.calls.len(), 1);
+            assert_eq!(checkpoint.state.accounting.calls[0].attempts.len(), 1);
+            if !outage {
+                let target = inbound.reply.clone();
+                let replier = transport.replier();
+                let (a, b) = tokio::join!(
+                    replier.reply(target.clone(), OutboundReply::text("concurrent A")),
+                    replier.reply(target, OutboundReply::text("concurrent B"))
+                );
+                assert!(a.unwrap().accepted());
+                assert!(b.unwrap().accepted());
+            }
+            // Cleanup is independently bounded; it can be shed while finals wait.
+            let finals: Vec<_> = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, body, _)| {
+                    path == "/api/chat.postMessage" && body["text"] != "Working…"
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                finals
+                    .iter()
+                    .filter(|(_, body, status)| body["text"] == "same paid-for answer"
+                        && *status == 200)
+                    .count(),
+                usize::from(!outage)
+            );
+            if outage {
+                assert_eq!(
+                    finals.len(),
+                    1,
+                    "Retry-After beyond the bound is not retried"
+                );
+                assert_eq!(finals[0].2, 429);
+            } else {
+                for text in ["same paid-for answer", "concurrent A", "concurrent B"] {
+                    assert_eq!(
+                        finals
+                            .iter()
+                            .filter(|(_, body, status)| body["text"] == text && *status == 200)
+                            .count(),
+                        1,
+                        "exactly one accepted copy of each final"
+                    );
+                }
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn authenticated_duplicate_slack_startup_refuses_before_opening_another_socket() {
+    let first_socket = spawn_socket_mock(vec![]);
+    let next_socket = spawn_socket_mock(vec![]);
+    let http = spawn_http_mock(slack_handler(vec![first_socket.url, next_socket.url]));
+    let mut first = slack(&http.base);
+    first.connect().await.unwrap();
+    let retained_replier = first.replier();
+    let mut duplicate = crate::transport::slack::SlackTransport::new(
+        "independent-config".into(),
+        http.base.clone(),
+        "another-app-token".into(),
+        "another-bot-token".into(),
+        SlackExperience::Classic,
+        SlackActivityConfig::default(),
+    )
+    .unwrap();
+    let error = duplicate.connect().await.unwrap_err();
+    assert!(
+        matches!(error, TransportError::Service { code } if code == "duplicate-slack-installation")
+    );
+    drop(first);
+    let error = duplicate.connect().await.unwrap_err();
+    assert!(
+        matches!(error, TransportError::Service { code } if code == "duplicate-slack-installation"),
+        "a retained reply/activity owner still owns physical installation budgets"
+    );
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        1
+    );
+    drop(retained_replier);
+    duplicate.connect().await.unwrap();
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/auth.test")
+            .count(),
+        4
+    );
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        2
+    );
+}

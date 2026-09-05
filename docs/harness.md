@@ -113,8 +113,16 @@ explicit HTTP 429 may retry a final post once, honoring a bounded Retry-After; u
 never retry. Physical platform pacing can delay acceptance. Runner prompt/replay finalizers now live
 through output write/flush, distinguishing acceptance, failed/partial writes and unknown flushes.
 
-The recording migration remains incomplete: prior portable tool history and later full context
-revisions can still be refused by the legacy history decoder. Independent call accounting now retains
-failed/no-answer and image calls; an absent transcript answer never proves zero spend. Broader gateway
-fixture migration, parallel tracing isolation and full platform-rate delivery-equivalence coverage
-remain validation gaps, not successful claims.
+Recording reconstruction preserves portable tool history and ordered full/delta context revisions,
+including model-switch rebuilds and byte-free attachment summaries between correlated tool results,
+independently of answered turns and call accounting. Replay seeds
+the initial bounded portable context without executing remembered calls or restoring opaque state.
+Failed/no-answer and image calls remain accounted; an absent answer never proves zero spend.
+Replay comparisons count independent chat calls, including failed inference, rather than answers;
+image calls contribute spend but not chat-turn counts. Historical files without independent call
+accounting retain their transcript-turn fallback.
+Focused regressions cover portable reconstruction, parallel accounting capture, gateway safe-yield
+fixtures, real broker restart/revocation during inference, terminal receipts and tiny-window Stop.
+A loopback Slack fixture enforces one accepted post per channel per second with progress on/off,
+including concurrent finals and bounded rate-limit refusal. This does not certify live-platform
+availability or zero quota latency; workspace/MSRV and release gates remain separate requirements.

@@ -2,12 +2,10 @@
 //!
 //! # Why this is its own test binary
 //!
-//! `tracing` caches per-callsite interest **globally and once**, the first time a callsite is hit.
-//! A callsite first reached while no subscriber is installed caches as `Interest::never()` and
-//! stays disabled for every later thread-local subscriber. Every other test that calls
-//! `run_prompt` does exactly that, so sharing a binary with them made this assertion depend on
-//! test execution order — it passed roughly six runs in eight and failed the rest, on CI and
-//! locally alike.
+//! `tracing` caches per-callsite interest globally. Its single-dispatch fast path can register
+//! a callsite against a parallel thread with no subscriber, caching `Interest::never()` even
+//! after a thread-local capture rebuilt the cache. Other prompt tests sharing this binary
+//! could therefore disable instrumentation while this test was running.
 //!
 //! One test per binary removes the race rather than papering over it: nothing else can reach
 //! `prompt.session` or `prompt.script` before the capturing subscriber is in place.
@@ -212,6 +210,7 @@ async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge
                 "shell.script".to_owned(),
                 "prompt.script".to_owned(),
                 "prompt.session".to_owned(),
+                "accounting.model.job".to_owned(),
                 "runner.prompt".to_owned(),
             ],
             "an interpreter span must land inside the script span that drove it"

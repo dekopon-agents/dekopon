@@ -51,14 +51,7 @@ pub(crate) fn replay_job(job: &JobRecord, messages: &mut Vec<ModelMessage>) {
                 replay_items: Vec::new(),
             }));
             for result in &group.results {
-                let text = if result.result.truncated {
-                    format!(
-                        "{}\n[excerpt; original {} bytes, sha256 {}]",
-                        result.result.text, result.result.original_bytes, result.result.digest
-                    )
-                } else {
-                    result.result.text.clone()
-                };
+                let text = result.result.render();
                 let index = group
                     .calls
                     .iter()
