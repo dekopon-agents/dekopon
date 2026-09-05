@@ -969,14 +969,34 @@ fn unfinished_batch_reusing_a_provider_id_cannot_capture_earlier_success() {
 /// Driven at both sizes on purpose. The ceiling that used to select the second encoding is the
 /// *group* ceiling, so a snapshot under 512 KiB never showed the cost at all: the corpus a busy
 /// session actually accumulates is the one that paid it.
+///
+/// The large fixture carries its corpus in `record.groups` deliberately. That field is the one the
+/// old algorithm walked a second time — once whole in the `while` condition that bounded it, once
+/// more as part of the document `validate` encoded — so a corpus parked anywhere else (user text,
+/// the execution ledger) leaves `groups` encoding to the two bytes `[]` and makes the two
+/// algorithms cost the same. Only a large `groups` can fail on the old code.
 #[test]
 fn one_mutation_encodes_the_checkpoint_once() {
     for large in [false, true] {
         let store = Arc::new(MemoryCheckpointStore::default());
         let mut stored = snapshot();
         if large {
-            // Comfortably past MAX_GROUP_BYTES with no oversized group: user text plus a ledger,
-            // which is what a long-running session with a large corpus looks like.
+            // Comfortably past MAX_GROUP_BYTES with no oversized group: model-facing batches plus
+            // user text and a ledger, which is what a long-running session with a large corpus
+            // looks like. The batches stay just under the group ceiling, so the trimming loop
+            // never runs and what this measures is the encoding rather than the omissions.
+            stored.record.groups = (0..118)
+                .map(|call| crate::history::ToolGroup {
+                    call,
+                    calls: script("echo one").tool_calls,
+                    results: vec![crate::history::ToolResult {
+                        id: "call-a".into(),
+                        result: Excerpt::new(&"g".repeat(MAX_EXCERPT_BYTES), MAX_EXCERPT_BYTES),
+                    }],
+                    omitted: false,
+                    provenance: None,
+                })
+                .collect();
             stored.record.user = "u".repeat(120 * 1024);
             stored.record.executions = (0..96)
                 .map(|i| ExecutionRecord {
@@ -994,10 +1014,18 @@ fn one_mutation_encodes_the_checkpoint_once() {
                 .collect();
         }
         let measured = stored.measure().expect("the fixture encodes");
+        let groups = crate::checkpoint::encoded_len(&stored.record.groups).expect("groups encode");
         assert_eq!(
             measured > crate::context::MAX_GROUP_BYTES,
             large,
             "the fixture sits on the side of the group ceiling this pass is about"
+        );
+        assert_eq!(
+            large,
+            groups > crate::context::MAX_GROUP_BYTES / 2
+                && groups <= crate::context::MAX_GROUP_BYTES,
+            "the large pass parks its corpus in the groups, under the ceiling that would trim \
+             them: {groups} bytes of groups"
         );
         let journal =
             ExecutionJournal::new(store.clone(), stored, true, None).expect("journal opens");
@@ -1013,7 +1041,8 @@ fn one_mutation_encodes_the_checkpoint_once() {
             assert!(
                 encoded <= mutations * (measured + 64),
                 "{mutations} mutations walk the {measured}-byte document {mutations} times, \
-                 not twice each: {encoded} bytes measured"
+                 not twice each: {encoded} bytes measured. Encoding the {groups} bytes of groups \
+                 a second time each, as the old algorithm did, exceeds this bound."
             );
         }
     }
