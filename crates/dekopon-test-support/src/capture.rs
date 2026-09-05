@@ -6,14 +6,18 @@
 //! instrumentation event by event, which both drowns the assertions and makes them depend on a
 //! dependency's logging.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+    thread::ThreadId,
+};
 
 use tracing::{
     Metadata,
     field::{Field, Visit},
     subscriber::Interest,
 };
-use tracing_subscriber::{layer::Context, registry::LookupSpan};
+use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 /// One captured span or event, flattened to the strings a collector would receive.
 #[derive(Clone, Debug)]
@@ -153,6 +157,173 @@ impl CaptureLayer {
     pub fn clear(&self) {
         self.records.lock().expect("capture sink").clear();
     }
+
+    /// Captures this thread's workspace callsites through the process-global subscriber.
+    ///
+    /// This is the only correct way for a test that runs beside others in the same binary to
+    /// capture `tracing`; see [`CaptureSession`] for why a scoped dispatcher is not.
+    #[must_use]
+    pub fn install() -> CaptureSession {
+        Self::install_with_target_prefix(GLOBAL_TARGET_PREFIX)
+    }
+
+    /// The same, narrowed to callsites whose target begins with `prefix`.
+    ///
+    /// # Panics
+    ///
+    /// When `prefix` does not itself begin with `dekopon`: the global subscriber refuses every
+    /// other target outright, so such a capture could only ever be empty.
+    #[must_use]
+    pub fn install_with_target_prefix(prefix: &'static str) -> CaptureSession {
+        assert!(
+            prefix.starts_with(GLOBAL_TARGET_PREFIX),
+            "a capture prefix must begin with {GLOBAL_TARGET_PREFIX:?}; the global capture \
+             subscriber refuses every other target"
+        );
+        install_global_subscriber();
+        let thread = std::thread::current().id();
+        let layer = Self::with_target_prefix(prefix);
+        let previous = routes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread, layer.clone());
+        assert!(
+            previous.is_none(),
+            "a CaptureSession for this thread is still alive; one capture per thread"
+        );
+        CaptureSession { layer, thread }
+    }
+}
+
+/// The one target prefix the process-global capture subscriber will consider at all.
+const GLOBAL_TARGET_PREFIX: &str = "dekopon";
+
+/// One test's capture, routed to it by thread from the process-global subscriber.
+///
+/// `tracing` caches interest per callsite for the whole process, and its single-dispatch fast path
+/// registers a callsite against whatever dispatcher the *first* thread to reach it had. A test that
+/// installs a scoped dispatcher (`with_default`, `with_subscriber`) therefore races every sibling
+/// test in the same binary: a sibling reaching the callsite first, with no dispatcher, caches
+/// `Interest::never()`, and the capturing test fails with `missing <event>` only under parallel
+/// load. `rebuild_interest_cache` does not close the race, because the sibling can re-register
+/// afterwards.
+///
+/// The fix is one dispatcher for the process, installed once and never replaced, so a cached
+/// interest stays correct: this session installs it (the first caller in the binary does) and
+/// registers the calling thread in a routing table. Events are attributed to the thread that
+/// emitted them, so sibling tests stay parallel and cannot contaminate each other's records.
+/// Dropping the session unregisters the thread.
+///
+/// A capture is therefore per *thread*, not per task: drive it from a `#[test]`, or from a
+/// `#[tokio::test]` on the default current-thread runtime, and do not spawn the work under test
+/// onto another thread.
+pub struct CaptureSession {
+    layer: CaptureLayer,
+    thread: ThreadId,
+}
+
+impl std::ops::Deref for CaptureSession {
+    type Target = CaptureLayer;
+    fn deref(&self) -> &CaptureLayer {
+        &self.layer
+    }
+}
+
+impl Drop for CaptureSession {
+    fn drop(&mut self) {
+        routes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.thread);
+    }
+}
+
+fn routes() -> &'static Mutex<HashMap<ThreadId, CaptureLayer>> {
+    static ROUTES: OnceLock<Mutex<HashMap<ThreadId, CaptureLayer>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn route() -> Option<CaptureLayer> {
+    routes()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&std::thread::current().id())
+        .cloned()
+}
+
+fn install_global_subscriber() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let subscriber = tracing_subscriber::registry().with(RoutingLayer);
+        if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+            panic!(
+                "CaptureLayer::install owns this test binary's global subscriber, and something \
+                 else set one first: {error}"
+            );
+        }
+        // Callsites a sibling test reached before this point were registered against the default
+        // no-op dispatcher. Rebuilding is sound exactly because this dispatcher is now permanent.
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+/// Routes each span and event to the capture registered for the emitting thread, if any.
+struct RoutingLayer;
+
+impl<S> Layer<S> for RoutingLayer
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    /// The process-wide answer, so it is safe to cache: a target outside this workspace is never
+    /// captured by any session, and one inside it is offered to whichever session owns the thread.
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if metadata.target().starts_with(GLOBAL_TARGET_PREFIX) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>, _context: Context<'_, S>) -> bool {
+        metadata.target().starts_with(GLOBAL_TARGET_PREFIX)
+    }
+
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        context: Context<'_, S>,
+    ) {
+        if let Some(layer) = route()
+            && layer.interested(attributes.metadata())
+        {
+            <CaptureLayer as Layer<S>>::on_new_span(&layer, attributes, id, context);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        context: Context<'_, S>,
+    ) {
+        if let Some(layer) = route()
+            && context
+                .span(id)
+                .is_some_and(|span| layer.interested(span.metadata()))
+        {
+            <CaptureLayer as Layer<S>>::on_record(&layer, id, values, context);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
+        if let Some(layer) = route()
+            && layer.interested(event.metadata())
+        {
+            <CaptureLayer as Layer<S>>::on_event(&layer, event, context);
+        }
+    }
 }
 
 fn render<'a>(records: impl Iterator<Item = &'a Record>) -> String {
@@ -256,5 +427,62 @@ struct Visitor<'a>(&'a mut String);
 impl Visit for Visitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::CaptureLayer;
+
+    /// The property the routing table exists for: two tests capturing at the same moment on two
+    /// threads each see their own events and none of the other's.
+    #[test]
+    fn two_captures_running_at_once_on_two_threads_do_not_cross_talk() {
+        let barrier = Arc::new(Barrier::new(2));
+        let threads = ["alpha", "beta"].map(|marker| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let capture = CaptureLayer::install();
+                // Both captures are registered before either emits, so an event landing in the
+                // wrong sink would be observed rather than merely possible.
+                barrier.wait();
+                for sequence in 0..64 {
+                    tracing::info!(marker, sequence, "capture routing fixture");
+                }
+                barrier.wait();
+                capture.events_text()
+            })
+        });
+        let [alpha, beta] = threads.map(|thread| thread.join().expect("capture thread joins"));
+
+        assert_eq!(alpha.lines().count(), 64, "{alpha}");
+        assert_eq!(beta.lines().count(), 64, "{beta}");
+        assert!(alpha.contains("marker=\"alpha\""), "{alpha}");
+        assert!(!alpha.contains("beta"), "{alpha}");
+        assert!(beta.contains("marker=\"beta\""), "{beta}");
+        assert!(!beta.contains("alpha"), "{beta}");
+    }
+
+    /// A dropped session leaves no route behind, so a later test reusing the thread starts empty.
+    #[test]
+    fn a_dropped_session_stops_capturing_and_frees_the_thread() {
+        {
+            let capture = CaptureLayer::install();
+            tracing::info!(marker = "first", "capture routing fixture");
+            assert!(capture.saw("first"));
+        }
+        tracing::info!(marker = "between", "capture routing fixture");
+        let capture = CaptureLayer::install();
+        tracing::info!(marker = "second", "capture routing fixture");
+        assert!(capture.saw("second"));
+        assert!(!capture.saw("between"), "{}", capture.events_text());
+    }
+
+    #[test]
+    #[should_panic(expected = "must begin with")]
+    fn a_prefix_the_global_subscriber_refuses_is_rejected_at_install() {
+        let _capture = CaptureLayer::install_with_target_prefix("wasmtime");
     }
 }
