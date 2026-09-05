@@ -1259,6 +1259,22 @@ impl PromptError {
             Self::MaxSteps { .. } => "max-steps",
         }
     }
+
+    /// A second stable token naming *which* failure of that kind, where one exists.
+    ///
+    /// [`Self::telemetry_kind`] answers "what class"; this answers "which one", and like it never
+    /// carries model-, provider-, or transport-authored text. A control failure is the case that
+    /// needs it: `model-control` collapses a substituted decision binding, a broker that never
+    /// answered, and a spent attempt budget, and an operator acts differently on each. Variants
+    /// whose only remaining detail is untrusted text — a model-selected tool name, a decoder
+    /// diagnostic — deliberately have none, and are read from the error itself instead.
+    #[must_use]
+    pub fn telemetry_cause(&self) -> Option<&'static str> {
+        match self {
+            Self::Control(error) => Some(crate::control::ControlFailureKind::of(error).as_str()),
+            _ => None,
+        }
+    }
 }
 
 fn transcript(messages: &[ModelMessage]) -> String {

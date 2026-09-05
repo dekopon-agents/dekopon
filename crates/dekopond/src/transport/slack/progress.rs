@@ -24,6 +24,32 @@ const POST_TOTAL_WAIT_CEILING: Duration = Duration::from_secs(120);
 const UNSTATED_RETRY_PENALTY: Duration = Duration::from_secs(5);
 /// Longest server-stated backoff this process sleeps through before retrying the same post once.
 const MAX_HONORED_RETRY: Duration = Duration::from_secs(5);
+/// What a 429 with no usable `Retry-After` puts on the cosmetic budget's own cooldown.
+const UNSTATED_COSMETIC_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The `Retry-After` a 429 stated, in seconds, or `None` when it stated none this process can use.
+fn stated_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, 86400)))
+}
+
+/// How long a 429 parks the *shared channel slot*, whichever writer of [`PostRate`] observed it.
+///
+/// One definition for both, because both create a message in the same physical channel and draw
+/// the same platform 429: the final `chat.postMessage`/`files.completeUploadExternal` path and the
+/// cosmetic ⌛ progress post. A park is what every *other* sender in the channel then waits out, so
+/// a day-long `Retry-After` parked here would leave a slot no later caller can reach and turn every
+/// answer in that channel into an instant `post-capacity`. The stating caller's own cooldown and
+/// refusal keep the full value; only the slot everyone shares is capped.
+fn channel_post_park(stated: Option<Duration>) -> Duration {
+    stated
+        .unwrap_or(UNSTATED_RETRY_PENALTY)
+        .min(POST_WAIT_CEILING)
+}
 
 /// Only a validated creation response can construct this handle. Not a delivery receipt.
 pub(crate) struct OwnedProgressArtifact {
@@ -211,18 +237,11 @@ impl SlackReplier {
             if response.status().as_u16() != 429 {
                 return check_ok(response).await;
             }
-            let stated = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(|seconds| Duration::from_secs(seconds.max(1)));
+            let stated = stated_retry_after(&response);
             // The penalty is bounded by the wait ceiling: a day-long Retry-After must not make
             // every other sender in this channel wait past it, and it must not park the slot
             // somewhere no later caller can reach.
-            let penalty = stated
-                .unwrap_or(UNSTATED_RETRY_PENALTY)
-                .min(POST_WAIT_CEILING);
+            let penalty = channel_post_park(stated);
             self.channel_post_completed(channel, penalty);
             // One retry per post, and only for a backoff the service actually stated and this
             // caller can sit through. Anything longer is this caller's refusal, not the channel's.
@@ -382,21 +401,19 @@ impl SlackReplier {
         }
         let status = response.status();
         if status.as_u16() == 429 {
-            let seconds = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(60)
-                .clamp(1, 86400);
-            let retry_after = Duration::from_secs(seconds);
+            let stated = stated_retry_after(&response);
+            let retry_after = stated.unwrap_or(UNSTATED_COSMETIC_COOLDOWN);
             if method == "chat.postMessage" {
+                // The ⌛ progress post is a `chat.postMessage` on the same physical channel as the
+                // answer, so its 429 parks the slot every other sender in that channel waits on.
+                // It goes through the same bound the final-post path uses: parking the shared slot
+                // for the stated hour would drop every later answer there as `post-capacity`.
                 self.post_rate
                     .lock()
                     .expect("Slack channel post rate")
                     .completed(
                         body["channel"].as_str().ok_or(TransportError::Response)?,
-                        retry_after,
+                        channel_post_park(stated),
                     );
             }
             self.cosmetic_rate
@@ -681,6 +698,61 @@ mod rate_tests {
                 "{header:?} parks the slot for {parked:?}, not {remaining:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_429_on_the_progress_post_never_parks_the_channel_past_the_wait_ceiling() {
+        // The ⌛ post is the other writer of the shared channel slot, and it draws the same
+        // platform 429 the answer does. Parking the slot for the stated hour there dropped every
+        // later answer in that channel — including the failure fallback — as `post-capacity`,
+        // which is the finding's exact scenario reached through the sibling path.
+        let server = dekopon_test_support::LoopbackServer::sequence([
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            response(200, r#"{"ok":true,"channel":"C1","ts":"1700000000.000003"}"#),
+        ]);
+        let transport = with_endpoint(server.url(), true);
+        let replier = &transport.replier;
+        let rate_limited = replier
+            .cosmetic_json("chat.postMessage", &json!({"channel": "C1", "text": "⌛"}))
+            .await
+            .expect_err("the progress post is rate limited");
+        assert!(
+            matches!(&rate_limited, TransportError::ActivityRateLimited { retry_after }
+                if *retry_after == Duration::from_secs(3600)),
+            "the stating caller still learns the whole stated backoff: {rate_limited:?}"
+        );
+        let park = replier.post_rate.lock().unwrap().next["C1"];
+        assert!(
+            park <= Instant::now() + POST_WAIT_CEILING,
+            "the shared slot is parked to the ceiling, not to the stated hour"
+        );
+
+        // Virtual from here: the park is a minute, and a real one would be a minute of test.
+        tokio::time::pause();
+        let start = Instant::now();
+        replier
+            .reserve_channel_post("C1", Instant::now())
+            .await
+            .expect("a following answer waits the progress post's park out, not `post-capacity`");
+        assert!(
+            start.elapsed() >= POST_WAIT_CEILING - Duration::from_secs(2),
+            "it waited the park out: {:?}",
+            start.elapsed()
+        );
+        tokio::time::resume();
+        assert!(
+            replier
+                .reply(
+                    ReplyTarget::Slack {
+                        channel: "C1".into(),
+                        thread_ts: None,
+                    },
+                    OutboundReply::text("the answer this session paid for"),
+                )
+                .await
+                .expect("the answer posts once the park expires")
+                .accepted()
+        );
     }
 
     #[tokio::test]

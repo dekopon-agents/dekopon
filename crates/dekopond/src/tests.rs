@@ -5337,6 +5337,80 @@ fn the_route_and_conversation_cache_lanes_cannot_collide() {
     );
 }
 
+/// A session failure reports a stable cause, never the error chain behind it.
+///
+/// `gateway_session_failed` is the terminal catch-all for every `SessionError`, so whatever it
+/// records is recorded for `PromptError::UnknownTool` too — and that variant carries the tool name
+/// the *model* chose. `docs/observability.md` promises model-selected names never reach an event,
+/// and the harness says so at the site that builds the error. A cause is still required, so the
+/// event carries the control failure kind where there is one and the category otherwise.
+#[test]
+fn a_session_failure_names_a_stable_cause_and_never_the_model_s_own_text() {
+    const AUTHORED: &str = "exfiltrate; rm -rf /";
+    let unknown_tool = SessionError::Prompt(dekopon_harness::session::PromptError::UnknownTool(
+        AUTHORED.to_owned(),
+    ));
+    assert!(
+        dekopon_core::error_chain(&unknown_tool).contains(AUTHORED),
+        "the operator still reads the name from the error itself"
+    );
+    assert_eq!(unknown_tool.category(), "unknown-tool");
+    assert_eq!(
+        unknown_tool.cause(),
+        "unknown-tool",
+        "the cause is a token, not the chain that quotes the model"
+    );
+
+    // Where a finer stable classification exists it is what the cause reports: `model-control`
+    // alone collapses an unusable control surface, a broker that never answered, and a spent
+    // attempt budget, and an operator acts differently on each.
+    let control = SessionError::Prompt(dekopon_harness::session::PromptError::Control(
+        dekopon_harness::control::ControlError::Surface {
+            reason: AUTHORED.to_owned(),
+        },
+    ));
+    assert_eq!(control.category(), "model-control");
+    assert_eq!(control.cause(), "configuration");
+    assert!(
+        !control.cause().contains("rm -rf"),
+        "no variant's cause quotes the text it wrapped"
+    );
+}
+
+/// The exit record publishes how many conversations died with the process, once.
+///
+/// `BoundedConversationStore::tracked` is public API, and public API with nothing but tests behind
+/// it is a bug: this is the shipped reader. It also has to stay a *shutdown* record — a residency
+/// count republished per message would describe a live conversation more often than the eviction
+/// events do — so the assertion is on the exit event, not on a per-message one.
+#[test]
+fn the_exit_record_says_how_many_conversations_died_with_the_process() {
+    let store = BoundedConversationStore::new(8);
+    let now = Instant::now();
+    for conversation in ["c0123abc", "c0456def"] {
+        store.begin(
+            &conversation_key("dev", conversation, SUBJECT),
+            &granted(&["echo.echo"]),
+            window(),
+            now,
+        );
+    }
+
+    let capture = dekopon_test_support::CaptureLayer::install();
+    crate::gateway_stopped("shutdown", store.tracked());
+    let events = capture.events_text();
+    assert!(
+        events.contains("gateway_stopped")
+            && events.contains("reason=\"shutdown\"")
+            && events.contains("conversations=2"),
+        "the exit record carries the residency the store reported: {events}"
+    );
+    assert!(
+        !events.contains("c0123abc") && !events.contains(SUBJECT),
+        "it is a count, never a conversation or a sender: {events}"
+    );
+}
+
 #[test]
 fn a_cache_key_carries_nothing_about_the_sender() {
     // The whole reason the key is minted rather than derived. A canonical subject can be a phone

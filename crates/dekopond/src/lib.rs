@@ -278,7 +278,7 @@ where
     );
 
     let outcome = serve(
-        runner,
+        Arc::clone(&runner),
         routes,
         Arc::new(identities),
         Arc::new(repliers),
@@ -314,16 +314,31 @@ where
 
     match outcome {
         ServeOutcome::Shutdown => {
-            tracing::info!(event = "gateway_stopped", reason = "shutdown");
+            gateway_stopped("shutdown", runner.conversations.tracked());
             Ok(())
         }
         // Nothing can wake the daemon again, and nobody asked it to stop. Exiting successfully
         // here is what let a gateway that lost every workspace to a revoked token look like a
         // clean run to whatever supervises it.
         ServeOutcome::TransportsLost => {
-            tracing::error!(event = "gateway_stopped", reason = "transports-lost");
+            gateway_stopped("transports-lost", runner.conversations.tracked());
             Err(DekopondError::TransportsLost)
         }
+    }
+}
+
+/// The daemon's exit record, and the one place the conversation count is ever published.
+///
+/// Conversations are process memory and die here, so how many were still resident at exit is what
+/// an operator sizing `sessions.maxConversations` reads back: a store that ends every run at the
+/// ceiling was set too low, and the `gateway_conversation_evicted` churn it produced has a
+/// denominator. It is published once, at exit, rather than per message — a size reported on every
+/// message would be one more place a live conversation could be described.
+fn gateway_stopped(reason: &'static str, conversations: usize) {
+    if reason == "shutdown" {
+        tracing::info!(event = "gateway_stopped", reason, conversations);
+    } else {
+        tracing::error!(event = "gateway_stopped", reason, conversations);
     }
 }
 

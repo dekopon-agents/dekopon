@@ -579,8 +579,11 @@ async fn a_progress_message_abandoned_by_the_grace_is_reported_as_its_own_outcom
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_transport_that_cannot_connect_is_named_in_one_refusal() {
-    // Two configurations claiming one Slack installation fail *each other*; naming only the first
-    // one connected hides the half of the conflict an operator has to look at to resolve it.
+    // Startup used to stop at the first transport that could not connect, so an operator who
+    // mis-scoped two of them restarted the daemon once per conflict to discover the next. Two
+    // sockets that cannot bind here; the loop is the same one a refused duplicate Slack
+    // installation goes through, which
+    // `every_configuration_after_the_first_is_refused_for_one_slack_installation` covers.
     let directory = temporary();
     std::fs::write(
         directory.path().join("dekopon.yaml"),
@@ -623,6 +626,50 @@ async fn every_transport_that_cannot_connect_is_named_in_one_refusal() {
     assert!(
         rendered.contains("first-local") && rendered.contains("second-local"),
         "the refusal names both transports: {rendered}"
+    );
+}
+
+/// Every configuration after the first is refused for one installation, and each says so.
+///
+/// The refusal is not mutual: the configuration already holding the installation connected and is
+/// not a failure to report, so a deployment that wrote the same workspace three times gets two
+/// refusals, not three, and neither of them takes the socket away from the one that works.
+#[tokio::test]
+async fn every_configuration_after_the_first_is_refused_for_one_slack_installation() {
+    let socket = spawn_socket_mock(vec![]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut owner = slack(&http.base);
+    owner
+        .connect()
+        .await
+        .expect("the first configuration claims the installation");
+
+    for name in ["second-configuration", "third-configuration"] {
+        let mut duplicate = crate::transport::slack::SlackTransport::new(
+            name.to_owned(),
+            http.base.clone(),
+            "xapp-another-app-token".to_owned(),
+            "xoxb-another-bot-token".to_owned(),
+            SlackExperience::Classic,
+            SlackActivityConfig::default(),
+        )
+        .expect("the duplicate configuration builds");
+        let error = duplicate
+            .connect()
+            .await
+            .expect_err("the installation is already claimed");
+        assert!(
+            matches!(&error, TransportError::Service { code } if code == "duplicate-slack-installation"),
+            "{name}: {error:?}"
+        );
+    }
+    assert_eq!(
+        http.calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/apps.connections.open")
+            .count(),
+        1,
+        "a refused configuration never opened a second socket onto the same installation"
     );
 }
 

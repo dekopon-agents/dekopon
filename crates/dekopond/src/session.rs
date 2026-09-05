@@ -736,7 +736,7 @@ async fn session(
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category(),
-                cause = %dekopon_core::error_chain(&error)
+                cause = error.cause()
             );
             answer(replier, message, FAILURE_REPLY).await;
             return "failed";
@@ -915,7 +915,7 @@ async fn session(
                 tracing::error!(
                     event = "gateway_session_failed",
                     category = error.category(),
-                    cause = %dekopon_core::error_chain(&error)
+                    cause = error.cause()
                 );
                 answer(replier, message, FAILURE_REPLY).await;
                 return "failed";
@@ -1158,7 +1158,7 @@ async fn session(
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category(),
-                cause = %dekopon_core::error_chain(&error)
+                cause = error.cause()
             );
             (FAILURE_REPLY.to_owned(), "failed", false)
         }
@@ -1578,6 +1578,22 @@ impl SessionError {
             Self::ModelCredential(_) => "model-credential",
             Self::ChatGpt(_) => "chatgpt",
             Self::Prompt(error) => error.telemetry_kind(),
+        }
+    }
+
+    /// The most specific stable token this failure carries, never its message.
+    ///
+    /// `gateway_session_failed` is the terminal catch-all for every `SessionError`, including ones
+    /// wrapping model-authored text (`PromptError::UnknownTool` carries the name the model chose)
+    /// and raw provider or transport messages. Logging the error chain there would export exactly
+    /// what `docs/observability.md` withholds, so the event carries this instead: the control
+    /// failure kind where there is one — which is what makes a substituted decision binding
+    /// distinguishable from a broker that never answered — and the category otherwise. The chain
+    /// itself reaches an operator through the error the caller returns, on stderr.
+    pub fn cause(&self) -> &'static str {
+        match self {
+            Self::Prompt(error) => error.telemetry_cause().unwrap_or_else(|| self.category()),
+            _ => self.category(),
         }
     }
 }
